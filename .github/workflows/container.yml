@@ -1,19 +1,22 @@
 name: Container
 
-# Builds the edge image on every merge to main and publishes two tags:
-#   :edge          — moving, what the canary host tracks
+# Builds the edge image. On a merge to main it publishes two tags:
+#   :edge          — moving, what the canary (beta) fleet tracks
 #   :edge-<sha>    — immutable, the handle the promotion workflow consumes
+# On a pull request it builds and scans the image WITHOUT publishing, so a
+# base-image bump or Dockerfile change is validated before it can merge.
 # Releases are NOT built here — they are promoted (re-tagged by digest) from a
-# validated edge image by promote.yml, so the release host runs identical bytes.
+# validated edge image by promote.yml, so the stable fleet runs identical bytes.
 # See ADR-0004.
 
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
-  packages: write
+  packages: write # only exercised on push to main (see the `if:` guards below)
   security-events: write
 
 concurrency:
@@ -24,7 +27,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve lowercase image name
         id: img
@@ -32,9 +35,13 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      # Publishing only happens on a push to main. PR builds never log in or push
+      # (Dependabot/fork PRs get a read-only token anyway), they just build + scan.
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -42,19 +49,20 @@ jobs:
 
       - name: Compute tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.img.outputs.name }}
           tags: |
             type=raw,value=edge
             type=sha,prefix=edge-,format=short
 
-      - name: Build and push
+      - name: Build (push on main, load locally on PRs)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name != 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -63,13 +71,23 @@ jobs:
       - name: Scan image (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+          # On push the image is in the registry (scan by digest); on a PR it was
+          # loaded into the local daemon (scan by the :edge tag).
+          image-ref: ${{ github.event_name == 'push' && format('{0}@{1}', steps.img.outputs.name, steps.build.outputs.digest) || format('{0}:edge', steps.img.outputs.name) }}
           format: sarif
           output: trivy-results.sarif
-          severity: HIGH,CRITICAL
-          exit-code: "0" # report-only for now; tighten once the image is clean
+          # Surface every finding, not just HIGH/CRITICAL — the Security tab is the
+          # honest, complete tally. We do NOT gate the build on it (exit-code 0):
+          # the bulk of base-image OS CVEs have no upstream fix yet, so failing
+          # here would block every build forever. Fixable findings are fixed in
+          # the Dockerfile instead.
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"
 
+      # Only the canonical main-branch scan updates the code-scanning dashboard.
+      # PR scans surface in the job log without polluting the repo's alert tally.
       - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.event_name == 'push'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif

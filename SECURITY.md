@@ -15,8 +15,8 @@ The project is pre-1.0; only the latest build on each channel is supported.
 ## Reporting a vulnerability
 
 **Do not open a public issue for security problems.** Instead use GitHub's
-**private vulnerability reporting** (Security → "Report a vulnerability") once the
-repository exists, or email **95397613+LunchBox951@users.noreply.github.com **.
+**private vulnerability reporting** (Security → "Report a vulnerability"), or
+email **95397613+LunchBox951@users.noreply.github.com **.
 
 Please include reproduction steps and the affected version/tag. You can expect an
 acknowledgement within a few days. Because this is a self-hosted home application,
@@ -41,24 +41,29 @@ there is no bug-bounty program.
 | Dependency vulnerabilities | `pip-audit` (runtime deps) + Dependabot alerts (incl. dev) |
 | Python security lints | `ruff` (bandit `S` rules) |
 | Secret scanning | gitleaks (CI) + GitHub secret scanning (repo setting) |
-| Container image CVEs | Trivy (report-only, post-merge until the base image is clean) |
+| Container image CVEs | Trivy — scans the built image on every PR and on push to `main`; report-only, all severities (the Security tab is the honest tally) |
 | Dependency / Action / base-image updates | Dependabot |
 
 GitHub Actions are version-pinned and kept current by Dependabot. Pinning Actions
-to commit SHAs is a planned hardening step before the repository is made public.
+to commit SHAs remains a planned hardening step.
 
-## Repository hardening checklist (enable after creating the GitHub repo)
+## Repository hardening checklist
 
 These are GitHub **settings**, not files, so they are tracked here rather than
-committed:
+committed. Current status:
 
-- [ ] Enable **secret scanning** and **push protection**.
-- [ ] Enable **private vulnerability reporting**.
-- [ ] Enable **Dependabot alerts** and security updates.
-- [ ] CodeQL **advanced** setup is already configured via
-      `.github/workflows/codeql.yml` — do **not** also enable CodeQL *default*
-      setup (the two conflict and default would disable the committed workflow).
-- [ ] Protect `main`: require PRs, require CI + CodeQL status checks to pass,
-      disallow force-pushes.
+- [x] **Secret scanning** and **push protection** enabled.
+- [x] **Private vulnerability reporting** enabled.
+- [x] **Dependabot alerts** and security updates enabled.
+- [x] CodeQL **advanced** setup is configured via
+      `.github/workflows/codeql.yml` (runs on every PR to `main` and on push) —
+      do **not** also enable CodeQL *default* setup (the two conflict and default
+      would disable the committed workflow).
+- [x] `main` is protected: a PR is required; the `quality`, `analyze` (CodeQL),
+      `secret-scan`, `dependency-audit`, and `build` (container) checks must
+      pass; branches must be up to date; and force-pushes and deletion are
+      blocked. Admins are **not** forced through the gate, so the solo maintainer
+      can still self-merge and hotfix.
 - [ ] Restrict GHCR package visibility/permissions as desired.
-- [ ] (Planned, before going public) pin Actions to commit SHAs.
+- [ ] (Planned) pin Actions to commit SHAs — Dependabot keeps the version tags
+      current in the meantime.
