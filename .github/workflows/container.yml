@@ -1,10 +1,16 @@
 name: Container
 
-# Builds the edge image. On a merge to main it publishes two tags:
-#   :edge          — moving, what the canary (beta) fleet tracks
-#   :edge-<sha>    — immutable, the handle the promotion workflow consumes
-# On a pull request it builds and scans the image WITHOUT publishing, so a
-# base-image bump or Dockerfile change is validated before it can merge.
+# Builds the edge image.
+#   build   — on a pull request: build + Trivy-scan WITHOUT publishing, so a
+#             base-image bump or Dockerfile change is validated before it can
+#             merge. Findings print to the job log (table format). The token is
+#             read-only — a PR validation job never needs registry write.
+#   publish — on a merge to main: build + push two tags, then scan by digest and
+#             upload the SARIF to the Security tab:
+#               :edge        — moving, what the canary (beta) fleet tracks
+#               :edge-<sha>  — immutable, the handle promote.yml consumes
+#             This is the ONLY job granted packages: write, and it never runs on
+#             a pull request.
 # Releases are NOT built here — they are promoted (re-tagged by digest) from a
 # validated edge image by promote.yml, so the stable fleet runs identical bytes.
 # See ADR-0004.
@@ -14,18 +20,24 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege by default; the publish job opts into more (below).
 permissions:
   contents: read
-  packages: write # only exercised on push to main (see the `if:` guards below)
-  security-events: write
 
 concurrency:
   group: container-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # PR validation — the required "build" status check. Builds the image and runs
+  # Trivy, printing every finding to the job log (table) so a vulnerable
+  # base-image or Dockerfile change is visible before it can merge. Never logs
+  # in or pushes, and holds only a read-only token.
   build:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -37,10 +49,52 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      # Publishing only happens on a push to main. PR builds never log in or push
-      # (Dependabot/fork PRs get a read-only token anyway), they just build + scan.
+      - name: Build (load locally, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.img.outputs.name }}:pr
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (Trivy — findings to the job log)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.name }}:pr
+          # Table goes to stdout so the findings actually surface on a PR (SARIF
+          # is for the Security tab and is not uploaded on PRs). Surface every
+          # severity — the job log is the honest, complete tally. We do NOT gate
+          # the build on it (exit-code 0): most base-image OS CVEs have no
+          # upstream fix yet, so failing here would block every build forever.
+          # Fixable findings are fixed in the Dockerfile instead.
+          format: table
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"
+
+  # Publish on merge to main: build + push, then scan by digest and upload the
+  # SARIF to the Security tab. Only this job carries packages: write, and it is
+  # gated to push events so a pull-request run can never obtain registry write.
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve lowercase image name
+        id: img
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
       - name: Log in to GHCR
-        if: github.event_name == 'push'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -56,38 +110,28 @@ jobs:
             type=raw,value=edge
             type=sha,prefix=edge-,format=short
 
-      - name: Build (push on main, load locally on PRs)
+      - name: Build and push
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: ${{ github.event_name == 'push' }}
-          load: ${{ github.event_name != 'push' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan image (Trivy)
+      - name: Scan image (Trivy — SARIF to the Security tab)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          # On push the image is in the registry (scan by digest); on a PR it was
-          # loaded into the local daemon (scan by the :edge tag).
-          image-ref: ${{ github.event_name == 'push' && format('{0}@{1}', steps.img.outputs.name, steps.build.outputs.digest) || format('{0}:edge', steps.img.outputs.name) }}
+          # The image is in the registry now; scan it by digest.
+          image-ref: ${{ format('{0}@{1}', steps.img.outputs.name, steps.build.outputs.digest) }}
           format: sarif
           output: trivy-results.sarif
-          # Surface every finding, not just HIGH/CRITICAL — the Security tab is the
-          # honest, complete tally. We do NOT gate the build on it (exit-code 0):
-          # the bulk of base-image OS CVEs have no upstream fix yet, so failing
-          # here would block every build forever. Fixable findings are fixed in
-          # the Dockerfile instead.
           severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
           exit-code: "0"
 
-      # Only the canonical main-branch scan updates the code-scanning dashboard.
-      # PR scans surface in the job log without polluting the repo's alert tally.
       - name: Upload Trivy results
-        if: github.event_name == 'push'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
