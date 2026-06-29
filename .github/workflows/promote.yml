@@ -1,0 +1,67 @@
+name: Promote to stable
+
+# Manually promote an already-built, already-tested edge image to the release
+# channel. This re-tags by reference (no rebuild), so the release host runs the
+# exact bytes validated on the canary host. Pass the IMMUTABLE edge-<sha> tag
+# (shown in the Container workflow run) as the source for a precise promotion.
+# See ADR-0004.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Source tag to promote — prefer the immutable edge-<sha> over the floating 'edge'"
+        required: true
+        default: edge
+      version:
+        description: "Release version to also assign, e.g. 1.4.0 (leave blank to tag :stable only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve lowercase image name
+        id: img
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
+
+      - name: Validate inputs and promote
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Reject anything that is not a plain image tag before using it in a command.
+          if ! printf '%s' "$SOURCE_TAG" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::Invalid source_tag: '$SOURCE_TAG'"
+            exit 1
+          fi
+
+          tags="--tag ${IMAGE}:stable"
+          if [ -n "$VERSION" ]; then
+            if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Invalid version (expected x.y.z): '$VERSION'"
+              exit 1
+            fi
+            major_minor="${VERSION%.*}"
+            tags="$tags --tag ${IMAGE}:${VERSION} --tag ${IMAGE}:${major_minor}"
+          fi
+
+          echo "Promoting ${IMAGE}:${SOURCE_TAG} -> ${tags} (re-tag by reference, no rebuild)"
+          # shellcheck disable=SC2086 -- intentional word-splitting of the --tag list
+          docker buildx imagetools create $tags "${IMAGE}:${SOURCE_TAG}"

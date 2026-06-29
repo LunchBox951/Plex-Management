@@ -1,0 +1,36 @@
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Reference repositories (huge; never part of the image)
+prototype
+ombi
+overseerr
+radarr
+sonarr
+jackett
+prowlarr
+
+# Local dev artifacts
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.coverage
+coverage.xml
+htmlcov
+.pyright
+.mypy_cache
+
+# Scratch / data / secrets
+.superpowers
+data
+*.db
+*.sqlite3
+.env
+
+# Docs & tests are not needed at runtime
+docs
+tests

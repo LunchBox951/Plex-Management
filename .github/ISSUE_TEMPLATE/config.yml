@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    # NOTE: update the slug to match the real repository once it is created.
+    url: https://github.com/LunchBox951/Plex-Management/security/advisories/new
+    about: Report security issues privately via GitHub's advisory form — see SECURITY.md. Do not open a public issue.

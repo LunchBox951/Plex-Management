@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.pyright/
+
+# App data & secrets (config lives in the mounted volume / web wizard)
+.env
+data/
+*.db
+*.sqlite3
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Claude Code: ship the shared project config + hooks (the env-secrets guard),
+# but keep each contributor's personal overrides out of the repo.
+.claude/settings.local.json
+
+# Brainstorming visual companion (scratch)
+.superpowers/
+
+# Reference repositories (cloned by init.sh, not part of this project)
+prototype
+ombi
+overseerr
+radarr
+sonarr
+jackett
+prowlarr

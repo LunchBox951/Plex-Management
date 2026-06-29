@@ -1,0 +1,26 @@
+# Plex Manager deployment. Install is the one-time admin step; everything after
+# (setup, config, recovery) happens in the browser. See ADR-0003 / ADR-0005.
+#
+#   cp .env.example .env   # then adjust
+#   docker compose up -d
+#
+# Canary host: set PLEX_MANAGER_IMAGE=ghcr.io/<owner>/plex-manager:edge
+# Release host: ...:stable (the default in .env.example)
+
+services:
+  plex-manager:
+    image: ${PLEX_MANAGER_IMAGE:-ghcr.io/lunchbox951/plex-manager:stable}
+    container_name: plex-manager
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${PLEX_MANAGER_PORT:-8000}:8000"
+    volumes:
+      # Config + database persist across updates and rollbacks.
+      - plex-manager-data:/app/data
+      # In v1, media + download paths are mounted here and selected in the wizard:
+      # - /srv/media:/media
+      # - /srv/downloads:/downloads
+
+volumes:
+  plex-manager-data:

@@ -1,0 +1,36 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the report. Please do not include tokens, API keys, or other secrets.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Request '...'
+        2. Observe '...'
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / channel
+      placeholder: "e.g. :stable 1.2.3, or :edge"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (from the in-app console)
+      description: Paste any relevant log output. Redact secrets.
+      render: shell
