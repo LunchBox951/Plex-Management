@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
-import { useDiscoverSearch } from '../api/hooks'
+import { useDiscoverHome, useDiscoverSearch } from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
 import { PosterCard } from '../components/ui/PosterCard'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { TitleDetailModal } from '../components/TitleDetailModal'
-
-const EXAMPLES = ['Dune', 'Severance', 'The Matrix', 'Breaking Bad']
+import { Row } from '../components/Row'
+import { Spotlight } from '../components/Spotlight'
 
 /** Debounce a value so we don't fire a TMDB search on every keystroke. */
 function useDebounced<T>(value: T, delayMs: number): T {
@@ -20,8 +20,12 @@ function useDebounced<T>(value: T, delayMs: number): T {
 export function Discover() {
   const [query, setQuery] = useState('')
   const debounced = useDebounced(query, 300)
-  const { data, isFetching, isError, error, refetch } = useDiscoverSearch(debounced)
+  const hasQuery = debounced.trim().length > 0
 
+  const search = useDiscoverSearch(debounced)
+  const home = useDiscoverHome()
+
+  // One selected-title + modal state, shared across the home and search branches.
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
 
@@ -30,8 +34,7 @@ export function Discover() {
     setModalOpen(true)
   }
 
-  const results = data?.results ?? []
-  const hasQuery = debounced.trim().length > 0
+  const results = search.data?.results ?? []
 
   return (
     <div>
@@ -52,37 +55,52 @@ export function Discover() {
       </div>
 
       {!hasQuery ? (
-        <div className="flex flex-col items-center gap-4 py-16 text-center">
-          <p className="text-muted">Start typing, or try one of these:</p>
-          <div className="flex flex-wrap justify-center gap-2">
-            {EXAMPLES.map((ex) => (
+        home.isLoading ? (
+          <CenteredSpinner label="Loading Discover…" />
+        ) : home.isError ? (
+          <StateMessage
+            tone="error"
+            title="Couldn’t load Discover"
+            message={home.error.message}
+            action={
               <button
-                key={ex}
                 type="button"
-                onClick={() => setQuery(ex)}
-                className="rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-muted ring-1 ring-inset ring-white/10 transition-colors hover:text-ink"
+                onClick={() => void home.refetch()}
+                className="rounded-lg bg-white/8 px-4 py-2 text-sm font-semibold text-ink ring-1 ring-inset ring-white/10 hover:bg-white/12"
               >
-                {ex}
+                Retry
               </button>
+            }
+          />
+        ) : (
+          <>
+            <Spotlight item={home.data?.spotlight ?? null} onOpen={openTitle} />
+            {(home.data?.rows ?? []).map((row) => (
+              <Row
+                key={row.row_type}
+                title={row.title}
+                items={row.items}
+                onSelect={openTitle}
+              />
             ))}
-          </div>
-        </div>
-      ) : isError ? (
+          </>
+        )
+      ) : search.isError ? (
         <StateMessage
           tone="error"
           title="Search failed"
-          message={error.message}
+          message={search.error.message}
           action={
             <button
               type="button"
-              onClick={() => void refetch()}
+              onClick={() => void search.refetch()}
               className="rounded-lg bg-white/8 px-4 py-2 text-sm font-semibold text-ink ring-1 ring-inset ring-white/10 hover:bg-white/12"
             >
               Retry
             </button>
           }
         />
-      ) : isFetching && results.length === 0 ? (
+      ) : search.isFetching && results.length === 0 ? (
         <CenteredSpinner label="Searching…" />
       ) : results.length === 0 ? (
         <StateMessage title="No matches" message={`Nothing on TMDB matched “${debounced}”.`} />

@@ -9,6 +9,10 @@ type Schemas = components['schemas']
 
 export type DiscoverResult = Schemas['DiscoverResult']
 export type DiscoverSearchResponse = Schemas['DiscoverSearchResponse']
+export type DiscoverHomeResponse = Schemas['DiscoverHomeResponse']
+export type DiscoverHomeRow = Schemas['DiscoverHomeRow']
+export type DiscoverListResponse = Schemas['DiscoverListResponse']
+export type MoviesRootValidateRequest = Schemas['MoviesRootValidateRequest']
 
 export type RequestResponse = Schemas['RequestResponse']
 export type RequestListResponse = Schemas['RequestListResponse']

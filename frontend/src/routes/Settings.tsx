@@ -20,6 +20,7 @@ interface FormState {
   qbittorrent_username: string
   qbittorrent_password: string
   tmdb_api_key: string
+  movies_root: string
 }
 
 /** Plaintext fields prefill from current values; secret inputs always start empty. */
@@ -33,10 +34,16 @@ function initialForm(data: SettingsResponse): FormState {
     qbittorrent_username: data.qbittorrent_username ?? '',
     qbittorrent_password: '',
     tmdb_api_key: '',
+    movies_root: data.movies_root ?? '',
   }
 }
 
-type TextKey = 'plex_url' | 'prowlarr_url' | 'qbittorrent_url' | 'qbittorrent_username'
+type TextKey =
+  | 'plex_url'
+  | 'prowlarr_url'
+  | 'qbittorrent_url'
+  | 'qbittorrent_username'
+  | 'movies_root'
 type SecretKey = 'plex_token' | 'prowlarr_api_key' | 'qbittorrent_password' | 'tmdb_api_key'
 
 const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
@@ -111,6 +118,7 @@ export function Settings() {
       prowlarr_url: form.prowlarr_url,
       qbittorrent_url: form.qbittorrent_url,
       qbittorrent_username: form.qbittorrent_username,
+      movies_root: form.movies_root,
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -172,6 +180,13 @@ export function Settings() {
           <h2 className="font-display text-sm font-semibold text-ink">TMDB</h2>
           <div className="mt-4 flex flex-col gap-4">
             {secretField('tmdb_api_key', 'API key', data.tmdb_api_key === SECRET_SET)}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-hairline bg-surface p-5">
+          <h2 className="font-display text-sm font-semibold text-ink">Library</h2>
+          <div className="mt-4 flex flex-col gap-4">
+            {textField('movies_root', 'Movies library folder', '/library/movies')}
           </div>
         </section>
       </div>

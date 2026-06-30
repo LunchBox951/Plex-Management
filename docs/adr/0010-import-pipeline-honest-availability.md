@@ -87,10 +87,14 @@ A pure validation gate plus a thin orchestration service over existing ports:
   without a terminal ([ADR-0005](0005-zero-terminal-web-operability.md)). A row is
   never stranded in `ImportPending` and never silently dropped.
 
-The importer is **idempotent** (status compare-and-set on `ImportPending`),
-because it is driven from the polling reconciler; a dedicated background worker is
-deferred (the existing `GET /queue` poll drives it, with the disk copy run off the
-event loop).
+The importer is **idempotent** (status compare-and-set on `ImportPending`) and is
+driven by a **lightweight background reconcile loop** in the app lifespan — a
+single asyncio task that, every ~15 s with its own session and best-effort
+adapters, reconciles the client, drains imports, and confirms availability. This
+keeps the reconciler the single owner of cross-system truth (overview §5) and
+keeps `GET /queue` a fast read that never blocks on a multi-GB copy (which runs
+off the event loop via `asyncio.to_thread`). A more capable scheduler (configurable
+interval, multi-worker) is a noted follow-up.
 
 ### 3. Honest two-phase availability
 
@@ -129,9 +133,9 @@ connects at import time and is not injectable. We borrow Overseerr's GUID-matchi
   may briefly read as absent. The DB-level active-request uniqueness still
   serializes duplicate requests, so the worst case is a slightly delayed
   `available`, not a double grab.
-- Import is driven from the poll loop, not a worker; a multi-GB cross-mount copy
-  runs in a thread to avoid blocking the event loop, but a dedicated scheduler is
-  a noted fast-follow.
+- Import is driven by a single in-process background loop (no distributed worker);
+  a multi-GB cross-mount copy runs in a thread to avoid blocking the event loop. A
+  configurable-interval / multi-worker scheduler is a noted fast-follow.
 - Movies-first: TV season/episode import/availability is **out of scope** and
   raises an honest deferral rather than faking a show-level answer.
 

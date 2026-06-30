@@ -198,9 +198,106 @@
         "title": "CreateRequestBody",
         "type": "object"
       },
+      "DiscoverHomeResponse": {
+        "description": "The composed Discover home: an optional spotlight + ordered rows.",
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/DiscoverHomeRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "spotlight": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DiscoverResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "title": "DiscoverHomeResponse",
+        "type": "object"
+      },
+      "DiscoverHomeRow": {
+        "description": "One server-composed Discover row: a title + its items.\n\n``row_type`` is an OPEN string (e.g. ``trending`` / ``popular`` / ``upcoming``)\nso the frontend renders rows generically and stays dumb about WHY a row exists\n\u2014 TV and recommendation rows slot in later with no contract change.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DiscoverResult"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "row_type": {
+            "title": "Row Type",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "row_type",
+          "title",
+          "items"
+        ],
+        "title": "DiscoverHomeRow",
+        "type": "object"
+      },
+      "DiscoverListResponse": {
+        "description": "A paginated category listing (trending / popular / upcoming).",
+        "properties": {
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/DiscoverResult"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "total_pages": {
+            "title": "Total Pages",
+            "type": "integer"
+          },
+          "total_results": {
+            "title": "Total Results",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "page",
+          "total_pages",
+          "total_results",
+          "results"
+        ],
+        "title": "DiscoverListResponse",
+        "type": "object"
+      },
       "DiscoverResult": {
         "description": "One discovery search row.",
         "properties": {
+          "backdrop_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backdrop Url"
+          },
           "media_type": {
             "enum": [
               "movie",
@@ -334,6 +431,20 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "MoviesRootValidateRequest": {
+        "description": "Candidate Movies library folder to test (exists + writable).",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "MoviesRootValidateRequest",
         "type": "object"
       },
       "PlexValidateRequest": {
@@ -597,6 +708,17 @@
       "RequestResponse": {
         "description": "A media request as returned to the client.",
         "properties": {
+          "backdrop_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backdrop Url"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
@@ -609,6 +731,17 @@
           "media_type": {
             "title": "Media Type",
             "type": "string"
+          },
+          "poster_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster Url"
           },
           "status": {
             "title": "Status",
@@ -784,6 +917,17 @@
       "SettingsResponse": {
         "description": "Redacted view of stored service config.\n\nPlaintext (non-secret) values are returned as-is; secret values are shown as\n``\"***\"`` when configured and ``None`` when unset \u2014 the plaintext secret is\nNEVER serialized.",
         "properties": {
+          "movies_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Movies Root"
+          },
           "plex_token": {
             "anyOf": [
               {
@@ -879,6 +1023,17 @@
       "SettingsUpdate": {
         "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
         "properties": {
+          "movies_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Movies Root"
+          },
           "plex_token": {
             "anyOf": [
               {
@@ -974,6 +1129,10 @@
       "SetupCompleteRequest": {
         "description": "The validated credential set written on ``POST /setup/complete``.",
         "properties": {
+          "movies_root": {
+            "title": "Movies Root",
+            "type": "string"
+          },
           "plex_token": {
             "title": "Plex Token",
             "type": "string"
@@ -1015,7 +1174,8 @@
           "qbittorrent_url",
           "qbittorrent_username",
           "qbittorrent_password",
-          "tmdb_api_key"
+          "tmdb_api_key",
+          "movies_root"
         ],
         "title": "SetupCompleteRequest",
         "type": "object"
@@ -1210,6 +1370,33 @@
         ]
       }
     },
+    "/api/v1/discover/home": {
+      "get": {
+        "description": "Return the server-composed Discover home (spotlight + ordered rows).",
+        "operationId": "discover_home_api_v1_discover_home_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoverHomeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Discover Home",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
     "/api/v1/discover/search": {
       "get": {
         "description": "Search TMDB for movies / shows matching ``query`` (optional ``year``).",
@@ -1270,6 +1457,70 @@
           }
         ],
         "summary": "Discover Search",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/api/v1/discover/{category}": {
+      "get": {
+        "description": "Return a paginated movie category (``trending`` / ``popular`` / ``upcoming``).",
+        "operationId": "discover_category_api_v1_discover__category__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "category",
+            "required": true,
+            "schema": {
+              "enum": [
+                "trending",
+                "popular",
+                "upcoming"
+              ],
+              "title": "Category",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoverListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Discover Category",
         "tags": [
           "discovery"
         ]
@@ -1376,6 +1627,54 @@
         ]
       }
     },
+    "/api/v1/queue/{download_id}/import": {
+      "post": {
+        "description": "Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).\n\nRequires Plex + the Movies root configured (409 ``service_not_configured``\notherwise). The correction-without-a-terminal button for a blocked import.",
+        "operationId": "import_endpoint_api_v1_queue__download_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "download_id",
+            "required": true,
+            "schema": {
+              "title": "Download Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Import Endpoint",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
     "/api/v1/queue/{download_id}/mark-failed": {
       "post": {
         "description": "Operator move: mark a download failed (optionally blocklisting the release).",
@@ -1461,7 +1760,7 @@
         ]
       },
       "post": {
-        "description": "Create a request (or return the existing active one for this media).",
+        "description": "Create a request (or return the existing active one for this media).\n\nIf Plex is configured and the movie is already in the library, the request is\nrecorded directly as ``available`` (no needless search/grab).",
         "operationId": "create_request_endpoint_api_v1_requests_post",
         "requestBody": {
           "content": {
@@ -1732,6 +2031,48 @@
           }
         },
         "summary": "Status",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/api/v1/setup/validate/movies_root": {
+      "post": {
+        "description": "Test a candidate Movies library folder (a local path: exists + writable).",
+        "operationId": "validate_movies_root_endpoint_api_v1_setup_validate_movies_root_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoviesRootValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceValidateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Movies Root Endpoint",
         "tags": [
           "setup"
         ]

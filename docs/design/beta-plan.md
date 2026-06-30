@@ -136,10 +136,11 @@ hero slot), and `ReleaseList`. Net-new:
   backdrop base + discover methods; both are reached only through the new
   `web/deps` factories so `domain`/`services` stay adapter-free. The importer
   receives ports by injection and never imports an adapter.
-- **Background task**: no scheduler is added; import + availability run on the
-  existing `GET /queue` reconcile poll, so they are fast, guarded, and idempotent,
-  and the disk copy runs via `asyncio.to_thread`. A dedicated worker is a noted
-  fast-follow.
+- **Background task**: a lightweight reconcile loop in the app lifespan (one
+  asyncio task, ~15 s, own session, best-effort adapters) reconciles the client,
+  drains imports, and confirms availability — so `GET /queue` stays a fast read
+  and never blocks on a copy (run via `asyncio.to_thread`). Imports are guarded +
+  idempotent. A configurable / multi-worker scheduler is a noted follow-up.
 - **Honesty thread**: a failed import is `ImportBlocked` (retryable, in-app
   button), never silent and never stranded; `no_acceptable_release` stays a
   visible retryable state; Plex token and TMDB key are never logged.
@@ -167,8 +168,8 @@ check · build. `make check` green at every step.
 
 ## Deferred to the next beta
 
-TV season/episode scoping · SSE/WebSocket event stream + a dedicated reconciler
-worker · multi-root libraries (Radarr-style longest-parent-match) · a backend
+TV season/episode scoping · SSE/WebSocket event stream + a configurable / multi-
+worker reconciler scheduler · multi-root libraries (Radarr-style longest-parent-match) · a backend
 image proxy/cache (posters/backdrops still load from TMDB's CDN) · Plex-OAuth
 identity + avatars · recommendation/affinity rows · disk-pressure eviction ·
 policy-based retention.

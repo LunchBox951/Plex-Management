@@ -66,6 +66,19 @@ const SERVICES: ServiceDef[] = [
     blurb: 'The metadata source powering Discover search.',
     fields: [{ key: 'tmdb_api_key', label: 'API key', type: 'password' }],
   },
+  {
+    key: 'movies_root',
+    label: 'Library',
+    blurb: 'The folder imported movies are placed into — a path the app/container can write to.',
+    fields: [
+      {
+        key: 'movies_root',
+        label: 'Movies library folder',
+        type: 'text',
+        placeholder: '/library/movies',
+      },
+    ],
+  },
 ]
 
 const EMPTY_FORM: SetupCompleteRequest = {
@@ -77,6 +90,7 @@ const EMPTY_FORM: SetupCompleteRequest = {
   qbittorrent_username: '',
   qbittorrent_password: '',
   tmdb_api_key: '',
+  movies_root: '',
 }
 
 interface TestResult {
@@ -102,6 +116,8 @@ function bodyFor(service: SetupService, form: SetupCompleteRequest): Record<stri
       }
     case 'tmdb':
       return { api_key: form.tmdb_api_key }
+    case 'movies_root':
+      return { path: form.movies_root }
   }
 }
 
@@ -118,6 +134,7 @@ export function SetupWizard() {
     prowlarr: null,
     qbittorrent: null,
     tmdb: null,
+    movies_root: null,
   })
   const [testing, setTesting] = useState<SetupService | null>(null)
   const [mintedKey, setMintedKey] = useState<string | null>(null)
@@ -128,6 +145,7 @@ export function SetupWizard() {
     prowlarr: 0,
     qbittorrent: 0,
     tmdb: 0,
+    movies_root: 0,
   })
 
   const copyKey = async () => {
@@ -286,7 +304,9 @@ export function SetupWizard() {
       </div>
 
       <div className="sticky bottom-0 mt-6 flex items-center justify-between gap-4 rounded-2xl border border-hairline bg-bg/90 p-4 backdrop-blur">
-        <span className="font-mono text-xs text-faint">{verifiedCount}/4 verified</span>
+        <span className="font-mono text-xs text-faint">
+          {verifiedCount}/{SERVICES.length} verified
+        </span>
         <Button
           disabled={!allVerified}
           loading={complete.isPending}

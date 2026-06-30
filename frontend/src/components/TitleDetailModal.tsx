@@ -1,16 +1,28 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useCreateRequest, useGrab, useSearchPreview } from '../api/hooks'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  useCreateRequest,
+  useGrab,
+  useMarkFailed,
+  useQueue,
+  useRequests,
+  useSearchPreview,
+} from '../api/hooks'
 import type {
   AcceptedRelease,
   DiscoverResult,
   GrabRequest,
+  QueueItem,
+  RequestResponse,
   SearchPreviewRequest,
   SearchPreviewResponse,
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
+import { requestStatus, type StatusPresentation } from '../lib/status'
 import { Dialog } from './ui/Dialog'
 import { ReleaseList } from './ReleaseList'
 import { Button } from './ui/Button'
+import { StatusBadge } from './ui/StatusBadge'
+import { ProgressBar } from './ui/ProgressBar'
 import { CenteredSpinner } from './ui/feedback'
 import { useToast } from './ui/toast'
 
@@ -25,19 +37,70 @@ function asApiError(error: unknown): ApiError {
 }
 
 /**
+ * The title's live lifecycle, derived by correlating the open title against the
+ * polled request list and download queue. The backend `status` is a free string
+ * carrying the canonical RequestStatus enum; the switch's default keeps unknown
+ * values honest rather than throwing.
+ */
+type DerivedState =
+  | { kind: 'none' }
+  | { kind: 'pending' }
+  | { kind: 'searching' }
+  | { kind: 'downloading' }
+  | { kind: 'no_acceptable_release' }
+  | { kind: 'completed' }
+  | { kind: 'available' }
+  | { kind: 'failed' }
+  | { kind: 'unknown'; status: string }
+
+function deriveState(request: RequestResponse | null, optimistic: boolean): DerivedState {
+  if (!request) return optimistic ? { kind: 'pending' } : { kind: 'none' }
+  switch (request.status) {
+    case 'pending':
+      return { kind: 'pending' }
+    case 'searching':
+      return { kind: 'searching' }
+    case 'downloading':
+      return { kind: 'downloading' }
+    case 'no_acceptable_release':
+      return { kind: 'no_acceptable_release' }
+    case 'completed':
+      return { kind: 'completed' }
+    case 'available':
+      return { kind: 'available' }
+    case 'failed':
+      return { kind: 'failed' }
+    default:
+      return { kind: 'unknown', status: request.status }
+  }
+}
+
+const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
+
+/**
  * The headline flow: request a title, run the decision engine (search-preview),
- * and grab a ranked release into the download client. This single modal exercises
- * the whole request -> search -> grab path the alpha exists to prove.
+ * and grab a ranked release into the download client. Beyond the first grab, the
+ * modal derives the title's live state from the polled request + queue and offers
+ * a state-aware action zone — including an in-modal "report a problem" correction
+ * that blocklists the bad release and re-arms the request (north star #1).
  */
 export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModalProps) {
   const { toast } = useToast()
   const createRequest = useCreateRequest()
   const searchPreview = useSearchPreview()
   const grab = useGrab()
+  const markFailed = useMarkFailed()
+
+  // Live correlation sources — poll while a title is open so the action zone
+  // tracks the backend through search -> download -> import without a refresh.
+  const requestsQuery = useRequests({ poll: open })
+  const queueQuery = useQueue({ poll: open })
 
   const [requestId, setRequestId] = useState<number | null>(null)
   const [preview, setPreview] = useState<SearchPreviewResponse | null>(null)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
+  // The confirm dialog for "report a problem"; carries the download to re-arm.
+  const [reportFor, setReportFor] = useState<{ downloadId: number } | null>(null)
 
   // Reset the per-title flow whenever a different title is opened. Keyed on
   // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
@@ -51,7 +114,36 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     setRequestId(null)
     setPreview(null)
     setGrabbingGuid(null)
+    setReportFor(null)
   }, [titleKey])
+
+  // The live request for this exact title (media_type + tmdb_id), if any.
+  const liveRequest = useMemo<RequestResponse | null>(() => {
+    if (!title) return null
+    return (
+      requestsQuery.data?.requests.find(
+        (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
+      ) ?? null
+    )
+  }, [requestsQuery.data, title])
+
+  // A just-created request shows immediately even before the next poll lands.
+  const effectiveRequestId = requestId ?? liveRequest?.id ?? null
+
+  // The matching download. Prefer the request linkage (collision-free); fall back
+  // to tmdb_id only when no request is known yet.
+  const queueItem = useMemo<QueueItem | null>(() => {
+    if (!title) return null
+    const items = queueQuery.data?.queue ?? []
+    const matches = items.filter((q) =>
+      effectiveRequestId !== null
+        ? q.media_request_id === effectiveRequestId
+        : q.tmdb_id === title.tmdb_id,
+    )
+    return matches.length > 0 ? matches[matches.length - 1]! : null
+  }, [queueQuery.data, title, effectiveRequestId])
+
+  const state = deriveState(liveRequest, requestId !== null)
 
   const runPreview = useCallback(
     async (forRequestId: number | null) => {
@@ -98,11 +190,11 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
       // Need a request, and never fire a second grab while one is in flight.
-      if (requestId === null || grab.isPending) return
+      if (effectiveRequestId === null || grab.isPending) return
       // Send only the GUID — it uniquely identifies the clicked row. info_hash can
       // be shared across indexers and the backend matches it BEFORE guid, so
       // including it could grab a different release that shares the hash.
-      const body: GrabRequest = { request_id: requestId, guid: release.guid }
+      const body: GrabRequest = { request_id: effectiveRequestId, guid: release.guid }
       setGrabbingGuid(release.guid)
       try {
         await grab.mutateAsync(body)
@@ -117,13 +209,164 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         setGrabbingGuid(null)
       }
     },
-    [requestId, grab, toast],
+    [effectiveRequestId, grab, toast],
   )
+
+  // Blocklist the bad release and re-arm the request to search again. Mirrors the
+  // Queue screen's mark-failed confirm; no separate "issues" record is created.
+  const runReport = useCallback(async () => {
+    if (!reportFor) return
+    try {
+      await markFailed.mutateAsync({ downloadId: reportFor.downloadId, blocklist: true })
+      toast({
+        title: 'Reported',
+        description: 'Blocklisted that release and re-armed the search.',
+        intent: 'success',
+      })
+      setReportFor(null)
+    } catch (error) {
+      toast({
+        title: 'Report failed',
+        description: asApiError(error).message,
+        intent: 'error',
+      })
+    }
+  }, [reportFor, markFailed, toast])
 
   if (!title) return null
 
-  const requested = requestId !== null
+  const canGrab = effectiveRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
+
+  // The report button only makes sense when there's a real download to act on.
+  const canReport = queueItem !== null
+  const reportButton =
+    canReport && queueItem ? (
+      <Button variant="danger" onClick={() => setReportFor({ downloadId: queueItem.id })}>
+        Report a problem
+      </Button>
+    ) : null
+
+  const reSearchButton = (
+    <Button
+      variant="secondary"
+      onClick={() => void runPreview(effectiveRequestId)}
+      loading={searchPreview.isPending}
+    >
+      Re-search
+    </Button>
+  )
+
+  // States where browsing/grabbing releases is part of the action — the decision
+  // engine output stays visible (especially the honest no-acceptable-release).
+  const showReleases =
+    state.kind === 'none' ||
+    state.kind === 'pending' ||
+    state.kind === 'searching' ||
+    state.kind === 'no_acceptable_release' ||
+    state.kind === 'failed' ||
+    state.kind === 'unknown'
+
+  let actionZone: ReactNode
+  switch (state.kind) {
+    case 'none':
+      actionZone = (
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
+            Request
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => void runPreview(null)}
+            loading={searchPreview.isPending}
+          >
+            Preview releases
+          </Button>
+        </div>
+      )
+      break
+    case 'pending':
+    case 'searching':
+      actionZone = (
+        <div className="flex flex-wrap items-center gap-4">
+          <span className="inline-flex items-center gap-2 text-sm font-semibold text-searching">
+            <span className="size-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            Searching
+          </span>
+          {reSearchButton}
+        </div>
+      )
+      break
+    case 'downloading':
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-3">
+            <StatusBadge status={requestStatus('downloading')} />
+            <div className="flex flex-1 items-center gap-3">
+              <ProgressBar value={queueItem?.progress ?? 0} />
+              <span className="font-mono text-xs text-muted tabular-nums">
+                {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
+              </span>
+            </div>
+          </div>
+          {reportButton ? <div className="flex flex-wrap gap-2">{reportButton}</div> : null}
+        </div>
+      )
+      break
+    case 'no_acceptable_release':
+      actionZone = (
+        <div className="flex flex-wrap items-center gap-3">
+          <StatusBadge status={requestStatus('no_acceptable_release')} />
+          <span className="text-sm text-muted">
+            Nothing was grabbed. Re-search to try again later.
+          </span>
+          {reSearchButton}
+        </div>
+      )
+      break
+    case 'completed':
+      actionZone = (
+        <div className="flex flex-wrap items-center gap-3">
+          <StatusBadge status={FINALIZING} />
+          <span className="text-sm text-muted">Imported — awaiting Plex confirmation.</span>
+        </div>
+      )
+      break
+    case 'available':
+      actionZone = (
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="inline-flex items-center gap-1.5 rounded-lg bg-available/15 px-3 py-1 text-sm font-semibold text-available ring-1 ring-available/30">
+            ✓ In your library
+          </span>
+          {reportButton}
+        </div>
+      )
+      break
+    case 'failed':
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={requestStatus('failed')} />
+            {queueItem?.failed_reason ? (
+              <span className="text-sm text-error">{queueItem.failed_reason}</span>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {reSearchButton}
+            {reportButton}
+          </div>
+        </div>
+      )
+      break
+    case 'unknown':
+      actionZone = (
+        <div className="flex flex-wrap items-center gap-3">
+          <StatusBadge status={requestStatus(state.status)} />
+          {reSearchButton}
+        </div>
+      )
+      break
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange} title={title.title} description={title.title}>
@@ -141,38 +384,46 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
                 {title.overview}
               </p>
             ) : null}
-            <div className="mt-4 flex flex-wrap gap-2">
-              {requested ? (
-                <span className="inline-flex items-center gap-1.5 rounded-lg bg-available/15 px-3 text-sm font-semibold text-available ring-1 ring-available/30">
-                  ✓ Requested
-                </span>
-              ) : (
-                <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
-                  Request
-                </Button>
-              )}
-              <Button
-                variant="secondary"
-                onClick={() => void runPreview(requestId)}
-                loading={searchPreview.isPending}
-              >
-                {requested ? 'Re-search' : 'Preview releases'}
-              </Button>
-            </div>
+            <div className="mt-4">{actionZone}</div>
           </div>
         </div>
 
-        {searchPreview.isPending && !preview ? (
-          <CenteredSpinner label="Running the decision engine…" />
-        ) : preview ? (
-          <ReleaseList
-            preview={preview}
-            onGrab={(rel) => void onGrab(rel)}
-            grabbingGuid={grabbingGuid}
-            canGrab={requested}
-          />
+        {showReleases ? (
+          searchPreview.isPending && !preview ? (
+            <CenteredSpinner label="Running the decision engine…" />
+          ) : preview ? (
+            <ReleaseList
+              preview={preview}
+              onGrab={(rel) => void onGrab(rel)}
+              grabbingGuid={grabbingGuid}
+              canGrab={canGrab}
+            />
+          ) : null
         ) : null}
       </div>
+
+      {reportFor ? (
+        <Dialog
+          open
+          onOpenChange={(next) => {
+            if (!next) setReportFor(null)
+          }}
+          title="Blocklist this release and search again? It won't be grabbed again."
+        >
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setReportFor(null)}
+              disabled={markFailed.isPending}
+            >
+              Cancel
+            </Button>
+            <Button variant="danger" loading={markFailed.isPending} onClick={() => void runReport()}>
+              Blocklist &amp; re-search
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
     </Dialog>
   )
 }

@@ -9,6 +9,7 @@ import { unwrap, ensureOk } from './http'
 import type {
   BlocklistResponse,
   CreateRequestBody,
+  DiscoverHomeResponse,
   DiscoverSearchResponse,
   GrabRequest,
   QualityProfileResponse,
@@ -40,7 +41,7 @@ export function useSetupStatus() {
   })
 }
 
-export type SetupService = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb'
+export type SetupService = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb' | 'movies_root'
 
 export function useValidateService() {
   return useMutation({
@@ -49,6 +50,12 @@ export function useValidateService() {
       body: Record<string, string>
     }): Promise<ServiceValidateResponse> => {
       switch (args.service) {
+        case 'movies_root':
+          return unwrap(
+            await client.POST('/api/v1/setup/validate/movies_root', {
+              body: args.body as { path: string },
+            }),
+          )
         case 'plex':
           return unwrap(
             await client.POST('/api/v1/setup/validate/plex', {
@@ -110,6 +117,14 @@ export function useUpdateSettings() {
 }
 
 /* --------------------------------------------------------------- discover -- */
+
+export function useDiscoverHome() {
+  return useQuery({
+    queryKey: queryKeys.discoverHome,
+    queryFn: async (): Promise<DiscoverHomeResponse> =>
+      unwrap(await client.GET('/api/v1/discover/home')),
+  })
+}
 
 export function useDiscoverSearch(query: string, year?: number) {
   const trimmed = query.trim()
@@ -205,6 +220,22 @@ export function useMarkFailed() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.queue })
       void qc.invalidateQueries({ queryKey: ['blocklist'] })
+    },
+  })
+}
+
+export function useImportDownload() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (downloadId: number): Promise<QueueItem> =>
+      unwrap(
+        await client.POST('/api/v1/queue/{download_id}/import', {
+          params: { path: { download_id: downloadId } },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
     },
   })
 }
