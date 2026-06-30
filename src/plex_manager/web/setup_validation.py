@@ -13,20 +13,26 @@ issued with the credential carried in a header (never in a logged URL).
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
 from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
-from plex_manager.web.schemas import ServiceValidateResponse
+from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from plex_manager.ports.library import LibrarySection
 
 __all__ = [
-    "validate_movies_root",
+    "movie_library_options",
     "validate_plex",
     "validate_prowlarr",
     "validate_qbittorrent",
@@ -38,31 +44,62 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_FORBIDDEN = 403
 
 
-async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
-    """Check a Plex server + token via ``GET /identity`` (token in header)."""
-    try:
-        response = await client.get(
-            f"{url.rstrip('/')}/identity",
-            headers={"X-Plex-Token": token, "Accept": "application/json"},
+def _is_writable(path: str) -> bool:
+    """Whether the app's OWN process can write into ``path`` (a Plex library dir).
+
+    Deliberately read-only (``os.access``): it never writes, so a Plex an attacker
+    pointed us at cannot be turned into an arbitrary-write probe. It can be
+    optimistic under NFS root-squash / a container-UID mismatch — a false positive
+    surfaces later as an honest, retryable ``ImportBlocked``, never a silent fail.
+    """
+    return os.path.isdir(path) and os.access(path, os.W_OK)
+
+
+def movie_library_options(sections: Sequence[LibrarySection]) -> list[PlexLibraryOption]:
+    """Map Plex's movie sections to pickable ``movies_root`` folders + writability.
+
+    The paths come from Plex's own ``/library/sections`` (not a typed request
+    value), so choosing one avoids a path-injection sink AND guarantees the
+    targeted-scan path match. Every movie-section location is offered; the UI marks
+    (and disables) the non-writable ones, which is the split-mount signal.
+    """
+    return [
+        PlexLibraryOption(
+            section_key=section.key,
+            title=section.title,
+            path=path,
+            writable=_is_writable(path),
         )
-    except httpx.HTTPError as exc:
-        # The token travels in a header, not the URL, so str(exc) cannot leak it.
+        for section in sections
+        if section.type == "movie"
+        for path in section.locations
+    ]
+
+
+async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
+    """Validate Plex + token AND return the movie library folders to pick from.
+
+    Uses the real adapter (``list_sections``): one call both proves connectivity +
+    token and yields the library locations, so the wizard offers a writable-folder
+    pick-list for ``movies_root`` instead of a typed, mismatch-prone path. The token
+    rides the ``X-Plex-Token`` header, never the URL.
+    """
+    try:
+        sections = await PlexLibrary(client, url, token).list_sections()
+    except PlexAuthError:
+        return ServiceValidateResponse(ok=False, message="Plex rejected the token.")
+    except PlexLibraryError as exc:
         return ServiceValidateResponse(
             ok=False, message="Could not reach the Plex server.", detail=str(exc)
         )
-    if response.status_code == _HTTP_OK:
-        return ServiceValidateResponse(ok=True, message="Connected to Plex.")
-    if response.status_code in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
+    libraries = movie_library_options(sections)
+    if not libraries:
         return ServiceValidateResponse(
-            ok=False,
-            message="Plex rejected the token.",
-            detail=f"HTTP {response.status_code}",
+            ok=True,
+            message="Connected to Plex, but no Movie library was found — add one in Plex.",
+            libraries=[],
         )
-    return ServiceValidateResponse(
-        ok=False,
-        message="Unexpected response from Plex.",
-        detail=f"HTTP {response.status_code}",
-    )
+    return ServiceValidateResponse(ok=True, message="Connected to Plex.", libraries=libraries)
 
 
 async def validate_prowlarr(
@@ -119,37 +156,6 @@ async def validate_qbittorrent(
             ok=False, message="Could not reach qBittorrent.", detail=str(exc)
         )
     return ServiceValidateResponse(ok=True, message="Connected to qBittorrent.")
-
-
-def validate_movies_root(path: str) -> ServiceValidateResponse:
-    """Check the Movies library folder exists and is writable (a local path).
-
-    Runs server-side, so it validates the path as the app's process (and, in a
-    container, the mounted volume) sees it — the same path the importer will route
-    movies into. A path is not a secret, so it may appear in the message.
-    """
-    candidate = path.strip()
-    if not candidate:
-        return ServiceValidateResponse(ok=False, message="Enter a library folder path.")
-    # Require an absolute, traversal-free path: the importer writes movies to an
-    # absolute root, and a relative / ``..``-laden value is both broken for import
-    # and a needless way to point the probe outside the intended tree.
-    if not os.path.isabs(candidate) or ".." in Path(candidate).parts:
-        return ServiceValidateResponse(
-            ok=False,
-            message="Use an absolute path with no '..' segments (e.g. /library/movies).",
-            detail=path,
-        )
-    target = Path(candidate)
-    if not target.exists():
-        return ServiceValidateResponse(ok=False, message="That folder does not exist.", detail=path)
-    if not target.is_dir():
-        return ServiceValidateResponse(ok=False, message="That path is not a folder.", detail=path)
-    if not os.access(target, os.W_OK):
-        return ServiceValidateResponse(
-            ok=False, message="That folder is not writable.", detail=path
-        )
-    return ServiceValidateResponse(ok=True, message="Library folder is ready.")
 
 
 async def validate_tmdb(client: httpx.AsyncClient, api_key: str) -> ServiceValidateResponse:

@@ -433,18 +433,33 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
-      "MoviesRootValidateRequest": {
-        "description": "Candidate Movies library folder to test (exists + writable).",
+      "PlexLibraryOption": {
+        "description": "One movie-library folder Plex reports, with whether the app can write to it.\n\n``path`` is a Plex library location (from Plex's own ``/library/sections``), so\nchoosing it for ``movies_root`` avoids a typed path entirely (and the path\u2194\nsection mismatch that breaks a targeted scan). ``writable`` is the app's own\ncheck: a not-writable location is the split-mount signal \u2014 surfaced, not hidden.",
         "properties": {
           "path": {
             "title": "Path",
             "type": "string"
+          },
+          "section_key": {
+            "title": "Section Key",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "writable": {
+            "title": "Writable",
+            "type": "boolean"
           }
         },
         "required": [
-          "path"
+          "section_key",
+          "title",
+          "path",
+          "writable"
         ],
-        "title": "MoviesRootValidateRequest",
+        "title": "PlexLibraryOption",
         "type": "object"
       },
       "PlexValidateRequest": {
@@ -885,7 +900,7 @@
         "type": "object"
       },
       "ServiceValidateResponse": {
-        "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.",
+        "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.\n\nFor Plex, ``libraries`` carries the movie library folders so the UI can offer a\npick-list for ``movies_root`` instead of a typed path. ``None`` for every other\nservice (and for a failed Plex check).",
         "properties": {
           "detail": {
             "anyOf": [
@@ -897,6 +912,20 @@
               }
             ],
             "title": "Detail"
+          },
+          "libraries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PlexLibraryOption"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libraries"
           },
           "message": {
             "title": "Message",
@@ -1972,6 +2001,37 @@
         ]
       }
     },
+    "/api/v1/settings/plex-libraries": {
+      "get": {
+        "description": "Movie library folders Plex reports, for the Settings ``movies_root`` picker.\n\nUses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.",
+        "operationId": "plex_libraries_endpoint_api_v1_settings_plex_libraries_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PlexLibraryOption"
+                  },
+                  "title": "Response Plex Libraries Endpoint Api V1 Settings Plex Libraries Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Plex Libraries Endpoint",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
     "/api/v1/setup/complete": {
       "post": {
         "description": "Persist the validated creds, mint the app api key, mark initialized.\n\nOne-shot AND concurrency-safe: rejected with 409 once initialized. Two\nconcurrent ``/complete`` calls can both pass an in-memory ``initialized`` check\nand double-write (a ``settings.key`` unique-constraint 500, or one overwriting\nthe other's just-issued ``app_api_key``). To prevent that, initialization is\nclaimed with a CONDITIONAL update (``... WHERE id = 1 AND initialized = false``):\nexactly one request flips the row, and the loser sees ``rowcount == 0`` and is\nrejected 409 \u2014 so only the winner mints the key and writes the creds. Re-running\nsetup post-init would also let an unauthenticated caller overwrite every stored\ncredential and re-disclose the app key, so post-init changes must go through the\nauthenticated ``PUT /settings``.",
@@ -2031,48 +2091,6 @@
           }
         },
         "summary": "Status",
-        "tags": [
-          "setup"
-        ]
-      }
-    },
-    "/api/v1/setup/validate/movies_root": {
-      "post": {
-        "description": "Test a candidate Movies library folder (a local path: exists + writable).",
-        "operationId": "validate_movies_root_endpoint_api_v1_setup_validate_movies_root_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/MoviesRootValidateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ServiceValidateResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Validate Movies Root Endpoint",
         "tags": [
           "setup"
         ]

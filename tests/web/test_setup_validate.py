@@ -6,32 +6,43 @@ auth failures surface honestly as ``ok=False`` without leaking secrets.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
-from plex_manager.web.setup_validation import validate_movies_root
+from plex_manager.adapters.plex.library import reset_caches
+from plex_manager.ports.library import LibrarySection
+from plex_manager.web.setup_validation import movie_library_options
 
 Handler = Callable[[httpx.Request], httpx.Response]
 SeedFn = Callable[..., Awaitable[None]]
 
 
-def test_validate_movies_root_rejects_relative_and_traversal() -> None:
-    assert validate_movies_root("relative/movies").ok is False
-    assert validate_movies_root("/library/../etc").ok is False
-    assert validate_movies_root("   ").ok is False
+@pytest.fixture(autouse=True)
+def reset_plex_caches() -> Iterator[None]:
+    # The Plex adapter caches sections by base_url at module level; isolate tests.
+    reset_caches()
+    yield
+    reset_caches()
 
 
-def test_validate_movies_root_accepts_a_writable_dir(tmp_path: Path) -> None:
-    assert validate_movies_root(str(tmp_path)).ok is True
-
-
-def test_validate_movies_root_reports_a_missing_dir() -> None:
-    result = validate_movies_root("/definitely/not/a/real/path/xyz123")
-    assert result.ok is False
-    assert "does not exist" in result.message
+def test_movie_library_options_filters_movies_and_flags_writable(tmp_path: Path) -> None:
+    sections = [
+        LibrarySection(
+            key="1", title="Movies", type="movie", locations=(str(tmp_path), "/no/such/dir")
+        ),
+        LibrarySection(key="2", title="Shows", type="show", locations=("/tv",)),
+    ]
+    options = movie_library_options(sections)
+    # Only movie sections; one option per location; writability is per-path.
+    assert [(o.title, o.path, o.writable) for o in options] == [
+        ("Movies", str(tmp_path), True),
+        ("Movies", "/no/such/dir", False),
+    ]
+    assert all(o.section_key == "1" for o in options)
 
 
 async def _use_transport(app: FastAPI, handler: Handler) -> None:
@@ -82,18 +93,57 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
     assert response.json()["ok"] is False
 
 
-async def test_validate_plex_ok(client: httpx.AsyncClient, app: FastAPI) -> None:
+async def test_validate_plex_ok_returns_movie_libraries(
+    client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/identity"
+        assert request.url.path == "/library/sections"
         assert request.headers["X-Plex-Token"] == "tok"
-        return httpx.Response(200, json={"machineIdentifier": "abc"})
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "Directory": [
+                        {
+                            "key": "1",
+                            "title": "Movies",
+                            "type": "movie",
+                            "Location": [{"path": str(tmp_path)}],
+                        },
+                        {
+                            "key": "2",
+                            "title": "Shows",
+                            "type": "show",
+                            "Location": [{"path": "/tv"}],
+                        },
+                    ]
+                }
+            },
+        )
 
     await _use_transport(app, handler)
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
     )
-    assert response.json()["ok"] is True
+    body = response.json()
+    assert body["ok"] is True
+    # Only the movie library is offered, with its writability flagged.
+    assert len(body["libraries"]) == 1
+    assert body["libraries"][0]["title"] == "Movies"
+    assert body["libraries"][0]["path"] == str(tmp_path)
+    assert body["libraries"][0]["writable"] is True
+
+
+async def test_validate_plex_bad_token(client: httpx.AsyncClient, app: FastAPI) -> None:
+    await _use_transport(app, lambda _r: httpx.Response(401, json={}))
+    response = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": "nope-secret"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert "nope-secret" not in response.text  # the rejected token never echoes back
 
 
 async def test_validate_qbittorrent_ok(client: httpx.AsyncClient, app: FastAPI) -> None:

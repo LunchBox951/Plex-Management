@@ -24,7 +24,7 @@ __all__ = [
     "DiscoverResult",
     "DiscoverSearchResponse",
     "GrabRequest",
-    "MoviesRootValidateRequest",
+    "PlexLibraryOption",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -87,23 +87,37 @@ class TmdbValidateRequest(BaseModel):
     api_key: str
 
 
-class MoviesRootValidateRequest(BaseModel):
-    """Candidate Movies library folder to test (exists + writable)."""
+class PlexLibraryOption(BaseModel):
+    """One movie-library folder Plex reports, with whether the app can write to it.
+
+    ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
+    choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
+    section mismatch that breaks a targeted scan). ``writable`` is the app's own
+    check: a not-writable location is the split-mount signal — surfaced, not hidden.
+    """
 
     model_config = ConfigDict(frozen=True)
 
+    section_key: str
+    title: str
     path: str
+    writable: bool
 
 
 class ServiceValidateResponse(BaseModel):
     """Result of a connection check. ``message`` is operator-facing; ``detail``
-    is an optional diagnostic. Neither ever contains a secret value."""
+    is an optional diagnostic. Neither ever contains a secret value.
+
+    For Plex, ``libraries`` carries the movie library folders so the UI can offer a
+    pick-list for ``movies_root`` instead of a typed path. ``None`` for every other
+    service (and for a failed Plex check)."""
 
     model_config = ConfigDict(frozen=True)
 
     ok: bool
     message: str
     detail: str | None = None
+    libraries: list[PlexLibraryOption] | None = None
 
 
 # --------------------------------------------------------------------------- #

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useSettings, useUpdateSettings } from '../api/hooks'
+import { usePlexLibraries, useSettings, useUpdateSettings } from '../api/hooks'
 import type { SettingsResponse, SettingsUpdate } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { Button } from '../components/ui/Button'
@@ -51,10 +51,13 @@ const Heading = () => <h1 className="font-display text-2xl font-extrabold">Setti
 export function Settings() {
   const { data, isLoading, isError, error, refetch } = useSettings()
   const update = useUpdateSettings()
+  const libraries = usePlexLibraries() // movie folders Plex reports (409 if unconfigured)
   const { toast } = useToast()
 
   // Controlled state, seeded once the settings have loaded.
   const [form, setForm] = useState<FormState | null>(null)
+  // Reveal a typed override instead of the Plex pick-list.
+  const [manualPath, setManualPath] = useState(false)
   useEffect(() => {
     if (data && form === null) setForm(initialForm(data))
   }, [data, form])
@@ -185,8 +188,50 @@ export function Settings() {
 
         <section className="rounded-xl border border-hairline bg-surface p-5">
           <h2 className="font-display text-sm font-semibold text-ink">Library</h2>
-          <div className="mt-4 flex flex-col gap-4">
-            {textField('movies_root', 'Movies library folder', '/library/movies')}
+          <p className="mt-1 text-xs text-faint">Where imported movies are placed.</p>
+          <div className="mt-4 flex flex-col gap-2">
+            {!manualPath && libraries.data && libraries.data.length > 0 ? (
+              <>
+                <select
+                  aria-label="Movies library folder"
+                  className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                  value={form.movies_root}
+                  onChange={(e) => setField('movies_root', e.target.value)}
+                >
+                  <option value="">Choose a movie library folder…</option>
+                  {libraries.data.map((lib) => (
+                    <option
+                      key={`${lib.section_key}:${lib.path}`}
+                      value={lib.path}
+                      disabled={!lib.writable}
+                    >
+                      {lib.title} — {lib.path}
+                      {lib.writable ? '' : ' · not writable by the app'}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="self-start text-xs text-gold hover:underline"
+                  onClick={() => setManualPath(true)}
+                >
+                  Use a custom path instead
+                </button>
+              </>
+            ) : (
+              <>
+                {textField('movies_root', 'Movies library folder', '/library/movies')}
+                {libraries.data && libraries.data.length > 0 ? (
+                  <button
+                    type="button"
+                    className="self-start text-xs text-gold hover:underline"
+                    onClick={() => setManualPath(false)}
+                  >
+                    ← Pick from a Plex library instead
+                  </button>
+                ) : null}
+              </>
+            )}
           </div>
         </section>
       </div>

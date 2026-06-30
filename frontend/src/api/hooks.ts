@@ -12,6 +12,7 @@ import type {
   DiscoverHomeResponse,
   DiscoverSearchResponse,
   GrabRequest,
+  PlexLibraryOption,
   QualityProfileResponse,
   QueueItem,
   QueueResponse,
@@ -41,7 +42,7 @@ export function useSetupStatus() {
   })
 }
 
-export type SetupService = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb' | 'movies_root'
+export type SetupService = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb'
 
 export function useValidateService() {
   return useMutation({
@@ -50,12 +51,6 @@ export function useValidateService() {
       body: Record<string, string>
     }): Promise<ServiceValidateResponse> => {
       switch (args.service) {
-        case 'movies_root':
-          return unwrap(
-            await client.POST('/api/v1/setup/validate/movies_root', {
-              body: args.body as { path: string },
-            }),
-          )
         case 'plex':
           return unwrap(
             await client.POST('/api/v1/setup/validate/plex', {
@@ -113,6 +108,17 @@ export function useUpdateSettings() {
     onSuccess: (data) => {
       qc.setQueryData(queryKeys.settings, data)
     },
+  })
+}
+
+/** Movie library folders Plex reports, for the Settings movies_root picker. */
+export function usePlexLibraries(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.plexLibraries,
+    enabled,
+    retry: false, // a 409 (Plex unconfigured) is a normal state, not worth retrying
+    queryFn: async (): Promise<PlexLibraryOption[]> =>
+      unwrap(await client.GET('/api/v1/settings/plex-libraries')),
   })
 }
 

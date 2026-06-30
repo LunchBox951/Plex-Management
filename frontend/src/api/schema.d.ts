@@ -304,6 +304,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/settings/plex-libraries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Plex Libraries Endpoint
+         * @description Movie library folders Plex reports, for the Settings ``movies_root`` picker.
+         *
+         *     Uses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.
+         */
+        get: operations["plex_libraries_endpoint_api_v1_settings_plex_libraries_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/setup/complete": {
         parameters: {
             query?: never;
@@ -354,26 +376,6 @@ export interface paths {
         get: operations["status_api_v1_setup_status_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/setup/validate/movies_root": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Validate Movies Root Endpoint
-         * @description Test a candidate Movies library folder (a local path: exists + writable).
-         */
-        post: operations["validate_movies_root_endpoint_api_v1_setup_validate_movies_root_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -648,12 +650,23 @@ export interface components {
             detail?: components["schemas"]["ValidationError"][];
         };
         /**
-         * MoviesRootValidateRequest
-         * @description Candidate Movies library folder to test (exists + writable).
+         * PlexLibraryOption
+         * @description One movie-library folder Plex reports, with whether the app can write to it.
+         *
+         *     ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
+         *     choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
+         *     section mismatch that breaks a targeted scan). ``writable`` is the app's own
+         *     check: a not-writable location is the split-mount signal — surfaced, not hidden.
          */
-        MoviesRootValidateRequest: {
+        PlexLibraryOption: {
             /** Path */
             path: string;
+            /** Section Key */
+            section_key: string;
+            /** Title */
+            title: string;
+            /** Writable */
+            writable: boolean;
         };
         /**
          * PlexValidateRequest
@@ -840,10 +853,16 @@ export interface components {
          * ServiceValidateResponse
          * @description Result of a connection check. ``message`` is operator-facing; ``detail``
          *     is an optional diagnostic. Neither ever contains a secret value.
+         *
+         *     For Plex, ``libraries`` carries the movie library folders so the UI can offer a
+         *     pick-list for ``movies_root`` instead of a typed path. ``None`` for every other
+         *     service (and for a failed Plex check).
          */
         ServiceValidateResponse: {
             /** Detail */
             detail?: string | null;
+            /** Libraries */
+            libraries?: components["schemas"]["PlexLibraryOption"][] | null;
             /** Message */
             message: string;
             /** Ok */
@@ -1420,6 +1439,26 @@ export interface operations {
             };
         };
     };
+    plex_libraries_endpoint_api_v1_settings_plex_libraries_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLibraryOption"][];
+                };
+            };
+        };
+    };
     complete_api_v1_setup_complete_post: {
         parameters: {
             query?: never;
@@ -1469,39 +1508,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SetupStatusResponse"];
-                };
-            };
-        };
-    };
-    validate_movies_root_endpoint_api_v1_setup_validate_movies_root_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MoviesRootValidateRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ServiceValidateResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

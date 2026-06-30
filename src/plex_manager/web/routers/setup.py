@@ -34,7 +34,6 @@ from plex_manager.web.deps import (
     require_pre_init_or_api_key,
 )
 from plex_manager.web.schemas import (
-    MoviesRootValidateRequest,
     PlexValidateRequest,
     ProwlarrValidateRequest,
     QbittorrentValidateRequest,
@@ -44,7 +43,6 @@ from plex_manager.web.schemas import (
     TmdbValidateRequest,
 )
 from plex_manager.web.setup_validation import (
-    validate_movies_root,
     validate_plex,
     validate_prowlarr,
     validate_qbittorrent,
@@ -92,14 +90,6 @@ async def validate_tmdb_endpoint(
 ) -> ServiceValidateResponse:
     """Test a candidate TMDB api key."""
     return await validate_tmdb(client, body.api_key)
-
-
-@router.post("/validate/movies_root", dependencies=[Depends(require_pre_init_or_api_key)])
-async def validate_movies_root_endpoint(
-    body: MoviesRootValidateRequest,
-) -> ServiceValidateResponse:
-    """Test a candidate Movies library folder (a local path: exists + writable)."""
-    return validate_movies_root(body.path)
 
 
 @router.post("/complete")
