@@ -25,6 +25,7 @@ from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from tests.web.fakes import (
+    FakeLibrary,
     FakeProwlarr,
     FakeQbittorrent,
     FakeTmdb,
@@ -692,3 +693,17 @@ async def test_queue_requires_api_key(
     override_adapters(app, qbt=FakeQbittorrent())
     response = await client.get("/api/v1/queue")
     assert response.status_code == 401
+
+
+async def test_import_endpoint_requires_movies_root(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # The operator import-retry needs Plex + the Movies root configured. With the
+    # root unset it is an honest 409 service_not_configured, never a crash.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, qbt=FakeQbittorrent(), library=FakeLibrary())
+    response = await client.post("/api/v1/queue/1/import", headers=_HEADERS)
+    assert response.status_code == 409
+    body = response.json()
+    assert body["detail"] == "service_not_configured"
+    assert body["service"] == "movies_root"

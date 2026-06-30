@@ -10,11 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.release import ScoredRelease
 from plex_manager.ports.download_client import DownloadClientPort
+from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.services import grab_service, queue_service, request_service
+from plex_manager.services import grab_service, import_service, queue_service, request_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
@@ -23,6 +25,9 @@ from plex_manager.services.grab_service import (
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
+    get_filesystem,
+    get_library,
+    get_movies_root,
     get_parser,
     get_prowlarr,
     get_qbittorrent,
@@ -164,6 +169,37 @@ async def grab_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="grab_hash_unresolved"
         ) from exc
+    return _to_item(record)
+
+
+@router.post("/{download_id}/import")
+async def import_endpoint(
+    download_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
+    library: Annotated[LibraryPort, Depends(get_library)],
+    fs: Annotated[FileSystemPort, Depends(get_filesystem)],
+    parser: Annotated[ParserPort, Depends(get_parser)],
+    profile: Annotated[QualityProfile, Depends(get_quality_profile)],
+    movies_root: Annotated[str, Depends(get_movies_root)],
+) -> QueueItem:
+    """Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
+
+    Requires Plex + the Movies root configured (409 ``service_not_configured``
+    otherwise). The correction-without-a-terminal button for a blocked import.
+    """
+    record = await import_service.import_download(
+        download_id=download_id,
+        fs=fs,
+        library=library,
+        qbt=qbt,
+        parser=parser,
+        profile=profile,
+        session=session,
+        movies_root=movies_root,
+    )
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found")
     return _to_item(record)
 
 

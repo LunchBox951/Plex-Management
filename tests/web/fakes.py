@@ -10,6 +10,7 @@ faked.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import FastAPI
 
@@ -20,6 +21,7 @@ from plex_manager.ports.download_client import (
     DownloadStatus,
 )
 from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.library import LibraryPort, LibrarySection
 from plex_manager.ports.metadata import (
     MediaPage,
     MediaSearchResult,
@@ -27,9 +29,16 @@ from plex_manager.ports.metadata import (
     MovieMetadata,
     TvMetadata,
 )
-from plex_manager.web.deps import get_prowlarr, get_qbittorrent, get_tmdb
+from plex_manager.web.deps import (
+    get_library,
+    get_library_optional,
+    get_prowlarr,
+    get_qbittorrent,
+    get_tmdb,
+)
 
 __all__ = [
+    "FakeLibrary",
     "FakeProwlarr",
     "FakeQbittorrent",
     "FakeTmdb",
@@ -203,17 +212,51 @@ class FakeQbittorrent:
         return list(self.files.get(info_hash.lower(), []))
 
 
+class FakeLibrary:
+    """In-memory :class:`LibraryPort`: a set of in-library tmdb ids + scan recorder."""
+
+    def __init__(
+        self,
+        *,
+        available: set[int] | None = None,
+        sections: list[LibrarySection] | None = None,
+    ) -> None:
+        self.available_ids = available or set()
+        self.sections = sections or []
+        self.scanned: list[str] = []
+
+    async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
+        if media_type == "tv":
+            raise NotImplementedError("tv availability deferred to next beta")
+        return tmdb_id in self.available_ids
+
+    async def trigger_scan(self, path: str) -> None:
+        self.scanned.append(path)
+
+    async def list_sections(self) -> list[LibrarySection]:
+        return list(self.sections)
+
+
 def override_adapters(
     app: FastAPI,
     *,
     tmdb: MetadataPort | None = None,
     prowlarr: IndexerPort | None = None,
     qbt: DownloadClientPort | None = None,
+    library: LibraryPort | None = None,
 ) -> None:
-    """Point the adapter dependencies at the supplied fakes."""
+    """Point the adapter dependencies at the supplied fakes.
+
+    ``library`` overrides BOTH the required (``get_library``) and optional
+    (``get_library_optional``) Plex dependencies, so the request-dedupe and import
+    endpoints see the same fake.
+    """
     if tmdb is not None:
         app.dependency_overrides[get_tmdb] = lambda: tmdb
     if prowlarr is not None:
         app.dependency_overrides[get_prowlarr] = lambda: prowlarr
     if qbt is not None:
         app.dependency_overrides[get_qbittorrent] = lambda: qbt
+    if library is not None:
+        app.dependency_overrides[get_library] = lambda: library
+        app.dependency_overrides[get_library_optional] = lambda: library

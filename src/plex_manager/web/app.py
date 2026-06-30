@@ -7,6 +7,9 @@ stays unauthenticated and outside the setup guard.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -21,7 +24,17 @@ from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.db import get_sessionmaker
-from plex_manager.web.deps import ServiceNotConfiguredError, ensure_system_settings
+from plex_manager.services import import_service, queue_service
+from plex_manager.web.deps import (
+    ServiceNotConfiguredError,
+    ensure_system_settings,
+    get_filesystem,
+    get_library_optional,
+    get_movies_root_optional,
+    get_parser,
+    get_qbittorrent,
+    get_quality_profile,
+)
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
@@ -35,11 +48,59 @@ from plex_manager.web.spa import mount_spa
 
 router = APIRouter()
 
+_logger = logging.getLogger(__name__)
+
+# How often the background reconciler reconciles the client, drains imports, and
+# confirms availability. A constant for the beta (a configurable interval / a
+# dedicated worker are noted follow-ups).
+_RECONCILE_INTERVAL_SECONDS = 15.0
+
 
 @router.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe used by the container healthcheck and monitoring."""
     return {"status": "ok"}
+
+
+async def _reconcile_once(app: FastAPI) -> None:
+    """One reconcile + import + availability pass with a fresh session.
+
+    Best-effort: if the download client isn't configured yet, the cycle is a no-op;
+    import + availability only run when Plex and the Movies root are configured too.
+    The reconciler is the single owner of cross-system truth (overview §5,
+    north-star #5), so this — not a GET /queue poll — drives the loop, keeping the
+    queue read fast and never blocking a request on a multi-GB copy.
+    """
+    sessionmaker = app.state.sessionmaker
+    client = app.state.http_client
+    async with sessionmaker() as session:
+        try:
+            qbt = await get_qbittorrent(session, client)
+        except ServiceNotConfiguredError:
+            return
+        await queue_service.reconcile_and_list(qbt, session)
+        library = await get_library_optional(session, client)
+        movies_root = await get_movies_root_optional(session)
+        if library is not None and movies_root:
+            await import_service.run_import_cycle(
+                fs=get_filesystem(),
+                library=library,
+                qbt=qbt,
+                parser=get_parser(),
+                profile=get_quality_profile(),
+                session=session,
+                movies_root=movies_root,
+            )
+
+
+async def _reconcile_loop(app: FastAPI) -> None:
+    """Run :func:`_reconcile_once` forever; one bad cycle never kills the loop."""
+    while True:
+        try:
+            await _reconcile_once(app)
+        except Exception:
+            _logger.exception("reconcile loop iteration failed; continuing")
+        await asyncio.sleep(_RECONCILE_INTERVAL_SECONDS)
 
 
 async def _service_not_configured_handler(request: Request, exc: Exception) -> Response:
@@ -97,9 +158,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     prepare_encryption(initialized=initialized)
 
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
+    # The background reconciler closes the request -> grab -> import -> available
+    # loop without a GET /queue poll having to do the heavy work.
+    reconcile_task = asyncio.create_task(_reconcile_loop(app))
     try:
         yield
     finally:
+        reconcile_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reconcile_task
         await app.state.http_client.aclose()
 
 

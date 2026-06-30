@@ -8,7 +8,7 @@ import httpx
 from fastapi import FastAPI
 
 from plex_manager.ports.metadata import MovieMetadata
-from tests.web.fakes import FakeTmdb, override_adapters
+from tests.web.fakes import FakeLibrary, FakeTmdb, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
 
@@ -60,6 +60,34 @@ async def test_create_dedups_active_request(
 
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
     assert len(listed.json()["requests"]) == 1
+
+
+async def test_create_records_already_in_plex_as_available(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # A movie already in Plex is recorded directly as `available` (poster art
+    # persisted), short-circuiting search/grab — never a wasted request.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb(), library=FakeLibrary(available={603}))
+
+    created = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 603, "media_type": "movie"}, headers=_HEADERS
+    )
+    assert created.status_code == 201
+    assert created.json()["status"] == "available"
+
+
+async def test_create_proceeds_when_not_in_plex(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb(), library=FakeLibrary(available=set()))
+
+    created = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 603, "media_type": "movie"}, headers=_HEADERS
+    )
+    assert created.status_code == 201
+    assert created.json()["status"] == "pending"
 
 
 async def test_create_unknown_media_is_404(
