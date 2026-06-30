@@ -23,6 +23,7 @@ every cycle.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import DownloadRecord
 
-__all__ = ["import_download", "run_import_cycle"]
+__all__ = ["import_download", "run_availability_cycle", "run_import_cycle"]
 
 _logger = logging.getLogger(__name__)
 
@@ -117,9 +118,19 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> None:
     os.makedirs(dst.parent, exist_ok=True)
     if dst.exists():
         if dst.stat().st_size == os.path.getsize(src):
-            return
-        os.remove(dst)
+            return  # already fully imported here — idempotent skip
+        # A differently-sized file is already at the destination: a user's
+        # manually-managed library file, or a title Plex availability missed. NEVER
+        # blind-delete it (that is data loss) — surface it as an import conflict the
+        # operator resolves, instead of overwriting their file with the download.
+        raise FileExistsError(f"destination already exists with different content: {dst}")
     fs.hardlink_or_copy(Path(src), dst)
+
+
+def _remove_quietly(path: Path) -> None:
+    """Best-effort unlink (rolling back a placed file when a later step fails)."""
+    with contextlib.suppress(OSError):
+        path.unlink()
 
 
 async def _block(
@@ -253,6 +264,11 @@ async def import_download(
 
     try:
         await asyncio.to_thread(_place_file, fs, src, dst)
+    except FileExistsError as exc:
+        # A pre-existing, differently-sized file at the destination (a user's file,
+        # or a stale partial) — surfaced as a conflict, never overwritten.
+        await _block(session, download_repo, download_id, str(exc), request_id=request.id)
+        return await download_repo.get_by_hash(row.torrent_hash)
     except OSError as exc:
         await _block(
             session,
@@ -264,12 +280,14 @@ async def import_download(
         return await download_repo.get_by_hash(row.torrent_hash)
 
     # Targeted Plex scan of the movie folder — the partial scan the prototype never
-    # did. A scan failure (incl. a path no Plex movie section covers) is retryable
-    # (the file IS in the library), so block rather than assert availability the
-    # operator can't see.
+    # did. movies_root is a Plex library location (the picker guarantees the path↔
+    # section match), so a scan failure here is a transient Plex error, not a wrong
+    # path. Roll the just-placed file back before blocking so a later reject /
+    # re-search can't orphan it in the library (the retry re-places it).
     try:
         await library.trigger_scan(str(dst.parent))
     except (PlexLibraryError, PlexAuthError) as exc:
+        await asyncio.to_thread(_remove_quietly, dst)
         await _block(
             session,
             download_repo,
@@ -308,11 +326,12 @@ async def run_import_cycle(
     session: AsyncSession,
     movies_root: str,
 ) -> None:
-    """One pass of the import + availability phases (driven by the reconcile loop).
+    """Drain freshly-completed (and crash-stranded) imports. Needs the download
+    client + the Movies root. One item failing never aborts the cycle.
 
-    Phase 1: drain freshly-completed (and crash-stranded) imports. Phase 2: confirm
-    ``completed`` movies are indexed in Plex and promote them to ``available``. One
-    item failing never aborts the cycle (it is logged and retried next cycle).
+    The completed -> available promotion is a SEPARATE pass
+    (:func:`run_availability_cycle`) that needs only Plex, so it keeps working even
+    when the download client is down or the Movies root is unset.
     """
     download_repo = SqlDownloadRepository(session)
     for row in await download_repo.list_active():
@@ -332,6 +351,13 @@ async def run_import_cycle(
                 await session.rollback()
                 _logger.exception("import of download %s failed; will retry next cycle", row.id)
 
+
+async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession) -> None:
+    """Confirm ``completed`` ("Finalizing") movies are indexed in Plex and promote
+    them to ``available``. Depends ONLY on Plex — so an import that already triggered
+    a scan still reaches ``available`` even if the download client or Movies root is
+    unavailable afterward. One item failing never aborts the cycle.
+    """
     request_repo = SqlRequestRepository(session)
     for request in await request_repo.list_by_status(RequestStatus.completed.value):
         if request.media_type != "movie":

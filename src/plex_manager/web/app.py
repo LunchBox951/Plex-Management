@@ -74,23 +74,33 @@ async def _reconcile_once(app: FastAPI) -> None:
     sessionmaker = app.state.sessionmaker
     client = app.state.http_client
     async with sessionmaker() as session:
+        library = await get_library_optional(session, client)
+
+        # Download-client reconcile + import drain — needs qBittorrent (+ the Movies
+        # root for the drain). Skipped when qBittorrent isn't configured.
         try:
             qbt = await get_qbittorrent(session, client)
         except ServiceNotConfiguredError:
-            return
-        await queue_service.reconcile_and_list(qbt, session)
-        library = await get_library_optional(session, client)
-        movies_root = await get_movies_root_optional(session)
-        if library is not None and movies_root:
-            await import_service.run_import_cycle(
-                fs=get_filesystem(),
-                library=library,
-                qbt=qbt,
-                parser=get_parser(),
-                profile=get_quality_profile(),
-                session=session,
-                movies_root=movies_root,
-            )
+            qbt = None
+        if qbt is not None:
+            await queue_service.reconcile_and_list(qbt, session)
+            movies_root = await get_movies_root_optional(session)
+            if library is not None and movies_root:
+                await import_service.run_import_cycle(
+                    fs=get_filesystem(),
+                    library=library,
+                    qbt=qbt,
+                    parser=get_parser(),
+                    profile=get_quality_profile(),
+                    session=session,
+                    movies_root=movies_root,
+                )
+
+        # Availability promotion (completed -> available) needs ONLY Plex, so it runs
+        # even when qBittorrent is down or the Movies root was cleared after an
+        # import already triggered a scan — no request stuck in "Finalizing".
+        if library is not None:
+            await import_service.run_availability_cycle(library=library, session=session)
 
 
 async def _reconcile_loop(app: FastAPI) -> None:

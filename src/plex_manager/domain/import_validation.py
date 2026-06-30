@@ -72,7 +72,10 @@ _SAMPLE_EXTRAS = re.compile(
 # download whose feature file is one slice of a set cannot be imported as a single
 # movie, so it is surfaced rather than half-imported.
 _MULTI_PART = re.compile(
-    r"(?:^|[\s._\-])(?:cd|dvd|disc|disk|part|pt)[\s._\-]?\d{1,2}(?:$|[\s._\-])",
+    # Path separators (/ and \) ARE token boundaries: a split-disk release stores
+    # each part under a ``CD1/`` / ``Disc 1/`` directory, so the marker is bounded
+    # by a slash, not a space/dot/dash.
+    r"(?:^|[\s._\-/\\])(?:cd|dvd|disc|disk|part|pt)[\s._\-]?\d{1,2}(?:$|[\s._\-/\\])",
     re.IGNORECASE,
 )
 

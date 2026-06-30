@@ -22,7 +22,11 @@ from plex_manager.models import Blocklist, Download, MediaRequest, MediaType, Re
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import queue_service
-from plex_manager.services.import_service import import_download, run_import_cycle
+from plex_manager.services.import_service import (
+    import_download,
+    run_availability_cycle,
+    run_import_cycle,
+)
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -226,11 +230,48 @@ async def test_import_is_idempotent_on_an_already_imported_row(
     assert library.scanned == [str(movies_root / "The Matrix (1999)")]
 
 
-async def test_run_import_cycle_promotes_completed_to_available_when_in_plex(
+async def test_run_import_cycle_drains_pending_download_to_completed(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
+    # The drain phase imports every auto-drainable download (ImportPending here)
+    # and promotes its request to 'completed' ("Finalizing"). It needs the download
+    # client + the Movies root; availability is a separate pass.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        await run_import_cycle(
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=_qbt(video),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(movies_root),
+        )
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        assert download is not None and download.status == DownloadState.Imported.value
+        assert request is not None and request.status == RequestStatus.completed
+
+
+async def test_run_availability_cycle_promotes_completed_to_available_when_in_plex(
+    sessionmaker_: SessionMaker,
+) -> None:
     # A request already 'completed' (imported, scan triggered) is promoted to
-    # 'available' only once Plex confirms it is indexed (honest two-phase).
+    # 'available' only once Plex confirms it is indexed (honest two-phase). The
+    # availability phase depends ONLY on Plex, so it runs without qBittorrent or
+    # the Movies root.
     _download_id, request_id = await _seed(
         sessionmaker_,
         request_status=RequestStatus.completed,
@@ -239,15 +280,7 @@ async def test_run_import_cycle_promotes_completed_to_available_when_in_plex(
     library = FakeLibrary(available={_TMDB_ID})
 
     async with sessionmaker_() as session:
-        await run_import_cycle(
-            fs=LocalFileSystem(),
-            library=library,
-            qbt=FakeQbittorrent(),
-            parser=GuessitParser(),
-            profile=default_profile(),
-            session=session,
-            movies_root=str(tmp_path),
-        )
+        await run_availability_cycle(library=library, session=session)
 
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
@@ -256,8 +289,8 @@ async def test_run_import_cycle_promotes_completed_to_available_when_in_plex(
         assert request.library_verified_at is not None
 
 
-async def test_run_import_cycle_leaves_completed_when_not_yet_in_plex(
-    tmp_path: Path, sessionmaker_: SessionMaker
+async def test_run_availability_cycle_leaves_completed_when_not_yet_in_plex(
+    sessionmaker_: SessionMaker,
 ) -> None:
     _download_id, request_id = await _seed(
         sessionmaker_,
@@ -267,15 +300,7 @@ async def test_run_import_cycle_leaves_completed_when_not_yet_in_plex(
     library = FakeLibrary(available=set())  # Plex has not indexed it yet
 
     async with sessionmaker_() as session:
-        await run_import_cycle(
-            fs=LocalFileSystem(),
-            library=library,
-            qbt=FakeQbittorrent(),
-            parser=GuessitParser(),
-            profile=default_profile(),
-            session=session,
-            movies_root=str(tmp_path),
-        )
+        await run_availability_cycle(library=library, session=session)
 
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)

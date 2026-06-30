@@ -136,8 +136,20 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     return active ?? matches[matches.length - 1] ?? null
   }, [requestsQuery.data, title])
 
-  // A just-created request shows immediately even before the next poll lands.
+  // A just-created request shows immediately even before the next poll lands. Used
+  // for preview + queue correlation (a terminal request still owns its old download).
   const effectiveRequestId = requestId ?? liveRequest?.id ?? null
+
+  // Grabbing needs a NON-terminal request: the backend rejects a terminal request id
+  // in /queue/grab (request_not_active). A just-created request, or the live one
+  // while still active, qualifies; a failed/available/completed one does not — for
+  // those the user must "Request again" (create a fresh request) before grabbing.
+  const liveRequestGrabbable =
+    liveRequest != null &&
+    liveRequest.status !== 'available' &&
+    liveRequest.status !== 'failed' &&
+    liveRequest.status !== 'completed'
+  const grabRequestId = requestId ?? (liveRequestGrabbable ? liveRequest.id : null)
 
   // The matching download. Prefer the request linkage (collision-free); fall back
   // to tmdb_id only when no request is known yet.
@@ -198,12 +210,12 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
-      // Need a request, and never fire a second grab while one is in flight.
-      if (effectiveRequestId === null || grab.isPending) return
+      // Need a grabbable (non-terminal) request; never fire a second grab in flight.
+      if (grabRequestId === null || grab.isPending) return
       // Send only the GUID — it uniquely identifies the clicked row. info_hash can
       // be shared across indexers and the backend matches it BEFORE guid, so
       // including it could grab a different release that shares the hash.
-      const body: GrabRequest = { request_id: effectiveRequestId, guid: release.guid }
+      const body: GrabRequest = { request_id: grabRequestId, guid: release.guid }
       setGrabbingGuid(release.guid)
       try {
         await grab.mutateAsync(body)
@@ -218,7 +230,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         setGrabbingGuid(null)
       }
     },
-    [effectiveRequestId, grab, toast],
+    [grabRequestId, grab, toast],
   )
 
   // Blocklist the bad release and re-arm the request to search again. Mirrors the
@@ -257,8 +269,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   if (!title) return null
 
-  const canGrab = effectiveRequestId !== null
+  const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
+
+  // For a settled (failed/available) title, grabbing a release needs a FRESH request
+  // (the old id is terminal) — onRequest creates one, then previews.
+  const requestAgainButton = (
+    <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
+      Request again
+    </Button>
+  )
 
   // The report button only makes sense when there's a real download to act on.
   const canReport = queueItem !== null
@@ -400,8 +420,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
               <span className="text-sm text-error">{queueItem.failed_reason}</span>
             ) : null}
           </div>
+          {/* The prior request is terminal — "Request again" makes a fresh, grabbable
+              one (re-searching the dead id would show releases that all fail to grab). */}
           <div className="flex flex-wrap gap-2">
-            {reSearchButton}
+            {requestAgainButton}
             {reportButton}
           </div>
         </div>

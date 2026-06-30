@@ -113,8 +113,14 @@ class LocalFileSystem:
         """
         root_path = Path(root)
         if root_path.is_file():
-            if root_path.suffix.lower() in VIDEO_EXTENSIONS:
-                return os.fspath(root_path.resolve())
+            # Same containment as the walk below: a single-file content root that is
+            # a symlink escaping its own directory must not be followed and copied
+            # into the public library.
+            resolved = os.path.realpath(root_path)
+            if root_path.suffix.lower() in VIDEO_EXTENSIONS and _is_within(
+                os.path.realpath(root_path.parent), resolved
+            ):
+                return resolved
             return None
 
         # Containment anchor: a symlink (or nested mount) inside the download tree
