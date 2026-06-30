@@ -31,7 +31,7 @@ const authMiddleware: Middleware = {
     }
     return request
   },
-  onResponse({ response }) {
+  onResponse({ request, response }) {
     if (response.status === 409) {
       // Body shape: { detail: "setup_required", setup_path: "/setup" }. We only
       // need to know it happened; the route guard reads install state itself.
@@ -43,8 +43,13 @@ const authMiddleware: Middleware = {
         })
         .catch(() => undefined)
     } else if (response.status === 401) {
-      clearApiKey()
-      emit(AUTH_INVALID_EVENT)
+      // Only react if the key THIS request used is still the current one. A slow
+      // 401 from an earlier request that used a now-replaced key must not clobber
+      // a freshly pasted/valid key and undo recovery.
+      if (request.headers.get('X-Api-Key') === getApiKey()) {
+        clearApiKey()
+        emit(AUTH_INVALID_EVENT)
+      }
     }
     return response
   },

@@ -99,8 +99,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     async (release: AcceptedRelease) => {
       // Need a request, and never fire a second grab while one is in flight.
       if (requestId === null || grab.isPending) return
+      // Send only the GUID — it uniquely identifies the clicked row. info_hash can
+      // be shared across indexers and the backend matches it BEFORE guid, so
+      // including it could grab a different release that shares the hash.
       const body: GrabRequest = { request_id: requestId, guid: release.guid }
-      if (release.info_hash) body.info_hash = release.info_hash
       setGrabbingGuid(release.guid)
       try {
         await grab.mutateAsync(body)
