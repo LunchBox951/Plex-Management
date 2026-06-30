@@ -183,6 +183,26 @@ async def test_search_degrades_when_indexer_priorities_unavailable() -> None:
     assert results[0].indexer_priority == 25
 
 
+async def test_search_degrades_when_indexer_returns_200_html() -> None:
+    # A 200 with a non-JSON body (an auth / reverse-proxy HTML page) on
+    # /api/v1/indexer must NOT abort the search: response.json() would raise, but
+    # the priority join is best-effort, so it degrades to default priorities and
+    # the search still succeeds.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, text="<html><body>Login</body></html>")
+        return httpx.Response(200, json=SEARCH_RESULTS)
+
+    results = await _adapter(handler).search(
+        IndexerSearchRequest(media_type="movie", tmdb_id=27205)
+    )
+    assert len(results) == 2
+    # No priorities resolved -> every candidate carries the default; de-dup falls
+    # back to first-appearance-wins (Indexer B, listed first).
+    assert results[0].indexer_name == "Indexer B"
+    assert results[0].indexer_priority == 25
+
+
 async def test_search_builds_expected_query_params() -> None:
     captured: dict[str, list[tuple[str, str]]] = {}
 

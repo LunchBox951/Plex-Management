@@ -31,6 +31,7 @@ Behaviours carried over from the analysis extract:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -306,8 +307,20 @@ class ProwlarrIndexer:
                 response.status_code,
             )
             return {}
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            # A 200 with a non-JSON body (an auth/reverse-proxy HTML page) must NOT
+            # abort the search before it runs — the priority join is best-effort, so
+            # degrade to default priorities rather than turning a working
+            # /api/v1/search into a 500. The exception message carries no api key.
+            _logger.warning(
+                "Prowlarr /api/v1/indexer returned a non-JSON body; using default priorities: %s",
+                exc,
+            )
+            return {}
         mapping: dict[int, int] = {}
-        for raw in _as_sequence(response.json()):
+        for raw in _as_sequence(payload):
             row = _as_mapping(raw)
             indexer_id = _get_opt_int(row, "id")
             priority = _get_opt_int(row, "priority")

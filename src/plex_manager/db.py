@@ -63,7 +63,7 @@ def get_engine() -> AsyncEngine:
     """Return the process-wide async engine, creating it on first use."""
     global _engine
     if _engine is None:
-        _engine = create_async_engine(get_settings().database_url)
+        _engine = create_async_engine(async_database_url(get_settings().database_url))
         enable_sqlite_fk_enforcement(_engine)
     return _engine
 
@@ -97,3 +97,25 @@ def sync_database_url(async_url: str) -> str:
         if async_url.startswith(async_prefix):
             return sync_prefix + async_url[len(async_prefix) :]
     return async_url
+
+
+def async_database_url(url: str) -> str:
+    """Coerce a (possibly sync) SQLAlchemy URL to the async driver the app needs.
+
+    The reverse of :func:`sync_database_url`. :func:`get_engine` uses
+    ``create_async_engine``, which requires an async driver, but the shipped
+    ``.env.example`` documents a plain sync URL (``sqlite:///./data/...``). Without
+    this coercion a docs-following install would fail at startup with "the
+    asyncio extension requires an async driver". Mapping: ``sqlite://`` ->
+    ``sqlite+aiosqlite://``, ``postgresql://`` -> ``postgresql+asyncpg://``. A URL
+    that already names an async driver matches neither sync prefix and is returned
+    unchanged.
+    """
+    replacements = {
+        "sqlite://": "sqlite+aiosqlite://",
+        "postgresql://": "postgresql+asyncpg://",
+    }
+    for sync_prefix, async_prefix in replacements.items():
+        if url.startswith(sync_prefix):
+            return async_prefix + url[len(sync_prefix) :]
+    return url

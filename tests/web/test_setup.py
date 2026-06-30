@@ -59,3 +59,24 @@ async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> Non
     second = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
     assert second.status_code == 409
     assert second.json()["detail"] == "already_initialized"
+
+
+async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(
+    client: httpx.AsyncClient,
+) -> None:
+    # Concurrency contract: completion is claimed with a conditional UPDATE, so
+    # only the first /complete wins. The second must be rejected WITHOUT re-minting
+    # the key or re-writing creds — the original key must still authenticate, and
+    # the stored creds must be intact and singular.
+    first = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert first.status_code == 200
+    issued_key = first.json()["app_api_key"]
+
+    second = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert second.status_code == 409
+    assert "app_api_key" not in second.json()  # the loser discloses no key
+
+    # The original key was NOT rotated/overwritten by the rejected second call.
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.status_code == 200
+    assert settings.json()["plex_url"] == _COMPLETE_BODY["plex_url"]

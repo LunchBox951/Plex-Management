@@ -45,6 +45,22 @@ def test_ensure_secret_key_creates_file_with_owner_only_mode(file_backed_key: Pa
     assert (file_backed_key.stat().st_mode & 0o777) == 0o600
 
 
+def test_ensure_secret_key_does_not_overwrite_existing_key(file_backed_key: Path) -> None:
+    # First worker mints the key.
+    encryption.ensure_secret_key()
+    original = file_backed_key.read_bytes()
+    assert original
+    # A second ensure_secret_key with the file already present (e.g. a racing
+    # worker, or a fresh process) must RE-READ it, never truncate/overwrite — an
+    # overwritten key would orphan data the first worker already encrypted.
+    encryption.reset_fernet_cache()
+    second = encryption.ensure_secret_key()
+    assert file_backed_key.read_bytes() == original
+    # The reloaded key must decrypt ciphertext produced by the original key.
+    token = Fernet(original).encrypt(b"payload")
+    assert second.decrypt(token) == b"payload"
+
+
 def test_get_fernet_loads_an_existing_key(file_backed_key: Path) -> None:
     fernet = encryption.ensure_secret_key()
     token = fernet.encrypt(b"hello")

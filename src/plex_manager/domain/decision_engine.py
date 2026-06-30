@@ -3,11 +3,16 @@
 Mirrors Radarr's decision-engine specification pipeline, in a fixed order:
 
 1. **parse** each candidate title via the injected :class:`ParserPort`;
-2. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
+2. **media-identity gate** (injected ``media_match``) — a release that does not
+   name the wanted title (an indexer that ignored the id, a stale mapping) is a
+   *permanent* rejection and is never scored; this guards the north star "do NOT
+   grab the wrong media" and runs BEFORE quality so a high-quality wrong release
+   can never out-rank a correct one;
+3. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
    a *permanent* rejection and is never scored (north-star hard cutoff);
-3. **blocklist filter** — a previously failed/reported release is an
+4. **blocklist filter** — a previously failed/reported release is an
    unconditional skip;
-4. **score / sort** the survivors, best-first.
+5. **score / sort** the survivors, best-first.
 
 There is deliberately **no relaxed-fallback retry**: if nothing survives, the
 result carries ``no_acceptable_release=True`` as an observable state. The engine
@@ -37,11 +42,16 @@ from plex_manager.domain.release import CandidateRelease, ParsedRelease, ScoredR
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
-__all__ = ["BlocklistCheck", "DecisionResult", "decide"]
+__all__ = ["BlocklistCheck", "DecisionResult", "MediaMatchCheck", "decide"]
 
 # Returns True when the (candidate, parsed) pair is blocklisted. The caller wires
 # this to a BlocklistRepository-backed check; the engine stays pure.
 BlocklistCheck = Callable[[CandidateRelease, ParsedRelease], bool]
+
+# Returns True when the (candidate, parsed) pair actually names the wanted media.
+# The caller builds this from the request's expected (title, year, tmdb id) via
+# the pure ``matches_media`` helper; the engine stays pure and only sees the hook.
+MediaMatchCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 
 # Weighting so the composite score reproduces the comparator ordering: profile
 # index dominates seeders, which dominates size. The gaps are far larger than any
@@ -78,14 +88,22 @@ def decide(
     candidates: list[CandidateRelease],
     parser: ParserPort,
     profile: QualityProfile,
+    media_match: MediaMatchCheck,
     is_blocklisted: BlocklistCheck,
 ) -> DecisionResult:
-    """Run the parse -> gate -> filter -> rank pipeline over ``candidates``."""
+    """Run the parse -> match -> gate -> filter -> rank pipeline over ``candidates``."""
     accepted: list[ScoredRelease] = []
     rejected: list[tuple[CandidateRelease, RejectionReason]] = []
 
     for candidate in candidates:
         parsed = parser.parse(candidate.title)
+
+        # Media-identity gate FIRST: a release for a different movie/show is never
+        # scored, so a high-quality wrong release can't out-rank a correct one.
+        if not media_match(candidate, parsed):
+            rejected.append((candidate, RejectionReason.WRONG_MEDIA))
+            continue
+
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
 
         verdict = check_quality(quality, profile)

@@ -33,6 +33,7 @@ class RejectionReason(StrEnum):
     FORMAT_SCORE_TOO_LOW = "format_score_too_low"
     NO_QUALITY_DETECTED = "no_quality_detected"
     BLOCKLISTED = "blocklisted"
+    WRONG_MEDIA = "wrong_media"
 
 
 @dataclass(frozen=True)

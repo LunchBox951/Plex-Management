@@ -308,14 +308,24 @@ class QbittorrentClient:
             # a retryable error rather than an opaque 500. No url/secret in the message.
             raise QbittorrentError("qBittorrent request failed") from exc
         text = response.text.strip()
-        if response.status_code in (_HTTP_OK, _HTTP_NO_CONTENT) and text != "Fails.":
+        status = response.status_code
+        if status in (_HTTP_OK, _HTTP_NO_CONTENT) and text != "Fails.":
             self._logged_in = True
             _logger.info("authenticated with qBittorrent")
             return
-        raise QbittorrentAuthError(
-            f"qBittorrent rejected the login (HTTP {response.status_code}): "
-            f"check the username and password"
-        )
+        # Genuine auth rejection: a 200 "Fails." body (bad credentials) or a 403
+        # (IP banned after repeated failures). Only these route the operator to the
+        # credential-reset correction path.
+        if status == _HTTP_FORBIDDEN or (
+            status in (_HTTP_OK, _HTTP_NO_CONTENT) and text == "Fails."
+        ):
+            raise QbittorrentAuthError(
+                f"qBittorrent rejected the login (HTTP {status}): check the username and password"
+            )
+        # Any other non-2xx (5xx / 404 — the WebUI or a reverse proxy in front of
+        # it is down) is a retryable OUTAGE, not an auth failure: surface it as a
+        # QbittorrentError so the operator isn't wrongly told to reset credentials.
+        raise QbittorrentError(f"qBittorrent login failed (HTTP {status})")
 
     async def _request(
         self,

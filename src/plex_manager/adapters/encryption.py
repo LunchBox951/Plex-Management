@@ -83,14 +83,24 @@ def _missing_key_error(key_path: Path) -> RuntimeError:
 
 
 def _generate_key_file(key_path: Path) -> bytes:
-    """Mint a fresh key and persist it with owner-only permissions.
+    """Atomically mint the first-run key, or re-read an existing one on a lost race.
 
-    Using ``os.open`` with an explicit mode avoids a window where the file is
-    world-readable.
+    ``os.open`` with ``O_CREAT | O_EXCL | O_WRONLY`` (mode ``0o600``) is the race
+    guard: two workers starting on a fresh install can both observe the file as
+    absent, but only ONE wins the exclusive create. The loser catches
+    ``FileExistsError`` and re-reads the winner's key rather than truncating it —
+    truncating would orphan the winner's already-cached key and render any data it
+    encrypted permanently undecryptable. An existing key is therefore NEVER
+    overwritten. ``O_EXCL`` also closes the window where the file is world-readable
+    (the mode is applied at create time).
     """
     key = Fernet.generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Lost the create race: another worker already wrote the canonical key.
+        return key_path.read_bytes()
     with os.fdopen(fd, "wb") as handle:
         handle.write(key)
     logger.info("generated new encryption key at %s", key_path)

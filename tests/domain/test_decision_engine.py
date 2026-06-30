@@ -64,6 +64,11 @@ def _never_blocklisted(_candidate: CandidateRelease, _parsed: ParsedRelease) -> 
     return False
 
 
+def _always_media(_candidate: CandidateRelease, _parsed: ParsedRelease) -> bool:
+    """Media-identity gate that accepts everything (isolates the other gates)."""
+    return True
+
+
 def test_ranks_accepted_best_first_and_rejects_prerelease() -> None:
     candidates = [
         _candidate("Movie.2024.720p.WEB-DL.x264-GRP"),
@@ -72,7 +77,7 @@ def test_ranks_accepted_best_first_and_rejects_prerelease() -> None:
         _candidate("Movie.2024.1080p.WEB-DL.x264-A"),
         _candidate("Movie.2024.HQCAM.x264-GRP"),
     ]
-    result = decide(candidates, FakeParser(), default_profile(), _never_blocklisted)
+    result = decide(candidates, FakeParser(), default_profile(), _always_media, _never_blocklisted)
 
     assert result.no_acceptable_release is False
     accepted_qualities = [scored.quality for scored in result.accepted]
@@ -89,7 +94,7 @@ def test_ranks_accepted_best_first_and_rejects_prerelease() -> None:
 def test_seeders_break_ties_within_same_quality() -> None:
     high = _candidate("Movie.2024.1080p.WEB-DL.x264-A", seeders=500)
     low = _candidate("Movie.2024.1080p.WEB-DL.x264-B", seeders=5)
-    result = decide([low, high], FakeParser(), default_profile(), _never_blocklisted)
+    result = decide([low, high], FakeParser(), default_profile(), _always_media, _never_blocklisted)
 
     assert [s.candidate.title for s in result.accepted] == [
         "Movie.2024.1080p.WEB-DL.x264-A",
@@ -100,7 +105,9 @@ def test_seeders_break_ties_within_same_quality() -> None:
 def test_size_breaks_ties_when_quality_and_seeders_equal() -> None:
     big = _candidate("Movie.2024.1080p.WEB-DL.x264-A", seeders=10, size_bytes=8_000_000_000)
     small = _candidate("Movie.2024.1080p.WEB-DL.x264-B", seeders=10, size_bytes=2_000_000_000)
-    result = decide([small, big], FakeParser(), default_profile(), _never_blocklisted)
+    result = decide(
+        [small, big], FakeParser(), default_profile(), _always_media, _never_blocklisted
+    )
 
     assert result.accepted[0].candidate is big
 
@@ -111,7 +118,9 @@ def test_webdl_outranks_equal_webrip_at_same_resolution() -> None:
     # only the profile order decides — WEBDL-1080p must win.
     webdl = _candidate("Movie.2024.1080p.WEB-DL.x264-A", seeders=10, size_bytes=1_000_000_000)
     webrip = _candidate("Movie.2024.1080p.WEBRip.x264-GRP", seeders=10, size_bytes=1_000_000_000)
-    result = decide([webrip, webdl], FakeParser(), default_profile(), _never_blocklisted)
+    result = decide(
+        [webrip, webdl], FakeParser(), default_profile(), _always_media, _never_blocklisted
+    )
 
     assert result.no_acceptable_release is False
     assert [s.quality for s in result.accepted] == [WEBDL1080P, WEBRIP1080P]
@@ -123,7 +132,7 @@ def test_no_acceptable_release_when_all_candidates_are_prerelease() -> None:
         _candidate("Movie.2024.TELESYNC.x264-GRP"),
         _candidate("Movie.2024.HQCAM.x264-GRP"),
     ]
-    result = decide(candidates, FakeParser(), default_profile(), _never_blocklisted)
+    result = decide(candidates, FakeParser(), default_profile(), _always_media, _never_blocklisted)
 
     assert result.accepted == []
     assert result.no_acceptable_release is True
@@ -144,14 +153,34 @@ def test_blocklisted_candidate_is_filtered_after_quality_gate() -> None:
 
     blocked = _candidate("Movie.2024.1080p.BluRay.x264-GRP", info_hash=bad_hash)
     clean = _candidate("Movie.2024.1080p.WEB-DL.x264-A")
-    result = decide([blocked, clean], FakeParser(), default_profile(), _blocklist_check)
+    result = decide(
+        [blocked, clean], FakeParser(), default_profile(), _always_media, _blocklist_check
+    )
 
     assert [s.candidate.title for s in result.accepted] == ["Movie.2024.1080p.WEB-DL.x264-A"]
     assert (blocked, RejectionReason.BLOCKLISTED) in result.rejected
 
 
 def test_empty_candidate_set_surfaces_no_acceptable_release() -> None:
-    result = decide([], FakeParser(), default_profile(), _never_blocklisted)
+    result = decide([], FakeParser(), default_profile(), _always_media, _never_blocklisted)
     assert result.accepted == []
     assert result.no_acceptable_release is True
     assert result.rejected == []
+
+
+def test_wrong_media_is_rejected_before_quality_even_if_top_quality() -> None:
+    # A pristine BluRay-1080p release that the media-identity gate rejects (it
+    # names a different movie) must be discarded WRONG_MEDIA and never scored —
+    # its high quality must not let it out-rank the correct, lower-quality grab.
+    wrong = _candidate("Movie.2024.1080p.BluRay.x264-GRP")
+    right = _candidate("Movie.2024.720p.WEB-DL.x264-GRP")
+
+    def _reject_the_bluray(candidate: CandidateRelease, _parsed: ParsedRelease) -> bool:
+        return candidate is not wrong
+
+    result = decide(
+        [wrong, right], FakeParser(), default_profile(), _reject_the_bluray, _never_blocklisted
+    )
+
+    assert [s.candidate.title for s in result.accepted] == ["Movie.2024.720p.WEB-DL.x264-GRP"]
+    assert (wrong, RejectionReason.WRONG_MEDIA) in result.rejected

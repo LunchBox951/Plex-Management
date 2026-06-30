@@ -124,6 +124,33 @@ async def test_login_failure_raises_auth_error() -> None:
         await _client(handler).get_all_statuses()
 
 
+async def test_login_5xx_raises_outage_error_not_auth_error() -> None:
+    # A 5xx on /auth/login means the WebUI (or a reverse proxy) is down, NOT that
+    # the credentials are wrong: it must surface as a retryable QbittorrentError so
+    # the operator isn't wrongly sent to reset credentials. QbittorrentAuthError is
+    # a QbittorrentError subclass, so assert it is specifically NOT the auth type.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(502, text="Bad Gateway")
+        return httpx.Response(200, json=[])
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).get_all_statuses()
+    assert not isinstance(exc_info.value, QbittorrentAuthError)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_login_200_fails_body_raises_auth_error() -> None:
+    # The canonical bad-credentials signal: HTTP 200 with body "Fails.".
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Fails.")
+        return httpx.Response(200, json=[])
+
+    with pytest.raises(QbittorrentAuthError):
+        await _client(handler).get_all_statuses()
+
+
 async def test_auth_error_excludes_password() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="Fails.")

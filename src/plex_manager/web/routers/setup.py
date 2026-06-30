@@ -15,14 +15,16 @@ from __future__ import annotations
 
 import secrets
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import CursorResult, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
 
 from plex_manager.db import get_session
+from plex_manager.models import SystemSettings
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
     SettingsStore,
@@ -97,14 +99,43 @@ async def complete(
 ) -> SetupStatusResponse:
     """Persist the validated creds, mint the app api key, mark initialized.
 
-    One-shot: rejected with 409 once initialized. Re-running setup post-init would
-    let an unauthenticated caller overwrite every stored credential (repoint
-    qB/Prowlarr/Plex/TMDB at attacker infrastructure) and re-disclose the app key,
-    so post-init changes must go through the authenticated ``PUT /settings``.
+    One-shot AND concurrency-safe: rejected with 409 once initialized. Two
+    concurrent ``/complete`` calls can both pass an in-memory ``initialized`` check
+    and double-write (a ``settings.key`` unique-constraint 500, or one overwriting
+    the other's just-issued ``app_api_key``). To prevent that, initialization is
+    claimed with a CONDITIONAL update (``... WHERE id = 1 AND initialized = false``):
+    exactly one request flips the row, and the loser sees ``rowcount == 0`` and is
+    rejected 409 — so only the winner mints the key and writes the creds. Re-running
+    setup post-init would also let an unauthenticated caller overwrite every stored
+    credential and re-disclose the app key, so post-init changes must go through the
+    authenticated ``PUT /settings``.
     """
-    system = await ensure_system_settings(session)
-    if system.initialized:
+    # Ensure the singleton row (id=1) exists so the conditional update has a target.
+    await ensure_system_settings(session)
+
+    app_api_key = secrets.token_urlsafe(_API_KEY_BYTES)
+    now = datetime.now(UTC)
+    # Atomically claim initialization. Only the still-uninitialized row matches, so
+    # a concurrent second caller updates 0 rows and is rejected below — the claim is
+    # the single serialization point that guarantees one key and one set of creds.
+    claim = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            update(SystemSettings)
+            .where(SystemSettings.id == 1, SystemSettings.initialized.is_(False))
+            .values(
+                initialized=True,
+                app_api_key=app_api_key,
+                setup_started_at=now,
+                setup_completed_at=now,
+            )
+        ),
+    )
+    if claim.rowcount == 0:
+        await session.rollback()
         raise HTTPException(status_code=HTTP_409_CONFLICT, detail="already_initialized")
+
+    # We won the claim — persist the validated creds in the same transaction.
     store = SettingsStore(session)
     values: dict[str, str] = {
         "plex_url": body.plex_url,
@@ -119,14 +150,8 @@ async def complete(
     for key in KNOWN_SETTING_KEYS:
         await store.set(key, values[key])
 
-    if not system.app_api_key:
-        system.app_api_key = secrets.token_urlsafe(_API_KEY_BYTES)
-    if system.setup_started_at is None:
-        system.setup_started_at = datetime.now(UTC)
-    system.initialized = True
-    system.setup_completed_at = datetime.now(UTC)
     await session.commit()
-    return SetupStatusResponse(initialized=True, app_api_key=system.app_api_key)
+    return SetupStatusResponse(initialized=True, app_api_key=app_api_key)
 
 
 @router.get("/status")
