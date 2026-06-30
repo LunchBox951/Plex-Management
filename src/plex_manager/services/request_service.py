@@ -9,16 +9,19 @@ request is *returned*, not silently re-created, so a double-submit is idempotent
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final
+import logging
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.repositories import RequestRecord
 
@@ -28,8 +31,12 @@ __all__ = [
     "create_request",
     "get_request",
     "list_requests",
+    "mark_available",
+    "mark_completed",
     "mark_no_acceptable_release",
 ]
+
+_logger = logging.getLogger(__name__)
 
 # Request statuses (string values) at which a request is FINISHED. A terminal
 # request must never be re-armed to a non-terminal status: a newer ACTIVE request
@@ -54,21 +61,48 @@ class MediaNotFoundError(Exception):
         super().__init__(f"{media_type} tmdb_id={tmdb_id} not found")
 
 
-async def _resolve_detail(
-    tmdb: MetadataPort,
-    tmdb_id: int,
-    media_type: str,
-) -> tuple[str, int | None, bool]:
-    """Return ``(title, year, is_anime)`` for the media, or raise if unresolved."""
+class _Detail(NamedTuple):
+    """Resolved TMDB detail needed to persist a request (incl. art for rows)."""
+
+    title: str
+    year: int | None
+    is_anime: bool
+    poster_url: str | None
+    backdrop_url: str | None
+
+
+async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> _Detail:
+    """Return the request detail (title/year/anime + art), or raise if unresolved."""
     if media_type == "movie":
         movie = await tmdb.get_movie(tmdb_id)
         if movie is None:
             raise MediaNotFoundError(tmdb_id, media_type)
-        return movie.title, movie.year, movie.is_anime
+        return _Detail(
+            movie.title, movie.year, movie.is_anime, movie.poster_url, movie.backdrop_url
+        )
     tv = await tmdb.get_tv_show(tmdb_id)
     if tv is None:
         raise MediaNotFoundError(tmdb_id, media_type)
-    return tv.title, tv.year, tv.is_anime
+    return _Detail(tv.title, tv.year, tv.is_anime, tv.poster_url, tv.backdrop_url)
+
+
+async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
+    """Best-effort Plex availability check; an error is an explicit, logged 'no'.
+
+    Honesty over silence (and never strand the request): a transient Plex outage or
+    the deferred-TV ``NotImplementedError`` must not block a request. The failure is
+    logged and treated as "can't prove it's a dup", so the request proceeds normally
+    — an explicit decision, not a swallowed ``False`` (the prototype's bug).
+    """
+    try:
+        return await library.is_available(tmdb_id, "movie")
+    except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
+        _logger.warning(
+            "plex availability check failed for tmdb %s (%s); proceeding with a request",
+            tmdb_id,
+            type(exc).__name__,
+        )
+        return False
 
 
 async def create_request(
@@ -78,30 +112,50 @@ async def create_request(
     tmdb_id: int,
     media_type: str,
     user_id: int | None = None,
+    library: LibraryPort | None = None,
 ) -> RequestRecord:
     """Create (or return the existing active) media request for this media.
 
     Dedups on the ``(tmdb_id, media_type)`` composite via
     :meth:`RequestRepository.find_active`: a non-terminal request for the same
-    media is returned unchanged. Otherwise the TMDB detail is resolved and a new
-    ``pending`` request is persisted.
+    media is returned unchanged. Otherwise the TMDB detail (incl. art) is resolved
+    and a new ``pending`` request is persisted.
+
+    When ``library`` is supplied and the movie is **already in Plex**, the request
+    is recorded directly as ``available`` (and ``library_verified_at`` stamped),
+    short-circuiting the search/grab — a visible "already in your library" record,
+    not a wasted grab. An unconfigured/unreachable Plex skips the check (see
+    :func:`_already_in_library`).
     """
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:
         return existing
 
-    title, year, is_anime = await _resolve_detail(tmdb, tmdb_id, media_type)
+    detail = await _resolve_detail(tmdb, tmdb_id, media_type)
+
+    initial_status = RequestStatus.pending.value
+    if (
+        library is not None
+        and media_type == "movie"
+        and await _already_in_library(library, tmdb_id)
+    ):
+        initial_status = RequestStatus.available.value
     try:
         record = await repo.create(
             tmdb_id=tmdb_id,
             media_type=media_type,
-            title=title,
-            status=RequestStatus.pending.value,
-            year=year,
-            is_anime=is_anime,
+            title=detail.title,
+            status=initial_status,
+            year=detail.year,
+            is_anime=detail.is_anime,
             user_id=user_id,
+            poster_url=detail.poster_url,
+            backdrop_url=detail.backdrop_url,
         )
+        if initial_status == RequestStatus.available.value:
+            # It IS in Plex — stamp library_verified_at so the record is honest.
+            await repo.mark_available(record.id)
         await session.commit()
     except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
@@ -149,4 +203,21 @@ async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> 
     if current is not None and current.status in TERMINAL_REQUEST_STATUS_VALUES:
         return
     await repo.set_status(request_id, RequestStatus.no_acceptable_release.value)
+    await session.commit()
+
+
+async def mark_completed(session: AsyncSession, request_id: int) -> None:
+    """Phase 1 of honest availability: imported + Plex scan triggered ("Finalizing").
+
+    The file is in the library folder and a scan was triggered, but Plex has not yet
+    confirmed it is indexed — so this is ``completed``, not ``available``. The
+    reconcile loop later confirms via ``is_available`` and promotes it (phase 2).
+    """
+    await SqlRequestRepository(session).mark_completed(request_id)
+    await session.commit()
+
+
+async def mark_available(session: AsyncSession, request_id: int) -> None:
+    """Phase 2 of honest availability: Plex has confirmed the title is in the library."""
+    await SqlRequestRepository(session).mark_available(request_id)
     await session.commit()

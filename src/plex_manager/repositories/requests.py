@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -32,6 +33,8 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         year=row.year,
         is_anime=bool(row.is_anime),
         user_id=row.user_id,
+        poster_url=row.poster_url,
+        backdrop_url=row.backdrop_url,
     )
 
 
@@ -77,6 +80,8 @@ class SqlRequestRepository:
         year: int | None = None,
         is_anime: bool = False,
         user_id: int | None = None,
+        poster_url: str | None = None,
+        backdrop_url: str | None = None,
     ) -> RequestRecord:
         row = MediaRequest(
             tmdb_id=tmdb_id,
@@ -86,6 +91,8 @@ class SqlRequestRepository:
             year=year,
             is_anime=is_anime,
             user_id=user_id,
+            poster_url=poster_url,
+            backdrop_url=backdrop_url,
         )
         self._session.add(row)
         await self._session.flush()
@@ -97,4 +104,25 @@ class SqlRequestRepository:
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.status = RequestStatus(status)
+        await self._session.flush()
+
+    async def mark_completed(self, request_id: int) -> None:
+        """Set ``completed`` + stamp ``completed_at`` (imported, scan triggered)."""
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.status = RequestStatus.completed
+        row.completed_at = datetime.now(UTC)
+        await self._session.flush()
+
+    async def mark_available(self, request_id: int) -> None:
+        """Set ``available`` + stamp ``library_verified_at`` (Plex-confirmed)."""
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        now = datetime.now(UTC)
+        row.status = RequestStatus.available
+        row.library_verified_at = now
+        if row.completed_at is None:
+            row.completed_at = now
         await self._session.flush()

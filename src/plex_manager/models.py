@@ -234,6 +234,10 @@ class MediaRequest(Base):
     year: Mapped[int | None] = mapped_column()
     status: Mapped[RequestStatus] = mapped_column(_enum(RequestStatus), index=True)
     is_anime: Mapped[bool | None] = mapped_column()
+    # TMDB art persisted at request time so Requests / Queue rows can render a
+    # poster (and the detail backdrop) without a per-row TMDB re-fetch.
+    poster_url: Mapped[str | None] = mapped_column(String)
+    backdrop_url: Mapped[str | None] = mapped_column(String)
     requested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
