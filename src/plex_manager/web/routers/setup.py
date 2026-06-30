@@ -119,7 +119,7 @@ async def complete(
     # a concurrent second caller updates 0 rows and is rejected below — the claim is
     # the single serialization point that guarantees one key and one set of creds.
     claim = cast(
-        "CursorResult[Any]",
+        CursorResult[Any],
         await session.execute(
             update(SystemSettings)
             .where(SystemSettings.id == 1, SystemSettings.initialized.is_(False))
