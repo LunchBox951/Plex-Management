@@ -200,6 +200,8 @@ class SqlDownloadRepository:
             .execution_options(synchronize_session="fetch")
         )
         # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
-        # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it).
-        result = cast("CursorResult[Any]", await self._session.execute(stmt))
+        # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it). The
+        # cast target is referenced at runtime (not a string) so CodeQL does not read
+        # ``CursorResult``/``Any`` as unused imports.
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
         return result.rowcount == 1
