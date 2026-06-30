@@ -18,6 +18,9 @@ __all__ = [
     "BlocklistEntry",
     "BlocklistResponse",
     "CreateRequestBody",
+    "DiscoverHomeResponse",
+    "DiscoverHomeRow",
+    "DiscoverListResponse",
     "DiscoverResult",
     "DiscoverSearchResponse",
     "GrabRequest",
@@ -197,6 +200,41 @@ class DiscoverSearchResponse(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    results: list[DiscoverResult]
+
+
+class DiscoverHomeRow(BaseModel):
+    """One server-composed Discover row: a title + its items.
+
+    ``row_type`` is an OPEN string (e.g. ``trending`` / ``popular`` / ``upcoming``)
+    so the frontend renders rows generically and stays dumb about WHY a row exists
+    — TV and recommendation rows slot in later with no contract change.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    row_type: str
+    title: str
+    items: list[DiscoverResult]
+
+
+class DiscoverHomeResponse(BaseModel):
+    """The composed Discover home: an optional spotlight + ordered rows."""
+
+    model_config = ConfigDict(frozen=True)
+
+    spotlight: DiscoverResult | None = None
+    rows: list[DiscoverHomeRow]
+
+
+class DiscoverListResponse(BaseModel):
+    """A paginated category listing (trending / popular / upcoming)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    page: int
+    total_pages: int
+    total_results: int
     results: list[DiscoverResult]
 
 
