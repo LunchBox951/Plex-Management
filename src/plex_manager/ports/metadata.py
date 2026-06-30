@@ -70,12 +70,10 @@ class MetadataPort(Protocol):
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         """Search by free text, optionally constrained to ``year``."""
-        ...
+        raise NotImplementedError
 
     async def get_movie(self, tmdb_id: int) -> MovieMetadata | None:
         """Resolve a movie by tmdb id, or ``None`` if not found."""
-        ...
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
         """Resolve a TV show by tmdb id, or ``None`` if not found."""
-        ...

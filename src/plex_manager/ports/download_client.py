@@ -52,32 +52,26 @@ class DownloadClientPort(Protocol):
 
         A 409 (already present) resolves to the existing hash, never an error.
         """
-        ...
+        raise NotImplementedError
 
     async def get_status(self, info_hash: str) -> DownloadStatus | None:
         """Return the status for ``info_hash``, or ``None`` if absent."""
-        ...
 
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         """Return statuses for all torrents, optionally filtered by category."""
-        ...
+        raise NotImplementedError
 
     async def pause(self, info_hash: str) -> None:
         """Pause the torrent identified by ``info_hash``."""
-        ...
 
     async def resume(self, info_hash: str) -> None:
         """Resume the torrent identified by ``info_hash``."""
-        ...
 
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
         """Remove the torrent, deleting its files when ``delete_files`` is set."""
-        ...
 
     async def set_category(self, info_hash: str, category: str) -> None:
         """Set the torrent's category (used to mark imported items)."""
-        ...
 
     async def get_save_path(self, info_hash: str) -> str | None:
         """Return the torrent's current save path, re-read from the client."""
-        ...

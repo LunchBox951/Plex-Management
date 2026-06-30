@@ -20,4 +20,4 @@ class ParserPort(Protocol):
 
     def parse(self, release_name: str) -> ParsedRelease:
         """Parse ``release_name`` into a :class:`ParsedRelease` (never raises)."""
-        ...
+        raise NotImplementedError

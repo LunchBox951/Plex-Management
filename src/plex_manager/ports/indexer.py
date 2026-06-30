@@ -24,4 +24,4 @@ class IndexerPort(Protocol):
         Implementations surface rate-limit / transport failures as raised
         errors (never an empty list masquerading as "no results").
         """
-        ...
+        raise NotImplementedError

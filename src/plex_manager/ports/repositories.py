@@ -83,15 +83,13 @@ class RequestRepository(Protocol):
 
     async def get(self, request_id: int) -> RequestRecord | None:
         """Return the request by id, or ``None``."""
-        ...
 
     async def list_by_status(self, status: str | None = None) -> list[RequestRecord]:
         """List requests, optionally filtered by ``status``."""
-        ...
+        raise NotImplementedError
 
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return an existing non-terminal request for this media, for dedup."""
-        ...
 
     async def create(
         self,
@@ -105,11 +103,10 @@ class RequestRepository(Protocol):
         user_id: int | None = None,
     ) -> RequestRecord:
         """Insert a new request and return the persisted record."""
-        ...
+        raise NotImplementedError
 
     async def set_status(self, request_id: int, status: str) -> None:
         """Update a request's status."""
-        ...
 
 
 @runtime_checkable
@@ -118,11 +115,10 @@ class DownloadRepository(Protocol):
 
     async def get_by_hash(self, torrent_hash: str) -> DownloadRecord | None:
         """Return the download for ``torrent_hash``, or ``None``."""
-        ...
 
     async def list_active(self) -> list[DownloadRecord]:
         """List downloads in a non-terminal state (for the reconcile loop)."""
-        ...
+        raise NotImplementedError
 
     async def create(
         self,
@@ -136,7 +132,7 @@ class DownloadRepository(Protocol):
         season: int | None = None,
     ) -> DownloadRecord:
         """Insert a new download and return the persisted record."""
-        ...
+        raise NotImplementedError
 
     async def update_status(
         self,
@@ -155,7 +151,6 @@ class DownloadRepository(Protocol):
         ``now`` when persisting a ``StateTransition`` whose ``set_first_seen_at``
         flag is set, so the reconciler's grace window can actually start.
         """
-        ...
 
 
 @runtime_checkable
@@ -170,11 +165,11 @@ class BlocklistRepository(Protocol):
         indexer: str | None,
     ) -> bool:
         """Two-tier identity check: hash first, then title/indexer fallback."""
-        ...
+        raise NotImplementedError
 
     async def list_for_media(self, tmdb_id: int | None = None) -> list[BlocklistRecord]:
         """List blocklist entries, optionally scoped to one media item."""
-        ...
+        raise NotImplementedError
 
     async def create(
         self,
@@ -188,8 +183,7 @@ class BlocklistRepository(Protocol):
         media_type: str | None = None,
     ) -> BlocklistRecord:
         """Insert a new blocklist entry and return the persisted record."""
-        ...
+        raise NotImplementedError
 
     async def delete(self, blocklist_id: int) -> None:
         """Remove a blocklist entry (operator un-blocklist)."""
-        ...

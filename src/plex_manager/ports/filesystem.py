@@ -19,12 +19,10 @@ class FileSystemPort(Protocol):
 
     def available_bytes(self, path: Path) -> int:
         """Return free bytes on the filesystem containing ``path``."""
-        ...
+        raise NotImplementedError
 
     def move(self, src: Path, dst: Path) -> None:
         """Move ``src`` to ``dst`` (atomic rename when on the same device)."""
-        ...
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices."""
-        ...

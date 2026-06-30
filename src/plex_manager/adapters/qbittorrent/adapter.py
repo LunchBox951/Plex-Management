@@ -260,7 +260,7 @@ class QbittorrentClient:
         text = response.text.strip()
         if response.status_code in (_HTTP_OK, _HTTP_NO_CONTENT) and text != "Fails.":
             self._logged_in = True
-            _logger.info("authenticated with qBittorrent at %s", self._base_url)
+            _logger.info("authenticated with qBittorrent")
             return
         raise QbittorrentAuthError(
             f"qBittorrent rejected the login at {self._base_url} "

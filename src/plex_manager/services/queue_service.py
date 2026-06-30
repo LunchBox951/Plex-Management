@@ -200,7 +200,6 @@ async def mark_failed(
         if not is_legal_transition(current, DownloadState.FailedPending):
             raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
         await download_repo.update_status(download_id, DownloadState.FailedPending.value)
-        current = DownloadState.FailedPending
 
     await download_repo.update_status(
         download_id,

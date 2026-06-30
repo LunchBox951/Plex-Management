@@ -30,12 +30,11 @@ class LibraryPort(Protocol):
 
     async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
         """Return whether the item is already present in the library."""
-        ...
+        raise NotImplementedError
 
     async def trigger_scan(self, path: str) -> None:
         """Ask the media server to scan ``path`` (partial-scan when supported)."""
-        ...
 
     async def list_sections(self) -> list[LibrarySection]:
         """Return the configured library sections."""
-        ...
+        raise NotImplementedError
