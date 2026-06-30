@@ -14,7 +14,9 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0006](0006-download-client-port-qbittorrent.md) | `DownloadClient` port; qBittorrent as v1 adapter | Accepted |
 | [0007](0007-sqlite-alembic-migrations.md) | SQLite + Alembic migrations from day one | Accepted |
 | [0008](0008-release-parser-guessit.md) | `guessit` parses; the quality model stays ours | Accepted |
+| [0009](0009-frontend-typed-spa.md) | Frontend is a typed SPA (Vite + React + TS), contract-bound | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
-session; 0008 during the first backend-alpha session. Full context:
+session; 0008 during the first backend-alpha session; 0009 during the
+first frontend-alpha session. Full context:
 [`docs/design/overview.md`](../design/overview.md).

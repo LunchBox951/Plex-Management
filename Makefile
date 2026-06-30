@@ -1,5 +1,6 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint format type test check run migrate openapi docker-build
+.PHONY: help install lint format type test check run migrate openapi docker-build \
+	ui-install gen-client ui-check ui-build
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -38,3 +39,18 @@ openapi: ## Export the OpenAPI document to docs/api/openapi.json
 
 docker-build: ## Build the container image locally
 	docker build -t plex-manager:dev .
+
+ui-install: ## Install frontend dependencies (npm ci)
+	npm --prefix frontend ci
+
+gen-client: ## Regenerate the typed API client from docs/api/openapi.json
+	npm --prefix frontend run gen:client
+
+ui-check: ## Frontend gates: client-drift, typecheck, lint, unit tests
+	npm --prefix frontend run gen:check
+	npm --prefix frontend run typecheck
+	npm --prefix frontend run lint
+	npm --prefix frontend run test
+
+ui-build: ## Build the SPA into src/plex_manager/web/static
+	npm --prefix frontend run build

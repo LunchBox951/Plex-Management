@@ -31,6 +31,7 @@ from plex_manager.web.routers import requests as requests_router
 from plex_manager.web.routers import search_preview as search_preview_router
 from plex_manager.web.routers import settings as settings_router
 from plex_manager.web.routers import setup as setup_router
+from plex_manager.web.spa import mount_spa
 
 router = APIRouter()
 
@@ -118,6 +119,9 @@ def create_app() -> FastAPI:
     app.include_router(queue_router.router)
     app.include_router(blocklist_router.router)
     app.include_router(quality_profile_router.router)
+    # Mount the built SPA LAST so its catch-all fallback has the lowest match
+    # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
+    mount_spa(app)
     return app
 
 

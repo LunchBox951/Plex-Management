@@ -35,6 +35,14 @@ data/
 # Brainstorming visual companion (scratch)
 .superpowers/
 
+# Frontend (ADR-0009): the SPA source lives in frontend/; its build OUTPUT lands
+# in src/plex_manager/web/static and is a build artifact (produced by CI/Docker's
+# Node stage), so it is ignored here. hatchling force-includes it into the wheel
+# via [tool.hatch.build.targets.wheel].artifacts, so the shipped image still
+# carries the UI even though git does not track the built bytes.
+node_modules/
+/src/plex_manager/web/static/
+
 # Reference repositories (cloned by init.sh, not part of this project).
 # Anchored to the repo root with a trailing slash so they ONLY ignore the
 # top-level clones — an unanchored name like `prowlarr` would also swallow our

@@ -1,0 +1,62 @@
+@import 'tailwindcss';
+
+/*
+ * Design tokens — lifted from the Claude Design handoff (issue #7).
+ * Tailwind v4 exposes each --color-* as bg-/text-/border- utilities.
+ * Fonts are loaded via <link> in index.html (TODO: self-host woff2 before :stable
+ * so the appliance never depends on the Google Fonts CDN — see ADR-0005).
+ */
+@theme {
+  --color-bg: #0a0c10; /* app background */
+  --color-surface: #12151b; /* cards, modals, rows */
+  --color-poster: #15171c; /* poster placeholder */
+
+  --color-ink: #f4f1ea; /* primary text */
+  --color-muted: #b3b9c2; /* secondary text */
+  --color-faint: #7a8089; /* meta / mono captions */
+
+  --color-gold: #e7c27d; /* primary action / brand */
+  --color-gold-ink: #1a1206; /* text on gold */
+
+  --color-available: #60c48e; /* in library / completed */
+  --color-downloading: #e8b060; /* active download + progress */
+  --color-searching: #7a96c4; /* searching indexers */
+  --color-error: #d6736a; /* no release / destructive */
+
+  --color-hairline: rgb(255 255 255 / 8%);
+
+  --font-display: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+  --radius-poster: 7px;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    margin: 0;
+    background-color: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Cinematic scrollbars (handoff §2.3) */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(255 255 255 / 14%) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: rgb(255 255 255 / 14%);
+    border-radius: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
