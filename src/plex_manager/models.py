@@ -175,7 +175,26 @@ class MediaRequest(Base):
     """A user request for a movie or TV show — the entity the reconciler polls."""
 
     __tablename__ = "media_requests"
-    __table_args__ = (Index("ix_media_requests_tmdb_media", "tmdb_id", "media_type"),)
+    __table_args__ = (
+        Index("ix_media_requests_tmdb_media", "tmdb_id", "media_type"),
+        # Serialize active-request dedup at the database level: two concurrent
+        # POST /requests for the same (tmdb_id, media_type) can both pass the
+        # application-level find_active() check, then both INSERT. A PARTIAL UNIQUE
+        # index scoped to the ACTIVE statuses (pending / searching /
+        # no_acceptable_release / downloading) makes the second insert raise
+        # IntegrityError, which create_request catches and resolves to the existing
+        # active request. Terminal rows (completed / available / failed) are
+        # excluded, so a fresh request after one finishes is still allowed.
+        Index(
+            "uq_media_requests_active",
+            "tmdb_id",
+            "media_type",
+            unique=True,
+            sqlite_where=sa.text(
+                "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
+            ),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))

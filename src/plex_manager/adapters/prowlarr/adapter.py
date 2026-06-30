@@ -40,7 +40,7 @@ import httpx
 
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 
-__all__ = ["IndexerRateLimitError", "ProwlarrIndexer"]
+__all__ = ["IndexerError", "IndexerRateLimitError", "ProwlarrIndexer"]
 
 _logger = logging.getLogger(__name__)
 
@@ -64,7 +64,17 @@ _TYPE_MAP: Final[Mapping[str, str]] = {
 }
 
 
-class IndexerRateLimitError(RuntimeError):
+class IndexerError(RuntimeError):
+    """Base for surfaced Prowlarr failures (transport outage or HTTP error).
+
+    Raised instead of letting httpx's transport / status errors escape as an
+    opaque 500 (whose message embeds the request url). A surfaced, retryable state
+    — never swallowed into an empty result set. The message never includes the api
+    key or url.
+    """
+
+
+class IndexerRateLimitError(IndexerError):
     """Raised when Prowlarr reports every indexer is rate-limited (HTTP 400).
 
     A surfaced, retryable state — never swallowed into an empty result set. The
@@ -224,17 +234,25 @@ class ProwlarrIndexer:
     async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
         """Run ``request`` and return de-duplicated candidate releases."""
         priorities = await self._indexer_priorities()
-        response = await self._client.get(
-            f"{self._base_url}{_SEARCH_PATH}",
-            params=self._build_params(request),
-            headers={"X-Api-Key": self._api_key},
-        )
+        try:
+            response = await self._client.get(
+                f"{self._base_url}{_SEARCH_PATH}",
+                params=self._build_params(request),
+                headers={"X-Api-Key": self._api_key},
+            )
+        except httpx.RequestError as exc:
+            # Prowlarr unreachable (DNS / refused / timeout): surface a retryable
+            # error rather than an opaque 500. No url/api key in the message.
+            raise IndexerError("Prowlarr search request failed") from exc
         if response.status_code == _HTTP_BAD_REQUEST:
             raise IndexerRateLimitError(
                 "Prowlarr returned HTTP 400 for the search — all indexers are "
                 "rate-limited or the query was rejected"
             )
-        response.raise_for_status()
+        if response.is_error:
+            # Non-400 HTTP failure (5xx / auth): surface a retryable IndexerError
+            # rather than letting httpx's HTTPStatusError escape (it embeds the url).
+            raise IndexerError(f"Prowlarr search failed (HTTP {response.status_code})")
 
         rows = _as_sequence(response.json())
         candidates: list[CandidateRelease] = []

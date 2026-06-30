@@ -6,14 +6,18 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.release import CandidateRelease
-from plex_manager.models import Download, DownloadHistory, DownloadHistoryEvent
+from plex_manager.models import Download, DownloadHistory, DownloadHistoryEvent, MediaRequest
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from tests.web.fakes import (
     FakeProwlarr,
     FakeQbittorrent,
@@ -177,6 +181,110 @@ async def test_grab_refuses_cam_only_release_and_adds_nothing(
     assert response.json()["detail"] == "no_acceptable_release"
     # The CAM/TS never reached qBittorrent — nothing was leaked to the client.
     assert qbt.added == []
+
+
+async def test_grab_no_acceptable_release_marks_request(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A grab that finds nothing acceptable returns 409 AND persists the dead-end on
+    the owning request (no_acceptable_release) — honesty over silence: the request
+    no longer lingers as 'pending'/'searching' with nothing in flight."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+    override_adapters(
+        app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=FakeQbittorrent()
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_acceptable_release"
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None
+    assert request.status.value == "no_acceptable_release"
+
+
+async def test_grab_recovers_from_concurrent_insert_conflict(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent grabs for the same release both pass the get_by_hash guard
+    then both INSERT; the loser hits UNIQUE(torrent_hash). Instead of an opaque 500,
+    it recovers by re-fetching and reusing the winner row — no duplicate inserted."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=FakeQbittorrent(),
+    )
+
+    real_create = SqlDownloadRepository.create
+    calls = {"n": 0}
+
+    async def conflicting_create(
+        self: SqlDownloadRepository,
+        *,
+        torrent_hash: str,
+        status: str,
+        media_request_id: int | None = None,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+    ) -> DownloadRecord:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            # Simulate the winning concurrent transaction landing the row first
+            # (committed, so it survives the loser's rollback), then this insert
+            # losing the UNIQUE race.
+            async with sessionmaker_() as winner:
+                winner.add(
+                    Download(
+                        torrent_hash=torrent_hash,
+                        status=status,
+                        media_request_id=media_request_id,
+                        tmdb_id=tmdb_id,
+                    )
+                )
+                await winner.commit()
+            raise IntegrityError(
+                "INSERT INTO downloads",
+                {},
+                Exception("UNIQUE constraint failed: downloads.torrent_hash"),
+            )
+        return await real_create(
+            self,
+            torrent_hash=torrent_hash,
+            status=status,
+            media_request_id=media_request_id,
+            magnet_link=magnet_link,
+            tmdb_id=tmdb_id,
+            year=year,
+            season=season,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 201
+    assert response.json()["torrent_hash"] == _GOOD_HASH
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.torrent_hash == _GOOD_HASH)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # the winner only — the loser inserted no duplicate
 
 
 async def test_grab_operator_chosen_release_grabs_that_one(

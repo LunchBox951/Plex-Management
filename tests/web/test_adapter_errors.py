@@ -13,8 +13,8 @@ from collections.abc import Awaitable, Callable
 import httpx
 from fastapi import FastAPI
 
-from plex_manager.adapters.prowlarr import IndexerRateLimitError
-from plex_manager.adapters.qbittorrent import QbittorrentAuthError
+from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
+from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.ports.download_client import DownloadStatus
@@ -46,6 +46,16 @@ class _RateLimitedProwlarr(FakeProwlarr):
 class _AuthFailQbt(FakeQbittorrent):
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         raise QbittorrentAuthError("qBittorrent rejected the login")
+
+
+class _OutageQbt(FakeQbittorrent):
+    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+        raise QbittorrentError("qBittorrent request failed")
+
+
+class _OutageProwlarr(FakeProwlarr):
+    async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+        raise IndexerError("Prowlarr search request failed")
 
 
 async def test_tmdb_auth_error_maps_to_502(
@@ -90,3 +100,27 @@ async def test_qbittorrent_auth_error_maps_to_502(
     response = await client.get("/api/v1/queue", headers=_HEADERS)
     assert response.status_code == 502
     assert response.json() == {"detail": "qbittorrent_auth_failed"}
+
+
+async def test_qbittorrent_outage_maps_to_502_unavailable(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """A qBittorrent outage (base QbittorrentError) maps to a distinct honest
+    detail from the auth subclass — not an opaque 500."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, qbt=_OutageQbt())
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "qbittorrent_unavailable"}
+
+
+async def test_indexer_outage_maps_to_503_unavailable(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """A Prowlarr outage (base IndexerError) maps to 503 indexer_unavailable,
+    distinct from the rate-limit subclass detail."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, prowlarr=_OutageProwlarr())
+    response = await client.post("/api/v1/search-preview", json=_DESCRIPTOR, headers=_HEADERS)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "indexer_unavailable"}

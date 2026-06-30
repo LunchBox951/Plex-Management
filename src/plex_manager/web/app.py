@@ -17,8 +17,8 @@ from starlette.responses import JSONResponse, Response
 
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
-from plex_manager.adapters.prowlarr import IndexerRateLimitError
-from plex_manager.adapters.qbittorrent import QbittorrentAuthError
+from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
+from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.db import get_sessionmaker
 from plex_manager.web.deps import ServiceNotConfiguredError, ensure_system_settings
@@ -56,11 +56,19 @@ async def _service_not_configured_handler(request: Request, exc: Exception) -> R
 # the UI can offer 'retry later' / 're-check credentials' instead of an opaque
 # 500. The error TYPES guarantee no secret is in the message, but we return a
 # fixed detail string (never ``str(exc)``) so nothing can leak by accident.
+#
+# Subclass relationships (e.g. QbittorrentAuthError < QbittorrentError,
+# IndexerRateLimitError < IndexerError) are disambiguated by Starlette, which
+# resolves the handler by walking the exception's MRO and picking the most
+# specific registered type. The handler itself then keys on the EXACT type, so a
+# base-class outage and its auth/rate-limit subclass map to distinct details.
 _ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
     IndexerRateLimitError: (503, "indexer_rate_limited"),
+    IndexerError: (503, "indexer_unavailable"),
     TmdbAuthError: (502, "tmdb_auth_failed"),
     TmdbApiError: (502, "tmdb_unavailable"),
     QbittorrentAuthError: (502, "qbittorrent_auth_failed"),
+    QbittorrentError: (502, "qbittorrent_unavailable"),
 }
 
 

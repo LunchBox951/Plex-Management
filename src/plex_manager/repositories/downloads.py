@@ -117,6 +117,7 @@ class SqlDownloadRepository:
         download_path: str | None = None,
         first_seen_at: datetime | None = None,
         clear_failed_reason: bool = False,
+        media_request_id: int | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -126,6 +127,10 @@ class SqlDownloadRepository:
             row.progress = progress
         if seed_ratio is not None:
             row.seed_ratio = seed_ratio
+        if media_request_id is not None:
+            # Re-own a reused (terminal) row: a fresh grab from a different request
+            # must point the row at the CURRENT request, not the stale prior owner.
+            row.media_request_id = media_request_id
         if clear_failed_reason:
             # A terminal row being reused for a fresh grab must not carry a stale
             # failure reason (honesty over silence: a Downloading row claiming a

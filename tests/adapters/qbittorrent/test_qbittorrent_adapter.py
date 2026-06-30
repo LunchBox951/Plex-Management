@@ -9,6 +9,7 @@ OPTIONAL live smoke test is env-guarded.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 from typing import Any
@@ -16,7 +17,11 @@ from typing import Any
 import httpx
 import pytest
 
-from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentClient
+from plex_manager.adapters.qbittorrent import (
+    QbittorrentAuthError,
+    QbittorrentClient,
+    QbittorrentError,
+)
 
 BASE_URL = "http://qbit.local:8080"
 USERNAME = "admin"
@@ -262,6 +267,71 @@ async def test_pause_resume_use_legacy_endpoints_on_qbit4() -> None:
     assert "/api/v2/torrents/resume" in seen
     assert "/api/v2/torrents/stop" not in seen
     assert "/api/v2/torrents/start" not in seen
+
+
+async def test_add_base32_btih_magnet_normalizes_to_hex() -> None:
+    """A valid 32-char base32 ``btih`` magnet must resolve to the 40-char hex hash
+    qBittorrent reports — otherwise the stored hash never matches the client
+    snapshot and the reconciler sees ClientMissing forever."""
+    raw = bytes.fromhex(MAGNET_HASH)
+    b32 = base64.b32encode(raw).decode()
+    assert len(b32) == 32  # base32 of 20 bytes is 32 chars
+    base32_magnet = f"magnet:?xt=urn:btih:{b32}&dn=Test"
+
+    info_hash = await _client().add(base32_magnet, "/downloads/movies", "plex-manager")
+    assert info_hash == MAGNET_HASH  # decoded to lowercase hex
+
+
+async def test_add_hex_btih_magnet_is_lowercased_as_is() -> None:
+    """The 40-char hex form is left as-is (lowercased), not mangled."""
+    upper_magnet = f"magnet:?xt=urn:btih:{MAGNET_HASH.upper()}&dn=Test"
+    info_hash = await _client().add(upper_magnet, "/downloads/movies", "plex-manager")
+    assert info_hash == MAGNET_HASH
+
+
+async def test_transport_outage_raises_qbittorrent_error() -> None:
+    """qBittorrent unreachable (connection error) surfaces a wrapped, retryable
+    QbittorrentError — never an opaque httpx error -> 500."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).get_all_statuses()
+    # No url / secret leak in the surfaced message.
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_unreachable_http_source_raises_qbittorrent_error() -> None:
+    """A release exposing only a download_url whose indexer/Prowlarr URL is
+    unreachable surfaces a wrapped, retryable QbittorrentError on the grab path —
+    never an opaque httpx transport error -> 500."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    # No url / secret leak in the surfaced message.
+    assert DOWNLOAD_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_server_5xx_raises_qbittorrent_error() -> None:
+    """A 5xx from qBittorrent is wrapped as QbittorrentError (not an opaque 500)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(503, text="Service Unavailable")
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).get_all_statuses()
 
 
 def test_adapter_satisfies_download_client_port() -> None:

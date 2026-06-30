@@ -177,6 +177,24 @@ async def test_server_error_raises_redacted_without_api_key(status: int) -> None
     assert str(status) in message
 
 
+async def test_transport_outage_raises_tmdb_api_error_without_url() -> None:
+    """TMDB unreachable (DNS / connection / timeout): httpx raises BEFORE the
+    status check, so without wrapping it propagates as an opaque 500. It must be
+    converted to a retryable TmdbApiError naming the path only — never the url
+    (which embeds the api key)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("name resolution failed", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    with pytest.raises(TmdbApiError) as exc_info:
+        await adapter.get_movie(27205)
+    message = str(exc_info.value)
+    assert API_KEY not in message
+    assert "/movie/27205" in message
+
+
 async def test_cache_serves_second_lookup_without_network() -> None:
     calls = {"n": 0}
 

@@ -17,7 +17,11 @@ from typing import Any
 import httpx
 import pytest
 
-from plex_manager.adapters.prowlarr import IndexerRateLimitError, ProwlarrIndexer
+from plex_manager.adapters.prowlarr import (
+    IndexerError,
+    IndexerRateLimitError,
+    ProwlarrIndexer,
+)
 from plex_manager.domain.release import IndexerSearchRequest
 
 API_KEY = "prowlarr-key-never-logged"
@@ -207,6 +211,38 @@ async def test_rate_limit_error_excludes_api_key() -> None:
         assert API_KEY not in str(exc)
     else:  # pragma: no cover - guarded by the call above
         pytest.fail("expected IndexerRateLimitError")
+
+
+async def test_transport_outage_raises_indexer_error() -> None:
+    """Prowlarr unreachable surfaces a wrapped, retryable IndexerError — never an
+    opaque httpx error -> 500. (The priority pre-fetch failing is swallowed; the
+    search request failing is what surfaces.)"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(IndexerError) as exc_info:
+        await _adapter(handler).search(IndexerSearchRequest(query="x"))
+    assert API_KEY not in str(exc_info.value)
+    assert BASE_URL not in str(exc_info.value)
+
+
+async def test_search_5xx_raises_indexer_error() -> None:
+    """A non-400 HTTP failure (5xx) on the search is wrapped as IndexerError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS)
+        return httpx.Response(502, text="Bad Gateway")
+
+    with pytest.raises(IndexerError):
+        await _adapter(handler).search(IndexerSearchRequest(query="x"))
+
+
+def test_rate_limit_error_is_indexer_error_subclass() -> None:
+    """IndexerRateLimitError is an IndexerError so a base-class handler still
+    catches the rate-limit case (and the app maps each to its own detail)."""
+    assert issubclass(IndexerRateLimitError, IndexerError)
 
 
 def test_adapter_satisfies_indexer_port() -> None:

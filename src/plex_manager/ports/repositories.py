@@ -144,12 +144,18 @@ class DownloadRepository(Protocol):
         failed_reason: str | None = None,
         download_path: str | None = None,
         first_seen_at: datetime | None = None,
+        clear_failed_reason: bool = False,
+        media_request_id: int | None = None,
     ) -> None:
         """Update a download's status and optional progress fields.
 
         ``first_seen_at`` stamps the missing-grace anchor: the caller passes
         ``now`` when persisting a ``StateTransition`` whose ``set_first_seen_at``
         flag is set, so the reconciler's grace window can actually start.
+
+        ``clear_failed_reason`` wipes a stale failure reason when a terminal row is
+        reused for a fresh grab; ``media_request_id`` (when not ``None``) re-owns
+        the reused row to the current request. Both are no-ops otherwise.
         """
 
 

@@ -168,7 +168,14 @@ class TmdbMetadata:
         param).
         """
         query = {"api_key": self._api_key, **params}
-        response = await self._client.get(f"{self._base_url}{path}", params=query)
+        try:
+            response = await self._client.get(f"{self._base_url}{path}", params=query)
+        except httpx.RequestError as exc:
+            # TMDB unreachable (DNS / connection refused / timeout): httpx raises
+            # before any status check, so without this it would propagate as an
+            # opaque 500. Convert to the surfaced, retryable TmdbApiError. The
+            # message names the path only — never the url (which embeds api_key).
+            raise TmdbApiError(f"tmdb request to {path} failed") from exc
         if response.status_code == _HTTP_NOT_FOUND:
             return None
         if response.status_code == _HTTP_UNAUTHORIZED:

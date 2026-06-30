@@ -16,6 +16,7 @@ from plex_manager.models import (
     MediaType,
     RequestStatus,
 )
+from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.services import queue_service
 from tests.web.fakes import FakeQbittorrent
@@ -123,6 +124,47 @@ async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate
             tmdb_id=603, torrent_hash=None, source_title=_TITLE, indexer="OtherIndexer"
         )
         assert other is False
+
+
+async def test_live_progress_persisted_without_state_change(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A download advancing 10%->50% while staying 'Downloading' emits NO state
+    transition from the pure reconciler, but reconcile_and_list must still persist
+    the live progress/seed_ratio — otherwise the queue shows stale progress."""
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash=_HASH,
+            status="downloading",
+            tmdb_id=603,
+            progress=0.1,
+            seed_ratio=0.0,
+        )
+        session.add(download)
+        await session.commit()
+
+    # The client reports the SAME mapped state ('downloading') but further along.
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie",
+        raw_state="downloading",
+        progress=0.5,
+        ratio=1.2,
+    )
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[live]), session)
+
+    item = next(i for i in queue if i.torrent_hash == _HASH)
+    assert item.status == "downloading"  # unchanged state
+    assert item.progress == 0.5  # progress moved despite no transition
+    assert item.seed_ratio == 1.2
+
+    async with sessionmaker_() as session:
+        persisted = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert persisted.progress == 0.5
+    assert persisted.seed_ratio == 1.2
 
 
 async def test_mark_failed_routes_downloading_through_failed_pending(

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy.exc import IntegrityError
+
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.models import (
     DownloadHistory,
@@ -52,6 +54,32 @@ class NoGrabSourceError(Exception):
     def __init__(self, guid: str) -> None:
         self.guid = guid
         super().__init__(f"release {guid} has no magnet or download url")
+
+
+async def _reuse_terminal_row(
+    download_repo: SqlDownloadRepository,
+    download_id: int,
+    torrent_hash: str,
+    request_id: int | None,
+) -> DownloadRecord:
+    """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
+
+    A previously-failed (not blocklisted) release may legitimately be grabbed
+    afresh; the row's ``torrent_hash`` is UNIQUE, so we reuse the existing row
+    rather than colliding on a fresh insert. The stale failure reason is cleared
+    and ``media_request_id`` is repointed at the CURRENT request (it may differ
+    from the prior owner) so the row is owned by the active request.
+    """
+    await download_repo.update_status(
+        download_id,
+        DownloadState.Downloading.value,
+        clear_failed_reason=True,
+        media_request_id=request_id,
+    )
+    record = await download_repo.get_by_hash(torrent_hash)
+    if record is None:  # pragma: no cover - just updated this row
+        raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
+    return record
 
 
 async def grab(
@@ -97,29 +125,31 @@ async def grab(
         return existing
 
     if existing is not None:
-        # A terminal row (Failed/Imported) already owns this hash. ``torrent_hash``
-        # is UNIQUE, so a plain insert would raise IntegrityError -> opaque 500.
-        # A previously-failed (not blocklisted) release may legitimately be
-        # grabbed afresh, so REUSE the row: drive it back to Downloading and clear
-        # the stale failure reason, rather than colliding on the constraint.
-        await download_repo.update_status(
-            existing.id,
-            DownloadState.Downloading.value,
-            clear_failed_reason=True,
-        )
-        record = await download_repo.get_by_hash(torrent_hash)
-        if record is None:  # pragma: no cover - just updated this row
-            raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
+        record = await _reuse_terminal_row(download_repo, existing.id, torrent_hash, request_id)
     else:
-        record = await download_repo.create(
-            torrent_hash=torrent_hash,
-            status=DownloadState.Downloading.value,
-            media_request_id=request_id,
-            magnet_link=source,
-            tmdb_id=tmdb_id,
-            year=year,
-            season=season,
-        )
+        try:
+            record = await download_repo.create(
+                torrent_hash=torrent_hash,
+                status=DownloadState.Downloading.value,
+                media_request_id=request_id,
+                magnet_link=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+            )
+        except IntegrityError:
+            # Two concurrent grabs for the same release both passed the
+            # get_by_hash check above, then both tried to INSERT — ``torrent_hash``
+            # is UNIQUE, so the loser lands here. Recover instead of crashing
+            # (opaque 500): roll back the failed insert, re-fetch the winner, and
+            # reuse it — the same recovery as the terminal-reuse path.
+            await session.rollback()
+            winner = await download_repo.get_by_hash(torrent_hash)
+            if winner is None:  # pragma: no cover - the conflicting row must exist
+                raise
+            if winner.status not in _TERMINAL_STATUS_VALUES:
+                return winner
+            record = await _reuse_terminal_row(download_repo, winner.id, torrent_hash, request_id)
     session.add(
         DownloadHistory(
             tmdb_id=tmdb_id,

@@ -149,6 +149,18 @@ def upgrade() -> None:
         batch_op.create_index(batch_op.f('ix_media_requests_status'), ['status'], unique=False)
         batch_op.create_index(batch_op.f('ix_media_requests_tmdb_id'), ['tmdb_id'], unique=False)
         batch_op.create_index('ix_media_requests_tmdb_media', ['tmdb_id', 'media_type'], unique=False)
+        # Partial UNIQUE index: dedup is enforced only across ACTIVE statuses, so a
+        # second concurrent request for the same media raises IntegrityError (which
+        # create_request resolves to the existing active request), while a fresh
+        # request after the prior one reaches a terminal status is still allowed.
+        batch_op.create_index(
+            'uq_media_requests_active',
+            ['tmdb_id', 'media_type'],
+            unique=True,
+            sqlite_where=sa.text(
+                "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
+            ),
+        )
 
     op.create_table('downloads',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -213,6 +225,7 @@ def downgrade() -> None:
 
     op.drop_table('downloads')
     with op.batch_alter_table('media_requests', schema=None) as batch_op:
+        batch_op.drop_index('uq_media_requests_active')
         batch_op.drop_index('ix_media_requests_tmdb_media')
         batch_op.drop_index(batch_op.f('ix_media_requests_tmdb_id'))
         batch_op.drop_index(batch_op.f('ix_media_requests_status'))

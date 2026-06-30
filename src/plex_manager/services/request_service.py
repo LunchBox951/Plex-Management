@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from sqlalchemy.exc import IntegrityError
+
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
 
@@ -20,7 +22,13 @@ if TYPE_CHECKING:
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.repositories import RequestRecord
 
-__all__ = ["MediaNotFoundError", "create_request", "get_request", "list_requests"]
+__all__ = [
+    "MediaNotFoundError",
+    "create_request",
+    "get_request",
+    "list_requests",
+    "mark_no_acceptable_release",
+]
 
 
 class MediaNotFoundError(Exception):
@@ -73,16 +81,27 @@ async def create_request(
         return existing
 
     title, year, is_anime = await _resolve_detail(tmdb, tmdb_id, media_type)
-    record = await repo.create(
-        tmdb_id=tmdb_id,
-        media_type=media_type,
-        title=title,
-        status=RequestStatus.pending.value,
-        year=year,
-        is_anime=is_anime,
-        user_id=user_id,
-    )
-    await session.commit()
+    try:
+        record = await repo.create(
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            title=title,
+            status=RequestStatus.pending.value,
+            year=year,
+            is_anime=is_anime,
+            user_id=user_id,
+        )
+        await session.commit()
+    except IntegrityError:
+        # A concurrent POST /requests for the same (tmdb_id, media_type) won the
+        # race: the partial UNIQUE index over active statuses rejected this insert.
+        # Resolve to the existing active request instead of crashing (idempotent
+        # dedup, honesty over silence). The failed transaction is rolled back first.
+        await session.rollback()
+        winner = await repo.find_active(tmdb_id, media_type)
+        if winner is None:  # pragma: no cover - the conflicting active row must exist
+            raise
+        return winner
     return record
 
 
@@ -97,3 +116,18 @@ async def list_requests(
 async def get_request(session: AsyncSession, request_id: int) -> RequestRecord | None:
     """Return the request by id, or ``None`` if absent."""
     return await SqlRequestRepository(session).get(request_id)
+
+
+async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> None:
+    """Persist ``no_acceptable_release`` on the request when a grab finds nothing.
+
+    Honesty over silence: a live grab that finds no acceptable candidate returns
+    409, but without this the owning request would stay ``downloading`` /
+    ``searching`` — a dishonest status asserting progress that is not happening.
+    ``no_acceptable_release`` is a visible, retryable state (the operator can
+    re-search later), not a silent ``failed``.
+    """
+    await SqlRequestRepository(session).set_status(
+        request_id, RequestStatus.no_acceptable_release.value
+    )
+    await session.commit()

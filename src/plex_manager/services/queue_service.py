@@ -161,15 +161,31 @@ async def reconcile_and_list(
             raw_state,
         )
 
-    for transition in transitions:
-        live = snapshot.get(transition.torrent_hash.lower())
-        await download_repo.update_status(
-            transition.download_id,
-            transition.to_state.value,
-            progress=live.progress if live is not None else None,
-            seed_ratio=live.ratio if live is not None else None,
-            first_seen_at=now if transition.set_first_seen_at else None,
-        )
+    # Single update path over every tracked row. A row with a transition is moved
+    # to its new state (carrying the live progress); a row with NO transition but
+    # still present in the client snapshot has its progress/seed_ratio refreshed —
+    # the pure reconciler only emits on a STATE change, so a download advancing
+    # 10%->50%->90% while staying "Downloading" would otherwise show stale progress
+    # in the queue forever (honesty over silence).
+    transitions_by_id = {transition.download_id: transition for transition in transitions}
+    for row in rows:
+        live = snapshot.get(row.torrent_hash.lower())
+        transition = transitions_by_id.get(row.id)
+        if transition is not None:
+            await download_repo.update_status(
+                transition.download_id,
+                transition.to_state.value,
+                progress=live.progress if live is not None else None,
+                seed_ratio=live.ratio if live is not None else None,
+                first_seen_at=now if transition.set_first_seen_at else None,
+            )
+        elif live is not None:
+            await download_repo.update_status(
+                row.id,
+                row.status,  # unchanged state — only progress/seed_ratio move
+                progress=live.progress,
+                seed_ratio=live.ratio,
+            )
 
     for event in failed_download_events(transitions, rows, occurred_at=now):
         await _handle_failed(session, event, rows)

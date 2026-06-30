@@ -105,6 +105,9 @@ async def grab_endpoint(
         profile,
     )
     if not result.accepted:
+        # Honesty over silence: reflect the dead-end on the owning request so it
+        # does not linger as 'downloading'/'searching' with nothing in flight.
+        await request_service.mark_no_acceptable_release(session, request.id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)

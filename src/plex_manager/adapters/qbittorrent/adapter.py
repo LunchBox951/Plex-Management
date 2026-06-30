@@ -30,6 +30,7 @@ HTTP->magnet redirect walker, and the 409-as-success behaviour.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 from datetime import UTC, datetime
@@ -40,7 +41,7 @@ import httpx
 
 from plex_manager.ports.download_client import DownloadStatus
 
-__all__ = ["QbittorrentAuthError", "QbittorrentClient"]
+__all__ = ["QbittorrentAuthError", "QbittorrentClient", "QbittorrentError"]
 
 _logger = logging.getLogger(__name__)
 
@@ -55,7 +56,19 @@ _PROPERTIES_TTL_SECONDS: Final = 30.0
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
 
 
-class QbittorrentAuthError(RuntimeError):
+class QbittorrentError(RuntimeError):
+    """Base for surfaced qBittorrent failures (transport outage or HTTP error).
+
+    Raised instead of letting httpx's transport / status errors escape: those
+    propagate as an opaque 500 and embed the request url (and, on login, the
+    credentials in the posted body never reaches the message, but the url could).
+    Converting at the boundary keeps the failure visible and retryable (honesty
+    over silence) without leaking any secret — the message carries the status code
+    only, never the url, username, password or session id.
+    """
+
+
+class QbittorrentAuthError(QbittorrentError):
     """Raised when qBittorrent rejects the login (bad credentials / banned IP).
 
     A surfaced error — never a silent failure. The message never includes the
@@ -108,6 +121,25 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
     return hashlib.sha1(data[info_start:info_end]).hexdigest().lower()  # noqa: S324
 
 
+def _normalize_btih(value: str) -> str:
+    """Normalise a ``btih`` info-hash to the 40-char lowercase hex qBittorrent uses.
+
+    A magnet ``xt=urn:btih:`` value is either the 40-char hex form or the valid
+    32-char base32 encoding of the same 20-byte hash. qBittorrent always reports
+    the hex form, so a base32 magnet must be decoded to hex — otherwise the stored
+    hash never matches the client snapshot and the reconciler treats the torrent as
+    ``ClientMissing`` forever. A 40-char hex value is returned lowercased; any other
+    shape is passed through lowercased (best effort — nothing is swallowed).
+    """
+    if len(value) == 32:
+        try:
+            # b32decode raises binascii.Error (a ValueError subclass) on bad input.
+            return base64.b32decode(value.upper()).hex()
+        except ValueError:
+            return value.lower()
+    return value.lower()
+
+
 def _info_hash_from_magnet(magnet: str) -> str | None:
     """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter."""
     parsed = urlparse(magnet)
@@ -115,7 +147,7 @@ def _info_hash_from_magnet(magnet: str) -> str | None:
         return None
     for xt in parse_qs(parsed.query).get("xt", []):
         if xt.startswith("urn:btih:"):
-            return xt[len("urn:btih:") :].lower()
+            return _normalize_btih(xt[len("urn:btih:") :])
     return None
 
 
@@ -249,22 +281,40 @@ class QbittorrentClient:
             f"username=<redacted>, password=<redacted>)"
         )
 
+    @staticmethod
+    def _raise_for_status(response: httpx.Response) -> None:
+        """Convert a non-2xx response into a wrapped :class:`QbittorrentError`.
+
+        Replaces ``httpx.Response.raise_for_status``: its ``HTTPStatusError`` would
+        propagate as an opaque 500 and embeds the request url. The wrapped error
+        carries the status code only — never the url or any secret. Auth (403) is
+        already handled by ``_request``'s transparent re-login, so a status reaching
+        here is a genuine, surfaced failure.
+        """
+        if response.is_error:
+            raise QbittorrentError(f"qBittorrent request failed (HTTP {response.status_code})")
+
     # ---- auth ----------------------------------------------------------- #
     async def _login(self) -> None:
         """Authenticate and capture the ``SID`` cookie in the client jar."""
-        response = await self._client.post(
-            f"{self._base_url}{_API}/auth/login",
-            data={"username": self._username, "password": self._password},
-            headers={"Referer": self._base_url},
-        )
+        try:
+            response = await self._client.post(
+                f"{self._base_url}{_API}/auth/login",
+                data={"username": self._username, "password": self._password},
+                headers={"Referer": self._base_url},
+            )
+        except httpx.RequestError as exc:
+            # qBittorrent unreachable during login (DNS / refused / timeout): surface
+            # a retryable error rather than an opaque 500. No url/secret in the message.
+            raise QbittorrentError("qBittorrent request failed") from exc
         text = response.text.strip()
         if response.status_code in (_HTTP_OK, _HTTP_NO_CONTENT) and text != "Fails.":
             self._logged_in = True
             _logger.info("authenticated with qBittorrent")
             return
         raise QbittorrentAuthError(
-            f"qBittorrent rejected the login at {self._base_url} "
-            f"(HTTP {response.status_code}): check the username and password"
+            f"qBittorrent rejected the login (HTTP {response.status_code}): "
+            f"check the username and password"
         )
 
     async def _request(
@@ -280,13 +330,21 @@ class QbittorrentClient:
         if not self._logged_in:
             await self._login()
         url = f"{self._base_url}{_API}{path}"
-        response = await self._client.request(method, url, params=params, data=data, files=files)
-        if response.status_code == _HTTP_FORBIDDEN:
-            self._logged_in = False
-            await self._login()
+        try:
             response = await self._client.request(
                 method, url, params=params, data=data, files=files
             )
+            if response.status_code == _HTTP_FORBIDDEN:
+                self._logged_in = False
+                await self._login()
+                response = await self._client.request(
+                    method, url, params=params, data=data, files=files
+                )
+        except httpx.RequestError as exc:
+            # qBittorrent down or network failure mid-request: surface a retryable
+            # error rather than letting httpx's transport error escape as an opaque
+            # 500. The message carries no url or secret.
+            raise QbittorrentError("qBittorrent request failed") from exc
         return response
 
     # ---- add ------------------------------------------------------------ #
@@ -299,7 +357,13 @@ class QbittorrentClient:
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
-            response = await self._client.get(current, follow_redirects=False)
+            try:
+                response = await self._client.get(current, follow_redirects=False)
+            except httpx.RequestError as exc:
+                # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):
+                # surface a retryable error rather than letting httpx's transport error
+                # escape as an opaque 500 on the grab path. No url/secret in the message.
+                raise QbittorrentError("qBittorrent request failed") from exc
             if response.is_redirect:
                 location = response.headers.get("Location", "")
                 if not location:
@@ -350,10 +414,9 @@ class QbittorrentClient:
 
         response = await self._request("POST", "/torrents/add", data=form, files=files)
         if not _is_add_success(response):
-            raise httpx.HTTPStatusError(
-                f"qBittorrent rejected the torrent (HTTP {response.status_code})",
-                request=response.request,
-                response=response,
+            # Surfaced, retryable failure — never an opaque 500. No url/secret leak.
+            raise QbittorrentError(
+                f"qBittorrent rejected the torrent (HTTP {response.status_code})"
             )
 
         if info_hash is not None:
@@ -369,7 +432,7 @@ class QbittorrentClient:
         response = await self._request(
             "GET", "/torrents/info", params={"hashes": info_hash.lower()}
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         rows = _as_list(response.json())
         if rows:
             return _torrent_to_status(_as_dict(rows[0]))
@@ -381,7 +444,7 @@ class QbittorrentClient:
         if category is not None:
             params["category"] = category
         response = await self._request("GET", "/torrents/info", params=params)
-        response.raise_for_status()
+        self._raise_for_status(response)
         out: list[DownloadStatus] = []
         for row in _as_list(response.json()):
             mapped = _as_dict(row)
@@ -409,13 +472,13 @@ class QbittorrentClient:
         """Pause (qBit 4.x) / stop (qBit 5.x) the torrent ``info_hash``."""
         path = "/torrents/stop" if await self._use_stop_start() else "/torrents/pause"
         response = await self._request("POST", path, data={"hashes": info_hash.lower()})
-        response.raise_for_status()
+        self._raise_for_status(response)
 
     async def resume(self, info_hash: str) -> None:
         """Resume (qBit 4.x) / start (qBit 5.x) the torrent ``info_hash``."""
         path = "/torrents/start" if await self._use_stop_start() else "/torrents/resume"
         response = await self._request("POST", path, data={"hashes": info_hash.lower()})
-        response.raise_for_status()
+        self._raise_for_status(response)
 
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
         """Remove the torrent, deleting its files when ``delete_files`` is set."""
@@ -427,7 +490,7 @@ class QbittorrentClient:
                 "deleteFiles": "true" if delete_files else "false",
             },
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         self._properties_cache.pop(info_hash.lower(), None)
 
     async def set_category(self, info_hash: str, category: str) -> None:
@@ -437,7 +500,7 @@ class QbittorrentClient:
             "/torrents/setCategory",
             data={"hashes": info_hash.lower(), "category": category},
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
 
     async def get_save_path(self, info_hash: str) -> str | None:
         """Return the torrent's current save path, re-read from the client."""
