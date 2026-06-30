@@ -194,8 +194,10 @@ export function SetupWizard() {
         [service]: { ok: false, message: asApiError(error).message },
       }))
     } finally {
-      // Only clear the spinner if this is still the active test for the service.
-      if (validationGen.current[service] === gen) setTesting((t) => (t === service ? null : t))
+      // Always release this service's spinner. The Test button is disabled while
+      // loading, so a same-service test can't be concurrently in flight; the
+      // (t === service) check only avoids clobbering a DIFFERENT service's spinner.
+      setTesting((t) => (t === service ? null : t))
     }
   }
 

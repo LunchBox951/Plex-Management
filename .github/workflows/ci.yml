@@ -28,6 +28,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      # Prove the committed OpenAPI doc still matches the wired backend. Combined
+      # with the frontend job's client drift check, this gates the whole contract
+      # chain: backend -> docs/api/openapi.json -> generated TS client. The
+      # exporter is deterministic (SPA routes are include_in_schema=False), so a
+      # diff here means a router/schema change wasn't re-exported + committed.
+      - name: OpenAPI contract is fresh
+        run: |
+          python -m plex_manager.web.openapi_export
+          git diff --exit-code docs/api/openapi.json
       - name: Lint (ruff)
         run: ruff check --output-format=github .
       - name: Format check (ruff)
