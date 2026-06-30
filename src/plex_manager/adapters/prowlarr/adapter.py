@@ -50,6 +50,13 @@ _HTTP_OK: Final = 200
 _HTTP_BAD_REQUEST: Final = 400
 _DEFAULT_INDEXER_PRIORITY: Final = 25
 _PRIORITY_TTL_SECONDS: Final = 300.0
+# Indexer searches fan out across every configured tracker, so a single search
+# routinely runs far longer than a normal HTTP call (a popular movie can return
+# hundreds of releases across a dozen indexers, ~60s+). The shared client's
+# default timeout (~30s) would abort real searches, so the search request gets a
+# generous, configurable override. The prototype used 300s; 120s is the default
+# here and is tunable per deployment.
+_DEFAULT_SEARCH_TIMEOUT: Final = 120.0
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 # One query-param pair; the value union matches httpx's ``PrimitiveData`` so the
@@ -189,10 +196,13 @@ class ProwlarrIndexer:
         client: httpx.AsyncClient,
         base_url: str,
         api_key: str,
+        *,
+        search_timeout: float = _DEFAULT_SEARCH_TIMEOUT,
     ) -> None:
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._search_timeout = search_timeout
         # indexerId -> priority, resolved from /api/v1/indexer and cached with a
         # short TTL so a reconciler loop does not re-fetch on every search.
         self._priority_cache: tuple[datetime, Mapping[int, int]] | None = None
@@ -239,6 +249,7 @@ class ProwlarrIndexer:
                 f"{self._base_url}{_SEARCH_PATH}",
                 params=self._build_params(request),
                 headers={"X-Api-Key": self._api_key},
+                timeout=self._search_timeout,
             )
         except httpx.RequestError as exc:
             # Prowlarr unreachable (DNS / refused / timeout): surface a retryable

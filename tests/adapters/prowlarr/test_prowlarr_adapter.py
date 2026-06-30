@@ -245,6 +245,27 @@ def test_rate_limit_error_is_indexer_error_subclass() -> None:
     assert issubclass(IndexerRateLimitError, IndexerError)
 
 
+async def test_search_applies_generous_per_request_timeout() -> None:
+    """The search request overrides the shared client's short timeout — a real
+    indexer search fans out across many trackers and can take ~60s+, so the
+    default ~30s client timeout would abort it. The priority pre-fetch keeps the
+    client default; only the search GET carries the override."""
+    seen: dict[str, object] = {}
+    real_get: Any = None
+
+    async def spy_get(url: str, **kwargs: Any) -> httpx.Response:
+        if str(url).endswith("/api/v1/search"):
+            seen["timeout"] = kwargs.get("timeout")
+        return await real_get(url, **kwargs)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    real_get = client.get
+    client.get = spy_get  # type: ignore[method-assign]
+    adapter = ProwlarrIndexer(client, BASE_URL, API_KEY, search_timeout=123.0)
+    await adapter.search(IndexerSearchRequest(media_type="movie", tmdb_id=1))
+    assert seen["timeout"] == 123.0
+
+
 def test_adapter_satisfies_indexer_port() -> None:
     from plex_manager.ports.indexer import IndexerPort
 
