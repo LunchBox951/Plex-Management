@@ -96,7 +96,9 @@ async def grab_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
 
     result = await run_preview(
-        SearchPreviewRequest(request_id=body.request_id),
+        # Carry the season so a TV grab searches (and later records) the right
+        # season; it is None for a movie and so leaves movie behaviour unchanged.
+        SearchPreviewRequest(request_id=body.request_id, season=body.season),
         session,
         prowlarr,
         parser,
@@ -114,7 +116,7 @@ async def grab_endpoint(
             request_id=request.id,
             tmdb_id=request.tmdb_id,
             year=request.year,
-            season=None,
+            season=body.season,
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc

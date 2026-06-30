@@ -307,7 +307,9 @@ class GrabRequest(BaseModel):
     """Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.
 
     With neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted
-    release is grabbed ("grab top").
+    release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
+    indexer search and the stored download to that season; it is ignored for
+    movies.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -315,6 +317,7 @@ class GrabRequest(BaseModel):
     request_id: int
     info_hash: str | None = None
     guid: str | None = None
+    season: int | None = None
 
 
 # --------------------------------------------------------------------------- #

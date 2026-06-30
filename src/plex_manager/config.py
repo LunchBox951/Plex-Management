@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,8 +37,9 @@ class Settings(BaseSettings):
 
     # Optional override for the at-rest encryption key. When unset, the key is
     # generated once into ``<data_dir>/secret.key`` (mode 0600) on first start.
-    # Never logged.
-    fernet_key: str | None = None
+    # Wrapped in ``SecretStr`` so it never leaks through a log line or ``repr`` of
+    # the settings object; read the raw value with ``.get_secret_value()``.
+    fernet_key: SecretStr | None = None
 
     # Skip the API-key check on protected routes. Development convenience only;
     # the :stable deployment leaves this False.

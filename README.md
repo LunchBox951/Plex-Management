@@ -9,9 +9,35 @@ single app — with two differences that define the project:
    CAM/TS/telecast junk is *rejected outright* instead of slipping into your
    library.
 
-> **Status:** foundation / design phase. This repository currently contains the
-> design, the architecture decisions, the CI/security pipeline, and a minimal
-> runnable skeleton. Feature work toward v1 begins next.
+> **Status:** backend alpha (the **request → search → grab** slice). The pure
+> decision engine, persistence, the live Prowlarr/qBittorrent/TMDB adapters, the
+> reconciler, and the REST API are built and tested; file import, Plex dedupe,
+> retention, and the front-end are deferred. See
+> [docs/design/alpha-plan.md](docs/design/alpha-plan.md).
+
+## What works now (backend alpha)
+
+- **First-run setup wizard** (`/api/v1/setup/*`): validate and store
+  Plex/Prowlarr/qBittorrent/TMDB credentials — encrypted at rest, never logged.
+- **API-key auth** (`X-Api-Key`) on every protected route; a setup guard blocks
+  the API until the install is initialized.
+- **TMDB discovery** → **request** a movie/show (anime auto-tagged).
+- **`/api/v1/search-preview`** — the headline: searches Prowlarr, parses each
+  release with `guessit`, runs the Radarr-style **ordered quality profile with a
+  hard cutoff**, and returns ranked candidates with a per-release *rejection
+  reason*. CAM/TS/TELECINE/WORKPRINT/DVD-screener releases are **rejected
+  outright**, and "no acceptable release" is a real, retryable status — never a
+  silent failure.
+- **Grab** the chosen release into qBittorrent and **reconcile** its status; a
+  single missed poll never falses a download, failures are blocklisted and
+  re-searched, and the blocklist is operator-manageable.
+
+The typed contract for all of this is published at
+[`docs/api/openapi.json`](docs/api/openapi.json) (regenerate with `make openapi`).
+
+**Deferred** (ports defined, adapters stubbed): file import (validate → rename →
+route → Plex scan), Plex availability dedupe, disk-pressure eviction, retention,
+Plex OAuth, and the front-end.
 
 ## Why
 
@@ -58,21 +84,26 @@ Requires Python 3.12+.
 
 ```bash
 make install   # editable install + dev tools + pre-commit
+make migrate   # apply Alembic migrations (creates ./data and the schema)
 make check     # ruff (lint+format), pyright --strict, pytest
-make run       # http://localhost:8000  (/health to verify)
+make run       # http://localhost:8000  (/health to verify, /docs for the API)
+make openapi   # regenerate docs/api/openapi.json from the live app
 ```
 
 Project layout and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Tech stack
 
-Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2.0 + Alembic · pyright (strict)
-· ruff · pytest · Docker / GHCR. See
-[ADR-0002](docs/adr/0002-python-typed-stack.md).
+Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) + Alembic · `httpx` ·
+`guessit` (release parsing) · pyright (strict) · ruff · pytest · Docker / GHCR.
+See [ADR-0002](docs/adr/0002-python-typed-stack.md) and
+[ADR-0008](docs/adr/0008-release-parser-guessit.md).
 
 ## Documentation
 
 - [Design overview](docs/design/overview.md)
+- [Backend alpha scope & plan](docs/design/alpha-plan.md)
+- [REST API contract (OpenAPI)](docs/api/openapi.json)
 - [Architecture Decision Records](docs/adr/)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)

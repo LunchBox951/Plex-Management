@@ -8,6 +8,7 @@ string literals; it mirrors P4's terminal ``DownloadState`` members.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -16,8 +17,6 @@ from plex_manager.models import Download
 from plex_manager.ports.repositories import DownloadRecord
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlDownloadRepository"]
@@ -28,6 +27,19 @@ __all__ = ["SqlDownloadRepository"]
 _TERMINAL_DOWNLOAD_STATUSES: frozenset[str] = frozenset(
     {"imported", "failed", "no_acceptable_release"}
 )
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Coerce a stored timestamp to tz-aware UTC.
+
+    SQLite returns naive datetimes even for ``DateTime(timezone=True)`` columns;
+    the app's stored values are always UTC (``datetime.now(timezone.utc)``), and
+    the reconciler does aware-datetime arithmetic on ``first_seen_at``. Attaching
+    UTC here keeps the DTO contract tz-aware regardless of backend.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 def _to_record(row: Download) -> DownloadRecord:
@@ -44,7 +56,7 @@ def _to_record(row: Download) -> DownloadRecord:
         year=row.year,
         season=row.season,
         failed_reason=row.failed_reason,
-        first_seen_at=row.first_seen_at,
+        first_seen_at=_as_utc(row.first_seen_at),
         download_path=row.download_path,
     )
 

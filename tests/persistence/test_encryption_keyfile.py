@@ -11,9 +11,11 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from cryptography.fernet import Fernet
+from pydantic import SecretStr
 
 from plex_manager.adapters import encryption
-from plex_manager.config import get_settings
+from plex_manager.config import Settings, get_settings
 
 
 @pytest.fixture
@@ -61,3 +63,31 @@ def test_prepare_encryption_initialized_aborts_on_missing_key(file_backed_key: P
     with pytest.raises(RuntimeError, match="Encryption key not found"):
         encryption.prepare_encryption(initialized=True)
     assert not file_backed_key.exists()
+
+
+def test_fernet_key_is_a_secret_and_never_leaks_in_repr() -> None:
+    """The override key is a ``SecretStr`` so it cannot leak via ``repr``/logs."""
+    key = Fernet.generate_key().decode()
+    settings = Settings(fernet_key=SecretStr(key))
+    assert isinstance(settings.fernet_key, SecretStr)
+    # Neither the field repr nor the whole-settings repr exposes the plaintext.
+    assert key not in repr(settings.fernet_key)
+    assert key not in repr(settings)
+    assert key not in str(settings)
+    # The raw value is still recoverable for the encryption layer.
+    assert settings.fernet_key.get_secret_value() == key
+
+
+def test_secret_override_still_drives_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``SecretStr`` override is read via ``get_secret_value`` and used as the key."""
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("PLEX_MANAGER_FERNET_KEY", key)
+    get_settings.cache_clear()
+    encryption.reset_fernet_cache()
+    try:
+        assert isinstance(get_settings().fernet_key, SecretStr)
+        token = encryption.get_fernet().encrypt(b"hi")
+        assert Fernet(key.encode()).decrypt(token) == b"hi"
+    finally:
+        get_settings.cache_clear()
+        encryption.reset_fernet_cache()

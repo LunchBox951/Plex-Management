@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from plex_manager.domain.reconciler import failed_download_events, reconcile
+from plex_manager.domain.reconciler import (
+    failed_download_events,
+    reconcile,
+    unmapped_client_states,
+)
 from plex_manager.domain.state_machine import (
     TERMINAL_STATES,
     DownloadState,
@@ -126,9 +130,18 @@ async def reconcile_and_list(
     transitions = reconcile(rows, statuses, now=now)
     snapshot = {status.info_hash.lower(): status for status in statuses}
 
+    # Honesty over silence: surface every unmapped raw client state on EVERY
+    # cycle, even when it maps to the row's current state and so emits no
+    # transition (otherwise the unknown string would be swallowed). This is
+    # independent of the transition loop below, which only fires on a change.
+    for torrent_hash, raw_state in unmapped_client_states(rows, statuses):
+        _logger.warning(
+            "download %s: unmapped qBittorrent state %r; tracking as downloading",
+            torrent_hash,
+            raw_state,
+        )
+
     for transition in transitions:
-        if transition.reason is not None and "unknown client state" in transition.reason:
-            _logger.warning("download %s: %s", transition.torrent_hash, transition.reason)
         live = snapshot.get(transition.torrent_hash.lower())
         await download_repo.update_status(
             transition.download_id,

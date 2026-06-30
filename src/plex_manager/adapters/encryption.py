@@ -49,6 +49,21 @@ logger = logging.getLogger(__name__)
 _fernet: Fernet | None = None
 
 
+def _fernet_override(settings: Settings) -> str | None:
+    """Return the configured key-override plaintext, or ``None`` when unset/empty.
+
+    ``Settings.fernet_key`` is a :class:`~pydantic.SecretStr` so the key never
+    leaks through a settings ``repr`` or a log line; the raw value is read here
+    via ``.get_secret_value()``. An unset (``None``) or empty override yields
+    ``None`` so the caller falls back to the key file — identical to the prior
+    truthiness check on the bare string.
+    """
+    if settings.fernet_key is None:
+        return None
+    value = settings.fernet_key.get_secret_value()
+    return value or None
+
+
 def secret_key_path(settings: Settings | None = None) -> Path:
     """Return the path to the Fernet key file (``<data_dir>/secret.key``)."""
     settings = settings or get_settings()
@@ -95,8 +110,9 @@ def get_fernet() -> Fernet:
         return _fernet
     settings = get_settings()
     # An explicit override always wins and is never persisted to the file.
-    if settings.fernet_key:
-        _fernet = Fernet(settings.fernet_key.encode())
+    override = _fernet_override(settings)
+    if override is not None:
+        _fernet = Fernet(override.encode())
         return _fernet
     key_path = secret_key_path(settings)
     if not key_path.exists():
@@ -116,8 +132,9 @@ def ensure_secret_key() -> Fernet:
     if _fernet is not None:
         return _fernet
     settings = get_settings()
-    if settings.fernet_key:
-        _fernet = Fernet(settings.fernet_key.encode())
+    override = _fernet_override(settings)
+    if override is not None:
+        _fernet = Fernet(override.encode())
         return _fernet
     key_path = secret_key_path(settings)
     if key_path.exists():

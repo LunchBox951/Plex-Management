@@ -1,0 +1,183 @@
+"""Fake adapters implementing the ports, with canned data, for the web suite.
+
+These satisfy the runtime-checkable port Protocols (no live network) and are
+injected via ``app.dependency_overrides``. The decision path uses the REAL
+``GuessitParser`` and the REAL default profile, so the CAM/TS-vs-good ranking is
+genuinely exercised — only the I/O edges (TMDB / Prowlarr / qBittorrent) are
+faked.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from fastapi import FastAPI
+
+from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
+from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.metadata import (
+    MediaSearchResult,
+    MetadataPort,
+    MovieMetadata,
+    TvMetadata,
+)
+from plex_manager.web.deps import get_prowlarr, get_qbittorrent, get_tmdb
+
+__all__ = [
+    "FakeProwlarr",
+    "FakeQbittorrent",
+    "FakeTmdb",
+    "candidate",
+    "good_and_cam_candidates",
+    "override_adapters",
+    "prerelease_only_candidates",
+]
+
+_EPOCH = datetime(2020, 1, 1, tzinfo=UTC)
+
+
+def candidate(
+    title: str,
+    *,
+    info_hash: str | None = None,
+    seeders: int = 10,
+    size_bytes: int = 1_000_000_000,
+    magnet: bool = True,
+) -> CandidateRelease:
+    """Build a torrent :class:`CandidateRelease` (magnet by default)."""
+    magnet_url = f"magnet:?xt=urn:btih:{info_hash or 'deadbeef'}" if magnet else None
+    return CandidateRelease(
+        guid=title,
+        title=title,
+        size_bytes=size_bytes,
+        magnet_url=magnet_url,
+        download_url=None if magnet else f"http://idx.local/{title}",
+        info_hash=info_hash,
+        seeders=seeders,
+        leechers=1,
+        indexer_id=1,
+        indexer_name="FakeIndexer",
+        publish_date=_EPOCH,
+    )
+
+
+def good_and_cam_candidates() -> list[CandidateRelease]:
+    """A good WEBDL-1080p release plus a CAM and a TS (both rejected)."""
+    return [
+        candidate(
+            "Some.Movie.2020.CAM.x264-GROUP",
+            info_hash="1" * 40,
+            seeders=500,
+        ),
+        candidate(
+            "Some.Movie.2020.HDTS.x264-GROUP",
+            info_hash="2" * 40,
+            seeders=400,
+        ),
+        candidate(
+            "Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+            info_hash="3" * 40,
+            seeders=42,
+        ),
+    ]
+
+
+def prerelease_only_candidates() -> list[CandidateRelease]:
+    """Only pre-release (CAM/TS) candidates — nothing acceptable."""
+    return [
+        candidate("Some.Movie.2020.CAM.x264-GROUP", info_hash="1" * 40),
+        candidate("Some.Movie.2020.HDTS.x264-GROUP", info_hash="2" * 40),
+    ]
+
+
+class FakeTmdb:
+    """In-memory :class:`MetadataPort` with canned search + detail."""
+
+    def __init__(
+        self,
+        *,
+        movies: dict[int, MovieMetadata] | None = None,
+        shows: dict[int, TvMetadata] | None = None,
+        results: list[MediaSearchResult] | None = None,
+    ) -> None:
+        self.movies = movies or {}
+        self.shows = shows or {}
+        self.results = results or []
+
+    async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
+        return list(self.results)
+
+    async def get_movie(self, tmdb_id: int) -> MovieMetadata | None:
+        return self.movies.get(tmdb_id)
+
+    async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
+        return self.shows.get(tmdb_id)
+
+
+class FakeProwlarr:
+    """In-memory :class:`IndexerPort` returning a fixed candidate set."""
+
+    def __init__(self, candidates: list[CandidateRelease] | None = None) -> None:
+        self.candidates = candidates or []
+        self.searched: list[IndexerSearchRequest] = []
+
+    async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+        self.searched.append(request)
+        return list(self.candidates)
+
+
+class FakeQbittorrent:
+    """In-memory :class:`DownloadClientPort` recording adds + canned statuses."""
+
+    def __init__(self, statuses: list[DownloadStatus] | None = None) -> None:
+        self.statuses = statuses or []
+        self.added: list[tuple[str, str, str]] = []
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        self.added.append((magnet_or_url, save_path, category))
+        # Mirror the real adapter: derive the info-hash from the magnet's btih.
+        marker = "urn:btih:"
+        if marker in magnet_or_url:
+            return magnet_or_url.split(marker, 1)[1].split("&", 1)[0].lower()
+        return ""
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        for status in self.statuses:
+            if status.info_hash.lower() == info_hash.lower():
+                return status
+        return None
+
+    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+        return list(self.statuses)
+
+    async def pause(self, info_hash: str) -> None:
+        return None
+
+    async def resume(self, info_hash: str) -> None:
+        return None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        return None
+
+    async def set_category(self, info_hash: str, category: str) -> None:
+        return None
+
+    async def get_save_path(self, info_hash: str) -> str | None:
+        return None
+
+
+def override_adapters(
+    app: FastAPI,
+    *,
+    tmdb: MetadataPort | None = None,
+    prowlarr: IndexerPort | None = None,
+    qbt: DownloadClientPort | None = None,
+) -> None:
+    """Point the adapter dependencies at the supplied fakes."""
+    if tmdb is not None:
+        app.dependency_overrides[get_tmdb] = lambda: tmdb
+    if prowlarr is not None:
+        app.dependency_overrides[get_prowlarr] = lambda: prowlarr
+    if qbt is not None:
+        app.dependency_overrides[get_qbittorrent] = lambda: qbt

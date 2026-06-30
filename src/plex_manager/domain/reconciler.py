@@ -44,6 +44,7 @@ __all__ = [
     "StateTransition",
     "failed_download_events",
     "reconcile",
+    "unmapped_client_states",
 ]
 
 
@@ -109,6 +110,28 @@ class StateTransition:
     to_state: DownloadState
     reason: str | None
     set_first_seen_at: bool = False
+
+
+def unmapped_client_states(
+    rows: Sequence[DownloadRecord],
+    client: Sequence[DownloadStatus],
+) -> list[tuple[str, str]]:
+    """Return ``(torrent_hash, raw_state)`` for tracked rows on an unknown raw state.
+
+    Pure detector for honesty over silence: an unknown qBittorrent state maps to
+    the conservative ``Downloading`` fallback, so when the row is *already*
+    ``downloading`` :func:`reconcile` emits no transition and the unmapped string
+    would otherwise vanish. The caller logs each pair every cycle so an unexpected
+    client state is always surfaced — not only when it happens to change the row's
+    state. Scoped to the supplied (active) rows; unrelated torrents in the client
+    are ignored. Order follows the client snapshot for deterministic logging.
+    """
+    tracked = {row.torrent_hash.lower() for row in rows}
+    return [
+        (status.info_hash, status.raw_state)
+        for status in client
+        if status.info_hash.lower() in tracked and status.raw_state not in _RAW_STATE_MAP
+    ]
 
 
 def _map_raw_state(raw_state: str) -> tuple[DownloadState, str | None]:
