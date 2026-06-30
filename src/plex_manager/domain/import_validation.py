@@ -207,7 +207,14 @@ def validate_import(
 
     chosen = max(videos, key=lambda video: video.size_bytes)
     name = _basename(chosen.relative_path)
-    parsed = parser.parse(name)
+    # Parse the FULL relative path, not just the basename: a release that ships a
+    # generic feature file (``movie.mkv``) under a token-rich folder
+    # (``The.Matrix.1999.1080p.WEB-DL/``) carries its identity + quality tokens in
+    # the FOLDER. The borrowed parser reads every path component (folder name
+    # included), so a folder-qualified parse recovers them; a path that is generic
+    # at every level still parses to an unknown title and is honestly rejected. The
+    # human-facing ``name`` stays the basename for readable rejection details.
+    parsed = parser.parse(chosen.relative_path.replace("\\", "/"))
 
     rejections: list[ImportRejection] = []
 

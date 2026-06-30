@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse, Response
 
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
@@ -141,6 +142,8 @@ _ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
     TmdbApiError: (502, "tmdb_unavailable"),
     QbittorrentAuthError: (502, "qbittorrent_auth_failed"),
     QbittorrentError: (502, "qbittorrent_unavailable"),
+    PlexAuthError: (502, "plex_auth_failed"),
+    PlexLibraryError: (502, "plex_unavailable"),
 }
 
 

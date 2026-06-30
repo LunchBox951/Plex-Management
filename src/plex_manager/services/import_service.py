@@ -96,16 +96,24 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
 def _resolve_source(fs: FileSystemPort, content_path: str) -> tuple[str, int, str]:
     """Find the primary video file under ``content_path``: ``(abs_path, size, rel)``.
 
-    ``rel`` is the path RELATIVE to the content root (the download's own folder), so
-    a split-disk layout like ``Movie/CD1/movie.mkv`` reaches the validator as
-    ``CD1/movie.mkv`` and its multi-part check fires — passing only the basename
-    would strip ``CD1`` and silently import one half as the whole movie.
+    ``rel`` includes the release FOLDER, not just the file. A torrent whose folder
+    carries the title/quality (``The.Matrix.1999.1080p.WEB-DL/movie.mkv``) but ships
+    a generic feature file would otherwise reach the validator as a token-less
+    ``movie.mkv`` and be wrongly rejected as wrong/unknown media; anchoring the
+    relative path ABOVE the download root keeps the folder tokens — and any
+    ``CD1``/``Disc 1`` split-disk marker under it — in the string the validator
+    parses. For a single-file torrent (``content_path`` is the file) the anchor is
+    the save dir, so ``rel`` is just the token-rich filename, which is sufficient.
     """
     src = fs.largest_video_file(content_path)
     if src is None:
         raise _NoVideoError(content_path)
-    root = content_path if os.path.isdir(content_path) else os.path.dirname(content_path)
-    return src, os.path.getsize(src), os.path.relpath(src, root)
+    anchor = (
+        os.path.dirname(os.path.normpath(content_path))
+        if os.path.isdir(content_path)
+        else os.path.dirname(content_path)
+    )
+    return src, os.path.getsize(src), os.path.relpath(src, anchor)
 
 
 def _place_file(fs: FileSystemPort, src: str, dst: Path) -> None:
@@ -124,7 +132,17 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> None:
         # blind-delete it (that is data loss) — surface it as an import conflict the
         # operator resolves, instead of overwriting their file with the download.
         raise FileExistsError(f"destination already exists with different content: {dst}")
-    fs.hardlink_or_copy(Path(src), dst)
+    try:
+        fs.hardlink_or_copy(Path(src), dst)
+    except FileExistsError:
+        # Lost a placement race: a concurrent import (the reconcile loop racing the
+        # operator's POST /queue/{id}/import retry) created ``dst`` between the
+        # exists() check above and this link. Same content (same size) is an
+        # idempotent win for the other attempt, NOT a failure to block on; a
+        # different size is a genuine conflict, surfaced like the pre-existing case.
+        if dst.exists() and dst.stat().st_size == os.path.getsize(src):
+            return
+        raise
 
 
 def _remove_quietly(path: Path) -> None:

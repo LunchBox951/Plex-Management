@@ -131,6 +131,137 @@ async def test_import_happy_path_places_file_scans_and_marks_completed(
         assert request.completed_at is not None
 
 
+async def test_import_generic_file_under_release_folder_succeeds(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A folder torrent whose NAME carries the title/year/quality, containing a
+    # generic feature file (movie.mkv). _resolve_source anchors the relative path
+    # above the download root so the folder tokens reach the validator, whose
+    # full-path parse identifies it — the import succeeds instead of blocking as
+    # wrong/unknown media.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "movie.mkv")
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.completed
+
+
+class _LosingRaceFs(LocalFileSystem):
+    """A LocalFileSystem that always loses a placement race: on ``hardlink_or_copy``
+    it finds ``dst`` already created by the 'winning' concurrent import (sized
+    ``winner_size``) and raises ``FileExistsError`` — exactly what ``os.link`` raises
+    on EEXIST when another import won the race."""
+
+    def __init__(self, winner_size: int) -> None:
+        self._winner_size = winner_size
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+        _make_video(dst, self._winner_size)
+        raise FileExistsError(str(dst))
+
+
+async def _import_with_fs(
+    sessionmaker_: SessionMaker,
+    download_id: int,
+    movies_root: Path,
+    qbt: FakeQbittorrent,
+    library: FakeLibrary,
+    fs: LocalFileSystem,
+) -> DownloadRecord | None:
+    async with sessionmaker_() as session:
+        return await import_download(
+            download_id=download_id,
+            fs=fs,
+            library=library,
+            qbt=qbt,
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(movies_root),
+        )
+
+
+async def test_import_idempotent_when_placement_race_lost_to_same_size(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # The operator's retry races the reconcile loop; this import's hardlink raises
+    # EEXIST, but the winner already placed an identical (same-size) file. That is an
+    # idempotent win — the import completes, it is NOT blocked.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video, 60 * 1024 * 1024)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        _LosingRaceFs(winner_size=60 * 1024 * 1024),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.completed
+
+
+async def test_import_blocks_when_placement_race_lost_to_different_size(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A DIFFERENT-sized file already at the destination after the race is a genuine
+    # conflict (a user's manually-managed file) — surfaced as ImportBlocked, never
+    # overwritten.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video, 60 * 1024 * 1024)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        _LosingRaceFs(winner_size=10 * 1024 * 1024),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
 async def test_import_rejects_cam_as_blocked_not_imported(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

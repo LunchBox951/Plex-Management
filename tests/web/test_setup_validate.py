@@ -135,6 +135,41 @@ async def test_validate_plex_ok_returns_movie_libraries(
     assert body["libraries"][0]["writable"] is True
 
 
+async def test_validate_plex_no_movie_library_blocks_setup(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # Plex is reachable and the token is valid, but there is no Movie library: an
+    # install that cannot import anything must be reported as not-ok so the wizard
+    # stops here instead of finishing into a configured-but-unusable state.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/library/sections"
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "Directory": [
+                        {
+                            "key": "2",
+                            "title": "Shows",
+                            "type": "show",
+                            "Location": [{"path": "/tv"}],
+                        }
+                    ]
+                }
+            },
+        )
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": "tok"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["libraries"] == []
+    assert "Movie library" in body["message"]
+
+
 async def test_validate_plex_bad_token(client: httpx.AsyncClient, app: FastAPI) -> None:
     await _use_transport(app, lambda _r: httpx.Response(401, json={}))
     response = await client.post(

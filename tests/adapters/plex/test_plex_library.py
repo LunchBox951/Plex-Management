@@ -139,6 +139,29 @@ async def test_list_sections_is_cached_per_base_url() -> None:
     assert calls["n"] == 1  # second call served from the module-level cache
 
 
+async def test_list_sections_cache_is_keyed_by_token_not_just_url() -> None:
+    # A rotated or mistyped token for the SAME server must not read back the previous
+    # token's cached sections; otherwise a bad credential could surface a stale
+    # "Connected to Plex" and be saved. The cache key includes a hash of the token.
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        return httpx.Response(404, json={})
+
+    base = "http://rotated-plex:32400"
+    token_a = "token-a-value"  # noqa: S105 — test fixture, not a real secret
+    token_b = "token-b-value"  # noqa: S105 — test fixture, not a real secret
+    client = httpx.AsyncClient(transport=httpx.MockTransport(counting))
+    await PlexLibrary(client, base_url=base, token=token_a).list_sections()
+    await PlexLibrary(client, base_url=base, token=token_b).list_sections()
+    assert calls["n"] == 2  # token-B must NOT be served from token-A's cache entry
+    await PlexLibrary(client, base_url=base, token=token_a).list_sections()
+    assert calls["n"] == 2  # token-A is still served from its own cache entry
+
+
 # --------------------------------------------------------------------------- #
 # is_available — GUID parsing
 # --------------------------------------------------------------------------- #

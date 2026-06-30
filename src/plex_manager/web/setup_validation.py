@@ -94,9 +94,15 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
         )
     libraries = movie_library_options(sections)
     if not libraries:
+        # Connectivity + token are fine, but an install with no Movie library cannot
+        # import anything (every scan would raise "no Plex movie library section").
+        # Report ok=False so the wizard stops here instead of letting the operator
+        # finish into a configured-but-unusable state — north-star: honest, with a
+        # next step, never a silent pass.
         return ServiceValidateResponse(
-            ok=True,
-            message="Connected to Plex, but no Movie library was found — add one in Plex.",
+            ok=False,
+            message="Connected to Plex, but no Movie library exists yet — "
+            "add a Movie library in Plex, then test again.",
             libraries=[],
         )
     return ServiceValidateResponse(ok=True, message="Connected to Plex.", libraries=libraries)

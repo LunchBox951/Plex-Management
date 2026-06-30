@@ -11,13 +11,19 @@ later). The token is sent in the ``X-Plex-Token`` header — NEVER in the URL (w
 could be logged) — and is redacted from ``repr``.
 
 Caching: the web layer builds a fresh adapter per request, so the section list and
-the set of present tmdb ids live in MODULE-LEVEL TTL caches keyed by ``base_url``
-(a per-instance cache would never be hit). The TTL is short — availability changes
-when a scan completes, and a stale "present" answer for a few minutes is harmless.
+the set of present tmdb ids live in MODULE-LEVEL TTL caches keyed by the
+``(base_url, token-hash)`` pair (a per-instance cache would never be hit). The
+token is part of the key so a rotated or mistyped credential for the same server
+re-fetches with the new token instead of returning the previous token's sections —
+otherwise a bad token could read back a stale "Connected to Plex" and be saved.
+Only a SHA-256 of the token enters the key, never the token itself. The TTL is
+short — availability changes when a scan completes, and a stale "present" answer
+for a few minutes is harmless.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -192,6 +198,11 @@ class PlexLibrary:
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._token = token
+        # Cache key = server + a hash of the token, so a different credential for the
+        # same URL never reads back another token's cached sections (the raw token is
+        # never put in the key — north-star: secrets are never logged or persisted).
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        self._cache_key = f"{self._base_url}|{token_hash}"
 
     def __repr__(self) -> str:  # pragma: no cover - trivial, redacts the token
         return f"PlexLibrary(base_url={self._base_url!r}, token='***')"
@@ -257,7 +268,7 @@ class PlexLibrary:
 
     async def list_sections(self) -> list[LibrarySection]:
         """Return the configured library sections (movie / show), cached briefly."""
-        cached = _SECTIONS_CACHE.get(self._base_url)
+        cached = _SECTIONS_CACHE.get(self._cache_key)
         if cached is not None:
             return list(cached)
         payload = await self._get("/library/sections")
@@ -267,7 +278,7 @@ class PlexLibrary:
             section = _parse_section(_as_mapping(entry))
             if section is not None:
                 sections.append(section)
-        _SECTIONS_CACHE.set(self._base_url, tuple(sections))
+        _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
         return sections
 
     async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
@@ -282,11 +293,11 @@ class PlexLibrary:
         # cached ABSENCE: right after an import+scan the first page commonly precedes
         # Plex indexing, so caching that miss would keep the title "Finalizing" for
         # the whole TTL. On a cache miss OR a cached-absent answer, re-page Plex.
-        cached = _PRESENT_TMDB_CACHE.get(self._base_url)
+        cached = _PRESENT_TMDB_CACHE.get(self._cache_key)
         if cached is not None and tmdb_id in cached:
             return True
         present = await self._collect_present_tmdb_ids()
-        _PRESENT_TMDB_CACHE.set(self._base_url, present)
+        _PRESENT_TMDB_CACHE.set(self._cache_key, present)
         return tmdb_id in present
 
     async def _collect_present_tmdb_ids(self) -> frozenset[int]:
@@ -348,6 +359,7 @@ class PlexLibrary:
                 for section in movie_sections:
                     await self._request(f"/library/sections/{section.key}/refresh", {})
         finally:
-            # Bust the per-server presence index so completed -> available promotion
-            # is not delayed up to the full cache TTL after the file is in Plex.
-            _PRESENT_TMDB_CACHE.invalidate(self._base_url)
+            # Bust the per-credential presence index so completed -> available
+            # promotion is not delayed up to the full cache TTL after the file is in
+            # Plex.
+            _PRESENT_TMDB_CACHE.invalidate(self._cache_key)

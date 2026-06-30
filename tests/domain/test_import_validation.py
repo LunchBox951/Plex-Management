@@ -50,6 +50,16 @@ _FIELDS: dict[str, dict[str, object]] = {
         "screen_size": "1080p",
     },
     "sample.mkv": {"title": "sample"},
+    # A token-rich release FOLDER over a generic feature file: the validator must
+    # parse the full relative path (folder included), so only the folder-qualified
+    # key resolves to The Matrix; the bare "movie.mkv" is deliberately generic.
+    "movie.mkv": {"title": "movie"},
+    "The.Matrix.1999.1080p.WEB-DL/movie.mkv": {
+        "title": "The Matrix",
+        "year": "1999",
+        "source": "Web",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -185,6 +195,19 @@ def test_multi_part_rejects() -> None:
     assert result.accepted is False
     reasons = {r.reason for r in result.rejections}
     assert ImportRejectionReason.MULTI_PART in reasons
+
+
+def test_generic_file_under_token_rich_folder_accepts() -> None:
+    # The release folder carries the title/year/quality; the feature file is generic
+    # ("movie.mkv"). Parsing the FULL relative path recovers the tokens, so a valid
+    # download is accepted instead of rejected as wrong/unknown media.
+    result = _validate(
+        VideoFile("The.Matrix.1999.1080p.WEB-DL/movie.mkv", 8 * _GIB),
+    )
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.parsed is not None
+    assert result.parsed.clean_title == "The Matrix"
 
 
 def test_all_applicable_rejections_collected() -> None:
