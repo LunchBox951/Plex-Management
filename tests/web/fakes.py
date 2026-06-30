@@ -133,6 +133,7 @@ class FakeQbittorrent:
     def __init__(self, statuses: list[DownloadStatus] | None = None) -> None:
         self.statuses = statuses or []
         self.added: list[tuple[str, str, str]] = []
+        self.removed: list[tuple[str, bool]] = []
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
         self.added.append((magnet_or_url, save_path, category))
@@ -158,7 +159,7 @@ class FakeQbittorrent:
         return None
 
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
-        return None
+        self.removed.append((info_hash.lower(), delete_files))
 
     async def set_category(self, info_hash: str, category: str) -> None:
         return None

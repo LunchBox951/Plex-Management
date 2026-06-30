@@ -242,10 +242,15 @@ def _api_key_matches(provided: str | None, expected: str | None) -> bool:
     Fernet-encrypted at rest). ``hmac.compare_digest`` keeps the comparison
     timing-safe. A missing header or an uninitialised install (no stored key)
     never matches.
+
+    The values are compared as UTF-8 BYTES: ``hmac.compare_digest`` raises
+    ``TypeError`` on a ``str`` containing non-ASCII characters, so a malformed
+    header would otherwise surface as an unhandled 500 instead of an honest 401.
+    Encoding both sides keeps the comparison constant-time and total.
     """
     if not provided or not expected:
         return False
-    return hmac.compare_digest(provided, expected)
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
 async def require_api_key(

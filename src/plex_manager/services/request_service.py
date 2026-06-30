@@ -9,7 +9,7 @@ request is *returned*, not silently re-created, so a double-submit is idempotent
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
 
@@ -23,12 +23,23 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import RequestRecord
 
 __all__ = [
+    "TERMINAL_REQUEST_STATUS_VALUES",
     "MediaNotFoundError",
     "create_request",
     "get_request",
     "list_requests",
     "mark_no_acceptable_release",
 ]
+
+# Request statuses (string values) at which a request is FINISHED. A terminal
+# request must never be re-armed to a non-terminal status: a newer ACTIVE request
+# for the same ``(tmdb_id, media_type)`` owns the ``uq_media_requests_active``
+# slot, so resurrecting an old terminal row as active would re-block dedup against
+# a dead-end ghost. The canonical source for the string-valued set (the SQL-side
+# enum set lives in ``repositories.requests``); ``grab_service`` reuses this.
+TERMINAL_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value for s in (RequestStatus.completed, RequestStatus.available, RequestStatus.failed)
+)
 
 
 class MediaNotFoundError(Exception):
@@ -126,8 +137,16 @@ async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> 
     ``searching`` — a dishonest status asserting progress that is not happening.
     ``no_acceptable_release`` is a visible, retryable state (the operator can
     re-search later), not a silent ``failed``.
+
+    A request that is already TERMINAL (``completed`` / ``available`` / ``failed``)
+    is left untouched: ``no_acceptable_release`` is itself non-terminal and
+    dedup-blocking, so writing it over a finished request would resurrect it as a
+    ghost that re-blocks a fresh request for the same media. Never un-terminate a
+    finished request.
     """
-    await SqlRequestRepository(session).set_status(
-        request_id, RequestStatus.no_acceptable_release.value
-    )
+    repo = SqlRequestRepository(session)
+    current = await repo.get(request_id)
+    if current is not None and current.status in TERMINAL_REQUEST_STATUS_VALUES:
+        return
+    await repo.set_status(request_id, RequestStatus.no_acceptable_release.value)
     await session.commit()

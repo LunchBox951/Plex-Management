@@ -13,11 +13,13 @@ from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import grab_service, queue_service, request_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
     NoGrabSourceError,
+    RequestNotActiveError,
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
@@ -99,6 +101,16 @@ async def grab_endpoint(
     if request is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
 
+    if request.status in request_service.TERMINAL_REQUEST_STATUS_VALUES:
+        # A stale TERMINAL request id (completed / available / failed) is not
+        # grabbable: a newer ACTIVE request for the same media owns the
+        # uq_media_requests_active slot. Reject up front — BEFORE run_preview can
+        # reach the empty-preview branch and flip this finished request to the
+        # non-terminal dead-end no_acceptable_release (which would resurrect it as
+        # a dedup-blocking ghost), and before grab can hand anything to the client.
+        # Mirrors grab_service's RequestNotActiveError guard so both paths agree.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
+
     result = await run_preview(
         # Carry the season so a TV grab searches (and later records) the right
         # season; it is None for a movie and so leaves movie behaviour unchanged.
@@ -111,7 +123,12 @@ async def grab_endpoint(
     if not result.accepted:
         # Honesty over silence: reflect the dead-end on the owning request so it
         # does not linger as 'downloading'/'searching' with nothing in flight.
-        await request_service.mark_no_acceptable_release(session, request.id)
+        # BUT only when nothing is actually in flight: a re-search for a request
+        # that ALREADY has an active download must not flip it to a dead-end status
+        # while that download is still running. Leave such a request untouched.
+        active = await SqlDownloadRepository(session).find_active_for_request(request.id)
+        if active is None:
+            await request_service.mark_no_acceptable_release(session, request.id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)
@@ -127,6 +144,13 @@ async def grab_endpoint(
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
+    except RequestNotActiveError as exc:
+        # A stale terminal request id was grabbed while a newer active request owns
+        # the media. Refused before anything was added to the client (no untracked
+        # torrent), surfaced honestly so the operator grabs the live request.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="request_not_active"
+        ) from exc
     except AlreadyDownloadingError as exc:
         # The request already has an active download for a different release;
         # refuse the parallel grab instead of spawning a second active row.

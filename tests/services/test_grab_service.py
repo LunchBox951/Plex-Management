@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -10,7 +12,7 @@ from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.release import ParsedRelease, ScoredRelease
 from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
 from plex_manager.services import grab_service
-from plex_manager.services.grab_service import GrabError
+from plex_manager.services.grab_service import GrabError, RequestNotActiveError
 from tests.web.fakes import FakeQbittorrent, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -77,6 +79,81 @@ async def test_grab_reuses_terminal_row_and_reowns_to_current_request(
     assert len(rows) == 1  # reused, not duplicated
     assert row.media_request_id == new_id  # re-owned to the CURRENT request
     assert row.failed_reason is None  # stale failure reason cleared
+
+
+async def test_grab_reuse_clears_stale_first_seen_at_grace_anchor(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A terminal row that previously went ClientMissing carries an old
+    first_seen_at anchor. Re-grabbing it must reset that anchor to NULL, or the
+    reconciler would fast-fail the fresh grab against the long-expired window."""
+    stale_anchor = datetime(2020, 1, 1, tzinfo=UTC)
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.searching
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=req_id,
+                tmdb_id=100,
+                failed_reason="prior failure",
+                first_seen_at=stale_anchor,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=req_id,
+            tmdb_id=100,
+        )
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.status == "downloading"
+    assert row.first_seen_at is None  # stale grace anchor cleared on re-grab
+
+
+async def test_grab_rejects_terminal_request_and_adds_nothing(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Grabbing a stale TERMINAL request id (a newer active request owns the media)
+    is refused BEFORE anything reaches the client: re-arming the old row would be
+    rejected by uq_media_requests_active only after an untracked torrent was added."""
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.completed
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(RequestNotActiveError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=req_id,
+                tmdb_id=100,
+            )
+    # Nothing was handed to the client, and no row was tracked.
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert rows == []
 
 
 async def test_grab_raises_when_no_info_hash_can_be_determined(

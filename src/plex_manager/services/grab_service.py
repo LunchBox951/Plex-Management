@@ -17,6 +17,7 @@ request never ends up with two active downloads racing each other.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +30,7 @@ from plex_manager.models import (
 )
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,8 +44,11 @@ __all__ = [
     "AlreadyDownloadingError",
     "GrabError",
     "NoGrabSourceError",
+    "RequestNotActiveError",
     "grab",
 ]
+
+_logger = logging.getLogger(__name__)
 
 # The qBittorrent category the app tags its torrents with (lets a later import
 # pipeline filter to only app-managed downloads).
@@ -98,6 +103,24 @@ class GrabError(Exception):
         super().__init__(f"could not determine torrent hash for {title}")
 
 
+class RequestNotActiveError(Exception):
+    """The request being grabbed is already terminal — refuse before adding anything.
+
+    Surfaced (HTTP 409 ``request_not_active``), never a silent 500. A stale,
+    terminal request id (``completed`` / ``available`` / ``failed``) can still be
+    handed to ``/queue/grab``; a newer ACTIVE request for the same
+    ``(tmdb_id, media_type)`` now owns the ``uq_media_requests_active`` slot. Adding
+    the torrent first and only then trying to drive the old row back to
+    ``downloading`` would have the partial unique index reject the update, leaving
+    an untracked torrent behind. Honesty over silence: reject up front so nothing
+    is added.
+    """
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(f"request {request_id} is terminal and cannot be grabbed")
+
+
 async def _reuse_terminal_row(
     download_repo: SqlDownloadRepository,
     download_id: int,
@@ -111,11 +134,18 @@ async def _reuse_terminal_row(
     rather than colliding on a fresh insert. The stale failure reason is cleared
     and ``media_request_id`` is repointed at the CURRENT request (it may differ
     from the prior owner) so the row is owned by the active request.
+
+    The stale ``first_seen_at`` grace anchor is also reset: a row that previously
+    went ``ClientMissing`` carries its old anchor, and driving it straight back to
+    ``Downloading`` without clearing it would let the reconciler fast-fail this
+    fresh grab against the long-expired window. ``clear_first_seen_at`` gives the
+    re-grab a clean grace window.
     """
     await download_repo.update_status(
         download_id,
         DownloadState.Downloading.value,
         clear_failed_reason=True,
+        clear_first_seen_at=True,
         media_request_id=request_id,
     )
     record = await download_repo.get_by_hash(torrent_hash)
@@ -147,6 +177,16 @@ async def grab(
     source = candidate.magnet_url or candidate.download_url
     if source is None:
         raise NoGrabSourceError(candidate.guid)
+
+    # Reject a stale/terminal request id BEFORE handing anything to the client. If
+    # this request is already terminal, a newer ACTIVE request for the same media
+    # owns the ``uq_media_requests_active`` slot, so re-arming this row to
+    # ``downloading`` would be rejected by that index — but only AFTER qbt.add had
+    # already created an untracked torrent. Refuse up front so nothing is added.
+    if request_id is not None:
+        request = await SqlRequestRepository(session).get(request_id)
+        if request is not None and request.status in TERMINAL_REQUEST_STATUS_VALUES:
+            raise RequestNotActiveError(request_id)
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
@@ -203,6 +243,22 @@ async def grab(
             if request_id is not None:
                 active = await download_repo.find_active_for_request(request_id)
                 if active is not None and active.torrent_hash != torrent_hash:
+                    # The other release won the request's single active slot. The
+                    # torrent we just added to qBittorrent is now orphaned — nothing
+                    # tracks it, so it would seed forever consuming bandwidth.
+                    # Best-effort remove it (deleting its files) before refusing the
+                    # parallel grab; if the remove fails we still raise, but log it
+                    # so the leak is visible (honesty over silence).
+                    try:
+                        await qbt.remove(torrent_hash, delete_files=True)
+                    except Exception:
+                        _logger.warning(
+                            "failed to remove orphaned torrent %s after losing a "
+                            "parallel grab for request %s",
+                            torrent_hash,
+                            request_id,
+                            exc_info=True,
+                        )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)
             if winner is None:  # pragma: no cover - the conflicting row must exist

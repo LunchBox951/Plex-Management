@@ -13,7 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.release import CandidateRelease
-from plex_manager.models import Download, DownloadHistory, DownloadHistoryEvent, MediaRequest
+from plex_manager.models import (
+    Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
+    MediaRequest,
+    RequestStatus,
+)
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.ports.repositories import DownloadRecord
@@ -485,6 +491,198 @@ async def test_grab_rejects_second_active_release_for_same_request(
         )
     assert len(rows) == 1
     assert rows[0].torrent_hash == _GOOD_HASH
+
+
+async def test_grab_no_acceptable_release_keeps_active_download_status(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A re-search (grab) for a request that ALREADY has an active download, where the
+    fresh preview finds nothing acceptable, must NOT flip the request to the dead-end
+    no_acceptable_release: a download is still in flight, so the request stays
+    'downloading' (honesty over silence cuts both ways — don't assert a dead-end that
+    isn't true)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    # First grab lands an active download and drives the request to 'downloading'.
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=FakeQbittorrent(),
+    )
+    first = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert first.status_code == 201
+
+    # Re-search now returns nothing acceptable while the download is still active.
+    override_adapters(
+        app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=FakeQbittorrent()
+    )
+    second = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == "no_acceptable_release"
+
+    # The request was left untouched — still downloading, not a false dead-end.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None
+    assert request.status.value == "downloading"
+
+
+async def test_grab_terminal_request_returns_409_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Grabbing a stale TERMINAL request id is an honest 409 request_not_active and
+    nothing is handed to the client (no untracked torrent left behind)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    # Drive the request terminal (a newer active request would own the media slot).
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        request.status = RequestStatus.completed
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "request_not_active"
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert rows == []
+
+
+async def test_grab_terminal_request_with_empty_preview_stays_terminal(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A stale TERMINAL request grabbed when the fresh preview finds nothing
+    acceptable must NOT be flipped to no_acceptable_release: that non-terminal,
+    dedup-blocking status would resurrect the finished request as a ghost. The
+    empty-preview path is rejected up front (409 request_not_active) and the
+    request's terminal status is left intact — never un-terminate a finished
+    request."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    # Drive the request terminal (media already obtained); a newer active request
+    # would own the media slot.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        request.status = RequestStatus.available
+        await session.commit()
+
+    # Only CAM/TS available -> empty preview, the path that previously clobbered
+    # the terminal status via mark_no_acceptable_release.
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=qbt)
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "request_not_active"
+    assert qbt.added == []
+
+    # The terminal status is untouched — the finished request was not resurrected.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None
+    assert request.status.value == "available"
+
+
+async def test_grab_loser_orphaned_torrent_is_removed_from_client(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two DIFFERENT releases for the same request race past the pre-add guard and
+    both reach qBittorrent. The loser's INSERT hits uq_downloads_active_request; it
+    must remove the torrent it just added (best-effort) before returning 409, so no
+    untracked torrent is left seeding."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+
+    real_create = SqlDownloadRepository.create
+    calls = {"n": 0}
+    winner_hash = "9" * 40
+
+    async def conflicting_create(
+        self: SqlDownloadRepository,
+        *,
+        torrent_hash: str,
+        status: str,
+        media_request_id: int | None = None,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+    ) -> DownloadRecord:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            # A concurrent grab of a DIFFERENT release wins the request's single
+            # active slot (committed), then this insert loses the partial-unique
+            # uq_downloads_active_request race.
+            async with sessionmaker_() as winner:
+                winner.add(
+                    Download(
+                        torrent_hash=winner_hash,
+                        status="downloading",
+                        media_request_id=media_request_id,
+                        tmdb_id=tmdb_id,
+                    )
+                )
+                await winner.commit()
+            raise IntegrityError(
+                "INSERT INTO downloads",
+                {},
+                Exception("UNIQUE constraint failed: uq_downloads_active_request"),
+            )
+        return await real_create(
+            self,
+            torrent_hash=torrent_hash,
+            status=status,
+            media_request_id=media_request_id,
+            magnet_link=magnet_link,
+            tmdb_id=tmdb_id,
+            year=year,
+            season=season,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "already_downloading"
+
+    # The loser added its torrent to the client, then removed it (with its files).
+    assert (_GOOD_HASH, True) in qbt.removed
+    # Only the winner's row survives — the loser tracked nothing.
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert {row.torrent_hash for row in rows} == {winner_hash}
 
 
 async def test_queue_requires_api_key(

@@ -68,3 +68,35 @@ async def test_create_request_recovers_from_active_dedup_conflict(
             .all()
         )
     assert len(rows) == 1  # no duplicate active request was created
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [RequestStatus.completed, RequestStatus.available, RequestStatus.failed],
+)
+async def test_mark_no_acceptable_release_never_unterminates_finished_request(
+    sessionmaker_: SessionMaker,
+    terminal_status: RequestStatus,
+) -> None:
+    """A finished (terminal) request is left intact. ``no_acceptable_release`` is
+    itself non-terminal and dedup-blocking, so writing it over a completed /
+    available / failed request would resurrect a dead-end ghost that re-blocks a
+    fresh request for the same media — never un-terminate a finished request."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=888,
+            media_type=MediaType.movie,
+            title="Arrival",
+            status=terminal_status,
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        await request_service.mark_no_acceptable_release(session, request_id)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is terminal_status  # untouched, not no_acceptable_release
