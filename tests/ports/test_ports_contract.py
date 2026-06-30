@@ -74,10 +74,17 @@ class _FakeDownloadClient:
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         return []
 
-    async def pause(self, info_hash: str) -> None: ...
-    async def resume(self, info_hash: str) -> None: ...
-    async def remove(self, info_hash: str, *, delete_files: bool) -> None: ...
-    async def set_category(self, info_hash: str, category: str) -> None: ...
+    async def pause(self, info_hash: str) -> None:
+        return None
+
+    async def resume(self, info_hash: str) -> None:
+        return None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        return None
+
+    async def set_category(self, info_hash: str, category: str) -> None:
+        return None
 
     async def get_save_path(self, info_hash: str) -> str | None:
         return None
