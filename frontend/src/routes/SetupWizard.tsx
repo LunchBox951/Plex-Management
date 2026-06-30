@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Navigate, useNavigate } from 'react-router-dom'
 import {
   type SetupService,
@@ -120,29 +120,82 @@ export function SetupWizard() {
     tmdb: null,
   })
   const [testing, setTesting] = useState<SetupService | null>(null)
+  const [mintedKey, setMintedKey] = useState<string | null>(null)
+  // Per-service generation: bumped on every edit so an in-flight validation whose
+  // fields changed underneath it is discarded (never marks stale creds verified).
+  const validationGen = useRef<Record<SetupService, number>>({
+    plex: 0,
+    prowlarr: 0,
+    qbittorrent: 0,
+    tmdb: 0,
+  })
+
+  const copyKey = async () => {
+    if (!mintedKey) return
+    try {
+      await navigator.clipboard.writeText(mintedKey)
+      toast({ title: 'Copied to clipboard', intent: 'success' })
+    } catch {
+      toast({ title: 'Copy failed', description: 'Select the key and copy it manually.', intent: 'error' })
+    }
+  }
 
   if (status.isLoading) return <CenteredSpinner label="Loading…" />
+
+  // Setup just completed: reveal the one-time key BEFORE leaving (it is shown
+  // exactly once and is the only thing the in-app key-recovery screen can accept).
+  if (mintedKey) {
+    return (
+      <div className="mx-auto max-w-md px-5 py-24">
+        <div className="rounded-2xl border border-available/40 bg-surface p-6">
+          <div className="font-display text-xl font-extrabold text-available">✓ Setup complete</div>
+          <p className="mt-2 text-sm text-muted">
+            Save your <span className="text-ink">access key</span>. It is shown{' '}
+            <span className="text-ink">only once</span> — you'll need it to sign in from another
+            browser, or if this browser's storage is cleared.
+          </p>
+          <div className="mt-4 flex items-center gap-2 rounded-lg bg-bg p-3 ring-1 ring-inset ring-white/10">
+            <code className="min-w-0 flex-1 truncate font-mono text-sm text-gold select-all">
+              {mintedKey}
+            </code>
+            <Button variant="secondary" size="sm" onClick={() => void copyKey()}>
+              Copy
+            </Button>
+          </div>
+          <Button className="mt-6 w-full" onClick={() => navigate('/', { replace: true })}>
+            I've saved it — continue
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
   // Already configured -> the wizard has nothing to do.
   if (status.data?.initialized) return <Navigate to="/" replace />
 
   const setField = (key: FormKey, value: string, service: SetupService) => {
     setForm((prev) => ({ ...prev, [key]: value }))
-    // Editing a field invalidates that service's prior test result.
+    // Editing a field invalidates that service's prior test result + any in-flight one.
     setResults((prev) => ({ ...prev, [service]: null }))
+    validationGen.current[service] += 1
   }
 
   const test = async (service: SetupService) => {
+    const gen = validationGen.current[service]
     setTesting(service)
     try {
       const res = await validate.mutateAsync({ service, body: bodyFor(service, form) })
+      if (validationGen.current[service] !== gen) return // fields changed; ignore stale result
       setResults((prev) => ({ ...prev, [service]: { ok: res.ok, message: res.message } }))
     } catch (error) {
+      if (validationGen.current[service] !== gen) return
       setResults((prev) => ({
         ...prev,
         [service]: { ok: false, message: asApiError(error).message },
       }))
     } finally {
-      setTesting(null)
+      // Only clear the spinner if this is still the active test for the service.
+      if (validationGen.current[service] === gen) setTesting((t) => (t === service ? null : t))
     }
   }
 
@@ -152,9 +205,14 @@ export function SetupWizard() {
   const onComplete = async () => {
     try {
       const res = await complete.mutateAsync(form)
-      if (res.app_api_key) setApiKey(res.app_api_key)
-      toast({ title: 'Setup complete', intent: 'success' })
-      navigate('/', { replace: true })
+      if (res.app_api_key) {
+        setApiKey(res.app_api_key)
+        // Reveal it once before navigating (see the mintedKey branch above).
+        setMintedKey(res.app_api_key)
+      } else {
+        // No key returned (already-initialized edge) — just proceed.
+        navigate('/', { replace: true })
+      }
     } catch (error) {
       toast({ title: 'Setup failed', description: asApiError(error).message, intent: 'error' })
     }

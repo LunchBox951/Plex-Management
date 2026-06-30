@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useCreateRequest, useGrab, useSearchPreview } from '../api/hooks'
 import type {
   AcceptedRelease,
@@ -43,6 +43,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
   // collide, so tmdb_id alone would carry one title's request state onto another.
   const titleKey = title ? `${title.media_type}:${title.tmdb_id}` : null
+  // Always-current title key, read by async handlers after an await to discard
+  // results that belong to a title the modal has since moved on from.
+  const latestTitleKey = useRef(titleKey)
+  latestTitleKey.current = titleKey
   useEffect(() => {
     setRequestId(null)
     setPreview(null)
@@ -52,6 +56,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const runPreview = useCallback(
     async (forRequestId: number | null) => {
       if (!title) return
+      const startedKey = `${title.media_type}:${title.tmdb_id}`
       const body: SearchPreviewRequest =
         forRequestId !== null
           ? { request_id: forRequestId }
@@ -60,8 +65,11 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         body.year = title.year
       }
       try {
-        setPreview(await searchPreview.mutateAsync(body))
+        const result = await searchPreview.mutateAsync(body)
+        if (latestTitleKey.current !== startedKey) return // modal moved to another title
+        setPreview(result)
       } catch (error) {
+        if (latestTitleKey.current !== startedKey) return
         toast({ title: 'Search failed', description: asApiError(error).message, intent: 'error' })
       }
     },
@@ -70,15 +78,19 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   const onRequest = useCallback(async () => {
     if (!title) return
+    const startedKey = `${title.media_type}:${title.tmdb_id}`
+    const titleName = title.title
     try {
       const created = await createRequest.mutateAsync({
         tmdb_id: title.tmdb_id,
         media_type: title.media_type,
       })
+      if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
       setRequestId(created.id)
-      toast({ title: `Requested ${title.title}`, intent: 'success' })
+      toast({ title: `Requested ${titleName}`, intent: 'success' })
       await runPreview(created.id)
     } catch (error) {
+      if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
   }, [title, createRequest, toast, runPreview])
