@@ -28,7 +28,6 @@ from plex_manager.config import get_settings
 from plex_manager.db import Base, enable_sqlite_fk_enforcement, get_session
 from plex_manager.models import SystemSettings
 from plex_manager.web.app import create_app
-from plex_manager.web.deps import hash_api_key
 
 SessionMaker = async_sessionmaker[AsyncSession]
 SeedFn = Callable[..., Awaitable[None]]
@@ -74,11 +73,10 @@ def seed(sessionmaker_: SessionMaker) -> SeedFn:
     """Return a coroutine that inserts the single ``system_settings`` row."""
 
     async def _seed(*, initialized: bool, app_api_key: str | None = None) -> None:
-        # The column stores only the SHA-256 hash; tests pass the plaintext key in
-        # the X-Api-Key header, so seed the hash of that plaintext here.
-        key_hash = hash_api_key(app_api_key) if app_api_key is not None else None
+        # app_api_key is EncryptedStr — the plaintext is encrypted on commit; tests
+        # pass the same plaintext in the X-Api-Key header.
         async with sessionmaker_() as session:
-            session.add(SystemSettings(initialized=initialized, app_api_key_hash=key_hash))
+            session.add(SystemSettings(initialized=initialized, app_api_key=app_api_key))
             await session.commit()
 
     return _seed

@@ -4,11 +4,11 @@ Wiring rules:
 
 * ``get_session`` reuses :func:`plex_manager.db.get_session`.
 * ``require_api_key`` enforces the static ``X-Api-Key`` header against
-  ``SystemSettings.app_api_key_hash`` — the incoming header is SHA-256-hashed and
-  constant-time-compared, so the plaintext key is never at rest. The header is
-  sourced via ``APIKeyHeader`` so the security scheme appears in the OpenAPI. It
-  is skipped when ``settings.dev_auth_bypass`` is set. Health, setup and docs
-  routes do NOT depend on it.
+  ``SystemSettings.app_api_key`` — which is Fernet-encrypted at rest, so the
+  plaintext is never on disk; the header is constant-time-compared against the
+  decrypted value. The header is sourced via ``APIKeyHeader`` so the security
+  scheme appears in the OpenAPI. It is skipped when ``settings.dev_auth_bypass``
+  is set. Health, setup and docs routes do NOT depend on it.
 * ``SettingsStore`` is the typed access layer over the ``settings`` table: secret
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
@@ -21,7 +21,6 @@ Wiring rules:
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 from typing import Annotated
 
@@ -60,7 +59,6 @@ __all__ = [
     "get_quality_profile",
     "get_session",
     "get_tmdb",
-    "hash_api_key",
     "load_system_settings",
     "require_api_key",
     "require_pre_init_or_api_key",
@@ -74,16 +72,6 @@ API_KEY_HEADER_NAME = "X-Api-Key"
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
-
-
-def hash_api_key(token: str) -> str:
-    """Return the SHA-256 hex digest used to store / compare the app API key.
-
-    The plaintext bearer token is NEVER persisted; only this digest is. Auth then
-    hashes the incoming header and constant-time-compares it to the stored digest,
-    so a DB-backup leak cannot yield a usable key (ADR-0005).
-    """
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -247,35 +235,35 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
 # --------------------------------------------------------------------------- #
 # Authentication
 # --------------------------------------------------------------------------- #
-def _api_key_matches(provided: str | None, expected_hash: str | None) -> bool:
-    """Constant-time check of the incoming header against the stored hash.
+def _api_key_matches(provided: str | None, expected: str | None) -> bool:
+    """Constant-time check of the incoming header against the stored key.
 
-    The header is hashed and ``hmac.compare_digest``-compared to the stored
-    SHA-256 digest, so neither the comparison nor the database read can leak a
-    usable key. A missing header or an uninitialised install (no stored hash)
+    ``expected`` is the decrypted ``SystemSettings.app_api_key`` (the column is
+    Fernet-encrypted at rest). ``hmac.compare_digest`` keeps the comparison
+    timing-safe. A missing header or an uninitialised install (no stored key)
     never matches.
     """
-    if not provided or not expected_hash:
+    if not provided or not expected:
         return False
-    return hmac.compare_digest(hash_api_key(provided), expected_hash)
+    return hmac.compare_digest(provided, expected)
 
 
 async def require_api_key(
     provided: Annotated[str | None, Depends(_api_key_header)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Enforce the ``X-Api-Key`` header against ``SystemSettings.app_api_key_hash``.
+    """Enforce the ``X-Api-Key`` header against ``SystemSettings.app_api_key``.
 
     The header source is :class:`APIKeyHeader`, so the security scheme + per-route
     requirement appear in the exported OpenAPI (generated clients then send the
-    key). The incoming value is SHA-256-hashed and constant-time-compared
-    (``hmac.compare_digest``) to the stored digest — the plaintext key is never at
-    rest. Skipped entirely when ``settings.dev_auth_bypass`` is set (dev only).
+    key). The stored key is Fernet-encrypted at rest; the incoming value is
+    constant-time-compared (``hmac.compare_digest``) against the decrypted value.
+    Skipped entirely when ``settings.dev_auth_bypass`` is set (dev only).
     """
     if get_settings().dev_auth_bypass:
         return
     system = await load_system_settings(session)
-    expected = system.app_api_key_hash if system is not None else None
+    expected = system.app_api_key if system is not None else None
     if not _api_key_matches(provided, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
@@ -302,7 +290,7 @@ async def require_pre_init_or_api_key(
     if get_settings().dev_auth_bypass:
         return
     provided = request.headers.get(API_KEY_HEADER_NAME)
-    if not _api_key_matches(provided, system.app_api_key_hash):
+    if not _api_key_matches(provided, system.app_api_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 

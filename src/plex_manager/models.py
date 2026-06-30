@@ -145,19 +145,19 @@ class Setting(Base):
 
 
 class SystemSettings(Base):
-    """Single-row install state: the setup flag + a HASH of the app API key.
+    """Single-row install state: the setup flag + the app API key (encrypted).
 
     A genuine singleton: the row is pinned to ``id=1`` and a ``CHECK (id = 1)``
     constraint forbids any second row at the database level, so two workers racing
     to initialise an empty DB cannot both insert (the loser hits a PK / CHECK
     violation, caught and resolved to a re-read in :func:`ensure_system_settings`).
 
-    The app API key is stored ONLY as its SHA-256 hex digest
-    (``app_api_key_hash``), never in plaintext: the bearer token is a master
-    credential, so persisting it raw would turn any DB-backup leak into an auth
-    bypass. The plaintext is revealed exactly once in the ``/setup/complete``
-    response; thereafter every request is authenticated by hashing the incoming
-    ``X-Api-Key`` header and constant-time-comparing it to this digest (ADR-0005).
+    The app API key is **encrypted at rest** (Fernet, via :class:`EncryptedStr`),
+    exactly like every other service secret — never stored in plaintext. The
+    encryption key lives only in ``data/secret.key`` (file-only, never in the DB),
+    so a DB-backup leak cannot yield a usable key. The plaintext is revealed once
+    in the ``/setup/complete`` response; thereafter the incoming ``X-Api-Key``
+    header is constant-time-compared against the decrypted value (ADR-0005).
     """
 
     __tablename__ = "system_settings"
@@ -168,8 +168,8 @@ class SystemSettings(Base):
     # ``false`` on PostgreSQL); ``sa.text("0")`` would emit ``DEFAULT 0``, rejected
     # by PostgreSQL on a BOOLEAN column.
     initialized: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
-    # SHA-256 hex digest of the app API key — never the plaintext token.
-    app_api_key_hash: Mapped[str | None] = mapped_column(String)
+    # The app API key, Fernet-encrypted at rest (EncryptedStr) — never plaintext.
+    app_api_key: Mapped[str | None] = mapped_column(EncryptedStr)
     setup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     setup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

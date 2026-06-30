@@ -79,7 +79,9 @@ def upgrade() -> None:
     sa.Column('initialized', sa.Boolean(), server_default=sa.false(), nullable=False),
     # The app API key is stored ONLY as its SHA-256 hex digest, never in plaintext
     # (a DB-backup leak of the raw bearer token would be an auth bypass, ADR-0005).
-    sa.Column('app_api_key_hash', sa.String(), nullable=True),
+    # app_api_key is EncryptedStr (Fernet); its DB-level impl is String, so the
+    # column is plain VARCHAR at rest with encryption applied in the Python layer.
+    sa.Column('app_api_key', sa.String(), nullable=True),
     sa.Column('setup_started_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('setup_completed_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id'),
