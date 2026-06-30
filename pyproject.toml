@@ -15,11 +15,28 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
     "alembic>=1.13",
+    "httpx>=0.27",
+    # Release-name parser (borrowed brains, ADR-0008). Pinned exactly: the
+    # parse output drives the safety-critical CAM/TS hard cutoff, so a silent
+    # upgrade must never shift classification (golden tests guard it too).
+    "guessit==4.0.2",
+    # Fernet encryption for secrets at rest (ADR-0005).
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
+# PostgreSQL drivers (Postgres is a config swap — SQLite is the default, so these
+# are NOT base runtime deps). async_database_url() targets ``postgresql+asyncpg``
+# for the app and sync_database_url() targets a sync DBAPI (psycopg2) for Alembic,
+# so a documented ``postgresql://`` deployment needs BOTH. Install with
+# ``pip install '.[postgres]'``.
+postgres = [
+    "asyncpg>=0.29",
+    "psycopg2-binary>=2.9",
+]
 dev = [
     # Gate tools are pinned exactly so pre-commit, local, and CI never drift
     # (bump deliberately; Dependabot's pip ecosystem proposes updates).
@@ -27,7 +44,7 @@ dev = [
     "pyright==1.1.411",
     "pytest>=8.2",
     "pytest-cov>=5.0",
-    "httpx>=0.27",
+    "pytest-asyncio>=0.23",
     "pip-audit>=2.7",
     "pre-commit>=3.7",
 ]
@@ -72,6 +89,9 @@ reportMissingTypeStubs = false
 # errors flagged but tolerate the unknowns those libraries surface.
 [[tool.pyright.executionEnvironments]]
 root = "tests"
+# Repo root on the path so cross-suite helpers import absolutely as
+# ``tests.web.fakes`` (matching pytest's rootdir-based resolution at runtime).
+extraPaths = ["."]
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
@@ -79,6 +99,7 @@ reportUnknownArgumentType = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=plex_manager --cov-report=term-missing"
+asyncio_mode = "auto"
 
 [tool.coverage.run]
 source = ["plex_manager"]

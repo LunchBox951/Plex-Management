@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint format type test check run migrate docker-build
+.PHONY: help install lint format type test check run migrate openapi docker-build
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -32,6 +32,9 @@ run: ## Run the app locally
 
 migrate: ## Apply database migrations (creates ./data if needed)
 	alembic upgrade head
+
+openapi: ## Export the OpenAPI document to docs/api/openapi.json
+	python -m plex_manager.web.openapi_export
 
 docker-build: ## Build the container image locally
 	docker build -t plex-manager:dev .

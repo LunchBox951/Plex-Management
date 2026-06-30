@@ -13,6 +13,8 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0005](0005-zero-terminal-web-operability.md) | Zero-terminal, web-operable release deployment | Accepted |
 | [0006](0006-download-client-port-qbittorrent.md) | `DownloadClient` port; qBittorrent as v1 adapter | Accepted |
 | [0007](0007-sqlite-alembic-migrations.md) | SQLite + Alembic migrations from day one | Accepted |
+| [0008](0008-release-parser-guessit.md) | `guessit` parses; the quality model stays ours | Accepted |
 
-All accepted on **2026-06-29** during the v2 brainstorming session. Full context:
+ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
+session; 0008 during the first backend-alpha session. Full context:
 [`docs/design/overview.md`](../design/overview.md).

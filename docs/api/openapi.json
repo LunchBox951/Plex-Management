@@ -1,0 +1,1932 @@
+{
+  "components": {
+    "schemas": {
+      "AcceptedRelease": {
+        "description": "A release that passed the quality gate and blocklist, with its ranking.",
+        "properties": {
+          "guid": {
+            "title": "Guid",
+            "type": "string"
+          },
+          "indexer": {
+            "title": "Indexer",
+            "type": "string"
+          },
+          "info_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Info Hash"
+          },
+          "quality_name": {
+            "title": "Quality Name",
+            "type": "string"
+          },
+          "resolution": {
+            "title": "Resolution",
+            "type": "string"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "seeders": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seeders"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "quality_name",
+          "resolution",
+          "source",
+          "score",
+          "indexer",
+          "guid"
+        ],
+        "title": "AcceptedRelease",
+        "type": "object"
+      },
+      "BlocklistEntry": {
+        "description": "A blocklist entry as returned to the client.",
+        "properties": {
+          "added_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Added At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "indexer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indexer"
+          },
+          "media_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Type"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "source_title": {
+            "title": "Source Title",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Id"
+          },
+          "torrent_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Torrent Hash"
+          }
+        },
+        "required": [
+          "id",
+          "source_title",
+          "reason"
+        ],
+        "title": "BlocklistEntry",
+        "type": "object"
+      },
+      "BlocklistResponse": {
+        "description": "A list of blocklist entries.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/BlocklistEntry"
+            },
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "title": "BlocklistResponse",
+        "type": "object"
+      },
+      "CreateRequestBody": {
+        "description": "Create a media request by tmdb id + media type.",
+        "properties": {
+          "media_type": {
+            "enum": [
+              "movie",
+              "tv"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "media_type"
+        ],
+        "title": "CreateRequestBody",
+        "type": "object"
+      },
+      "DiscoverResult": {
+        "description": "One discovery search row.",
+        "properties": {
+          "media_type": {
+            "enum": [
+              "movie",
+              "tv"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "overview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overview"
+          },
+          "poster_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster Url"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "media_type",
+          "title"
+        ],
+        "title": "DiscoverResult",
+        "type": "object"
+      },
+      "DiscoverSearchResponse": {
+        "description": "The discovery search result set.",
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/DiscoverResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "DiscoverSearchResponse",
+        "type": "object"
+      },
+      "GrabRequest": {
+        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; it is ignored for\nmovies.",
+        "properties": {
+          "guid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guid"
+          },
+          "info_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Info Hash"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "integer"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "GrabRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "PlexValidateRequest": {
+        "description": "Candidate Plex credentials to test (``POST /setup/validate/plex``).",
+        "properties": {
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "token"
+        ],
+        "title": "PlexValidateRequest",
+        "type": "object"
+      },
+      "ProwlarrValidateRequest": {
+        "description": "Candidate Prowlarr credentials to test.",
+        "properties": {
+          "api_key": {
+            "title": "Api Key",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "api_key"
+        ],
+        "title": "ProwlarrValidateRequest",
+        "type": "object"
+      },
+      "QbittorrentValidateRequest": {
+        "description": "Candidate qBittorrent credentials to test.",
+        "properties": {
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "username",
+          "password"
+        ],
+        "title": "QbittorrentValidateRequest",
+        "type": "object"
+      },
+      "QualityProfileItemResponse": {
+        "description": "One ordered entry in the quality profile.",
+        "properties": {
+          "allowed": {
+            "title": "Allowed",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "quality_id": {
+            "title": "Quality Id",
+            "type": "integer"
+          },
+          "resolution": {
+            "title": "Resolution",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "quality_id",
+          "name",
+          "source",
+          "resolution",
+          "allowed"
+        ],
+        "title": "QualityProfileItemResponse",
+        "type": "object"
+      },
+      "QualityProfileResponse": {
+        "description": "The serialized default quality profile (ordered low -> high, with cutoff).",
+        "properties": {
+          "cutoff_name": {
+            "title": "Cutoff Name",
+            "type": "string"
+          },
+          "cutoff_quality_id": {
+            "title": "Cutoff Quality Id",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/QualityProfileItemResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "upgrade_allowed": {
+            "title": "Upgrade Allowed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "cutoff_quality_id",
+          "cutoff_name",
+          "upgrade_allowed",
+          "items"
+        ],
+        "title": "QualityProfileResponse",
+        "type": "object"
+      },
+      "QueueItem": {
+        "description": "A tracked download in the live queue.",
+        "properties": {
+          "failed_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Reason"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "media_request_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Request Id"
+          },
+          "progress": {
+            "default": 0.0,
+            "title": "Progress",
+            "type": "number"
+          },
+          "seed_ratio": {
+            "default": 0.0,
+            "title": "Seed Ratio",
+            "type": "number"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Id"
+          },
+          "torrent_hash": {
+            "title": "Torrent Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "torrent_hash",
+          "status"
+        ],
+        "title": "QueueItem",
+        "type": "object"
+      },
+      "QueueResponse": {
+        "description": "The reconciled download queue.",
+        "properties": {
+          "queue": {
+            "items": {
+              "$ref": "#/components/schemas/QueueItem"
+            },
+            "title": "Queue",
+            "type": "array"
+          }
+        },
+        "required": [
+          "queue"
+        ],
+        "title": "QueueResponse",
+        "type": "object"
+      },
+      "RejectedRelease": {
+        "description": "A discarded release paired with its surfaced rejection reason.",
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "reason"
+        ],
+        "title": "RejectedRelease",
+        "type": "object"
+      },
+      "RequestListResponse": {
+        "description": "A list of media requests.",
+        "properties": {
+          "requests": {
+            "items": {
+              "$ref": "#/components/schemas/RequestResponse"
+            },
+            "title": "Requests",
+            "type": "array"
+          }
+        },
+        "required": [
+          "requests"
+        ],
+        "title": "RequestListResponse",
+        "type": "object"
+      },
+      "RequestResponse": {
+        "description": "A media request as returned to the client.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_anime": {
+            "default": false,
+            "title": "Is Anime",
+            "type": "boolean"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
+          }
+        },
+        "required": [
+          "id",
+          "tmdb_id",
+          "media_type",
+          "title",
+          "status"
+        ],
+        "title": "RequestResponse",
+        "type": "object"
+      },
+      "SearchPreviewRequest": {
+        "description": "Preview by ``request_id`` OR by an explicit media descriptor.\n\nWhen ``request_id`` is set the other fields are ignored (resolved from the\nstored request). Otherwise ``tmdb_id``, ``media_type`` and ``title`` are\nrequired.",
+        "properties": {
+          "media_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "movie",
+                  "tv"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Type"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "tmdb_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Id"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
+          }
+        },
+        "title": "SearchPreviewRequest",
+        "type": "object"
+      },
+      "SearchPreviewResponse": {
+        "description": "Ranked accepted releases, per-release rejections, and the empty-set flag.",
+        "properties": {
+          "accepted": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptedRelease"
+            },
+            "title": "Accepted",
+            "type": "array"
+          },
+          "no_acceptable_release": {
+            "title": "No Acceptable Release",
+            "type": "boolean"
+          },
+          "rejected": {
+            "items": {
+              "$ref": "#/components/schemas/RejectedRelease"
+            },
+            "title": "Rejected",
+            "type": "array"
+          }
+        },
+        "required": [
+          "accepted",
+          "rejected",
+          "no_acceptable_release"
+        ],
+        "title": "SearchPreviewResponse",
+        "type": "object"
+      },
+      "ServiceValidateResponse": {
+        "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ],
+        "title": "ServiceValidateResponse",
+        "type": "object"
+      },
+      "SettingsResponse": {
+        "description": "Redacted view of stored service config.\n\nPlaintext (non-secret) values are returned as-is; secret values are shown as\n``\"***\"`` when configured and ``None`` when unset \u2014 the plaintext secret is\nNEVER serialized.",
+        "properties": {
+          "plex_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Token"
+          },
+          "plex_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Url"
+          },
+          "prowlarr_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prowlarr Api Key"
+          },
+          "prowlarr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prowlarr Url"
+          },
+          "qbittorrent_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qbittorrent Password"
+          },
+          "qbittorrent_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qbittorrent Url"
+          },
+          "qbittorrent_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qbittorrent Username"
+          },
+          "tmdb_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Api Key"
+          }
+        },
+        "title": "SettingsResponse",
+        "type": "object"
+      },
+      "SettingsUpdate": {
+        "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
+        "properties": {
+          "plex_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Token"
+          },
+          "plex_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Url"
+          },
+          "prowlarr_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prowlarr Api Key"
+          },
+          "prowlarr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prowlarr Url"
+          },
+          "qbittorrent_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qbittorrent Password"
+          },
+          "qbittorrent_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qbittorrent Url"
+          },
+          "qbittorrent_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qbittorrent Username"
+          },
+          "tmdb_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tmdb Api Key"
+          }
+        },
+        "title": "SettingsUpdate",
+        "type": "object"
+      },
+      "SetupCompleteRequest": {
+        "description": "The validated credential set written on ``POST /setup/complete``.",
+        "properties": {
+          "plex_token": {
+            "title": "Plex Token",
+            "type": "string"
+          },
+          "plex_url": {
+            "title": "Plex Url",
+            "type": "string"
+          },
+          "prowlarr_api_key": {
+            "title": "Prowlarr Api Key",
+            "type": "string"
+          },
+          "prowlarr_url": {
+            "title": "Prowlarr Url",
+            "type": "string"
+          },
+          "qbittorrent_password": {
+            "title": "Qbittorrent Password",
+            "type": "string"
+          },
+          "qbittorrent_url": {
+            "title": "Qbittorrent Url",
+            "type": "string"
+          },
+          "qbittorrent_username": {
+            "title": "Qbittorrent Username",
+            "type": "string"
+          },
+          "tmdb_api_key": {
+            "title": "Tmdb Api Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plex_url",
+          "plex_token",
+          "prowlarr_url",
+          "prowlarr_api_key",
+          "qbittorrent_url",
+          "qbittorrent_username",
+          "qbittorrent_password",
+          "tmdb_api_key"
+        ],
+        "title": "SetupCompleteRequest",
+        "type": "object"
+      },
+      "SetupStatusResponse": {
+        "description": "Install state. ``app_api_key`` is populated only once initialized.",
+        "properties": {
+          "app_api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Api Key"
+          },
+          "initialized": {
+            "title": "Initialized",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "initialized"
+        ],
+        "title": "SetupStatusResponse",
+        "type": "object"
+      },
+      "TmdbValidateRequest": {
+        "description": "Candidate TMDB api key to test.",
+        "properties": {
+          "api_key": {
+            "title": "Api Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_key"
+        ],
+        "title": "TmdbValidateRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "in": "header",
+        "name": "X-Api-Key",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "title": "Plex Manager",
+    "version": "0.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/blocklist": {
+      "get": {
+        "description": "List blocklist entries, optionally scoped to one media item.",
+        "operationId": "list_blocklist_api_v1_blocklist_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tmdb_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tmdb Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlocklistResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "List Blocklist",
+        "tags": [
+          "blocklist"
+        ]
+      }
+    },
+    "/api/v1/blocklist/{blocklist_id}": {
+      "delete": {
+        "description": "Remove a blocklist entry (operator un-blocklist).",
+        "operationId": "delete_blocklist_api_v1_blocklist__blocklist_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "blocklist_id",
+            "required": true,
+            "schema": {
+              "title": "Blocklist Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Delete Blocklist",
+        "tags": [
+          "blocklist"
+        ]
+      }
+    },
+    "/api/v1/discover/search": {
+      "get": {
+        "description": "Search TMDB for movies / shows matching ``query`` (optional ``year``).",
+        "operationId": "discover_search_api_v1_discover_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Query",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "year",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Year"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoverSearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Discover Search",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/api/v1/quality-profile": {
+      "get": {
+        "description": "Return the alpha default quality profile (ordered low -> high, with cutoff).",
+        "operationId": "get_quality_profile_endpoint_api_v1_quality_profile_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QualityProfileResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Get Quality Profile Endpoint",
+        "tags": [
+          "quality-profile"
+        ]
+      }
+    },
+    "/api/v1/queue": {
+      "get": {
+        "description": "Reconcile active downloads against the client and return the live queue.",
+        "operationId": "get_queue_api_v1_queue_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Get Queue",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
+    "/api/v1/queue/grab": {
+      "post": {
+        "description": "Grab a release for a request: a chosen one, or the top accepted pick.",
+        "operationId": "grab_endpoint_api_v1_queue_grab_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrabRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Grab Endpoint",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
+    "/api/v1/queue/{download_id}/mark-failed": {
+      "post": {
+        "description": "Operator move: mark a download failed (optionally blocklisting the release).",
+        "operationId": "mark_failed_endpoint_api_v1_queue__download_id__mark_failed_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "download_id",
+            "required": true,
+            "schema": {
+              "title": "Download Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "blocklist",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Blocklist",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Mark Failed Endpoint",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
+    "/api/v1/requests": {
+      "get": {
+        "description": "List all media requests.",
+        "operationId": "list_requests_endpoint_api_v1_requests_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "List Requests Endpoint",
+        "tags": [
+          "requests"
+        ]
+      },
+      "post": {
+        "description": "Create a request (or return the existing active one for this media).",
+        "operationId": "create_request_endpoint_api_v1_requests_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Create Request Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/{request_id}": {
+      "get": {
+        "description": "Return a single media request, or 404.",
+        "operationId": "get_request_endpoint_api_v1_requests__request_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Get Request Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/search-preview": {
+      "post": {
+        "description": "Run the decision engine over the indexer results for this media.",
+        "operationId": "search_preview_endpoint_api_v1_search_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Search Preview Endpoint",
+        "tags": [
+          "search-preview"
+        ]
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "description": "Return the redacted service config (secrets shown as ``\"***\"``).",
+        "operationId": "get_settings_endpoint_api_v1_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Get Settings Endpoint",
+        "tags": [
+          "settings"
+        ]
+      },
+      "put": {
+        "description": "Upsert the provided config and return the redacted result.\n\nA secret field whose incoming value is the redaction mask (``\"***\"``) is a\nno-op: GET returns ``\"***\"`` for a configured secret, so a FE that round-trips\nthe whole object back (e.g. after editing only ``plex_url``) must not clobber\nthe real credential with the mask \u2014 a silent secret-wipe that would only\nsurface later as an auth failure to the downstream service.",
+        "operationId": "put_settings_endpoint_api_v1_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Put Settings Endpoint",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/v1/setup/complete": {
+      "post": {
+        "description": "Persist the validated creds, mint the app api key, mark initialized.\n\nOne-shot AND concurrency-safe: rejected with 409 once initialized. Two\nconcurrent ``/complete`` calls can both pass an in-memory ``initialized`` check\nand double-write (a ``settings.key`` unique-constraint 500, or one overwriting\nthe other's just-issued ``app_api_key``). To prevent that, initialization is\nclaimed with a CONDITIONAL update (``... WHERE id = 1 AND initialized = false``):\nexactly one request flips the row, and the loser sees ``rowcount == 0`` and is\nrejected 409 \u2014 so only the winner mints the key and writes the creds. Re-running\nsetup post-init would also let an unauthenticated caller overwrite every stored\ncredential and re-disclose the app key, so post-init changes must go through the\nauthenticated ``PUT /settings``.",
+        "operationId": "complete_api_v1_setup_complete_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/api/v1/setup/status": {
+      "get": {
+        "description": "Report install state only \u2014 never the app api key.\n\nThe key is revealed exactly once, in the ``/complete`` response (the SPA\npersists it then). Re-serving it from this unauthenticated GET would hand any\nanonymous caller the master ``X-Api-Key`` post-init, nullifying the entire\nauth model, so ``app_api_key`` is always ``None`` here.",
+        "operationId": "status_api_v1_setup_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/api/v1/setup/validate/plex": {
+      "post": {
+        "description": "Test candidate Plex credentials.",
+        "operationId": "validate_plex_endpoint_api_v1_setup_validate_plex_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlexValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceValidateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Plex Endpoint",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/api/v1/setup/validate/prowlarr": {
+      "post": {
+        "description": "Test candidate Prowlarr credentials.",
+        "operationId": "validate_prowlarr_endpoint_api_v1_setup_validate_prowlarr_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProwlarrValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceValidateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Prowlarr Endpoint",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/api/v1/setup/validate/qbittorrent": {
+      "post": {
+        "description": "Test candidate qBittorrent credentials.",
+        "operationId": "validate_qbittorrent_endpoint_api_v1_setup_validate_qbittorrent_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QbittorrentValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceValidateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Qbittorrent Endpoint",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/api/v1/setup/validate/tmdb": {
+      "post": {
+        "description": "Test a candidate TMDB api key.",
+        "operationId": "validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TmdbValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceValidateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Tmdb Endpoint",
+        "tags": [
+          "setup"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Liveness probe used by the container healthcheck and monitoring.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    }
+  }
+}

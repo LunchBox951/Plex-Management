@@ -1,0 +1,133 @@
+"""Search-preview endpoint — the headline decision-engine dry run. AUTHENTICATED.
+
+Resolves the media descriptor (from a stored ``request_id`` or the explicit body
+fields), runs the indexer search through the pure decision engine, and returns the
+ranked accepted releases, the per-release rejection reasons, and the
+``no_acceptable_release`` flag. Nothing is grabbed here — this is a preview the FE
+renders so the operator can choose.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from plex_manager.domain.decision_engine import DecisionResult
+from plex_manager.domain.quality import Resolution
+from plex_manager.domain.quality_profile import QualityProfile
+from plex_manager.domain.release import ScoredRelease
+from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.parser import ParserPort
+from plex_manager.repositories.blocklist import SqlBlocklistRepository
+from plex_manager.services import decision_service, request_service
+from plex_manager.web.deps import (
+    get_parser,
+    get_prowlarr,
+    get_quality_profile,
+    get_session,
+    require_api_key,
+)
+from plex_manager.web.schemas import (
+    AcceptedRelease,
+    RejectedRelease,
+    SearchPreviewRequest,
+    SearchPreviewResponse,
+)
+
+__all__ = ["router", "run_preview"]
+
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["search-preview"],
+    dependencies=[Depends(require_api_key)],
+)
+
+
+def _resolution_label(resolution: Resolution) -> str:
+    """Human label for a resolution (``1080p``); ``unknown`` for the zero value."""
+    return f"{resolution.value}p" if resolution is not Resolution.UNKNOWN else "unknown"
+
+
+def _to_accepted(scored: ScoredRelease) -> AcceptedRelease:
+    candidate = scored.candidate
+    return AcceptedRelease(
+        title=candidate.title,
+        quality_name=scored.quality.name,
+        resolution=_resolution_label(scored.quality.resolution),
+        source=scored.quality.source.name,
+        score=scored.score,
+        seeders=candidate.seeders,
+        indexer=candidate.indexer_name,
+        info_hash=candidate.info_hash,
+        guid=candidate.guid,
+    )
+
+
+def _to_response(result: DecisionResult) -> SearchPreviewResponse:
+    return SearchPreviewResponse(
+        accepted=[_to_accepted(s) for s in result.accepted],
+        rejected=[
+            RejectedRelease(title=candidate.title, reason=reason.value)
+            for candidate, reason in result.rejected
+        ],
+        no_acceptable_release=result.no_acceptable_release,
+    )
+
+
+async def _resolve_descriptor(
+    body: SearchPreviewRequest,
+    session: AsyncSession,
+) -> tuple[int, str, str, int | None, int | None]:
+    """Return ``(tmdb_id, title, media_type, year, season)`` for the preview.
+
+    Resolved from a stored request when ``request_id`` is given, else from the
+    explicit body fields (which then must be complete).
+    """
+    if body.request_id is not None:
+        record = await request_service.get_request(session, body.request_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+        return record.tmdb_id, record.title, record.media_type, record.year, body.season
+    if body.tmdb_id is None or body.media_type is None or body.title is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="request_id_or_descriptor_required",
+        )
+    return body.tmdb_id, body.title, body.media_type, body.year, body.season
+
+
+async def run_preview(
+    body: SearchPreviewRequest,
+    session: AsyncSession,
+    prowlarr: IndexerPort,
+    parser: ParserPort,
+    profile: QualityProfile,
+) -> DecisionResult:
+    """Resolve the descriptor and run the decision engine (shared with grab)."""
+    tmdb_id, title, media_type, year, season = await _resolve_descriptor(body, session)
+    return await decision_service.preview(
+        prowlarr,
+        parser,
+        profile,
+        SqlBlocklistRepository(session),
+        tmdb_id=tmdb_id,
+        title=title,
+        media_type=media_type,
+        year=year,
+        season=season,
+    )
+
+
+@router.post("/search-preview")
+async def search_preview_endpoint(
+    body: SearchPreviewRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    prowlarr: Annotated[IndexerPort, Depends(get_prowlarr)],
+    parser: Annotated[ParserPort, Depends(get_parser)],
+    profile: Annotated[QualityProfile, Depends(get_quality_profile)],
+) -> SearchPreviewResponse:
+    """Run the decision engine over the indexer results for this media."""
+    result = await run_preview(body, session, prowlarr, parser, profile)
+    return _to_response(result)
