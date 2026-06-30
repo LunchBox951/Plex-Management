@@ -22,6 +22,7 @@ class LibrarySection(BaseModel):
     key: str
     title: str
     type: Literal["movie", "show"]
+    locations: tuple[str, ...] = ()
 
 
 @runtime_checkable

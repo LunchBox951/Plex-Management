@@ -25,6 +25,8 @@ from typing import Final, cast
 import httpx
 
 from plex_manager.ports.metadata import (
+    MediaKind,
+    MediaPage,
     MediaSearchResult,
     MovieMetadata,
     TvMetadata,
@@ -36,11 +38,14 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL: Final = "https://api.themoviedb.org/3"
 _IMAGE_BASE_URL: Final = "https://image.tmdb.org/t/p/w500"
+_BACKDROP_BASE_URL: Final = "https://image.tmdb.org/t/p/w780"
 _ANIME_KEYWORD_ID: Final = 210024
 _DEFAULT_TTL_SECONDS: Final = 3600.0
 _APPEND: Final = "external_ids,keywords"
 _HTTP_NOT_FOUND: Final = 404
 _HTTP_UNAUTHORIZED: Final = 401
+_MIN_PAGE: Final = 1
+_MAX_PAGE: Final = 500
 
 
 class TmdbApiError(RuntimeError):
@@ -128,6 +133,11 @@ def _poster_url(fields: Mapping[str, object]) -> str | None:
     return f"{_IMAGE_BASE_URL}{poster_path}" if poster_path else None
 
 
+def _backdrop_url(fields: Mapping[str, object]) -> str | None:
+    backdrop_path = _get_str(fields, "backdrop_path")
+    return f"{_BACKDROP_BASE_URL}{backdrop_path}" if backdrop_path else None
+
+
 def _contains_anime_keyword(detail: Mapping[str, object]) -> bool:
     """Return True if TMDB tagged the title with the anime keyword (id 210024).
 
@@ -158,6 +168,7 @@ class TmdbMetadata:
         self._movie_cache: _TtlCache[MovieMetadata] = _TtlCache(cache_ttl_seconds)
         self._tv_cache: _TtlCache[TvMetadata] = _TtlCache(cache_ttl_seconds)
         self._search_cache: _TtlCache[list[MediaSearchResult]] = _TtlCache(cache_ttl_seconds)
+        self._page_cache: _TtlCache[MediaPage] = _TtlCache(cache_ttl_seconds)
 
     async def _get(self, path: str, params: Mapping[str, str]) -> Mapping[str, object] | None:
         """GET ``path`` with the api key; ``None`` on 404, raise on 401/other errors.
@@ -216,8 +227,16 @@ class TmdbMetadata:
         return results
 
     @staticmethod
-    def _parse_search_row(row: Mapping[str, object]) -> MediaSearchResult | None:
-        media_type = _get_str(row, "media_type")
+    def _parse_search_row(
+        row: Mapping[str, object], media_type_override: MediaKind | None = None
+    ) -> MediaSearchResult | None:
+        """Map one TMDB row to a ``MediaSearchResult`` (movie/tv only; else drop).
+
+        The movie-only list endpoints (trending/popular/upcoming) omit
+        ``media_type``; pass ``media_type_override='movie'`` so those rows map as
+        movies while any stray person/non-movie row is still dropped.
+        """
+        media_type = media_type_override or _get_str(row, "media_type")
         tmdb_id = _get_int(row, "id")
         if tmdb_id is None or media_type not in ("movie", "tv"):
             return None
@@ -236,6 +255,7 @@ class TmdbMetadata:
             year=year,
             overview=_get_str(row, "overview"),
             poster_url=_poster_url(row),
+            backdrop_url=_backdrop_url(row),
         )
 
     async def get_movie(self, tmdb_id: int) -> MovieMetadata | None:
@@ -256,6 +276,7 @@ class TmdbMetadata:
             year=_year_from_date(detail, "release_date"),
             overview=_get_str(detail, "overview"),
             poster_url=_poster_url(detail),
+            backdrop_url=_backdrop_url(detail),
             is_anime=_contains_anime_keyword(detail),
         )
         _logger.debug("resolved tmdb movie %s (anime=%s)", tmdb_id, movie.is_anime)
@@ -281,9 +302,51 @@ class TmdbMetadata:
             year=_year_from_date(detail, "first_air_date"),
             overview=_get_str(detail, "overview"),
             poster_url=_poster_url(detail),
+            backdrop_url=_backdrop_url(detail),
             season_count=_get_int(detail, "number_of_seasons") or 0,
             is_anime=_contains_anime_keyword(detail),
         )
         _logger.debug("resolved tmdb tv %s (anime=%s)", tmdb_id, show.is_anime)
         self._tv_cache.set(cache_key, show)
         return show
+
+    async def trending_movies(self, page: int = 1) -> MediaPage:
+        """List the week's trending movies via ``/trending/movie/week``."""
+        return await self._movie_page("/trending/movie/week", "trending:movie:week", page)
+
+    async def popular_movies(self, page: int = 1) -> MediaPage:
+        """List currently popular movies via ``/movie/popular``."""
+        return await self._movie_page("/movie/popular", "popular:movie", page)
+
+    async def upcoming_movies(self, page: int = 1) -> MediaPage:
+        """List upcoming movie releases via ``/movie/upcoming``."""
+        return await self._movie_page("/movie/upcoming", "upcoming:movie", page)
+
+    async def _movie_page(self, path: str, cache_prefix: str, page: int) -> MediaPage:
+        """Fetch one page of a movie-only list endpoint and map its envelope.
+
+        The page is clamped to TMDB's documented ``1..500`` window. Rows carry no
+        ``media_type`` on these endpoints, so they are mapped as movies (any stray
+        person/non-movie row is still dropped). Each page is cached by index.
+        """
+        clamped = max(_MIN_PAGE, min(page, _MAX_PAGE))
+        cache_key = f"{cache_prefix}:p{clamped}"
+        cached = self._page_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        payload = await self._get(path, {"page": str(clamped)})
+        fields: Mapping[str, object] = payload if payload is not None else {}
+        results: list[MediaSearchResult] = []
+        for row in _as_sequence(fields.get("results")):
+            parsed = self._parse_search_row(_as_mapping(row), "movie")
+            if parsed is not None:
+                results.append(parsed)
+        media_page = MediaPage(
+            page=_get_int(fields, "page") or clamped,
+            total_pages=_get_int(fields, "total_pages") or 0,
+            total_results=_get_int(fields, "total_results") or 0,
+            results=results,
+        )
+        self._page_cache.set(cache_key, media_page)
+        return media_page

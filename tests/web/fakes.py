@@ -14,9 +14,14 @@ from datetime import UTC, datetime
 from fastapi import FastAPI
 
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
-from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
+from plex_manager.ports.download_client import (
+    DownloadClientPort,
+    DownloadedFile,
+    DownloadStatus,
+)
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.metadata import (
+    MediaPage,
     MediaSearchResult,
     MetadataPort,
     MovieMetadata,
@@ -100,10 +105,18 @@ class FakeTmdb:
         movies: dict[int, MovieMetadata] | None = None,
         shows: dict[int, TvMetadata] | None = None,
         results: list[MediaSearchResult] | None = None,
+        trending: list[MediaSearchResult] | None = None,
+        popular: list[MediaSearchResult] | None = None,
+        upcoming: list[MediaSearchResult] | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
         self.results = results or []
+        # Discover rows default to the search results so a test that only sets
+        # ``results`` still gets populated trending/popular/upcoming pages.
+        self.trending = list(trending) if trending is not None else list(self.results)
+        self.popular = list(popular) if popular is not None else list(self.results)
+        self.upcoming = list(upcoming) if upcoming is not None else list(self.results)
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -113,6 +126,19 @@ class FakeTmdb:
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
         return self.shows.get(tmdb_id)
+
+    @staticmethod
+    def _page(items: list[MediaSearchResult]) -> MediaPage:
+        return MediaPage(page=1, total_pages=1, total_results=len(items), results=list(items))
+
+    async def trending_movies(self, page: int = 1) -> MediaPage:
+        return self._page(self.trending)
+
+    async def popular_movies(self, page: int = 1) -> MediaPage:
+        return self._page(self.popular)
+
+    async def upcoming_movies(self, page: int = 1) -> MediaPage:
+        return self._page(self.upcoming)
 
 
 class FakeProwlarr:
@@ -130,8 +156,14 @@ class FakeProwlarr:
 class FakeQbittorrent:
     """In-memory :class:`DownloadClientPort` recording adds + canned statuses."""
 
-    def __init__(self, statuses: list[DownloadStatus] | None = None) -> None:
+    def __init__(
+        self,
+        statuses: list[DownloadStatus] | None = None,
+        *,
+        files: dict[str, list[DownloadedFile]] | None = None,
+    ) -> None:
         self.statuses = statuses or []
+        self.files = files or {}
         self.added: list[tuple[str, str, str]] = []
         self.removed: list[tuple[str, bool]] = []
 
@@ -166,6 +198,9 @@ class FakeQbittorrent:
 
     async def get_save_path(self, info_hash: str) -> str | None:
         return None
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        return list(self.files.get(info_hash.lower(), []))
 
 
 def override_adapters(

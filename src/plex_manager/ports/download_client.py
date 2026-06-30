@@ -15,7 +15,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["DownloadClientPort", "DownloadStatus"]
+__all__ = ["DownloadClientPort", "DownloadStatus", "DownloadedFile"]
 
 
 class DownloadStatus(BaseModel):
@@ -41,6 +41,20 @@ class DownloadStatus(BaseModel):
     seeding_time_limit_minutes: int = -2
     inactive_seeding_time_limit_minutes: int = -2
     last_activity_unix: int = 0
+
+
+class DownloadedFile(BaseModel):
+    """One file inside a torrent's content, as reported by the download client.
+
+    ``name`` is the file's path relative to the torrent's save path (the client's
+    own ``name`` field); ``size_bytes`` is its size in bytes. The importer uses
+    these to locate the completed video file.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    size_bytes: int
 
 
 @runtime_checkable
@@ -75,3 +89,8 @@ class DownloadClientPort(Protocol):
 
     async def get_save_path(self, info_hash: str) -> str | None:
         """Return the torrent's current save path, re-read from the client."""
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        """Return the torrent's files (relative path + size) so the importer can
+        locate the completed video file."""
+        raise NotImplementedError

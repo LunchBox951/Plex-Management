@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,91 @@ def test_hardlink_or_copy_falls_back_to_copy(
 
     assert dst.read_text() == "payload"
     assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
+
+
+def test_hardlink_or_copy_raises_when_destination_too_small(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("a sizeable payload")
+    dst = tmp_path / "copied.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError("simulated cross-device link")
+
+    def _plenty(_self: LocalFileSystem, _path: str) -> int:
+        return 1
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    monkeypatch.setattr(LocalFileSystem, "available_bytes", _plenty)
+
+    with pytest.raises(OSError, match="insufficient space"):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert not dst.exists()  # nothing written on a failed preflight
+
+
+def test_hardlink_or_copy_rolls_back_partial_copy_on_size_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("the full expected payload")
+    dst = tmp_path / "copied.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError("simulated cross-device link")
+
+    def _short_copy2(_src: str, dst_arg: str) -> None:
+        Path(dst_arg).write_text("short")  # truncated write
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    monkeypatch.setattr(shutil, "copy2", _short_copy2)
+
+    with pytest.raises(OSError, match="incomplete"):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert not dst.exists()  # partial destination rolled back
+
+
+def test_largest_video_file_picks_largest_and_skips_sample_and_extras(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "feature.mkv").write_bytes(b"x" * 1000)
+    (tmp_path / "small.mp4").write_bytes(b"x" * 10)
+    (tmp_path / "sample.mkv").write_bytes(b"x" * 5000)  # name-filtered despite size
+    (tmp_path / "notes.txt").write_bytes(b"x" * 9000)  # non-video
+    extras = tmp_path / "Featurettes"
+    extras.mkdir()
+    (extras / "bonus.mkv").write_bytes(b"x" * 8000)  # extras dir, skipped
+
+    result = LocalFileSystem().largest_video_file(os.fspath(tmp_path))
+
+    assert result is not None
+    assert Path(result) == (tmp_path / "feature.mkv").resolve()
+
+
+def test_largest_video_file_returns_none_without_video(tmp_path: Path) -> None:
+    (tmp_path / "readme.txt").write_text("no video here")
+    (tmp_path / "art.jpg").write_bytes(b"x" * 100)
+
+    assert LocalFileSystem().largest_video_file(os.fspath(tmp_path)) is None
+
+
+def test_largest_video_file_returns_single_video_file_root(tmp_path: Path) -> None:
+    movie = tmp_path / "movie.mkv"
+    movie.write_bytes(b"x" * 100)
+
+    result = LocalFileSystem().largest_video_file(os.fspath(movie))
+
+    assert result is not None
+    assert Path(result) == movie.resolve()
+
+
+def test_largest_video_file_returns_none_for_non_video_file_root(tmp_path: Path) -> None:
+    doc = tmp_path / "movie.txt"
+    doc.write_text("not a video")
+
+    assert LocalFileSystem().largest_video_file(os.fspath(doc)) is None
 
 
 def test_adapter_satisfies_filesystem_port() -> None:

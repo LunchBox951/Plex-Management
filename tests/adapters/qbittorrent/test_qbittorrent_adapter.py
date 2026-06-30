@@ -62,6 +62,13 @@ INFO_ROWS: list[dict[str, Any]] = [
 ]
 
 
+FILE_ROWS: list[dict[str, Any]] = [
+    {"name": "Completed.Movie.1080p/movie.mkv", "size": 8_589_934_592},
+    {"name": "Completed.Movie.1080p/sample.mkv", "size": 52_428_800},
+    {"name": "Completed.Movie.1080p/readme.txt", "size": 1024},
+]
+
+
 def _login_response() -> httpx.Response:
     return httpx.Response(200, text="Ok.", headers={"Set-Cookie": "SID=test-session-id; path=/"})
 
@@ -91,6 +98,8 @@ def _router(*, add_status: int = 200, webapi_version: str = "2.11.0") -> Any:
             return httpx.Response(200, text="")
         if path == "/api/v2/torrents/properties" and method == "GET":
             return httpx.Response(200, json={"save_path": "/downloads/movies"})
+        if path == "/api/v2/torrents/files" and method == "GET":
+            return httpx.Response(200, json=FILE_ROWS)
         return httpx.Response(404, text="unhandled")
 
     return handler
@@ -197,6 +206,56 @@ async def test_remove_and_get_save_path() -> None:
     await client.remove(MAGNET_HASH, delete_files=True)
     save_path = await client.get_save_path(MAGNET_HASH)
     assert save_path == "/downloads/movies"
+
+
+async def test_list_files_maps_name_and_size() -> None:
+    files = await _client().list_files(MAGNET_HASH)
+    assert len(files) == 3
+    biggest = max(files, key=lambda f: f.size_bytes)
+    assert biggest.name == "Completed.Movie.1080p/movie.mkv"
+    assert biggest.size_bytes == 8_589_934_592
+
+
+async def test_list_files_authenticates_like_other_methods() -> None:
+    calls = {"login": 0, "files": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            calls["login"] += 1
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            calls["files"] += 1
+            assert request.url.params.get("hash") == MAGNET_HASH
+            return httpx.Response(200, json=FILE_ROWS)
+        return httpx.Response(404)
+
+    files = await _client(handler).list_files(MAGNET_HASH)
+    assert len(files) == 3
+    assert calls["login"] == 1  # logged in before the files call
+    assert calls["files"] == 1
+
+
+async def test_list_files_empty_response_returns_empty_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    assert await _client(handler).list_files(MAGNET_HASH) == []
+
+
+async def test_list_files_error_status_raises_typed_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).list_files(MAGNET_HASH)
 
 
 async def test_relogin_on_403() -> None:

@@ -84,12 +84,71 @@ TV_DETAIL: dict[str, Any] = {
 }
 
 
+TRENDING_MOVIES: dict[str, Any] = {
+    "page": 1,
+    "results": [
+        {
+            "id": 27205,
+            "title": "Inception",
+            "release_date": "2010-07-15",
+            "overview": "A thief who steals corporate secrets...",
+            "poster_path": "/inception.jpg",
+            "backdrop_path": "/inception_bg.jpg",
+        },
+        {
+            # A stray person row (no title) must still be dropped even though the
+            # endpoint forces media_type='movie'.
+            "id": 287,
+            "name": "Brad Pitt",
+        },
+    ],
+    "total_pages": 500,
+    "total_results": 10000,
+}
+
+POPULAR_MOVIES: dict[str, Any] = {
+    "page": 1,
+    "results": [
+        {
+            "id": 155,
+            "title": "The Dark Knight",
+            "release_date": "2008-07-16",
+            "poster_path": "/tdk.jpg",
+            "backdrop_path": "/tdk_bg.jpg",
+        }
+    ],
+    "total_pages": 42,
+    "total_results": 840,
+}
+
+UPCOMING_MOVIES: dict[str, Any] = {
+    "page": 2,
+    "results": [
+        {
+            "id": 1234,
+            "title": "Future Film",
+            "release_date": "2026-12-25",
+            "poster_path": "/future.jpg",
+            "backdrop_path": "/future_bg.jpg",
+        }
+    ],
+    "total_pages": 5,
+    "total_results": 95,
+}
+
+
 def _handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     # The api key must travel as a query param, and never anywhere else.
     assert request.url.params.get("api_key") == API_KEY
     if path == "/3/search/multi":
         return httpx.Response(200, json=SEARCH_MULTI)
+    if path == "/3/trending/movie/week":
+        return httpx.Response(200, json=TRENDING_MOVIES)
+    if path == "/3/movie/popular":
+        return httpx.Response(200, json=POPULAR_MOVIES)
+    if path == "/3/movie/upcoming":
+        return httpx.Response(200, json=UPCOMING_MOVIES)
     if path == "/3/movie/27205":
         return httpx.Response(200, json=MOVIE_DETAIL)
     if path == "/3/movie/129":
@@ -240,6 +299,69 @@ async def test_anime_keyword_sets_is_anime() -> None:
     non_anime = await _adapter().get_movie(27205)
     assert non_anime is not None
     assert non_anime.is_anime is False
+
+
+async def test_trending_movies_maps_page_and_backdrop() -> None:
+    page = await _adapter().trending_movies()
+    assert page.page == 1
+    assert page.total_pages == 500
+    assert page.total_results == 10000
+    assert len(page.results) == 1  # the person row (no title) is dropped
+    movie = page.results[0]
+    assert movie.media_type == "movie"
+    assert movie.tmdb_id == 27205
+    assert movie.title == "Inception"
+    assert movie.year == 2010
+    assert movie.poster_url == "https://image.tmdb.org/t/p/w500/inception.jpg"
+    assert movie.backdrop_url == "https://image.tmdb.org/t/p/w780/inception_bg.jpg"
+
+
+async def test_popular_movies_maps_envelope() -> None:
+    page = await _adapter().popular_movies()
+    assert page.total_pages == 42
+    assert page.total_results == 840
+    assert len(page.results) == 1
+    assert page.results[0].title == "The Dark Knight"
+    assert page.results[0].backdrop_url == "https://image.tmdb.org/t/p/w780/tdk_bg.jpg"
+
+
+async def test_upcoming_movies_maps_envelope() -> None:
+    page = await _adapter().upcoming_movies(page=2)
+    assert page.page == 2
+    assert page.total_pages == 5
+    assert len(page.results) == 1
+    assert page.results[0].media_type == "movie"
+    assert page.results[0].title == "Future Film"
+
+
+async def test_discover_page_clamped_to_valid_window() -> None:
+    requested_pages: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/trending/movie/week":
+            requested_pages.append(request.url.params.get("page"))
+            return httpx.Response(200, json=TRENDING_MOVIES)
+        return _handler(request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    await adapter.trending_movies(page=0)
+    await adapter.trending_movies(page=9999)
+    assert requested_pages == ["1", "500"]  # clamped to 1..500
+
+
+async def test_discover_error_excludes_api_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("api_key") == API_KEY  # key is in the URL
+        return httpx.Response(500, json={"status_message": "boom"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    with pytest.raises(TmdbApiError) as exc_info:
+        await adapter.popular_movies()
+    message = str(exc_info.value)
+    assert API_KEY not in message
+    assert "/movie/popular" in message
 
 
 def test_adapter_satisfies_metadata_port() -> None:
