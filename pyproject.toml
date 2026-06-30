@@ -80,6 +80,9 @@ reportMissingTypeStubs = false
 # errors flagged but tolerate the unknowns those libraries surface.
 [[tool.pyright.executionEnvironments]]
 root = "tests"
+# Repo root on the path so cross-suite helpers import absolutely as
+# ``tests.web.fakes`` (matching pytest's rootdir-based resolution at runtime).
+extraPaths = ["."]
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
