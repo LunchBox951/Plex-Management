@@ -224,11 +224,11 @@ class MediaRequest(Base):
             unique=True,
             sqlite_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked')"
+                "'downloading', 'import_blocked', 'completed')"
             ),
             postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked')"
+                "'downloading', 'import_blocked', 'completed')"
             ),
         ),
     )

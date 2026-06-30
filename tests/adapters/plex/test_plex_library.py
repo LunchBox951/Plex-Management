@@ -161,7 +161,7 @@ async def test_is_available_tv_raises_not_implemented() -> None:
         await _adapter(_main_handler).is_available(1399, "tv")
 
 
-async def test_is_available_is_cached() -> None:
+async def test_is_available_caches_presence_but_repages_absence() -> None:
     calls = {"n": 0}
 
     def counting(request: httpx.Request) -> httpx.Response:
@@ -169,10 +169,17 @@ async def test_is_available_is_cached() -> None:
         return _main_handler(request)
 
     adapter = _adapter(counting, base_url="http://cached-avail:32400")
+    # First present lookup pages sections (1) + section/all (1) and caches the set.
     assert await adapter.is_available(27205, "movie") is True
-    assert await adapter.is_available(55555, "movie") is False
-    # First call paged sections (1) + section/all (1); second call hit the cache.
     assert calls["n"] == 2
+    # A repeated PRESENT lookup is served from the cache — no extra paging.
+    assert await adapter.is_available(27205, "movie") is True
+    assert calls["n"] == 2
+    # An ABSENT answer is NEVER trusted from cache (a just-imported title may not be
+    # indexed yet, which would otherwise strand it in Finalizing): it re-pages the
+    # section contents (the section list stays cached).
+    assert await adapter.is_available(55555, "movie") is False
+    assert calls["n"] == 3
 
 
 # --------------------------------------------------------------------------- #

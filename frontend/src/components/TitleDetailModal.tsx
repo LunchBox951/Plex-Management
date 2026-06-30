@@ -123,14 +123,17 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     setReportFor(null)
   }, [titleKey])
 
-  // The live request for this exact title (media_type + tmdb_id), if any.
+  // The live request for this exact title (media_type + tmdb_id), if any. /requests
+  // comes back in ascending id order and the backend intentionally allows
+  // re-requesting an available/failed title, so a stale terminal row must not
+  // shadow a newer active re-request: prefer a non-settled match, else the newest.
   const liveRequest = useMemo<RequestResponse | null>(() => {
     if (!title) return null
-    return (
-      requestsQuery.data?.requests.find(
-        (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
-      ) ?? null
+    const matches = (requestsQuery.data?.requests ?? []).filter(
+      (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
     )
+    const active = matches.find((r) => r.status !== 'available' && r.status !== 'failed')
+    return active ?? matches[matches.length - 1] ?? null
   }, [requestsQuery.data, title])
 
   // A just-created request shows immediately even before the next poll lands.

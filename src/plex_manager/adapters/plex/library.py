@@ -278,10 +278,15 @@ class PlexLibrary:
         """
         if media_type == "tv":
             raise NotImplementedError("tv availability deferred to next beta")
-        present = _PRESENT_TMDB_CACHE.get(self._base_url)
-        if present is None:
-            present = await self._collect_present_tmdb_ids()
-            _PRESENT_TMDB_CACHE.set(self._base_url, present)
+        # Trust a cached PRESENCE (a movie in the library stays there) but never a
+        # cached ABSENCE: right after an import+scan the first page commonly precedes
+        # Plex indexing, so caching that miss would keep the title "Finalizing" for
+        # the whole TTL. On a cache miss OR a cached-absent answer, re-page Plex.
+        cached = _PRESENT_TMDB_CACHE.get(self._base_url)
+        if cached is not None and tmdb_id in cached:
+            return True
+        present = await self._collect_present_tmdb_ids()
+        _PRESENT_TMDB_CACHE.set(self._base_url, present)
         return tmdb_id in present
 
     async def _collect_present_tmdb_ids(self) -> frozenset[int]:

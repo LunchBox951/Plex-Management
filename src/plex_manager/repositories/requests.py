@@ -15,10 +15,13 @@ if TYPE_CHECKING:
 
 __all__ = ["SqlRequestRepository"]
 
-# Statuses at which a request is finished and no longer dedup-blocking. A new
+# Statuses at which a request is SETTLED and no longer dedup-blocking — a new
 # request for the same media is allowed once the prior one reaches one of these.
-_TERMINAL_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
-    {RequestStatus.completed, RequestStatus.available, RequestStatus.failed}
+# ``completed`` is deliberately NOT here: it is the in-flight "Finalizing" state
+# (imported, before Plex confirms availability), so it must keep deduping a second
+# request (and a second grab) for the same movie until it reaches available/failed.
+_SETTLED_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
+    {RequestStatus.available, RequestStatus.failed}
 )
 
 
@@ -62,7 +65,7 @@ class SqlRequestRepository:
             .where(
                 MediaRequest.tmdb_id == tmdb_id,
                 MediaRequest.media_type == MediaType(media_type),
-                MediaRequest.status.notin_(_TERMINAL_REQUEST_STATUSES),
+                MediaRequest.status.notin_(_SETTLED_REQUEST_STATUSES),
             )
             .order_by(MediaRequest.id)
             .limit(1)

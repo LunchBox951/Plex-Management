@@ -92,12 +92,19 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
     return None
 
 
-def _resolve_source(fs: FileSystemPort, content_path: str) -> tuple[str, int]:
-    """Find the primary video file under ``content_path`` and its size (sync I/O)."""
+def _resolve_source(fs: FileSystemPort, content_path: str) -> tuple[str, int, str]:
+    """Find the primary video file under ``content_path``: ``(abs_path, size, rel)``.
+
+    ``rel`` is the path RELATIVE to the content root (the download's own folder), so
+    a split-disk layout like ``Movie/CD1/movie.mkv`` reaches the validator as
+    ``CD1/movie.mkv`` and its multi-part check fires — passing only the basename
+    would strip ``CD1`` and silently import one half as the whole movie.
+    """
     src = fs.largest_video_file(content_path)
     if src is None:
         raise _NoVideoError(content_path)
-    return src, os.path.getsize(src)
+    root = content_path if os.path.isdir(content_path) else os.path.dirname(content_path)
+    return src, os.path.getsize(src), os.path.relpath(src, root)
 
 
 def _place_file(fs: FileSystemPort, src: str, dst: Path) -> None:
@@ -196,7 +203,7 @@ async def import_download(
         )
         return await download_repo.get_by_hash(row.torrent_hash)
     try:
-        src, size = await asyncio.to_thread(_resolve_source, fs, content)
+        src, size, source_rel = await asyncio.to_thread(_resolve_source, fs, content)
     except _NoVideoError:
         await _block(
             session,
@@ -211,7 +218,7 @@ async def import_download(
     # search), gating on profile-allowed (not equal-to-grab) so benign source drift
     # imports while CAM/TS/sample is rejected — the prototype's defining-bug fix.
     validation = validate_import(
-        [VideoFile(relative_path=os.path.basename(src), size_bytes=size)],
+        [VideoFile(relative_path=source_rel, size_bytes=size)],
         parser=parser,
         profile=profile,
         expected_title=request.title,

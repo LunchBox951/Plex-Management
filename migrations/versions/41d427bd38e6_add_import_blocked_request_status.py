@@ -25,9 +25,12 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _INDEX = "uq_media_requests_active"
+# Both import_blocked (download finished, import failed, retryable) and completed
+# (imported, "Finalizing" before Plex confirms availability) are in-flight states
+# that must keep blocking a duplicate request for the same media.
 _NEW_PREDICATE = (
     "status IN ('pending', 'searching', 'no_acceptable_release', "
-    "'downloading', 'import_blocked')"
+    "'downloading', 'import_blocked', 'completed')"
 )
 _OLD_PREDICATE = "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
 

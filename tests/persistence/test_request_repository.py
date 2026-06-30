@@ -57,16 +57,30 @@ async def test_find_active_uses_tmdb_media_composite_for_dedup(
     assert active.tmdb_id == 42
 
 
-async def test_find_active_ignores_terminal_requests(session: AsyncSession) -> None:
+async def test_find_active_ignores_settled_requests(session: AsyncSession) -> None:
     repo = SqlRequestRepository(session)
-    done = await repo.create(tmdb_id=7, media_type="movie", title="Done", status="completed")
+    # available/failed are SETTLED (no longer dedup-blocking).
+    done = await repo.create(tmdb_id=7, media_type="movie", title="Done", status="available")
     assert await repo.find_active(7, "movie") is None
 
-    # A non-terminal request for the same media is found again.
+    # A non-settled request for the same media is found again.
     await repo.set_status(done.id, "searching")
     again = await repo.find_active(7, "movie")
     assert again is not None
     assert again.status == "searching"
+
+
+async def test_find_active_treats_completed_finalizing_as_active(session: AsyncSession) -> None:
+    # 'completed' is the in-flight "Finalizing" state (imported, before Plex confirms
+    # availability) — it must keep deduping a second request for the same movie.
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=77, media_type="movie", title="Finalizing", status="completed")
+    active = await repo.find_active(77, "movie")
+    assert active is not None
+    assert active.status == "completed"
+    # And the DB backstop refuses a duplicate while it is still finalizing.
+    with pytest.raises(IntegrityError):
+        await repo.create(tmdb_id=77, media_type="movie", title="Dup", status="pending")
 
 
 async def test_partial_unique_index_blocks_second_active_request(
@@ -80,14 +94,14 @@ async def test_partial_unique_index_blocks_second_active_request(
         await repo.create(tmdb_id=500, media_type="movie", title="A again", status="searching")
 
 
-async def test_partial_unique_index_allows_new_request_after_terminal(
+async def test_partial_unique_index_allows_new_request_after_settled(
     session: AsyncSession,
 ) -> None:
-    """Terminal statuses are outside the partial index, so once a request finishes
-    (completed/available/failed) a fresh active request for the same media is
-    allowed — the index does not block legitimate re-requests."""
+    """Settled statuses (available/failed) are outside the partial index, so once a
+    request truly finishes a fresh request for the same media is allowed — the index
+    does not block legitimate re-requests after a title is removed from Plex."""
     repo = SqlRequestRepository(session)
-    done = await repo.create(tmdb_id=600, media_type="movie", title="Done", status="completed")
+    done = await repo.create(tmdb_id=600, media_type="movie", title="Done", status="available")
     fresh = await repo.create(tmdb_id=600, media_type="movie", title="Again", status="pending")
     assert fresh.id != done.id
 
