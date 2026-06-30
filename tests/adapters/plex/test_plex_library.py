@@ -380,3 +380,47 @@ def test_adapter_satisfies_library_port() -> None:
     from plex_manager.ports.library import LibraryPort
 
     assert isinstance(_adapter(_main_handler), LibraryPort)
+
+
+SECTIONS_NO_MOVIE: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "2", "title": "TV Shows", "type": "show", "Location": [{"path": "/data/tv"}]},
+        ]
+    }
+}
+
+
+async def test_list_sections_does_not_cache_a_no_movie_result() -> None:
+    # F10: a no-movie sections list is a self-healing negative -- validate_plex tells
+    # the operator to add a Movie library and test again. If that empty/show-only
+    # result were cached for the full TTL, the immediate re-test would read the stale
+    # snapshot and stay wrongly blocked. So a no-movie result must NOT be cached;
+    # adding a Movie library is seen on the very next call. A has-movie result still IS
+    # cached.
+    calls = {"n": 0}
+    state = {"has_movie": False}
+
+    def switching(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        if request.url.path == "/library/sections":
+            calls["n"] += 1
+            return httpx.Response(200, json=SECTIONS if state["has_movie"] else SECTIONS_NO_MOVIE)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(switching, base_url="http://no-movie-plex:32400")
+    # First test: no Movie library -> result returned but NOT cached.
+    first = await adapter.list_sections()
+    assert all(s.type != "movie" for s in first)
+    assert calls["n"] == 1
+    # Operator adds a Movie library and tests again immediately: the next call re-hits
+    # Plex (the no-movie result was never cached) and sees the new library at once.
+    state["has_movie"] = True
+    second = await adapter.list_sections()
+    assert calls["n"] == 2  # re-fetched, not served from a stale no-movie cache
+    assert any(s.type == "movie" for s in second)
+    # Now that a movie section exists, the positive result IS cached.
+    third = await adapter.list_sections()
+    assert calls["n"] == 2  # served from cache; no extra fetch
+    assert third == second

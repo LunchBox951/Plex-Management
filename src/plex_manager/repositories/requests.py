@@ -87,6 +87,37 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
+    async def find_earliest_available(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
+        """Return the OLDEST ``available`` request for this media (lowest id), or None.
+
+        Anchors the in-library short-circuit race-collapse: two concurrent requests
+        can each pass ``find_in_library`` (neither committed yet) and insert a separate
+        ``available`` row, which the active-dedup partial UNIQUE index does NOT reject
+        (it excludes terminal ``available``). After committing, ``create_request``
+        re-reads the earliest available row and deletes any later duplicate of it.
+        Scoped to ``available`` only (not ``completed``) so an in-flight re-acquire is
+        never mistaken for a race loser.
+        """
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.status == RequestStatus.available,
+            )
+            .order_by(MediaRequest.id)
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return _to_record(row) if row is not None else None
+
+    async def delete(self, request_id: int) -> None:
+        """Delete a request row (collapse a race-loser duplicate). No-op if absent."""
+        row = await self._session.get(MediaRequest, request_id)
+        if row is not None:
+            await self._session.delete(row)
+            await self._session.flush()
+
     async def create(
         self,
         *,

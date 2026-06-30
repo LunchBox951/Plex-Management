@@ -175,6 +175,24 @@ async def create_request(
         if winner is None:  # pragma: no cover - the conflicting active row must exist
             raise
         return winner
+    if initial_status == RequestStatus.available.value:
+        # Collapse the concurrent in-library race (F9). The active-dedup partial
+        # UNIQUE index excludes terminal 'available', so two POSTs that BOTH passed
+        # find_in_library above (neither had committed yet) can each insert a fresh
+        # 'available' row with NO IntegrityError backstop -> duplicate rows. Now that
+        # ours is committed, re-read the OLDEST available row for this media; if an
+        # earlier one exists, THIS row is the race loser -> delete it and return the
+        # winner, so the Requests list/modal shows ONE row.
+        #
+        # The remove-then-re-acquire flow is unaffected: when a movie was removed
+        # from Plex, _already_in_library() reads False and this whole short-circuit
+        # branch is skipped, so the (legitimate) SECOND available row produced by the
+        # normal pending -> download -> mark_available path is never reconciled away.
+        winner = await repo.find_earliest_available(tmdb_id, media_type)
+        if winner is not None and winner.id != record.id:
+            await repo.delete(record.id)
+            await session.commit()
+            return winner
     return record
 
 

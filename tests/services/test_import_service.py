@@ -19,7 +19,15 @@ from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.models import Blocklist, Download, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import (
+    Blocklist,
+    Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+)
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import queue_service
@@ -515,3 +523,277 @@ async def test_run_availability_cycle_leaves_completed_when_not_yet_in_plex(
         request = await session.get(MediaRequest, request_id)
         assert request is not None
         assert request.status == RequestStatus.completed  # stays "Finalizing", honestly
+
+
+async def test_crash_resume_rolls_back_orphaned_placement_on_scan_failure(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # F8: a crash struck AFTER _place_file created dst (and committed the download_path
+    # breadcrumb) but BEFORE the Imported write. The row resumes as ``Importing`` with
+    # dst already on disk (same size) and download_path == dst, so _place_file returns
+    # placed=False (idempotent skip). THIS row placed the orphan and nothing ever
+    # completed it, so a repeat scan failure must STILL roll dst back and clear the
+    # breadcrumb — otherwise mark-failed / re-search orphans the library file.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video, 60 * 1024 * 1024)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst, 60 * 1024 * 1024)  # the prior (crashed) run's placement, same size
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            year=1999,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.Importing.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=1999,
+            download_path=str(dst),  # breadcrumb that survived the crash
+        )
+        session.add(download)
+        await session.commit()
+        download_id, request_id = download.id, request.id
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, _qbt(video), _ScanFailsLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert not dst.exists(), "crash-orphaned placement must be rolled back on scan failure"
+    assert record.download_path is None, "breadcrumb must be cleared once the file is gone"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+class _MarkFailedMidImportQbt(FakeQbittorrent):
+    """A client whose ``get_status`` (called after import_download reads the row but
+    BEFORE it claims ``Importing``) lets an operator's ``mark_failed`` land in a
+    SEPARATE session — committing ``failed`` + blocklist + re-search during the long
+    validation gap. Reproduces the F11 race: an unconditional ``Importing`` claim
+    would overwrite that committed decision and copy/complete the rejected release."""
+
+    def __init__(
+        self, statuses: list[DownloadStatus], *, sessionmaker_: SessionMaker, download_id: int
+    ) -> None:
+        super().__init__(statuses)
+        self._sessionmaker = sessionmaker_
+        self._download_id = download_id
+        self._fired = False
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        if not self._fired:
+            self._fired = True
+            async with self._sessionmaker() as session:
+                await queue_service.mark_failed(
+                    session, download_id=self._download_id, blocklist=True
+                )
+        return await super().get_status(info_hash)
+
+
+async def test_import_does_not_overwrite_operator_mark_failed_during_gap(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # F11: the operator rejects the release (mark_failed -> blocklist + re-search) in a
+    # separate session DURING import_download's validation gap. The conditional
+    # ``Importing`` claim (compare-and-swap) must see the row is no longer resumable
+    # and abort: it must NOT overwrite the committed ``failed`` state and must NOT
+    # import the rejected release. The operator's correction is honored (north-star).
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _MarkFailedMidImportQbt(
+        _qbt(video).statuses, sessionmaker_=sessionmaker_, download_id=download_id
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    # The operator's failed state stands; the release was NOT imported.
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert record.failed_reason == "marked failed by operator"
+    assert not any(movies_root.iterdir())  # nothing copied into the library
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.searching  # operator's re-search stands
+        blocklisted = (await session.execute(select(Blocklist))).scalars().all()
+        assert len(blocklisted) == 1  # operator's blocklist stands
+        download = await session.get(Download, download_id)
+        assert download is not None and download.status == DownloadState.Failed.value
+
+
+class _FlipToFailedDuringScanLibrary(FakeLibrary):
+    """Forces the row out of ``Importing`` during the copy/scan window (a defensive,
+    can't-happen-under-the-lock scenario: a mark_failed on an Importing row legally
+    409s). Flips the DB row to ``failed`` in a separate session, then returns a normal
+    scan, exercising the FINAL-transition compare-and-swap guard."""
+
+    def __init__(self, *, sessionmaker_: SessionMaker, download_id: int) -> None:
+        super().__init__()
+        self._sessionmaker = sessionmaker_
+        self._download_id = download_id
+
+    async def trigger_scan(self, path: str) -> None:
+        async with self._sessionmaker() as session:
+            row = await session.get(Download, self._download_id)
+            assert row is not None
+            row.status = DownloadState.Failed.value
+            row.failed_reason = "marked failed by operator"
+            await session.commit()
+        self.scanned.append(path)
+
+
+async def test_final_import_transition_does_not_overwrite_a_concurrently_changed_row(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # Defense-in-depth for the copy/scan gap after the ``Importing`` claim: if the row
+    # leaves ``Importing`` before the finalize, the conditional ``Imported`` CAS must
+    # abandon the finalize — NOT overwrite the new state, and NOT mark the request
+    # completed. It must also NOT delete dst (the deterministic path a retry re-adopts),
+    # so a successfully-placed file is never destroyed on this defensive path.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = _FlipToFailedDuringScanLibrary(sessionmaker_=sessionmaker_, download_id=download_id)
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value  # not overwritten to Imported
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists(), "the placed file must NOT be deleted when the finalize is abandoned"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status != RequestStatus.completed  # not completed over the change
+
+
+async def test_blocked_import_blocklists_grabbed_release_title_not_file_basename(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # F12: import history must not shadow the grabbed RELEASE title. A folder torrent
+    # carries the title (The.Matrix.1999...) but ships a generic movie.mkv; the import
+    # writes import_started with a NULL source_title (basename kept only in ``message``).
+    # When the import later blocks and the operator mark-fails + blocklists, the
+    # blocklist row records the grabbed release title -- not ``movie.mkv`` -- so the
+    # tier-2 (title+indexer) suppression keeps working for hashless candidates.
+    release_title = "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    indexer = "FakeIndexer"
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / release_title
+    _make_video(release_dir / "movie.mkv")
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    # Grab-time anchor: the ORIGINAL release title + indexer the blocklist must record.
+    async with sessionmaker_() as session:
+        session.add(
+            DownloadHistory(
+                tmdb_id=_TMDB_ID,
+                torrent_hash=_HASH,
+                event_type=DownloadHistoryEvent.grabbed,
+                source_title=release_title,
+                indexer=indexer,
+            )
+        )
+        await session.commit()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(release_dir),
+        _ScanFailsLibrary(),
+        LocalFileSystem(),
+    )
+    assert record is not None and record.status == DownloadState.ImportBlocked.value
+
+    async with sessionmaker_() as session:
+        started = (
+            (
+                await session.execute(
+                    select(DownloadHistory)
+                    .where(DownloadHistory.torrent_hash == _HASH)
+                    .where(DownloadHistory.event_type == DownloadHistoryEvent.import_started)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert started and all(e.source_title is None for e in started)
+    assert all("movie.mkv" in (e.message or "") for e in started)
+
+    async with sessionmaker_() as session:
+        await queue_service.mark_failed(session, download_id=download_id, blocklist=True)
+
+    async with sessionmaker_() as session:
+        entry = (await session.execute(select(Blocklist))).scalar_one()
+    assert entry.source_title == release_title
+    assert entry.source_title != "movie.mkv"
+    assert entry.indexer == indexer  # title+indexer tier stays effective for hashless feeds
+
+
+async def test_import_history_events_keep_basename_in_message_not_source_title(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # Both import history events (import_started + imported) carry a NULL source_title
+    # with the file basename preserved in ``message`` -- so neither can shadow the
+    # grabbed release title the blocklist relies on (F12).
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "movie.mkv")
+    download_id, _ = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, _qbt(release_dir), FakeLibrary()
+    )
+    assert record is not None and record.status == DownloadState.Imported.value
+
+    async with sessionmaker_() as session:
+        events = (
+            (
+                await session.execute(
+                    select(DownloadHistory)
+                    .where(DownloadHistory.torrent_hash == _HASH)
+                    .order_by(DownloadHistory.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    by_type = {e.event_type: e for e in events}
+    started = by_type[DownloadHistoryEvent.import_started]
+    imported = by_type[DownloadHistoryEvent.imported]
+    assert started.source_title is None and "movie.mkv" in (started.message or "")
+    assert imported.source_title is None and "movie.mkv" in (imported.message or "")

@@ -9,9 +9,9 @@ string literals; it mirrors P4's terminal ``DownloadState`` members.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 
 from plex_manager.models import Download
 from plex_manager.ports.repositories import DownloadRecord
@@ -130,6 +130,7 @@ class SqlDownloadRepository:
         first_seen_at: datetime | None = None,
         clear_first_seen_at: bool = False,
         clear_failed_reason: bool = False,
+        clear_download_path: bool = False,
         media_request_id: int | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
@@ -151,7 +152,12 @@ class SqlDownloadRepository:
             row.failed_reason = None
         elif failed_reason is not None:
             row.failed_reason = failed_reason
-        if download_path is not None:
+        if clear_download_path:
+            # A rolled-back placement (scan-failure orphan): drop the breadcrumb so a
+            # later retry's _resolve_content can't treat the now-deleted library path
+            # as the torrent's content.
+            row.download_path = None
+        elif download_path is not None:
             row.download_path = download_path
         if clear_first_seen_at:
             # Explicit reset to NULL (a recovered ClientMissing torrent): distinct
@@ -160,3 +166,40 @@ class SqlDownloadRepository:
         elif first_seen_at is not None:
             row.first_seen_at = first_seen_at
         await self._session.flush()
+
+    async def update_status_if_in(
+        self,
+        download_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        download_path: str | None = None,
+    ) -> bool:
+        """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
+        persisted status is in ``allowed_from``. Returns whether a row was updated.
+
+        ``update_status`` re-reads the row through the session identity map and issues
+        an unconditional ``UPDATE ... WHERE id = ?``, so a status another session
+        committed during a long async gap (e.g. an operator's mark_failed) would be
+        silently overwritten. This issues a single ``UPDATE ... WHERE id = ? AND status
+        IN (...)`` so the DATABASE — not stale in-memory state — decides whether the
+        move still applies; ``False`` means the row moved out from under the caller and
+        the transition must be abandoned, honoring whoever changed it.
+
+        ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
+        consistent with the DB result, so a later read returns the honest post-CAS
+        status.
+        """
+        values: dict[str, str] = {"status": status}
+        if download_path is not None:
+            values["download_path"] = download_path
+        stmt = (
+            update(Download)
+            .where(Download.id == download_id, Download.status.in_(allowed_from))
+            .values(**values)
+            .execution_options(synchronize_session="fetch")
+        )
+        # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
+        # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it).
+        result = cast("CursorResult[Any]", await self._session.execute(stmt))
+        return result.rowcount == 1

@@ -35,13 +35,23 @@ _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
-def _set_sqlite_fk_pragma(
+def _set_sqlite_pragmas(
     dbapi_connection: DBAPIConnection,
     _connection_record: ConnectionPoolEntry,
 ) -> None:
-    """Issue ``PRAGMA foreign_keys=ON`` on each new SQLite DBAPI connection."""
+    """Per-connection SQLite pragmas: ``foreign_keys=ON`` and a write ``busy_timeout``.
+
+    ``foreign_keys=ON`` makes the schema's ``ON DELETE`` clauses effective (off by
+    default, per-connection). ``busy_timeout=5000`` makes a writer that finds the
+    single SQLite write-lock held wait up to 5s for it instead of immediately raising
+    ``database is locked`` — so the reconcile loop's import claim/finalize and an
+    operator's concurrent ``mark_failed`` (a separate connection, not under the
+    per-download import lock) serialize gracefully instead of surfacing an opaque 500.
+    The wait happens inside aiosqlite's worker thread, so the event loop never blocks.
+    """
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 
@@ -56,7 +66,7 @@ def enable_sqlite_fk_enforcement(engine: AsyncEngine) -> None:
     cosmetic. A no-op for non-SQLite dialects (Postgres enforces FKs natively).
     """
     if engine.dialect.name == "sqlite":
-        event.listen(engine.sync_engine, "connect", _set_sqlite_fk_pragma)
+        event.listen(engine.sync_engine, "connect", _set_sqlite_pragmas)
 
 
 def get_engine() -> AsyncEngine:

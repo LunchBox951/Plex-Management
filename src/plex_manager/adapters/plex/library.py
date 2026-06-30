@@ -278,7 +278,14 @@ class PlexLibrary:
             section = _parse_section(_as_mapping(entry))
             if section is not None:
                 sections.append(section)
-        _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
+        # Cache only a list that CONTAINS a movie section. A no-movie result is a
+        # self-healing negative: validate_plex reports ok=False and tells the operator
+        # to add a Movie library and test again, so caching the empty/show-only
+        # snapshot for the full TTL would make the immediate re-test read stale data
+        # and leave setup wrongly blocked. Mirrors is_available's presence/absence
+        # asymmetry — cache a positive, never a negative the operator can fix.
+        if any(section.type == "movie" for section in sections):
+            _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
         return sections
 
     async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
