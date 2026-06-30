@@ -21,6 +21,7 @@ __all__ = [
     "DiscoverResult",
     "DiscoverSearchResponse",
     "GrabRequest",
+    "MoviesRootValidateRequest",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -83,6 +84,14 @@ class TmdbValidateRequest(BaseModel):
     api_key: str
 
 
+class MoviesRootValidateRequest(BaseModel):
+    """Candidate Movies library folder to test (exists + writable)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+
+
 class ServiceValidateResponse(BaseModel):
     """Result of a connection check. ``message`` is operator-facing; ``detail``
     is an optional diagnostic. Neither ever contains a secret value."""
@@ -110,6 +119,7 @@ class SetupCompleteRequest(BaseModel):
     qbittorrent_username: str
     qbittorrent_password: str
     tmdb_api_key: str
+    movies_root: str
 
 
 class SetupStatusResponse(BaseModel):
@@ -142,6 +152,7 @@ class SettingsResponse(BaseModel):
     qbittorrent_username: str | None = None
     qbittorrent_password: str | None = None
     tmdb_api_key: str | None = None
+    movies_root: str | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -161,6 +172,7 @@ class SettingsUpdate(BaseModel):
     qbittorrent_username: str | None = Field(default=None)
     qbittorrent_password: str | None = Field(default=None)
     tmdb_api_key: str | None = Field(default=None)
+    movies_root: str | None = Field(default=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +189,7 @@ class DiscoverResult(BaseModel):
     year: int | None = None
     overview: str | None = None
     poster_url: str | None = None
+    backdrop_url: str | None = None
 
 
 class DiscoverSearchResponse(BaseModel):
@@ -211,6 +224,8 @@ class RequestResponse(BaseModel):
     status: str
     year: int | None = None
     is_anime: bool = False
+    poster_url: str | None = None
+    backdrop_url: str | None = None
 
 
 class RequestListResponse(BaseModel):

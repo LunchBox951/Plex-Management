@@ -12,6 +12,9 @@ issued with the credential carried in a header (never in a logged URL).
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import httpx
 
 from plex_manager.adapters.qbittorrent.adapter import (
@@ -23,6 +26,7 @@ from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, Tmdb
 from plex_manager.web.schemas import ServiceValidateResponse
 
 __all__ = [
+    "validate_movies_root",
     "validate_plex",
     "validate_prowlarr",
     "validate_qbittorrent",
@@ -115,6 +119,27 @@ async def validate_qbittorrent(
             ok=False, message="Could not reach qBittorrent.", detail=str(exc)
         )
     return ServiceValidateResponse(ok=True, message="Connected to qBittorrent.")
+
+
+def validate_movies_root(path: str) -> ServiceValidateResponse:
+    """Check the Movies library folder exists and is writable (a local path).
+
+    Runs server-side, so it validates the path as the app's process (and, in a
+    container, the mounted volume) sees it — the same path the importer will route
+    movies into. A path is not a secret, so it may appear in the message.
+    """
+    if not path.strip():
+        return ServiceValidateResponse(ok=False, message="Enter a library folder path.")
+    target = Path(path)
+    if not target.exists():
+        return ServiceValidateResponse(ok=False, message="That folder does not exist.", detail=path)
+    if not target.is_dir():
+        return ServiceValidateResponse(ok=False, message="That path is not a folder.", detail=path)
+    if not os.access(target, os.W_OK):
+        return ServiceValidateResponse(
+            ok=False, message="That folder is not writable.", detail=path
+        )
+    return ServiceValidateResponse(ok=True, message="Library folder is ready.")
 
 
 async def validate_tmdb(client: httpx.AsyncClient, api_key: str) -> ServiceValidateResponse:

@@ -19,6 +19,7 @@ _COMPLETE_BODY = {
     "qbittorrent_username": "admin",
     "qbittorrent_password": "qb-pass-xyz",
     "tmdb_api_key": "tmdb-key-xyz",
+    "movies_root": "/library/movies",
 }
 
 

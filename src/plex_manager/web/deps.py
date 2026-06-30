@@ -31,7 +31,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
+from plex_manager.adapters.plex.library import PlexLibrary
 from plex_manager.adapters.prowlarr.adapter import ProwlarrIndexer
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentClient
 from plex_manager.adapters.tmdb.adapter import TmdbMetadata
@@ -40,7 +42,9 @@ from plex_manager.db import get_session
 from plex_manager.domain.quality_profile import QualityProfile, default_profile
 from plex_manager.models import Setting, SystemSettings
 from plex_manager.ports.download_client import DownloadClientPort
+from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 
@@ -52,7 +56,12 @@ __all__ = [
     "ServiceNotConfiguredError",
     "SettingsStore",
     "ensure_system_settings",
+    "get_filesystem",
     "get_http_client",
+    "get_library",
+    "get_library_optional",
+    "get_movies_root",
+    "get_movies_root_optional",
     "get_parser",
     "get_prowlarr",
     "get_qbittorrent",
@@ -76,6 +85,8 @@ _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
 # names in the settings schema — one stable naming, no translation layer).
+# ``movies_root`` is the on-disk library folder the importer routes movies into;
+# it is non-secret config (a path), entered at setup and editable in Settings.
 KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "plex_url",
     "plex_token",
@@ -85,6 +96,7 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "qbittorrent_username",
     "qbittorrent_password",
     "tmdb_api_key",
+    "movies_root",
 )
 
 # Keys whose values are secrets: stored encrypted, masked on read. Everything
@@ -338,6 +350,57 @@ async def get_qbittorrent(
     if not url or not username or password is None:
         raise ServiceNotConfiguredError("qbittorrent")
     return QbittorrentClient(client, url, username, password)
+
+
+def get_filesystem() -> FileSystemPort:
+    """Return the local filesystem adapter (no credentials needed)."""
+    return LocalFileSystem()
+
+
+async def get_library(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> LibraryPort:
+    """Build a configured :class:`LibraryPort` (Plex), or 409 if unconfigured."""
+    store = SettingsStore(session)
+    url = await store.get("plex_url")
+    token = await store.get("plex_token")
+    if not url or not token:
+        raise ServiceNotConfiguredError("plex")
+    return PlexLibrary(client, url, token)
+
+
+async def get_library_optional(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> LibraryPort | None:
+    """Like :func:`get_library`, but ``None`` when Plex is unconfigured.
+
+    Request-time availability dedupe degrades gracefully: an install without Plex
+    configured still creates requests (never a 409 on the request path), just
+    without the in-library short-circuit.
+    """
+    try:
+        return await get_library(session, client)
+    except ServiceNotConfiguredError:
+        return None
+
+
+async def get_movies_root(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> str:
+    """Return the configured Movies library root, or 409 if unset."""
+    root = await SettingsStore(session).get("movies_root")
+    if not root:
+        raise ServiceNotConfiguredError("movies_root")
+    return root
+
+
+async def get_movies_root_optional(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> str | None:
+    """Return the Movies root, or ``None`` when unset (the importer waits, no crash)."""
+    return await SettingsStore(session).get("movies_root")
 
 
 # --------------------------------------------------------------------------- #

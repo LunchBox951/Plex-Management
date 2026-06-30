@@ -40,6 +40,7 @@ async def test_search_returns_results(
             "year": 1999,
             "overview": None,
             "poster_url": None,
+            "backdrop_url": None,
         }
     ]
 
