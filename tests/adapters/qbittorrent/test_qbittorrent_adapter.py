@@ -1,0 +1,286 @@
+"""QbittorrentClient adapter tests — recorded ``/api/v2`` shapes via MockTransport.
+
+Covers: cookie login (``SID`` captured), magnet add (hash derived from the magnet
+``xt``), a 409-already-present add (treated as success), ``/torrents/info`` with
+several qBit-5 states including ``stoppedUP`` and ``metaDL`` (``raw_state`` kept
+verbatim), and remove. The password / SID are never asserted into logs. An
+OPTIONAL live smoke test is env-guarded.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from typing import Any
+
+import httpx
+import pytest
+
+from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentClient
+
+BASE_URL = "http://qbit.local:8080"
+USERNAME = "admin"
+PASSWORD = "never-logged-secret"  # noqa: S105
+
+MAGNET = "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678&dn=Test"
+MAGNET_HASH = "1234567890abcdef1234567890abcdef12345678"
+
+INFO_ROWS: list[dict[str, Any]] = [
+    {
+        "hash": "1234567890ABCDEF1234567890ABCDEF12345678",
+        "name": "Completed.Movie.1080p",
+        "state": "stoppedUP",  # qBit 5: finished + stopped
+        "progress": 1.0,
+        "ratio": 2.5,
+        "save_path": "/downloads/movies",
+        "content_path": "/downloads/movies/Completed.Movie.1080p.mkv",
+        "eta": 8640000,
+        "ratio_limit": -2,
+        "seeding_time_limit": -2,
+        "inactive_seeding_time_limit": -2,
+        "last_activity": 1700000000,
+    },
+    {
+        "hash": "abcabcabcabcabcabcabcabcabcabcabcabcabca",
+        "name": "Fetching.Metadata",
+        "state": "metaDL",  # magnet metadata being fetched
+        "progress": 0.0,
+        "ratio": 0.0,
+        "save_path": "/downloads/movies",
+        "content_path": "/downloads/movies",  # echoes save_path -> dropped to None
+        "eta": -1,
+        "ratio_limit": 1.5,
+        "seeding_time_limit": 120,
+        "inactive_seeding_time_limit": 30,
+        "last_activity": 1700000500,
+    },
+]
+
+
+def _login_response() -> httpx.Response:
+    return httpx.Response(200, text="Ok.", headers={"Set-Cookie": "SID=test-session-id; path=/"})
+
+
+def _router(*, add_status: int = 200, webapi_version: str = "2.11.0") -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if path == "/api/v2/auth/login" and method == "POST":
+            return _login_response()
+        if path == "/api/v2/app/webapiVersion" and method == "GET":
+            return httpx.Response(200, text=webapi_version)
+        if path == "/api/v2/torrents/add" and method == "POST":
+            if add_status == 409:
+                return httpx.Response(409, text="")
+            return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/torrents/info" and method == "GET":
+            hashes = request.url.params.get("hashes")
+            if hashes is not None:
+                wanted = hashes.lower()
+                rows = [r for r in INFO_ROWS if r["hash"].lower() == wanted]
+                return httpx.Response(200, json=rows)
+            return httpx.Response(200, json=INFO_ROWS)
+        if path == "/api/v2/torrents/delete" and method == "POST":
+            return httpx.Response(200, text="")
+        if path == "/api/v2/torrents/setCategory" and method == "POST":
+            return httpx.Response(200, text="")
+        if path == "/api/v2/torrents/properties" and method == "GET":
+            return httpx.Response(200, json={"save_path": "/downloads/movies"})
+        return httpx.Response(404, text="unhandled")
+
+    return handler
+
+
+def _client(handler: Any | None = None) -> QbittorrentClient:
+    transport = httpx.MockTransport(handler or _router())
+    http = httpx.AsyncClient(transport=transport)
+    return QbittorrentClient(http, BASE_URL, USERNAME, PASSWORD)
+
+
+async def test_add_magnet_returns_derived_hash() -> None:
+    client = _client()
+    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert info_hash == MAGNET_HASH
+
+
+async def test_add_409_already_present_is_success() -> None:
+    client = _client(_router(add_status=409))
+    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert info_hash == MAGNET_HASH
+
+
+async def test_login_failure_raises_auth_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Fails.")
+        return httpx.Response(200, json=[])
+
+    with pytest.raises(QbittorrentAuthError):
+        await _client(handler).get_all_statuses()
+
+
+async def test_auth_error_excludes_password() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="Fails.")
+
+    try:
+        await _client(handler).get_all_statuses()
+    except QbittorrentAuthError as exc:
+        assert PASSWORD not in str(exc)
+    else:  # pragma: no cover - guarded above
+        pytest.fail("expected QbittorrentAuthError")
+
+
+async def test_get_all_statuses_preserves_raw_state() -> None:
+    statuses = await _client().get_all_statuses()
+    assert len(statuses) == 2
+    by_state = {s.raw_state: s for s in statuses}
+    assert "stoppedUP" in by_state  # raw qBit-5 string kept verbatim
+    assert "metaDL" in by_state
+    done = by_state["stoppedUP"]
+    assert done.progress == 1.0
+    assert done.ratio == 2.5
+    assert done.content_path == "/downloads/movies/Completed.Movie.1080p.mkv"
+    assert done.eta_seconds is None or done.eta_seconds > 0
+    meta = by_state["metaDL"]
+    assert meta.content_path is None  # echoed save_path dropped
+    assert meta.seeding_time_limit_minutes == 120
+    assert meta.ratio_limit == 1.5
+
+
+async def test_get_status_by_hash() -> None:
+    status = await _client().get_status(MAGNET_HASH)
+    assert status is not None
+    assert status.info_hash == MAGNET_HASH  # lowercased
+    assert status.raw_state == "stoppedUP"
+
+
+async def test_get_status_absent_returns_none() -> None:
+    status = await _client().get_status("ffffffffffffffffffffffffffffffffffffffff")
+    assert status is None
+
+
+async def test_remove_and_get_save_path() -> None:
+    client = _client()
+    await client.remove(MAGNET_HASH, delete_files=True)
+    save_path = await client.get_save_path(MAGNET_HASH)
+    assert save_path == "/downloads/movies"
+
+
+async def test_relogin_on_403() -> None:
+    calls = {"login": 0, "info": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            calls["login"] += 1
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info":
+            calls["info"] += 1
+            if calls["info"] == 1:
+                return httpx.Response(403, text="Forbidden")
+            return httpx.Response(200, json=INFO_ROWS)
+        return httpx.Response(404)
+
+    statuses = await _client(handler).get_all_statuses()
+    assert len(statuses) == 2
+    assert calls["login"] == 2  # initial + re-login after 403
+
+
+# A minimal but well-formed .torrent: a top dict whose ``info`` is a bencoded
+# dict. The info-hash is SHA-1 over the raw ``info`` dict bytes.
+_INFO_DICT = b"d6:lengthi100e4:name8:test.txt12:piece lengthi16384ee"
+_TORRENT_BYTES = b"d8:announce14:http://x/annce4:info" + _INFO_DICT + b"e"
+_TORRENT_HASH = hashlib.sha1(_INFO_DICT).hexdigest()  # noqa: S324
+
+DOWNLOAD_URL = "http://indexer.local/file.torrent"
+REDIRECT_URL = "http://indexer.local/redirect"
+REDIRECT_MAGNET = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98&dn=Redirected"
+REDIRECT_HASH = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+async def test_add_torrent_file_url_computes_bencode_hash() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    assert info_hash == _TORRENT_HASH
+
+
+async def test_add_http_redirect_to_magnet_is_followed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == REDIRECT_URL:
+            return httpx.Response(302, headers={"Location": REDIRECT_MAGNET})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    info_hash = await _client(handler).add(REDIRECT_URL, "/downloads", "plex-manager")
+    assert info_hash == REDIRECT_HASH
+
+
+def _control_handler(seen: list[str], *, webapi_version: str) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text=webapi_version)
+        seen.append(request.url.path)
+        return httpx.Response(200, text="")
+
+    return handler
+
+
+async def test_pause_resume_use_stop_start_on_qbit5() -> None:
+    # qBit 5 (WebAPI 2.11.0) renamed pause/resume -> stop/start; the old paths 404.
+    seen: list[str] = []
+    client = _client(_control_handler(seen, webapi_version="2.11.0"))
+    await client.pause(MAGNET_HASH)
+    await client.resume(MAGNET_HASH)
+    await client.set_category(MAGNET_HASH, "plex-manager-imported")
+    assert "/api/v2/torrents/stop" in seen
+    assert "/api/v2/torrents/start" in seen
+    assert "/api/v2/torrents/pause" not in seen
+    assert "/api/v2/torrents/resume" not in seen
+    assert "/api/v2/torrents/setCategory" in seen
+
+
+async def test_pause_resume_use_legacy_endpoints_on_qbit4() -> None:
+    # On a pre-5.0 server (WebAPI 2.8.3) the legacy pause/resume paths are correct.
+    seen: list[str] = []
+    client = _client(_control_handler(seen, webapi_version="2.8.3"))
+    await client.pause(MAGNET_HASH)
+    await client.resume(MAGNET_HASH)
+    assert "/api/v2/torrents/pause" in seen
+    assert "/api/v2/torrents/resume" in seen
+    assert "/api/v2/torrents/stop" not in seen
+    assert "/api/v2/torrents/start" not in seen
+
+
+def test_adapter_satisfies_download_client_port() -> None:
+    from plex_manager.ports.download_client import DownloadClientPort
+
+    assert isinstance(_client(), DownloadClientPort)
+
+
+@pytest.mark.skipif(
+    not os.getenv("PLEX_MANAGER_LIVE_TESTS"),
+    reason="live qBittorrent smoke test; set PLEX_MANAGER_LIVE_TESTS + QBITTORRENT_*",
+)
+async def test_live_smoke_statuses() -> None:  # pragma: no cover - live only
+    base_url = os.environ.get("QBITTORRENT_URL")
+    username = os.environ.get("QBITTORRENT_USERNAME")
+    password = os.environ.get("QBITTORRENT_PASSWORD")
+    if not base_url or not username or not password:
+        pytest.skip("QBITTORRENT_URL / USERNAME / PASSWORD not set")
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        client = QbittorrentClient(http, base_url, username, password)
+        statuses = await client.get_all_statuses()
+        assert isinstance(statuses, list)

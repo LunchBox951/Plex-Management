@@ -45,6 +45,7 @@ class MovieMetadata(BaseModel):
     year: int | None = None
     overview: str | None = None
     poster_url: str | None = None
+    is_anime: bool = False
 
 
 class TvMetadata(BaseModel):
@@ -60,6 +61,7 @@ class TvMetadata(BaseModel):
     overview: str | None = None
     poster_url: str | None = None
     season_count: int = 0
+    is_anime: bool = False
 
 
 @runtime_checkable
