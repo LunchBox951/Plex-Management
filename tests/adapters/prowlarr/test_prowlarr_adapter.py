@@ -296,6 +296,22 @@ async def test_search_5xx_raises_indexer_error() -> None:
         await _adapter(handler).search(IndexerSearchRequest(query="x"))
 
 
+async def test_search_non_json_200_raises_indexer_error() -> None:
+    """A 200 whose body is NOT JSON (an auth / reverse-proxy HTML page) would make
+    the search response.json() raise a raw JSONDecodeError that bypasses the
+    IndexerError handler -> opaque 500. It must be wrapped as a retryable
+    IndexerError carrying no api key or url."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS)
+        return httpx.Response(200, text="<html>login</html>")
+
+    with pytest.raises(IndexerError) as exc_info:
+        await _adapter(handler).search(IndexerSearchRequest(query="x"))
+    assert API_KEY not in str(exc_info.value)
+
+
 def test_rate_limit_error_is_indexer_error_subclass() -> None:
     """IndexerRateLimitError is an IndexerError so a base-class handler still
     catches the rate-limit case (and the app maps each to its own detail)."""

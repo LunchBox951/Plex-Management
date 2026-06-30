@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Final, cast
@@ -178,6 +179,21 @@ def _is_add_success(response: httpx.Response) -> bool:
         if isinstance(ids, list) and ids:
             return True
     return False
+
+
+def _decode_json(response: httpx.Response, what: str) -> object:
+    """Decode a response body as JSON, converting a non-JSON body to a typed error.
+
+    A 200 whose body is not JSON (a reverse-proxy / auth HTML page in front of the
+    WebUI) would otherwise raise a raw ``JSONDecodeError`` that bypasses the
+    ``QbittorrentError`` handler and surfaces as an opaque 500. Converting it here
+    keeps the failure visible and retryable; the message names only the endpoint,
+    never the url or any secret.
+    """
+    try:
+        return response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise QbittorrentError(f"qBittorrent returned a non-JSON body for {what}") from exc
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -443,7 +459,7 @@ class QbittorrentClient:
             "GET", "/torrents/info", params={"hashes": info_hash.lower()}
         )
         self._raise_for_status(response)
-        rows = _as_list(response.json())
+        rows = _as_list(_decode_json(response, "/torrents/info"))
         if rows:
             return _torrent_to_status(_as_dict(rows[0]))
         return None
@@ -456,7 +472,7 @@ class QbittorrentClient:
         response = await self._request("GET", "/torrents/info", params=params)
         self._raise_for_status(response)
         out: list[DownloadStatus] = []
-        for row in _as_list(response.json()):
+        for row in _as_list(_decode_json(response, "/torrents/info")):
             mapped = _as_dict(row)
             if mapped:
                 out.append(_torrent_to_status(mapped))
@@ -535,7 +551,7 @@ class QbittorrentClient:
         response = await self._request("GET", "/torrents/properties", params={"hash": info_hash})
         if response.status_code != _HTTP_OK:
             return None
-        payload = _as_dict(response.json())
+        payload = _as_dict(_decode_json(response, "/torrents/properties"))
         if not payload:
             return None
         self._properties_cache[info_hash] = (now, payload)

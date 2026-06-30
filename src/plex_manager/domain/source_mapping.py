@@ -298,6 +298,27 @@ def _coerce_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _coerce_season(value: object) -> int | list[int] | None:
+    """Normalize guessit's ``season`` field to ``int`` | ``list[int]`` | ``None``.
+
+    guessit yields a single ``int`` for ``SxxExx`` / a single-season pack and a
+    ``list[int]`` for a multi-season pack (``S01-S03``). ``bool`` is excluded (it
+    subclasses ``int``); a list is filtered to its ``int`` members and collapsed
+    to ``None`` when empty, so the wrong-season gate never sees a bogus value.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        sequence = cast("list[object] | tuple[object, ...]", value)
+        seasons = [
+            item for item in sequence if isinstance(item, int) and not isinstance(item, bool)
+        ]
+        return seasons or None
+    return None
+
+
 def to_parsed_release(fields: Mapping[str, object], raw_title: str) -> ParsedRelease:
     """Assemble a :class:`ParsedRelease` from a guessit field mapping + raw title."""
     source, resolution, modifier, revision = map_fields(fields, raw_title)
@@ -306,6 +327,7 @@ def to_parsed_release(fields: Mapping[str, object], raw_title: str) -> ParsedRel
         raw_title=raw_title,
         clean_title=clean_title,
         year=_coerce_year(fields.get("year")),
+        season=_coerce_season(fields.get("season")),
         source=source,
         resolution=resolution,
         modifier=modifier,

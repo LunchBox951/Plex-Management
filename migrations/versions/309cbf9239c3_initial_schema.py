@@ -77,7 +77,9 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), nullable=False),
     # sa.false(): portable boolean default (see settings.is_secret).
     sa.Column('initialized', sa.Boolean(), server_default=sa.false(), nullable=False),
-    sa.Column('app_api_key', sa.String(), nullable=True),
+    # The app API key is stored ONLY as its SHA-256 hex digest, never in plaintext
+    # (a DB-backup leak of the raw bearer token would be an auth bypass, ADR-0005).
+    sa.Column('app_api_key_hash', sa.String(), nullable=True),
     sa.Column('setup_started_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('setup_completed_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id'),
@@ -209,6 +211,22 @@ def upgrade() -> None:
     with op.batch_alter_table('downloads', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_downloads_status'), ['status'], unique=False)
         batch_op.create_index(batch_op.f('ix_downloads_torrent_hash'), ['torrent_hash'], unique=True)
+        # At most one active download per request (the DB backstop to the
+        # app-level parallel-grab guard). Terminal statuses are excluded; the
+        # predicate is supplied per-dialect so Postgres honours the partial index.
+        batch_op.create_index(
+            'uq_downloads_active_request',
+            ['media_request_id'],
+            unique=True,
+            sqlite_where=sa.text(
+                "media_request_id IS NOT NULL "
+                "AND status NOT IN ('imported', 'failed', 'no_acceptable_release')"
+            ),
+            postgresql_where=sa.text(
+                "media_request_id IS NOT NULL "
+                "AND status NOT IN ('imported', 'failed', 'no_acceptable_release')"
+            ),
+        )
 
     op.create_table('season_requests',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -234,6 +252,7 @@ def downgrade() -> None:
 
     op.drop_table('season_requests')
     with op.batch_alter_table('downloads', schema=None) as batch_op:
+        batch_op.drop_index('uq_downloads_active_request')
         batch_op.drop_index(batch_op.f('ix_downloads_torrent_hash'))
         batch_op.drop_index(batch_op.f('ix_downloads_status'))
 

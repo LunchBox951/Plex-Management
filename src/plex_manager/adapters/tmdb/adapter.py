@@ -16,6 +16,7 @@ for repeated lookups during a search/grab flow.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -184,7 +185,15 @@ class TmdbMetadata:
             )
         if response.is_error:
             raise TmdbApiError(f"TMDB request to {path} failed (HTTP {response.status_code})")
-        return _as_mapping(response.json())
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            # A 200 with a non-JSON body (a reverse-proxy / auth HTML page) would
+            # otherwise raise a raw JSONDecodeError that bypasses the TmdbApiError
+            # handler and surfaces as an opaque 500. Convert it at the boundary —
+            # the message names the path only, never the url (which embeds api_key).
+            raise TmdbApiError(f"TMDB returned a non-JSON body for {path}") from exc
+        return _as_mapping(payload)
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         """Search by free text via ``/search/multi`` (movie + tv rows only)."""

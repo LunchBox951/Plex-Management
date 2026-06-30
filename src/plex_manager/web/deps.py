@@ -4,9 +4,11 @@ Wiring rules:
 
 * ``get_session`` reuses :func:`plex_manager.db.get_session`.
 * ``require_api_key`` enforces the static ``X-Api-Key`` header against
-  ``SystemSettings.app_api_key`` (constant-time compare). It is skipped when
-  ``settings.dev_auth_bypass`` is set. Health, setup and docs routes do NOT
-  depend on it.
+  ``SystemSettings.app_api_key_hash`` — the incoming header is SHA-256-hashed and
+  constant-time-compared, so the plaintext key is never at rest. The header is
+  sourced via ``APIKeyHeader`` so the security scheme appears in the OpenAPI. It
+  is skipped when ``settings.dev_auth_bypass`` is set. Health, setup and docs
+  routes do NOT depend on it.
 * ``SettingsStore`` is the typed access layer over the ``settings`` table: secret
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
@@ -19,11 +21,13 @@ Wiring rules:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 from typing import Annotated
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import APIKeyHeader
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +46,7 @@ from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 
 __all__ = [
+    "API_KEY_HEADER_NAME",
     "KNOWN_SETTING_KEYS",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
@@ -55,10 +60,31 @@ __all__ = [
     "get_quality_profile",
     "get_session",
     "get_tmdb",
+    "hash_api_key",
     "load_system_settings",
     "require_api_key",
     "require_pre_init_or_api_key",
 ]
+
+# The bearer-token header. Declared via ``APIKeyHeader`` (below) so FastAPI emits
+# the security scheme + per-route requirement into the OpenAPI document — without
+# it, generated clients would treat protected routes as unauthenticated and omit
+# the key.
+API_KEY_HEADER_NAME = "X-Api-Key"
+# ``auto_error=False``: we do the rejection ourselves so the failure detail stays
+# the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
+_api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+
+
+def hash_api_key(token: str) -> str:
+    """Return the SHA-256 hex digest used to store / compare the app API key.
+
+    The plaintext bearer token is NEVER persisted; only this digest is. Auth then
+    hashes the incoming header and constant-time-compares it to the stored digest,
+    so a DB-backup leak cannot yield a usable key (ADR-0005).
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
 # names in the settings schema — one stable naming, no translation layer).
@@ -221,21 +247,36 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
 # --------------------------------------------------------------------------- #
 # Authentication
 # --------------------------------------------------------------------------- #
+def _api_key_matches(provided: str | None, expected_hash: str | None) -> bool:
+    """Constant-time check of the incoming header against the stored hash.
+
+    The header is hashed and ``hmac.compare_digest``-compared to the stored
+    SHA-256 digest, so neither the comparison nor the database read can leak a
+    usable key. A missing header or an uninitialised install (no stored hash)
+    never matches.
+    """
+    if not provided or not expected_hash:
+        return False
+    return hmac.compare_digest(hash_api_key(provided), expected_hash)
+
+
 async def require_api_key(
-    request: Request,
+    provided: Annotated[str | None, Depends(_api_key_header)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Enforce the ``X-Api-Key`` header against ``SystemSettings.app_api_key``.
+    """Enforce the ``X-Api-Key`` header against ``SystemSettings.app_api_key_hash``.
 
-    Constant-time comparison (``hmac.compare_digest``) avoids a timing oracle.
-    Skipped entirely when ``settings.dev_auth_bypass`` is set (dev convenience).
+    The header source is :class:`APIKeyHeader`, so the security scheme + per-route
+    requirement appear in the exported OpenAPI (generated clients then send the
+    key). The incoming value is SHA-256-hashed and constant-time-compared
+    (``hmac.compare_digest``) to the stored digest — the plaintext key is never at
+    rest. Skipped entirely when ``settings.dev_auth_bypass`` is set (dev only).
     """
     if get_settings().dev_auth_bypass:
         return
-    provided = request.headers.get("X-Api-Key")
     system = await load_system_settings(session)
-    expected = system.app_api_key if system is not None else None
-    if not expected or not provided or not hmac.compare_digest(provided, expected):
+    expected = system.app_api_key_hash if system is not None else None
+    if not _api_key_matches(provided, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 
@@ -250,15 +291,18 @@ async def require_pre_init_or_api_key(
     them anonymous post-init would turn them into an SSRF / reachability oracle,
     so once ``initialized`` is set they fall under the same api-key gate as the
     rest of the API (still skippable via ``dev_auth_bypass``).
+
+    Unlike :func:`require_api_key`, the header is read imperatively from the
+    request (not via :class:`APIKeyHeader`): these setup routes are intentionally
+    NOT marked as secured in the OpenAPI, since they are open before init.
     """
     system = await load_system_settings(session)
     if system is None or not system.initialized:
         return
     if get_settings().dev_auth_bypass:
         return
-    provided = request.headers.get("X-Api-Key")
-    expected = system.app_api_key
-    if not expected or not provided or not hmac.compare_digest(provided, expected):
+    provided = request.headers.get(API_KEY_HEADER_NAME)
+    if not _api_key_matches(provided, system.app_api_key_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 

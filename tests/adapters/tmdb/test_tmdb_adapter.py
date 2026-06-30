@@ -195,6 +195,25 @@ async def test_transport_outage_raises_tmdb_api_error_without_url() -> None:
     assert "/movie/27205" in message
 
 
+async def test_non_json_200_raises_tmdb_api_error_without_url() -> None:
+    """A 200 whose body is NOT JSON (a reverse-proxy / auth HTML page) would make
+    response.json() raise a raw JSONDecodeError that bypasses the TmdbApiError
+    handler -> opaque 500. It must be converted to a retryable TmdbApiError naming
+    the path only — never the url (which embeds the api key)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("api_key") == API_KEY  # key is in the URL
+        return httpx.Response(200, text="<html>login</html>")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    with pytest.raises(TmdbApiError) as exc_info:
+        await adapter.get_movie(27205)
+    message = str(exc_info.value)
+    assert API_KEY not in message
+    assert "/movie/27205" in message
+
+
 async def test_cache_serves_second_lookup_without_network() -> None:
     calls = {"n": 0}
 

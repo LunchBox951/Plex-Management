@@ -30,6 +30,7 @@ from plex_manager.web.deps import (
     SettingsStore,
     ensure_system_settings,
     get_http_client,
+    hash_api_key,
     load_system_settings,
     require_pre_init_or_api_key,
 )
@@ -113,6 +114,9 @@ async def complete(
     # Ensure the singleton row (id=1) exists so the conditional update has a target.
     await ensure_system_settings(session)
 
+    # Mint the bearer token, but persist only its hash — the plaintext is revealed
+    # exactly once (in the response below) and never stored, so a DB-backup leak
+    # cannot yield a usable key (ADR-0005).
     app_api_key = secrets.token_urlsafe(_API_KEY_BYTES)
     now = datetime.now(UTC)
     # Atomically claim initialization. Only the still-uninitialized row matches, so
@@ -125,7 +129,7 @@ async def complete(
             .where(SystemSettings.id == 1, SystemSettings.initialized.is_(False))
             .values(
                 initialized=True,
-                app_api_key=app_api_key,
+                app_api_key_hash=hash_api_key(app_api_key),
                 setup_started_at=now,
                 setup_completed_at=now,
             )

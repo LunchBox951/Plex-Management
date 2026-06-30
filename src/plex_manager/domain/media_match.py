@@ -49,17 +49,41 @@ def normalize_title(title: str) -> str:
     return _NON_ALNUM.sub("", stripped)
 
 
+def _season_covers(parsed_season: int | list[int] | None, expected_season: int) -> bool:
+    """Return ``True`` only if the parsed release covers ``expected_season``.
+
+    Conservative by design: a release that exposes NO season (``None``) is treated
+    as uncertain and rejected — a tracker that ignored Prowlarr's ``season`` param
+    can return an arbitrary season, so an unparseable season is not proof of a
+    match. An ``int`` must equal the request; a multi-season pack (``list``)
+    matches when it contains the requested season.
+    """
+    if parsed_season is None:
+        return False
+    if isinstance(parsed_season, int):
+        return parsed_season == expected_season
+    return expected_season in parsed_season
+
+
 def matches_media(
     parsed: ParsedRelease,
     expected_title: str,
     expected_year: int | None,
     candidate_tmdb_id: int,
     expected_tmdb_id: int,
+    expected_season: int | None = None,
 ) -> bool:
     """Return ``True`` only when ``parsed`` plausibly names the wanted media.
 
     Decision order, conservative by design:
 
+    0. **Season gate (TV).** When ``expected_season`` is set, the parsed release
+       must cover that season; otherwise REJECT. This runs FIRST and independently
+       of the id/title checks, because a season pack for the *wrong* season still
+       carries the show's (correct) ``tmdb_id`` — without this gate an authoritative
+       id match would wave it through. A release exposing no season at all is
+       treated as uncertain and rejected (a tracker may ignore the ``season``
+       param), per the same conservative policy as the missing-year case.
     1. **Authoritative id match.** When the candidate carries a non-zero
        ``tmdb_id`` *and* the request has one, the id is decisive — equal accepts,
        unequal rejects (no title fallback can override a definitive id mismatch).
@@ -70,6 +94,9 @@ def matches_media(
        but *no* parsed year is treated as uncertain and rejected — better to
        surface ``no_acceptable_release`` than grab the wrong thing.
     """
+    if expected_season is not None and not _season_covers(parsed.season, expected_season):
+        return False
+
     if candidate_tmdb_id and expected_tmdb_id:
         return candidate_tmdb_id == expected_tmdb_id
 

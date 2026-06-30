@@ -116,6 +116,15 @@ class DownloadRepository(Protocol):
     async def get_by_hash(self, torrent_hash: str) -> DownloadRecord | None:
         """Return the download for ``torrent_hash``, or ``None``."""
 
+    async def find_active_for_request(self, media_request_id: int) -> DownloadRecord | None:
+        """Return an existing non-terminal download owned by ``media_request_id``.
+
+        The parallel-grab guard: a request that already has an active (non-terminal)
+        download must not spawn a second one for a *different* release, or a later
+        failure of either would re-arm the request while the other still runs.
+        """
+        raise NotImplementedError
+
     async def list_active(self) -> list[DownloadRecord]:
         """List downloads in a non-terminal state (for the reconcile loop)."""
         raise NotImplementedError

@@ -442,6 +442,51 @@ async def test_mark_failed_without_blocklist_rearms_request_via_api(
     assert detail.json()["status"] == "searching"
 
 
+async def test_grab_rejects_second_active_release_for_same_request(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A request that already has an ACTIVE download must not spawn a second one for
+    a DIFFERENT release: the parallel grab is refused 409 already_downloading and no
+    second active row is created (later failure of one must not re-arm the request
+    while the other still runs)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    first = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert first.status_code == 201
+
+    # A DIFFERENT acceptable release for the same request, while the first is still
+    # active (downloading). Grabbing it by hash must be refused.
+    other = candidate("Some.Movie.2020.720p.WEB-DL.x264-GROUP", info_hash="7" * 40, seeders=5)
+    qbt2 = FakeQbittorrent()
+    override_adapters(app, prowlarr=FakeProwlarr([other]), qbt=qbt2)
+    second = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "info_hash": "7" * 40},
+        headers=_HEADERS,
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == "already_downloading"
+    # The second release never reached the client, and no parallel row exists.
+    assert qbt2.added == []
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.media_request_id == request_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].torrent_hash == _GOOD_HASH
+
+
 async def test_queue_requires_api_key(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:

@@ -72,6 +72,18 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
+    async def find_active_for_request(self, media_request_id: int) -> DownloadRecord | None:
+        stmt = (
+            select(Download)
+            .where(
+                Download.media_request_id == media_request_id,
+                Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+            )
+            .order_by(Download.id)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return _to_record(row) if row is not None else None
+
     async def list_active(self) -> list[DownloadRecord]:
         stmt = (
             select(Download)

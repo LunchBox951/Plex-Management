@@ -1099,6 +1099,13 @@
         "title": "ValidationError",
         "type": "object"
       }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "in": "header",
+        "name": "X-Api-Key",
+        "type": "apiKey"
+      }
     }
   },
   "info": {
@@ -1151,6 +1158,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "List Blocklist",
         "tags": [
           "blocklist"
@@ -1187,6 +1199,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Delete Blocklist",
         "tags": [
           "blocklist"
@@ -1247,6 +1264,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Discover Search",
         "tags": [
           "discovery"
@@ -1269,6 +1291,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Get Quality Profile Endpoint",
         "tags": [
           "quality-profile"
@@ -1291,6 +1318,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Get Queue",
         "tags": [
           "queue"
@@ -1333,6 +1365,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Grab Endpoint",
         "tags": [
           "queue"
@@ -1386,6 +1423,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Mark Failed Endpoint",
         "tags": [
           "queue"
@@ -1408,6 +1450,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "List Requests Endpoint",
         "tags": [
           "requests"
@@ -1448,6 +1495,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Create Request Endpoint",
         "tags": [
           "requests"
@@ -1491,6 +1543,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Get Request Endpoint",
         "tags": [
           "requests"
@@ -1533,6 +1590,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Search Preview Endpoint",
         "tags": [
           "search-preview"
@@ -1555,6 +1617,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Get Settings Endpoint",
         "tags": [
           "settings"
@@ -1595,6 +1662,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Put Settings Endpoint",
         "tags": [
           "settings"

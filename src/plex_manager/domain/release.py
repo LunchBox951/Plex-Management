@@ -55,6 +55,10 @@ class ParsedRelease(BaseModel):
     raw_title: str
     clean_title: str
     year: int | None = None
+    # Parsed season(s). A single ``SxxExx`` / single-season pack yields an ``int``;
+    # a multi-season pack (``S01-S03``) yields a ``list[int]``; ``None`` when the
+    # name exposes no season at all. The wrong-season gate reads this.
+    season: int | list[int] | None = None
     source: QualitySource = QualitySource.UNKNOWN
     resolution: Resolution = Resolution.UNKNOWN
     modifier: Modifier = Modifier.NONE

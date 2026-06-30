@@ -74,6 +74,62 @@ def test_matches_media_table(
     )
 
 
+def _tv_parsed(title: str, season: int | list[int] | None) -> ParsedRelease:
+    return ParsedRelease(raw_title=title, clean_title=title, season=season)
+
+
+@pytest.mark.parametrize(
+    ("parsed_season", "expected_season", "want"),
+    [
+        # Correct season accepted (the show id matches and the season covers it).
+        (2, 2, True),
+        # An S01 pack for an S02 request is the wrong season -> reject, even though
+        # the tmdb id is the show's correct id (a tracker ignored the season param).
+        (1, 2, False),
+        # A multi-season pack that spans the requested season covers it.
+        ([1, 2, 3], 2, True),
+        # A multi-season pack that does NOT span the requested season is rejected.
+        ([1, 3], 2, False),
+        # No season parsed at all is uncertain -> conservative reject.
+        (None, 2, False),
+    ],
+)
+def test_matches_media_season_gate(
+    parsed_season: int | list[int] | None, expected_season: int, want: bool
+) -> None:
+    # The candidate carries the show's CORRECT tmdb id, so without the season gate
+    # the authoritative id match would wave a wrong-season pack straight through.
+    parsed = _tv_parsed("The.Mandalorian.S0x.1080p.WEB-DL", parsed_season)
+    assert (
+        matches_media(
+            parsed,
+            expected_title="The Mandalorian",
+            expected_year=None,
+            candidate_tmdb_id=82856,
+            expected_tmdb_id=82856,
+            expected_season=expected_season,
+        )
+        is want
+    )
+
+
+def test_matches_media_no_expected_season_is_unconstrained() -> None:
+    # When no season is requested (movie, or a season-less TV preview), the season
+    # gate is inert and the id match alone decides.
+    parsed = _tv_parsed("Some.Show.1080p.WEB-DL", season=None)
+    assert (
+        matches_media(
+            parsed,
+            expected_title="Some Show",
+            expected_year=None,
+            candidate_tmdb_id=42,
+            expected_tmdb_id=42,
+            expected_season=None,
+        )
+        is True
+    )
+
+
 def test_normalize_title_strips_punctuation_and_case() -> None:
     assert normalize_title("Spider-Man: No Way Home") == "spidermannowayhome"
     assert normalize_title("  The.Matrix  ") == "thematrix"

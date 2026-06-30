@@ -28,6 +28,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PostgreSQL drivers (Postgres is a config swap — SQLite is the default, so these
+# are NOT base runtime deps). async_database_url() targets ``postgresql+asyncpg``
+# for the app and sync_database_url() targets a sync DBAPI (psycopg2) for Alembic,
+# so a documented ``postgresql://`` deployment needs BOTH. Install with
+# ``pip install '.[postgres]'``.
+postgres = [
+    "asyncpg>=0.29",
+    "psycopg2-binary>=2.9",
+]
 dev = [
     # Gate tools are pinned exactly so pre-commit, local, and CI never drift
     # (bump deliberately; Dependabot's pip ecosystem proposes updates).

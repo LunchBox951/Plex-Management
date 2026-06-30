@@ -14,7 +14,11 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import grab_service, queue_service, request_service
-from plex_manager.services.grab_service import GrabError, NoGrabSourceError
+from plex_manager.services.grab_service import (
+    AlreadyDownloadingError,
+    GrabError,
+    NoGrabSourceError,
+)
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
     get_parser,
@@ -123,6 +127,12 @@ async def grab_endpoint(
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
+    except AlreadyDownloadingError as exc:
+        # The request already has an active download for a different release;
+        # refuse the parallel grab instead of spawning a second active row.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
+        ) from exc
     except GrabError as exc:
         # qBittorrent took the grab but no real info-hash could be determined;
         # surfaced (not silently tracked by an unmatchable guid) so the operator

@@ -330,6 +330,26 @@ async def test_transport_outage_raises_qbittorrent_error() -> None:
     assert PASSWORD not in str(exc_info.value)
 
 
+async def test_info_non_json_200_raises_qbittorrent_error() -> None:
+    """A 200 on /torrents/info whose body is NOT JSON (a reverse-proxy / auth HTML
+    page in front of the WebUI) would make response.json() raise a raw
+    JSONDecodeError -> opaque 500. It must be wrapped as a retryable
+    QbittorrentError carrying no url or secret."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info":
+            return httpx.Response(200, text="<html>login</html>")
+        return httpx.Response(404, text="unhandled")
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).get_all_statuses()
+    message = str(exc_info.value)
+    assert BASE_URL not in message
+    assert PASSWORD not in message
+
+
 async def test_add_unreachable_http_source_raises_qbittorrent_error() -> None:
     """A release exposing only a download_url whose indexer/Prowlarr URL is
     unreachable surfaces a wrapped, retryable QbittorrentError on the grab path —

@@ -266,7 +266,15 @@ class ProwlarrIndexer:
             # rather than letting httpx's HTTPStatusError escape (it embeds the url).
             raise IndexerError(f"Prowlarr search failed (HTTP {response.status_code})")
 
-        rows = _as_sequence(response.json())
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            # A 200 with a non-JSON body (an auth / reverse-proxy HTML page) would
+            # otherwise raise a raw JSONDecodeError that bypasses the IndexerError
+            # handler and surfaces as an opaque 500. Convert it at the boundary; the
+            # message carries no api key or url.
+            raise IndexerError("Prowlarr returned a non-JSON body for the search") from exc
+        rows = _as_sequence(payload)
         candidates: list[CandidateRelease] = []
         for raw in rows:
             candidate = self._to_candidate(_as_mapping(raw), priorities)

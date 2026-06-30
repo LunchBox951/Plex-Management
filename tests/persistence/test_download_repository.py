@@ -4,9 +4,28 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.repositories import SqlDownloadRepository
+
+
+async def test_at_most_one_active_download_per_request(session: AsyncSession) -> None:
+    # The uq_downloads_active_request partial unique index is the DB backstop to
+    # the app-level parallel-grab guard: a request can never have two active
+    # downloads racing each other, even under true concurrency.
+    mr = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="X", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    await repo.create(torrent_hash="active_a", status="downloading", media_request_id=mr.id)
+    with pytest.raises(IntegrityError):
+        # A DIFFERENT release for the SAME request while one is still active.
+        await repo.create(torrent_hash="active_b", status="downloading", media_request_id=mr.id)
 
 
 async def test_create_then_get_by_hash(session: AsyncSession) -> None:

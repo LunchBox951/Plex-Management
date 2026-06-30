@@ -145,12 +145,19 @@ class Setting(Base):
 
 
 class SystemSettings(Base):
-    """Single-row install state: the setup flag + auto-generated app API key.
+    """Single-row install state: the setup flag + a HASH of the app API key.
 
     A genuine singleton: the row is pinned to ``id=1`` and a ``CHECK (id = 1)``
     constraint forbids any second row at the database level, so two workers racing
     to initialise an empty DB cannot both insert (the loser hits a PK / CHECK
     violation, caught and resolved to a re-read in :func:`ensure_system_settings`).
+
+    The app API key is stored ONLY as its SHA-256 hex digest
+    (``app_api_key_hash``), never in plaintext: the bearer token is a master
+    credential, so persisting it raw would turn any DB-backup leak into an auth
+    bypass. The plaintext is revealed exactly once in the ``/setup/complete``
+    response; thereafter every request is authenticated by hashing the incoming
+    ``X-Api-Key`` header and constant-time-comparing it to this digest (ADR-0005).
     """
 
     __tablename__ = "system_settings"
@@ -161,7 +168,8 @@ class SystemSettings(Base):
     # ``false`` on PostgreSQL); ``sa.text("0")`` would emit ``DEFAULT 0``, rejected
     # by PostgreSQL on a BOOLEAN column.
     initialized: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
-    app_api_key: Mapped[str | None] = mapped_column(String)
+    # SHA-256 hex digest of the app API key — never the plaintext token.
+    app_api_key_hash: Mapped[str | None] = mapped_column(String)
     setup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     setup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -252,6 +260,26 @@ class Download(Base):
     """A tracked torrent. ``status`` holds the P4 ``DownloadState`` value (str)."""
 
     __tablename__ = "downloads"
+    __table_args__ = (
+        # At most one ACTIVE download per request — the DB backstop for the
+        # app-level parallel-grab guard (which is otherwise a TOCTOU check).
+        # Mirrors uq_media_requests_active: terminal statuses are excluded so a
+        # fresh grab after one finishes/fails is still allowed, and the predicate
+        # is supplied per-dialect so the partial index is honoured on Postgres too.
+        Index(
+            "uq_downloads_active_request",
+            "media_request_id",
+            unique=True,
+            sqlite_where=sa.text(
+                "media_request_id IS NOT NULL "
+                "AND status NOT IN ('imported', 'failed', 'no_acceptable_release')"
+            ),
+            postgresql_where=sa.text(
+                "media_request_id IS NOT NULL "
+                "AND status NOT IN ('imported', 'failed', 'no_acceptable_release')"
+            ),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     media_request_id: Mapped[int | None] = mapped_column(

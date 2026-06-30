@@ -126,6 +126,35 @@ async def test_preview_accepts_tv_episode_despite_series_year(
     assert result.rejected == []
 
 
+async def test_preview_rejects_wrong_season_pack(sessionmaker_: SessionMaker) -> None:
+    # A tracker ignored Prowlarr's season param and returned an S01 pack for an S02
+    # request. The pack still carries the show's correct identity, so only the
+    # season gate stops it — it must be rejected WRONG_MEDIA, never grabbed.
+    candidates = [
+        candidate("The.Mandalorian.S01.1080p.WEB-DL.x264-GROUP", info_hash="e" * 40),
+        candidate("The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="f" * 40),
+    ]
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr(candidates),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+        )
+
+    # Only the S02 pack survives; the S01 pack is a wrong-season reject.
+    assert [s.candidate.title for s in result.accepted] == [
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP"
+    ]
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert rejected["The.Mandalorian.S01.1080p.WEB-DL.x264-GROUP"] is RejectionReason.WRONG_MEDIA
+
+
 async def test_preview_rejects_mismatched_tmdb_id(sessionmaker_: SessionMaker) -> None:
     # A candidate whose own tmdb id disagrees with the request's tmdb id is a
     # definitive wrong-media reject — the title looks right but the id is decisive.

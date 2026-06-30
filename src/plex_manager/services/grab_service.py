@@ -5,10 +5,14 @@ client, then records a ``downloads`` row (``Downloading``) plus an append-only
 ``download_history`` ``grabbed`` event — the durable state-recovery anchor. The
 alpha pipeline stops here: the reconciler tracks the torrent from this point.
 
-Idempotency: a duplicate grab of the same torrent is a no-op. The guard checks
-both the candidate's pre-known info-hash and the hash qBittorrent returns (a 409
-"already present" resolves to the existing hash), so a double-click never creates
-a second row or a second history event.
+Idempotency & one-active-per-request: re-grabbing the SAME torrent is a no-op —
+the guard checks both the candidate's pre-known info-hash and the hash
+qBittorrent returns (a 409 "already present" resolves to the existing hash), so a
+double-click never creates a second row or history event. Grabbing a DIFFERENT
+release while the request already has an active download is refused with
+``AlreadyDownloadingError`` (the app-level guard, backstopped by the
+``uq_downloads_active_request`` partial unique index under true concurrency), so a
+request never ends up with two active downloads racing each other.
 """
 
 from __future__ import annotations
@@ -33,7 +37,13 @@ if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.repositories import DownloadRecord
 
-__all__ = ["DEFAULT_CATEGORY", "GrabError", "NoGrabSourceError", "grab"]
+__all__ = [
+    "DEFAULT_CATEGORY",
+    "AlreadyDownloadingError",
+    "GrabError",
+    "NoGrabSourceError",
+    "grab",
+]
 
 # The qBittorrent category the app tags its torrents with (lets a later import
 # pipeline filter to only app-managed downloads).
@@ -54,6 +64,22 @@ class NoGrabSourceError(Exception):
     def __init__(self, guid: str) -> None:
         self.guid = guid
         super().__init__(f"release {guid} has no magnet or download url")
+
+
+class AlreadyDownloadingError(Exception):
+    """The request already has a DIFFERENT active download — refuse a parallel grab.
+
+    Surfaced (HTTP 409 ``already_downloading``), never a silent second row. The
+    duplicate guard makes re-grabbing the SAME release idempotent; this catches
+    grabbing a *different* accepted release while one is still in flight, which
+    would create a second active row for the request (and a later failure of either
+    would wrongly re-arm the request while the other still runs). Honesty over
+    silence: tell the operator one is already downloading.
+    """
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(f"request {request_id} already has an active download")
 
 
 class GrabError(Exception):
@@ -130,6 +156,17 @@ async def grab(
         if pre is not None and pre.status not in _TERMINAL_STATUS_VALUES:
             return pre
 
+    # Parallel-grab guard: if this request already has an active (non-terminal)
+    # download for a DIFFERENT release, refuse rather than create a second active
+    # row. The known-hash precheck above already returned for the SAME release, so
+    # an active download whose hash differs (or that we can't yet match because the
+    # indexer gave no hash) is a genuine second grab. Checked BEFORE handing the
+    # torrent to the client, so nothing is added on rejection.
+    if request_id is not None:
+        active = await download_repo.find_active_for_request(request_id)
+        if active is not None and active.torrent_hash != known_hash:
+            raise AlreadyDownloadingError(request_id)
+
     torrent_hash = (await qbt.add(source, save_path, category)).lower() or (known_hash or "")
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
@@ -157,12 +194,16 @@ async def grab(
                 season=season,
             )
         except IntegrityError:
-            # Two concurrent grabs for the same release both passed the
-            # get_by_hash check above, then both tried to INSERT — ``torrent_hash``
-            # is UNIQUE, so the loser lands here. Recover instead of crashing
-            # (opaque 500): roll back the failed insert, re-fetch the winner, and
-            # reuse it — the same recovery as the terminal-reuse path.
+            # A concurrent grab won the race. It either grabbed the SAME release
+            # (``torrent_hash`` UNIQUE) or a DIFFERENT release for this request
+            # (``uq_downloads_active_request`` — the DB backstop to the TOCTOU
+            # guard above). Roll back and distinguish, so neither becomes an opaque
+            # 500: a different-release conflict is the honest ``already_downloading``.
             await session.rollback()
+            if request_id is not None:
+                active = await download_repo.find_active_for_request(request_id)
+                if active is not None and active.torrent_hash != torrent_hash:
+                    raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)
             if winner is None:  # pragma: no cover - the conflicting row must exist
                 raise

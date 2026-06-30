@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import httpx
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from plex_manager.models import SystemSettings
+
+SessionMaker = async_sessionmaker[AsyncSession]
 
 _COMPLETE_BODY = {
     "plex_url": "http://plex.local:32400",
@@ -49,6 +57,30 @@ async def test_complete_flips_initialized_and_issues_key(client: httpx.AsyncClie
     # No plaintext secret leaks anywhere in the redacted response.
     assert _COMPLETE_BODY["tmdb_api_key"] not in settings.text
     assert _COMPLETE_BODY["plex_token"] not in settings.text
+
+
+async def test_complete_stores_only_a_hash_not_the_plaintext_key(
+    client: httpx.AsyncClient, sessionmaker_: SessionMaker
+) -> None:
+    # The bearer token is revealed once in the response, but ONLY its SHA-256 hash
+    # is persisted — a DB-backup leak must not yield a usable key (auth bypass).
+    response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+    assert isinstance(issued_key, str) and issued_key
+
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(SystemSettings))).scalars().one()
+
+    stored = row.app_api_key_hash
+    assert stored is not None
+    # The plaintext token is NOT at rest; only its digest is.
+    assert stored != issued_key
+    assert issued_key not in stored
+    assert stored == hashlib.sha256(issued_key.encode("utf-8")).hexdigest()
+    # And the still-revealed key authenticates against that stored hash.
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.status_code == 200
 
 
 async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> None:

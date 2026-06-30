@@ -89,9 +89,14 @@ async def preview(
     # release year and the matcher should enforce it. For TV it is the show's
     # *first-air* year, which a per-episode release name legitimately omits
     # (``S02E04`` carries no year); gating on it would reject every correctly
-    # named episode as WRONG_MEDIA. Season identity is already enforced by the
-    # Prowlarr ``season`` search param, so only pass the year for movies.
+    # named episode as WRONG_MEDIA. So only pass the year for movies.
     match_year = year if media_type == "movie" else None
+    # Season identity is NOT taken on faith from the Prowlarr ``season`` param: a
+    # tracker may ignore it and return another season (whose pack still carries the
+    # show's correct tmdb id). For a season-scoped TV request, enforce the parsed
+    # release's season in the gate too. ``None`` (movie, or no season requested)
+    # leaves behaviour unchanged.
+    match_season = season if media_type == "tv" else None
 
     def _media_match(candidate: CandidateRelease, parsed: ParsedRelease) -> bool:
         return matches_media(
@@ -100,6 +105,7 @@ async def preview(
             expected_year=match_year,
             candidate_tmdb_id=candidate.tmdb_id,
             expected_tmdb_id=tmdb_id,
+            expected_season=match_season,
         )
 
     return decide(candidates, parser, profile, _media_match, _blocklisted)
