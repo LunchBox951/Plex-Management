@@ -68,14 +68,24 @@ _SAMPLE_EXTRAS = re.compile(
     re.IGNORECASE,
 )
 
-# Multi-part / split-disk markers (``CD1``, ``part2``, ``disc 3``). A completed
-# download whose feature file is one slice of a set cannot be imported as a single
-# movie, so it is surfaced rather than half-imported.
-_MULTI_PART = re.compile(
-    # Path separators (/ and \) ARE token boundaries: a split-disk release stores
-    # each part under a ``CD1/`` / ``Disc 1/`` directory, so the marker is bounded
-    # by a slash, not a space/dot/dash.
-    r"(?:^|[\s._\-/\\])(?:cd|dvd|disc|disk|part|pt)[\s._\-]?\d{1,2}(?:$|[\s._\-/\\])",
+# Multi-part / split-disk markers. A completed download whose feature file is one
+# slice of a set cannot be imported as a single movie, so it is surfaced rather
+# than half-imported. Path separators (/ and \) ARE token boundaries: a split-disk
+# release stores each part under a ``CD1/`` / ``Disc 1/`` directory, so the marker
+# is bounded by a slash, not just a space/dot/dash. ``cd``/``dvd``/``disc``/``disk``
+# + a number are NEVER part of a real movie title, so a match is decisive.
+_DISK_MARKER = re.compile(
+    r"(?:^|[\s._\-/\\])(?:cd|dvd|disc|disk)[\s._\-]?\d{1,2}(?:$|[\s._\-/\\])",
+    re.IGNORECASE,
+)
+
+# ``part``/``pt`` + a number are AMBIGUOUS: a 2-CD split names its slices
+# ``Movie.Part1``/``Movie.Part2``, but a real title can also carry one
+# (``...Deathly Hallows Part 1``). The captured number lets :func:`_is_multi_part`
+# tell them apart — a part marker is a split only when the *expected* (canonical
+# TMDB) title does not itself carry that same part number.
+_PART_MARKER = re.compile(
+    r"(?:^|[\s._\-/\\])(?:part|pt)[\s._\-]?(\d{1,2})(?:$|[\s._\-/\\])",
     re.IGNORECASE,
 )
 
@@ -153,6 +163,25 @@ def _looks_like_sample_name(name: str) -> bool:
     return _SAMPLE_EXTRAS.search(name) is not None
 
 
+def _is_multi_part(relative_path: str, expected_title: str) -> bool:
+    """Return ``True`` when the chosen file is one slice of a split-disk/multi-part set.
+
+    A ``cd``/``dvd``/``disc``/``disk`` marker is decisive — those tokens are never
+    part of a real movie title. A ``part``/``pt`` marker is ambiguous, so it counts
+    as a split ONLY when ``expected_title`` (the canonical TMDB title) does not
+    itself carry that same part number: a movie genuinely titled ``...Part 1``
+    imports, while a 2-CD ``Movie.Part1`` split whose title has no part number is
+    still surfaced. Numbers compare as integers so ``Part.01`` and ``Part 1`` match.
+    """
+    if _DISK_MARKER.search(relative_path):
+        return True
+    title_part_numbers = {int(match.group(1)) for match in _PART_MARKER.finditer(expected_title)}
+    return any(
+        int(match.group(1)) not in title_part_numbers
+        for match in _PART_MARKER.finditer(relative_path)
+    )
+
+
 def validate_import(
     files: Sequence[VideoFile],
     *,
@@ -177,8 +206,10 @@ def validate_import(
        gate keys on PROFILE-ALLOWED, so benign source drift still passes.
     5. A file below the absolute sample floor (or of unknown size) is
        :attr:`~ImportRejectionReason.SAMPLE`.
-    6. A multi-part / split-disk marker in the path is
-       :attr:`~ImportRejectionReason.MULTI_PART`.
+    6. A split-disk (cd/dvd/disc/disk + number) or genuine multi-part marker in
+       the path is :attr:`~ImportRejectionReason.MULTI_PART`. A ``part``/``pt``
+       marker whose number the expected title itself carries (a movie genuinely
+       titled ``...Part 1``) is NOT a split and does not reject.
 
     ALL applicable rejections are collected; ``accepted`` is True iff there are
     none. An indeterminate file is always a reject, never an optimistic import.
@@ -265,8 +296,10 @@ def validate_import(
             )
         )
 
-    # 6. Multi-part / split-disk shape.
-    if _MULTI_PART.search(chosen.relative_path):
+    # 6. Multi-part / split-disk shape. A cd/dvd/disc/disk marker is decisive; a
+    #    part/pt marker is a split only when the expected title does not itself
+    #    carry that same part number, so a movie titled "...Part 1" still imports.
+    if _is_multi_part(chosen.relative_path, expected_title):
         rejections.append(
             ImportRejection(
                 reason=ImportRejectionReason.MULTI_PART,

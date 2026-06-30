@@ -153,6 +153,34 @@ def test_adapter_satisfies_filesystem_port() -> None:
     assert isinstance(LocalFileSystem(), FileSystemPort)
 
 
+def test_hardlink_or_copy_removes_partial_dst_when_copy_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # copy2 can die mid-write AFTER creating dst (e.g. ENOSPC when another writer
+    # ate the preflighted free space). The partial file must be removed and the
+    # ORIGINAL error surfaced, so a retry sees a clean slate instead of a
+    # differently-sized dst that _place_file would reject as a persistent conflict.
+    src = tmp_path / "src.mkv"
+    src.write_text("the full expected payload")
+    dst = tmp_path / "copied.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    def _partial_then_raise(_src: str, dst_arg: str) -> None:
+        Path(dst_arg).write_text("partial")  # dst created/truncated...
+        raise OSError(errno.ENOSPC, "no space left on device")  # ...then the write dies
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    monkeypatch.setattr(shutil, "copy2", _partial_then_raise)
+
+    with pytest.raises(OSError) as exc_info:
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert exc_info.value.errno == errno.ENOSPC  # original error, not masked
+    assert not dst.exists()  # partial destination removed so a retry is clean
+
+
 def test_largest_video_file_rejects_symlinked_root_escaping_its_parent(
     tmp_path: Path,
 ) -> None:

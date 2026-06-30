@@ -84,17 +84,35 @@ async def _reconcile_once(app: FastAPI) -> None:
         except ServiceNotConfiguredError:
             qbt = None
         if qbt is not None:
-            await queue_service.reconcile_and_list(qbt, session)
-            movies_root = await get_movies_root_optional(session)
-            if library is not None and movies_root:
-                await import_service.run_import_cycle(
-                    fs=get_filesystem(),
-                    library=library,
-                    qbt=qbt,
-                    parser=get_parser(),
-                    profile=get_quality_profile(),
-                    session=session,
-                    movies_root=movies_root,
+            # A qBittorrent outage / auth-failure must not abort the cycle before the
+            # Plex-only availability pass below. reconcile_and_list ->
+            # qbt.get_all_statuses() raises QbittorrentError when the client is
+            # unreachable or rejects the login (QbittorrentAuthError is a subclass, so
+            # it is covered too); the adapter wraps every httpx transport/status error
+            # into QbittorrentError, so that one type is the whole surface. Surface it
+            # (honesty over silence: the type name only, never a secret) and roll the
+            # shared session back so a mid-reconcile partial write can't taint the
+            # availability commit, then fall through — no request stuck in "Finalizing"
+            # while qBittorrent is down.
+            try:
+                await queue_service.reconcile_and_list(qbt, session)
+                movies_root = await get_movies_root_optional(session)
+                if library is not None and movies_root:
+                    await import_service.run_import_cycle(
+                        fs=get_filesystem(),
+                        library=library,
+                        qbt=qbt,
+                        parser=get_parser(),
+                        profile=get_quality_profile(),
+                        session=session,
+                        movies_root=movies_root,
+                    )
+            except QbittorrentError as exc:
+                await session.rollback()
+                _logger.warning(
+                    "qBittorrent reconcile/import skipped this cycle (%s); "
+                    "running availability pass anyway",
+                    type(exc).__name__,
                 )
 
         # Availability promotion (completed -> available) needs ONLY Plex, so it runs

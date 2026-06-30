@@ -12,6 +12,7 @@ classic seedbox/library cross-mount case.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
@@ -91,7 +92,19 @@ class LocalFileSystem:
                     f"insufficient space to copy {src.name}: need {src_size} bytes, "
                     f"{free} available on destination filesystem"
                 ) from None
-            shutil.copy2(os.fspath(src), os.fspath(dst))
+            try:
+                shutil.copy2(os.fspath(src), os.fspath(dst))
+            except OSError:
+                # copy2 can raise AFTER it created/truncated dst (e.g. ENOSPC
+                # mid-write when another writer consumed the preflighted space).
+                # dst did not pre-exist here — EEXIST is not a copy-fallback errno —
+                # so any partial file is OURS to remove. Clean it up best-effort so a
+                # retry sees a clean slate, not a differently-sized file that
+                # _place_file would surface as a PERSISTENT FileExistsError conflict.
+                # Re-raise the ORIGINAL error, unmasked (north-star #3: honesty).
+                with contextlib.suppress(OSError):
+                    os.unlink(os.fspath(dst))
+                raise
             # Verify the copy is complete; a short write means a truncated /
             # corrupt import, so roll back the partial file and surface it.
             copied_size = dst.stat().st_size

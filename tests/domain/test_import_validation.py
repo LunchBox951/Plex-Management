@@ -60,6 +60,21 @@ _FIELDS: dict[str, dict[str, object]] = {
         "source": "Web",
         "screen_size": "1080p",
     },
+    # A real movie genuinely titled "...Part 1": the file's "Part.1" token matches
+    # the expected title's own part number, so it must NOT be flagged MULTI_PART.
+    "Harry.Potter.and.the.Deathly.Hallows.Part.1.2010.1080p.mkv": {
+        "title": "Harry Potter and the Deathly Hallows Part 1",
+        "year": "2010",
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    # A genuine 2-CD split whose title carries NO part number: still MULTI_PART.
+    "The.Matrix.1999.1080p.BluRay.Part1.mkv": {
+        "title": "The Matrix",
+        "year": "1999",
+        "source": "Blu-ray",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -191,6 +206,35 @@ def test_named_sample_not_chosen_over_real_feature() -> None:
 def test_multi_part_rejects() -> None:
     result = _validate(
         VideoFile("The.Matrix.1999.1080p.BluRay.x264-CD1.mkv", 4 * _GIB),
+    )
+    assert result.accepted is False
+    reasons = {r.reason for r in result.rejections}
+    assert ImportRejectionReason.MULTI_PART in reasons
+
+
+def test_part_in_real_title_accepts_not_multi_part() -> None:
+    # The requested movie is genuinely titled "...Part 1"; the file's "Part.1"
+    # token matches the expected title's own part number, so it is NOT a split and
+    # the full, correct movie imports instead of being permanently rejected.
+    result = validate_import(
+        [VideoFile("Harry.Potter.and.the.Deathly.Hallows.Part.1.2010.1080p.mkv", 8 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Harry Potter and the Deathly Hallows: Part 1",
+        expected_year=2010,
+        expected_tmdb_id=12444,
+    )
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.parsed is not None
+    assert ImportRejectionReason.MULTI_PART not in {r.reason for r in result.rejections}
+
+
+def test_genuine_part_split_still_rejects_multi_part() -> None:
+    # The requested title carries no part number, so a lone "Part1" slice IS a
+    # split-disk set and must still be surfaced as MULTI_PART.
+    result = _validate(
+        VideoFile("The.Matrix.1999.1080p.BluRay.Part1.mkv", 4 * _GIB),
     )
     assert result.accepted is False
     reasons = {r.reason for r in result.rejections}
