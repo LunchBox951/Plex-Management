@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -9,6 +10,7 @@ from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.release import ParsedRelease, ScoredRelease
 from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
 from plex_manager.services import grab_service
+from plex_manager.services.grab_service import GrabError
 from tests.web.fakes import FakeQbittorrent, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -75,3 +77,27 @@ async def test_grab_reuses_terminal_row_and_reowns_to_current_request(
     assert len(rows) == 1  # reused, not duplicated
     assert row.media_request_id == new_id  # re-owned to the CURRENT request
     assert row.failed_reason is None  # stale failure reason cleared
+
+
+async def test_grab_raises_when_no_info_hash_can_be_determined(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """qBittorrent accepts an opaque HTTP download_url whose hash cannot be derived
+    AND the indexer omitted infoHash: tracking by the guid would make the reconciler
+    false-fail it as ClientMissing. Surface a GrabError instead, and persist nothing."""
+    cand = candidate("Some.Opaque.Release-GROUP", info_hash=None, magnet=False)
+    parsed = ParsedRelease(
+        raw_title=cand.title, clean_title="Some Opaque Release", source=QualitySource.WEBDL
+    )
+    scored = ScoredRelease(
+        candidate=cand, parsed=parsed, quality=WEBDL1080P, profile_index=19, score=1.0
+    )
+
+    async with sessionmaker_() as session:
+        with pytest.raises(GrabError):
+            await grab_service.grab(FakeQbittorrent(), session, scored=scored, tmdb_id=300)
+
+    # Nothing was tracked: no phantom row keyed by the unmatchable guid.
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert rows == []

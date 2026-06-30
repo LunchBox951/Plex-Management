@@ -271,7 +271,14 @@ class ProwlarrIndexer:
             candidate = self._to_candidate(_as_mapping(raw), priorities)
             if candidate is not None:
                 candidates.append(candidate)
-        return _dedupe_by_guid(candidates)
+        # The alpha only wires a torrent client, so usenet releases (protocol !=
+        # "torrent") must never reach qBittorrent — drop them here, surfacing the
+        # count at debug rather than silently shrinking the result set.
+        torrent_candidates = [c for c in candidates if c.protocol == "torrent"]
+        dropped = len(candidates) - len(torrent_candidates)
+        if dropped:
+            _logger.debug("dropped %d non-torrent (usenet) Prowlarr release(s)", dropped)
+        return _dedupe_by_guid(torrent_candidates)
 
     async def _indexer_priorities(self) -> Mapping[int, int]:
         """Return ``{indexerId: priority}`` from ``/api/v1/indexer`` (cached).

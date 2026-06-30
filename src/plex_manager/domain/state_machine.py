@@ -71,7 +71,12 @@ TRANSITIONS: Mapping[DownloadState, frozenset[DownloadState]] = {
             DownloadState.ClientMissing,
         }
     ),
-    DownloadState.ImportPending: frozenset({DownloadState.Importing, DownloadState.ImportBlocked}),
+    # Import is deferred in the alpha, so a completed torrent sits in
+    # ImportPending. The operator must be able to fail/blocklist it to re-search
+    # (e.g. a fake or unimportable release), so FailedPending is a legal move.
+    DownloadState.ImportPending: frozenset(
+        {DownloadState.Importing, DownloadState.ImportBlocked, DownloadState.FailedPending}
+    ),
     DownloadState.Importing: frozenset({DownloadState.Imported, DownloadState.ImportBlocked}),
     DownloadState.ImportBlocked: frozenset({DownloadState.Importing}),
     DownloadState.FailedPending: frozenset({DownloadState.Failed}),

@@ -14,7 +14,7 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import grab_service, queue_service, request_service
-from plex_manager.services.grab_service import NoGrabSourceError
+from plex_manager.services.grab_service import GrabError, NoGrabSourceError
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
     get_parser,
@@ -123,6 +123,13 @@ async def grab_endpoint(
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
+    except GrabError as exc:
+        # qBittorrent took the grab but no real info-hash could be determined;
+        # surfaced (not silently tracked by an unmatchable guid) so the operator
+        # can retry a different release rather than watch a phantom false-fail.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="grab_hash_unresolved"
+        ) from exc
     return _to_item(record)
 
 

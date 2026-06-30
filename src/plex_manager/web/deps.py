@@ -25,6 +25,7 @@ from typing import Annotated
 import httpx
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
@@ -99,18 +100,38 @@ class ServiceNotConfiguredError(Exception):
 # SystemSettings helpers
 # --------------------------------------------------------------------------- #
 async def load_system_settings(session: AsyncSession) -> SystemSettings | None:
-    """Return the single ``system_settings`` row, or ``None`` if not yet created."""
-    result = await session.execute(select(SystemSettings).limit(1))
+    """Return the single ``system_settings`` row, or ``None`` if not yet created.
+
+    Ordered by ``id`` for determinism: the row is pinned to ``id=1`` (a CHECK
+    constraint forbids any other), so this is belt-and-braces, but a bare
+    ``limit(1)`` without an ``ORDER BY`` has no guaranteed row order.
+    """
+    result = await session.execute(select(SystemSettings).order_by(SystemSettings.id).limit(1))
     return result.scalars().first()
 
 
 async def ensure_system_settings(session: AsyncSession) -> SystemSettings:
-    """Return the install-state row, creating an uninitialized one if absent."""
+    """Return the install-state row, creating an uninitialized one if absent.
+
+    Concurrency-safe: the row is pinned to ``id=1``. Two workers starting on an
+    empty DB can both pass the ``load_system_settings`` check and both attempt the
+    insert; the loser collides on the primary key (id=1) and raises
+    ``IntegrityError``, which we catch, roll back, and resolve by re-reading the
+    winner's row — never two rows, never a crash (honesty over silence).
+    """
     row = await load_system_settings(session)
-    if row is None:
-        row = SystemSettings(initialized=False)
-        session.add(row)
+    if row is not None:
+        return row
+    row = SystemSettings(id=1, initialized=False)
+    session.add(row)
+    try:
         await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        existing = await load_system_settings(session)
+        if existing is None:  # pragma: no cover - the conflicting row must exist
+            raise
+        return existing
     return row
 
 

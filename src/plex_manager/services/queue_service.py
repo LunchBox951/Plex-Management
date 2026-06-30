@@ -178,6 +178,7 @@ async def reconcile_and_list(
                 progress=live.progress if live is not None else None,
                 seed_ratio=live.ratio if live is not None else None,
                 first_seen_at=now if transition.set_first_seen_at else None,
+                clear_first_seen_at=transition.clear_first_seen_at,
             )
         elif live is not None:
             await download_repo.update_status(

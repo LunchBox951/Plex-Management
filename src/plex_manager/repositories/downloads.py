@@ -116,6 +116,7 @@ class SqlDownloadRepository:
         failed_reason: str | None = None,
         download_path: str | None = None,
         first_seen_at: datetime | None = None,
+        clear_first_seen_at: bool = False,
         clear_failed_reason: bool = False,
         media_request_id: int | None = None,
     ) -> None:
@@ -140,6 +141,10 @@ class SqlDownloadRepository:
             row.failed_reason = failed_reason
         if download_path is not None:
             row.download_path = download_path
-        if first_seen_at is not None:
+        if clear_first_seen_at:
+            # Explicit reset to NULL (a recovered ClientMissing torrent): distinct
+            # from first_seen_at=None, which leaves the existing anchor unchanged.
+            row.first_seen_at = None
+        elif first_seen_at is not None:
             row.first_seen_at = first_seen_at
         await self._session.flush()

@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import httpx
 
-from plex_manager.adapters.qbittorrent.adapter import QbittorrentAuthError, QbittorrentClient
+from plex_manager.adapters.qbittorrent.adapter import (
+    QbittorrentAuthError,
+    QbittorrentClient,
+    QbittorrentError,
+)
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
 from plex_manager.web.schemas import ServiceValidateResponse
 
@@ -96,6 +100,14 @@ async def validate_qbittorrent(
     except QbittorrentAuthError:
         return ServiceValidateResponse(
             ok=False, message="qBittorrent rejected the username or password."
+        )
+    except QbittorrentError as exc:
+        # The adapter wraps httpx transport/status errors into QbittorrentError so
+        # they never escape as the app-level 502; the wizard expects the validation
+        # shape (ok=False). The QbittorrentError message carries a status code only
+        # — never the url, username or password — so str(exc) cannot leak a secret.
+        return ServiceValidateResponse(
+            ok=False, message="Could not reach qBittorrent.", detail=str(exc)
         )
     except httpx.HTTPError as exc:
         # The password travels in a POST body, not the URL, so str(exc) is safe.

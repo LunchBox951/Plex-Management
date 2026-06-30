@@ -250,6 +250,54 @@ def test_reappeared_hash_transitions_client_missing_to_downloading() -> None:
     assert transitions[0].to_state is DownloadState.Downloading
 
 
+def test_recovery_from_client_missing_clears_grace_anchor() -> None:
+    # A ClientMissing torrent that reappears must clear its stale grace anchor so a
+    # later disappearance starts a fresh full window (not measured from the old one).
+    rows = [
+        _row(
+            status=DownloadState.ClientMissing.value,
+            first_seen_at=_NOW - timedelta(minutes=5),
+        )
+    ]
+    client = [_status(raw_state="downloading")]
+
+    transitions = reconcile(rows, client, now=_NOW)
+
+    assert len(transitions) == 1
+    assert transitions[0].to_state is DownloadState.Downloading
+    assert transitions[0].clear_first_seen_at is True
+    assert transitions[0].set_first_seen_at is False
+
+
+def test_recovery_then_redisappearance_gets_fresh_full_grace_window() -> None:
+    # End-to-end: a missing torrent recovers (anchor cleared), then disappears
+    # again far later. The fresh disappearance must surface ClientMissing and
+    # re-stamp the anchor — NOT fail fast against the long-stale prior anchor.
+    grace = timedelta(minutes=10)
+
+    # Poll 1: absent, anchor stamped at _NOW.
+    anchor = _NOW
+    missing = _row(status=DownloadState.ClientMissing.value, first_seen_at=anchor)
+
+    # Poll 2: reappears 3 min later -> recovery clears the anchor.
+    reappear_at = _NOW + timedelta(minutes=3)
+    recovery = reconcile([missing], [_status(raw_state="downloading")], now=reappear_at)
+    assert len(recovery) == 1
+    assert recovery[0].clear_first_seen_at is True
+
+    # Caller persists: status=downloading, first_seen_at cleared to NULL.
+    recovered = _row(status=DownloadState.Downloading.value, first_seen_at=None)
+
+    # Poll 3: disappears again an hour later — far beyond the OLD anchor+grace. With
+    # the anchor cleared this is a FIRST absence: surface ClientMissing + re-stamp,
+    # never fail. (A stale anchor would have failed it immediately.)
+    redisappear_at = _NOW + timedelta(minutes=60)
+    fresh = reconcile([recovered], [], now=redisappear_at, missing_grace=grace)
+    assert len(fresh) == 1
+    assert fresh[0].to_state is DownloadState.ClientMissing
+    assert fresh[0].set_first_seen_at is True
+
+
 # --------------------------------------------------------------------------- #
 # Gating + idempotency
 # --------------------------------------------------------------------------- #

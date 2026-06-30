@@ -26,6 +26,9 @@ _LEGAL: list[tuple[DownloadState, DownloadState]] = [
     (DownloadState.MetadataFetching, DownloadState.ClientMissing),
     (DownloadState.ImportPending, DownloadState.Importing),
     (DownloadState.ImportPending, DownloadState.ImportBlocked),
+    # Import is deferred in the alpha, so the operator must be able to fail/blocklist
+    # a completed-but-pending download to re-search it.
+    (DownloadState.ImportPending, DownloadState.FailedPending),
     (DownloadState.Importing, DownloadState.Imported),
     (DownloadState.Importing, DownloadState.ImportBlocked),
     (DownloadState.ImportBlocked, DownloadState.Importing),

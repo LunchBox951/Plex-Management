@@ -128,6 +128,43 @@ async def test_search_maps_and_dedupes_by_guid() -> None:
     assert second.publish_date.year == 1970  # malformed date -> epoch
 
 
+async def test_search_drops_usenet_releases() -> None:
+    # The alpha only wires a torrent client, so usenet results must never reach
+    # qBittorrent: the adapter drops every non-torrent candidate.
+    mixed = [
+        {
+            "guid": "https://indexer-a/details/torrent",
+            "title": "Movie 2020 1080p BluRay x264-GROUP",
+            "size": 1000,
+            "indexerId": 1,
+            "indexer": "Indexer A",
+            "magnetUrl": "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "infoHash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "seeders": 10,
+            "protocol": "torrent",
+        },
+        {
+            "guid": "https://indexer-u/details/usenet",
+            "title": "Movie 2020 1080p BluRay x264-NZBGROUP",
+            "size": 1000,
+            "indexerId": 9,
+            "indexer": "Usenet Indexer",
+            "downloadUrl": "https://indexer-u/getnzb/usenet.nzb",
+            "protocol": "usenet",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS)
+        return httpx.Response(200, json=mixed)
+
+    results = await _adapter(handler).search(IndexerSearchRequest(media_type="movie", tmdb_id=1))
+    assert len(results) == 1
+    assert results[0].protocol == "torrent"
+    assert results[0].guid == "https://indexer-a/details/torrent"
+
+
 async def test_search_degrades_when_indexer_priorities_unavailable() -> None:
     # /api/v1/indexer failing must NOT abort the search; de-dup falls back to
     # first-appearance-wins and every candidate gets the default priority.

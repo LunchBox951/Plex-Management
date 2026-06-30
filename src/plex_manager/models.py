@@ -133,7 +133,11 @@ class Setting(Base):
     value: Mapped[str | None] = mapped_column(Text)
     # Encrypted-at-rest home for secret values. NULL when the value is plaintext.
     encrypted_value: Mapped[str | None] = mapped_column(EncryptedStr)
-    is_secret: Mapped[bool] = mapped_column(default=False, server_default=sa.text("0"))
+    # ``sa.false()`` renders the dialect's boolean literal (``0`` on SQLite,
+    # ``false`` on PostgreSQL). A bare ``sa.text("0")`` emits ``DEFAULT 0``, which
+    # PostgreSQL rejects on a BOOLEAN column — Postgres is a config swap (ADR), so
+    # the schema must be dialect-portable.
+    is_secret: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
     description: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -141,12 +145,22 @@ class Setting(Base):
 
 
 class SystemSettings(Base):
-    """Single-row install state: the setup flag + auto-generated app API key."""
+    """Single-row install state: the setup flag + auto-generated app API key.
+
+    A genuine singleton: the row is pinned to ``id=1`` and a ``CHECK (id = 1)``
+    constraint forbids any second row at the database level, so two workers racing
+    to initialise an empty DB cannot both insert (the loser hits a PK / CHECK
+    violation, caught and resolved to a re-read in :func:`ensure_system_settings`).
+    """
 
     __tablename__ = "system_settings"
+    __table_args__ = (sa.CheckConstraint("id = 1", name="ck_system_settings_singleton"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    initialized: Mapped[bool] = mapped_column(default=False, server_default=sa.text("0"))
+    # ``sa.false()`` renders the dialect's boolean literal (``0`` on SQLite,
+    # ``false`` on PostgreSQL); ``sa.text("0")`` would emit ``DEFAULT 0``, rejected
+    # by PostgreSQL on a BOOLEAN column.
+    initialized: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
     app_api_key: Mapped[str | None] = mapped_column(String)
     setup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     setup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -185,12 +199,20 @@ class MediaRequest(Base):
         # IntegrityError, which create_request catches and resolves to the existing
         # active request. Terminal rows (completed / available / failed) are
         # excluded, so a fresh request after one finishes is still allowed.
+        # The predicate must be supplied per-dialect: ``sqlite_where`` alone is
+        # ignored by PostgreSQL, which would then build an UNCONDITIONAL unique
+        # index and reject a valid re-request after a prior one reached a terminal
+        # status. ``postgresql_where`` carries the SAME predicate so the partial
+        # index is honoured on both backends (Postgres is a config swap).
         Index(
             "uq_media_requests_active",
             "tmdb_id",
             "media_type",
             unique=True,
             sqlite_where=sa.text(
+                "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
+            ),
+            postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
             ),
         ),

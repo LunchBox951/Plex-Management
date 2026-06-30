@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.repositories import DownloadRecord
 
-__all__ = ["DEFAULT_CATEGORY", "NoGrabSourceError", "grab"]
+__all__ = ["DEFAULT_CATEGORY", "GrabError", "NoGrabSourceError", "grab"]
 
 # The qBittorrent category the app tags its torrents with (lets a later import
 # pipeline filter to only app-managed downloads).
@@ -54,6 +54,22 @@ class NoGrabSourceError(Exception):
     def __init__(self, guid: str) -> None:
         self.guid = guid
         super().__init__(f"release {guid} has no magnet or download url")
+
+
+class GrabError(Exception):
+    """qBittorrent accepted the grab but no real torrent info-hash could be found.
+
+    Surfaced (HTTP 409), never silently tracked: the prior behaviour stored the
+    indexer ``guid`` as ``downloads.torrent_hash`` when the client returned no
+    derivable hash and the indexer omitted ``infoHash``. The reconciler then never
+    matches that fake hash against the client snapshot, so the download is wrongly
+    declared ``ClientMissing`` and fails after the grace window — a false failure.
+    Honesty over silence: refuse to track an unmatchable grab and tell the operator.
+    """
+
+    def __init__(self, title: str) -> None:
+        self.title = title
+        super().__init__(f"could not determine torrent hash for {title}")
 
 
 async def _reuse_terminal_row(
@@ -116,9 +132,12 @@ async def grab(
 
     torrent_hash = (await qbt.add(source, save_path, category)).lower() or (known_hash or "")
     if not torrent_hash:
-        # The client accepted it but no hash could be derived (rare opaque URL):
-        # fall back to the guid so the row is still uniquely keyed and trackable.
-        torrent_hash = candidate.guid
+        # The client accepted it but no real info-hash could be derived (rare
+        # opaque URL) and the indexer supplied none either. Tracking by the indexer
+        # guid would never match the client snapshot, so the reconciler would
+        # false-fail it as ClientMissing. Surface the failure instead of silently
+        # tracking an unmatchable row.
+        raise GrabError(candidate.title)
 
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:

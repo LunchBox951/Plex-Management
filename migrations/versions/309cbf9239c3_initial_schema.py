@@ -62,7 +62,10 @@ def upgrade() -> None:
     # is String, so it is plain VARCHAR at rest with encryption applied in the
     # Python bind/result layer. Secret settings store ciphertext here.
     sa.Column('encrypted_value', sa.String(), nullable=True),
-    sa.Column('is_secret', sa.Boolean(), server_default=sa.text('0'), nullable=False),
+    # sa.false() renders the dialect boolean literal (0 on SQLite, false on
+    # PostgreSQL); sa.text('0') would emit DEFAULT 0, rejected by PostgreSQL on a
+    # BOOLEAN column. Postgres is a config swap, so the schema stays portable.
+    sa.Column('is_secret', sa.Boolean(), server_default=sa.false(), nullable=False),
     sa.Column('description', sa.Text(), nullable=True),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.PrimaryKeyConstraint('id')
@@ -72,11 +75,15 @@ def upgrade() -> None:
 
     op.create_table('system_settings',
     sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('initialized', sa.Boolean(), server_default=sa.text('0'), nullable=False),
+    # sa.false(): portable boolean default (see settings.is_secret).
+    sa.Column('initialized', sa.Boolean(), server_default=sa.false(), nullable=False),
     sa.Column('app_api_key', sa.String(), nullable=True),
     sa.Column('setup_started_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('setup_completed_at', sa.DateTime(timezone=True), nullable=True),
-    sa.PrimaryKeyConstraint('id')
+    sa.PrimaryKeyConstraint('id'),
+    # Singleton: the install-state row is pinned to id=1, so a second insert can
+    # never succeed (the app catches the violation and re-reads the one row).
+    sa.CheckConstraint('id = 1', name='ck_system_settings_singleton')
     )
     op.create_table('tmdb_cache',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -153,11 +160,18 @@ def upgrade() -> None:
         # second concurrent request for the same media raises IntegrityError (which
         # create_request resolves to the existing active request), while a fresh
         # request after the prior one reaches a terminal status is still allowed.
+        # postgresql_where carries the SAME predicate as sqlite_where: without it
+        # PostgreSQL ignores the sqlite-only clause and builds an UNCONDITIONAL
+        # unique index, which would reject a valid re-request after the prior one
+        # reached a terminal status. Both dialects must render the partial index.
         batch_op.create_index(
             'uq_media_requests_active',
             ['tmdb_id', 'media_type'],
             unique=True,
             sqlite_where=sa.text(
+                "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
+            ),
+            postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
             ),
         )

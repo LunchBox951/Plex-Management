@@ -181,6 +181,28 @@ async def test_mark_failed_routes_downloading_through_failed_pending(
     assert record.status == "failed"
 
 
+async def test_mark_failed_routes_import_pending_through_failed_pending(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Import is deferred, so a completed torrent sits in import_pending. The
+    operator must be able to mark-failed/blocklist it to re-search — it routes
+    ImportPending -> FailedPending -> Failed."""
+    async with sessionmaker_() as session:
+        download = Download(torrent_hash=_HASH, status="import_pending", tmdb_id=603)
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=True)
+    assert record.status == "failed"
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+
+
 async def test_mark_failed_without_blocklist_rearms_request(
     sessionmaker_: SessionMaker,
 ) -> None:

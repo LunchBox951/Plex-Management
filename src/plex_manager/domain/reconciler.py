@@ -102,6 +102,13 @@ class StateTransition:
     first observed absent and has no grace anchor yet; the caller must honour it
     (``DownloadRepository.update_status(..., first_seen_at=now)``) or the
     missing-grace window can never start.
+
+    ``clear_first_seen_at`` signals the caller to reset ``downloads.first_seen_at``
+    to NULL. It is set when a ``ClientMissing`` torrent reappears in the client and
+    recovers to an active state: the stale grace anchor from the prior
+    disappearance must be cleared, otherwise a *later* disappearance would measure
+    its grace from the old anchor and fail far too fast. ``set_first_seen_at`` and
+    ``clear_first_seen_at`` are never both set on one transition.
     """
 
     download_id: int
@@ -110,6 +117,7 @@ class StateTransition:
     to_state: DownloadState
     reason: str | None
     set_first_seen_at: bool = False
+    clear_first_seen_at: bool = False
 
 
 def unmapped_client_states(
@@ -170,6 +178,10 @@ def reconcile(
         if present is not None:
             target, reason = _map_raw_state(present.raw_state)
             if target.value != row.status:
+                # A torrent that was ClientMissing has now reappeared: clear the
+                # stale grace anchor so a future disappearance starts a fresh, full
+                # missing-grace window rather than inheriting the old one.
+                recovered = row.status == DownloadState.ClientMissing.value
                 transitions.append(
                     StateTransition(
                         download_id=row.id,
@@ -177,6 +189,7 @@ def reconcile(
                         from_state=row.status,
                         to_state=target,
                         reason=reason,
+                        clear_first_seen_at=recovered,
                     )
                 )
             continue
