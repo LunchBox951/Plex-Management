@@ -15,6 +15,8 @@ from sqlalchemy import engine_from_config, pool
 from plex_manager.config import get_settings
 from plex_manager.db import Base, sync_database_url
 
+import plex_manager.models  # noqa: F401  (register ORM metadata for autogenerate)
+
 config = context.config
 
 if config.config_file_name is not None:

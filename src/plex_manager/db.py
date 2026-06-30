@@ -9,7 +9,9 @@ returned by :func:`sync_database_url`.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -20,6 +22,10 @@ from sqlalchemy.orm import DeclarativeBase
 
 from plex_manager.config import get_settings
 
+if TYPE_CHECKING:
+    from sqlalchemy.engine.interfaces import DBAPIConnection
+    from sqlalchemy.pool import ConnectionPoolEntry
+
 
 class Base(DeclarativeBase):
     """Declarative base for all ORM models."""
@@ -29,11 +35,36 @@ _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
+def _set_sqlite_fk_pragma(
+    dbapi_connection: DBAPIConnection,
+    _connection_record: ConnectionPoolEntry,
+) -> None:
+    """Issue ``PRAGMA foreign_keys=ON`` on each new SQLite DBAPI connection."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
+def enable_sqlite_fk_enforcement(engine: AsyncEngine) -> None:
+    """Make SQLite honour ``ON DELETE`` (CASCADE / SET NULL) on every connection.
+
+    SQLite ships with foreign-key enforcement *off* by default and the setting is
+    per-connection, so the schema's ``ON DELETE`` clauses are inert until each
+    DBAPI connection issues ``PRAGMA foreign_keys=ON``. Without this, deleting a
+    parent row neither cascades to children nor nulls referencing columns, and
+    FK-violating inserts succeed silently — the integrity guarantees would be
+    cosmetic. A no-op for non-SQLite dialects (Postgres enforces FKs natively).
+    """
+    if engine.dialect.name == "sqlite":
+        event.listen(engine.sync_engine, "connect", _set_sqlite_fk_pragma)
+
+
 def get_engine() -> AsyncEngine:
     """Return the process-wide async engine, creating it on first use."""
     global _engine
     if _engine is None:
         _engine = create_async_engine(get_settings().database_url)
+        enable_sqlite_fk_enforcement(_engine)
     return _engine
 
 
