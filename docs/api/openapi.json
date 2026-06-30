@@ -277,7 +277,7 @@
         "type": "object"
       },
       "GrabRequest": {
-        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\").",
+        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; it is ignored for\nmovies.",
         "properties": {
           "guid": {
             "anyOf": [
@@ -304,6 +304,17 @@
           "request_id": {
             "title": "Request Id",
             "type": "integer"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
           }
         },
         "required": [

@@ -16,15 +16,20 @@ from plex_manager.models import (
     MediaType,
     RequestStatus,
 )
+from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.services import queue_service
 from tests.web.fakes import FakeQbittorrent
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _HASH = "f" * 40
+_TITLE = "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+_INDEXER = "FakeIndexer"
 
 
-async def _seed_request_with_download(sm: SessionMaker, *, first_seen_at: datetime) -> int:
+async def _seed_request_with_download(
+    sm: SessionMaker, *, first_seen_at: datetime, indexer: str | None = _INDEXER
+) -> int:
     async with sm() as session:
         request = MediaRequest(
             tmdb_id=603,
@@ -48,7 +53,8 @@ async def _seed_request_with_download(sm: SessionMaker, *, first_seen_at: dateti
                 tmdb_id=603,
                 torrent_hash=_HASH,
                 event_type=DownloadHistoryEvent.grabbed,
-                source_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+                source_title=_TITLE,
+                indexer=indexer,
             )
         )
         await session.commit()
@@ -88,6 +94,37 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
     assert failed.status == "failed"
 
 
+async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The auto-fail blocklist row carries the originating indexer (recovered from
+    history), so a later candidate from that indexer with NO info_hash is rejected
+    by the pure tier-2 (title + indexer) check — blocklist-then-research holds for
+    hashless feeds."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        entry = (await session.execute(select(Blocklist))).scalar_one()
+        assert entry.indexer == _INDEXER
+
+        repo = SqlBlocklistRepository(session)
+        # A re-searched candidate that exposes NO info_hash (only title+indexer) is
+        # still rejected via tier 2 — the bug was an indexer=None blocklist row.
+        blocked = await repo.is_blocklisted(
+            tmdb_id=603, torrent_hash=None, source_title=_TITLE, indexer=_INDEXER
+        )
+        assert blocked is True
+        # A different indexer with the same title is NOT blocked (tier-2 is scoped).
+        other = await repo.is_blocklisted(
+            tmdb_id=603, torrent_hash=None, source_title=_TITLE, indexer="OtherIndexer"
+        )
+        assert other is False
+
+
 async def test_mark_failed_routes_downloading_through_failed_pending(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -100,3 +137,41 @@ async def test_mark_failed_routes_downloading_through_failed_pending(
     async with sessionmaker_() as session:
         record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
     assert record.status == "failed"
+
+
+async def test_mark_failed_without_blocklist_rearms_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """mark_failed(blocklist=False) must still reconcile the owning request: the
+    download goes terminal Failed, so the request cannot stay 'downloading' with no
+    active download (a dishonest state). The blocklist flag gates ONLY whether a
+    Blocklist row is written, not the request re-arm."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=603,
+        )
+        session.add(download)
+        await session.commit()
+        request_id, download_id = request.id, download.id
+
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+    assert record.status == "failed"
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None
+    assert request.status is RequestStatus.searching  # re-armed despite blocklist=False
+    assert blocklist == []  # but no blocklist row was written

@@ -217,7 +217,11 @@ class Download(Base):
         ForeignKey("media_requests.id", ondelete="SET NULL")
     )
     torrent_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
-    magnet_link: Mapped[str | None] = mapped_column(Text)
+    # The grab source (magnet OR Prowlarr download url). A Prowlarr download url
+    # embeds the Prowlarr api key as a query param, so this is a secret at rest:
+    # it is Fernet-encrypted (:class:`EncryptedStr`) like the other credentials
+    # (ADR-0005), never returned in any response and never logged.
+    magnet_link: Mapped[str | None] = mapped_column(EncryptedStr)
     status: Mapped[str] = mapped_column(String, index=True)
     progress: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))
     seed_ratio: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))

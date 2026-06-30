@@ -154,7 +154,10 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('media_request_id', sa.Integer(), nullable=True),
     sa.Column('torrent_hash', sa.String(), nullable=False),
-    sa.Column('magnet_link', sa.Text(), nullable=True),
+    # magnet_link is EncryptedStr (a download url can embed the Prowlarr api key);
+    # its DB-level impl is String, so it is plain VARCHAR at rest with encryption
+    # applied in the Python bind/result layer (ADR-0005).
+    sa.Column('magnet_link', sa.String(), nullable=True),
     sa.Column('status', sa.String(), nullable=False),
     sa.Column('progress', sa.Float(), server_default=sa.text('0'), nullable=False),
     sa.Column('seed_ratio', sa.Float(), server_default=sa.text('0'), nullable=False),

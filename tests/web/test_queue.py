@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.domain.release import CandidateRelease
 from plex_manager.models import Download, DownloadHistory, DownloadHistoryEvent
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata
@@ -19,6 +20,7 @@ from tests.web.fakes import (
     FakeTmdb,
     candidate,
     override_adapters,
+    prerelease_only_candidates,
 )
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -155,6 +157,181 @@ async def test_mark_failed_blocklists(
     entries = blocklist.json()["entries"]
     assert len(entries) == 1
     assert entries[0]["torrent_hash"] == "c" * 40
+
+
+async def test_grab_refuses_cam_only_release_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """The hard cutoff at the WIRED grab path: a CAM/TS-only indexer result yields
+    409 no_acceptable_release and NOTHING is handed to the download client."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=qbt)
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_acceptable_release"
+    # The CAM/TS never reached qBittorrent — nothing was leaked to the client.
+    assert qbt.added == []
+
+
+async def test_grab_operator_chosen_release_grabs_that_one(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """A grab targeting a specific (non-top) accepted release by info_hash grabs
+    THAT release, not the top-ranked default."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    # Two acceptable releases; the 720p ranks below the 1080p, so it is never the
+    # default pick — choosing it by hash proves operator selection works.
+    top = candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", info_hash="3" * 40, seeders=99)
+    chosen = candidate("Some.Movie.2020.720p.WEB-DL.x264-GROUP", info_hash="7" * 40, seeders=5)
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=FakeProwlarr([top, chosen]), qbt=qbt)
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "info_hash": "7" * 40},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 201
+    assert response.json()["torrent_hash"] == "7" * 40
+
+
+async def test_grab_unknown_chosen_hash_returns_404(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH)]),
+        qbt=FakeQbittorrent(),
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "info_hash": "9" * 40},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "release_not_found"
+
+
+async def test_grab_release_without_source_returns_409_no_grab_source(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """A chosen release exposing neither magnet nor download url is an honest 409,
+    never a silent skip (NoGrabSourceError surface)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    # An accepted (good-quality) candidate with NO grab source at all.
+    sourceless = CandidateRelease(
+        guid="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        size_bytes=1_000_000_000,
+        magnet_url=None,
+        download_url=None,
+        info_hash=_GOOD_HASH,
+        seeders=10,
+        leechers=1,
+        indexer_id=1,
+        indexer_name="FakeIndexer",
+        publish_date=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=FakeProwlarr([sourceless]), qbt=qbt)
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_grab_source"
+    assert qbt.added == []
+
+
+async def test_regrab_after_mark_failed_without_blocklist_reuses_row(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """grab -> mark-failed(blocklist=false) -> grab-same-release must NOT crash on
+    the UNIQUE torrent_hash. The terminal (Failed) row is reused, driven back to
+    Downloading, rather than colliding on a fresh insert."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+
+    first = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert first.status_code == 201
+    download_id = first.json()["id"]
+
+    # Fail WITHOUT blocklisting: the release stays acceptable to the decision engine.
+    failed = await client.post(
+        f"/api/v1/queue/{download_id}/mark-failed",
+        params={"blocklist": "false"},
+        headers=_HEADERS,
+    )
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "failed"
+
+    # Re-grab the same release: previously a 500 (UNIQUE violation); now heals.
+    regrab = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert regrab.status_code == 201
+    item = regrab.json()
+    assert item["id"] == download_id  # same row reused
+    assert item["status"] == "downloading"
+    assert item["failed_reason"] is None  # stale failure reason cleared
+
+    # Exactly one downloads row for the hash (no duplicate inserted).
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.torrent_hash == _GOOD_HASH)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+
+
+async def test_mark_failed_without_blocklist_rearms_request_via_api(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Through the wired endpoint: mark-failed?blocklist=false re-arms the request
+    to 'searching' (no zombie 'downloading' request without an active download)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=FakeQbittorrent(),
+    )
+    grabbed = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    download_id = grabbed.json()["id"]
+
+    await client.post(
+        f"/api/v1/queue/{download_id}/mark-failed",
+        params={"blocklist": "false"},
+        headers=_HEADERS,
+    )
+
+    detail = await client.get(f"/api/v1/requests/{request_id}", headers=_HEADERS)
+    assert detail.json()["status"] == "searching"
 
 
 async def test_queue_requires_api_key(

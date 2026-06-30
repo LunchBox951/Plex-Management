@@ -96,15 +96,30 @@ async def grab(
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
         return existing
 
-    record = await download_repo.create(
-        torrent_hash=torrent_hash,
-        status=DownloadState.Downloading.value,
-        media_request_id=request_id,
-        magnet_link=source,
-        tmdb_id=tmdb_id,
-        year=year,
-        season=season,
-    )
+    if existing is not None:
+        # A terminal row (Failed/Imported) already owns this hash. ``torrent_hash``
+        # is UNIQUE, so a plain insert would raise IntegrityError -> opaque 500.
+        # A previously-failed (not blocklisted) release may legitimately be
+        # grabbed afresh, so REUSE the row: drive it back to Downloading and clear
+        # the stale failure reason, rather than colliding on the constraint.
+        await download_repo.update_status(
+            existing.id,
+            DownloadState.Downloading.value,
+            clear_failed_reason=True,
+        )
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is None:  # pragma: no cover - just updated this row
+            raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
+    else:
+        record = await download_repo.create(
+            torrent_hash=torrent_hash,
+            status=DownloadState.Downloading.value,
+            media_request_id=request_id,
+            magnet_link=source,
+            tmdb_id=tmdb_id,
+            year=year,
+            season=season,
+        )
     session.add(
         DownloadHistory(
             tmdb_id=tmdb_id,

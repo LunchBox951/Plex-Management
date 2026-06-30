@@ -116,6 +116,7 @@ class SqlDownloadRepository:
         failed_reason: str | None = None,
         download_path: str | None = None,
         first_seen_at: datetime | None = None,
+        clear_failed_reason: bool = False,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -125,7 +126,12 @@ class SqlDownloadRepository:
             row.progress = progress
         if seed_ratio is not None:
             row.seed_ratio = seed_ratio
-        if failed_reason is not None:
+        if clear_failed_reason:
+            # A terminal row being reused for a fresh grab must not carry a stale
+            # failure reason (honesty over silence: a Downloading row claiming a
+            # failure is a dishonest state).
+            row.failed_reason = None
+        elif failed_reason is not None:
             row.failed_reason = failed_reason
         if download_path is not None:
             row.download_path = download_path

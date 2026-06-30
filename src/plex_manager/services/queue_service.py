@@ -82,6 +82,24 @@ async def _source_title_for(session: AsyncSession, torrent_hash: str) -> str | N
     return (await session.execute(stmt)).scalars().first()
 
 
+async def _indexer_for(session: AsyncSession, torrent_hash: str) -> str | None:
+    """Best-effort originating indexer from the download history (for blocklist).
+
+    Recorded at grab time (``grab_service`` writes ``DownloadHistory.indexer``).
+    Without it a blocklist row has ``indexer=None``, so the pure two-tier identity
+    check can never fall back to title+indexer for a candidate that exposes no
+    info_hash — defeating blocklist-then-research for hashless feeds.
+    """
+    stmt = (
+        select(DownloadHistory.indexer)
+        .where(DownloadHistory.torrent_hash == torrent_hash)
+        .where(DownloadHistory.indexer.is_not(None))
+        .order_by(DownloadHistory.id.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalars().first()
+
+
 async def _handle_failed(
     session: AsyncSession,
     event: DownloadFailed,
@@ -96,11 +114,13 @@ async def _handle_failed(
         None,
     )
     source_title = await _source_title_for(session, event.torrent_hash) or event.source_title
+    indexer = await _indexer_for(session, event.torrent_hash)
     await blocklist_repo.create(
         source_title=source_title,
         reason=BlocklistReason.failed.value,
         tmdb_id=event.tmdb_id,
         torrent_hash=event.torrent_hash,
+        indexer=indexer,
     )
     if record is not None and record.media_request_id is not None:
         await request_repo.set_status(record.media_request_id, RequestStatus.searching.value)
@@ -190,16 +210,26 @@ async def mark_failed(
 
     if blocklist:
         source_title = await _source_title_for(session, row.torrent_hash) or row.torrent_hash
+        indexer = await _indexer_for(session, row.torrent_hash)
         await SqlBlocklistRepository(session).create(
             source_title=source_title,
             reason=BlocklistReason.user_reported.value,
             tmdb_id=row.tmdb_id,
             torrent_hash=row.torrent_hash,
+            indexer=indexer,
         )
-        if row.media_request_id is not None:
-            await SqlRequestRepository(session).set_status(
-                row.media_request_id, RequestStatus.searching.value
-            )
+
+    # Re-arm the owning request unconditionally — the blocklist flag governs ONLY
+    # whether a Blocklist row is written, NOT whether the request status is
+    # corrected. Without this, a mark-failed(blocklist=false) drives the download
+    # to terminal Failed (gone from the active queue) while the request stays
+    # 'downloading' forever: a dishonest status asserting an active download that
+    # no longer exists, with nothing to re-search or re-fail it. Mirrors the
+    # reconcile-driven ``_handle_failed`` re-arm.
+    if row.media_request_id is not None:
+        await SqlRequestRepository(session).set_status(
+            row.media_request_id, RequestStatus.searching.value
+        )
 
     await session.commit()
     failed = await download_repo.get_by_hash(row.torrent_hash)

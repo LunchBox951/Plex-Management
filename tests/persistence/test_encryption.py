@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
+from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.adapters import encryption
+from plex_manager.config import get_settings
 from plex_manager.models import Setting, User
 
 _TOKEN = "plex-token-super-secret-value"  # noqa: S105 — test fixture, not a real secret
@@ -72,3 +76,24 @@ async def test_setting_encrypted_value_is_ciphertext_at_rest(
     session.expire(setting)
     await session.refresh(setting)
     assert setting.encrypted_value == _API_KEY
+
+
+async def test_decrypt_with_replaced_key_raises_actionable_runtime_error(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ciphertext written under one key then read under a DIFFERENT key must fail
+    loudly (honesty over silence): EncryptedStr names the key file in a clear
+    RuntimeError instead of silently returning a broken value."""
+    # Stored under the key the autouse fixture installed.
+    user = User(username="carol", encrypted_plex_token=_TOKEN)
+    session.add(user)
+    await session.flush()
+
+    # Swap in a DIFFERENT key, as if the operator replaced/lost the original.
+    monkeypatch.setenv("PLEX_MANAGER_FERNET_KEY", Fernet.generate_key().decode())
+    get_settings.cache_clear()
+    encryption.reset_fernet_cache()
+
+    session.expire(user)
+    with pytest.raises(RuntimeError, match="does not match the data"):
+        await session.refresh(user)

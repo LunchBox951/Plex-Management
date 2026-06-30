@@ -17,6 +17,9 @@ from starlette.responses import JSONResponse, Response
 
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
+from plex_manager.adapters.prowlarr import IndexerRateLimitError
+from plex_manager.adapters.qbittorrent import QbittorrentAuthError
+from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.db import get_sessionmaker
 from plex_manager.web.deps import ServiceNotConfiguredError, ensure_system_settings
 from plex_manager.web.middleware import SetupGuardMiddleware
@@ -45,6 +48,26 @@ async def _service_not_configured_handler(request: Request, exc: Exception) -> R
         status_code=409,
         content={"detail": "service_not_configured", "service": service},
     )
+
+
+# Typed, actionable adapter errors -> honest HTTP states (status, detail). The
+# adapters deliberately raise these instead of swallowing the failure; mapping
+# them here keeps the reason visible at the boundary (honesty over silence) so
+# the UI can offer 'retry later' / 're-check credentials' instead of an opaque
+# 500. The error TYPES guarantee no secret is in the message, but we return a
+# fixed detail string (never ``str(exc)``) so nothing can leak by accident.
+_ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
+    IndexerRateLimitError: (503, "indexer_rate_limited"),
+    TmdbAuthError: (502, "tmdb_auth_failed"),
+    TmdbApiError: (502, "tmdb_unavailable"),
+    QbittorrentAuthError: (502, "qbittorrent_auth_failed"),
+}
+
+
+async def _adapter_error_handler(request: Request, exc: Exception) -> Response:
+    """Render a typed adapter error as its mapped honest status + detail."""
+    status_code, detail = _ADAPTER_ERROR_RESPONSES.get(type(exc), (502, "upstream_error"))
+    return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
 @asynccontextmanager
@@ -76,6 +99,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
     app.add_middleware(SetupGuardMiddleware)
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
+    for adapter_error in _ADAPTER_ERROR_RESPONSES:
+        app.add_exception_handler(adapter_error, _adapter_error_handler)
     app.include_router(router)
     app.include_router(setup_router.router)
     app.include_router(settings_router.router)
