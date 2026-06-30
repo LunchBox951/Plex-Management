@@ -7,12 +7,31 @@ auth failures surface honestly as ``ok=False`` without leaking secrets.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
 
+from plex_manager.web.setup_validation import validate_movies_root
+
 Handler = Callable[[httpx.Request], httpx.Response]
 SeedFn = Callable[..., Awaitable[None]]
+
+
+def test_validate_movies_root_rejects_relative_and_traversal() -> None:
+    assert validate_movies_root("relative/movies").ok is False
+    assert validate_movies_root("/library/../etc").ok is False
+    assert validate_movies_root("   ").ok is False
+
+
+def test_validate_movies_root_accepts_a_writable_dir(tmp_path: Path) -> None:
+    assert validate_movies_root(str(tmp_path)).ok is True
+
+
+def test_validate_movies_root_reports_a_missing_dir() -> None:
+    result = validate_movies_root("/definitely/not/a/real/path/xyz123")
+    assert result.ok is False
+    assert "does not exist" in result.message
 
 
 async def _use_transport(app: FastAPI, handler: Handler) -> None:

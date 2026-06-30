@@ -128,9 +128,19 @@ def validate_movies_root(path: str) -> ServiceValidateResponse:
     container, the mounted volume) sees it — the same path the importer will route
     movies into. A path is not a secret, so it may appear in the message.
     """
-    if not path.strip():
+    candidate = path.strip()
+    if not candidate:
         return ServiceValidateResponse(ok=False, message="Enter a library folder path.")
-    target = Path(path)
+    # Require an absolute, traversal-free path: the importer writes movies to an
+    # absolute root, and a relative / ``..``-laden value is both broken for import
+    # and a needless way to point the probe outside the intended tree.
+    if not os.path.isabs(candidate) or ".." in Path(candidate).parts:
+        return ServiceValidateResponse(
+            ok=False,
+            message="Use an absolute path with no '..' segments (e.g. /library/movies).",
+            detail=path,
+        )
+    target = Path(candidate)
     if not target.exists():
         return ServiceValidateResponse(ok=False, message="That folder does not exist.", detail=path)
     if not target.is_dir():
