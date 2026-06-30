@@ -147,8 +147,14 @@ class DownloadRepository(Protocol):
         seed_ratio: float | None = None,
         failed_reason: str | None = None,
         download_path: str | None = None,
+        first_seen_at: datetime | None = None,
     ) -> None:
-        """Update a download's status and optional progress fields."""
+        """Update a download's status and optional progress fields.
+
+        ``first_seen_at`` stamps the missing-grace anchor: the caller passes
+        ``now`` when persisting a ``StateTransition`` whose ``set_first_seen_at``
+        flag is set, so the reconciler's grace window can actually start.
+        """
         ...
 
 

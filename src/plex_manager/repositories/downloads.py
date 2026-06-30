@@ -16,6 +16,8 @@ from plex_manager.models import Download
 from plex_manager.ports.repositories import DownloadRecord
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlDownloadRepository"]
@@ -101,6 +103,7 @@ class SqlDownloadRepository:
         seed_ratio: float | None = None,
         failed_reason: str | None = None,
         download_path: str | None = None,
+        first_seen_at: datetime | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -114,4 +117,6 @@ class SqlDownloadRepository:
             row.failed_reason = failed_reason
         if download_path is not None:
             row.download_path = download_path
+        if first_seen_at is not None:
+            row.first_seen_at = first_seen_at
         await self._session.flush()

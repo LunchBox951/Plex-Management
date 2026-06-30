@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.repositories import SqlDownloadRepository
@@ -67,3 +69,30 @@ async def test_update_status_leaves_unspecified_fields_untouched(
     assert fetched.progress == 0.5
     assert fetched.seed_ratio == 0.0
     assert fetched.failed_reason is None
+
+
+async def test_update_status_stamps_first_seen_at_grace_anchor(
+    session: AsyncSession,
+) -> None:
+    # The missing-grace anchor must be settable via the repository so the
+    # reconciler's grace window can actually start (set_first_seen_at path).
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(torrent_hash="miss", status="downloading")
+    assert created.first_seen_at is None
+
+    anchor = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    await repo.update_status(created.id, "client_missing", first_seen_at=anchor)
+
+    fetched = await repo.get_by_hash("miss")
+    assert fetched is not None
+    assert fetched.status == "client_missing"
+    # SQLite stores DATETIME without tzinfo; the wall-clock value round-trips.
+    assert fetched.first_seen_at is not None
+    assert fetched.first_seen_at.replace(tzinfo=UTC) == anchor
+
+    # A later status update without first_seen_at must not clear the anchor.
+    await repo.update_status(created.id, "client_missing", progress=0.0)
+    again = await repo.get_by_hash("miss")
+    assert again is not None
+    assert again.first_seen_at is not None
+    assert again.first_seen_at.replace(tzinfo=UTC) == anchor
