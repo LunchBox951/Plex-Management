@@ -35,11 +35,15 @@ data/
 # Brainstorming visual companion (scratch)
 .superpowers/
 
-# Reference repositories (cloned by init.sh, not part of this project)
-prototype
-ombi
-overseerr
-radarr
-sonarr
-jackett
-prowlarr
+# Reference repositories (cloned by init.sh, not part of this project).
+# Anchored to the repo root with a trailing slash so they ONLY ignore the
+# top-level clones — an unanchored name like `prowlarr` would also swallow our
+# own `src/plex_manager/adapters/prowlarr/` package (it did: it was missing from
+# git and broke CI while passing locally).
+/prototype/
+/ombi/
+/overseerr/
+/radarr/
+/sonarr/
+/jackett/
+/prowlarr/
