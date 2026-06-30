@@ -11,15 +11,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import Blocklist, Download, MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.services import queue_service
 from plex_manager.services.import_service import import_download, run_import_cycle
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
@@ -132,7 +134,7 @@ async def test_import_rejects_cam_as_blocked_not_imported(
     movies_root.mkdir()
     video = tmp_path / "downloads" / "The.Matrix.1999.CAM.x264-GRP.mkv"
     _make_video(video)
-    download_id, _ = await _seed(
+    download_id, request_id = await _seed(
         sessionmaker_,
         request_status=RequestStatus.downloading,
         download_status=DownloadState.ImportPending.value,
@@ -146,6 +148,34 @@ async def test_import_rejects_cam_as_blocked_not_imported(
     assert "quality_not_wanted" in record.failed_reason
     # Nothing was imported into the library.
     assert not any(movies_root.iterdir())
+    # The owning request is moved to the honest, retryable import_blocked state —
+    # never left lying as 'downloading' while nothing is downloading.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.import_blocked
+
+
+async def test_mark_failed_recovers_a_blocked_import(sessionmaker_: SessionMaker) -> None:
+    # Correction without a terminal: an ImportBlocked download can be rejected via
+    # mark-failed -> blocklist + re-search (the P1 the review caught, where
+    # ImportBlocked had no legal FailedPending edge and the request stranded).
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.import_blocked,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=True)
+    assert record.status == DownloadState.Failed.value
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.searching  # re-armed for a fresh search
+        blocklisted = (await session.execute(select(Blocklist))).scalars().all()
+        assert len(blocklisted) == 1  # the bad release was blocklisted
 
 
 async def test_import_with_no_video_file_is_blocked(

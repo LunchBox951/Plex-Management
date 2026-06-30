@@ -120,11 +120,23 @@ async def _block(
     download_repo: SqlDownloadRepository,
     download_id: int,
     reason: str,
+    *,
+    request_id: int | None = None,
 ) -> None:
-    """Move a download to the honest, retryable ``ImportBlocked`` state."""
+    """Move a download to the retryable ``ImportBlocked`` state, honestly.
+
+    The owning request (when known) is moved to ``import_blocked`` — a surfaced,
+    retryable "needs attention" state — so it never lies as ``downloading`` while
+    nothing is downloading (north-star #3). The operator retries the import or
+    rejects the release (mark-failed -> blocklist + re-search).
+    """
     await download_repo.update_status(
         download_id, DownloadState.ImportBlocked.value, failed_reason=reason
     )
+    if request_id is not None:
+        await SqlRequestRepository(session).set_status(
+            request_id, RequestStatus.import_blocked.value
+        )
     await session.commit()
 
 
@@ -162,7 +174,13 @@ async def import_download(
         await _block(session, download_repo, download_id, "owning request no longer exists")
         return await download_repo.get_by_hash(row.torrent_hash)
     if request.media_type != "movie":
-        await _block(session, download_repo, download_id, "tv import deferred to the next beta")
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "tv import deferred to the next beta",
+            request_id=request.id,
+        )
         return await download_repo.get_by_hash(row.torrent_hash)
 
     # Locate the completed video file on disk.
@@ -170,13 +188,23 @@ async def import_download(
     content = _resolve_content(status, row.download_path)
     if content is None:
         await _block(
-            session, download_repo, download_id, "download client reported no content path"
+            session,
+            download_repo,
+            download_id,
+            "download client reported no content path",
+            request_id=request.id,
         )
         return await download_repo.get_by_hash(row.torrent_hash)
     try:
         src, size = await asyncio.to_thread(_resolve_source, fs, content)
     except _NoVideoError:
-        await _block(session, download_repo, download_id, "no video file found in the download")
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "no video file found in the download",
+            request_id=request.id,
+        )
         return await download_repo.get_by_hash(row.torrent_hash)
 
     # Validate the file IS the requested movie at acceptable quality (same brain as
@@ -191,10 +219,10 @@ async def import_download(
         expected_tmdb_id=request.tmdb_id,
     )
     if not validation.accepted:
-        rejection = validation.rejections[0]
-        await _block(
-            session, download_repo, download_id, f"{rejection.reason.value}: {rejection.detail}"
-        )
+        # Surface EVERY rejection the validator collected (not just the first), so
+        # the operator sees the full picture before retrying or rejecting.
+        reason = "; ".join(f"{r.reason.value}: {r.detail}" for r in validation.rejections)
+        await _block(session, download_repo, download_id, reason, request_id=request.id)
         return await download_repo.get_by_hash(row.torrent_hash)
 
     ext = os.path.splitext(src)[1].lstrip(".")
@@ -220,17 +248,28 @@ async def import_download(
         await asyncio.to_thread(_place_file, fs, src, dst)
     except OSError as exc:
         await _block(
-            session, download_repo, download_id, f"import copy failed: {type(exc).__name__}"
+            session,
+            download_repo,
+            download_id,
+            f"import copy failed: {type(exc).__name__}",
+            request_id=request.id,
         )
         return await download_repo.get_by_hash(row.torrent_hash)
 
     # Targeted Plex scan of the movie folder — the partial scan the prototype never
-    # did. A scan failure is retryable (the file IS in the library), so block rather
-    # than assert availability the operator can't see.
+    # did. A scan failure (incl. a path no Plex movie section covers) is retryable
+    # (the file IS in the library), so block rather than assert availability the
+    # operator can't see.
     try:
         await library.trigger_scan(str(dst.parent))
     except (PlexLibraryError, PlexAuthError) as exc:
-        await _block(session, download_repo, download_id, f"plex scan failed: {type(exc).__name__}")
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"plex scan failed: {type(exc).__name__}",
+            request_id=request.id,
+        )
         return await download_repo.get_by_hash(row.torrent_hash)
 
     # Imported. The download is terminal; the request is 'completed' ("Finalizing")

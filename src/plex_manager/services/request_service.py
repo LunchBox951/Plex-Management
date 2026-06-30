@@ -140,6 +140,14 @@ async def create_request(
         and media_type == "movie"
         and await _already_in_library(library, tmdb_id)
     ):
+        # Dedup the available short-circuit: if this movie is already recorded as
+        # in-library, return that row rather than accumulating duplicate 'available'
+        # rows (the active-dedup partial index excludes terminal statuses, so it
+        # would not catch this). A movie REMOVED from Plex reads not-available above
+        # and falls through to a normal pending request, so re-requests still work.
+        in_library = await repo.find_in_library(tmdb_id, media_type)
+        if in_library is not None:
+            return in_library
         initial_status = RequestStatus.available.value
     try:
         record = await repo.create(

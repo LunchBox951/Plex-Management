@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 from pathlib import Path
@@ -52,7 +53,7 @@ def test_hardlink_or_copy_falls_back_to_copy(
     dst = tmp_path / "copied.mkv"
 
     def _refuse_link(_src: str, _dst: str) -> None:
-        raise OSError("simulated cross-device link")
+        raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
     LocalFileSystem().hardlink_or_copy(src, dst)
@@ -69,7 +70,7 @@ def test_hardlink_or_copy_raises_when_destination_too_small(
     dst = tmp_path / "copied.mkv"
 
     def _refuse_link(_src: str, _dst: str) -> None:
-        raise OSError("simulated cross-device link")
+        raise OSError(errno.EXDEV, "simulated cross-device link")
 
     def _plenty(_self: LocalFileSystem, _path: str) -> int:
         return 1
@@ -91,7 +92,7 @@ def test_hardlink_or_copy_rolls_back_partial_copy_on_size_mismatch(
     dst = tmp_path / "copied.mkv"
 
     def _refuse_link(_src: str, _dst: str) -> None:
-        raise OSError("simulated cross-device link")
+        raise OSError(errno.EXDEV, "simulated cross-device link")
 
     def _short_copy2(_src: str, dst_arg: str) -> None:
         Path(dst_arg).write_text("short")  # truncated write

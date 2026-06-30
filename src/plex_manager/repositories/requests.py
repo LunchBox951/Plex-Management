@@ -70,6 +70,20 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
+    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
+            )
+            .order_by(MediaRequest.id.desc())
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return _to_record(row) if row is not None else None
+
     async def create(
         self,
         *,

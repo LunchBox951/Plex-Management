@@ -93,6 +93,14 @@ class RequestRepository(Protocol):
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return an existing non-terminal request for this media, for dedup."""
 
+    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
+        """Return the latest already-in-library (available/completed) request.
+
+        Dedups the Plex-availability short-circuit: a repeat request for a movie
+        already recorded as available returns that row instead of a duplicate.
+        """
+        raise NotImplementedError
+
     async def create(
         self,
         *,

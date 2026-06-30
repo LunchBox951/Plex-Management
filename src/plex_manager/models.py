@@ -70,6 +70,11 @@ class RequestStatus(StrEnum):
     completed = "completed"
     available = "available"
     failed = "failed"
+    # The download finished but the import was blocked (a bad file or an import
+    # error). A surfaced, retryable "needs attention" state — never a silent fail,
+    # never a dishonest "downloading". The operator retries the import or rejects
+    # the release (blocklist + re-search). Non-terminal, so it keeps dedup-blocking.
+    import_blocked = "import_blocked"
 
 
 class BlocklistReason(StrEnum):
@@ -218,10 +223,12 @@ class MediaRequest(Base):
             "media_type",
             unique=True,
             sqlite_where=sa.text(
-                "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
+                "status IN ('pending', 'searching', 'no_acceptable_release', "
+                "'downloading', 'import_blocked')"
             ),
             postgresql_where=sa.text(
-                "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
+                "status IN ('pending', 'searching', 'no_acceptable_release', "
+                "'downloading', 'import_blocked')"
             ),
         ),
     )

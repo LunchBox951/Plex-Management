@@ -42,6 +42,7 @@ from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.release import ParsedRelease
 from plex_manager.domain.source_mapping import resolve_quality
+from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.ports.parser import ParserPort
 
 __all__ = [
@@ -53,13 +54,10 @@ __all__ = [
     "validate_import",
 ]
 
-# Container extensions we treat as the feature video. Lower-case, leading dot.
-# Disk-image / stream containers (``.iso``, ``.ts``, ``.m2ts``) are intentionally
-# excluded: they are the multi-part / raw-disk shapes the gate is meant to catch,
-# not a clean importable file.
-VIDEO_EXTENSIONS: frozenset[str] = frozenset(
-    {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".mpg", ".mpeg", ".webm", ".flv"}
-)
+# NB: ``VIDEO_EXTENSIONS`` (imported above, re-exported via ``__all__``) is the
+# SAME set ``FileSystemPort.largest_video_file`` uses to SELECT the source file, so
+# the selector and this validator can never disagree — a file picked as the source
+# but then rejected here as "no video" was a real beta bug.
 
 # Files whose *name* marks them as a sample/extra rather than the feature. These
 # are dropped from consideration up front so a 40 MB "sample.mkv" can never be

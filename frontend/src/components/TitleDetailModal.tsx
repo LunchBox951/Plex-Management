@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   useCreateRequest,
   useGrab,
+  useImportDownload,
   useMarkFailed,
   useQueue,
   useRequests,
@@ -48,6 +49,7 @@ type DerivedState =
   | { kind: 'searching' }
   | { kind: 'downloading' }
   | { kind: 'no_acceptable_release' }
+  | { kind: 'import_blocked' }
   | { kind: 'completed' }
   | { kind: 'available' }
   | { kind: 'failed' }
@@ -64,6 +66,8 @@ function deriveState(request: RequestResponse | null, optimistic: boolean): Deri
       return { kind: 'downloading' }
     case 'no_acceptable_release':
       return { kind: 'no_acceptable_release' }
+    case 'import_blocked':
+      return { kind: 'import_blocked' }
     case 'completed':
       return { kind: 'completed' }
     case 'available':
@@ -76,6 +80,7 @@ function deriveState(request: RequestResponse | null, optimistic: boolean): Deri
 }
 
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
+const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'error' }
 
 /**
  * The headline flow: request a title, run the decision engine (search-preview),
@@ -90,6 +95,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const searchPreview = useSearchPreview()
   const grab = useGrab()
   const markFailed = useMarkFailed()
+  const importDownload = useImportDownload()
 
   // Live correlation sources — poll while a title is open so the action zone
   // tracks the backend through search -> download -> import without a refresh.
@@ -233,6 +239,19 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     }
   }, [reportFor, markFailed, toast])
 
+  // Retry a blocked import (operator fixed the infra, or it was a transient Plex
+  // hiccup). The reconcile loop re-runs validate -> place -> scan; an idempotent
+  // re-import skips the copy if the file is already in place.
+  const onRetryImport = useCallback(async () => {
+    if (!queueItem) return
+    try {
+      await importDownload.mutateAsync(queueItem.id)
+      toast({ title: 'Retrying import', intent: 'success' })
+    } catch (error) {
+      toast({ title: 'Import retry failed', description: asApiError(error).message, intent: 'error' })
+    }
+  }, [queueItem, importDownload, toast])
+
   if (!title) return null
 
   const canGrab = effectiveRequestId !== null
@@ -246,6 +265,12 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         Report a problem
       </Button>
     ) : null
+
+  const retryImportButton = queueItem ? (
+    <Button onClick={() => void onRetryImport()} loading={importDownload.isPending}>
+      Retry import
+    </Button>
+  ) : null
 
   const reSearchButton = (
     <Button
@@ -324,6 +349,25 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         </div>
       )
       break
+    case 'import_blocked':
+      // Honest, retryable: the download finished but the import was blocked (a bad
+      // file or an import error). Show the reason + the two correction buttons —
+      // retry the import, or reject the release (blocklist + re-search).
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={IMPORT_BLOCKED} />
+            {queueItem?.failed_reason ? (
+              <span className="text-sm text-error">{queueItem.failed_reason}</span>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {retryImportButton}
+            {reportButton}
+          </div>
+        </div>
+      )
+      break
     case 'completed':
       actionZone = (
         <div className="flex flex-wrap items-center gap-3">
@@ -333,12 +377,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       )
       break
     case 'available':
+      // In the library. The download is terminal (gone from the active queue), so
+      // there is no mark-failed target here; report-issue-with-purge (blocklist +
+      // delete from Plex/disk + re-search) is a deferred next-beta capability.
       actionZone = (
         <div className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center gap-1.5 rounded-lg bg-available/15 px-3 py-1 text-sm font-semibold text-available ring-1 ring-available/30">
             ✓ In your library
           </span>
-          {reportButton}
         </div>
       )
       break

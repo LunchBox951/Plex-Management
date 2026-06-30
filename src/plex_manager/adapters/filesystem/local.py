@@ -12,6 +12,7 @@ classic seedbox/library cross-mount case.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 from pathlib import Path
@@ -20,11 +21,24 @@ from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 
 __all__ = ["LocalFileSystem"]
 
+# os.link failures that genuinely warrant a content-copy fallback (cross-device,
+# hardlink-refusing / unsupported filesystem). Any OTHER errno (notably EEXIST —
+# the destination already exists) must NOT be masked as cross-device, or a copy
+# could overwrite a file another import just placed.
+_COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
+    {errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.EACCES}
+)
+
 #: Lowercased directory names whose contents are bonus material, not the main
 #: feature — skipped entirely when picking the largest video.
 _EXTRAS_DIR_NAMES: frozenset[str] = frozenset(
     {"featurettes", "extras", "trailers", "behind the scenes", "deleted scenes"}
 )
+
+
+def _is_within(root_real: str, candidate_real: str) -> bool:
+    """True if ``candidate_real`` is ``root_real`` or sits under it (both realpaths)."""
+    return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
 
 
 class LocalFileSystem:
@@ -60,7 +74,13 @@ class LocalFileSystem:
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.link(os.fspath(src), os.fspath(dst))
-        except OSError:
+        except OSError as exc:
+            # Only a genuine cross-device / hardlink-unsupported failure warrants a
+            # copy. EEXIST (the destination already exists — e.g. a concurrent import
+            # won the race) or any other errno is surfaced, never silently masked as
+            # cross-device into an overwriting copy.
+            if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                raise
             # Cross-device (or hardlink-refusing) filesystem: copy instead. A
             # copy actually consumes space, so preflight that the destination
             # filesystem can hold the source before writing a partial file.
@@ -97,6 +117,10 @@ class LocalFileSystem:
                 return os.fspath(root_path.resolve())
             return None
 
+        # Containment anchor: a symlink (or nested mount) inside the download tree
+        # must never let the chosen source resolve OUTSIDE it, or the importer would
+        # copy an arbitrary file (e.g. /etc/passwd) into the public library.
+        root_real = os.path.realpath(root)
         best_path: str | None = None
         best_size = -1
         for dirpath, dirnames, filenames in os.walk(root):
@@ -111,14 +135,17 @@ class LocalFileSystem:
                     continue
                 if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
                     continue
-                candidate = Path(dirpath) / filename
+                candidate = os.path.realpath(Path(dirpath) / filename)
+                if not _is_within(root_real, candidate):
+                    # Symlink (or mount) escaping the download tree — skip honestly.
+                    continue
                 try:
-                    size = candidate.stat().st_size
+                    size = os.path.getsize(candidate)
                 except OSError:
                     # A broken symlink or vanished file: skip it honestly rather
                     # than letting it abort the whole scan.
                     continue
                 if size > best_size:
                     best_size = size
-                    best_path = os.fspath(candidate.resolve())
+                    best_path = candidate
         return best_path

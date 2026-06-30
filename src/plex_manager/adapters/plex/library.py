@@ -90,6 +90,10 @@ class _TtlCache[V]:
     def clear(self) -> None:
         self._store.clear()
 
+    def invalidate(self, key: str) -> None:
+        """Drop one key so the next ``get`` re-fetches (e.g. after a Plex scan)."""
+        self._store.pop(key, None)
+
 
 # Module-level caches (keyed by base_url) — see the module docstring for why these
 # cannot be per-instance.
@@ -309,20 +313,36 @@ class PlexLibrary:
             start += _PAGE_SIZE
 
     async def trigger_scan(self, path: str) -> None:
-        """Ask Plex to scan ``path`` (partial-scan on the owning section).
+        """Ask Plex to scan ``path`` (a targeted partial-scan on the owning section).
 
-        The movie section whose location is a parent of ``path`` is refreshed for
-        just that path; if none matches (an unexpected layout), every movie section
-        is refreshed so the item is not silently missed. A 2xx (possibly empty body)
-        is success.
+        The movie section whose location is a parent of ``path`` gets a partial
+        refresh of just that path. If NO section covers it (a path-mapping
+        difference between the app and Plex, or Plex didn't report locations), we
+        do a real FULL refresh of each movie section instead — heavier, but it
+        actually indexes the new file, unlike refreshing with a path Plex does not
+        own (a silent no-op that would strand the request at "Finalizing"). With no
+        movie section at all, raise so the import blocks honestly. A 2xx (possibly
+        empty body) is success. After scanning, the presence cache is invalidated so
+        the availability check re-pages Plex instead of returning a pre-import snapshot.
         """
         movie_sections = [s for s in await self.list_sections() if s.type == "movie"]
+        if not movie_sections:
+            raise PlexLibraryError("no Plex movie library section to scan into")
         matched = [s for s in movie_sections if _section_covers(s, path)]
-        targets = matched or movie_sections
-        if not targets:
-            _logger.warning("no movie section to scan for the requested path")
-            return
-        # The raw path is handed to httpx as a query param so it is percent-encoded
-        # exactly once (pre-quoting here would double-encode it).
-        for section in targets:
-            await self._request(f"/library/sections/{section.key}/refresh", {"path": path})
+        try:
+            if matched:
+                # The raw path is handed to httpx as a query param so it is
+                # percent-encoded exactly once (pre-quoting here would double-encode).
+                for section in matched:
+                    await self._request(f"/library/sections/{section.key}/refresh", {"path": path})
+            else:
+                _logger.warning(
+                    "import path is not under any Plex movie section location; "
+                    "full-scanning every movie section instead of a no-op partial scan"
+                )
+                for section in movie_sections:
+                    await self._request(f"/library/sections/{section.key}/refresh", {})
+        finally:
+            # Bust the per-server presence index so completed -> available promotion
+            # is not delayed up to the full cache TTL after the file is in Plex.
+            _PRESENT_TMDB_CACHE.invalidate(self._base_url)

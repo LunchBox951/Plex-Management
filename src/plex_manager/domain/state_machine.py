@@ -78,7 +78,12 @@ TRANSITIONS: Mapping[DownloadState, frozenset[DownloadState]] = {
         {DownloadState.Importing, DownloadState.ImportBlocked, DownloadState.FailedPending}
     ),
     DownloadState.Importing: frozenset({DownloadState.Imported, DownloadState.ImportBlocked}),
-    DownloadState.ImportBlocked: frozenset({DownloadState.Importing}),
+    # A blocked import is a first-class correction point: the operator can retry the
+    # import (-> Importing) OR reject the release (-> FailedPending -> Failed +
+    # blocklist + re-search). Without the FailedPending edge the mark-failed button
+    # 409s and the request is stranded — correction without a terminal (north-star
+    # #1) requires this edge, mirroring ImportPending.
+    DownloadState.ImportBlocked: frozenset({DownloadState.Importing, DownloadState.FailedPending}),
     DownloadState.FailedPending: frozenset({DownloadState.Failed}),
     DownloadState.ClientMissing: frozenset(
         {DownloadState.Downloading, DownloadState.FailedPending}
