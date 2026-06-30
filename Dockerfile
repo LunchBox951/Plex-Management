@@ -1,5 +1,18 @@
 # syntax=docker/dockerfile:1
 
+# ---- web: build the typed SPA (ADR-0009) into the package's static dir ----
+# Node lives ONLY in this throwaway stage; the runtime image stays Node-free, so
+# bit-identical :edge -> :stable promotion (ADR-0004) is preserved. The committed
+# generated client (frontend/src/api/schema.d.ts) is used as-is — no openapi.json
+# needed here (docs/ is .dockerignore'd anyway).
+FROM node:22-slim AS web
+WORKDIR /web
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+# vite's outDir is ../src/plex_manager/web/static (relative to /web -> /src/...).
+RUN npm run build
+
 # ---- builder: install the app into an isolated venv ----
 FROM python:3.14-slim AS builder
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -15,6 +28,9 @@ RUN pip install --upgrade pip
 # Copy only what the build backend needs, then install.
 COPY pyproject.toml README.md ./
 COPY src ./src
+# Drop the built SPA in BEFORE the install so hatchling packages it into the
+# wheel (via [tool.hatch.build.targets.wheel].artifacts) and it ships in the image.
+COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
 RUN pip install .
 
 # ---- runtime: slim image with just the venv + migration assets ----

@@ -34,3 +34,10 @@ data
 # Docs & tests are not needed at runtime
 docs
 tests
+
+# Frontend: node_modules and any local build output are rebuilt in the image's
+# Node stage. Excluding the local static build also ensures `COPY src ./src`
+# never carries a stale UI — only the freshly built one (COPY --from=web) ships.
+**/node_modules
+frontend/dist
+src/plex_manager/web/static

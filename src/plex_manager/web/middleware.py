@@ -44,7 +44,13 @@ def _is_allowed(path: str) -> bool:
     """Whether ``path`` is reachable before the install is initialized."""
     if path in SETUP_ALLOWLIST_PATHS:
         return True
-    return any(path.startswith(prefix) for prefix in SETUP_ALLOWLIST_PREFIXES)
+    if any(path.startswith(prefix) for prefix in SETUP_ALLOWLIST_PREFIXES):
+        return True
+    # The SPA shell, its hashed assets, and client-side routes (e.g. ``/setup``,
+    # ``/queue``) carry no secrets and must render before first-run setup so the
+    # wizard is reachable. Only the protected API is gated pre-init: everything
+    # under ``/api/`` except the setup sub-API (allowed above) still gets the 409.
+    return not path.startswith("/api/")
 
 
 class SetupGuardMiddleware(BaseHTTPMiddleware):

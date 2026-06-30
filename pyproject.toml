@@ -57,6 +57,12 @@ path = "src/plex_manager/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/plex_manager"]
+# The SPA build output (ADR-0009) is git-ignored as a build artifact, so hatchling
+# would drop it when building inside a VCS checkout. Force-include it: in Docker the
+# Node stage populates this dir before ``pip install .`` and these bytes become the
+# served UI. The glob matches nothing when the frontend hasn't been built (e.g. a
+# Python-only CI lane), which is fine.
+artifacts = ["src/plex_manager/web/static/**"]
 
 [tool.ruff]
 line-length = 100

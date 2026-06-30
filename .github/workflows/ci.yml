@@ -28,6 +28,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      # Prove the committed OpenAPI doc still matches the wired backend. Combined
+      # with the frontend job's client drift check, this gates the whole contract
+      # chain: backend -> docs/api/openapi.json -> generated TS client. The
+      # exporter is deterministic (SPA routes are include_in_schema=False), so a
+      # diff here means a router/schema change wasn't re-exported + committed.
+      - name: OpenAPI contract is fresh
+        run: |
+          python -m plex_manager.web.openapi_export
+          git diff --exit-code docs/api/openapi.json
       - name: Lint (ruff)
         run: ruff check --output-format=github .
       - name: Format check (ruff)
@@ -54,3 +63,31 @@ jobs:
           pip install -e ".[dev]"
       - name: Tests
         run: pytest
+
+  # Frontend gates (ADR-0009). The typed client is generated from the exported
+  # OpenAPI doc, so the drift check fails the build if the committed client no
+  # longer matches the backend contract — keeping front and back in lockstep.
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Client contract drift (generated vs committed)
+        run: npm run gen:check
+      - name: Type check (tsc strict)
+        run: npm run typecheck
+      - name: Lint (eslint)
+        run: npm run lint
+      - name: Unit tests (vitest)
+        run: npm run test
+      - name: Build
+        run: npm run build
