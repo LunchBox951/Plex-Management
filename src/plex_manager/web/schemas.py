@@ -93,7 +93,8 @@ class PlexLibraryOption(BaseModel):
     ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
     choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
     section mismatch that breaks a targeted scan). ``writable`` is the app's own
-    check: a not-writable location is the split-mount signal — surfaced, not hidden.
+    check (``None`` when not probed — see the field): a known-not-writable location
+    is the split-mount signal — surfaced, not hidden.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -101,7 +102,12 @@ class PlexLibraryOption(BaseModel):
     section_key: str
     title: str
     path: str
-    writable: bool
+    # ``None`` = writability was NOT probed. The pre-init ``validate/plex`` wizard
+    # step never touches the filesystem for a caller-supplied Plex server (that would
+    # be a pre-auth local-FS existence/writability oracle); a real ``True``/``False``
+    # is set only by the authenticated Settings picker, where the operator's own
+    # stored creds make the probe legitimate.
+    writable: bool | None = None
 
 
 class ServiceValidateResponse(BaseModel):

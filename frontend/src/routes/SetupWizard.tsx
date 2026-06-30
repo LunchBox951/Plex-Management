@@ -331,9 +331,13 @@ export function SetupWizard() {
             >
               <option value="">Choose a movie library folder…</option>
               {plexLibraries.map((lib) => (
-                <option key={`${lib.section_key}:${lib.path}`} value={lib.path} disabled={!lib.writable}>
+                <option
+                  key={`${lib.section_key}:${lib.path}`}
+                  value={lib.path}
+                  disabled={lib.writable === false}
+                >
                   {lib.title} — {lib.path}
-                  {lib.writable ? '' : ' · not writable by the app'}
+                  {lib.writable === false ? ' · not writable by the app' : ''}
                 </option>
               ))}
             </select>

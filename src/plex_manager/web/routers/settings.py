@@ -53,7 +53,10 @@ async def plex_libraries_endpoint(
 
     Uses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.
     """
-    return movie_library_options(await library.list_sections())
+    # probe_writable=True (the default): authenticated, and the Plex creds are the
+    # operator's own stored config — so the real writability signal is legitimate
+    # here (unlike the pre-init validate/plex step, which must NOT probe).
+    return movie_library_options(await library.list_sections(), probe_writable=True)
 
 
 @router.put("")

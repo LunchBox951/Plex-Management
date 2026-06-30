@@ -434,7 +434,7 @@
         "type": "object"
       },
       "PlexLibraryOption": {
-        "description": "One movie-library folder Plex reports, with whether the app can write to it.\n\n``path`` is a Plex library location (from Plex's own ``/library/sections``), so\nchoosing it for ``movies_root`` avoids a typed path entirely (and the path\u2194\nsection mismatch that breaks a targeted scan). ``writable`` is the app's own\ncheck: a not-writable location is the split-mount signal \u2014 surfaced, not hidden.",
+        "description": "One movie-library folder Plex reports, with whether the app can write to it.\n\n``path`` is a Plex library location (from Plex's own ``/library/sections``), so\nchoosing it for ``movies_root`` avoids a typed path entirely (and the path\u2194\nsection mismatch that breaks a targeted scan). ``writable`` is the app's own\ncheck (``None`` when not probed \u2014 see the field): a known-not-writable location\nis the split-mount signal \u2014 surfaced, not hidden.",
         "properties": {
           "path": {
             "title": "Path",
@@ -449,15 +449,21 @@
             "type": "string"
           },
           "writable": {
-            "title": "Writable",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Writable"
           }
         },
         "required": [
           "section_key",
           "title",
-          "path",
-          "writable"
+          "path"
         ],
         "title": "PlexLibraryOption",
         "type": "object"

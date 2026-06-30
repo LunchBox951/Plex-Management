@@ -116,17 +116,24 @@ def _resolve_source(fs: FileSystemPort, content_path: str) -> tuple[str, int, st
     return src, os.path.getsize(src), os.path.relpath(src, anchor)
 
 
-def _place_file(fs: FileSystemPort, src: str, dst: Path) -> None:
+def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     """Hardlink/copy ``src`` to ``dst``, idempotently (sync I/O, run in a thread).
 
-    A fully-imported destination (same size) is left untouched; a partial/stale
-    leftover (e.g. a crash mid-copy) is removed and redone, so a re-import never
-    blesses a truncated file.
+    Returns ``True`` iff THIS call created ``dst``; ``False`` when ``dst`` was
+    already supplied by another writer — a prior fully-imported copy (idempotent
+    skip) or a concurrent import that won a placement race. The caller rolls ``dst``
+    back on a later failure ONLY when it actually placed it, so it never unlinks a
+    file another import (or the user) owns.
+
+    A fully-imported destination (same size) is left untouched. A *differently*-sized
+    file already at ``dst`` (a user's library file, or a stale partial) is NEVER
+    blind-deleted — it is surfaced as a ``FileExistsError`` conflict for the operator
+    to resolve, so a re-import never silently overwrites someone else's file.
     """
     os.makedirs(dst.parent, exist_ok=True)
     if dst.exists():
         if dst.stat().st_size == os.path.getsize(src):
-            return  # already fully imported here — idempotent skip
+            return False  # already fully imported here — idempotent skip; not ours
         # A differently-sized file is already at the destination: a user's
         # manually-managed library file, or a title Plex availability missed. NEVER
         # blind-delete it (that is data loss) — surface it as an import conflict the
@@ -141,8 +148,9 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> None:
         # idempotent win for the other attempt, NOT a failure to block on; a
         # different size is a genuine conflict, surfaced like the pre-existing case.
         if dst.exists() and dst.stat().st_size == os.path.getsize(src):
-            return
+            return False  # the race winner's file — not ours to roll back
         raise
+    return True  # we created dst; a later failure may roll it back
 
 
 def _remove_quietly(path: Path) -> None:
@@ -281,7 +289,7 @@ async def import_download(
     await session.commit()
 
     try:
-        await asyncio.to_thread(_place_file, fs, src, dst)
+        placed = await asyncio.to_thread(_place_file, fs, src, dst)
     except FileExistsError as exc:
         # A pre-existing, differently-sized file at the destination (a user's file,
         # or a stale partial) — surfaced as a conflict, never overwritten.
@@ -300,12 +308,14 @@ async def import_download(
     # Targeted Plex scan of the movie folder — the partial scan the prototype never
     # did. movies_root is a Plex library location (the picker guarantees the path↔
     # section match), so a scan failure here is a transient Plex error, not a wrong
-    # path. Roll the just-placed file back before blocking so a later reject /
-    # re-search can't orphan it in the library (the retry re-places it).
+    # path. Roll the file back before blocking — but ONLY when THIS attempt placed it
+    # — so a later reject / re-search can't orphan it (the retry re-places it), while
+    # a concurrent import's file (idempotent skip / lost race) is left intact.
     try:
         await library.trigger_scan(str(dst.parent))
     except (PlexLibraryError, PlexAuthError) as exc:
-        await asyncio.to_thread(_remove_quietly, dst)
+        if placed:
+            await asyncio.to_thread(_remove_quietly, dst)
         await _block(
             session,
             download_repo,

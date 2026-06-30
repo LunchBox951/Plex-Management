@@ -127,6 +127,17 @@ class LocalFileSystem:
         # must never let the chosen source resolve OUTSIDE it, or the importer would
         # copy an arbitrary file (e.g. /etc/passwd) into the public library.
         root_real = os.path.realpath(root)
+        # Reject a content root that is ITSELF a symlink escaping its own parent
+        # directory (e.g. /downloads/release -> /etc): root_real would become the
+        # symlink target and every file beneath it would spuriously satisfy the
+        # per-file containment check below, copying arbitrary files into the public
+        # library. A legitimately symlinked *parent* (e.g. /downloads -> /mnt/store)
+        # is unaffected, because realpath(parent) still contains root_real. At the
+        # filesystem root the parent check is vacuous (everything is under it), so
+        # skip it there rather than spuriously rejecting a top-level download dir.
+        parent_real = os.path.realpath(root_path.parent)
+        if parent_real != os.sep and not _is_within(parent_real, root_real):
+            return None
         best_path: str | None = None
         best_size = -1
         for dirpath, dirnames, filenames in os.walk(root):

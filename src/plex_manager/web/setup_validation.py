@@ -55,20 +55,30 @@ def _is_writable(path: str) -> bool:
     return os.path.isdir(path) and os.access(path, os.W_OK)
 
 
-def movie_library_options(sections: Sequence[LibrarySection]) -> list[PlexLibraryOption]:
+def movie_library_options(
+    sections: Sequence[LibrarySection], *, probe_writable: bool = True
+) -> list[PlexLibraryOption]:
     """Map Plex's movie sections to pickable ``movies_root`` folders + writability.
 
     The paths come from Plex's own ``/library/sections`` (not a typed request
     value), so choosing one avoids a path-injection sink AND guarantees the
     targeted-scan path match. Every movie-section location is offered; the UI marks
     (and disables) the non-writable ones, which is the split-mount signal.
+
+    ``probe_writable`` gates the only filesystem touch. The authenticated Settings
+    picker leaves it True (the operator's own stored creds make the probe theirs).
+    The PRE-INIT ``validate/plex`` wizard step passes False: there the Plex server
+    is caller-supplied and unauthenticated, so probing its reported locations would
+    turn this into a pre-auth local-FS existence/writability oracle. With it False
+    we report ``writable=None`` (UNKNOWN) — honest, never a faked bool — and never
+    call ``_is_writable`` / ``os.access`` on an attacker-chosen path.
     """
     return [
         PlexLibraryOption(
             section_key=section.key,
             title=section.title,
             path=path,
-            writable=_is_writable(path),
+            writable=_is_writable(path) if probe_writable else None,
         )
         for section in sections
         if section.type == "movie"
@@ -92,7 +102,11 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
         return ServiceValidateResponse(
             ok=False, message="Could not reach the Plex server.", detail=str(exc)
         )
-    libraries = movie_library_options(sections)
+    # probe_writable=False: this endpoint is reachable PRE-INIT against a
+    # caller-supplied Plex server, so never touch the local filesystem here (no
+    # pre-auth existence/writability oracle). Writability is reported UNKNOWN
+    # (None); the authenticated Settings picker fills in the real signal later.
+    libraries = movie_library_options(sections, probe_writable=False)
     if not libraries:
         # Connectivity + token are fine, but an install with no Movie library cannot
         # import anything (every scan would raise "no Plex movie library section").

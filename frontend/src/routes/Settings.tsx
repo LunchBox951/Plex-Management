@@ -203,10 +203,10 @@ export function Settings() {
                     <option
                       key={`${lib.section_key}:${lib.path}`}
                       value={lib.path}
-                      disabled={!lib.writable}
+                      disabled={lib.writable === false}
                     >
                       {lib.title} — {lib.path}
-                      {lib.writable ? '' : ' · not writable by the app'}
+                      {lib.writable === false ? ' · not writable by the app' : ''}
                     </option>
                   ))}
                 </select>

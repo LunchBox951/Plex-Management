@@ -151,3 +151,42 @@ def test_adapter_satisfies_filesystem_port() -> None:
     from plex_manager.ports.filesystem import FileSystemPort
 
     assert isinstance(LocalFileSystem(), FileSystemPort)
+
+
+def test_largest_video_file_rejects_symlinked_root_escaping_its_parent(
+    tmp_path: Path,
+) -> None:
+    # A file outside the download tree the importer must never reach.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.mkv").write_bytes(b"x" * 5000)
+
+    # The download tree; the "release" content root is itself a symlink that
+    # escapes the tree (e.g. /downloads/release -> /etc).
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    evil_root = downloads / "release"
+    os.symlink(outside, evil_root)
+
+    # Must refuse to surface a file from outside the download tree, exactly as
+    # the single-file branch already does for an escaping symlinked file root.
+    assert LocalFileSystem().largest_video_file(os.fspath(evil_root)) is None
+
+
+def test_largest_video_file_allows_symlinked_downloads_parent(
+    tmp_path: Path,
+) -> None:
+    # Real backing store; /downloads is a symlink to it (classic seedbox layout).
+    store = tmp_path / "store"
+    release = store / "Movie.2020"
+    release.mkdir(parents=True)
+    (release / "feature.mkv").write_bytes(b"x" * 1000)
+
+    downloads = tmp_path / "downloads"
+    os.symlink(store, downloads)  # symlinked PARENT, not an escaping root
+    root = downloads / "Movie.2020"
+
+    result = LocalFileSystem().largest_video_file(os.fspath(root))
+
+    assert result is not None
+    assert Path(result) == (release / "feature.mkv").resolve()

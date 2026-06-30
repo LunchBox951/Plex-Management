@@ -107,6 +107,10 @@ export function useUpdateSettings() {
       unwrap(await client.PUT('/api/v1/settings', { body })),
     onSuccess: (data) => {
       qc.setQueryData(queryKeys.settings, data)
+      // The Plex URL/token may have changed; the movies_root picker must refetch
+      // against the newly-saved connection — and clear any prior unconfigured/auth
+      // error, which retry:false otherwise leaves stuck until the page remounts.
+      void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
     },
   })
 }

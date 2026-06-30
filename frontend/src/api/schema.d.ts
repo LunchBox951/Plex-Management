@@ -656,7 +656,8 @@ export interface components {
          *     ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
          *     choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
          *     section mismatch that breaks a targeted scan). ``writable`` is the app's own
-         *     check: a not-writable location is the split-mount signal — surfaced, not hidden.
+         *     check (``None`` when not probed — see the field): a known-not-writable location
+         *     is the split-mount signal — surfaced, not hidden.
          */
         PlexLibraryOption: {
             /** Path */
@@ -666,7 +667,7 @@ export interface components {
             /** Title */
             title: string;
             /** Writable */
-            writable: boolean;
+            writable?: boolean | null;
         };
         /**
          * PlexValidateRequest

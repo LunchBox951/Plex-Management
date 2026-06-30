@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
+from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import Blocklist, Download, MediaRequest, MediaType, RequestStatus
@@ -194,6 +195,83 @@ async def _import_with_fs(
             session=session,
             movies_root=str(movies_root),
         )
+
+
+class _ScanFailsLibrary(FakeLibrary):
+    """A FakeLibrary whose targeted scan always fails with a transient Plex error,
+    driving import_download into its scan-failure rollback branch."""
+
+    async def trigger_scan(self, path: str) -> None:
+        self.scanned.append(path)
+        raise PlexLibraryError(f"plex scan failed for {path}")
+
+
+async def test_scan_failure_after_lost_race_does_not_delete_winners_file(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # F3: the reconcile loop races the operator's retry. THIS import loses the
+    # placement race (an identical, same-size file is already on disk), so it did
+    # NOT create dst. The Plex scan then fails. The scan-failure rollback must NOT
+    # unlink dst — that file belongs to the import that won the race; deleting it
+    # orphans another successful import's content.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video, 60 * 1024 * 1024)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = _ScanFailsLibrary()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        _LosingRaceFs(winner_size=60 * 1024 * 1024),
+    )
+
+    # Honest, retryable block — and the race winner's identical file survives intact.
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists(), "scan-failure rollback orphaned a concurrent import's file"
+    assert dst.stat().st_size == 60 * 1024 * 1024
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_scan_failure_after_real_placement_rolls_back_dst(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # The legitimate rollback the F3 fix must preserve: THIS import actually places
+    # the file (real hardlink via LocalFileSystem), then the Plex scan fails. Because
+    # this attempt created dst, it IS rolled back, so a later reject / re-search
+    # can't orphan it in the library (the retry re-places it).
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = _ScanFailsLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert not dst.exists(), "a file THIS import placed must be rolled back on scan failure"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
 
 
 async def test_import_idempotent_when_placement_race_lost_to_same_size(
