@@ -8,6 +8,13 @@ import { QueryClient } from '@tanstack/react-query'
  */
 export const POLL_INTERVAL_MS = 2000
 export const REQUESTS_POLL_INTERVAL_MS = 5000
+// The Status page's health/disk cards: matches the backend's own ~15s TTL
+// cache on the upstream probes (ADR-0012), so polling faster than this would
+// just re-read the same cached snapshot without learning anything new.
+export const OPS_POLL_INTERVAL_MS = 15000
+// The Logs page's live-tail toggle — a snappier cadence than the durable
+// store poll above, since the ring buffer is meant to feel "live".
+export const LOG_TAIL_POLL_INTERVAL_MS = 3000
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -32,4 +39,15 @@ export const queryKeys = {
   discover: (query: string, year?: number) => ['discover', query, year ?? null] as const,
   discoverHome: ['discover', 'home'] as const,
   searchPreview: ['search-preview'] as const,
+  opsHealth: ['ops', 'health'] as const,
+  opsDisk: ['ops', 'disk'] as const,
+  opsLogsTail: ['ops', 'logs', 'tail'] as const,
+  opsLogs: (filter: {
+    level?: string
+    since?: string
+    logger?: string
+    correlationId?: string
+    limit?: number
+    offset?: number
+  }) => ['ops', 'logs', filter] as const,
 }

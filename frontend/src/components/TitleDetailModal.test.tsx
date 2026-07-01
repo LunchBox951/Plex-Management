@@ -9,6 +9,7 @@ import {
   useQueue,
   useRequests,
   useSearchPreview,
+  useSetKeepForever,
 } from '../api/hooks'
 import type {
   DiscoverResult,
@@ -30,6 +31,7 @@ vi.mock('../api/hooks', () => ({
   useImportDownload: vi.fn(),
   useRequests: vi.fn(),
   useQueue: vi.fn(),
+  useSetKeepForever: vi.fn(),
 }))
 
 vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -93,6 +95,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(mutation(undefined))
     ;(useMarkFailed as unknown as Mock).mockReturnValue(mutation(undefined))
     ;(useImportDownload as unknown as Mock).mockReturnValue(mutation(undefined))
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     // liveRequest stays null: the /requests poll has NOT yet reflected the new row,
     // which is exactly the window where the bug enabled Grab.
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
@@ -162,6 +165,7 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(idle())
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
   })
 
   it('hides "Report a problem" while the download is importing (mark-failed would 409)', () => {
@@ -199,6 +203,7 @@ describe('TitleDetailModal — movie path is unchanged by the tv season selector
     ;(useGrab as unknown as Mock).mockReturnValue(idle())
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
@@ -256,6 +261,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(idle())
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
@@ -370,6 +376,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(grabMock)
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
@@ -423,6 +430,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(idle())
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
@@ -455,6 +463,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(idle())
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
@@ -468,5 +477,96 @@ describe('TitleDetailModal — tv season selector', () => {
     // rather than the show's 'partially_available' rollup leaking through.
     fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
     expect(await screen.findByText(/in your library/i)).toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', () => {
+  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'available',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  })
+
+  it('shows no keep-forever control before any request exists', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByText(/keep forever/i)).not.toBeInTheDocument()
+  })
+
+  it("reflects the live request's unpinned state and pins it on click", async () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ keep_forever: false })] },
+    })
+    const setKeepForeverMock = mutation(undefined)
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(setKeepForeverMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    const checkbox = screen.getByRole('checkbox', { name: /keep forever/i })
+    expect(checkbox).not.toBeChecked()
+
+    fireEvent.click(checkbox)
+    await waitFor(() =>
+      expect(setKeepForeverMock.mutateAsync).toHaveBeenCalledWith({
+        requestId: 7,
+        keepForever: true,
+      }),
+    )
+  })
+
+  it('shows the checkbox pre-checked when the request is already pinned', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ keep_forever: true })] },
+    })
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('checkbox', { name: /keep forever/i })).toBeChecked()
+  })
+
+  it('renders the evicted status honestly with a "Request again" affordance, never Grab', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'evicted' })] },
+    })
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText('Evicted')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /request again/i })).toBeInTheDocument()
+    // A settled (evicted) request is not grabbable — no stray Grab button.
+    expect(screen.queryByRole('button', { name: /^grab/i })).not.toBeInTheDocument()
+  })
+
+  it('does not let a stale evicted row shadow a fresh re-request for the same title', () => {
+    // Both an old evicted request AND a fresh one exist for this tmdb_id — the
+    // fresh (non-settled) one must win, never the older evicted row (mirrors the
+    // backend's own `_SETTLED_REQUEST_STATUSES` dedup exclusion).
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 7, status: 'evicted' }),
+          movieRequest({ id: 8, status: 'pending' }),
+        ],
+      },
+    })
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+    expect(screen.queryByText(/^evicted$/i)).not.toBeInTheDocument()
   })
 })

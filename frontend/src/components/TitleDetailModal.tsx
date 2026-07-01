@@ -7,6 +7,7 @@ import {
   useQueue,
   useRequests,
   useSearchPreview,
+  useSetKeepForever,
 } from '../api/hooks'
 import type {
   AcceptedRelease,
@@ -55,6 +56,10 @@ type DerivedState =
   | { kind: 'completed' }
   | { kind: 'available' }
   | { kind: 'failed' }
+  // ADR-0012: the disk-pressure sweep reclaimed this title's (or, for tv, this
+  // season's) file. Settled, same as available/failed — "Request again" makes
+  // a fresh, grabbable request.
+  | { kind: 'evicted' }
   | { kind: 'unknown'; status: string }
 
 /**
@@ -116,6 +121,8 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
       return { kind: 'available' }
     case 'failed':
       return { kind: 'failed' }
+    case 'evicted':
+      return { kind: 'evicted' }
     default:
       return { kind: 'unknown', status }
   }
@@ -124,13 +131,21 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
  * terminal request id in /queue/grab (`request_not_active`). Terminal statuses are
- * `available` (already in the library), `completed` (imported, finalizing) and
- * `failed`. POST /requests can itself hand back a terminal row — Plex already owns
- * the title, or an existing completed/failed request is reused — so the create
- * path must gate Grab on the returned status, not merely the presence of an id.
+ * `available` (already in the library), `completed` (imported, finalizing),
+ * `failed`, and `evicted` (ADR-0012 — the disk-pressure sweep already deleted the
+ * file; re-grabbing the same id would just re-arm a row the backend now treats as
+ * settled, see `_SETTLED_REQUEST_STATUSES`). POST /requests can itself hand back a
+ * terminal row — Plex already owns the title, or an existing completed/failed/
+ * evicted request is reused — so the create path must gate Grab on the returned
+ * status, not merely the presence of an id.
  */
 function isGrabbableStatus(status: string): boolean {
-  return status !== 'available' && status !== 'completed' && status !== 'failed'
+  return (
+    status !== 'available' &&
+    status !== 'completed' &&
+    status !== 'failed' &&
+    status !== 'evicted'
+  )
 }
 
 /**
@@ -167,6 +182,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const grab = useGrab()
   const markFailed = useMarkFailed()
   const importDownload = useImportDownload()
+  const setKeepForever = useSetKeepForever()
 
   // Live correlation sources — poll while a title is open so the action zone
   // tracks the backend through search -> download -> import without a refresh.
@@ -214,20 +230,34 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   // The live request for this exact title (media_type + tmdb_id), if any. /requests
   // comes back in ascending id order and the backend intentionally allows
-  // re-requesting an available/failed title, so a stale terminal row must not
-  // shadow a newer active re-request: prefer a non-settled match, else the newest.
+  // re-requesting an available/failed/evicted title, so a stale terminal row must
+  // not shadow a newer active re-request: prefer a non-settled match, else the
+  // newest. `evicted` (ADR-0012) is excluded for the SAME reason as
+  // available/failed — it must never shadow a fresh re-request created after the
+  // disk-pressure sweep reclaimed the old one (mirrors the backend's own
+  // `_SETTLED_REQUEST_STATUSES`).
   const liveRequest = useMemo<RequestResponse | null>(() => {
     if (!title) return null
     const matches = (requestsQuery.data?.requests ?? []).filter(
       (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
     )
-    const active = matches.find((r) => r.status !== 'available' && r.status !== 'failed')
+    const active = matches.find(
+      (r) => r.status !== 'available' && r.status !== 'failed' && r.status !== 'evicted',
+    )
     return active ?? matches[matches.length - 1] ?? null
   }, [requestsQuery.data, title])
 
   // A just-created request shows immediately even before the next poll lands. Used
   // for preview + queue correlation (a terminal request still owns its old download).
   const effectiveRequestId = requestId ?? liveRequest?.id ?? null
+
+  // The "keep forever" pin (ADR-0012): prefers the live (polled) request's own
+  // field — the canonical source — falling back to the just-created id before
+  // the next poll lands (a freshly created request always starts unpinned, so
+  // `false` there is correct, not merely a placeholder). `null` when there is
+  // no request at all yet: nothing exists to pin.
+  const pinRequestId = liveRequest?.id ?? requestId
+  const keepForever = liveRequest?.keep_forever ?? false
 
   // tv only: this show's per-season rollup — the live poll once it lands, else the
   // just-created request's own list (the same create-then-poll gap as
@@ -436,6 +466,28 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       toast({ title: 'Import retry failed', description: asApiError(error).message, intent: 'error' })
     }
   }, [queueItem, importDownload, toast])
+
+  // Toggle the "keep forever" pin (ADR-0012): pinned means `domain/eviction.py`
+  // will never select this title (or, for a show, any of its seasons — the pin
+  // lives on the parent request) regardless of watch state or disk pressure.
+  const onToggleKeepForever = useCallback(async () => {
+    if (pinRequestId == null) return
+    const next = !keepForever
+    try {
+      await setKeepForever.mutateAsync({ requestId: pinRequestId, keepForever: next })
+      if (next) {
+        toast({
+          title: 'Pinned — kept forever',
+          description: 'The disk-pressure sweep will never touch this title.',
+          intent: 'success',
+        })
+      } else {
+        toast({ title: 'Unpinned', intent: 'success' })
+      }
+    } catch (error) {
+      toast({ title: 'Could not update pin', description: asApiError(error).message, intent: 'error' })
+    }
+  }, [pinRequestId, keepForever, setKeepForever, toast])
 
   if (!title) return null
 
@@ -660,6 +712,22 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         </div>
       )
       break
+    case 'evicted':
+      // ADR-0012: honest, retryable — the disk-pressure sweep freed this title's
+      // file on purpose (not a failure), and re-requesting grabs it again from
+      // scratch (the old id is settled, same as available/failed).
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={requestStatus('evicted')} />
+            <span className="text-sm text-muted">
+              Freed to relieve disk pressure. Request it again to re-grab it.
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2">{requestAgainButton}</div>
+        </div>
+      )
+      break
     case 'unknown':
       actionZone = (
         <div className="flex flex-wrap items-center gap-3">
@@ -687,6 +755,17 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
               </p>
             ) : null}
             {seasonSelector}
+            {pinRequestId != null ? (
+              <label className="mt-3 flex items-center gap-2 text-xs text-muted">
+                <input
+                  type="checkbox"
+                  checked={keepForever}
+                  disabled={setKeepForever.isPending}
+                  onChange={() => void onToggleKeepForever()}
+                />
+                Keep forever (never auto-evicted)
+              </label>
+            ) : null}
             <div className="mt-4">{actionZone}</div>
           </div>
         </div>
