@@ -20,8 +20,14 @@ __all__ = ["SqlRequestRepository"]
 # ``completed`` is deliberately NOT here: it is the in-flight "Finalizing" state
 # (imported, before Plex confirms availability), so it must keep deduping a second
 # request (and a second grab) for the same movie until it reaches available/failed.
+# ``evicted`` (ADR-0012) belongs here for the SAME reason as available/failed: the
+# disk-pressure sweep already deleted the file, so the old row must never shadow a
+# fresh re-request that actually re-grabs the content. This MUST stay in sync with
+# ``uq_media_requests_active``'s partial-index predicate in ``models.py`` (also
+# ADR-0012), which excludes ``evicted`` from the DB backstop for the identical
+# reason — see ``RequestStatus.evicted``'s docstring there.
 _SETTLED_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
-    {RequestStatus.available, RequestStatus.failed}
+    {RequestStatus.available, RequestStatus.failed, RequestStatus.evicted}
 )
 
 

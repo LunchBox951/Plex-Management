@@ -132,6 +132,22 @@ async def test_partial_unique_index_allows_new_request_after_settled(
     assert fresh.id != done.id
 
 
+async def test_partial_unique_index_allows_new_request_after_eviction(
+    session: AsyncSession,
+) -> None:
+    """``evicted`` (ADR-0012) is ALSO outside the partial index, exactly like
+    available/failed: the disk-pressure sweep already deleted the file, so a
+    re-request must create a fresh, independent row that actually re-grabs the
+    content rather than being rejected in favour of the old, now off-disk row."""
+    repo = SqlRequestRepository(session)
+    gone = await repo.create(tmdb_id=601, media_type="movie", title="Evicted", status="evicted")
+    assert gone.status == "evicted"
+    fresh = await repo.create(
+        tmdb_id=601, media_type="movie", title="Evicted, re-requested", status="pending"
+    )
+    assert fresh.id != gone.id
+
+
 async def test_partial_unique_index_scoped_by_media_type(session: AsyncSession) -> None:
     """The index is on (tmdb_id, media_type): the same tmdb_id under a different
     media_type is not a conflict."""

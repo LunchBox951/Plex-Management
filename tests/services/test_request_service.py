@@ -258,6 +258,45 @@ async def test_create_request_redetects_removal_within_cache_ttl(
         assert pending_row.status is RequestStatus.pending
 
 
+async def test_create_request_after_eviction_creates_a_fresh_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """ADR-0012: once the disk-pressure sweep flips a request to ``evicted``, the
+    old (now off-disk) row must never shadow a re-request as if it were still
+    active. This exercises the SERVICE-level path (``create_request`` ->
+    ``find_active``), not just the DB partial-index backstop: without
+    ``evicted`` in ``repositories.requests._SETTLED_REQUEST_STATUSES``,
+    ``find_active`` would keep returning the evicted row and ``create_request``
+    would resolve to the stale row instead of creating a fresh one that
+    actually re-grabs the content."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=601,
+            media_type=MediaType.movie,
+            title="Evicted Movie",
+            status=RequestStatus.evicted,
+        )
+        session.add(evicted)
+        await session.commit()
+        evicted_id = evicted.id
+
+    tmdb = FakeTmdb(movies={601: MovieMetadata(tmdb_id=601, title="Evicted Movie", year=2019)})
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(session, tmdb, tmdb_id=601, media_type="movie")
+
+    assert fresh.id != evicted_id
+    assert fresh.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 601)))
+            .scalars()
+            .all()
+        )
+    statuses = sorted(r.status.value for r in rows)
+    assert statuses == ["evicted", "pending"]  # both rows survive, independently
+
+
 async def _season_numbers(sm: SessionMaker, media_request_id: int) -> set[int]:
     async with sm() as session:
         rows = (
