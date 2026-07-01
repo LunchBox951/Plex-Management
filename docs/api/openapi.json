@@ -388,7 +388,7 @@
         "type": "object"
       },
       "GrabRequest": {
-        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; ``episodes`` further\nscopes it to those specific episode number(s) (``None``/empty = the whole\nseason). Both are ignored for movies.",
+        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; ``episodes`` further\nscopes it to those specific episode number(s) (``None``/empty = the whole\nseason). Every TV grab is per-season: the endpoint REJECTS (422) a tv request\ngrabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed\nWITH a ``season`` -- the branch is always the request's actual media type,\nnever merely whether ``season`` happens to be set.",
         "properties": {
           "episodes": {
             "anyOf": [
