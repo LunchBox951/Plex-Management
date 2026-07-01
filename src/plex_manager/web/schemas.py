@@ -25,6 +25,7 @@ __all__ = [
     "DiscoverSearchResponse",
     "DiskResponse",
     "DiskRootItem",
+    "ErrorDetail",
     "EvictErrorItem",
     "EvictResponse",
     "EvictionCandidateItem",
@@ -61,6 +62,14 @@ __all__ = [
 ]
 
 MediaTypeField = Literal["movie", "tv"]
+
+
+class ErrorDetail(BaseModel):
+    """Machine-readable error body returned by manual HTTPException paths."""
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
 
 
 # --------------------------------------------------------------------------- #

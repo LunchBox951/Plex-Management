@@ -25,6 +25,7 @@ import hmac
 import ipaddress
 import logging
 from typing import Annotated, cast
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
@@ -383,24 +384,47 @@ def _configured_setup_token() -> str | None:
 def _is_loopback_client(request: Request) -> bool:
     """True when the request comes from the local host."""
     host = request.client.host if request.client is not None else None
+    return _is_loopback_hostname(host)
+
+
+def _is_loopback_hostname(host: str | None) -> bool:
     if host is None:
         return False
+    normalized = host.strip().strip("[]").rstrip(".").lower()
+    if normalized == "localhost":
+        return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
         return False
+
+
+def _origin_matches_request(request: Request, origin: str) -> bool:
+    parsed = urlsplit(origin)
+    return (
+        parsed.scheme == request.url.scheme
+        and parsed.hostname == request.url.hostname
+        and parsed.port == request.url.port
+    )
+
+
+def _is_trusted_local_setup_request(request: Request) -> bool:
+    if not _is_loopback_client(request) or not _is_loopback_hostname(request.url.hostname):
+        return False
+    origin = request.headers.get("Origin")
+    return origin is None or _origin_matches_request(request, origin)
 
 
 def is_setup_token_required(request: Request | None = None) -> bool:
     """Whether this request requires ``X-Setup-Token`` before initialization."""
     if _configured_setup_token() is not None:
         return True
-    return request is not None and not _is_loopback_client(request)
+    return request is not None and not _is_trusted_local_setup_request(request)
 
 
 def _pre_init_setup_token_valid(request: Request) -> bool:
     expected_setup_token = _configured_setup_token()
-    if expected_setup_token is None and _is_loopback_client(request):
+    if expected_setup_token is None and _is_trusted_local_setup_request(request):
         return True
     provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
     return _api_key_matches(provided_setup_token, expected_setup_token)

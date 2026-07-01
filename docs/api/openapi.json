@@ -502,6 +502,20 @@
         "title": "DiskRootItem",
         "type": "object"
       },
+      "ErrorDetail": {
+        "description": "Machine-readable error body returned by manual HTTPException paths.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ErrorDetail",
+        "type": "object"
+      },
       "EvictErrorItem": {
         "description": "One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --\na LATER root raising (e.g. a transient Plex error resolving TV watch\nstate) must never hide an EARLIER root's evictions that already deleted\nfiles and committed (honesty over silence: partial progress is surfaced,\nnot swallowed behind a 500).",
         "properties": {
@@ -3076,7 +3090,24 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Media not found"
+          },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
             "description": "Media type deferred"
           },
           "422": {
@@ -3403,7 +3434,14 @@
             "description": "Successful Response"
           },
           "401": {
-            "description": "Invalid setup token"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -3466,6 +3504,24 @@
               "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
               "title": "X-Setup-Token"
             }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
           }
         ],
         "requestBody": {
@@ -3490,7 +3546,14 @@
             "description": "Successful Response"
           },
           "401": {
-            "description": "Invalid setup token"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -3531,6 +3594,24 @@
               "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
               "title": "X-Setup-Token"
             }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
           }
         ],
         "requestBody": {
@@ -3555,7 +3636,14 @@
             "description": "Successful Response"
           },
           "401": {
-            "description": "Invalid setup token"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -3596,6 +3684,24 @@
               "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
               "title": "X-Setup-Token"
             }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
           }
         ],
         "requestBody": {
@@ -3620,7 +3726,14 @@
             "description": "Successful Response"
           },
           "401": {
-            "description": "Invalid setup token"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -3661,6 +3774,24 @@
               "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
               "title": "X-Setup-Token"
             }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
           }
         ],
         "requestBody": {
@@ -3685,7 +3816,14 @@
             "description": "Successful Response"
           },
           "401": {
-            "description": "Invalid setup token"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {

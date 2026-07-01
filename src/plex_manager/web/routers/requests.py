@@ -25,6 +25,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.schemas import (
     CreateRequestBody,
+    ErrorDetail,
     KeepForeverBody,
     RequestListResponse,
     RequestResponse,
@@ -44,7 +45,8 @@ router = APIRouter(
 
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
-    409: {"description": "Media type deferred"},
+    404: {"model": ErrorDetail, "description": "Media not found"},
+    409: {"model": ErrorDetail, "description": "Media type deferred"},
 }
 
 

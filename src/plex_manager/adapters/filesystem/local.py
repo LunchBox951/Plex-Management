@@ -100,7 +100,43 @@ def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
     with _publish_lock(dst):
         if dst.exists():
             raise FileExistsError(os.fspath(dst))
-        os.replace(tmp_path, os.fspath(dst))
+        try:
+            os.link(tmp_path, os.fspath(dst))
+        except OSError as exc:
+            if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                raise
+            _copy_temp_no_overwrite(tmp_path, dst)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
+def _copy_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
+    """Publish a temp file with exclusive create when final hardlinking is unsupported."""
+    dst_fd: int | None = None
+    created_dst = False
+    try:
+        mode = Path(tmp_path).stat().st_mode & 0o777
+        dst_fd = os.open(os.fspath(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+        created_dst = True
+        with os.fdopen(dst_fd, "wb") as dst_file:
+            dst_fd = None
+            with open(tmp_path, "rb") as tmp_file:
+                shutil.copyfileobj(tmp_file, dst_file)
+        if dst.stat().st_size != Path(tmp_path).stat().st_size:
+            raise OSError(f"publish of {dst.name} is incomplete; partial destination removed")
+    except OSError:
+        if dst_fd is not None:
+            os.close(dst_fd)
+        if created_dst:
+            with contextlib.suppress(OSError):
+                os.unlink(dst)
+        raise
+
+
+def _publish_link_no_overwrite(src: Path, dst: Path) -> None:
+    """Publish ``src`` at ``dst`` via an exclusive hardlink under the destination lock."""
+    with _publish_lock(dst):
+        os.link(os.fspath(src), os.fspath(dst))
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -202,7 +238,7 @@ class LocalFileSystem:
         """Move ``src`` to ``dst`` without replacing an existing destination file."""
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(os.fspath(src), os.fspath(dst))
+            _publish_link_no_overwrite(src, dst)
         except OSError as exc:
             if exc.errno not in _COPY_FALLBACK_ERRNOS:
                 raise
@@ -218,7 +254,7 @@ class LocalFileSystem:
         """
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(os.fspath(src), os.fspath(dst))
+            _publish_link_no_overwrite(src, dst)
         except OSError as exc:
             # Only a genuine cross-device / hardlink-unsupported failure warrants a
             # copy. EEXIST (the destination already exists — e.g. a concurrent import

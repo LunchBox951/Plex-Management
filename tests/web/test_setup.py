@@ -98,6 +98,28 @@ async def test_complete_rejects_remote_client_without_setup_token(app: FastAPI) 
     assert response.json()["detail"] == "invalid_setup_token"
 
 
+async def test_complete_rejects_loopback_client_with_nonlocal_host(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://attacker.test") as remote:
+        response = await remote.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+
+
+async def test_complete_rejects_loopback_client_with_cross_origin(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.post(
+            "/api/v1/setup/complete",
+            json=_COMPLETE_BODY,
+            headers={"Origin": "http://attacker.test"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+
+
 async def test_complete_flips_initialized_and_issues_key(client: httpx.AsyncClient) -> None:
     response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
     assert response.status_code == 200

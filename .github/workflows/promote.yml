@@ -10,9 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: "Source tag to promote — prefer the immutable edge-<sha> over the floating 'edge'"
+        description: "Immutable source tag to promote, e.g. edge-abc1234"
         required: true
-        default: edge
       version:
         description: "Release version to also assign, e.g. 1.4.0 (leave blank to tag :stable only)"
         required: false
@@ -46,9 +45,10 @@ jobs:
           SOURCE_TAG: ${{ inputs.source_tag }}
           VERSION: ${{ inputs.version }}
         run: |
-          # Reject anything that is not a plain image tag before using it in a command.
-          if ! printf '%s' "$SOURCE_TAG" | grep -Eq '^[A-Za-z0-9._-]+$'; then
-            echo "::error::Invalid source_tag: '$SOURCE_TAG'"
+          # Promote only immutable edge-<sha> handles so :stable is exactly the
+          # canary-proven image, never whatever the floating :edge points at now.
+          if ! printf '%s' "$SOURCE_TAG" | grep -Eq '^edge-[A-Za-z0-9._-]+$'; then
+            echo "::error::Invalid source_tag (expected immutable edge-<sha>): '$SOURCE_TAG'"
             exit 1
           fi
 
