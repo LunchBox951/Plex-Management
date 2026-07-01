@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Plex Manager"
-    host: str = "0.0.0.0"  # noqa: S104 — binding all interfaces is intentional inside the container
+    # Local/non-Docker startup defaults to loopback so first-run setup cannot be
+    # claimed from the network. Docker deployments set PLEX_MANAGER_HOST=0.0.0.0
+    # explicitly inside the container and require PLEX_MANAGER_SETUP_TOKEN.
+    host: str = "127.0.0.1"
     port: int = 8000
 
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync

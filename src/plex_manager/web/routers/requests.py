@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +32,10 @@ router = APIRouter(
     dependencies=[Depends(require_api_key)],
 )
 
+_MEDIA_TYPE_DEFERRED_RESPONSES: dict[int | str, dict[str, Any]] = {
+    409: {"description": "Media type deferred"},
+}
+
 
 def _to_response(record: RequestRecord) -> RequestResponse:
     return RequestResponse(
@@ -47,7 +51,11 @@ def _to_response(record: RequestRecord) -> RequestResponse:
     )
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    responses=_MEDIA_TYPE_DEFERRED_RESPONSES,
+)
 async def create_request_endpoint(
     body: CreateRequestBody,
     session: Annotated[AsyncSession, Depends(get_session)],

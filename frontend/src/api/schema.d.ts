@@ -1324,6 +1324,13 @@ export interface operations {
                     "application/json": components["schemas"]["RequestResponse"];
                 };
             };
+            /** @description Media type deferred */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1475,7 +1482,10 @@ export interface operations {
     complete_api_v1_setup_complete_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -1493,6 +1503,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SetupStatusResponse"];
                 };
+            };
+            /** @description Invalid setup token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1528,7 +1545,10 @@ export interface operations {
     validate_plex_endpoint_api_v1_setup_validate_plex_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -1547,6 +1567,13 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
+            /** @description Invalid setup token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1561,7 +1588,10 @@ export interface operations {
     validate_prowlarr_endpoint_api_v1_setup_validate_prowlarr_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -1580,6 +1610,13 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
+            /** @description Invalid setup token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1594,7 +1631,10 @@ export interface operations {
     validate_qbittorrent_endpoint_api_v1_setup_validate_qbittorrent_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -1613,6 +1653,13 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
+            /** @description Invalid setup token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1627,7 +1674,10 @@ export interface operations {
     validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -1645,6 +1695,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
+            };
+            /** @description Invalid setup token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

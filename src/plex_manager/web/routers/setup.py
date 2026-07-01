@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, cast
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import CursorResult, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
@@ -27,6 +27,7 @@ from plex_manager.db import get_session
 from plex_manager.models import SystemSettings
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
+    SETUP_TOKEN_HEADER_NAME,
     SettingsStore,
     ensure_system_settings,
     get_http_client,
@@ -56,48 +57,86 @@ __all__ = ["router"]
 router = APIRouter(prefix="/api/v1/setup", tags=["setup"])
 
 _API_KEY_BYTES = 32
+SetupTokenHeader = Annotated[
+    str | None,
+    Header(
+        alias=SETUP_TOKEN_HEADER_NAME,
+        description=(
+            "Required before setup only when /api/v1/setup/status reports "
+            "setup_token_required=true."
+        ),
+    ),
+]
+_SETUP_TOKEN_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {"description": "Invalid setup token"},
+}
 
 
-@router.post("/validate/plex", dependencies=[Depends(require_pre_init_or_api_key)])
+@router.post(
+    "/validate/plex",
+    dependencies=[Depends(require_pre_init_or_api_key)],
+    responses=_SETUP_TOKEN_RESPONSES,
+)
 async def validate_plex_endpoint(
     body: PlexValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+    _setup_token: SetupTokenHeader = None,
 ) -> ServiceValidateResponse:
     """Test candidate Plex credentials."""
     return await validate_plex(client, body.url, body.token)
 
 
-@router.post("/validate/prowlarr", dependencies=[Depends(require_pre_init_or_api_key)])
+@router.post(
+    "/validate/prowlarr",
+    dependencies=[Depends(require_pre_init_or_api_key)],
+    responses=_SETUP_TOKEN_RESPONSES,
+)
 async def validate_prowlarr_endpoint(
     body: ProwlarrValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+    _setup_token: SetupTokenHeader = None,
 ) -> ServiceValidateResponse:
     """Test candidate Prowlarr credentials."""
     return await validate_prowlarr(client, body.url, body.api_key)
 
 
-@router.post("/validate/qbittorrent", dependencies=[Depends(require_pre_init_or_api_key)])
+@router.post(
+    "/validate/qbittorrent",
+    dependencies=[Depends(require_pre_init_or_api_key)],
+    responses=_SETUP_TOKEN_RESPONSES,
+)
 async def validate_qbittorrent_endpoint(
     body: QbittorrentValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+    _setup_token: SetupTokenHeader = None,
 ) -> ServiceValidateResponse:
     """Test candidate qBittorrent credentials."""
     return await validate_qbittorrent(client, body.url, body.username, body.password)
 
 
-@router.post("/validate/tmdb", dependencies=[Depends(require_pre_init_or_api_key)])
+@router.post(
+    "/validate/tmdb",
+    dependencies=[Depends(require_pre_init_or_api_key)],
+    responses=_SETUP_TOKEN_RESPONSES,
+)
 async def validate_tmdb_endpoint(
     body: TmdbValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+    _setup_token: SetupTokenHeader = None,
 ) -> ServiceValidateResponse:
     """Test a candidate TMDB api key."""
     return await validate_tmdb(client, body.api_key)
 
 
-@router.post("/complete", dependencies=[Depends(require_setup_token_pre_init)])
+@router.post(
+    "/complete",
+    dependencies=[Depends(require_setup_token_pre_init)],
+    responses=_SETUP_TOKEN_RESPONSES,
+)
 async def complete(
     body: SetupCompleteRequest,
     session: Annotated[AsyncSession, Depends(get_session)],
+    _setup_token: SetupTokenHeader = None,
 ) -> SetupStatusResponse:
     """Persist the validated creds, mint the app api key, mark initialized.
 

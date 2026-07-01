@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useMarkFailed, useQueue } from '../api/hooks'
 import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
@@ -19,7 +19,7 @@ function isActive(status: string): boolean {
 
 /** What the confirm dialog is about to do, captured when a button is pressed. */
 interface PendingAction {
-  item: QueueItem
+  downloadId: number
   blocklist: boolean
 }
 
@@ -31,12 +31,22 @@ export function Queue() {
 
   const items = data?.queue ?? []
   const activeCount = items.filter((item) => isActive(item.status)).length
+  const pendingItem = pending ? (items.find((item) => item.id === pending.downloadId) ?? null) : null
+  const pendingActionable = pendingItem !== null && pendingItem.status !== 'importing'
+
+  useEffect(() => {
+    if (pending && !pendingActionable) {
+      setPending(null)
+    }
+  }, [pending, pendingActionable])
 
   async function runConfirm() {
-    if (!pending) return
-    const { item, blocklist } = pending
+    if (!pending || !pendingItem || pendingItem.status === 'importing') {
+      setPending(null)
+      return
+    }
     try {
-      await markFailed.mutateAsync({ downloadId: item.id, blocklist })
+      await markFailed.mutateAsync({ downloadId: pendingItem.id, blocklist: pending.blocklist })
       toast({ title: 'Marked failed', intent: 'success' })
       setPending(null)
     } catch (err) {
@@ -77,7 +87,7 @@ export function Queue() {
             key={item.id}
             item={item}
             disabled={markFailed.isPending}
-            onAction={(target, blocklist) => setPending({ item: target, blocklist })}
+            onAction={(target, blocklist) => setPending({ downloadId: target.id, blocklist })}
           />
         ))}
       </div>
@@ -109,7 +119,7 @@ export function Queue() {
 
       {content}
 
-      {pending ? (
+      {pending && pendingActionable ? (
         <Dialog
           open
           onOpenChange={(open) => {

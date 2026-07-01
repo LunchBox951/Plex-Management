@@ -114,6 +114,47 @@ def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     assert not observed_copy_dst[0].exists()
 
 
+def test_cross_device_copy_recovers_stale_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+    lock = tmp_path / ".copied.mkv.publish.lock"
+    lock.write_text("999999999")
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_cross_device_copy_preserves_active_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+    lock = tmp_path / ".copied.mkv.publish.lock"
+    lock.write_text(str(os.getpid()))
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert not dst.exists()
+    assert lock.read_text() == str(os.getpid())
+
+
 def test_hardlink_or_copy_raises_when_destination_too_small(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1840,6 +1840,9 @@
             },
             "description": "Successful Response"
           },
+          "409": {
+            "description": "Media type deferred"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2064,6 +2067,26 @@
       "post": {
         "description": "Persist the validated creds, mint the app api key, mark initialized.\n\nOne-shot AND concurrency-safe: rejected with 409 once initialized. Two\nconcurrent ``/complete`` calls can both pass an in-memory ``initialized`` check\nand double-write (a ``settings.key`` unique-constraint 500, or one overwriting\nthe other's just-issued ``app_api_key``). To prevent that, initialization is\nclaimed with a CONDITIONAL update (``... WHERE id = 1 AND initialized = false``):\nexactly one request flips the row, and the loser sees ``rowcount == 0`` and is\nrejected 409 \u2014 so only the winner mints the key and writes the creds. Re-running\nsetup post-init would also let an unauthenticated caller overwrite every stored\ncredential and re-disclose the app key, so post-init changes must go through the\nauthenticated ``PUT /settings``.",
         "operationId": "complete_api_v1_setup_complete_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2084,6 +2107,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "Invalid setup token"
           },
           "422": {
             "content": {
@@ -2128,6 +2154,26 @@
       "post": {
         "description": "Test candidate Plex credentials.",
         "operationId": "validate_plex_endpoint_api_v1_setup_validate_plex_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2148,6 +2194,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "Invalid setup token"
           },
           "422": {
             "content": {
@@ -2170,6 +2219,26 @@
       "post": {
         "description": "Test candidate Prowlarr credentials.",
         "operationId": "validate_prowlarr_endpoint_api_v1_setup_validate_prowlarr_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2190,6 +2259,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "Invalid setup token"
           },
           "422": {
             "content": {
@@ -2212,6 +2284,26 @@
       "post": {
         "description": "Test candidate qBittorrent credentials.",
         "operationId": "validate_qbittorrent_endpoint_api_v1_setup_validate_qbittorrent_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2232,6 +2324,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "Invalid setup token"
           },
           "422": {
             "content": {
@@ -2254,6 +2349,26 @@
       "post": {
         "description": "Test a candidate TMDB api key.",
         "operationId": "validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2274,6 +2389,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "Invalid setup token"
           },
           "422": {
             "content": {

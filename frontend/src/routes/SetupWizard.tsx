@@ -80,6 +80,13 @@ const EMPTY_FORM: SetupCompleteRequest = {
   movies_root: '',
 }
 
+const EMPTY_TESTING: Record<SetupService, boolean> = {
+  plex: false,
+  prowlarr: false,
+  qbittorrent: false,
+  tmdb: false,
+}
+
 interface TestResult {
   ok: boolean
   message: string
@@ -120,7 +127,7 @@ export function SetupWizard() {
     qbittorrent: null,
     tmdb: null,
   })
-  const [testing, setTesting] = useState<SetupService | null>(null)
+  const [testing, setTesting] = useState<Record<SetupService, boolean>>(EMPTY_TESTING)
   const [mintedKey, setMintedKey] = useState<string | null>(null)
   const [setupTokenInput, setSetupTokenInput] = useState('')
   // Movie library folders Plex reports (set when Plex verifies); null until then.
@@ -195,7 +202,7 @@ export function SetupWizard() {
 
   const test = async (service: SetupService) => {
     const gen = validationGen.current[service]
-    setTesting(service)
+    setTesting((prev) => ({ ...prev, [service]: true }))
     try {
       const res = await validate.mutateAsync({ service, body: bodyFor(service, form) })
       if (validationGen.current[service] !== gen) return // fields changed; ignore stale result
@@ -209,10 +216,7 @@ export function SetupWizard() {
         [service]: { ok: false, message: asApiError(error).message },
       }))
     } finally {
-      // Always release this service's spinner. The Test button is disabled while
-      // loading, so a same-service test can't be concurrently in flight; the
-      // (t === service) check only avoids clobbering a DIFFERENT service's spinner.
-      setTesting((t) => (t === service ? null : t))
+      setTesting((prev) => ({ ...prev, [service]: false }))
     }
   }
 
@@ -319,7 +323,7 @@ export function SetupWizard() {
                 <Button
                   variant="secondary"
                   size="sm"
-                  loading={testing === service.key}
+                  loading={testing[service.key]}
                   disabled={!setupTokenReady}
                   onClick={() => void test(service.key)}
                 >

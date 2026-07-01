@@ -187,6 +187,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   }, [queueQuery.data, title, effectiveRequestId])
 
   const state = deriveState(liveRequest, requestId !== null)
+  const reportTarget = reportFor
+    ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
+    : null
+  const reportActionable = reportTarget !== null && reportTarget.status !== 'importing'
+
+  useEffect(() => {
+    if (reportFor && !reportActionable) {
+      setReportFor(null)
+    }
+  }, [reportFor, reportActionable])
 
   const runPreview = useCallback(
     async (forRequestId: number | null) => {
@@ -266,7 +276,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // Blocklist the bad release and re-arm the request to search again. Mirrors the
   // Queue screen's mark-failed confirm; no separate "issues" record is created.
   const runReport = useCallback(async () => {
-    if (!reportFor) return
+    if (!reportFor || !reportActionable) {
+      setReportFor(null)
+      return
+    }
     try {
       await markFailed.mutateAsync({ downloadId: reportFor.downloadId, blocklist: true })
       toast({
@@ -282,7 +295,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         intent: 'error',
       })
     }
-  }, [reportFor, markFailed, toast])
+  }, [reportFor, reportActionable, markFailed, toast])
 
   // Retry a blocked import (operator fixed the infra, or it was a transient Plex
   // hiccup). The reconcile loop re-runs validate -> place -> scan; an idempotent
@@ -522,7 +535,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         ) : null}
       </div>
 
-      {reportFor ? (
+      {reportFor && reportActionable ? (
         <Dialog
           open
           onOpenChange={(next) => {

@@ -162,4 +162,30 @@ describe('SetupWizard', () => {
     expect(h.clearSetupToken).toHaveBeenCalled()
     expect(testButtons[0]).toBeDisabled()
   })
+
+  it('keeps each service test disabled while its own validation is pending', async () => {
+    const plexPending = deferred<ServiceValidateResponse>()
+    const prowlarrPending = deferred<ServiceValidateResponse>()
+    h.validate.mockImplementation(({ service }: { service: string }) =>
+      service === 'plex' ? plexPending.promise : prowlarrPending.promise,
+    )
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    fireEvent.click(testButtons[0]!)
+    await waitFor(() => expect(testButtons[0]).toBeDisabled())
+
+    fireEvent.click(testButtons[1]!)
+    await waitFor(() => {
+      expect(testButtons[0]).toBeDisabled()
+      expect(testButtons[1]).toBeDisabled()
+    })
+
+    await act(async () => {
+      plexPending.resolve(plexOk())
+      prowlarrPending.resolve({ ok: true, message: 'Prowlarr ok' })
+      await Promise.all([plexPending.promise, prowlarrPending.promise])
+    })
+  })
 })
