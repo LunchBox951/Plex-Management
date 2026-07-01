@@ -120,6 +120,23 @@ async def test_grab_creates_download_and_history_and_is_idempotent(
     assert len(qbt.added) == 1
 
 
+def test_queue_contract_documents_manual_error_bodies(app: FastAPI) -> None:
+    paths = app.openapi()["paths"]
+
+    for path in (
+        "/api/v1/queue/grab",
+        "/api/v1/queue/{download_id}/import",
+        "/api/v1/queue/{download_id}/mark-failed",
+    ):
+        responses = paths[path]["post"]["responses"]
+        assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+            "/ErrorDetail"
+        )
+        assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+            "/ErrorDetail"
+        )
+
+
 async def test_get_queue_is_passive_and_does_not_reconcile(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:

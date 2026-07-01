@@ -1057,6 +1057,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Blocklist entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1215,6 +1224,24 @@ export interface operations {
                     "application/json": components["schemas"]["QueueItem"];
                 };
             };
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1244,6 +1271,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -1277,6 +1322,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -1390,6 +1453,15 @@ export interface operations {
                     "application/json": components["schemas"]["RequestResponse"];
                 };
             };
+            /** @description Request not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1423,13 +1495,22 @@ export interface operations {
                     "application/json": components["schemas"]["SearchPreviewResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Request not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Validation error or missing request descriptor */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };
@@ -1534,6 +1615,15 @@ export interface operations {
             };
             /** @description Invalid setup token or API key */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Setup already initialized */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

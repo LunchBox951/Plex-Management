@@ -103,7 +103,10 @@ async def list_requests_endpoint(
     return RequestListResponse(requests=[_to_response(r) for r in records])
 
 
-@router.get("/{request_id}")
+@router.get(
+    "/{request_id}",
+    responses={404: {"model": ErrorDetail, "description": "Request not found"}},
+)
 async def get_request_endpoint(
     request_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],

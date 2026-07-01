@@ -79,6 +79,10 @@ ApiKeyHeader = Annotated[
 _SETUP_TOKEN_RESPONSES: dict[int | str, dict[str, Any]] = {
     401: {"model": ErrorDetail, "description": "Invalid setup token or API key"},
 }
+_SETUP_COMPLETE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_SETUP_TOKEN_RESPONSES,
+    409: {"model": ErrorDetail, "description": "Setup already initialized"},
+}
 
 
 @router.post(
@@ -144,7 +148,7 @@ async def validate_tmdb_endpoint(
 @router.post(
     "/complete",
     dependencies=[Depends(require_setup_token_pre_init)],
-    responses=_SETUP_TOKEN_RESPONSES,
+    responses=_SETUP_COMPLETE_RESPONSES,
 )
 async def complete(
     body: SetupCompleteRequest,

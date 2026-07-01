@@ -185,6 +185,14 @@ async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> Non
     assert second.json()["detail"] == "already_initialized"
 
 
+def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/setup/complete"]["post"]["responses"]
+
+    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+
+
 async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(
     client: httpx.AsyncClient,
 ) -> None:
