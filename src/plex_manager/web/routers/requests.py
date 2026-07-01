@@ -21,6 +21,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.schemas import (
     CreateRequestBody,
+    KeepForeverBody,
     RequestListResponse,
     RequestResponse,
     SeasonStatus,
@@ -76,6 +77,7 @@ async def _to_response(
             if seasons is not None
             else None
         ),
+        keep_forever=record.keep_forever,
     )
 
 
@@ -142,6 +144,28 @@ async def get_request_endpoint(
 ) -> RequestResponse:
     """Return a single media request, or 404."""
     record = await request_service.get_request(session, request_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+    return await _to_response(session, record)
+
+
+@router.post("/{request_id}/keep-forever")
+async def keep_forever_endpoint(
+    request_id: int,
+    body: KeepForeverBody,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> RequestResponse:
+    """Set or clear the operator's "keep forever" pin (ADR-0012).
+
+    The north-star #1 correction path for "don't let the eviction sweep touch
+    this one": a pinned title (or, for a show, every one of its seasons -- the
+    pin lives on the parent) is never selected by ``domain/eviction.py``
+    regardless of watch state or disk pressure. A 404 for an unknown id, never
+    a silent no-op.
+    """
+    record = await request_service.set_keep_forever(
+        session, request_id, keep_forever=body.keep_forever
+    )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
     return await _to_response(session, record)

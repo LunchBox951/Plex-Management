@@ -1,0 +1,161 @@
+"""``POST /api/v1/ops/evict`` (ADR-0012, Component 3) — the manual,
+operator-triggered pressure sweep: north-star #1's "free space on demand"
+button, and the ``evicted`` status it produces.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from plex_manager.models import MediaRequest, MediaType, RequestStatus
+from plex_manager.ports.library import WatchState
+from plex_manager.web.deps import SettingsStore
+from tests.web.fakes import FakeLibrary, override_adapters
+
+SeedFn = Callable[..., Awaitable[None]]
+SessionMaker = async_sessionmaker[AsyncSession]
+
+_API_KEY = "ops-evict-key"
+_HEADERS = {"X-Api-Key": _API_KEY}
+_TMDB_ID = 5150
+_STALE = datetime.now(UTC) - timedelta(days=45)
+
+
+async def _seed(
+    sm: SessionMaker,
+    *,
+    movies_root: str,
+    library_path: str,
+    keep_forever: bool = False,
+    eviction_enabled: str = "true",
+) -> int:
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.movie,
+            title="Stale Movie",
+            status=RequestStatus.available,
+            library_path=library_path,
+            keep_forever=keep_forever,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+
+        store = SettingsStore(session)
+        await store.set("movies_root", movies_root)
+        await store.set("eviction_enabled", eviction_enabled)
+        # threshold=0 always trips (real disk usage is never negative); target=0
+        # asks the sweep to evict every eligible candidate.
+        await store.set("disk_pressure_threshold_percent", "0")
+        await store.set("disk_pressure_target_percent", "0")
+        await store.set("eviction_grace_days", "30")
+        await session.commit()
+    return request_id
+
+
+async def test_evict_requires_api_key(client: httpx.AsyncClient, seed: SeedFn) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    assert (await client.post("/api/v1/ops/evict")).status_code == 401
+
+
+async def test_evict_requires_plex_configured(client: httpx.AsyncClient, seed: SeedFn) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "service_not_configured", "service": "plex"}
+
+
+async def test_evict_frees_space_and_flips_status_to_evicted(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["evicted"]) == 1
+    outcome = body["evicted"][0]
+    assert outcome["request_id"] == request_id
+    assert outcome["title"] == "Stale Movie"
+    assert outcome["media_type"] == "movie"
+
+    # The file is actually gone and the request is honestly, re-requestably
+    # marked `evicted` (never a silent delete, never a terminal dead-end).
+    assert not movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.evicted
+
+
+async def test_evict_still_runs_when_the_automatic_switch_is_disabled(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # `eviction_enabled=false` gates the AUTOMATIC periodic sweep only -- an
+    # operator who disabled the background loop must still be able to free
+    # space on demand via this explicit, manual button.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _seed(
+        sessionmaker_,
+        movies_root=str(tmp_path),
+        library_path=str(movie_file),
+        eviction_enabled="false",
+    )
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 200
+    assert len(response.json()["evicted"]) == 1
+    assert not movie_file.exists()
+
+
+async def test_evict_never_touches_a_pinned_keep_forever_title(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _seed(
+        sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file), keep_forever=True
+    )
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["evicted"] == []
+    assert movie_file.exists()

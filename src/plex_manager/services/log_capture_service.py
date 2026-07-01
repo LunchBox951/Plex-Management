@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -177,6 +178,16 @@ class LogCaptureHandler(logging.Handler):
     that some INFO+ records did not make it to durable storage this tick. The
     ring buffer (the live tail) is unaffected by queue pressure — it is a
     separate, always-appended structure.
+
+    ``ring_buffer`` itself is a plain ``deque`` (no lock) because a single
+    ``append`` is an atomic C-level op under the GIL — safe from any thread.
+    Reading a CONSISTENT snapshot for the live-tail endpoint is a different
+    problem: iterating a deque (what ``list(...)`` does) while another thread
+    appends to it can raise ``RuntimeError: deque mutated during iteration`` —
+    a real risk here since ``emit`` is documented above to run from ANY thread.
+    :meth:`snapshot_tail` is the only supported way to read it: it takes
+    ``_lock`` around both the read (here) and the write (in :meth:`emit`), so a
+    reader is never caught mid-iteration by a concurrent append.
     """
 
     def __init__(
@@ -191,6 +202,13 @@ class LogCaptureHandler(logging.Handler):
         self.queue: asyncio.Queue[CapturedLogRecord] = asyncio.Queue(maxsize=queue_maxsize)
         self.dropped_count = 0
         self._loop = loop if loop is not None else asyncio.get_running_loop()
+        # Guards ``ring_buffer`` against the concurrent-iteration hazard above.
+        # A ``threading.Lock`` (not ``asyncio.Lock``): ``emit`` can run from a
+        # non-loop thread and must never ``await``; the critical section on
+        # either side is a single, non-blocking, no-I/O list copy/append, so a
+        # brief synchronous lock is never held long enough to matter, even when
+        # acquired from the event-loop thread inside ``snapshot_tail``.
+        self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
         # Never let a capture bug break logging itself (north star: honesty over
@@ -202,10 +220,11 @@ class LogCaptureHandler(logging.Handler):
         except Exception:
             self.handleError(record)
             return
-        # ``deque.append`` is a single, effectively-atomic C-level operation under
-        # the GIL — safe to call directly from ``emit`` regardless of which thread
-        # is logging, unlike the queue below.
-        self.ring_buffer.append(captured)
+        # See ``snapshot_tail`` for why this append is lock-guarded despite being
+        # individually atomic: the hazard is a READER's iteration being caught
+        # mid-mutation, not the append itself.
+        with self._lock:
+            self.ring_buffer.append(captured)
         if record.levelno < logging.INFO:
             return
         # The loop is closed (shutdown race) — the ring buffer already has it for
@@ -213,6 +232,20 @@ class LogCaptureHandler(logging.Handler):
         # is acceptable during shutdown and must never raise from emit().
         with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(self._enqueue, captured)
+
+    def snapshot_tail(self, limit: int) -> list[CapturedLogRecord]:
+        """Thread-safe copy of the last ``limit`` ring-buffer records, OLDEST
+        first (mirrors the deque's own insertion order — the caller, ``GET
+        /ops/logs/tail``, reverses it to newest-first for display).
+
+        The ONLY safe way to read ``ring_buffer`` from outside this class: a
+        plain ``list(handler.ring_buffer)`` can raise ``RuntimeError: deque
+        mutated during iteration`` if ``emit`` appends from another thread
+        while the copy is in flight (see the class docstring). Held only for a
+        single, fast, in-memory copy — never awaits, never does I/O.
+        """
+        with self._lock:
+            return list(self.ring_buffer)[-limit:]
 
     def _enqueue(self, captured: CapturedLogRecord) -> None:
         """Runs ON THE LOOP THREAD (via ``call_soon_threadsafe``) — safe to touch

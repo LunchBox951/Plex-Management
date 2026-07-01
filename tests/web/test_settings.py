@@ -9,15 +9,37 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.web.deps import (
+    KNOWN_SETTING_KEYS,
     SettingsStore,
+    get_disk_pressure_target_percent,
+    get_disk_pressure_threshold_percent,
+    get_eviction_enabled,
+    get_eviction_grace_days,
+    get_eviction_interval_minutes,
+    get_eviction_proactive_enabled,
+    get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
 )
+from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _API_KEY = "settings-key"
+
+
+def test_every_known_setting_key_has_a_response_and_update_field() -> None:
+    """Regression guard for the operability beta's original defect: every
+    ``KNOWN_SETTING_KEYS`` entry (what ``SettingsStore.redacted()`` always
+    returns a value for) must be a real field on BOTH ``SettingsResponse`` and
+    ``SettingsUpdate`` -- otherwise it is readable/writable only via a direct
+    DB edit, which violates the "100% web-operable" north star. The 7
+    eviction/log-retention settings were once present in ``KNOWN_SETTING_KEYS``
+    but absent from both schemas."""
+    for key in KNOWN_SETTING_KEYS:
+        assert key in SettingsResponse.model_fields, f"{key} missing from SettingsResponse"
+        assert key in SettingsUpdate.model_fields, f"{key} missing from SettingsUpdate"
 
 
 async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -156,3 +178,76 @@ async def test_empty_string_root_reads_back_as_unset(
         assert await SettingsStore(session).get("tv_root") == ""
         assert await get_movies_root_optional(session) is None
         assert await get_tv_root_optional(session) is None
+
+
+# --------------------------------------------------------------------------- #
+# Operability beta (ADR-0012) settings: disk-pressure eviction + log retention
+# --------------------------------------------------------------------------- #
+async def test_put_round_trips_operability_settings(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    update = {
+        "disk_pressure_threshold_percent": 88.5,
+        "disk_pressure_target_percent": 75,
+        "eviction_grace_days": 14,
+        "eviction_enabled": False,
+        "eviction_proactive_enabled": True,
+        "eviction_interval_minutes": 45,
+        "log_retention_days": 3,
+    }
+    put = await client.put("/api/v1/settings", json=update, headers=headers)
+    assert put.status_code == 200
+    body = put.json()
+    assert body["disk_pressure_threshold_percent"] == 88.5
+    assert body["disk_pressure_target_percent"] == 75.0
+    assert body["eviction_grace_days"] == 14
+    assert body["eviction_enabled"] is False
+    assert body["eviction_proactive_enabled"] is True
+    assert body["eviction_interval_minutes"] == 45.0
+    assert body["log_retention_days"] == 3
+
+    # GET reflects the identical stored values.
+    got = (await client.get("/api/v1/settings", headers=headers)).json()
+    assert got == body
+
+    # The typed getters the eviction/log-retention loops actually read must see
+    # the SAME values -- not just a wire-level round trip (guards against e.g.
+    # a bool serialized in a form the case-insensitive parser wouldn't accept).
+    async with sessionmaker_() as session:
+        assert await get_disk_pressure_threshold_percent(session) == 88.5
+        assert await get_disk_pressure_target_percent(session) == 75.0
+        assert await get_eviction_grace_days(session) == 14
+        assert await get_eviction_enabled(session) is False
+        assert await get_eviction_proactive_enabled(session) is True
+        assert await get_eviction_interval_minutes(session) == 45.0
+        assert await get_log_retention_days(session) == 3
+
+
+async def test_put_rejects_out_of_range_operability_settings(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+
+    over_100 = await client.put(
+        "/api/v1/settings",
+        json={"disk_pressure_threshold_percent": 150},
+        headers=headers,
+    )
+    assert over_100.status_code == 422
+
+    zero_interval = await client.put(
+        "/api/v1/settings",
+        json={"eviction_interval_minutes": 0},
+        headers=headers,
+    )
+    assert zero_interval.status_code == 422
+
+    negative_days = await client.put(
+        "/api/v1/settings",
+        json={"log_retention_days": -1},
+        headers=headers,
+    )
+    assert negative_days.status_code == 422

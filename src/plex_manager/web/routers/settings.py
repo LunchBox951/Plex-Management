@@ -37,6 +37,23 @@ async def _redacted(store: SettingsStore) -> SettingsResponse:
     return SettingsResponse.model_validate(await store.redacted())
 
 
+def _to_stored_string(value: object) -> str:
+    """Render an incoming ``SettingsUpdate`` field value as the plain-text string
+    :meth:`SettingsStore.set` persists (``settings.value`` has no typed columns).
+
+    Booleans render lowercase (``"true"``/``"false"``) to match this codebase's
+    own convention for the setting (see ``web.deps._TRUE_STRINGS`` and the
+    eviction tests that seed ``store.set("eviction_enabled", "true")`` directly)
+    rather than Python's capitalized ``str(True)`` -- both round-trip correctly
+    through ``web.deps``'s case-insensitive parse, but the lowercase form is
+    the one actually written elsewhere, so a raw DB read stays consistent
+    regardless of which path wrote the value.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value if isinstance(value, str) else str(value)
+
+
 @router.get("")
 async def get_settings_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -81,6 +98,6 @@ async def put_settings_endpoint(
             continue
         if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
             continue
-        await store.set(field, value)
+        await store.set(field, _to_stored_string(value))
     await session.commit()
     return await _redacted(store)

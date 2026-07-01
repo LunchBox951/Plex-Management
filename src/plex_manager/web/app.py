@@ -57,6 +57,7 @@ from plex_manager.web.deps import (
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
+from plex_manager.web.routers import ops as ops_router
 from plex_manager.web.routers import quality_profile as quality_profile_router
 from plex_manager.web.routers import queue as queue_router
 from plex_manager.web.routers import requests as requests_router
@@ -430,6 +431,7 @@ def create_app() -> FastAPI:
     app.include_router(queue_router.router)
     app.include_router(blocklist_router.router)
     app.include_router(quality_profile_router.router)
+    app.include_router(ops_router.router)
     # Mount the built SPA LAST so its catch-all fallback has the lowest match
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
     mount_spa(app)

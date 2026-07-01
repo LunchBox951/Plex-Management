@@ -85,6 +85,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
       title: 'Test Movie',
       status: createdStatus,
       is_anime: false,
+      keep_forever: false,
       year: 2021,
     }
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
@@ -123,6 +124,7 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
     return {
       id: 7,
       is_anime: false,
+      keep_forever: false,
       media_type: 'movie',
       status: 'downloading',
       title: 'Test Movie',
@@ -184,6 +186,7 @@ describe('TitleDetailModal — movie path is unchanged by the tv season selector
       title: 'Test Movie',
       status: 'pending',
       is_anime: false,
+      keep_forever: false,
     }
     const createRequestMock = mutation(created)
     const searchPreviewMock = mutation({
@@ -239,6 +242,7 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test Show',
       status: 'pending',
       is_anime: false,
+      keep_forever: false,
       seasons: [{ season_number: 2, status: 'pending' }],
     }
     const createRequestMock = mutation(created)
@@ -337,6 +341,7 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test Show',
       status: 'partially_available',
       is_anime: false,
+      keep_forever: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -407,6 +412,7 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test Show',
       status: 'partially_available',
       is_anime: false,
+      keep_forever: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -438,6 +444,7 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test Show',
       status: 'partially_available',
       is_anime: false,
+      keep_forever: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },

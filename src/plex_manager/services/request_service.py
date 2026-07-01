@@ -36,6 +36,7 @@ __all__ = [
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
+    "set_keep_forever",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -463,3 +464,25 @@ async def mark_available(session: AsyncSession, request_id: int) -> None:
     """Phase 2 of honest availability: Plex has confirmed the title is in the library."""
     await SqlRequestRepository(session).mark_available(request_id)
     await session.commit()
+
+
+async def set_keep_forever(
+    session: AsyncSession, request_id: int, *, keep_forever: bool
+) -> RequestRecord | None:
+    """Toggle the operator's "keep forever" pin (ADR-0012).
+
+    Movie or (whole) show granularity: the pin lives on the parent
+    ``MediaRequest`` regardless of media type, so pinning a series protects
+    every one of its seasons (``domain/eviction.py`` reads it off the parent —
+    see ``eviction_service._season_candidates``). Returns ``None`` when the
+    request does not exist (the router surfaces 404); otherwise commits and
+    returns the freshly updated record so the endpoint can hand back the new
+    state without a second round trip.
+    """
+    repo = SqlRequestRepository(session)
+    current = await repo.get(request_id)
+    if current is None:
+        return None
+    await repo.set_keep_forever(request_id, keep_forever)
+    await session.commit()
+    return await repo.get(request_id)

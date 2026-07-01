@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.repositories import RequestRecord
 
-__all__ = ["EvictionOutcome", "run_eviction_sweep"]
+__all__ = ["EvictionOutcome", "preview_candidates", "run_eviction_sweep"]
 
 _logger = logging.getLogger(__name__)
 
@@ -318,6 +318,46 @@ async def _evict_one(
         library_path=library_path,
         freed_bytes=pending.size_bytes,
     )
+
+
+async def preview_candidates(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    media_type: Literal["movie", "tv"],
+    root_path: str,
+    grace_days: int,
+) -> list[EvictionCandidate]:
+    """Read-only, ranked preview of one root's eviction candidates.
+
+    Backs ``GET /api/v1/ops/disk``'s candidate preview: mirrors
+    :func:`run_eviction_sweep`'s candidate-assembly steps (0-2 minus the
+    pressure gate) but never deletes anything and never flips a status --
+    exactly the "what WOULD a sweep pick" view
+    :func:`~plex_manager.domain.eviction.rank_eviction_candidates`'s docstring
+    describes. An unreadable ``root_path`` (missing mount, permission denied)
+    returns an empty list (logged), the same honest fallback the sweep itself
+    uses -- never a crash of the whole health/disk dashboard over one bad root.
+    """
+    try:
+        disk = read_disk_usage(root_path)
+    except OSError as exc:
+        _logger.warning(
+            "eviction candidate preview skipped for %s root %s (%s)",
+            media_type,
+            root_path,
+            type(exc).__name__,
+        )
+        return []
+
+    pairs = (
+        await _movie_candidates(session, library, disk.total_bytes)
+        if media_type == "movie"
+        else await _season_candidates(session, library, disk.total_bytes)
+    )
+    candidates = [candidate for candidate, _pending in pairs]
+    grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
+    return rank_eviction_candidates(candidates, grace_cutoff)
 
 
 async def run_eviction_sweep(

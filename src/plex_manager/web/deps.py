@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import hmac
 import logging
-from typing import Annotated
+from typing import Annotated, cast
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
@@ -48,6 +48,8 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
+from plex_manager.services import log_capture_service
+from plex_manager.services.health_service import ReconcileStatus, SubsystemHealth, TtlCache
 
 __all__ = [
     "API_KEY_HEADER_NAME",
@@ -72,9 +74,11 @@ __all__ = [
     "get_eviction_interval_minutes",
     "get_eviction_proactive_enabled",
     "get_filesystem",
+    "get_health_cache",
     "get_http_client",
     "get_library",
     "get_library_optional",
+    "get_log_handler",
     "get_log_retention_days",
     "get_movies_root",
     "get_movies_root_optional",
@@ -82,6 +86,7 @@ __all__ = [
     "get_prowlarr",
     "get_qbittorrent",
     "get_quality_profile",
+    "get_reconcile_status",
     "get_session",
     "get_tmdb",
     "get_tv_root",
@@ -277,6 +282,68 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
             detail="http_client_unavailable",
         )
     return client
+
+
+def get_health_cache(request: Request) -> TtlCache[SubsystemHealth]:
+    """Return the process-wide subsystem-probe TTL cache (ADR-0012).
+
+    Lazily created on first access and stashed on ``app.state`` so every
+    subsequent request in this process reuses the SAME cache instance (the
+    whole point — see ``health_service.SUBSYSTEM_PROBE_TTL_SECONDS``'s docstring
+    on why a per-request cache would never actually deduplicate anything).
+    Unlike ``reconcile_status``/``log_handler``, this is NOT created up front by
+    ``lifespan``: nothing outside ``GET /api/v1/ops/health`` ever reads or
+    mutates it, so it is a pure web-layer concern the dependency itself owns —
+    mirrors ``get_http_client``'s own ``app.state`` lookup/lazy-init shape.
+    """
+    cache = getattr(request.app.state, "health_cache", None)
+    if not isinstance(cache, TtlCache):
+        cache = TtlCache[SubsystemHealth]()
+        request.app.state.health_cache = cache
+    # ``isinstance`` against a generic runtime class can't narrow the type
+    # parameter (pyright sees ``TtlCache[Unknown]``); the cast is safe because
+    # this accessor is the ONLY place anything ever assigns ``app.state.
+    # health_cache``, always with this exact type.
+    return cast("TtlCache[SubsystemHealth]", cache)
+
+
+def get_log_handler(request: Request) -> log_capture_service.LogCaptureHandler:
+    """Return the process-wide :class:`LogCaptureHandler` ``lifespan`` created
+    (the ring-buffer + ``dropped_count`` source for ``GET /api/v1/ops/logs/tail``).
+
+    Mirrors :func:`get_http_client`'s ``app.state`` lookup and honest 503 when
+    absent -- a real deployment always has one (``lifespan`` sets it up before
+    serving traffic), so a missing handler here means logging genuinely was
+    never configured (e.g. a test driving the router without going through
+    ``lifespan`` and without setting one up itself), not a value worth
+    fabricating a placeholder for.
+    """
+    handler = getattr(request.app.state, "log_handler", None)
+    if not isinstance(handler, log_capture_service.LogCaptureHandler):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="log_handler_unavailable",
+        )
+    return handler
+
+
+def get_reconcile_status(request: Request) -> ReconcileStatus:
+    """Return ``app.state.reconcile_status`` for a read-only HTTP response
+    (``GET /api/v1/ops/health``'s reconcile panel).
+
+    Lazily creates + stores a fresh, never-run :class:`ReconcileStatus` if
+    absent so the health endpoint stays honest ("the loop hasn't run yet")
+    rather than 503ing -- a real deployment always has one by the time it
+    serves traffic (``lifespan`` sets it up front, mutated in place by
+    ``_reconcile_once``/``_reconcile_loop`` in ``web/app.py``); this lazy path
+    only matters for a test exercising the router without going through
+    ``lifespan``.
+    """
+    current = getattr(request.app.state, "reconcile_status", None)
+    if not isinstance(current, ReconcileStatus):
+        current = ReconcileStatus()
+        request.app.state.reconcile_status = current
+    return current
 
 
 # --------------------------------------------------------------------------- #
