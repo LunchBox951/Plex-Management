@@ -446,7 +446,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           id="season-select"
           className="h-8 rounded-lg bg-bg px-2 text-xs text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
           value={currentSeason ?? ''}
-          onChange={(e) => setActiveSeason(Number(e.target.value))}
+          onChange={(e) => {
+            setActiveSeason(Number(e.target.value))
+            // Drop the previewed releases from the OLD season: they belong to a
+            // different scope, and grabbing one now would send the newly selected
+            // season and 404 (release_not_found) or grab under the wrong context.
+            // The operator re-searches for the newly selected season.
+            setPreview(null)
+          }}
         >
           {effectiveSeasons.map((s) => (
             <option key={s.season_number} value={s.season_number}>

@@ -43,6 +43,14 @@ from plex_manager.domain.season_pack import classify_release_scope
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
+# Release scopes that satisfy a WHOLE-season grab and so earn the season-pack
+# preference: an exact single-season pack AND a multi-season pack (``S01-S03``) that
+# covers the requested season (the media-identity season gate already confirmed it
+# does). Both must rank ahead of a single-episode release for a whole-season request,
+# or a higher-seeded single episode could out-rank a release that actually contains
+# the whole requested season.
+_PACK_SCOPES: frozenset[str] = frozenset({"season_pack", "multi_season_pack"})
+
 __all__ = ["BlocklistCheck", "DecisionResult", "MediaMatchCheck", "decide"]
 
 # Returns True when the (candidate, parsed) pair is blocklisted. The caller wires
@@ -137,7 +145,7 @@ def decide(
         # The quality passed the gate, so it is present in the profile.
         index = profile.get_index(quality.id)
         profile_index = index if index is not None else -1
-        is_season_pack = prefer_season_pack and classify_release_scope(parsed) == "season_pack"
+        is_season_pack = prefer_season_pack and classify_release_scope(parsed) in _PACK_SCOPES
         accepted.append(
             ScoredRelease(
                 candidate=candidate,
@@ -153,8 +161,8 @@ def decide(
         if by_quality != 0:
             return by_quality
         if prefer_season_pack:
-            left_pack = classify_release_scope(left.parsed) == "season_pack"
-            right_pack = classify_release_scope(right.parsed) == "season_pack"
+            left_pack = classify_release_scope(left.parsed) in _PACK_SCOPES
+            right_pack = classify_release_scope(right.parsed) in _PACK_SCOPES
             if left_pack != right_pack:
                 return 1 if left_pack else -1
         left_seeders = left.candidate.seeders or 0

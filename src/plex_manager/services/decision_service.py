@@ -91,7 +91,11 @@ async def preview(
     )
     candidates = await prowlarr.search(request)
 
-    records = await blocklist_repo.list_for_media(tmdb_id)
+    # Scope the blocklist to this media's namespace: a movie and a show can share a
+    # numeric tmdb_id, so a tmdb-id-only lookup would let one media type's blocklist
+    # reject the other's candidates. ``"search"`` (untyped) imposes no scope.
+    blocklist_media_type = media_type if media_type in ("movie", "tv") else None
+    records = await blocklist_repo.list_for_media(tmdb_id, media_type=blocklist_media_type)
     entries = [
         BlocklistedRelease(
             source_title=record.source_title,

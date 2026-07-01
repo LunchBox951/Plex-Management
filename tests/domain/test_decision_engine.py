@@ -37,6 +37,13 @@ _FIELDS: dict[str, dict[str, object]] = {
         "season": 2,
         "episode": 5,
     },
+    # A multi-season pack (S01-S03) — season is a LIST, so classify_release_scope
+    # returns "multi_season_pack".
+    "Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP": {
+        "source": "Web",
+        "screen_size": "1080p",
+        "season": [1, 2, 3],
+    },
 }
 
 
@@ -213,6 +220,25 @@ def test_prefer_season_pack_breaks_ties_toward_the_pack() -> None:
     # The scope bonus never overrides the profile-order comparator: it is a purely
     # additive score component that must not itself decide acceptance/rejection.
     assert result.no_acceptable_release is False
+
+
+def test_prefer_season_pack_prefers_a_multi_season_pack_over_a_single_episode() -> None:
+    # A whole-season grab: no exact S02 pack, but an S01-S03 multi-season pack that
+    # covers S02 and a HIGHER-seeded single episode. The multi-season pack must win --
+    # it can satisfy the whole requested season, a single episode cannot. Before the
+    # fix multi_season_pack earned no scope bonus and the single episode's seeder edge
+    # made it the top grab.
+    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP", seeders=10)
+    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=500)
+    result = decide(
+        [multi, single],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+    assert result.accepted[0].candidate.title == "Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP"
 
 
 def test_prefer_season_pack_never_beats_a_higher_quality_release() -> None:

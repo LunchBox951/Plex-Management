@@ -122,6 +122,10 @@ async def _handle_failed(
         tmdb_id=event.tmdb_id,
         torrent_hash=event.torrent_hash,
         indexer=indexer,
+        # Scope by media namespace so this entry can't reject a movie/show that
+        # happens to share the tmdb id. A TV download is always season-scoped, so a
+        # non-NULL season identifies it as tv (else movie).
+        media_type="tv" if record is not None and record.season is not None else "movie",
     )
     if record is not None and record.media_request_id is not None:
         if record.season is not None:
@@ -271,6 +275,8 @@ async def mark_failed(
             tmdb_id=row.tmdb_id,
             torrent_hash=row.torrent_hash,
             indexer=indexer,
+            # Scope by media namespace (see _handle_failed) — season present => tv.
+            media_type="tv" if row.season is not None else "movie",
         )
 
     # Re-arm the owning request unconditionally — the blocklist flag governs ONLY

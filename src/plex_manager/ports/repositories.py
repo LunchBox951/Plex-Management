@@ -326,12 +326,19 @@ class BlocklistRepository(Protocol):
         torrent_hash: str | None,
         source_title: str,
         indexer: str | None,
+        media_type: str | None = None,
     ) -> bool:
-        """Two-tier identity check: hash first, then title/indexer fallback."""
+        """Two-tier identity check: hash first, then title/indexer fallback.
+
+        ``media_type`` scopes to one TMDB namespace (movie/tv share id spaces); see
+        ``SqlBlocklistRepository._media_type_scope``.
+        """
         raise NotImplementedError
 
-    async def list_for_media(self, tmdb_id: int | None = None) -> list[BlocklistRecord]:
-        """List blocklist entries, optionally scoped to one media item."""
+    async def list_for_media(
+        self, tmdb_id: int | None = None, media_type: str | None = None
+    ) -> list[BlocklistRecord]:
+        """List blocklist entries, optionally scoped to one media item + namespace."""
         raise NotImplementedError
 
     async def create(

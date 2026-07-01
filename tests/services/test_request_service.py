@@ -363,6 +363,45 @@ async def test_create_request_tv_all_seasons_in_library_dedups_to_existing(
     assert len(rows) == 1  # no duplicate available MediaRequest
 
 
+async def test_create_request_tv_collapses_racing_in_library_available_rows(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TV analogue of the movie F9 collapse: two racing creates whose seasons are
+    ALL already in Plex each insert a 'pending' row that ensure_seasons rolls to
+    terminal 'available' (outside the active-dedup index). The post-commit collapse
+    resolves the loser onto the winner, so exactly one available row survives."""
+    tmdb = FakeTmdb(shows={557: TvMetadata(tmdb_id=557, title="Done", year=2020, season_count=2)})
+    library = FakeLibrary(available_tv_seasons={557: frozenset({1})})
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=557, media_type="tv", seasons=[1], library=library
+        )
+
+    # Force the in-library dedup + the racing transaction to MISS the winner row, so
+    # the second create inserts a duplicate the active-dedup index cannot catch.
+    async def racing_find_in_library(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        return None
+
+    monkeypatch.setattr(SqlRequestRepository, "find_in_library", racing_find_in_library)
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(
+            session, tmdb, tmdb_id=557, media_type="tv", seasons=[1], library=library
+        )
+
+    assert second.id == first.id  # the race loser collapsed onto the winner
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 557)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].status is RequestStatus.available
+
+
 async def test_create_request_tv_whole_series_with_zero_aired_seasons_raises(
     sessionmaker_: SessionMaker,
 ) -> None:

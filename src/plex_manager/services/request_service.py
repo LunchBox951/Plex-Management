@@ -168,6 +168,31 @@ async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
         return False
 
 
+async def _collapse_available_race(
+    session: AsyncSession,
+    repo: SqlRequestRepository,
+    record: RequestRecord,
+    tmdb_id: int,
+    media_type: str,
+) -> RequestRecord:
+    """Collapse a concurrent in-library create race, returning the surviving record.
+
+    The active-dedup partial UNIQUE index excludes terminal ``available``, so two
+    ``POST /requests`` that both saw the title as already-in-Plex (neither committed
+    yet) can each insert a fresh ``available`` row with no IntegrityError backstop.
+    Once ours is committed, re-read the OLDEST ``available`` row for this media; if an
+    earlier one exists, THIS row is the race loser -> delete it and return the winner,
+    so the list/modal shows ONE row. Movie and TV share this (TV reaches ``available``
+    via the season rollup, the movie via the in-library short-circuit).
+    """
+    winner = await repo.find_earliest_available(tmdb_id, media_type)
+    if winner is not None and winner.id != record.id:
+        await repo.delete(record.id)
+        await session.commit()
+        return winner
+    return record
+
+
 async def _present_seasons_or_empty(library: LibraryPort, tmdb_id: int) -> frozenset[int]:
     """Best-effort per-season Plex presence; an error is an explicit, logged empty set.
 
@@ -332,6 +357,12 @@ async def create_request(
             # so the returned top-level status matches the seasons the response embeds
             # (e.g. all-already-in-Plex -> 'available', a mix -> 'partially_available').
             record = await repo.get(record.id) or record
+            if record.status == RequestStatus.available.value:
+                # All requested seasons were already in Plex -> terminal 'available'
+                # (outside the active-dedup index), so two racing creates can each
+                # leave an available row. Collapse to the oldest, same as the movie
+                # path below (which never runs for tv: its initial_status is pending).
+                record = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
     except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
         # race: the partial UNIQUE index over active statuses rejected this insert.
@@ -356,23 +387,12 @@ async def create_request(
             winner = await repo.get(winner.id) or winner
         return winner
     if initial_status == RequestStatus.available.value:
-        # Collapse the concurrent in-library race (F9). The active-dedup partial
-        # UNIQUE index excludes terminal 'available', so two POSTs that BOTH passed
-        # find_in_library above (neither had committed yet) can each insert a fresh
-        # 'available' row with NO IntegrityError backstop -> duplicate rows. Now that
-        # ours is committed, re-read the OLDEST available row for this media; if an
-        # earlier one exists, THIS row is the race loser -> delete it and return the
-        # winner, so the Requests list/modal shows ONE row.
-        #
-        # The remove-then-re-acquire flow is unaffected: when a movie was removed
-        # from Plex, _already_in_library() reads False and this whole short-circuit
-        # branch is skipped, so the (legitimate) SECOND available row produced by the
-        # normal pending -> download -> mark_available path is never reconciled away.
-        winner = await repo.find_earliest_available(tmdb_id, media_type)
-        if winner is not None and winner.id != record.id:
-            await repo.delete(record.id)
-            await session.commit()
-            return winner
+        # Collapse the concurrent movie in-library race (F9) via the shared helper.
+        # The remove-then-re-acquire flow is unaffected: when a movie was removed from
+        # Plex, _already_in_library() reads False and this branch is skipped, so the
+        # legitimate SECOND available row from the normal pending -> download ->
+        # mark_available path is never reconciled away.
+        record = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
     return record
 
 
