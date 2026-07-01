@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from plex_manager.adapters.filesystem import LocalFileSystem
+from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
 
 
 def test_available_bytes_is_positive(tmp_path: Path) -> None:
@@ -300,3 +300,121 @@ def test_list_video_files_allows_symlinked_downloads_parent(tmp_path: Path) -> N
     assert Path(abs_path) == (release / "Show.S01E01.mkv").resolve()
     assert size == 1000
     assert rel == os.path.join("Season 01", "Show.S01E01.mkv")
+
+
+# --------------------------------------------------------------------------- #
+# delete — root-guarded eviction removal (ADR-0012)
+# --------------------------------------------------------------------------- #
+def test_delete_removes_file_within_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    target = root / "Some Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(target))
+
+    assert not target.exists()
+
+
+def test_delete_removes_directory_tree_within_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "tv"
+    root.mkdir()
+    season_dir = root / "Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (season_dir / "Show.S01E02.mkv").write_bytes(b"x" * 200)
+
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(season_dir))
+
+    assert not season_dir.exists()
+    assert (root / "Show").exists()  # only the season dir is removed, not its parent
+
+
+def test_delete_missing_path_is_a_noop(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    already_gone = root / "Removed Movie" / "movie.mkv"
+
+    # Must not raise: a retried eviction (or a breadcrumb pointing at something
+    # already removed out-of-band) is idempotent, not a failure.
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(already_gone))
+
+
+def test_delete_raises_when_no_root_is_configured(tmp_path: Path) -> None:
+    target = tmp_path / "movie.mkv"
+    target.write_bytes(b"x" * 10)
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem().delete(os.fspath(target))
+
+    assert target.exists()  # refused, never deleted
+
+
+def test_delete_raises_for_path_outside_every_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside = tmp_path / "outside" / "movie.mkv"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x" * 10)
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem([os.fspath(root)]).delete(os.fspath(outside))
+
+    assert outside.exists()  # refused, never deleted
+
+
+def test_delete_raises_for_missing_path_outside_every_configured_root(tmp_path: Path) -> None:
+    # A path outside every root is refused REGARDLESS of whether it exists -- a
+    # caller bug (wrong/misconfigured breadcrumb) must be surfaced loudly, never
+    # swallowed as a harmless no-op just because there happens to be nothing there.
+    root = tmp_path / "movies"
+    root.mkdir()
+    missing_outside = tmp_path / "outside" / "movie.mkv"
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem([os.fspath(root)]).delete(os.fspath(missing_outside))
+
+
+def test_delete_rejects_symlink_escaping_the_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.mkv"
+    secret.write_bytes(b"x" * 10)
+    # A symlink INSIDE the configured root that points OUTSIDE it -- the realpath
+    # containment check must catch this even though the nominal path is textually
+    # under the root, mirroring the symlink-escape guard the import scan uses.
+    escaping_link = root / "escape.mkv"
+    os.symlink(secret, escaping_link)
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem([os.fspath(root)]).delete(os.fspath(escaping_link))
+
+    assert secret.exists()  # the real target outside the root is untouched
+
+
+def test_delete_works_across_multiple_configured_roots(tmp_path: Path) -> None:
+    movies_root = tmp_path / "movies"
+    tv_root = tmp_path / "tv"
+    movies_root.mkdir()
+    tv_root.mkdir()
+    movie = movies_root / "movie.mkv"
+    movie.write_bytes(b"x" * 10)
+    episode = tv_root / "Show" / "episode.mkv"
+    episode.parent.mkdir(parents=True)
+    episode.write_bytes(b"x" * 10)
+
+    fs = LocalFileSystem([os.fspath(movies_root), os.fspath(tv_root)])
+    fs.delete(os.fspath(movie))
+    fs.delete(os.fspath(episode.parent))
+
+    assert not movie.exists()
+    assert not episode.parent.exists()
+
+
+def test_adapter_delete_conforms_to_filesystem_port() -> None:
+    from plex_manager.ports.filesystem import FileSystemPort
+
+    assert isinstance(LocalFileSystem(), FileSystemPort)
