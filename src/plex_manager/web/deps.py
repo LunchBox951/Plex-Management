@@ -22,6 +22,7 @@ Wiring rules:
 from __future__ import annotations
 
 import hmac
+import ipaddress
 from typing import Annotated
 
 import httpx
@@ -277,9 +278,30 @@ def _configured_setup_token() -> str | None:
     return value or None
 
 
-def is_setup_token_required() -> bool:
-    """Whether this process requires ``X-Setup-Token`` before initialization."""
-    return _configured_setup_token() is not None
+def _is_loopback_client(request: Request) -> bool:
+    """True when the request comes from the local host."""
+    host = request.client.host if request.client is not None else None
+    if host is None:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def is_setup_token_required(request: Request | None = None) -> bool:
+    """Whether this request requires ``X-Setup-Token`` before initialization."""
+    if _configured_setup_token() is not None:
+        return True
+    return request is not None and not _is_loopback_client(request)
+
+
+def _pre_init_setup_token_valid(request: Request) -> bool:
+    expected_setup_token = _configured_setup_token()
+    if expected_setup_token is None and _is_loopback_client(request):
+        return True
+    provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
+    return _api_key_matches(provided_setup_token, expected_setup_token)
 
 
 async def require_api_key(
@@ -322,11 +344,7 @@ async def require_pre_init_or_api_key(
     if system is None or not system.initialized:
         if get_settings().dev_auth_bypass:
             return
-        expected_setup_token = _configured_setup_token()
-        if expected_setup_token is None:
-            return
-        provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
-        if not _api_key_matches(provided_setup_token, expected_setup_token):
+        if not _pre_init_setup_token_valid(request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token"
             )
@@ -348,11 +366,7 @@ async def require_setup_token_pre_init(
         return
     if get_settings().dev_auth_bypass:
         return
-    expected_setup_token = _configured_setup_token()
-    if expected_setup_token is None:
-        return
-    provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
-    if not _api_key_matches(provided_setup_token, expected_setup_token):
+    if not _pre_init_setup_token_valid(request):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token")
 
 

@@ -1830,6 +1830,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Existing matching request"
+          },
           "201": {
             "content": {
               "application/json": {

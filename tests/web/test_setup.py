@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -49,6 +50,17 @@ async def test_status_reports_setup_token_requirement(
     assert body["setup_token_required"] is True
 
 
+async def test_status_reports_setup_token_requirement_for_remote_pre_init(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.get("/api/v1/setup/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["initialized"] is False
+    assert body["setup_token_required"] is True
+
+
 async def test_complete_requires_configured_setup_token_pre_init(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -75,6 +87,15 @@ async def test_complete_requires_configured_setup_token_pre_init(
     )
     assert ok.status_code == 200
     assert ok.json()["initialized"] is True
+
+
+async def test_complete_rejects_remote_client_without_setup_token(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
 
 
 async def test_complete_flips_initialized_and_issues_key(client: httpx.AsyncClient) -> None:

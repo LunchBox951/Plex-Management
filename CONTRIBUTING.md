@@ -6,6 +6,7 @@ standard. This guide covers the dev workflow.
 ## Prerequisites
 
 - Python **3.12+**
+- Node.js **22+** with npm
 - Docker (for building/running the container)
 - `make` (optional, for the shortcuts below)
 
@@ -13,9 +14,11 @@ standard. This guide covers the dev workflow.
 
 ```bash
 make install      # creates editable install with dev extras + installs pre-commit
+make ui-install   # installs frontend dependencies used by make check
 # equivalent to:
 #   pip install -e ".[dev]"
 #   pre-commit install
+#   npm --prefix frontend ci
 ```
 
 ## Day-to-day
@@ -25,7 +28,7 @@ make lint     # ruff check
 make format   # ruff format
 make type     # pyright (strict)
 make test     # pytest + coverage
-make check    # all of the above — run this before pushing
+make check    # backend + frontend gates — run this before pushing
 make run      # run the app locally (http://localhost:8000)
 ```
 

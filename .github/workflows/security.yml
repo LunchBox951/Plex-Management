@@ -31,9 +31,20 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - name: Install shipped runtime dependencies
         run: pip install -e ".[postgres]"
       - name: Audit dependencies for known vulnerabilities
         run: |
           pip install pip-audit
           pip-audit
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Audit shipped frontend dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high

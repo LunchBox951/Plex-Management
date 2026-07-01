@@ -106,6 +106,23 @@ async def test_validate_requires_configured_setup_token_pre_init(
     assert outbound == ["/3/search/multi"]
 
 
+async def test_validate_requires_setup_token_from_remote_pre_init(app: FastAPI) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
 async def test_validate_prowlarr_ok(client: httpx.AsyncClient, app: FastAPI) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/system/status"
