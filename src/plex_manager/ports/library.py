@@ -30,7 +30,12 @@ class LibraryPort(Protocol):
     """Query availability, trigger scans, and list sections on the media server."""
 
     async def is_available(
-        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        use_cache: bool = True,
+        season: int | None = None,
     ) -> bool:
         """Return whether the item is already present in the library.
 
@@ -38,11 +43,36 @@ class LibraryPort(Protocol):
         cached-presence fast path. The request-dedup path passes it so a title just
         REMOVED from the library is seen as absent immediately, instead of a stale
         "present" answer held for the cache TTL.
+
+        ``season`` (TV only) scopes the lookup to a single season: present means
+        that season's ``leafCount>0`` on the show in Plex, the per-season
+        availability granularity used by the TV beta (per-episode completeness is
+        a deferred follow-up). Ignored for movies and for a whole-show TV check
+        (``season=None``).
         """
         raise NotImplementedError
 
-    async def trigger_scan(self, path: str) -> None:
-        """Ask the media server to scan ``path`` (partial-scan when supported)."""
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Return the season numbers already present for a show, from ONE library read.
+
+        A season is "present" when it has at least one episode indexed
+        (``leafCount>0``) — the same per-season granularity as :meth:`is_available`
+        with a ``season``. Provided ALONGSIDE ``is_available`` so a caller checking
+        many seasons of one show (``season_request_service.ensure_seasons``) pays a
+        SINGLE library crawl instead of one per season. Always reflects the library
+        as it is NOW (like ``is_available(use_cache=False)`` — never trusts a cached
+        absence); empty when the show is absent or has no indexed season.
+        """
+        raise NotImplementedError
+
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+        """Ask the media server to scan ``path`` (partial-scan when supported).
+
+        ``media_type`` scopes which library sections are candidates for the
+        ``path``-prefix match (movie sections for movies, show sections for TV),
+        so a TV season folder is never matched against a movie section (or vice
+        versa) and the full-refresh fallback stays scoped to the relevant kind.
+        """
 
     async def list_sections(self) -> list[LibrarySection]:
         """Return the configured library sections."""

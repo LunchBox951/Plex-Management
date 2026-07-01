@@ -30,6 +30,7 @@ from plex_manager.domain.quality import (
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.source_mapping import (
+    _coerce_episode,  # pyright: ignore[reportPrivateUsage]
     map_modifier,
     map_source,
     resolve_quality,
@@ -280,6 +281,63 @@ def test_map_modifier_does_not_fire_on_clean_titles() -> None:
 
 
 # -- resolve_quality conservative source-only fallback (no over-promotion) ------
+
+
+# -- _coerce_episode: mirrors _coerce_season exactly ----------------------------
+
+
+def test_coerce_episode_single_int() -> None:
+    assert _coerce_episode(5) == 5
+
+
+def test_coerce_episode_list_of_ints() -> None:
+    assert _coerce_episode([5, 6]) == [5, 6]
+
+
+def test_coerce_episode_none_when_absent() -> None:
+    assert _coerce_episode(None) is None
+
+
+def test_coerce_episode_bool_excluded() -> None:
+    # bool is an int subclass; must not be misread as episode 0/1.
+    assert _coerce_episode(True) is None
+    assert _coerce_episode(False) is None
+
+
+def test_coerce_episode_filters_non_int_list_members() -> None:
+    assert _coerce_episode([5, "x", None, 6]) == [5, 6]
+
+
+def test_coerce_episode_empty_list_collapses_to_none() -> None:
+    assert _coerce_episode([]) is None
+    assert _coerce_episode(["x"]) is None
+
+
+def test_coerce_episode_wired_into_to_parsed_release() -> None:
+    parsed = to_parsed_release(
+        {"title": "Show", "season": 2, "episode": 5},
+        "Show.S02E05.1080p.WEB-DL.x264-GROUP",
+    )
+    assert parsed.season == 2
+    assert parsed.episode == 5
+
+
+def test_coerce_episode_multi_episode_wired_into_to_parsed_release() -> None:
+    parsed = to_parsed_release(
+        {"title": "Show", "season": 2, "episode": [5, 6]},
+        "Show.S02E05E06.1080p.WEB-DL.x264-GROUP",
+    )
+    assert parsed.episode == [5, 6]
+
+
+def test_coerce_episode_absent_for_season_pack() -> None:
+    # A whole-season pack carries no ``episode`` field at all.
+    parsed = to_parsed_release(
+        {"title": "Show", "season": 2},
+        "Show.S02.1080p.WEB-DL.x264-GROUP",
+    )
+    assert parsed.season == 2
+    assert parsed.episode is None
 
 
 def test_resolve_quality_source_only_fallback_does_not_over_promote() -> None:

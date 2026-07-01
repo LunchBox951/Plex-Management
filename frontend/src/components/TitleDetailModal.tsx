@@ -10,12 +10,14 @@ import {
 } from '../api/hooks'
 import type {
   AcceptedRelease,
+  CreateRequestBody,
   DiscoverResult,
   GrabRequest,
   QueueItem,
   RequestResponse,
   SearchPreviewRequest,
   SearchPreviewResponse,
+  SeasonStatus,
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { requestStatus, type StatusPresentation } from '../lib/status'
@@ -55,9 +57,49 @@ type DerivedState =
   | { kind: 'failed' }
   | { kind: 'unknown'; status: string }
 
-function deriveState(request: RequestResponse | null, optimistic: boolean): DerivedState {
-  if (!request) return optimistic ? { kind: 'pending' } : { kind: 'none' }
-  switch (request.status) {
+/**
+ * The status that actually drives the action zone. For a movie ``season`` is
+ * always ``null`` and this is just ``request.status`` (unchanged). For a tv
+ * request it is the ONE selected season's own status (``request.seasons`` never
+ * carries ``partially_available`` — that string only ever exists as the
+ * show-level rollup fold of per-season statuses, see
+ * `domain.season_rollup.rollup_status`) so a show with season 1 available and
+ * season 2 still downloading shows season 2's real 'downloading' state rather
+ * than the rollup. Falls back to ``request.status`` when the season isn't
+ * (yet) a tracked row — e.g. the instant after create, before the season list
+ * has loaded.
+ */
+function seasonStatusFor(request: RequestResponse, season: number | null): string {
+  if (season == null) return request.status
+  return request.seasons?.find((s) => s.season_number === season)?.status ?? request.status
+}
+
+/** The first non-terminal tracked season, else the first tracked season. */
+function firstActionableSeason(seasons: SeasonStatus[] | null): number | null {
+  if (!seasons || seasons.length === 0) return null
+  const active = seasons.find((s) => isGrabbableStatus(s.status))
+  return (active ?? seasons[0])!.season_number
+}
+
+/**
+ * The season driving search/grab/view, resolved against a GIVEN season list: the
+ * operator's explicit pick wins as long as it is still tracked in that list (or
+ * nothing is tracked yet); otherwise the first actionable tracked season, else
+ * season 1. Pulled out so `onRequest` can resolve against the BRAND NEW
+ * `created.seasons` the instant a request is created, rather than the stale
+ * `effectiveSeasons` from the render that preceded it — `activeSeason` predates the
+ * request and was never judged against seasons that didn't exist yet.
+ */
+function resolveSeason(seasons: SeasonStatus[] | null, activeSeason: number | null): number {
+  if (activeSeason != null && (seasons == null || seasons.some((s) => s.season_number === activeSeason))) {
+    return activeSeason
+  }
+  return firstActionableSeason(seasons) ?? 1
+}
+
+function deriveState(status: string | null, optimistic: boolean): DerivedState {
+  if (status == null) return optimistic ? { kind: 'pending' } : { kind: 'none' }
+  switch (status) {
     case 'pending':
       return { kind: 'pending' }
     case 'searching':
@@ -75,7 +117,7 @@ function deriveState(request: RequestResponse | null, optimistic: boolean): Deri
     case 'failed':
       return { kind: 'failed' }
     default:
-      return { kind: 'unknown', status: request.status }
+      return { kind: 'unknown', status }
   }
 }
 
@@ -89,6 +131,23 @@ function deriveState(request: RequestResponse | null, optimistic: boolean): Deri
  */
 function isGrabbableStatus(status: string): boolean {
   return status !== 'available' && status !== 'completed' && status !== 'failed'
+}
+
+/**
+ * Whether the Grab button should be live for the SELECTED season (or, for a movie,
+ * the request itself). A season is grabbable when its own status is non-terminal —
+ * OR when it is `failed` but the PARENT request is still non-terminal. The backend
+ * gates /queue/grab on the parent, so a failed season under an active (e.g.
+ * `partially_available`) show can be re-searched from the UI; without this it would
+ * dead-end into "Request again", which dedups straight back to the same failed
+ * season (an active show is never re-created), leaving the user unable to retry it.
+ * A movie (`season == null` → `seasonStatusFor` returns `request.status`) never
+ * enters the failed branch: its failed status equals the parent's terminal one.
+ */
+function isSeasonGrabbable(request: RequestResponse, season: number | null): boolean {
+  const seasonStatus = seasonStatusFor(request, season)
+  if (isGrabbableStatus(seasonStatus)) return true
+  return season != null && seasonStatus === 'failed' && isGrabbableStatus(request.status)
 }
 
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
@@ -119,6 +178,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // the id because POST /requests can return a TERMINAL row, and Grab must not arm
   // for it in the window before the /requests poll reveals the live status.
   const [createdGrabbable, setCreatedGrabbable] = useState(false)
+  // tv only: the just-created request's own per-season rollup, shown before the
+  // next /requests poll lands — mirrors `createdGrabbable`'s create-then-poll gap.
+  const [createdSeasons, setCreatedSeasons] = useState<SeasonStatus[] | null>(null)
+  // tv only, read at Request time: track the whole aired series (default) or just
+  // the one season named below. Irrelevant once a request exists.
+  const [wholeSeries, setWholeSeries] = useState(true)
+  // tv only: the season the operator explicitly picked (to search/grab/view).
+  // `null` until they touch the control — `currentSeason` below resolves the
+  // real default (the first actionable tracked season, else 1).
+  const [activeSeason, setActiveSeason] = useState<number | null>(null)
   const [preview, setPreview] = useState<SearchPreviewResponse | null>(null)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
   // The confirm dialog for "report a problem"; carries the download to re-arm.
@@ -135,6 +204,9 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   useEffect(() => {
     setRequestId(null)
     setCreatedGrabbable(false)
+    setCreatedSeasons(null)
+    setWholeSeries(true)
+    setActiveSeason(null)
     setPreview(null)
     setGrabbingGuid(null)
     setReportFor(null)
@@ -157,11 +229,32 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // for preview + queue correlation (a terminal request still owns its old download).
   const effectiveRequestId = requestId ?? liveRequest?.id ?? null
 
+  // tv only: this show's per-season rollup — the live poll once it lands, else the
+  // just-created request's own list (the same create-then-poll gap as
+  // `effectiveRequestId`). `null` for a movie, and for a tv title with no request
+  // yet (nothing tracked to enumerate).
+  const effectiveSeasons: SeasonStatus[] | null =
+    title?.media_type === 'tv'
+      ? requestId !== null && liveRequest === null
+        ? createdSeasons
+        : (liveRequest?.seasons ?? null)
+      : null
+
+  // The season driving search/grab/view. The operator's explicit pick wins as long
+  // as it is still a tracked season (or none are known yet, pre-request); otherwise
+  // the first actionable tracked season, else season 1 — the sane default before
+  // any season is tracked at all. Always `null` for a movie.
+  const currentSeason: number | null =
+    title?.media_type !== 'tv' ? null : resolveSeason(effectiveSeasons, activeSeason)
+
   // Grabbing needs a NON-terminal request: the backend rejects a terminal request id
   // in /queue/grab (request_not_active). A just-created request that came back active,
   // or the live one while still active, qualifies; a failed/available/completed one
   // does not — for those the user must "Request again" (a fresh request) before grabbing.
-  const liveRequestGrabbable = liveRequest != null && isGrabbableStatus(liveRequest.status)
+  // For tv this is judged against the SELECTED season's own status, never the
+  // show-level rollup (`seasonStatusFor`) — `currentSeason` is `null` for a movie,
+  // so this is byte-identical to the movie-only check it replaces.
+  const liveRequestGrabbable = liveRequest != null && isSeasonGrabbable(liveRequest, currentSeason)
   // Prefer the just-created request (it shows before the next poll lands), but only
   // while it is grabbable AND the live request (once the poll has landed) has not since
   // gone terminal; otherwise fall through to the live request, itself gated on a
@@ -174,22 +267,34 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         : null
 
   // The matching download. Prefer the request linkage (collision-free); fall back
-  // to tmdb_id only when no request is known yet.
+  // to tmdb_id only when no request is known yet. For tv, a show can have MULTIPLE
+  // concurrent per-season downloads (season 1 and season 2 grab independently), so
+  // also match the currently-selected season — otherwise a sibling season's
+  // download would shadow the one the operator is looking at. Movies never carry a
+  // season, so this filter is a no-op for them (unchanged behaviour).
   const queueItem = useMemo<QueueItem | null>(() => {
     if (!title) return null
     const items = queueQuery.data?.queue ?? []
-    const matches = items.filter((q) =>
-      effectiveRequestId !== null
-        ? q.media_request_id === effectiveRequestId
-        : q.tmdb_id === title.tmdb_id,
-    )
+    const matches = items.filter((q) => {
+      if (effectiveRequestId === null) return q.tmdb_id === title.tmdb_id
+      if (q.media_request_id !== effectiveRequestId) return false
+      return title.media_type === 'tv' ? q.season === currentSeason : true
+    })
     return matches.length > 0 ? matches[matches.length - 1]! : null
-  }, [queueQuery.data, title, effectiveRequestId])
+  }, [queueQuery.data, title, effectiveRequestId, currentSeason])
 
-  const state = deriveState(liveRequest, requestId !== null)
+  const state = deriveState(
+    liveRequest ? seasonStatusFor(liveRequest, currentSeason) : null,
+    requestId !== null,
+  )
 
   const runPreview = useCallback(
-    async (forRequestId: number | null) => {
+    // `seasonOverride` lets a caller preview a season that hasn't made it into
+    // `currentSeason` yet — namely `onRequest`, which must search the season the
+    // BRAND NEW create resolved to, not the one `currentSeason` still reads at
+    // click time (see onRequest below). Omitted (not merely `null`), it falls back
+    // to `currentSeason` — every other caller's behaviour is unchanged.
+    async (forRequestId: number | null, seasonOverride?: number | null) => {
       if (!title) return
       const startedKey = `${title.media_type}:${title.tmdb_id}`
       const body: SearchPreviewRequest =
@@ -198,6 +303,13 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           : { tmdb_id: title.tmdb_id, media_type: title.media_type, title: title.title }
       if (forRequestId === null && typeof title.year === 'number') {
         body.year = title.year
+      }
+      const season = seasonOverride !== undefined ? seasonOverride : currentSeason
+      // tv only: search/grab is always per-season, so a concrete season is threaded
+      // whenever one is known — `season` is `null` for a movie, so this is a
+      // no-op there (the field stays entirely absent, same payload as before).
+      if (title.media_type === 'tv' && season != null) {
+        body.season = season
       }
       try {
         const result = await searchPreview.mutateAsync(body)
@@ -208,7 +320,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         toast({ title: 'Search failed', description: asApiError(error).message, intent: 'error' })
       }
     },
-    [title, searchPreview, toast],
+    [title, searchPreview, toast, currentSeason],
   )
 
   const onRequest = useCallback(async () => {
@@ -216,22 +328,50 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     const startedKey = `${title.media_type}:${title.tmdb_id}`
     const titleName = title.title
     try {
-      const created = await createRequest.mutateAsync({
-        tmdb_id: title.tmdb_id,
-        media_type: title.media_type,
-      })
+      const body: CreateRequestBody = { tmdb_id: title.tmdb_id, media_type: title.media_type }
+      // tv only: naming a single season narrows CreateRequestBody.seasons; leaving
+      // "whole series" checked (the default) omits it entirely, which the backend
+      // reads as "track every aired season" (request_service._season_numbers).
+      // Movies never set this field — identical payload to before.
+      //
+      // A title that ALREADY has tracked seasons hides the "whole series" checkbox
+      // (the season PICKER drives selection instead), so `wholeSeries` is stale-true
+      // there: a "Request again" for a failed S2 must scope to the SELECTED season,
+      // not silently re-request the whole show. Only the pre-request flow (no tracked
+      // seasons yet, checkbox visible) honours `wholeSeries`.
+      if (title.media_type === 'tv') {
+        const hasTrackedSeasons = (effectiveSeasons?.length ?? 0) > 0
+        if (hasTrackedSeasons || !wholeSeries) {
+          body.seasons = [currentSeason ?? 1]
+        }
+      }
+      const created = await createRequest.mutateAsync(body)
       if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
       setRequestId(created.id)
+      setCreatedSeasons(created.seasons ?? null)
+      // tv only: resolve the season against `created.seasons` — the BRAND NEW list —
+      // rather than `currentSeason`, which still reflects the season list from
+      // BEFORE this request existed. For a whole-series request that's `null`
+      // (nothing tracked yet), so `currentSeason` defaults to season 1; but
+      // `created.seasons` can already have season 1 terminal (already in Plex) and
+      // resolve to season 2. Judging the create against the wrong season would arm
+      // Grab off S1's status while the selector (next render) shows S2, and would
+      // preview S1's releases under an S2 selector — exactly the bug this guards.
+      // Always `null` for a movie, byte-identical to the `currentSeason` it replaces.
+      const resolvedSeason =
+        title.media_type === 'tv' ? resolveSeason(created.seasons ?? null, activeSeason) : null
       // A terminal create (Plex already has the title, or a reused completed/failed
       // request) must not arm Grab — gate on the returned status, not just the id.
-      setCreatedGrabbable(isGrabbableStatus(created.status))
+      // For tv this is the SELECTED (resolved) season's own status (`created.seasons`
+      // is now populated), never the show-level rollup.
+      setCreatedGrabbable(isSeasonGrabbable(created, resolvedSeason))
       toast({ title: `Requested ${titleName}`, intent: 'success' })
-      await runPreview(created.id)
+      await runPreview(created.id, resolvedSeason)
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview])
+  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons])
 
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
@@ -241,6 +381,11 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       // be shared across indexers and the backend matches it BEFORE guid, so
       // including it could grab a different release that shares the hash.
       const body: GrabRequest = { request_id: grabRequestId, guid: release.guid }
+      // tv only: scope the grab (and the stored Download) to the selected season —
+      // `currentSeason` is `null` for a movie, so this stays absent there.
+      if (title?.media_type === 'tv' && currentSeason != null) {
+        body.season = currentSeason
+      }
       setGrabbingGuid(release.guid)
       try {
         await grab.mutateAsync(body)
@@ -255,7 +400,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         setGrabbingGuid(null)
       }
     },
-    [grabRequestId, grab, toast],
+    [grabRequestId, grab, toast, title, currentSeason],
   )
 
   // Blocklist the bad release and re-arm the request to search again. Mirrors the
@@ -296,6 +441,61 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
+
+  // tv only: before any request exists, let the operator name a single season (and
+  // whether to track just it or the whole series); once seasons are tracked,
+  // enumerate them in a picker that also drives which one is searched/grabbed/shown.
+  const seasonSelector: ReactNode =
+    title.media_type !== 'tv' ? null : effectiveSeasons && effectiveSeasons.length > 0 ? (
+      <div className="mt-3 flex items-center gap-2">
+        <label htmlFor="season-select" className="font-mono text-xs text-faint">
+          Season
+        </label>
+        <select
+          id="season-select"
+          className="h-8 rounded-lg bg-bg px-2 text-xs text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+          value={currentSeason ?? ''}
+          onChange={(e) => {
+            setActiveSeason(Number(e.target.value))
+            // Drop the previewed releases from the OLD season: they belong to a
+            // different scope, and grabbing one now would send the newly selected
+            // season and 404 (release_not_found) or grab under the wrong context.
+            // The operator re-searches for the newly selected season.
+            setPreview(null)
+          }}
+        >
+          {effectiveSeasons.map((s) => (
+            <option key={s.season_number} value={s.season_number}>
+              Season {s.season_number} — {requestStatus(s.status).label}
+            </option>
+          ))}
+        </select>
+      </div>
+    ) : state.kind === 'none' ? (
+      <div className="mt-3 flex flex-wrap items-center gap-4">
+        <label className="flex items-center gap-2 text-xs text-muted">
+          <input
+            type="checkbox"
+            checked={wholeSeries}
+            onChange={(e) => setWholeSeries(e.target.checked)}
+          />
+          Whole series
+        </label>
+        <label className="flex items-center gap-2 text-xs text-muted">
+          Season
+          <input
+            type="number"
+            min={1}
+            aria-label="Season to search"
+            className="h-8 w-16 rounded-lg bg-bg px-2 text-xs text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+            value={currentSeason ?? 1}
+            onChange={(e) =>
+              setActiveSeason(Math.max(1, Number.parseInt(e.target.value, 10) || 1))
+            }
+          />
+        </label>
+      </div>
+    ) : null
 
   // For a settled (failed/available) title, grabbing a release needs a FRESH request
   // (the old id is terminal) — onRequest creates one, then previews.
@@ -486,6 +686,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
                 {title.overview}
               </p>
             ) : null}
+            {seasonSelector}
             <div className="mt-4">{actionZone}</div>
           </div>
         </div>

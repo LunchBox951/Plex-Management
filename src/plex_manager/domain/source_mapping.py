@@ -319,6 +319,30 @@ def _coerce_season(value: object) -> int | list[int] | None:
     return None
 
 
+def _coerce_episode(value: object) -> int | list[int] | None:
+    """Normalize guessit's ``episode`` field to ``int`` | ``list[int]`` | ``None``.
+
+    Mirrors :func:`_coerce_season` exactly: guessit yields a single ``int`` for
+    ``SxxExx`` and a ``list[int]`` for a multi-episode file (``S02E05E06``). A
+    whole season pack has no ``episode`` field at all -> ``None``, which is what
+    :func:`plex_manager.domain.season_pack.classify_release_scope` reads to tell a
+    season pack from a single/multi-episode file. ``bool`` is excluded (it
+    subclasses ``int``); a list is filtered to its ``int`` members and collapsed to
+    ``None`` when empty.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        sequence = cast("list[object] | tuple[object, ...]", value)
+        episodes = [
+            item for item in sequence if isinstance(item, int) and not isinstance(item, bool)
+        ]
+        return episodes or None
+    return None
+
+
 def to_parsed_release(fields: Mapping[str, object], raw_title: str) -> ParsedRelease:
     """Assemble a :class:`ParsedRelease` from a guessit field mapping + raw title."""
     source, resolution, modifier, revision = map_fields(fields, raw_title)
@@ -328,6 +352,7 @@ def to_parsed_release(fields: Mapping[str, object], raw_title: str) -> ParsedRel
         clean_title=clean_title,
         year=_coerce_year(fields.get("year")),
         season=_coerce_season(fields.get("season")),
+        episode=_coerce_episode(fields.get("episode")),
         source=source,
         resolution=resolution,
         modifier=modifier,

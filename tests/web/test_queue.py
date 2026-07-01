@@ -13,15 +13,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.release import CandidateRelease
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
     MediaRequest,
+    MediaType,
     RequestStatus,
+    SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadStatus
-from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from tests.web.fakes import (
@@ -229,6 +232,58 @@ async def test_grab_no_acceptable_release_marks_request(
     assert request.status.value == "no_acceptable_release"
 
 
+async def test_grab_no_acceptable_release_marks_the_season_not_the_show(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A TV grab that finds nothing acceptable records the dead-end on the SEASON
+    (a visible, retryable SeasonRequest.no_acceptable_release), while the parent
+    MediaRequest.status stays a computed rollup — never a direct write. The season
+    service is flush-only, so the endpoint owns the commit; without it the season
+    write would be silently rolled back."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={901: TvMetadata(tmdb_id=901, title="Dead End Show", year=2021, season_count=3)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 901, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = int(created.json()["id"])
+
+    # Only prerelease/CAM-grade candidates come back, so nothing is acceptable.
+    override_adapters(
+        app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=FakeQbittorrent()
+    )
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_acceptable_release"
+
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        ).scalar_one()
+        # The SEASON carries the honest dead-end (committed, not rolled back).
+        assert season.status.value == "no_acceptable_release"
+        # And the parent rolls up to match (single requested season).
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status.value == "no_acceptable_release"
+
+
 async def test_grab_recovers_from_concurrent_insert_conflict(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -260,6 +315,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        episodes: list[int] | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -653,6 +709,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        episodes: list[int] | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -710,15 +767,254 @@ async def test_queue_requires_api_key(
     assert response.status_code == 401
 
 
-async def test_import_endpoint_requires_movies_root(
+async def test_import_endpoint_no_upfront_409_for_unset_root_nonexistent_download(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
-    # The operator import-retry needs Plex + the Movies root configured. With the
-    # root unset it is an honest 409 service_not_configured, never a crash.
+    # Neither root is configured, and download id 1 doesn't exist: with the roots
+    # now OPTIONAL dependencies (no upfront 409 the way the required Plex/qBittorrent
+    # deps still 409), the endpoint reaches import_download, which honestly reports
+    # 404 download_not_found rather than an unrelated service_not_configured.
     await seed(initialized=True, app_api_key=_API_KEY)
     override_adapters(app, qbt=FakeQbittorrent(), library=FakeLibrary())
     response = await client.post("/api/v1/queue/1/import", headers=_HEADERS)
-    assert response.status_code == 409
+    assert response.status_code == 404
+    assert response.json()["detail"] == "download_not_found"
+
+
+async def _insert_movie_download(sm: SessionMaker) -> tuple[int, int]:
+    """Insert a movie request + an ImportPending download; (download_id, request_id)."""
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash="a" * 40,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=603,
+            year=2020,
+        )
+        session.add(download)
+        await session.commit()
+        return download.id, request.id
+
+
+async def _insert_tv_download(sm: SessionMaker, *, season: int = 1) -> tuple[int, int]:
+    """Insert a tv request + one tracked season + an ImportPending download."""
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=900,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=request.id, season_number=season, status="downloading")
+        )
+        download = Download(
+            torrent_hash="b" * 40,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=900,
+            year=2020,
+            season=season,
+        )
+        session.add(download)
+        await session.commit()
+        return download.id, request.id
+
+
+async def test_import_endpoint_movies_root_unset_is_an_honest_block_not_a_409(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # movies_root is unset (never configured via PUT /settings); Plex + qBittorrent
+    # ARE configured. The endpoint still runs (no upfront 409) and reports the
+    # honest, retryable ImportBlocked as a normal 200 -- the correction-without-a
+    # -terminal button, not a dead end.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id, _request_id = await _insert_movie_download(sessionmaker_)
+    override_adapters(app, qbt=FakeQbittorrent(), library=FakeLibrary())
+
+    response = await client.post(f"/api/v1/queue/{download_id}/import", headers=_HEADERS)
+    assert response.status_code == 200
     body = response.json()
-    assert body["detail"] == "service_not_configured"
-    assert body["service"] == "movies_root"
+    assert body["status"] == "import_blocked"
+    assert body["failed_reason"] == "movies library root is not configured"
+
+
+async def test_import_endpoint_tv_root_unset_is_an_honest_block_not_a_409(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Symmetric to the movies-side case: tv_root is unset, movies_root may or may
+    # not be -- either way a tv download gets its OWN honest block, never a crash
+    # and never gated on the OTHER root.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id, _request_id = await _insert_tv_download(sessionmaker_)
+    override_adapters(app, qbt=FakeQbittorrent(), library=FakeLibrary())
+
+    response = await client.post(f"/api/v1/queue/{download_id}/import", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "import_blocked"
+    assert body["failed_reason"] == "tv library root is not configured"
+    assert body["season"] == 1
+
+
+async def test_grab_threads_season_and_episodes_into_search_and_queue_item(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """A TV grab scoped to specific episode(s) threads BOTH season and episodes:
+    into the indexer search (a single named episode narrows the search itself)
+    and onto the persisted ``QueueItem``, so the queue can render "S02E05"."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S02E05.1080p.WEB-DL.x264-GROUP", info_hash="5" * 40)]
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=prowlarr, qbt=qbt)
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2, "episodes": [5]},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["season"] == 2
+    assert body["episodes"] == [5]
+
+    # The indexer search itself was narrowed to the single named episode.
+    assert prowlarr.searched[-1].season == 2
+    assert prowlarr.searched[-1].episode == "5"
+
+
+async def test_grab_tv_without_season_rejected_422_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """F1: a tv request grabbed with NO season is rejected up front (422), BEFORE
+    run_preview even runs an unscoped search -- no Download row, no SeasonRequest
+    spuriously created, the parent's computed rollup status is untouched, and
+    NOTHING is handed to qBittorrent (an unscoped tv grab would otherwise update
+    the parent MediaRequest directly instead of a SeasonRequest, corrupting the
+    computed-rollup invariant, and the importer would later block it as
+    season-less)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    async with sessionmaker_() as session:
+        pre_request = await session.get(MediaRequest, request_id)
+        assert pre_request is not None
+        pre_status = pre_request.status
+        pre_season_count = len(
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Show.S02E05.1080p.WEB-DL.x264-GROUP", info_hash="5" * 40)]
+        ),
+        qbt=qbt,
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "tv_grab_requires_season"
+
+    # Nothing was ever handed to the download client.
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+        assert downloads == []  # no Download row created at all
+
+        post_request = await session.get(MediaRequest, request_id)
+        assert post_request is not None
+        assert post_request.status == pre_status  # unchanged computed rollup
+
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(seasons) == pre_season_count  # no season rows spuriously created
+
+
+async def test_grab_movie_with_season_rejected_422_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """F6: a movie grab carrying a ``season`` is rejected up front (422) rather
+    than silently treated as tv -- a movie must never spawn a SeasonRequest row
+    or have its one-active-download guard scoped to a fake season."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 1},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "movie_grab_rejects_season"
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+        assert downloads == []
+        seasons = (await session.execute(select(SeasonRequest))).scalars().all()
+        assert seasons == []

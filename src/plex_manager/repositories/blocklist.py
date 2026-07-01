@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from plex_manager.domain.blocklist import BlocklistedRelease
 from plex_manager.domain.blocklist import is_blocklisted as _domain_is_blocklisted
@@ -18,9 +18,30 @@ from plex_manager.models import Blocklist, BlocklistReason, MediaType
 from plex_manager.ports.repositories import BlocklistRecord
 
 if TYPE_CHECKING:
+    from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlBlocklistRepository"]
+
+
+def _media_type_scope(media_type: str | None) -> ColumnElement[bool] | None:
+    """A WHERE clause scoping the blocklist to one media namespace, or ``None``.
+
+    TMDB movie and TV ids are SEPARATE namespaces, so a movie and a show can share
+    the same numeric ``tmdb_id``; scoping only by ``tmdb_id`` lets a TV blocklist
+    entry match a movie candidate (and vice versa). Match rows of the requested media
+    type. Legacy ``NULL``-media_type rows predate BOTH the column and the TV feature,
+    so they are movie-era: fold them into the ``movie`` scope ONLY (keeping old movie
+    blocklists working) and NEVER into a ``tv`` scope (that would re-introduce exactly
+    the cross-namespace false block for legacy rows). ``None`` (an untyped "search")
+    imposes no scope.
+    """
+    if media_type is None:
+        return None
+    typed = Blocklist.media_type == MediaType(media_type)
+    if media_type == "movie":
+        return or_(typed, Blocklist.media_type.is_(None))
+    return typed
 
 
 def _to_record(row: Blocklist) -> BlocklistRecord:
@@ -50,10 +71,15 @@ class SqlBlocklistRepository:
         torrent_hash: str | None,
         source_title: str,
         indexer: str | None,
+        media_type: str | None = None,
     ) -> bool:
-        # Pre-scope to the same media item (tmdb_id, with NULL matching NULL) so
-        # the pure identity check never crosses media boundaries.
+        # Pre-scope to the same media item (tmdb_id, with NULL matching NULL) AND the
+        # same media namespace (see _media_type_scope) so the pure identity check
+        # never crosses media boundaries.
         stmt = select(Blocklist).where(Blocklist.tmdb_id == tmdb_id)
+        scope = _media_type_scope(media_type)
+        if scope is not None:
+            stmt = stmt.where(scope)
         rows = (await self._session.execute(stmt)).scalars().all()
         entries = [
             BlocklistedRelease(
@@ -70,10 +96,15 @@ class SqlBlocklistRepository:
             entries=entries,
         )
 
-    async def list_for_media(self, tmdb_id: int | None = None) -> list[BlocklistRecord]:
+    async def list_for_media(
+        self, tmdb_id: int | None = None, media_type: str | None = None
+    ) -> list[BlocklistRecord]:
         stmt = select(Blocklist)
         if tmdb_id is not None:
             stmt = stmt.where(Blocklist.tmdb_id == tmdb_id)
+        scope = _media_type_scope(media_type)
+        if scope is not None:
+            stmt = stmt.where(scope)
         stmt = stmt.order_by(Blocklist.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]

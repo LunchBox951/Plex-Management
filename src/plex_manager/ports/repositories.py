@@ -11,6 +11,7 @@ Method sets are intentionally minimal — sufficient for the alpha pipeline
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
@@ -23,6 +24,8 @@ __all__ = [
     "DownloadRepository",
     "RequestRecord",
     "RequestRepository",
+    "SeasonRequestRecord",
+    "SeasonRequestRepository",
 ]
 
 
@@ -58,9 +61,31 @@ class DownloadRecord(BaseModel):
     tmdb_id: int | None = None
     year: int | None = None
     season: int | None = None
+    # TV only. ``None`` = import every valid video file found; a list = import
+    # only those episode numbers, silently skipping the rest (a season-pack grab
+    # scoped to specific missing episodes).
+    episodes: list[int] | None = None
     failed_reason: str | None = None
     first_seen_at: datetime | None = None
     download_path: str | None = None
+
+
+class SeasonRequestRecord(BaseModel):
+    """A per-season TV request as the domain reads it.
+
+    Mirrors :class:`RequestRecord` at the per-season granularity: one row per
+    ``(media_request_id, season_number)``. ``tmdb_id`` is denormalized from the
+    parent :class:`RequestRecord` (a per-season join, never a stored column) so
+    callers never need a second fetch to know which show a season belongs to.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    media_request_id: int
+    season_number: int
+    status: str
+    tmdb_id: int
 
 
 class BlocklistRecord(BaseModel):
@@ -144,12 +169,21 @@ class DownloadRepository(Protocol):
     async def get_by_hash(self, torrent_hash: str) -> DownloadRecord | None:
         """Return the download for ``torrent_hash``, or ``None``."""
 
-    async def find_active_for_request(self, media_request_id: int) -> DownloadRecord | None:
+    async def find_active_for_request(
+        self, media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
         """Return an existing non-terminal download owned by ``media_request_id``.
 
         The parallel-grab guard: a request that already has an active (non-terminal)
         download must not spawn a second one for a *different* release, or a later
         failure of either would re-arm the request while the other still runs.
+
+        ``season`` scopes the guard PER SEASON for TV: passing the season being
+        grabbed lets a whole-series request have season 1 and season 2 downloading
+        at once (each a DIFFERENT ``SeasonRequest`` under the SAME
+        ``media_request_id``), while a second release for the SAME season still
+        collides. Movies always pass ``season=None``, which matches ``season IS
+        NULL`` -- their existing (unscoped) behaviour is unchanged.
         """
         raise NotImplementedError
 
@@ -167,8 +201,14 @@ class DownloadRepository(Protocol):
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        episodes: list[int] | None = None,
     ) -> DownloadRecord:
-        """Insert a new download and return the persisted record."""
+        """Insert a new download and return the persisted record.
+
+        ``episodes`` (TV only) persists to ``Download.episodes_json``: ``None``
+        means import every valid video file found for the season; an explicit list
+        scopes the import to those episode numbers only.
+        """
         raise NotImplementedError
 
     async def update_status(
@@ -201,6 +241,82 @@ class DownloadRepository(Protocol):
 
 
 @runtime_checkable
+class SeasonRequestRepository(Protocol):
+    """Persistence for per-season TV requests.
+
+    A TV ``MediaRequest`` has no lifecycle of its own -- its ``status`` is a
+    computed rollup of its ``SeasonRequest`` rows (see
+    ``domain.season_rollup.rollup_status``). This is the per-season equivalent of
+    :class:`RequestRepository`.
+    """
+
+    async def get(self, season_request_id: int) -> SeasonRequestRecord | None:
+        """Return the season request by id, or ``None``."""
+        raise NotImplementedError
+
+    async def list_for_request(self, media_request_id: int) -> list[SeasonRequestRecord]:
+        """List every season row belonging to ``media_request_id``, ordered by season."""
+        raise NotImplementedError
+
+    async def list_for_requests(
+        self, media_request_ids: Sequence[int]
+    ) -> dict[int, list[SeasonRequestRecord]]:
+        """Batch-list season rows for MULTIPLE requests in a single query.
+
+        Returns ``{media_request_id: [SeasonRequestRecord, ...]}``; a request id
+        with no tracked seasons (a movie, or absent from ``media_request_ids``)
+        is simply absent from the mapping rather than present with an empty list.
+        Lets ``GET /requests`` embed every tv row's per-season rollup WITHOUT one
+        query per row (the ``_to_response`` N+1 :meth:`list_for_request` would
+        otherwise cause on a list endpoint).
+        """
+        raise NotImplementedError
+
+    async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
+        """List season requests, optionally filtered by ``status``."""
+        raise NotImplementedError
+
+    async def ensure(
+        self, media_request_id: int, season_number: int, *, status: str
+    ) -> SeasonRequestRecord:
+        """Idempotently return the ``(media_request_id, season_number)`` row.
+
+        Creates it with ``status`` if it does not yet exist; if it already exists,
+        returns the EXISTING row unchanged (``status`` is only the value used on
+        first creation, never applied to an already-established season).
+
+        Race-safe under the unconditional ``uq_season_requests_media_season``
+        unique index: two callers racing to lazily-create the SAME season resolve
+        to the SAME single row, mirroring the IntegrityError-catch-and-reread
+        pattern at ``request_service.py:159-184``.
+        """
+        raise NotImplementedError
+
+    async def set_status(self, season_request_id: int, status: str) -> None:
+        """Update a season request's status."""
+        raise NotImplementedError
+
+    async def mark_completed(self, season_request_id: int) -> None:
+        """Mark a season ``completed`` (imported, scan triggered).
+
+        The honest pre-``available`` state, exactly like
+        :meth:`RequestRepository.mark_completed` -- the season's file(s) are in the
+        library and a Plex scan was triggered, but Plex has not yet confirmed the
+        season is indexed.
+        """
+        raise NotImplementedError
+
+    async def mark_available(self, season_request_id: int) -> None:
+        """Mark a season ``available``.
+
+        Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
+        the season (``leafCount>0``) -- never asserts watchable before Plex
+        actually has it.
+        """
+        raise NotImplementedError
+
+
+@runtime_checkable
 class BlocklistRepository(Protocol):
     """Persistence for the failed / reported-bad release blocklist."""
 
@@ -210,12 +326,19 @@ class BlocklistRepository(Protocol):
         torrent_hash: str | None,
         source_title: str,
         indexer: str | None,
+        media_type: str | None = None,
     ) -> bool:
-        """Two-tier identity check: hash first, then title/indexer fallback."""
+        """Two-tier identity check: hash first, then title/indexer fallback.
+
+        ``media_type`` scopes to one TMDB namespace (movie/tv share id spaces); see
+        ``SqlBlocklistRepository._media_type_scope``.
+        """
         raise NotImplementedError
 
-    async def list_for_media(self, tmdb_id: int | None = None) -> list[BlocklistRecord]:
-        """List blocklist entries, optionally scoped to one media item."""
+    async def list_for_media(
+        self, tmdb_id: int | None = None, media_type: str | None = None
+    ) -> list[BlocklistRecord]:
+        """List blocklist entries, optionally scoped to one media item + namespace."""
         raise NotImplementedError
 
     async def create(

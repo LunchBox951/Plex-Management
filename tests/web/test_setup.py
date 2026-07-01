@@ -96,6 +96,27 @@ async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> Non
     assert second.json()["detail"] == "already_initialized"
 
 
+async def test_complete_without_tv_root_leaves_it_unset(client: httpx.AsyncClient) -> None:
+    # tv_root is optional -- an install may complete setup with only a Movies
+    # library. It reads back as None, never an empty string.
+    response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.json()["tv_root"] is None
+
+
+async def test_complete_with_tv_root_stores_it(client: httpx.AsyncClient) -> None:
+    body = {**_COMPLETE_BODY, "tv_root": "/library/tv"}
+    response = await client.post("/api/v1/setup/complete", json=body)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.json()["tv_root"] == "/library/tv"
+
+
 async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(
     client: httpx.AsyncClient,
 ) -> None:

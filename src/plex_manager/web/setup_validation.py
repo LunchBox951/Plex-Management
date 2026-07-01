@@ -13,7 +13,7 @@ issued with the credential carried in a header (never in a logged URL).
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibrarySection
 
 __all__ = [
-    "movie_library_options",
+    "library_options",
     "validate_plex",
     "validate_prowlarr",
     "validate_qbittorrent",
@@ -55,15 +55,21 @@ def _is_writable(path: str) -> bool:
     return os.path.isdir(path) and os.access(path, os.W_OK)
 
 
-def movie_library_options(
+def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
+    """Map Plex's own section-type vocabulary (``"show"``) to ours (``"tv"``)."""
+    return "tv" if kind == "show" else "movie"
+
+
+def library_options(
     sections: Sequence[LibrarySection], *, probe_writable: bool = True
 ) -> list[PlexLibraryOption]:
-    """Map Plex's movie sections to pickable ``movies_root`` folders + writability.
+    """Map Plex's movie AND show sections to pickable library folders + writability.
 
     The paths come from Plex's own ``/library/sections`` (not a typed request
     value), so choosing one avoids a path-injection sink AND guarantees the
-    targeted-scan path match. Every movie-section location is offered; the UI marks
-    (and disables) the non-writable ones, which is the split-mount signal.
+    targeted-scan path match. Every movie- or show-section location is offered
+    (tagged by ``section_type``, ``"movie"``/``"tv"``); the UI marks (and
+    disables) the non-writable ones, which is the split-mount signal.
 
     ``probe_writable`` gates the only filesystem touch. The authenticated Settings
     picker leaves it True (the operator's own stored creds make the probe theirs).
@@ -78,21 +84,21 @@ def movie_library_options(
             section_key=section.key,
             title=section.title,
             path=path,
+            section_type=_section_type(section.type),
             writable=_is_writable(path) if probe_writable else None,
         )
         for section in sections
-        if section.type == "movie"
         for path in section.locations
     ]
 
 
 async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
-    """Validate Plex + token AND return the movie library folders to pick from.
+    """Validate Plex + token AND return the movie/tv library folders to pick from.
 
     Uses the real adapter (``list_sections``): one call both proves connectivity +
-    token and yields the library locations, so the wizard offers a writable-folder
-    pick-list for ``movies_root`` instead of a typed, mismatch-prone path. The token
-    rides the ``X-Plex-Token`` header, never the URL.
+    token and yields the library locations, so the wizard offers writable-folder
+    pick-lists for ``movies_root`` / ``tv_root`` instead of a typed, mismatch-prone
+    path. The token rides the ``X-Plex-Token`` header, never the URL.
     """
     try:
         sections = await PlexLibrary(client, url, token).list_sections()
@@ -106,17 +112,17 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
     # caller-supplied Plex server, so never touch the local filesystem here (no
     # pre-auth existence/writability oracle). Writability is reported UNKNOWN
     # (None); the authenticated Settings picker fills in the real signal later.
-    libraries = movie_library_options(sections, probe_writable=False)
+    libraries = library_options(sections, probe_writable=False)
     if not libraries:
-        # Connectivity + token are fine, but an install with no Movie library cannot
-        # import anything (every scan would raise "no Plex movie library section").
-        # Report ok=False so the wizard stops here instead of letting the operator
-        # finish into a configured-but-unusable state — north-star: honest, with a
-        # next step, never a silent pass.
+        # Connectivity + token are fine, but an install with NEITHER a Movie NOR a
+        # TV library cannot import anything (every scan would raise "no Plex
+        # library section" for that kind). A movie-only OR tv-only Plex is legit --
+        # only the fully-empty case stops the wizard here, honest with a next step,
+        # never a silent pass into a configured-but-unusable state.
         return ServiceValidateResponse(
             ok=False,
-            message="Connected to Plex, but no Movie library exists yet — "
-            "add a Movie library in Plex, then test again.",
+            message="Connected to Plex, but no Movie or TV library exists yet — "
+            "add one in Plex, then test again.",
             libraries=[],
         )
     return ServiceValidateResponse(ok=True, message="Connected to Plex.", libraries=libraries)

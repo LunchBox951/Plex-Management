@@ -68,6 +68,8 @@ __all__ = [
     "get_quality_profile",
     "get_session",
     "get_tmdb",
+    "get_tv_root",
+    "get_tv_root_optional",
     "load_system_settings",
     "require_api_key",
     "require_pre_init_or_api_key",
@@ -85,8 +87,10 @@ _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
 # names in the settings schema — one stable naming, no translation layer).
-# ``movies_root`` is the on-disk library folder the importer routes movies into;
-# it is non-secret config (a path), entered at setup and editable in Settings.
+# ``movies_root`` / ``tv_root`` are the on-disk library folders the importer routes
+# movies / tv into; both are non-secret config (a path), entered at setup and
+# editable in Settings. ``tv_root`` is OPTIONAL everywhere ``movies_root`` is
+# required nowhere new: an install may configure only one, or both.
 KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "plex_url",
     "plex_token",
@@ -97,6 +101,7 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "qbittorrent_password",
     "tmdb_api_key",
     "movies_root",
+    "tv_root",
 )
 
 # Keys whose values are secrets: stored encrypted, masked on read. Everything
@@ -399,8 +404,46 @@ async def get_movies_root(
 async def get_movies_root_optional(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> str | None:
-    """Return the Movies root, or ``None`` when unset (the importer waits, no crash)."""
-    return await SettingsStore(session).get("movies_root")
+    """Return the Movies root, or ``None`` when unset (the importer waits, no crash).
+
+    Normalizes a falsy stored value (``""``) to ``None`` so callers can use a
+    single ``is None`` check, matching :func:`get_movies_root`'s ``if not root``
+    treatment of "unset". Without this, an empty-string root would sail past an
+    ``is None`` guard downstream and silently resolve relative paths against the
+    process CWD instead of tripping the honest ``ImportBlocked`` it's meant to.
+    """
+    return await SettingsStore(session).get("movies_root") or None
+
+
+async def get_tv_root(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> str:
+    """Return the configured TV library root, or 409 if unset.
+
+    Mirrors :func:`get_movies_root`; used by a route that genuinely cannot proceed
+    at all without a TV root (there is none of those yet in the beta -- the import
+    endpoints use :func:`get_tv_root_optional` instead so a per-row honest block
+    replaces an upfront 409 -- but this is kept as the required counterpart for
+    symmetry with the movies-side dependency and any future all-or-nothing route).
+    """
+    root = await SettingsStore(session).get("tv_root")
+    if not root:
+        raise ServiceNotConfiguredError("tv_root")
+    return root
+
+
+async def get_tv_root_optional(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> str | None:
+    """Return the TV root, or ``None`` when unset (the importer surfaces an honest,
+    per-row ``ImportBlocked`` for a tv download instead of a crash or an upfront
+    409 that would also block importing movies on an install with no TV root).
+
+    Mirrors :func:`get_movies_root_optional`'s falsy-to-``None`` normalization: an
+    empty-string setting is "unset", not a valid root, so downstream ``is None``
+    guards must see it as such.
+    """
+    return await SettingsStore(session).get("tv_root") or None
 
 
 # --------------------------------------------------------------------------- #

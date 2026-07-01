@@ -38,6 +38,26 @@ def test_parsed_release_defaults() -> None:
     assert parsed.modifier is Modifier.NONE
     assert parsed.languages == []
     assert parsed.revision == Revision()
+    assert parsed.season is None
+    assert parsed.episode is None
+
+
+def test_parsed_release_episode_single() -> None:
+    parsed = ParsedRelease(raw_title="Show.S02E05", clean_title="Show", season=2, episode=5)
+    assert parsed.season == 2
+    assert parsed.episode == 5
+
+
+def test_parsed_release_episode_multi() -> None:
+    parsed = ParsedRelease(raw_title="Show.S02E05E06", clean_title="Show", season=2, episode=[5, 6])
+    assert parsed.episode == [5, 6]
+
+
+def test_parsed_release_season_pack_has_no_episode() -> None:
+    # A whole-season pack has a season but no episode at all.
+    parsed = ParsedRelease(raw_title="Show.S02.1080p.WEB-DL", clean_title="Show", season=2)
+    assert parsed.season == 2
+    assert parsed.episode is None
 
 
 @pytest.mark.parametrize(

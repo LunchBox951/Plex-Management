@@ -29,6 +29,39 @@ async def test_create_and_list_for_media(session: AsyncSession) -> None:
     assert len(await repo.list_for_media()) == 1
 
 
+async def test_blocklist_is_scoped_by_media_type(session: AsyncSession) -> None:
+    """TMDB movie and TV ids are separate namespaces, so a movie and a show can share
+    a tmdb_id. A TV blocklist entry must NOT match a movie query for that id (and vice
+    versa); a legacy NULL-media_type entry (movie-era) still matches both."""
+    repo = SqlBlocklistRepository(session)
+    await repo.create(
+        source_title="Show.S02.1080p.x264",
+        reason="failed",
+        tmdb_id=100,
+        torrent_hash="a" * 40,
+        media_type="tv",
+    )
+    await repo.create(
+        source_title="Legacy.Untyped.x264",
+        reason="failed",
+        tmdb_id=100,
+        torrent_hash="c" * 40,
+        media_type=None,  # pre-column entry
+    )
+
+    tv = {e.source_title for e in await repo.list_for_media(100, media_type="tv")}
+    movie = {e.source_title for e in await repo.list_for_media(100, media_type="movie")}
+    # A tv query matches ONLY typed-tv rows: a legacy NULL row is movie-era and must
+    # NOT leak into a tv scope (that would re-introduce the cross-namespace block).
+    assert tv == {"Show.S02.1080p.x264"}
+    # A movie query matches typed-movie rows PLUS legacy NULL (movie-era) rows.
+    assert movie == {"Legacy.Untyped.x264"}
+
+    # is_blocklisted honours the same scope: the tv entry's hash doesn't match a movie.
+    assert await repo.is_blocklisted(100, "a" * 40, "x", None, media_type="tv") is True
+    assert await repo.is_blocklisted(100, "a" * 40, "x", None, media_type="movie") is False
+
+
 async def test_is_blocklisted_hash_match_case_insensitive(
     session: AsyncSession,
 ) -> None:

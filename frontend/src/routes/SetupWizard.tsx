@@ -15,7 +15,12 @@ import { Field } from '../components/ui/Field'
 import { CenteredSpinner } from '../components/ui/feedback'
 import { useToast } from '../components/ui/toast'
 
-type FormKey = keyof SetupCompleteRequest
+// `movies_root` and `tv_root` are each optional/nullable (unlike every other
+// field here, which is a required string) and get their own dedicated Library
+// sections below rather than the generic field loop, so they are excluded here
+// — keeps `form[field.key]` a plain `string` for every key this type actually
+// carries.
+type FormKey = Exclude<keyof SetupCompleteRequest, 'movies_root' | 'tv_root'>
 
 interface FieldDef {
   key: FormKey
@@ -78,6 +83,7 @@ const EMPTY_FORM: SetupCompleteRequest = {
   qbittorrent_password: '',
   tmdb_api_key: '',
   movies_root: '',
+  tv_root: '',
 }
 
 interface TestResult {
@@ -122,10 +128,13 @@ export function SetupWizard() {
   })
   const [testing, setTesting] = useState<SetupService | null>(null)
   const [mintedKey, setMintedKey] = useState<string | null>(null)
-  // Movie library folders Plex reports (set when Plex verifies); null until then.
+  // Movie AND tv library folders Plex reports (set when Plex verifies), each
+  // tagged by `section_type` — filtered per-picker below. `null` until then.
   const [plexLibraries, setPlexLibraries] = useState<PlexLibraryOption[] | null>(null)
   // Reveal a typed override instead of the Plex pick-list (split-mount / odd layout).
   const [manualPath, setManualPath] = useState(false)
+  // Same, for the (optional) tv library folder.
+  const [manualTvPath, setManualTvPath] = useState(false)
   // Per-service generation: bumped on every edit so an in-flight validation whose
   // fields changed underneath it is discarded (never marks stale creds verified).
   const validationGen = useRef<Record<SetupService, number>>({
@@ -183,12 +192,13 @@ export function SetupWizard() {
     // Editing a field invalidates that service's prior test result + any in-flight one.
     setResults((prev) => ({ ...prev, [service]: null }))
     validationGen.current[service] += 1
-    // Editing Plex creds invalidates the library pick-list + any chosen folder (it
-    // belonged to the old server).
+    // Editing Plex creds invalidates the library pick-lists + any chosen folders
+    // (they belonged to the old server).
     if (service === 'plex') {
       setPlexLibraries(null)
       setManualPath(false)
-      setForm((prev) => ({ ...prev, movies_root: '' }))
+      setManualTvPath(false)
+      setForm((prev) => ({ ...prev, movies_root: '', tv_root: '' }))
     }
   }
 
@@ -199,7 +209,7 @@ export function SetupWizard() {
       const res = await validate.mutateAsync({ service, body: bodyFor(service, form) })
       if (validationGen.current[service] !== gen) return // fields changed; ignore stale result
       setResults((prev) => ({ ...prev, [service]: { ok: res.ok, message: res.message } }))
-      // Plex returns its movie library folders — drive the Library pick-list.
+      // Plex returns its movie AND tv library folders — drive both pick-lists.
       if (service === 'plex' && res.ok) setPlexLibraries(res.libraries ?? [])
     } catch (error) {
       if (validationGen.current[service] !== gen) return
@@ -218,8 +228,17 @@ export function SetupWizard() {
   const servicesVerified = SERVICES.every((s) => results[s.key]?.ok === true)
   const verifiedCount = SERVICES.filter((s) => results[s.key]?.ok === true).length
   const plexVerified = results.plex?.ok === true
-  // Completion also needs a chosen movie library folder (Plex-derived or override).
-  const allVerified = servicesVerified && form.movies_root.trim() !== ''
+  // `plexLibraries` carries BOTH movie and tv folders, each tagged by
+  // `section_type` — split per-picker below.
+  const movieLibraries = plexLibraries?.filter((l) => l.section_type === 'movie') ?? null
+  const tvLibraries = plexLibraries?.filter((l) => l.section_type === 'tv') ?? null
+  // Completion needs at least ONE library root — movies OR tv. Both roots are
+  // independently optional (ADR-0011: a movie-only OR a tv-only Plex is legit; the
+  // backend normalizes an empty root to None and surfaces a per-type ImportBlocked
+  // only for the missing kind). Forcing movies_root would lock a tv-only operator
+  // out of setup entirely — they have no movie library to point at.
+  const hasLibraryRoot = form.movies_root.trim() !== '' || (form.tv_root ?? '').trim() !== ''
+  const allVerified = servicesVerified && hasLibraryRoot
 
   const onComplete = async () => {
     try {
@@ -321,7 +340,7 @@ export function SetupWizard() {
           <p className="mt-4 text-sm text-faint">
             Verify Plex above to choose your movie library folder.
           </p>
-        ) : !manualPath && plexLibraries && plexLibraries.length > 0 ? (
+        ) : !manualPath && movieLibraries && movieLibraries.length > 0 ? (
           <div className="mt-4 flex flex-col gap-2">
             <select
               aria-label="Movies library folder"
@@ -330,7 +349,7 @@ export function SetupWizard() {
               onChange={(e) => setForm((prev) => ({ ...prev, movies_root: e.target.value }))}
             >
               <option value="">Choose a movie library folder…</option>
-              {plexLibraries.map((lib) => (
+              {movieLibraries.map((lib) => (
                 <option
                   key={`${lib.section_key}:${lib.path}`}
                   value={lib.path}
@@ -358,7 +377,7 @@ export function SetupWizard() {
               value={form.movies_root}
               onChange={(e) => setForm((prev) => ({ ...prev, movies_root: e.target.value }))}
             />
-            {plexLibraries && plexLibraries.length > 0 ? (
+            {movieLibraries && movieLibraries.length > 0 ? (
               <button
                 type="button"
                 className="self-start text-xs text-gold hover:underline"
@@ -368,8 +387,80 @@ export function SetupWizard() {
               </button>
             ) : (
               <p className="text-xs text-faint">
-                Plex reports no movie library — enter the folder the app writes movies into (it must
-                be writable).
+                Plex reports no movie library — leave this unset if you don't request movies, or enter
+                a writable folder the app places movies into.
+              </p>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* TV is entirely optional (ADR-0011): a movie-only install skips this
+          section with no consequence — `tv_root` never gates `allVerified`. */}
+      <section className="mt-4 rounded-2xl border border-hairline bg-surface p-5 transition-colors">
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="font-display text-lg font-bold text-ink">TV Library</h2>
+          {form.tv_root ? (
+            <span className="font-mono text-xs text-available">✓ chosen</span>
+          ) : (
+            <span className="font-mono text-xs text-faint">optional</span>
+          )}
+        </div>
+        <p className="mt-1 text-sm text-muted">
+          Where imported tv seasons are placed — pick a folder Plex already watches. Leave
+          unset if you don't request tv shows.
+        </p>
+        {!plexVerified ? (
+          <p className="mt-4 text-sm text-faint">Verify Plex above to choose your tv library folder.</p>
+        ) : !manualTvPath && tvLibraries && tvLibraries.length > 0 ? (
+          <div className="mt-4 flex flex-col gap-2">
+            <select
+              aria-label="TV library folder"
+              className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+              value={form.tv_root ?? ''}
+              onChange={(e) => setForm((prev) => ({ ...prev, tv_root: e.target.value }))}
+            >
+              <option value="">Skip TV for now…</option>
+              {tvLibraries.map((lib) => (
+                <option
+                  key={`${lib.section_key}:${lib.path}`}
+                  value={lib.path}
+                  disabled={lib.writable === false}
+                >
+                  {lib.title} — {lib.path}
+                  {lib.writable === false ? ' · not writable by the app' : ''}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="self-start text-xs text-gold hover:underline"
+              onClick={() => setManualTvPath(true)}
+            >
+              Use a custom path instead
+            </button>
+          </div>
+        ) : (
+          <div className="mt-4 flex flex-col gap-2">
+            <Field
+              label="TV library folder"
+              type="text"
+              placeholder="/library/tv"
+              value={form.tv_root ?? ''}
+              onChange={(e) => setForm((prev) => ({ ...prev, tv_root: e.target.value }))}
+            />
+            {tvLibraries && tvLibraries.length > 0 ? (
+              <button
+                type="button"
+                className="self-start text-xs text-gold hover:underline"
+                onClick={() => setManualTvPath(false)}
+              >
+                ← Pick from a Plex library instead
+              </button>
+            ) : (
+              <p className="text-xs text-faint">
+                Plex reports no tv library — enter the folder the app writes tv into (it must be
+                writable), or leave blank to skip TV.
               </p>
             )}
           </div>

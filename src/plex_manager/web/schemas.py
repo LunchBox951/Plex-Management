@@ -37,6 +37,7 @@ __all__ = [
     "RequestResponse",
     "SearchPreviewRequest",
     "SearchPreviewResponse",
+    "SeasonStatus",
     "ServiceValidateResponse",
     "SettingsResponse",
     "SettingsUpdate",
@@ -88,13 +89,15 @@ class TmdbValidateRequest(BaseModel):
 
 
 class PlexLibraryOption(BaseModel):
-    """One movie-library folder Plex reports, with whether the app can write to it.
+    """One movie- OR tv-library folder Plex reports, with whether the app can write to it.
 
     ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
-    choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
-    section mismatch that breaks a targeted scan). ``writable`` is the app's own
-    check (``None`` when not probed — see the field): a known-not-writable location
-    is the split-mount signal — surfaced, not hidden.
+    choosing it for ``movies_root`` / ``tv_root`` avoids a typed path entirely (and
+    the path↔section mismatch that breaks a targeted scan). ``section_type`` tags
+    which root this option is for (``"movie"`` -> ``movies_root``, ``"tv"`` ->
+    ``tv_root``) so a single generalized list can drive both pickers. ``writable``
+    is the app's own check (``None`` when not probed — see the field): a
+    known-not-writable location is the split-mount signal — surfaced, not hidden.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -102,6 +105,7 @@ class PlexLibraryOption(BaseModel):
     section_key: str
     title: str
     path: str
+    section_type: MediaTypeField
     # ``None`` = writability was NOT probed. The pre-init ``validate/plex`` wizard
     # step never touches the filesystem for a caller-supplied Plex server (that would
     # be a pre-auth local-FS existence/writability oracle); a real ``True``/``False``
@@ -114,9 +118,10 @@ class ServiceValidateResponse(BaseModel):
     """Result of a connection check. ``message`` is operator-facing; ``detail``
     is an optional diagnostic. Neither ever contains a secret value.
 
-    For Plex, ``libraries`` carries the movie library folders so the UI can offer a
-    pick-list for ``movies_root`` instead of a typed path. ``None`` for every other
-    service (and for a failed Plex check)."""
+    For Plex, ``libraries`` carries the movie AND tv library folders (each tagged
+    by ``section_type``) so the UI can offer pick-lists for ``movies_root`` /
+    ``tv_root`` instead of a typed path. ``None`` for every other service (and for
+    a failed Plex check)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -143,6 +148,11 @@ class SetupCompleteRequest(BaseModel):
     qbittorrent_password: str
     tmdb_api_key: str
     movies_root: str
+    # Optional (mirrors ``movies_root``'s TV sibling): an install may complete
+    # setup with only a Movies library, only a TV library, or both -- see
+    # ``setup_validation.validate_plex``'s "movie-only or tv-only is legit" gate.
+    # Written to the ``tv_root`` setting ONLY when non-empty (setup.complete).
+    tv_root: str | None = None
 
 
 class SetupStatusResponse(BaseModel):
@@ -176,6 +186,7 @@ class SettingsResponse(BaseModel):
     qbittorrent_password: str | None = None
     tmdb_api_key: str | None = None
     movies_root: str | None = None
+    tv_root: str | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -196,6 +207,7 @@ class SettingsUpdate(BaseModel):
     qbittorrent_password: str | None = Field(default=None)
     tmdb_api_key: str | None = Field(default=None)
     movies_root: str | None = Field(default=None)
+    tv_root: str | None = Field(default=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +280,21 @@ class CreateRequestBody(BaseModel):
 
     tmdb_id: int
     media_type: MediaTypeField
+    # TV only (ignored for movies): explicit season numbers to track. Omitted or
+    # empty means "track the whole aired series" -- every season 1..season_count,
+    # specials (season 0) excluded. See ``request_service.create_request`` /
+    # ``_season_numbers``. A repeat POST with a NEW season list GROWS the tracked
+    # set rather than being dropped by the request-level dedup.
+    seasons: list[int] | None = None
+
+
+class SeasonStatus(BaseModel):
+    """One tracked season's status, embedded in a tv ``RequestResponse``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    season_number: int
+    status: str
 
 
 class RequestResponse(BaseModel):
@@ -284,6 +311,10 @@ class RequestResponse(BaseModel):
     is_anime: bool = False
     poster_url: str | None = None
     backdrop_url: str | None = None
+    # TV only: this show's per-season rollup, ordered by season number. ``None``
+    # for a movie (movies have no ``SeasonRequest`` rows). ``status`` above is the
+    # COMPUTED fold of these (``domain.season_rollup.rollup_status``).
+    seasons: list[SeasonStatus] | None = None
 
 
 class RequestListResponse(BaseModel):
@@ -313,6 +344,10 @@ class SearchPreviewRequest(BaseModel):
     title: str | None = None
     year: int | None = None
     season: int | None = None
+    # TV only: the specific episode number(s) wanted out of ``season``. ``None``/
+    # empty means "the whole season" -- this is also what makes ``decision_service.
+    # preview`` prefer a season-pack release over an equivalent single episode.
+    episodes: list[int] | None = None
 
 
 class AcceptedRelease(BaseModel):
@@ -365,6 +400,11 @@ class QueueItem(BaseModel):
     seed_ratio: float = 0.0
     media_request_id: int | None = None
     tmdb_id: int | None = None
+    # TV only: the season this download belongs to, and the specific episode
+    # number(s) it is scoped to importing (``None`` = import every valid video
+    # file found for the season). Both ``None`` for a movie.
+    season: int | None = None
+    episodes: list[int] | None = None
     failed_reason: str | None = None
 
 
@@ -381,8 +421,12 @@ class GrabRequest(BaseModel):
 
     With neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted
     release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
-    indexer search and the stored download to that season; it is ignored for
-    movies.
+    indexer search and the stored download to that season; ``episodes`` further
+    scopes it to those specific episode number(s) (``None``/empty = the whole
+    season). Every TV grab is per-season: the endpoint REJECTS (422) a tv request
+    grabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed
+    WITH a ``season`` -- the branch is always the request's actual media type,
+    never merely whether ``season`` happens to be set.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -391,6 +435,7 @@ class GrabRequest(BaseModel):
     info_hash: str | None = None
     guid: str | None = None
     season: int | None = None
+    episodes: list[int] | None = None
 
 
 # --------------------------------------------------------------------------- #

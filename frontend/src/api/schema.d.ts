@@ -183,8 +183,13 @@ export interface paths {
          * Import Endpoint
          * @description Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
          *
-         *     Requires Plex + the Movies root configured (409 ``service_not_configured``
-         *     otherwise). The correction-without-a-terminal button for a blocked import.
+         *     Requires Plex + qBittorrent configured (409 ``service_not_configured``
+         *     otherwise); the Movies/TV roots are each OPTIONAL here -- no upfront 409 for
+         *     either. A download whose media type's root is unset gets its own honest,
+         *     retryable ``ImportBlocked`` (surfaced in the returned ``QueueItem``, a normal
+         *     200) instead of the endpoint refusing to even try, so an install with only
+         *     ONE root configured can still retry-import that type. The
+         *     correction-without-a-terminal button for a blocked import.
          */
         post: operations["import_endpoint_api_v1_queue__download_id__import_post"];
         delete?: never;
@@ -231,7 +236,11 @@ export interface paths {
          * @description Create a request (or return the existing active one for this media).
          *
          *     If Plex is configured and the movie is already in the library, the request is
-         *     recorded directly as ``available`` (no needless search/grab).
+         *     recorded directly as ``available`` (no needless search/grab). For a tv
+         *     request, ``body.seasons`` (omitted/empty = the whole aired series) is threaded
+         *     to ``request_service.create_request``, which tracks each named season as its
+         *     own ``SeasonRequest`` row -- including on the dedup path, where a repeat POST
+         *     with a NEW season list grows the tracked set rather than being dropped.
          */
         post: operations["create_request_endpoint_api_v1_requests_post"];
         delete?: never;
@@ -319,7 +328,9 @@ export interface paths {
         };
         /**
          * Plex Libraries Endpoint
-         * @description Movie library folders Plex reports, for the Settings ``movies_root`` picker.
+         * @description Library folders (movie AND tv) Plex reports, for the Settings
+         *     ``movies_root`` / ``tv_root`` pickers -- each option is tagged by
+         *     ``section_type`` so the frontend can filter to the picker it's rendering.
          *
          *     Uses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.
          */
@@ -558,6 +569,8 @@ export interface components {
              * @enum {string}
              */
             media_type: "movie" | "tv";
+            /** Seasons */
+            seasons?: number[] | null;
             /** Tmdb Id */
             tmdb_id: number;
         };
@@ -637,10 +650,16 @@ export interface components {
          *
          *     With neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted
          *     release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
-         *     indexer search and the stored download to that season; it is ignored for
-         *     movies.
+         *     indexer search and the stored download to that season; ``episodes`` further
+         *     scopes it to those specific episode number(s) (``None``/empty = the whole
+         *     season). Every TV grab is per-season: the endpoint REJECTS (422) a tv request
+         *     grabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed
+         *     WITH a ``season`` -- the branch is always the request's actual media type,
+         *     never merely whether ``season`` happens to be set.
          */
         GrabRequest: {
+            /** Episodes */
+            episodes?: number[] | null;
             /** Guid */
             guid?: string | null;
             /** Info Hash */
@@ -657,19 +676,26 @@ export interface components {
         };
         /**
          * PlexLibraryOption
-         * @description One movie-library folder Plex reports, with whether the app can write to it.
+         * @description One movie- OR tv-library folder Plex reports, with whether the app can write to it.
          *
          *     ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
-         *     choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
-         *     section mismatch that breaks a targeted scan). ``writable`` is the app's own
-         *     check (``None`` when not probed — see the field): a known-not-writable location
-         *     is the split-mount signal — surfaced, not hidden.
+         *     choosing it for ``movies_root`` / ``tv_root`` avoids a typed path entirely (and
+         *     the path↔section mismatch that breaks a targeted scan). ``section_type`` tags
+         *     which root this option is for (``"movie"`` -> ``movies_root``, ``"tv"`` ->
+         *     ``tv_root``) so a single generalized list can drive both pickers. ``writable``
+         *     is the app's own check (``None`` when not probed — see the field): a
+         *     known-not-writable location is the split-mount signal — surfaced, not hidden.
          */
         PlexLibraryOption: {
             /** Path */
             path: string;
             /** Section Key */
             section_key: string;
+            /**
+             * Section Type
+             * @enum {string}
+             */
+            section_type: "movie" | "tv";
             /** Title */
             title: string;
             /** Writable */
@@ -746,6 +772,8 @@ export interface components {
          * @description A tracked download in the live queue.
          */
         QueueItem: {
+            /** Episodes */
+            episodes?: number[] | null;
             /** Failed Reason */
             failed_reason?: string | null;
             /** Id */
@@ -757,6 +785,8 @@ export interface components {
              * @default 0
              */
             progress: number;
+            /** Season */
+            season?: number | null;
             /**
              * Seed Ratio
              * @default 0
@@ -813,6 +843,8 @@ export interface components {
             media_type: string;
             /** Poster Url */
             poster_url?: string | null;
+            /** Seasons */
+            seasons?: components["schemas"]["SeasonStatus"][] | null;
             /** Status */
             status: string;
             /** Title */
@@ -831,6 +863,8 @@ export interface components {
          *     required.
          */
         SearchPreviewRequest: {
+            /** Episodes */
+            episodes?: number[] | null;
             /** Media Type */
             media_type?: ("movie" | "tv") | null;
             /** Request Id */
@@ -857,13 +891,24 @@ export interface components {
             rejected: components["schemas"]["RejectedRelease"][];
         };
         /**
+         * SeasonStatus
+         * @description One tracked season's status, embedded in a tv ``RequestResponse``.
+         */
+        SeasonStatus: {
+            /** Season Number */
+            season_number: number;
+            /** Status */
+            status: string;
+        };
+        /**
          * ServiceValidateResponse
          * @description Result of a connection check. ``message`` is operator-facing; ``detail``
          *     is an optional diagnostic. Neither ever contains a secret value.
          *
-         *     For Plex, ``libraries`` carries the movie library folders so the UI can offer a
-         *     pick-list for ``movies_root`` instead of a typed path. ``None`` for every other
-         *     service (and for a failed Plex check).
+         *     For Plex, ``libraries`` carries the movie AND tv library folders (each tagged
+         *     by ``section_type``) so the UI can offer pick-lists for ``movies_root`` /
+         *     ``tv_root`` instead of a typed path. ``None`` for every other service (and for
+         *     a failed Plex check).
          */
         ServiceValidateResponse: {
             /** Detail */
@@ -902,6 +947,8 @@ export interface components {
             qbittorrent_username?: string | null;
             /** Tmdb Api Key */
             tmdb_api_key?: string | null;
+            /** Tv Root */
+            tv_root?: string | null;
         };
         /**
          * SettingsUpdate
@@ -929,6 +976,8 @@ export interface components {
             qbittorrent_username?: string | null;
             /** Tmdb Api Key */
             tmdb_api_key?: string | null;
+            /** Tv Root */
+            tv_root?: string | null;
         };
         /**
          * SetupCompleteRequest
@@ -953,6 +1002,8 @@ export interface components {
             qbittorrent_username: string;
             /** Tmdb Api Key */
             tmdb_api_key: string;
+            /** Tv Root */
+            tv_root?: string | null;
         };
         /**
          * SetupStatusResponse
@@ -1113,7 +1164,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                category: "trending" | "popular" | "upcoming";
+                category: "trending" | "popular" | "upcoming" | "trending_tv" | "popular_tv";
             };
             cookie?: never;
         };

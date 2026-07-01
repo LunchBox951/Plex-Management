@@ -104,3 +104,15 @@ class MetadataPort(Protocol):
     async def upcoming_movies(self, page: int = 1) -> MediaPage:
         """List upcoming movie releases, one page at a time."""
         raise NotImplementedError
+
+    async def trending_tv(self, page: int = 1) -> MediaPage:
+        """List the week's trending TV shows, one page at a time."""
+        raise NotImplementedError
+
+    async def popular_tv(self, page: int = 1) -> MediaPage:
+        """List currently popular TV shows, one page at a time.
+
+        No TV equivalent of ``upcoming_movies`` -- TMDB has no "upcoming" TV
+        endpoint comparable to its movie release-date listing.
+        """
+        raise NotImplementedError

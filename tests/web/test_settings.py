@@ -8,7 +8,11 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.web.deps import SettingsStore
+from plex_manager.web.deps import (
+    SettingsStore,
+    get_movies_root_optional,
+    get_tv_root_optional,
+)
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -23,6 +27,29 @@ async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None
     body = response.json()
     assert body["plex_url"] is None
     assert body["tmdb_api_key"] is None
+
+
+async def test_get_starts_with_tv_root_unset(client: httpx.AsyncClient, seed: SeedFn) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert response.json()["tv_root"] is None
+
+
+async def test_put_tv_root_round_trips_independently_of_movies_root(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # tv_root is a plain (non-secret) path, just like movies_root, and settable
+    # without touching movies_root -- the two roots are independently optional.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings", json={"tv_root": "/library/tv"}, headers={"X-Api-Key": _API_KEY}
+    )
+    assert put.status_code == 200
+    assert put.json()["tv_root"] == "/library/tv"
+    assert put.json()["movies_root"] is None
+
+    got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
+    assert got["tv_root"] == "/library/tv"
 
 
 async def test_put_round_trips_and_redacts(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -104,3 +131,28 @@ async def test_put_mask_round_trip_does_not_clobber_secret(
     # The real secret must survive — the mask write was a no-op, not a wipe.
     async with sessionmaker_() as session:
         assert await SettingsStore(session).get("tmdb_api_key") == "real-tmdb-secret"
+
+
+async def test_empty_string_root_reads_back_as_unset(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """PUT only skips a field when it's ``None`` (absent) — an empty-string
+    ``movies_root``/``tv_root`` (e.g. a frontend "clear" that submits ``""``
+    instead of omitting the field) is written verbatim. The importer's
+    ``get_*_root_optional`` deps must still report that as unset (``None``), not
+    a falsy-but-truthy-looking path: otherwise it would sail past a downstream
+    ``is None`` guard and silently resolve relative paths against the process
+    CWD instead of tripping the honest ``ImportBlocked`` it's meant to."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "", "tv_root": ""},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == ""
+        assert await SettingsStore(session).get("tv_root") == ""
+        assert await get_movies_root_optional(session) is None
+        assert await get_tv_root_optional(session) is None

@@ -55,4 +55,46 @@ describe('ReleaseList', () => {
     expect(screen.getByRole('button', { name: /grab/i })).toBeDisabled()
     expect(screen.getByText(/request this title to grab/i)).toBeInTheDocument()
   })
+
+  describe('season/episode chip (best-effort, parsed from the title)', () => {
+    it('shows "S02E05" for a single-episode release', () => {
+      const preview: SearchPreviewResponse = {
+        accepted: [accepted({ title: 'Test.Show.S02E05.1080p.WEB-DL' })],
+        rejected: [],
+        no_acceptable_release: false,
+      }
+      render(<ReleaseList preview={preview} onGrab={vi.fn()} grabbingGuid={null} canGrab />)
+      expect(screen.getByText('S02E05')).toBeInTheDocument()
+    })
+
+    it('shows a multi-episode range for a multi-episode file', () => {
+      const preview: SearchPreviewResponse = {
+        accepted: [accepted({ title: 'Test.Show.S02E05-E07.1080p.WEB-DL' })],
+        rejected: [],
+        no_acceptable_release: false,
+      }
+      render(<ReleaseList preview={preview} onGrab={vi.fn()} grabbingGuid={null} canGrab />)
+      expect(screen.getByText('S02E05-E07')).toBeInTheDocument()
+    })
+
+    it('shows "S02 pack" for a whole-season release (no episode named)', () => {
+      const preview: SearchPreviewResponse = {
+        accepted: [accepted({ title: 'Test.Show.S02.COMPLETE.1080p.WEB-DL' })],
+        rejected: [],
+        no_acceptable_release: false,
+      }
+      render(<ReleaseList preview={preview} onGrab={vi.fn()} grabbingGuid={null} canGrab />)
+      expect(screen.getByText('S02 pack')).toBeInTheDocument()
+    })
+
+    it('renders no chip for a movie release', () => {
+      const preview: SearchPreviewResponse = {
+        accepted: [accepted({ title: 'Test.Movie.2021.1080p.WEB-DL' })],
+        rejected: [],
+        no_acceptable_release: false,
+      }
+      render(<ReleaseList preview={preview} onGrab={vi.fn()} grabbingGuid={null} canGrab />)
+      expect(screen.queryByText(/^S\d{2}/)).not.toBeInTheDocument()
+    })
+  })
 })

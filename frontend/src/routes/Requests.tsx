@@ -27,7 +27,21 @@ function RequestRow({ request }: { request: RequestResponse }) {
           ) : null}
         </p>
       </div>
-      <StatusBadge status={requestStatus(request.status)} className="shrink-0" />
+      <div className="flex shrink-0 flex-col items-end gap-1.5">
+        <StatusBadge status={requestStatus(request.status)} />
+        {request.media_type === 'tv' && request.seasons && request.seasons.length > 0 ? (
+          <ul className="flex flex-wrap justify-end gap-1">
+            {request.seasons.map((season) => (
+              <li key={season.season_number}>
+                <StatusBadge
+                  status={requestStatus(season.status)}
+                  detail={`S${season.season_number}`}
+                />
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
     </li>
   )
 }

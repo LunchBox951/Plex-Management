@@ -312,22 +312,32 @@ class TmdbMetadata:
 
     async def trending_movies(self, page: int = 1) -> MediaPage:
         """List the week's trending movies via ``/trending/movie/week``."""
-        return await self._movie_page("/trending/movie/week", "trending:movie:week", page)
+        return await self._list_page("/trending/movie/week", "trending:movie:week", page, "movie")
 
     async def popular_movies(self, page: int = 1) -> MediaPage:
         """List currently popular movies via ``/movie/popular``."""
-        return await self._movie_page("/movie/popular", "popular:movie", page)
+        return await self._list_page("/movie/popular", "popular:movie", page, "movie")
 
     async def upcoming_movies(self, page: int = 1) -> MediaPage:
         """List upcoming movie releases via ``/movie/upcoming``."""
-        return await self._movie_page("/movie/upcoming", "upcoming:movie", page)
+        return await self._list_page("/movie/upcoming", "upcoming:movie", page, "movie")
 
-    async def _movie_page(self, path: str, cache_prefix: str, page: int) -> MediaPage:
-        """Fetch one page of a movie-only list endpoint and map its envelope.
+    async def trending_tv(self, page: int = 1) -> MediaPage:
+        """List the week's trending TV shows via ``/trending/tv/week``."""
+        return await self._list_page("/trending/tv/week", "trending:tv:week", page, "tv")
+
+    async def popular_tv(self, page: int = 1) -> MediaPage:
+        """List currently popular TV shows via ``/tv/popular``."""
+        return await self._list_page("/tv/popular", "popular:tv", page, "tv")
+
+    async def _list_page(
+        self, path: str, cache_prefix: str, page: int, kind: MediaKind
+    ) -> MediaPage:
+        """Fetch one page of a single-kind list endpoint and map its envelope.
 
         The page is clamped to TMDB's documented ``1..500`` window. Rows carry no
-        ``media_type`` on these endpoints, so they are mapped as movies (any stray
-        person/non-movie row is still dropped). Each page is cached by index.
+        ``media_type`` on these endpoints, so every row is mapped as ``kind`` (any
+        stray row of the other kind is still dropped). Each page is cached by index.
         """
         clamped = max(_MIN_PAGE, min(page, _MAX_PAGE))
         cache_key = f"{cache_prefix}:p{clamped}"
@@ -339,7 +349,7 @@ class TmdbMetadata:
         fields: Mapping[str, object] = payload if payload is not None else {}
         results: list[MediaSearchResult] = []
         for row in _as_sequence(fields.get("results")):
-            parsed = self._parse_search_row(_as_mapping(row), "movie")
+            parsed = self._parse_search_row(_as_mapping(row), kind)
             if parsed is not None:
                 results.append(parsed)
         media_page = MediaPage(

@@ -23,6 +23,10 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   import_blocked: { label: 'Import blocked', intent: 'error' },
   completed: { label: 'Finalizing', intent: 'downloading' },
   available: { label: 'In library', intent: 'available' },
+  // tv only: the show's rollup when SOME (not all) tracked seasons are available
+  // (domain.season_rollup.rollup_status). Never a per-season status itself — a
+  // single SeasonRequest only ever carries the statuses above.
+  partially_available: { label: 'Partially available', intent: 'available' },
   failed: { label: 'Failed', intent: 'error' },
 }
 

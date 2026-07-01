@@ -117,6 +117,8 @@ class FakeTmdb:
         trending: list[MediaSearchResult] | None = None,
         popular: list[MediaSearchResult] | None = None,
         upcoming: list[MediaSearchResult] | None = None,
+        trending_tv_results: list[MediaSearchResult] | None = None,
+        popular_tv_results: list[MediaSearchResult] | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
@@ -126,6 +128,15 @@ class FakeTmdb:
         self.trending = list(trending) if trending is not None else list(self.results)
         self.popular = list(popular) if popular is not None else list(self.results)
         self.upcoming = list(upcoming) if upcoming is not None else list(self.results)
+        # Named ``_tv`` (not ``trending_tv``/``popular_tv``) to avoid colliding with
+        # the like-named PORT METHODS below -- unlike the movie rows, the tv port
+        # methods carry no distinguishing suffix beyond ``_tv``.
+        self._trending_tv = (
+            list(trending_tv_results) if trending_tv_results is not None else list(self.results)
+        )
+        self._popular_tv = (
+            list(popular_tv_results) if popular_tv_results is not None else list(self.results)
+        )
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -148,6 +159,12 @@ class FakeTmdb:
 
     async def upcoming_movies(self, page: int = 1) -> MediaPage:
         return self._page(self.upcoming)
+
+    async def trending_tv(self, page: int = 1) -> MediaPage:
+        return self._page(self._trending_tv)
+
+    async def popular_tv(self, page: int = 1) -> MediaPage:
+        return self._page(self._popular_tv)
 
 
 class FakeProwlarr:
@@ -213,28 +230,57 @@ class FakeQbittorrent:
 
 
 class FakeLibrary:
-    """In-memory :class:`LibraryPort`: a set of in-library tmdb ids + scan recorder."""
+    """In-memory :class:`LibraryPort`: a set of in-library tmdb ids + scan recorder.
+
+    ``available_tv_seasons`` maps a show's tmdb id to the frozenset of season
+    numbers present (mirrors ``PlexLibrary``'s ``leafCount>0`` season map). A show
+    key with an EMPTY frozenset means "the show itself is present but no season has
+    aired episodes yet" — ``is_available(tv, season=None)`` is still ``True`` for
+    it, matching the real adapter's "show present" semantics.
+
+    ``scanned`` keeps the historical path-only log; ``scan_calls`` additionally
+    records the ``media_type`` passed to each :meth:`trigger_scan` call, so a test
+    can assert a TV import scans with ``"tv"`` (and a movie import with
+    ``"movie"``) rather than only checking that some path was scanned.
+    """
 
     def __init__(
         self,
         *,
         available: set[int] | None = None,
+        available_tv_seasons: dict[int, frozenset[int]] | None = None,
         sections: list[LibrarySection] | None = None,
     ) -> None:
         self.available_ids = available or set()
+        self.available_tv_seasons = available_tv_seasons or {}
         self.sections = sections or []
         self.scanned: list[str] = []
+        self.scan_calls: list[tuple[str, str]] = []
 
     async def is_available(
-        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        use_cache: bool = True,
+        season: int | None = None,
     ) -> bool:
         # No cache to bypass; ``use_cache`` is accepted to match LibraryPort.
         if media_type == "tv":
-            raise NotImplementedError("tv availability deferred to next beta")
+            seasons = self.available_tv_seasons.get(tmdb_id)
+            if seasons is None:
+                return False
+            return True if season is None else season in seasons
         return tmdb_id in self.available_ids
 
-    async def trigger_scan(self, path: str) -> None:
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        # The show's present seasons in one lookup (mirrors PlexLibrary's single
+        # crawl); empty for an absent show, matching the real adapter.
+        return self.available_tv_seasons.get(tmdb_id, frozenset())
+
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         self.scanned.append(path)
+        self.scan_calls.append((path, media_type))
 
     async def list_sections(self) -> list[LibrarySection]:
         return list(self.sections)

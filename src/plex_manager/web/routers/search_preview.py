@@ -79,23 +79,32 @@ def _to_response(result: DecisionResult) -> SearchPreviewResponse:
 async def _resolve_descriptor(
     body: SearchPreviewRequest,
     session: AsyncSession,
-) -> tuple[int, str, str, int | None, int | None]:
-    """Return ``(tmdb_id, title, media_type, year, season)`` for the preview.
+) -> tuple[int, str, str, int | None, int | None, list[int] | None]:
+    """Return ``(tmdb_id, title, media_type, year, season, episodes)`` for the preview.
 
     Resolved from a stored request when ``request_id`` is given, else from the
-    explicit body fields (which then must be complete).
+    explicit body fields (which then must be complete). ``season``/``episodes``
+    always come from the BODY regardless of the ``request_id`` branch -- a stored
+    request carries no per-search season/episode scoping of its own.
     """
     if body.request_id is not None:
         record = await request_service.get_request(session, body.request_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
-        return record.tmdb_id, record.title, record.media_type, record.year, body.season
+        return (
+            record.tmdb_id,
+            record.title,
+            record.media_type,
+            record.year,
+            body.season,
+            body.episodes,
+        )
     if body.tmdb_id is None or body.media_type is None or body.title is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="request_id_or_descriptor_required",
         )
-    return body.tmdb_id, body.title, body.media_type, body.year, body.season
+    return body.tmdb_id, body.title, body.media_type, body.year, body.season, body.episodes
 
 
 async def run_preview(
@@ -106,7 +115,7 @@ async def run_preview(
     profile: QualityProfile,
 ) -> DecisionResult:
     """Resolve the descriptor and run the decision engine (shared with grab)."""
-    tmdb_id, title, media_type, year, season = await _resolve_descriptor(body, session)
+    tmdb_id, title, media_type, year, season, episodes = await _resolve_descriptor(body, session)
     return await decision_service.preview(
         prowlarr,
         parser,
@@ -117,6 +126,7 @@ async def run_preview(
         media_type=media_type,
         year=year,
         season=season,
+        episodes=episodes,
     )
 
 

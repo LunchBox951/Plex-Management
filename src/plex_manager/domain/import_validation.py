@@ -41,17 +41,22 @@ from plex_manager.domain.media_match import matches_media
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.release import ParsedRelease
+from plex_manager.domain.season_pack import episode_numbers as _episode_numbers
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.ports.parser import ParserPort
 
 __all__ = [
     "VIDEO_EXTENSIONS",
+    "EpisodeImportRejection",
+    "EpisodeImportResult",
     "ImportRejection",
     "ImportRejectionReason",
     "ImportValidation",
+    "SeasonImportValidation",
     "VideoFile",
     "validate_import",
+    "validate_season_import",
 ]
 
 # NB: ``VIDEO_EXTENSIONS`` (imported above, re-exported via ``__all__``) is the
@@ -104,6 +109,10 @@ class ImportRejectionReason(StrEnum):
     SAMPLE = "sample"
     NO_VIDEO_FILE = "no_video_file"
     MULTI_PART = "multi_part"
+    # TV-only: the file parsed with no episode number at all (e.g. a stray extra
+    # that slipped past the sample-name filter), so it cannot be placed as a named
+    # episode. Never applies to movies (there is no episode concept to gate on).
+    NO_EPISODE_NUMBER = "no_episode_number"
 
 
 @dataclass(frozen=True)
@@ -140,6 +149,53 @@ class ImportValidation:
     video: VideoFile | None
     parsed: ParsedRelease | None
     rejections: tuple[ImportRejection, ...]
+
+
+@dataclass(frozen=True)
+class EpisodeImportResult:
+    """One episode file from a season download that validated cleanly.
+
+    Used both for genuinely ``accepted`` files and for the benign
+    ``skipped_not_requested`` bucket (same shape — a skip is not a validation
+    failure). ``episodes`` is the sorted, non-empty tuple of episode numbers the
+    file names (more than one entry for a multi-episode file).
+    """
+
+    video: VideoFile
+    parsed: ParsedRelease
+    episodes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class EpisodeImportRejection:
+    """A single surfaced reason one file in a season download was refused import.
+
+    Unlike :class:`ImportValidation` (one feature file, all reasons pooled), a
+    season download validates every file independently, so a file with more than
+    one applicable reason gets one :class:`EpisodeImportRejection` per reason,
+    all sharing ``relative_path`` — still honesty over silence, per file.
+    """
+
+    relative_path: str
+    reason: ImportRejectionReason
+    detail: str
+
+
+@dataclass(frozen=True)
+class SeasonImportValidation:
+    """Outcome of validating EVERY file in a completed season download.
+
+    Unlike :class:`ImportValidation` (movies-first, single feature file,
+    all-or-nothing), a season import legitimately PARTIALLY succeeds:
+    ``accepted`` can be non-empty even when ``rejected`` is too — the caller
+    imports whatever accepted and surfaces the rest. ``skipped_not_requested`` is
+    a distinct, BENIGN bucket (never a rejection) for episodes that validated
+    cleanly but were filtered out by an operator-supplied ``requested_episodes``.
+    """
+
+    accepted: tuple[EpisodeImportResult, ...]
+    rejected: tuple[EpisodeImportRejection, ...]
+    skipped_not_requested: tuple[EpisodeImportResult, ...]
 
 
 def _basename(relative_path: str) -> str:
@@ -312,4 +368,191 @@ def validate_import(
         video=chosen,
         parsed=parsed,
         rejections=tuple(rejections),
+    )
+
+
+def validate_season_import(
+    files: Sequence[VideoFile],
+    *,
+    parser: ParserPort,
+    profile: QualityProfile,
+    expected_title: str,
+    expected_tmdb_id: int,
+    expected_season: int,
+    requested_episodes: Sequence[int] | None = None,
+) -> SeasonImportValidation:
+    """Validate EVERY file in a completed TV season download; partial success is legit.
+
+    Unlike :func:`validate_import` (movies-first: pick ONE largest file, all gates
+    apply to it alone), a season download legitimately ships many independently
+    valid episode files, so each video-extension, non-sample file is parsed and
+    gated on its own. The caller imports whatever :attr:`SeasonImportValidation.accepted`
+    holds and surfaces :attr:`~SeasonImportValidation.rejected` for the rest — there
+    is no single pass/fail verdict for the whole download.
+
+    Per candidate file:
+
+    1. Non-video-extension names and sample/extra-named files
+       (:func:`_looks_like_sample_name`) are dropped up front, silently — same as
+       :func:`validate_import`; they were never episode candidates.
+    2. Parse the FULL folder-qualified relative path — a season-pack folder
+       routinely carries the season/quality tokens an individual episode filename
+       omits (mirrors :func:`validate_import`'s folder-qualified parse).
+    3. Media identity, gated on the expected SEASON as well as title
+       (:func:`matches_media` with ``expected_season=``, ``expected_year=None``
+       because a per-episode release name legitimately omits the show's first-air
+       year — same posture as ``decision_service.preview``'s TV path). A file for
+       the wrong show, or the right show's WRONG season (a mislabeled or
+       bonus-season file inside the pack), is
+       :attr:`~ImportRejectionReason.WRONG_MEDIA`.
+    4. Quality hard gate, identical to :func:`validate_import` (PROFILE-ALLOWED,
+       not equal-to-grabbed).
+    5. Sample / indeterminate-size floor, identical to :func:`validate_import`.
+    6. Multi-part / split-disk shape, identical to :func:`validate_import`
+       (:func:`_is_multi_part`): a split TV episode (``S02E01.CD1``/``Disc 1``)
+       still parses with a valid episode number, so without this gate it would
+       otherwise reach an ``accepted`` result and the caller's duplicate-
+       destination handling would keep only the largest chunk, completing the
+       season with an incomplete episode file. Rejected
+       :attr:`~ImportRejectionReason.MULTI_PART`, same as a movie split.
+    7. Episode-number gate — a file that parses with NO episode number at all
+       cannot be placed as a named episode:
+       :attr:`~ImportRejectionReason.NO_EPISODE_NUMBER`.
+
+    ALL applicable reasons (3-7) are collected for a file — one
+    :class:`EpisodeImportRejection` per reason, never just the first.
+
+    When ``requested_episodes`` is given (the operator asked for specific
+    episodes, not the whole season) a file that validated cleanly but whose
+    episode(s) share NO overlap with the requested set is moved to the BENIGN
+    ``skipped_not_requested`` bucket instead of ``accepted`` — not a rejection. A
+    multi-episode file that overlaps even partially is kept in ``accepted`` in
+    full; its other, unrequested episode(s) ride along (a file cannot be split).
+    """
+    requested = set(requested_episodes) if requested_episodes else None
+
+    accepted: list[EpisodeImportResult] = []
+    rejected: list[EpisodeImportRejection] = []
+    skipped_not_requested: list[EpisodeImportResult] = []
+
+    for video in files:
+        name = _basename(video.relative_path)
+        if not _is_video(name) or _looks_like_sample_name(name):
+            continue
+
+        # Parse the FULL relative path (folder included) — see step 2 above.
+        parsed = parser.parse(video.relative_path.replace("\\", "/"))
+        reasons: list[tuple[ImportRejectionReason, str]] = []
+
+        # 3. Media identity, gated on title + expected season (no year: see
+        #    docstring). A wrong-season file inside an otherwise-correct pack is
+        #    WRONG_MEDIA, same as a wrong-show file.
+        if not matches_media(
+            parsed,
+            expected_title=expected_title,
+            expected_year=None,
+            candidate_tmdb_id=0,
+            expected_tmdb_id=expected_tmdb_id,
+            expected_season=expected_season,
+        ):
+            reasons.append(
+                (
+                    ImportRejectionReason.WRONG_MEDIA,
+                    f"file {name!r} parsed as {parsed.clean_title!r} "
+                    f"(season={parsed.season!r}); expected {expected_title!r} "
+                    f"season {expected_season}",
+                )
+            )
+
+        # 3b. Ambiguous multi-season pack guard (placement precision). Step 3 parses
+        #     the FULL path so a season carried only by the folder is still seen, but
+        #     a MULTI-season folder (``S01-S03``) yields a season LIST that
+        #     ``_season_covers`` treats as covering the requested season -- so a file
+        #     whose OWN name says S01E01 would clear the season gate for a requested
+        #     S02 and then be PLACED under S02 as S02E01 (mis-routed, silently
+        #     completing the wrong season with the wrong file). When the parse is
+        #     multi-season, fall back to the file's OWN season (basename alone) and
+        #     require it to equal the requested season; an own-season that differs OR
+        #     cannot be determined is ambiguous -> WRONG_MEDIA, never placed. (A
+        #     single-season or folder-only ``int`` season is unambiguous and skips
+        #     this; season packs are still grab-selectable -- only per-file PLACEMENT
+        #     is tightened here.)
+        if isinstance(parsed.season, list):
+            own_season = parser.parse(name).season
+            if own_season != expected_season:
+                reasons.append(
+                    (
+                        ImportRejectionReason.WRONG_MEDIA,
+                        f"file {name!r} sits in a multi-season pack (parsed seasons "
+                        f"{parsed.season!r}); its own season {own_season!r} does not "
+                        f"unambiguously match requested season {expected_season}",
+                    )
+                )
+
+        # 4. Quality hard gate — key on PROFILE-ALLOWED, not equal-to-grabbed.
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        verdict = check_quality(quality, profile)
+        if not verdict.accepted:
+            reasons.append(
+                (
+                    ImportRejectionReason.QUALITY_NOT_WANTED,
+                    f"file {name!r} resolved to quality {quality.name!r}, "
+                    "which the profile does not allow",
+                )
+            )
+
+        # 5. Sample / indeterminate-size floor.
+        if video.size_bytes < _SAMPLE_FLOOR_BYTES:
+            reasons.append(
+                (
+                    ImportRejectionReason.SAMPLE,
+                    f"file {name!r} is {video.size_bytes} bytes, below the "
+                    f"{_SAMPLE_FLOOR_BYTES}-byte sample floor (unknown size counts as sample)",
+                )
+            )
+
+        # 6. Multi-part / split-disk shape — a split TV chunk still parses with a
+        #    valid episode number, so without this gate it would slip through as
+        #    a legitimate accepted episode and the duplicate-destination logic
+        #    would keep only the largest chunk, completing the season with an
+        #    incomplete episode file. Identical rule to validate_import's step 6.
+        if _is_multi_part(video.relative_path, expected_title):
+            reasons.append(
+                (
+                    ImportRejectionReason.MULTI_PART,
+                    f"path {video.relative_path!r} carries a multi-part / split-disk marker",
+                )
+            )
+
+        # 7. Episode-number gate (TV-only).
+        episodes = _episode_numbers(parsed.episode)
+        if not episodes:
+            reasons.append(
+                (
+                    ImportRejectionReason.NO_EPISODE_NUMBER,
+                    f"file {name!r} carries no parseable episode number",
+                )
+            )
+
+        if reasons:
+            rejected.extend(
+                EpisodeImportRejection(
+                    relative_path=video.relative_path,
+                    reason=reason,
+                    detail=detail,
+                )
+                for reason, detail in reasons
+            )
+            continue
+
+        result = EpisodeImportResult(video=video, parsed=parsed, episodes=episodes)
+        if requested is not None and requested.isdisjoint(episodes):
+            skipped_not_requested.append(result)
+        else:
+            accepted.append(result)
+
+    return SeasonImportValidation(
+        accepted=tuple(accepted),
+        rejected=tuple(rejected),
+        skipped_not_requested=tuple(skipped_not_requested),
     )

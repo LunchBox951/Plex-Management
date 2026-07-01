@@ -16,23 +16,32 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.services import grab_service, import_service, queue_service, request_service
+from plex_manager.services import (
+    grab_service,
+    import_service,
+    queue_service,
+    request_service,
+    season_request_service,
+)
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
+    DownloadScopeConflictError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
+    SeasonRequiredError,
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
     get_filesystem,
     get_library,
-    get_movies_root,
+    get_movies_root_optional,
     get_parser,
     get_prowlarr,
     get_qbittorrent,
     get_quality_profile,
     get_session,
+    get_tv_root_optional,
     require_api_key,
 )
 from plex_manager.web.routers.search_preview import run_preview
@@ -61,6 +70,8 @@ def _to_item(record: DownloadRecord) -> QueueItem:
         seed_ratio=record.seed_ratio,
         media_request_id=record.media_request_id,
         tmdb_id=record.tmdb_id,
+        season=record.season,
+        episodes=record.episodes,
         failed_reason=record.failed_reason,
     )
 
@@ -122,10 +133,36 @@ async def grab_endpoint(
         # Mirrors grab_service's RequestNotActiveError guard so both paths agree.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
 
+    # Branch on the request's ACTUAL media type, never on whether ``body.season``
+    # happens to be set -- a grab is always per-season for tv and never scoped
+    # for a movie, so the two invalid combinations are rejected up front, BEFORE
+    # run_preview runs an (unscoped, for tv) search or grab persists a bad row:
+    #   - tv with no season: an unscoped preview would run and, if accepted,
+    #     grab_service would update the parent MediaRequest directly instead of a
+    #     SeasonRequest (breaking the computed-rollup invariant), and the
+    #     importer would later block the download as season-less. And on the
+    #     empty-preview branch the season-scoped dead-end marker never fires
+    #     either, since there is no season to mark.
+    #   - movie with a season: would masquerade as a tv grab downstream (a fake
+    #     SeasonRequest, a season-scoped active-download guard bypassing the
+    #     real one-active-per-movie guard).
+    if request.media_type == "tv":
+        if body.season is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+            )
+    elif body.season is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
+        )
+
     result = await run_preview(
-        # Carry the season so a TV grab searches (and later records) the right
-        # season; it is None for a movie and so leaves movie behaviour unchanged.
-        SearchPreviewRequest(request_id=body.request_id, season=body.season),
+        # Carry season/episodes so a TV grab searches (and later records) the
+        # right scope; both are None for a movie and so leave movie behaviour
+        # unchanged.
+        SearchPreviewRequest(
+            request_id=body.request_id, season=body.season, episodes=body.episodes
+        ),
         session,
         prowlarr,
         parser,
@@ -136,10 +173,27 @@ async def grab_endpoint(
         # does not linger as 'downloading'/'searching' with nothing in flight.
         # BUT only when nothing is actually in flight: a re-search for a request
         # that ALREADY has an active download must not flip it to a dead-end status
-        # while that download is still running. Leave such a request untouched.
-        active = await SqlDownloadRepository(session).find_active_for_request(request.id)
+        # while that download is still running. Leave such a request untouched. The
+        # active check is season-SCOPED for a TV grab (body.season): another season
+        # still downloading must not suppress THIS season's honest dead-end, and a
+        # movie (season=None) keeps its whole-request guard unchanged.
+        active = await SqlDownloadRepository(session).find_active_for_request(
+            request.id, season=body.season
+        )
         if active is None:
-            await request_service.mark_no_acceptable_release(session, request.id)
+            if body.season is not None:
+                # TV: record the dead-end on the SEASON so it is visible + retryable
+                # per season, and let the parent MediaRequest.status stay a computed
+                # rollup (never a direct write _recompute_parent would clobber). The
+                # season service is FLUSH-ONLY by contract, so this caller owns the
+                # commit boundary (request_service.mark_no_acceptable_release, the
+                # movie path, commits internally instead).
+                await season_request_service.mark_no_acceptable_release(
+                    session, media_request_id=request.id, season_number=body.season
+                )
+                await session.commit()
+            else:
+                await request_service.mark_no_acceptable_release(session, request.id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)
@@ -152,9 +206,17 @@ async def grab_endpoint(
             tmdb_id=request.tmdb_id,
             year=request.year,
             season=body.season,
+            episodes=body.episodes,
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
+    except SeasonRequiredError as exc:
+        # Defense in depth: the endpoint guard above already rejects this before
+        # run_preview even runs, but the service-level invariant holds
+        # regardless of caller (never a season=None tv download persisted).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+        ) from exc
     except RequestNotActiveError as exc:
         # A stale terminal request id was grabbed while a newer active request owns
         # the media. Refused before anything was added to the client (no untracked
@@ -167,6 +229,13 @@ async def grab_endpoint(
         # refuse the parallel grab instead of spawning a second active row.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
+        ) from exc
+    except DownloadScopeConflictError as exc:
+        # The same physical torrent is already downloading for a DIFFERENT season
+        # (a multi-season pack re-grabbed per season). Refused honestly rather than
+        # returned as a no-op that would leave this season untracked.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="download_scope_conflict"
         ) from exc
     except GrabError as exc:
         # qBittorrent took the grab but no real info-hash could be determined;
@@ -187,12 +256,18 @@ async def import_endpoint(
     fs: Annotated[FileSystemPort, Depends(get_filesystem)],
     parser: Annotated[ParserPort, Depends(get_parser)],
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
-    movies_root: Annotated[str, Depends(get_movies_root)],
+    movies_root: Annotated[str | None, Depends(get_movies_root_optional)],
+    tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
 ) -> QueueItem:
     """Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
 
-    Requires Plex + the Movies root configured (409 ``service_not_configured``
-    otherwise). The correction-without-a-terminal button for a blocked import.
+    Requires Plex + qBittorrent configured (409 ``service_not_configured``
+    otherwise); the Movies/TV roots are each OPTIONAL here -- no upfront 409 for
+    either. A download whose media type's root is unset gets its own honest,
+    retryable ``ImportBlocked`` (surfaced in the returned ``QueueItem``, a normal
+    200) instead of the endpoint refusing to even try, so an install with only
+    ONE root configured can still retry-import that type. The
+    correction-without-a-terminal button for a blocked import.
     """
     record = await import_service.import_download(
         download_id=download_id,
@@ -203,6 +278,7 @@ async def import_endpoint(
         profile=profile,
         session=session,
         movies_root=movies_root,
+        tv_root=tv_root,
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found")

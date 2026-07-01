@@ -11,8 +11,10 @@ from __future__ import annotations
 from plex_manager.domain.import_validation import (
     ImportRejectionReason,
     ImportValidation,
+    SeasonImportValidation,
     VideoFile,
     validate_import,
+    validate_season_import,
 )
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import ParsedRelease
@@ -279,3 +281,264 @@ def test_largest_video_is_chosen_as_feature() -> None:
     assert result.video is not None
     assert result.video.relative_path == "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     assert result.accepted is True
+
+
+# -- validate_season_import: TV season-pack files, every file gated on its own --
+
+# basename -> recorded guessit-style field mapping for a "Breaking Bad" S02 pack.
+_TV_FIELDS: dict[str, dict[str, object]] = {
+    "Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Breaking.Bad.S02E02.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 2,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    # A CAM release of one episode in an otherwise-clean pack: right show, right
+    # season, right episode -- rejected on quality alone.
+    "Breaking.Bad.S02E03.HDCAM.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 3,
+    },
+    # Mislabeled/bonus file inside the "Season 2" pack that is actually Season 1.
+    "Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 1,
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    # A genuine multi-episode file.
+    "Breaking.Bad.S02E04E05.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": [4, 5],
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    # No episode token at all (a bonus/extra clip that slipped past the sample-name
+    # filter): right show, right season, but nothing to place as a named episode.
+    "Breaking.Bad.S02.Bonus.Content.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Breaking.Bad.S02.sample.mkv": {"title": "sample"},
+    # A multi-season pack FOLDER (S01-S03): parsing the FULL path yields a season
+    # LIST. A file whose OWN name is S01E01 must NOT be placed under a requested
+    # S02; a genuine S02E05 in the same pack must still import. The basename entries
+    # (S01E01 -> season 1 above, S02E05 below) carry each file's OWN season.
+    "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": [1, 2, 3],
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S02E05.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": [1, 2, 3],
+        "episode": 5,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Breaking.Bad.S02E05.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 5,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    # A split-disk chunk of a single episode: it STILL parses with a valid
+    # episode number, so without the same MULTI_PART guard validate_import uses
+    # it would otherwise reach an accepted result.
+    "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+}
+
+
+class FakeTvParser:
+    """A ParserPort that maps known basenames through the real source_mapping."""
+
+    def parse(self, release_name: str) -> ParsedRelease:
+        fields = _TV_FIELDS.get(release_name, {})
+        return to_parsed_release(fields, release_name)
+
+
+def _validate_season(
+    *files: VideoFile,
+    requested_episodes: list[int] | None = None,
+) -> SeasonImportValidation:
+    return validate_season_import(
+        list(files),
+        parser=FakeTvParser(),
+        profile=default_profile(),
+        expected_title="Breaking Bad",
+        expected_tmdb_id=1396,
+        expected_season=2,
+        requested_episodes=requested_episodes,
+    )
+
+
+def test_full_season_pack_all_accept() -> None:
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S02E02.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert result.rejected == ()
+    assert result.skipped_not_requested == ()
+    assert {frozenset(r.episodes) for r in result.accepted} == {
+        frozenset({1}),
+        frozenset({2}),
+    }
+
+
+def test_mixed_accept_reject_one_cam_episode() -> None:
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S02E03.HDCAM.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].episodes == (1,)
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.QUALITY_NOT_WANTED
+    assert result.rejected[0].relative_path == "Breaking.Bad.S02E03.HDCAM.x264-GRP.mkv"
+
+
+def test_wrong_season_in_pack_rejects_wrong_media() -> None:
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert len(result.accepted) == 1
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.WRONG_MEDIA
+    assert result.rejected[0].relative_path == "Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_ambiguous_multi_season_pack_placed_by_each_file_own_season() -> None:
+    # A completed multi-season pack (folder "S01-S03") imported for the requested
+    # season 2. Parsing the full path yields a season LIST that ``_season_covers``
+    # treats as covering S02, so a file whose OWN name is S01E01 would clear the
+    # season gate and be mis-placed under S02 as S02E01. The per-file guard rejects
+    # it (WRONG_MEDIA) while a genuine S02E05 file in the same pack still imports.
+    result = _validate_season(
+        VideoFile(
+            "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S02E05.1080p.WEB-DL.x264-GRP.mkv",
+            2 * _GIB,
+        ),
+        VideoFile(
+            "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv",
+            2 * _GIB,
+        ),
+    )
+    assert len(result.accepted) == 1
+    assert frozenset(result.accepted[0].episodes) == frozenset({5})
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.WRONG_MEDIA
+    assert result.rejected[0].relative_path.endswith(
+        "Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv"
+    )
+
+
+def test_no_episode_number_rejects() -> None:
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02.Bonus.Content.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert result.accepted == ()
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.NO_EPISODE_NUMBER
+
+
+def test_sample_and_nfo_are_silently_dropped() -> None:
+    # Neither the named sample nor a non-video (.nfo) file is a candidate at all:
+    # not accepted, not rejected, not skipped -- they were never episodes.
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S02.sample.mkv", 40 * 1024 * 1024),
+        VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.nfo", 1024),
+    )
+    assert len(result.accepted) == 1
+    assert result.rejected == ()
+    assert result.skipped_not_requested == ()
+
+
+def test_requested_episodes_skip_not_requested_ones() -> None:
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S02E02.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        requested_episodes=[1],
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].episodes == (1,)
+    assert result.rejected == ()
+    assert len(result.skipped_not_requested) == 1
+    assert result.skipped_not_requested[0].episodes == (2,)
+
+
+def test_multi_episode_file_kept_in_full_on_partial_overlap() -> None:
+    # Only episode 5 was requested, but the file also covers episode 4 (they
+    # cannot be split); the WHOLE file is accepted, not skipped.
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E04E05.1080p.WEB-DL.x264-GRP.mkv", 3 * _GIB),
+        requested_episodes=[5],
+    )
+    assert result.skipped_not_requested == ()
+    assert result.rejected == ()
+    assert len(result.accepted) == 1
+    assert result.accepted[0].episodes == (4, 5)
+
+
+def test_multi_episode_file_skipped_when_no_overlap_at_all() -> None:
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E04E05.1080p.WEB-DL.x264-GRP.mkv", 3 * _GIB),
+        requested_episodes=[1, 2],
+    )
+    assert result.accepted == ()
+    assert result.rejected == ()
+    assert len(result.skipped_not_requested) == 1
+    assert result.skipped_not_requested[0].episodes == (4, 5)
+
+
+def test_split_part_episode_rejects_multi_part() -> None:
+    # F5: a split TV episode chunk (S02E01.CD1) still parses with a valid episode
+    # number, so without applying the SAME split-part guard validate_import uses,
+    # it would reach an accepted result here; the duplicate-destination logic
+    # would then keep only the largest chunk and mark the season completed with
+    # an incomplete episode file. It must be rejected MULTI_PART instead.
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert result.accepted == ()
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.MULTI_PART
+    assert result.rejected[0].relative_path == "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_split_part_episode_rejected_others_in_pack_still_accepted() -> None:
+    # Partial success stays legit: a split chunk for E01 is rejected while a
+    # clean E02 file in the SAME pack is still accepted -- the season import is
+    # not all-or-nothing.
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S02E02.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].episodes == (2,)
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.MULTI_PART
+    assert result.rejected[0].relative_path == "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv"

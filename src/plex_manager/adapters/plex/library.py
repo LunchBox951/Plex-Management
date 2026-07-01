@@ -10,15 +10,15 @@ Construction is dependency-injected: ``base_url``, ``token`` and an
 later). The token is sent in the ``X-Plex-Token`` header — NEVER in the URL (which
 could be logged) — and is redacted from ``repr``.
 
-Caching: the web layer builds a fresh adapter per request, so the section list and
-the set of present tmdb ids live in MODULE-LEVEL TTL caches keyed by the
-``(base_url, token-hash)`` pair (a per-instance cache would never be hit). The
-token is part of the key so a rotated or mistyped credential for the same server
-re-fetches with the new token instead of returning the previous token's sections —
-otherwise a bad token could read back a stale "Connected to Plex" and be saved.
-Only a SHA-256 of the token enters the key, never the token itself. The TTL is
-short — availability changes when a scan completes, and a stale "present" answer
-for a few minutes is harmless.
+Caching: the web layer builds a fresh adapter per request, so the section list, the
+set of present movie tmdb ids, and the per-show map of present TV seasons each live
+in their own MODULE-LEVEL TTL cache keyed by the ``(base_url, token-hash)`` pair (a
+per-instance cache would never be hit). The token is part of the key so a rotated
+or mistyped credential for the same server re-fetches with the new token instead of
+returning the previous token's sections — otherwise a bad token could read back a
+stale "Connected to Plex" and be saved. Only a SHA-256 of the token enters the key,
+never the token itself. The TTL is short — availability changes when a scan
+completes, and a stale "present" answer for a few minutes is harmless.
 """
 
 from __future__ import annotations
@@ -105,12 +105,18 @@ class _TtlCache[V]:
 # cannot be per-instance.
 _SECTIONS_CACHE: _TtlCache[tuple[LibrarySection, ...]] = _TtlCache(_CACHE_TTL_SECONDS)
 _PRESENT_TMDB_CACHE: _TtlCache[frozenset[int]] = _TtlCache(_CACHE_TTL_SECONDS)
+# TV presence is per-season: tmdb id -> the frozenset of season numbers with at
+# least one episode present (``leafCount>0``). Same key/pattern/positive-only
+# discipline as ``_PRESENT_TMDB_CACHE`` (see its comment on ``is_available``) —
+# only a freshly-paged snapshot is ever stored, never a cached absence.
+_TV_SEASONS_CACHE: _TtlCache[dict[int, frozenset[int]]] = _TtlCache(_CACHE_TTL_SECONDS)
 
 
 def reset_caches() -> None:
     """Clear the module-level caches. Test-isolation helper (not part of the port)."""
     _SECTIONS_CACHE.clear()
     _PRESENT_TMDB_CACHE.clear()
+    _TV_SEASONS_CACHE.clear()
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -130,6 +136,15 @@ def _as_sequence(value: object) -> Sequence[object]:
 def _get_str(fields: Mapping[str, object], key: str) -> str | None:
     value = fields.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def _get_int(fields: Mapping[str, object], key: str) -> int | None:
+    value = fields.get(key)
+    if isinstance(value, bool):  # bool is an int subclass — exclude it
+        return None
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def _media_container(payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -289,20 +304,30 @@ class PlexLibrary:
         return sections
 
     async def is_available(
-        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        use_cache: bool = True,
+        season: int | None = None,
     ) -> bool:
         """Whether ``tmdb_id`` is already present in the library.
 
-        TV availability needs per-season presence logic and is deferred — it raises
-        honestly rather than returning a misleading ``False``.
+        For movies, "present" means the tmdb id shows up in some movie section.
+        For TV (``media_type='tv'``), presence is evaluated per-show: with
+        ``season=None`` it means the show itself is in the library; with
+        ``season=N`` it means that season has at least one episode present
+        (``leafCount>0`` on Plex's season metadata). Per-episode completeness is a
+        deferred follow-up — a season with a single episode present already reads
+        as "available".
 
         The availability reconcile cycle keeps the cached-presence fast path
         (``use_cache=True``); the request-dedup path passes ``use_cache=False`` so a
-        movie just REMOVED from Plex is seen as absent immediately and a re-request is
-        not blocked by a stale "present" answer for the cache TTL (G7).
+        title just REMOVED from Plex is seen as absent immediately and a re-request
+        is not blocked by a stale "present" answer for the cache TTL (G7).
         """
         if media_type == "tv":
-            raise NotImplementedError("tv availability deferred to next beta")
+            return await self._is_tv_available(tmdb_id, season, use_cache=use_cache)
         # Trust a cached PRESENCE (a movie in the library stays there) but never a
         # cached ABSENCE: right after an import+scan the first page commonly precedes
         # Plex indexing, so caching that miss would keep the title "Finalizing" for
@@ -317,6 +342,28 @@ class PlexLibrary:
         present = await self._collect_present_tmdb_ids()
         _PRESENT_TMDB_CACHE.set(self._cache_key, present)
         return tmdb_id in present
+
+    async def _is_tv_available(self, tmdb_id: int, season: int | None, *, use_cache: bool) -> bool:
+        """The tv branch of :meth:`is_available` — see its docstring for semantics."""
+
+        def _satisfied(seasons_by_show: Mapping[int, frozenset[int]]) -> bool | None:
+            """``True``/``False`` if ``seasons_by_show`` answers the question, else
+            ``None`` (show absent from this snapshot — the caller must re-page rather
+            than trust the absence)."""
+            seasons = seasons_by_show.get(tmdb_id)
+            if seasons is None:
+                return None
+            return True if season is None else season in seasons
+
+        if use_cache:
+            cached = _TV_SEASONS_CACHE.get(self._cache_key)
+            if cached is not None:
+                verdict = _satisfied(cached)
+                if verdict is True:
+                    return True
+        present = await self._collect_present_tv_seasons()
+        _TV_SEASONS_CACHE.set(self._cache_key, present)
+        return bool(_satisfied(present))
 
     async def _collect_present_tmdb_ids(self) -> frozenset[int]:
         """Page every movie section and gather the tmdb ids of its items."""
@@ -346,23 +393,112 @@ class PlexLibrary:
                 break
             start += _PAGE_SIZE
 
-    async def trigger_scan(self, path: str) -> None:
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """The seasons already present for ``tmdb_id`` — resolved in ONE fresh crawl.
+
+        A season is "present" when its ``leafCount>0`` (>=1 episode indexed), the
+        same per-season granularity as :meth:`is_available` with a ``season``. This
+        exists alongside ``is_available`` so ``ensure_seasons`` can resolve EVERY
+        requested season of a show from a single library read: calling
+        ``is_available(season=n, use_cache=False)`` once per season would re-page the
+        whole library N times (and hold the request's write transaction open across
+        all N). Always re-pages (never trusts a cached absence, mirroring
+        ``use_cache=False``) and refreshes the shared snapshot so a later cache read
+        stays consistent. Empty when the show is absent or has no indexed season.
+        """
+        present = await self._collect_present_tv_seasons()
+        _TV_SEASONS_CACHE.set(self._cache_key, present)
+        return present.get(tmdb_id, frozenset())
+
+    async def _collect_present_tv_seasons(self) -> dict[int, frozenset[int]]:
+        """Page every show section and gather each show's present seasons.
+
+        Returns tmdb id -> the frozenset of season numbers with ``leafCount>0``
+        (verified against ``/library/metadata/{ratingKey}/children``, which mirrors
+        overseerr's ``server/api/plexapi.ts:217-223``: season rows carry ``index``
+        (the season number, 0 for specials) and ``leafCount`` (episode count)). A
+        show with no ``ratingKey`` or no resolvable tmdb id is skipped — it can
+        never be matched by a request anyway.
+        """
+        result: dict[int, frozenset[int]] = {}
+        for section in await self.list_sections():
+            if section.type != "show":
+                continue
+            await self._collect_section_tv_seasons(section.key, result)
+        return result
+
+    async def _collect_section_tv_seasons(
+        self, key: str, result: dict[int, frozenset[int]]
+    ) -> None:
+        """Walk one show section's items page-by-page, resolving each show's seasons."""
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                await self._collect_show_seasons(_as_mapping(item), result)
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
+
+    async def _collect_show_seasons(
+        self, item: Mapping[str, object], result: dict[int, frozenset[int]]
+    ) -> None:
+        """Resolve one show item's tmdb id(s) and merge in its present seasons."""
+        tmdb_ids: set[int] = set()
+        _collect_item_tmdb_ids(item, tmdb_ids)
+        if not tmdb_ids:
+            return
+        rating_key = _get_str(item, "ratingKey")
+        if rating_key is None:
+            return
+        seasons = await self._fetch_present_seasons(rating_key)
+        for tmdb_id in tmdb_ids:
+            result[tmdb_id] = result.get(tmdb_id, frozenset()) | seasons
+
+    async def _fetch_present_seasons(self, rating_key: str) -> frozenset[int]:
+        """Return the season numbers with ``leafCount>0`` for one show's ``ratingKey``."""
+        payload = await self._get(f"/library/metadata/{rating_key}/children")
+        items = _as_sequence(_media_container(payload).get("Metadata"))
+        present: set[int] = set()
+        for item in items:
+            entry = _as_mapping(item)
+            index = _get_int(entry, "index")
+            leaf_count = _get_int(entry, "leafCount")
+            if index is not None and leaf_count is not None and leaf_count > 0:
+                present.add(index)
+        return frozenset(present)
+
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         """Ask Plex to scan ``path`` (a targeted partial-scan on the owning section).
 
-        The movie section whose location is a parent of ``path`` gets a partial
-        refresh of just that path. If NO section covers it (a path-mapping
-        difference between the app and Plex, or Plex didn't report locations), we
-        do a real FULL refresh of each movie section instead — heavier, but it
-        actually indexes the new file, unlike refreshing with a path Plex does not
-        own (a silent no-op that would strand the request at "Finalizing"). With no
-        movie section at all, raise so the import blocks honestly. A 2xx (possibly
-        empty body) is success. After scanning, the presence cache is invalidated so
-        the availability check re-pages Plex instead of returning a pre-import snapshot.
+        ``media_type`` scopes the candidate sections to movie sections for movies
+        and show sections for TV, so a TV season folder is never matched against a
+        movie section (or vice versa).
+
+        The section whose location is a parent of ``path`` gets a partial refresh
+        of just that path. If NO section covers it (a path-mapping difference
+        between the app and Plex, or Plex didn't report locations), we do a real
+        FULL refresh of each candidate section instead — heavier, but it actually
+        indexes the new file, unlike refreshing with a path Plex does not own (a
+        silent no-op that would strand the request at "Finalizing"). With no
+        candidate section at all, raise so the import blocks honestly. A 2xx
+        (possibly empty body) is success. After scanning, the presence cache for
+        ``media_type`` is invalidated so the availability check re-pages Plex
+        instead of returning a pre-import snapshot.
         """
-        movie_sections = [s for s in await self.list_sections() if s.type == "movie"]
-        if not movie_sections:
-            raise PlexLibraryError("no Plex movie library section to scan into")
-        matched = [s for s in movie_sections if _section_covers(s, path)]
+        section_type: Literal["movie", "show"] = "movie" if media_type == "movie" else "show"
+        candidate_sections = [s for s in await self.list_sections() if s.type == section_type]
+        if not candidate_sections:
+            raise PlexLibraryError(f"no Plex {section_type} library section to scan into")
+        matched = [s for s in candidate_sections if _section_covers(s, path)]
         try:
             if matched:
                 # The raw path is handed to httpx as a query param so it is
@@ -371,13 +507,19 @@ class PlexLibrary:
                     await self._request(f"/library/sections/{section.key}/refresh", {"path": path})
             else:
                 _logger.warning(
-                    "import path is not under any Plex movie section location; "
-                    "full-scanning every movie section instead of a no-op partial scan"
+                    "import path is not under any Plex %s section location; "
+                    "full-scanning every %s section instead of a no-op partial scan",
+                    section_type,
+                    section_type,
                 )
-                for section in movie_sections:
+                for section in candidate_sections:
                     await self._request(f"/library/sections/{section.key}/refresh", {})
         finally:
-            # Bust the per-credential presence index so completed -> available
-            # promotion is not delayed up to the full cache TTL after the file is in
-            # Plex.
-            _PRESENT_TMDB_CACHE.invalidate(self._cache_key)
+            # Bust the per-credential presence index for THIS media type so
+            # completed -> available promotion is not delayed up to the full cache
+            # TTL after the file is in Plex. Scoped to the type just scanned — a
+            # movie scan cannot change TV season presence and vice versa.
+            if media_type == "movie":
+                _PRESENT_TMDB_CACHE.invalidate(self._cache_key)
+            else:
+                _TV_SEASONS_CACHE.invalidate(self._cache_key)

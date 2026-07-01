@@ -10,6 +10,7 @@ real bytes.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -27,6 +28,7 @@ from plex_manager.models import (
     MediaRequest,
     MediaType,
     RequestStatus,
+    SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
@@ -209,8 +211,9 @@ class _ScanFailsLibrary(FakeLibrary):
     """A FakeLibrary whose targeted scan always fails with a transient Plex error,
     driving import_download into its scan-failure rollback branch."""
 
-    async def trigger_scan(self, path: str) -> None:
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         self.scanned.append(path)
+        self.scan_calls.append((path, media_type))
         raise PlexLibraryError(f"plex scan failed for {path}")
 
 
@@ -421,6 +424,41 @@ async def test_import_with_no_video_file_is_blocked(
     assert record.status == DownloadState.ImportBlocked.value
     assert record.failed_reason is not None
     assert "no video file" in record.failed_reason
+
+
+async def test_import_movies_root_unset_is_an_honest_retryable_block(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Mirrors ``test_import_tv_root_unset_is_an_honest_retryable_block``: an
+    install with the tv root configured but NOT the movies root must still block
+    a movie import honestly (never a crash from ``Path(None)``), and never gate
+    on movies_root being set to import the OTHER media type."""
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=FakeQbittorrent(),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=None,
+            tv_root="/unused",
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "movies library root is not configured"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
 
 
 async def test_import_is_idempotent_on_an_already_imported_row(
@@ -650,7 +688,7 @@ class _FlipToFailedDuringScanLibrary(FakeLibrary):
         self._sessionmaker = sessionmaker_
         self._download_id = download_id
 
-    async def trigger_scan(self, path: str) -> None:
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         async with self._sessionmaker() as session:
             row = await session.get(Download, self._download_id)
             assert row is not None
@@ -658,6 +696,7 @@ class _FlipToFailedDuringScanLibrary(FakeLibrary):
             row.failed_reason = "marked failed by operator"
             await session.commit()
         self.scanned.append(path)
+        self.scan_calls.append((path, media_type))
 
 
 async def test_final_import_transition_does_not_overwrite_a_concurrently_changed_row(
@@ -838,3 +877,477 @@ async def test_block_does_not_overwrite_operator_mark_failed_during_gap(
         assert len(blocklisted) == 1  # operator's blocklist stands
         download = await session.get(Download, download_id)
         assert download is not None and download.status == DownloadState.Failed.value
+
+
+# ---------------------------------------------------------------------------
+# TV import — season-scoped, partial-success, one scan for the whole season.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_tv(
+    sessionmaker_: SessionMaker,
+    *,
+    season: int,
+    request_status: RequestStatus = RequestStatus.downloading,
+    season_status: str = "downloading",
+    download_status: str = DownloadState.ImportPending.value,
+    episodes: list[int] | None = None,
+) -> tuple[int, int, int]:
+    """Insert a tv request + one tracked season + a download for that season.
+
+    Returns ``(download_id, request_id, season_request_id)``.
+    """
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=request_status,
+        )
+        session.add(request)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=request.id, season_number=season, status=season_status
+        )
+        session.add(season_row)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=download_status,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=season,
+            episodes_json=episodes,
+        )
+        session.add(download)
+        await session.commit()
+        return download.id, request.id, season_row.id
+
+
+async def _import_tv(
+    sessionmaker_: SessionMaker,
+    download_id: int,
+    tv_root: Path,
+    qbt: FakeQbittorrent,
+    library: FakeLibrary,
+) -> DownloadRecord | None:
+    async with sessionmaker_() as session:
+        return await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=qbt,
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root="/unused",  # required by the port, never touched by the tv branch
+            tv_root=str(tv_root),
+        )
+
+
+async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert (season_dir / "Some Show - S02E01.mkv").exists()
+    assert (season_dir / "Some Show - S02E02.mkv").exists()
+    # ONE targeted scan of the whole season directory, never one per episode.
+    assert library.scan_calls == [(str(season_dir), "tv")]
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None
+    assert season_row.status.value == "completed"
+    assert request is not None
+    assert request.status is RequestStatus.completed  # "Finalizing", not yet available
+
+
+async def test_import_tv_partial_accept_places_only_the_good_episode(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A season pack with one good episode and one CAM: partial success is legit
+    # for tv (unlike the movie all-or-nothing verdict) -- the good episode is
+    # imported and the download still reaches Imported / the season 'completed'.
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.CAM.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert (season_dir / "Some Show - S02E01.mkv").exists()
+    assert not (season_dir / "Some Show - S02E02.mkv").exists()  # the CAM was never placed
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "completed"
+    assert request is not None and request.status is RequestStatus.completed
+
+
+async def test_import_tv_blocks_the_whole_season_when_every_file_is_rejected(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.CAM.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.CAM.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.CAM.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "quality_not_wanted" in record.failed_reason
+    assert not any(tv_root.iterdir())  # nothing was imported into the library
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None
+    assert season_row.status.value == "import_blocked"
+    assert request is not None
+    # The season's block is a surfaced, retryable "needs attention" state -- never
+    # a request left lying as 'downloading' while nothing is downloading.
+    assert request.status is RequestStatus.import_blocked
+
+
+async def test_import_tv_episode_scoped_grab_blocks_when_incomplete(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """A grab scoped to episodes [4, 5] whose download only contains E04 must NOT be
+    finalized as a completed season with E05 silently missing (no retry). It is an
+    honest, retryable ImportBlocked, and NOTHING is placed -- a scoped grab is never
+    half-imported."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02E04.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E04.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2, episodes=[4, 5])
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None and "incomplete" in record.failed_reason
+    assert not any(tv_root.iterdir())  # E04 was NOT placed -- no half-import
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_tv_dedupes_two_files_for_the_same_episode_keeping_the_largest(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """A season pack that ships the SAME episode twice (e.g. a file plus its
+    PROPER/REPACK, or a mixed-resolution duplicate) must not roll back and block
+    the whole season: the smaller duplicate is dropped before placing, the larger
+    one is kept, and every OTHER episode still imports (partial success stays
+    legitimate over what is really just one duplicate)."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(
+        release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRPA.mkv", size_bytes=60 * 1024 * 1024
+    )
+    _make_video(
+        release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRPB.mkv", size_bytes=90 * 1024 * 1024
+    )
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value  # NOT blocked over the duplicate
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    ep1 = season_dir / "Some Show - S02E01.mkv"
+    assert ep1.exists()
+    assert ep1.stat().st_size == 90 * 1024 * 1024  # the LARGER duplicate won, not whichever
+    assert (season_dir / "Some Show - S02E02.mkv").exists()  # the other episode still imported
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "completed"
+    assert request is not None and request.status is RequestStatus.completed
+
+
+async def test_import_tv_single_file_symlink_escaping_parent_is_blocked_not_copied(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """A single-file TV 'torrent' (no season-pack folder) that is ITSELF a
+    symlink escaping its own parent directory must never be followed -- mirrors
+    ``largest_video_file``'s is_file containment guard on the movie path.
+    Without it, the importer would copy an arbitrary out-of-tree file into the
+    public TV library. An honest 'no video found' block, never a silent copy."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    secret = tmp_path / "secret.mkv"  # OUTSIDE the download tree
+    _make_video(secret)
+    escape_link = downloads_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv"
+    escape_link.symlink_to(secret)
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(escape_link), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "no video file found in the download"
+    assert not any(tv_root.iterdir())  # nothing was imported into the library
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_tv_root_unset_is_an_honest_retryable_block(
+    sessionmaker_: SessionMaker,
+) -> None:
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=1)
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=FakeQbittorrent(),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root="/unused",
+            tv_root=None,
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "tv library root is not configured"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_tv_scan_failure_never_leaves_a_lying_imported_history_row(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """F3: when the Plex scan fails after every episode in a season pack was
+    placed, the placed files are rolled back -- the ``imported`` DownloadHistory
+    rows for those SAME episodes must never have been committed either. Before
+    the fix, each episode's ``imported`` row was added to the session (and
+    committed alongside the download_path bookkeeping) BEFORE the scan ran, so a
+    scan failure left the audit trail claiming episodes were imported when they
+    had in fact just been deleted (honesty over silence)."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = _ScanFailsLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    # Rolled back: neither placed episode survives the scan failure.
+    assert not (season_dir / "Some Show - S02E01.mkv").exists()
+    assert not (season_dir / "Some Show - S02E02.mkv").exists()
+
+    async with sessionmaker_() as session:
+        events = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(DownloadHistory.torrent_hash == _HASH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Honesty over silence: no "imported" row for a file that was just deleted.
+    assert events  # import_started was still recorded, honestly
+    assert all(e.event_type != DownloadHistoryEvent.imported for e in events)
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+class _FailsOnSecondCallFs(LocalFileSystem):
+    """A LocalFileSystem whose ``hardlink_or_copy`` succeeds for the FIRST file
+    placed (whichever one the loop visits first -- directory iteration order is
+    not guaranteed across filesystems) and fails for the SECOND, simulating a
+    mid-loop copy failure on a LATER file in a season pack after an earlier
+    file already placed successfully."""
+
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+        self._calls += 1
+        if self._calls >= 2:
+            raise OSError("simulated copy failure")
+        super().hardlink_or_copy(src, dst)
+
+
+async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """F3 (second case): when a LATER episode's copy fails mid-loop, the earlier
+    episode already placed in THIS SAME loop is rolled back too (existing
+    behaviour) -- and, likewise, its ``imported`` history row must never have
+    been committed. Before the fix, the earlier file's ``imported`` row was
+    added to the session inside the loop and got flushed to the DB by the
+    failure path's own ``_block`` commit, lying about a file that had just been
+    unlinked."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=_FailsOnSecondCallFs(),
+            library=library,
+            qbt=_qbt(release_dir),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root="/unused",
+            tv_root=str(tv_root),
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    # Whichever episode placed first was rolled back too; no *.mkv survives.
+    if season_dir.exists():
+        assert not list(season_dir.glob("*.mkv"))
+
+    async with sessionmaker_() as session:
+        events = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(DownloadHistory.torrent_hash == _HASH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert all(e.event_type != DownloadHistoryEvent.imported for e in events)
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_run_import_cycle_drains_a_tv_download_to_a_completed_season(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=1)
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        await run_import_cycle(
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=_qbt(release_dir),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root="/unused",
+            tv_root=str(tv_root),
+        )
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert download is not None and download.status == DownloadState.Imported.value
+    assert season_row is not None and season_row.status.value == "completed"
+    assert request is not None and request.status is RequestStatus.completed
+
+
+async def test_run_availability_cycle_promotes_a_completed_season_to_available(
+    sessionmaker_: SessionMaker,
+) -> None:
+    _download_id, request_id, season_id = await _seed_tv(
+        sessionmaker_,
+        season=1,
+        request_status=RequestStatus.completed,
+        season_status="completed",
+        download_status=DownloadState.Imported.value,
+    )
+    library = FakeLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})})
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "available"
+    assert request is not None and request.status is RequestStatus.available
+
+
+async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_plex(
+    sessionmaker_: SessionMaker,
+) -> None:
+    _download_id, request_id, season_id = await _seed_tv(
+        sessionmaker_,
+        season=1,
+        request_status=RequestStatus.completed,
+        season_status="completed",
+        download_status=DownloadState.Imported.value,
+    )
+    library = FakeLibrary(available_tv_seasons={})  # Plex has not indexed it yet
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "completed"
+    assert request is not None and request.status is RequestStatus.completed  # stays "Finalizing"

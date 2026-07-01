@@ -2,11 +2,12 @@
 
 When a completed torrent reaches ``ImportPending`` (the reconciler maps the
 client's seeding/complete states there), this service validates the file against
-the requested movie with the SAME decision brain the search uses, hardlinks it
-into the Movies library under the Plex naming convention, triggers a targeted Plex
-scan, and marks the request ``completed`` ("Finalizing"). A later reconcile cycle
-confirms availability via :meth:`LibraryPort.is_available` and promotes it to
-``available`` — honest two-phase availability (ADR-0010).
+the requested movie/show with the SAME decision brain the search uses, hardlinks
+it into the Movies/TV library under the Plex naming convention, triggers a
+targeted Plex scan, and marks the request (or, for TV, the season)
+``completed`` ("Finalizing"). A later reconcile cycle confirms availability via
+:meth:`LibraryPort.is_available` and promotes it to ``available`` — honest
+two-phase availability (ADR-0010).
 
 A failed validation or move is an honest, retryable ``ImportBlocked`` (a surfaced
 reason + the ``POST /queue/{id}/import`` retry button) — never a silent failure
@@ -18,6 +19,12 @@ The reconcile loop only AUTO-drains ``ImportPending`` (and a crash-stranded
 ``Importing``); an ``ImportBlocked`` row is retried only by an explicit operator
 action, so a permanently-bad file (e.g. a mislabelled CAM) is not re-validated
 every cycle.
+
+TV is season-scoped and legitimately PARTIAL: a season-pack download can ship
+many independently-valid episode files, so :func:`_import_tv_locked` validates
+and places EVERY file, running ONE targeted Plex scan for the whole season
+directory (never one per episode) and honestly blocking only when NOTHING in the
+download validated.
 """
 
 from __future__ import annotations
@@ -26,12 +33,21 @@ import asyncio
 import contextlib
 import logging
 import os
-from pathlib import Path
-from typing import TYPE_CHECKING
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Final
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
-from plex_manager.domain.import_validation import VideoFile, validate_import
-from plex_manager.domain.naming import plex_movie_relative_path
+from plex_manager.domain.import_validation import (
+    EpisodeImportResult,
+    VideoFile,
+    validate_import,
+    validate_season_import,
+)
+from plex_manager.domain.naming import (
+    plex_movie_relative_path,
+    plex_tv_episode_relative_path,
+    plex_tv_season_relative_dir,
+)
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Download,
@@ -39,8 +55,11 @@ from plex_manager.models import (
     DownloadHistoryEvent,
     RequestStatus,
 )
+from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
+from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,7 +69,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.parser import ParserPort
-    from plex_manager.ports.repositories import DownloadRecord
+    from plex_manager.ports.repositories import DownloadRecord, RequestRecord
 
 __all__ = ["import_download", "run_availability_cycle", "run_import_cycle"]
 
@@ -71,9 +90,24 @@ _AUTO_DRAIN: frozenset[str] = frozenset(
     {DownloadState.ImportPending.value, DownloadState.Importing.value}
 )
 
+# Cap on how many per-file rejection reasons a whole-season block's
+# ``failed_reason`` joins together -- a 20+ episode pack where every file is
+# rejected must not produce an unreadably long string.
+_MAX_BLOCK_REASONS: Final = 10
+
 
 class _NoVideoError(Exception):
     """No importable video file was found under the resolved content path."""
+
+
+def _is_within(root_real: str, candidate_real: str) -> bool:
+    """True if ``candidate_real`` is ``root_real`` or sits under it (both realpaths).
+
+    Mirrors ``adapters.filesystem.local._is_within`` verbatim (kept local rather
+    than imported: that name is private to the adapter, and this service must not
+    reach into a specific ``FileSystemPort`` implementation's internals).
+    """
+    return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
 
 
 def _resolve_content(status: DownloadStatus | None, download_path: str | None) -> str | None:
@@ -114,6 +148,41 @@ def _resolve_source(fs: FileSystemPort, content_path: str) -> tuple[str, int, st
         else os.path.dirname(content_path)
     )
     return src, os.path.getsize(src), os.path.relpath(src, anchor)
+
+
+def _resolve_tv_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, int, str]]:
+    """Enumerate EVERY candidate video file under a TV download's content.
+
+    Same anchor-above-content-root trick as :func:`_resolve_source` (the release
+    folder's season/quality tokens stay in the parsed relative path), but returns
+    every eligible file rather than picking one "largest" feature: a season pack
+    legitimately ships many independently-valid episodes, each validated on its
+    own by :func:`~plex_manager.domain.import_validation.validate_season_import`.
+    """
+    root_path = Path(content_path)
+    if root_path.is_file():
+        # A single-file torrent (no season-pack folder): mirror
+        # ``largest_video_file``'s is_file branch (adapters/filesystem/local.py)
+        # verbatim -- the lone file is the only candidate, and its filename alone
+        # is sufficient (no folder to anchor above). Same containment + extension
+        # guard as that branch: a single-episode grab is a single-file torrent, so
+        # a content root that is ITSELF a symlink escaping its own parent
+        # directory (or that isn't even a video file) must never be followed, or
+        # the importer would copy an arbitrary out-of-tree file into the public
+        # TV library. An honest "no video found" ([]) -> whole-download block,
+        # never a silent skip.
+        resolved = os.path.realpath(content_path)
+        parent_real = os.path.realpath(root_path.parent)
+        if root_path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(
+            parent_real, resolved
+        ):
+            return []
+        return [(resolved, os.path.getsize(resolved), root_path.name)]
+    anchor = os.path.dirname(os.path.normpath(content_path))
+    return [
+        (abs_path, size, os.path.relpath(abs_path, anchor))
+        for abs_path, size, _rel in fs.list_video_files(content_path)
+    ]
 
 
 def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
@@ -159,6 +228,17 @@ def _remove_quietly(path: Path) -> None:
         path.unlink()
 
 
+def _remove_quietly_many(paths: list[Path]) -> None:
+    """Best-effort unlink of every path THIS call placed (TV scan-failure rollback).
+
+    Unlike the movie path's single ``dst``, a season import can place several
+    episode files before its one combined scan fails; each is rolled back the
+    same best-effort way.
+    """
+    for path in paths:
+        _remove_quietly(path)
+
+
 # Per-download serialization. The reconcile loop and an operator's
 # POST /queue/{id}/import retry share ONE event loop (single process; SQLite is the
 # store), so without this two import attempts of the SAME download could both claim
@@ -186,6 +266,7 @@ async def _block(
     reason: str,
     *,
     request_id: int | None = None,
+    season: int | None = None,
     clear_download_path: bool = False,
 ) -> None:
     """Move a download to the retryable ``ImportBlocked`` state, honestly.
@@ -204,6 +285,12 @@ async def _block(
     nothing is downloading (north-star #3) — but ONLY when the block actually applied,
     so a row the operator already re-armed to ``searching`` is left alone. The operator
     retries the import or rejects the release (mark-failed -> blocklist + re-search).
+
+    ``season`` (TV only) routes the write through ``season_request_service`` instead
+    of setting the request status directly: a TV request's status is a COMPUTED
+    rollup of its seasons (never itself the direct target of a move), so only the
+    OWNING SEASON moves to ``import_blocked`` and the parent's rollup is recomputed
+    from it. ``None`` (movie, the default) leaves the movie behaviour unchanged.
     """
     blocked = await download_repo.update_status_if_in(
         download_id,
@@ -221,9 +308,17 @@ async def _block(
         await session.rollback()
         return
     if request_id is not None:
-        await SqlRequestRepository(session).set_status(
-            request_id, RequestStatus.import_blocked.value
-        )
+        if season is not None:
+            await season_request_service.set_status(
+                session,
+                media_request_id=request_id,
+                season_number=season,
+                status=RequestStatus.import_blocked.value,
+            )
+        else:
+            await SqlRequestRepository(session).set_status(
+                request_id, RequestStatus.import_blocked.value
+            )
     await session.commit()
 
 
@@ -236,13 +331,21 @@ async def import_download(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
-    movies_root: str,
+    movies_root: str | None = None,
+    tv_root: str | None = None,
 ) -> DownloadRecord | None:
-    """Validate, import, and scan a single completed download (movies-first).
+    """Validate, import, and scan a single completed download.
 
     Idempotent and safe to re-run: an already-``Imported`` (or non-import-stage)
     row is a no-op. Returns the resulting :class:`DownloadRecord`, or ``None`` if
     the download id no longer exists.
+
+    Both roots are optional and independently honest: a movie download reaching
+    this function while ``movies_root`` is unset gets a retryable ``ImportBlocked``
+    ("movies library root is not configured"); a tv download reaching it while
+    ``tv_root`` is unset gets the same treatment ("tv library root is not
+    configured"). Neither ever crashes, and an install that has only ONE of the
+    two roots configured still imports that type normally.
 
     Serialized per download id: the reconcile loop and an operator's
     POST /queue/{id}/import retry must never import the SAME row concurrently.
@@ -257,6 +360,7 @@ async def import_download(
             profile=profile,
             session=session,
             movies_root=movies_root,
+            tv_root=tv_root,
         )
 
 
@@ -269,7 +373,8 @@ async def _import_download_locked(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
-    movies_root: str,
+    movies_root: str | None = None,
+    tv_root: str | None = None,
 ) -> DownloadRecord | None:
     download_repo = SqlDownloadRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -277,10 +382,13 @@ async def _import_download_locked(
     row = await session.get(Download, download_id)
     if row is None:
         return None
-    # Capture the hash now: the conditional-claim abort path below rolls back, which
-    # expires ``row``; reading ``row.torrent_hash`` after that would trigger an async
-    # lazy-load from a sync context (MissingGreenlet).
+    # Capture now: the conditional-claim abort path below rolls back, which
+    # expires ``row``; reading these after that would trigger an async lazy-load
+    # from a sync context (MissingGreenlet). ``season``/``episodes`` are movie-
+    # irrelevant (always ``None`` there) and only consumed by the tv branch below.
     torrent_hash = row.torrent_hash
+    season = row.season
+    episodes = row.episodes_json
     if row.status not in _RESUMABLE:
         return await download_repo.get_by_hash(torrent_hash)  # already done / not importable
     if row.media_request_id is None:
@@ -291,12 +399,61 @@ async def _import_download_locked(
     if request is None:
         await _block(session, download_repo, download_id, "owning request no longer exists")
         return await download_repo.get_by_hash(torrent_hash)
-    if request.media_type != "movie":
+
+    if request.media_type == "tv":
+        if tv_root is None:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                "tv library root is not configured",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        if season is None:  # pragma: no cover - grab_service always threads season for tv
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                "tv download is missing its season",
+                request_id=request.id,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        return await _import_tv_locked(
+            download_id=download_id,
+            request=request,
+            season=season,
+            episodes=episodes,
+            download_path=row.download_path,
+            fs=fs,
+            library=library,
+            qbt=qbt,
+            parser=parser,
+            profile=profile,
+            session=session,
+            tv_root=tv_root,
+            torrent_hash=torrent_hash,
+        )
+    if request.media_type != "movie":  # pragma: no cover - MediaType enum has only movie/tv
         await _block(
             session,
             download_repo,
             download_id,
-            "tv import deferred to the next beta",
+            f"unsupported media_type {request.media_type!r}",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    if movies_root is None:
+        # Mirrors the tv branch's ``tv_root is None`` guard above: an honest,
+        # retryable block rather than gating this whole cycle on movies_root being
+        # set (an install with only the TV root configured must still import TV).
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "movies library root is not configured",
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
@@ -419,7 +576,7 @@ async def _import_download_locked(
     # left intact. Clear the breadcrumb on rollback so the deleted path can't shadow
     # the torrent's content on a later retry.
     try:
-        await library.trigger_scan(str(dst.parent))
+        await library.trigger_scan(str(dst.parent), "movie")
     except (PlexLibraryError, PlexAuthError) as exc:
         # ``row.download_path`` is read live here (the breadcrumb commit set it for a
         # placed=True attempt; a crash-resume loaded it as dst). Safe only because the
@@ -470,6 +627,290 @@ async def _import_download_locked(
     return await download_repo.get_by_hash(torrent_hash)
 
 
+async def _import_tv_locked(
+    *,
+    download_id: int,
+    request: RequestRecord,
+    season: int,
+    episodes: list[int] | None,
+    download_path: str | None,
+    fs: FileSystemPort,
+    library: LibraryPort,
+    qbt: DownloadClientPort,
+    parser: ParserPort,
+    profile: QualityProfile,
+    session: AsyncSession,
+    tv_root: str,
+    torrent_hash: str,
+) -> DownloadRecord | None:
+    """Validate EVERY file in a completed TV season download; import whatever
+    accepted, ONE Plex scan for the whole season, then mark the SEASON completed.
+
+    Mirrors ``_import_download_locked`` (movies-first) but a season-pack download
+    legitimately ships MANY independently-valid episode files, so partial success
+    is legitimate: every file :func:`~plex_manager.domain.import_validation.
+    validate_season_import` accepts is placed, one targeted scan runs for the
+    whole season directory (never one per episode), and a whole-season block only
+    happens when NOTHING in the download validated. Rejected files are LOGGED (not
+    persisted as history); skipped-not-requested files (validated cleanly but
+    outside an operator-scoped ``episodes`` filter) are dropped silently -- neither
+    is a failure worth surfacing on its own. Accepted files that collapse to the
+    SAME destination (e.g. an episode plus its PROPER/REPACK) are deduped to the
+    largest one BEFORE placing, so one duplicate can never roll back / block
+    every OTHER genuinely-distinct episode in the pack.
+
+    Per-episode ``imported`` :class:`DownloadHistory` rows are staged in memory
+    while files are placed and only durably committed once the scan AND the
+    finalize compare-and-swap have BOTH succeeded -- mirroring the movie path,
+    which likewise writes its ``imported`` row only after a successful scan. A
+    later file's copy failure or a scan failure rolls placed files back via
+    :func:`_remove_quietly_many`/:func:`_block` before any of those rows are ever
+    added to the session, so the audit trail can never claim an episode was
+    imported when it was in fact deleted moments later.
+
+    Unlike the movie path's single ``download_path`` breadcrumb (which lets a
+    crash-resumed run re-adopt a placement it made before a prior crash), a TV
+    import that crashes mid-copy is simply retried by a fresh run: each file's
+    placement is independently idempotent (:func:`_place_file` skips an already-
+    identical-size destination), so only the files THIS invocation itself placed
+    are rolled back on a scan failure -- a single column cannot represent "N
+    placed files" across invocations, so cross-invocation ownership tracking is
+    not attempted here (a scoped follow-up, like true per-episode completeness).
+    """
+    download_repo = SqlDownloadRepository(session)
+
+    status = await qbt.get_status(torrent_hash)
+    content = _resolve_content(status, download_path)
+    if content is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "download client reported no content path",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    sources = await asyncio.to_thread(_resolve_tv_sources, fs, content)
+    if not sources:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "no video file found in the download",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    # Validate EVERY file against the SAME decision brain the search uses (title +
+    # season identity, quality gate, sample floor, episode-number gate). Partial
+    # success is legitimate here, unlike the movie path's all-or-nothing verdict.
+    validation = validate_season_import(
+        [VideoFile(relative_path=rel, size_bytes=size) for _abs, size, rel in sources],
+        parser=parser,
+        profile=profile,
+        expected_title=request.title,
+        expected_tmdb_id=request.tmdb_id,
+        expected_season=season,
+        requested_episodes=episodes,
+    )
+    for rejection in validation.rejected:
+        _logger.warning(
+            "tv import: rejected %s (%s): %s",
+            rejection.relative_path,
+            rejection.reason.value,
+            rejection.detail,
+        )
+
+    if not validation.accepted:
+        # Nothing survived -- an honest, whole-season block. Cap the joined
+        # per-file reasons so a large pack where every file is rejected doesn't
+        # produce an unreadably long ``failed_reason``.
+        reason_parts = [
+            f"{r.relative_path}: {r.reason.value}: {r.detail}"
+            for r in validation.rejected[:_MAX_BLOCK_REASONS]
+        ]
+        if len(validation.rejected) > _MAX_BLOCK_REASONS:
+            reason_parts.append(f"(+{len(validation.rejected) - _MAX_BLOCK_REASONS} more)")
+        reason = "; ".join(reason_parts) or (
+            f"no accepted episode among {len(sources)} file(s) inspected "
+            f"({len(validation.skipped_not_requested)} not requested)"
+        )
+        await _block(
+            session, download_repo, download_id, reason, request_id=request.id, season=season
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    # Episode-SCOPED completeness gate. When the grab named specific episodes
+    # (``episodes`` is a concrete list, not a whole-season ``None``), finalizing on a
+    # PARTIAL set would place those files and mark the season completed/available
+    # while a REQUESTED episode is still missing -- with no retry, a dishonest
+    # "done". Require the union of accepted episodes to COVER every requested
+    # episode; otherwise block honestly as a retryable ``ImportBlocked`` (never
+    # place a partial set), so the operator can re-search for a release carrying the
+    # rest. A whole-season grab (``episodes`` falsy) imposes no coverage requirement.
+    if episodes:
+        accepted_episodes = {ep for result in validation.accepted for ep in result.episodes}
+        missing = sorted(set(episodes) - accepted_episodes)
+        if missing:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"episode-scoped grab is incomplete: requested {sorted(set(episodes))}, "
+                f"missing {missing} (accepted {sorted(accepted_episodes)})",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+    # Multiple accepted files can resolve to the SAME destination -- e.g. an
+    # episode alongside its PROPER/REPACK, or a mixed-resolution pack shipping the
+    # same episode twice (identical episode number(s) AND extension). Collapse to
+    # the LARGEST file per destination BEFORE claiming/placing (mirrors the movie
+    # path's largest-feature pick): without this, the second ``_place_file`` call
+    # below would find a differently-sized file already at ``dst``, raise
+    # ``FileExistsError``, and the rollback+block path a few lines down would
+    # discard every OTHER already-placed, genuinely-distinct episode and block the
+    # WHOLE season -- defeating "partial success is legitimate" over what is
+    # really just a single duplicate. The smaller duplicate is dropped with a
+    # logged warning (never silently), same posture as a validation rejection.
+    abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
+    by_relative: dict[PurePosixPath, EpisodeImportResult] = {}
+    for result in validation.accepted:
+        src = abs_by_rel[result.video.relative_path]
+        ext = os.path.splitext(src)[1].lstrip(".")
+        relative = plex_tv_episode_relative_path(
+            request.title, request.year, season, result.episodes, ext
+        )
+        current = by_relative.get(relative)
+        if current is None or result.video.size_bytes > current.video.size_bytes:
+            if current is not None:
+                _logger.warning(
+                    "tv import: dropping smaller duplicate %s for %s (kept %s)",
+                    current.video.relative_path,
+                    relative,
+                    result.video.relative_path,
+                )
+            by_relative[relative] = result
+        else:
+            _logger.warning(
+                "tv import: dropping smaller duplicate %s for %s (kept %s)",
+                result.video.relative_path,
+                relative,
+                current.video.relative_path,
+            )
+
+    # Claim Importing BEFORE the (possibly long) copy -- same CAS discipline as
+    # the movie path, conditional on the row still being resumable (an operator's
+    # mark_failed during the validation gap above must not be overwritten).
+    claimed = await download_repo.update_status_if_in(
+        download_id, DownloadState.Importing.value, _RESUMABLE
+    )
+    if not claimed:
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash)
+
+    season_dir = Path(tv_root) / plex_tv_season_relative_dir(request.title, request.year, season)
+    session.add(
+        DownloadHistory(
+            tmdb_id=request.tmdb_id,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.import_started,
+            source_title=None,  # never shadow the grabbed release title
+            message=f"importing {len(by_relative)} episode(s) to {season_dir}",
+        )
+    )
+    await session.commit()
+
+    # ``imported`` history rows are staged (basename, relative) here rather than
+    # written immediately: they are committed to ``session`` ONLY after the scan
+    # AND the finalize CAS below have both succeeded (mirrors the movie path,
+    # which likewise writes its ``imported`` row only once the scan succeeds). A
+    # later file's copy failure OR a scan failure both roll placed files back via
+    # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
+    # the audit trail claim an episode was imported when it was in fact deleted
+    # moments later (honesty over silence: history must never lie about a rollback).
+    placed_paths: list[Path] = []
+    imported: list[tuple[str, PurePosixPath]] = []
+    for relative, result in by_relative.items():
+        src = abs_by_rel[result.video.relative_path]
+        dst = Path(tv_root) / relative
+        try:
+            placed = await asyncio.to_thread(_place_file, fs, src, dst)
+        except (FileExistsError, OSError) as exc:
+            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            reason = (
+                str(exc)
+                if isinstance(exc, FileExistsError)
+                else f"import copy failed: {type(exc).__name__}"
+            )
+            await _block(
+                session, download_repo, download_id, reason, request_id=request.id, season=season
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        if placed:
+            placed_paths.append(dst)
+        imported.append((os.path.basename(src), relative))
+
+    # download_path is stamped with the SEASON folder (not one file) purely for
+    # queue-display observability -- unlike the movie path, it is never consulted
+    # to decide scan-failure rollback ownership (see the docstring above).
+    await download_repo.update_status(
+        download_id, DownloadState.Importing.value, download_path=str(season_dir)
+    )
+    await session.commit()
+
+    # ONE targeted scan of the whole season directory, never one per episode.
+    try:
+        await library.trigger_scan(str(season_dir), "tv")
+    except (PlexLibraryError, PlexAuthError) as exc:
+        await asyncio.to_thread(_remove_quietly_many, placed_paths)
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"plex scan failed: {type(exc).__name__}",
+            request_id=request.id,
+            season=season,
+            clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    # Imported. The season is 'completed' ("Finalizing") until a reconcile cycle
+    # confirms availability via is_available (phase 2). Finalize with a
+    # compare-and-swap, conditional on STILL holding the Importing claim.
+    finalized = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.Imported.value,
+        frozenset({DownloadState.Importing.value}),
+        download_path=str(season_dir),
+    )
+    if not finalized:
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash)
+    # Only now -- after the scan AND the finalize CAS have both succeeded -- is the
+    # per-episode ``imported`` history durably recorded. See the staging comment
+    # above the loop for why this cannot happen any earlier.
+    for basename, relative in imported:
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,
+                message=f"imported {basename} to {relative}",
+            )
+        )
+    await season_request_service.mark_completed(
+        session, media_request_id=request.id, season_number=season
+    )
+    await session.commit()
+    return await download_repo.get_by_hash(torrent_hash)
+
+
 async def run_import_cycle(
     *,
     fs: FileSystemPort,
@@ -478,14 +919,22 @@ async def run_import_cycle(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
-    movies_root: str,
+    movies_root: str | None = None,
+    tv_root: str | None = None,
 ) -> None:
     """Drain freshly-completed (and crash-stranded) imports. Needs the download
-    client + the Movies root. One item failing never aborts the cycle.
+    client; the Movies/TV roots are each optional. One item failing never aborts
+    the cycle.
+
+    ``movies_root`` / ``tv_root`` are each optional: a row of that media type
+    reaching ``import_download`` while its root is unset gets its own honest,
+    retryable ``ImportBlocked`` (never a crash, never silently skipped) rather
+    than gating the whole cycle — an install with only ONE root configured still
+    drains that type normally.
 
     The completed -> available promotion is a SEPARATE pass
     (:func:`run_availability_cycle`) that needs only Plex, so it keeps working even
-    when the download client is down or the Movies root is unset.
+    when the download client is down or the Movies/TV root is unset.
     """
     download_repo = SqlDownloadRepository(session)
     for row in await download_repo.list_active():
@@ -500,6 +949,7 @@ async def run_import_cycle(
                     profile=profile,
                     session=session,
                     movies_root=movies_root,
+                    tv_root=tv_root,
                 )
             except Exception:
                 await session.rollback()
@@ -507,10 +957,10 @@ async def run_import_cycle(
 
 
 async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession) -> None:
-    """Confirm ``completed`` ("Finalizing") movies are indexed in Plex and promote
-    them to ``available``. Depends ONLY on Plex — so an import that already triggered
-    a scan still reaches ``available`` even if the download client or Movies root is
-    unavailable afterward. One item failing never aborts the cycle.
+    """Confirm ``completed`` ("Finalizing") movies/seasons are indexed in Plex and
+    promote them to ``available``. Depends ONLY on Plex — so an import that already
+    triggered a scan still reaches ``available`` even if the download client or the
+    Movies/TV root is unavailable afterward. One item failing never aborts the cycle.
     """
     request_repo = SqlRequestRepository(session)
     for request in await request_repo.list_by_status(RequestStatus.completed.value):
@@ -524,4 +974,28 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
             await session.rollback()
             _logger.warning(
                 "availability check failed for tmdb %s; will retry next cycle", request.tmdb_id
+            )
+
+    # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
+    # SeasonRequest rows -- a show's OTHER seasons may still be mid-flight while
+    # one season is ready to confirm, so this is never gated on the parent's
+    # (computed rollup) status.
+    season_repo = SqlSeasonRequestRepository(session)
+    for season_request in await season_repo.list_by_status(RequestStatus.completed.value):
+        try:
+            if await library.is_available(
+                season_request.tmdb_id, "tv", season=season_request.season_number
+            ):
+                await season_request_service.mark_available(
+                    session,
+                    media_request_id=season_request.media_request_id,
+                    season_number=season_request.season_number,
+                )
+                await session.commit()
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            await session.rollback()
+            _logger.warning(
+                "availability check failed for tmdb %s season %s; will retry next cycle",
+                season_request.tmdb_id,
+                season_request.season_number,
             )
