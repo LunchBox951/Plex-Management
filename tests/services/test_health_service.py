@@ -210,6 +210,73 @@ async def test_probe_result_is_refreshed_once_the_ttl_expires() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# R5-3: the four probes must run CONCURRENTLY, not serialize — otherwise
+# several simultaneously-blackholed (timeout, not conn-refused) upstreams stack
+# their ~30s httpx timeouts into minutes before /ops/health returns anything.
+# --------------------------------------------------------------------------- #
+
+
+async def test_check_subsystems_runs_the_four_probes_concurrently() -> None:
+    delay_seconds = 0.2
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # Every probe sleeps the SAME delay; if they ran sequentially the whole
+        # call takes ~4x delay, but concurrently it takes ~1x delay (wall-clock
+        # bounded by the slowest single probe, not the sum of all four).
+        await asyncio.sleep(delay_seconds)
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Directory": [
+                            {
+                                "key": "1",
+                                "title": "Movies",
+                                "type": "movie",
+                                "Location": [{"path": "/movies"}],
+                            }
+                        ]
+                    }
+                },
+            )
+        if path == "/api/v1/system/status":
+            return httpx.Response(200, json={"version": "1.0"})
+        if path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/torrents/info":
+            return httpx.Response(200, json=[])
+        if path == "/3/search/multi":
+            return httpx.Response(200, json={"results": []})
+        raise AssertionError(f"unexpected path {path}")  # pragma: no cover
+
+    creds = HealthCredentials(
+        plex_url="http://plex.local",
+        plex_token="tok",  # noqa: S106
+        prowlarr_url="http://prowlarr.local",
+        prowlarr_api_key="pk",
+        qbittorrent_url="http://qb.local",
+        qbittorrent_username="admin",
+        qbittorrent_password="pw",  # noqa: S106
+        tmdb_api_key="tk",
+    )
+    start = time.monotonic()
+    async with _client(handler) as client:
+        results = await check_subsystems(client, creds, TtlCache())
+    elapsed = time.monotonic() - start
+
+    # Order is preserved regardless of concurrency.
+    assert [r.name for r in results] == ["plex", "prowlarr", "qbittorrent", "tmdb"]
+    assert {r.status for r in results} == {"ok"}
+    # Sequential would take ~4 * delay_seconds (~0.8s); concurrent stays close to
+    # a single delay. The threshold is comfortably below the sequential sum but
+    # above a single delay, so it fails loudly if a future change re-serializes
+    # the probes.
+    assert elapsed < delay_seconds * 3
+
+
+# --------------------------------------------------------------------------- #
 # check_database
 # --------------------------------------------------------------------------- #
 

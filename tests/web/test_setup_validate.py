@@ -232,6 +232,52 @@ async def test_validate_plex_no_library_at_all_blocks_setup(
     assert "Movie or TV library" in body["message"]
 
 
+async def test_validate_plex_bypasses_the_sections_cache_on_a_later_outage(
+    client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
+) -> None:
+    # R5-4: list_sections' module-level cache has a 300s TTL. A healthy probe
+    # populates it; if a LATER probe (same url/token) trusted that cache, an
+    # outage or a revoked token in between would still read back a stale "ok"
+    # for up to 300s -- even though health_service has its OWN 15s TTL, because
+    # THIS re-probe would never even reach Plex. validate_plex must always
+    # reflect reality: use_cache=False on every call.
+    def healthy(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/library/sections"
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "Directory": [
+                        {
+                            "key": "1",
+                            "title": "Movies",
+                            "type": "movie",
+                            "Location": [{"path": str(tmp_path)}],
+                        }
+                    ]
+                }
+            },
+        )
+
+    await _use_transport(app, healthy)
+    first = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": "tok"},
+    )
+    assert first.json()["ok"] is True  # warms the 300s module-level sections cache
+
+    def down(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={})
+
+    await _use_transport(app, down)
+    second = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": "tok"},
+    )
+    body = second.json()
+    assert body["ok"] is False  # NOT a stale "ok" served from the 300s cache
+
+
 async def test_validate_plex_bad_token(client: httpx.AsyncClient, app: FastAPI) -> None:
     await _use_transport(app, lambda _r: httpx.Response(401, json={}))
     response = await client.post(

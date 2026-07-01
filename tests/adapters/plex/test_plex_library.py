@@ -141,6 +141,44 @@ async def test_list_sections_is_cached_per_base_url() -> None:
     assert calls["n"] == 1  # second call served from the module-level cache
 
 
+async def test_list_sections_use_cache_false_bypasses_the_cache_read() -> None:
+    # R5-4: the health/"Test connection" probe must always reflect reality, so
+    # it needs a cache-BYPASS -- a fresh call with use_cache=False re-pages Plex
+    # live even though a previous call already warmed the 300s cache.
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _main_handler(request)
+
+    adapter = _adapter(counting, base_url="http://bypass-plex:32400")
+    await adapter.list_sections()
+    assert calls["n"] == 1  # warms the cache
+    await adapter.list_sections(use_cache=False)
+    assert calls["n"] == 2  # bypassed the cache, re-hit Plex live
+    # A later default (cached) call is served from the cache the bypass call
+    # refreshed -- the bypass SETS the cache, it doesn't just skip it forever.
+    await adapter.list_sections()
+    assert calls["n"] == 2
+
+
+async def test_list_sections_use_cache_false_reflects_a_new_outage() -> None:
+    # The scenario the health probe exists to catch: a healthy call warms the
+    # cache, then Plex goes down (or the token is rejected) -- a use_cache=False
+    # call must see the CURRENT failure, not a cached "ok" sections list.
+    def flaky(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={})
+
+    adapter = _adapter(_main_handler, base_url="http://outage-plex:32400")
+    sections = await adapter.list_sections()
+    assert len(sections) == 2  # cache is warm
+
+    down_client = httpx.AsyncClient(transport=httpx.MockTransport(flaky))
+    down_adapter = PlexLibrary(down_client, base_url="http://outage-plex:32400", token=TOKEN)
+    with pytest.raises(PlexAuthError):
+        await down_adapter.list_sections(use_cache=False)
+
+
 async def test_list_sections_cache_is_keyed_by_token_not_just_url() -> None:
     # A rotated or mistyped token for the SAME server must not read back the previous
     # token's cached sections; otherwise a bad credential could surface a stale

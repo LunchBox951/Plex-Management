@@ -341,11 +341,22 @@ class PlexLibrary:
             raise PlexLibraryError(f"Plex returned a non-JSON body for {path}") from exc
         return _as_mapping(payload)
 
-    async def list_sections(self) -> list[LibrarySection]:
-        """Return the configured library sections (movie / show), cached briefly."""
-        cached = _SECTIONS_CACHE.get(self._cache_key)
-        if cached is not None:
-            return list(cached)
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+        """Return the configured library sections (movie / show), cached briefly.
+
+        ``use_cache=False`` skips the cache READ and re-pages Plex live -- the
+        health/"Test connection" probe (``setup_validation.validate_plex``) needs
+        this so an outage or a rejected token is reflected immediately rather than
+        served a stale "ok" from a healthy probe up to ``_CACHE_TTL_SECONDS``
+        (300s) earlier. A successful live call still SETS the cache below (never
+        just bypasses it), so the availability fast paths (``is_available``,
+        ``present_seasons``, ...) stay warm for the request-serving path that
+        follows a health check.
+        """
+        if use_cache:
+            cached = _SECTIONS_CACHE.get(self._cache_key)
+            if cached is not None:
+                return list(cached)
         payload = await self._get("/library/sections")
         container = _media_container(payload)
         sections: list[LibrarySection] = []

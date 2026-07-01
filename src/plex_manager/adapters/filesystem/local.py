@@ -312,8 +312,21 @@ class LocalFileSystem:
         ``0`` (best-effort, mirroring :func:`~plex_manager.services.
         eviction_service._size_bytes`'s honest "unknown" fallback) rather than
         aborting the whole computation or raising.
+
+        A SYMLINK entry -- whether ``path`` itself or a file found while walking
+        a directory -- ALWAYS contributes ``0``, matching :meth:`delete`'s own
+        contract: ``delete`` unlinks only the link entry and never dereferences
+        it, so nothing about the target's bytes is actually freed. ``os.stat``
+        (unlike ``os.lstat``) follows a symlink, so checking ``os.path.isfile``/
+        ``os.stat`` on a symlink would otherwise report the TARGET's size --
+        inflating a pressure sweep's ``freed_bytes`` for content that was never
+        touched. The symlink check happens BEFORE the ``isfile`` check (both
+        follow symlinks identically) so a symlinked file is caught here rather
+        than falling through to the size-reporting branch below.
         """
         try:
+            if os.path.islink(path):
+                return 0
             if os.path.isfile(path):
                 stat = os.stat(path)
                 return stat.st_size if stat.st_nlink <= 1 else 0
@@ -322,8 +335,11 @@ class LocalFileSystem:
             total = 0
             for dirpath, _dirnames, filenames in os.walk(path):
                 for filename in filenames:
+                    full = os.path.join(dirpath, filename)
+                    if os.path.islink(full):
+                        continue
                     with contextlib.suppress(OSError):
-                        stat = os.stat(os.path.join(dirpath, filename))
+                        stat = os.stat(full)
                         if stat.st_nlink <= 1:
                             total += stat.st_size
             return total

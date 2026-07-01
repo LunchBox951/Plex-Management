@@ -99,9 +99,14 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
     token and yields the library locations, so the wizard offers writable-folder
     pick-lists for ``movies_root`` / ``tv_root`` instead of a typed, mismatch-prone
     path. The token rides the ``X-Plex-Token`` header, never the URL.
+
+    ``use_cache=False``: this is BOTH the setup wizard's "Test connection" AND
+    (via ``health_service._check_plex``) the live health-card probe -- both must
+    always reflect reality, never a section list cached from a previous healthy
+    probe up to 300s stale.
     """
     try:
-        sections = await PlexLibrary(client, url, token).list_sections()
+        sections = await PlexLibrary(client, url, token).list_sections(use_cache=False)
     except PlexAuthError:
         return ServiceValidateResponse(ok=False, message="Plex rejected the token.")
     except PlexLibraryError as exc:

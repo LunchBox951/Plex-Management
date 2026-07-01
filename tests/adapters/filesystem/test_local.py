@@ -491,3 +491,40 @@ def test_reclaimable_bytes_is_zero_for_a_missing_path(tmp_path: Path) -> None:
     missing = tmp_path / "already-gone.mkv"
 
     assert LocalFileSystem().reclaimable_bytes(os.fspath(missing)) == 0
+
+
+def test_reclaimable_bytes_is_zero_for_a_symlink_to_a_real_file(tmp_path: Path) -> None:
+    # R5-2: a stored library_path can be a symlink to a single-linked file.
+    # delete() only ever unlinks the symlink entry itself (never dereferences
+    # it), so accounting must match: reclaiming a symlink frees ~nothing, NOT
+    # the target's size (os.path.isfile/os.stat both follow symlinks, which is
+    # exactly the bug -- they must never be trusted directly on `path`).
+    real_target = tmp_path / "real" / "movie.mkv"
+    real_target.parent.mkdir()
+    real_target.write_bytes(b"x" * 900)
+    link_path = tmp_path / "library" / "movie.mkv"
+    link_path.parent.mkdir()
+    os.symlink(real_target, link_path)
+
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(link_path)) == 0
+
+
+def test_reclaimable_bytes_for_a_directory_skips_a_symlinked_file(tmp_path: Path) -> None:
+    # A season dir can contain a symlinked episode alongside real files (e.g. a
+    # breadcrumb pointing at content actually stored elsewhere). Only the real,
+    # single-linked files are reclaimable; the symlinked entry contributes 0
+    # bytes, matching that shutil.rmtree unlinks the link rather than freeing
+    # whatever it points at.
+    season_dir = tmp_path / "Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    single_link = season_dir / "Show.S01E01.mkv"
+    single_link.write_bytes(b"x" * 300)
+    real_target = tmp_path / "elsewhere" / "Show.S01E02.mkv"
+    real_target.parent.mkdir()
+    real_target.write_bytes(b"x" * 900)
+    symlinked_episode = season_dir / "Show.S01E02.mkv"
+    os.symlink(real_target, symlinked_episode)
+
+    # Only E01 (300 bytes, real single-linked file) counts; the symlinked E02
+    # must NOT contribute its target's 900 bytes.
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(season_dir)) == 300

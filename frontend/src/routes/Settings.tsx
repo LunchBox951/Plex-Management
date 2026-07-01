@@ -93,6 +93,29 @@ type NumberKey =
   | 'log_retention_days'
 type BoolKey = 'eviction_enabled' | 'eviction_proactive_enabled'
 
+// Operator-facing label per numeric operability knob — reused by the Save
+// validation below so an invalid field's toast names it the same way the form
+// does (R5-1).
+const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
+  disk_pressure_threshold_percent: 'Pressure threshold (%)',
+  disk_pressure_target_percent: 'Pressure target (%)',
+  eviction_grace_days: 'Eviction grace period (days)',
+  eviction_interval_minutes: 'Eviction check interval (minutes)',
+  log_retention_days: 'Log retention (days)',
+}
+
+/** ``true`` only for a non-blank string that parses to a finite number.
+ *
+ * ``Number('')`` is ``0`` (NOT ``NaN``), so a blank/whitespace-only input must
+ * be rejected explicitly — otherwise a cleared numeric field would silently
+ * coerce to ``0`` on save (retention 0 = prune logs immediately; grace 0 =
+ * watched media eligible right away; threshold 0 = disk always "over
+ * pressure") while the UI still toasts success.
+ */
+function isValidNumberInput(value: string): boolean {
+  return value.trim() !== '' && Number.isFinite(Number(value))
+}
+
 const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
 
 export function Settings() {
@@ -199,6 +222,24 @@ export function Settings() {
   )
 
   const handleSave = async () => {
+    // Every numeric operability knob must be a non-empty, finite number BEFORE
+    // any save is attempted. An emptied input (or stray non-numeric text) must
+    // never silently coerce to 0 via `Number('')` — that would flip a real
+    // safety knob (immediate log prune, immediate eviction eligibility, an
+    // always-"over-pressure" disk) while the toast still says "Settings
+    // saved". Abort the whole save (no mutateAsync call) and show a visible,
+    // specific error the moment the FIRST invalid field is found.
+    for (const key of Object.keys(NUMBER_FIELD_LABELS) as NumberKey[]) {
+      if (!isValidNumberInput(form[key])) {
+        toast({
+          title: 'Save failed',
+          description: `Enter a number for ${NUMBER_FIELD_LABELS[key]}.`,
+          intent: 'error',
+        })
+        return
+      }
+    }
+
     // A library folder is discovered against a *specific* Plex server. If the
     // operator just changed the Plex connection (URL or a freshly typed token)
     // but hasn't re-picked a folder, don't carry the OLD server's movies_root /

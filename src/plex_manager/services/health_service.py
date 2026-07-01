@@ -353,13 +353,27 @@ async def check_subsystems(
 
     Reuses ``setup_validation.validate_*`` (the exact "Test connection" probes) so
     there is one definition of "is this upstream reachable" for the whole app.
+
+    The four probes are independent (each keyed to its OWN cache entry — see
+    ``_check_plex``/``_check_prowlarr``/``_check_qbittorrent``/``_check_tmdb``, no
+    shared mutable state between them) and each carries the app's own ~30s httpx
+    timeout, so running them sequentially would serialize worst-case wait times
+    into minutes whenever several upstreams are simultaneously blackholed (a
+    timeout, not a fast connection-refused) — stalling the Status page exactly
+    during an outage, the one moment it matters most. ``asyncio.gather`` runs
+    them concurrently so the wall-clock cost is the SLOWEST probe, not the sum,
+    while still returning them in the fixed plex/prowlarr/qbittorrent/tmdb order
+    the dashboard expects. Each probe helper already converts a failure into a
+    ``down``/``not_configured`` result rather than raising, so ``gather`` never
+    needs (and must never gain) a blanket exception handler here.
     """
-    return [
-        await _check_plex(client, creds, cache),
-        await _check_prowlarr(client, creds, cache),
-        await _check_qbittorrent(client, creds, cache),
-        await _check_tmdb(client, creds, cache),
-    ]
+    plex, prowlarr, qbittorrent, tmdb = await asyncio.gather(
+        _check_plex(client, creds, cache),
+        _check_prowlarr(client, creds, cache),
+        _check_qbittorrent(client, creds, cache),
+        _check_tmdb(client, creds, cache),
+    )
+    return [plex, prowlarr, qbittorrent, tmdb]
 
 
 # --------------------------------------------------------------------------- #

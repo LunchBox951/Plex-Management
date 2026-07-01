@@ -272,4 +272,74 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       }),
     )
   })
+
+  it('R5-1: clearing a numeric field aborts the save with a visible error instead of sending 0', async () => {
+    h.settingsData = {
+      plex_url: 'http://plex:32400',
+      plex_token: '***',
+      prowlarr_url: 'http://prowlarr:9696',
+      prowlarr_api_key: '***',
+      qbittorrent_url: 'http://qb:8080',
+      qbittorrent_username: 'admin',
+      qbittorrent_password: '***',
+      tmdb_api_key: '***',
+      movies_root: '/plex/movies',
+      disk_pressure_threshold_percent: 90,
+      disk_pressure_target_percent: 80,
+      eviction_grace_days: 30,
+      eviction_enabled: true,
+      eviction_proactive_enabled: false,
+      eviction_interval_minutes: 30,
+      log_retention_days: 7,
+    }
+
+    render(<Settings />, { wrapper: Wrapper })
+    // Clearing "Log retention" leaves the input at '' -- Number('') === 0, the
+    // exact silent-zero this fix must reject before ever calling mutateAsync.
+    fireEvent.change(screen.getByLabelText('Log retention (days)'), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() => expect(h.toast).toHaveBeenCalledTimes(1))
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Save failed',
+        description: expect.stringContaining('Log retention'),
+        intent: 'error',
+      }),
+    )
+    // No request was ever sent -- the invalid value never reached the backend
+    // (not even coerced to 0), and no misleading "Settings saved" toast fired.
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('R5-1: a valid numeric edit still round-trips and saves as today', async () => {
+    h.settingsData = {
+      plex_url: 'http://plex:32400',
+      plex_token: '***',
+      prowlarr_url: 'http://prowlarr:9696',
+      prowlarr_api_key: '***',
+      qbittorrent_url: 'http://qb:8080',
+      qbittorrent_username: 'admin',
+      qbittorrent_password: '***',
+      tmdb_api_key: '***',
+      movies_root: '/plex/movies',
+      disk_pressure_threshold_percent: 90,
+      disk_pressure_target_percent: 80,
+      eviction_grace_days: 30,
+      eviction_enabled: true,
+      eviction_proactive_enabled: false,
+      eviction_interval_minutes: 30,
+      log_retention_days: 7,
+    }
+
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('Log retention (days)'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().log_retention_days).toBe(3)
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Settings saved', intent: 'success' }),
+    )
+  })
 })
