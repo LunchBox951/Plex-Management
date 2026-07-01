@@ -16,6 +16,14 @@ updates:
       actions:
         patterns: ["*"]
 
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+    groups:
+      frontend-deps:
+        patterns: ["*"]
+
   - package-ecosystem: docker
     directory: "/"
     schedule:

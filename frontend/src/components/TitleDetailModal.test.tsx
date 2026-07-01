@@ -213,6 +213,21 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
     expect(screen.getByRole('progressbar', { name: /download progress/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
   })
+
+  it('closes an open report dialog when polling makes the download non-actionable', async () => {
+    setDownloadStatus('downloading')
+    const view = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /report a problem/i }))
+    expect(screen.getByText(/Blocklist this release/i)).toBeInTheDocument()
+
+    setDownloadStatus('importing')
+    view.rerender(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Blocklist this release/i)).not.toBeInTheDocument()
+    })
+  })
 })
 
 describe('TitleDetailModal — movie path is unchanged by the tv season selector', () => {

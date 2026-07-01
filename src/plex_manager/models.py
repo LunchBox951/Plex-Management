@@ -15,10 +15,11 @@ Conventions:
   from whether the ``Mapped`` type includes ``None``.
 * ``created_at``-style columns get ``server_default=func.now()`` so bulk inserts
   are timestamped by the database.
-* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False)`` (a portable
-  VARCHAR + CHECK on SQLite). ``downloads.status`` is a plain indexed ``String``:
-  the canonical ``DownloadState`` StrEnum is owned by the P4 state machine and
-  writes its values here, and the ``DownloadRecord`` DTO reads it as ``str``.
+* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)``
+  (a portable VARCHAR + CHECK on SQLite/PostgreSQL). ``downloads.status`` is a
+  plain indexed ``String``: the canonical ``DownloadState`` StrEnum is owned by
+  the P4 state machine and writes its values here, and the ``DownloadRecord`` DTO
+  reads it as ``str``.
 * Secrets (``users.encrypted_plex_token``) use :class:`EncryptedStr`.
 """
 
@@ -129,7 +130,7 @@ class DownloadHistoryEvent(StrEnum):
 
 def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
     """Build a portable, non-native ``Enum`` column type for ``enum_cls``."""
-    return sa.Enum(enum_cls, native_enum=False)
+    return sa.Enum(enum_cls, native_enum=False, create_constraint=True, validate_strings=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -442,7 +443,7 @@ class Blocklist(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
-    source_title: Mapped[str] = mapped_column(Text, index=True)
+    source_title: Mapped[str] = mapped_column(Text)
     indexer: Mapped[str | None] = mapped_column(String)
     protocol: Mapped[str | None] = mapped_column(String)
     media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))

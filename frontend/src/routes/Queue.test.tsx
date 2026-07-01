@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { QueueItem } from '../api/types'
 import { Queue } from './Queue'
@@ -97,5 +97,21 @@ describe('Queue actions', () => {
     expect(screen.getByRole('progressbar', { name: /download progress/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^mark failed$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /blocklist & fail/i })).toBeInTheDocument()
+  })
+
+  it('closes a pending fail dialog when polling makes the download non-actionable', async () => {
+    h.queue = [queueItem({ status: 'downloading' })]
+    const view = render(<Queue />)
+
+    fireEvent.click(screen.getByRole('button', { name: /blocklist & fail/i }))
+    expect(screen.getByText(/Blocklist this release/i)).toBeInTheDocument()
+
+    h.queue = [queueItem({ status: 'importing' })]
+    view.rerender(<Queue />)
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Blocklist this release/i)).not.toBeInTheDocument()
+    })
+    expect(h.markFailed).not.toHaveBeenCalled()
   })
 })

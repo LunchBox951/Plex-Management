@@ -53,18 +53,54 @@ class LocalFileSystemError(RuntimeError):
     """
 
 
-def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
-    """Publish a complete temp copy under a per-destination lock."""
-    lock_path = dst.parent / f".{dst.name}.publish.lock"
-    lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+def _pid_is_running(pid: int) -> bool:
     try:
-        if dst.exists():
-            raise FileExistsError(os.fspath(dst))
-        os.replace(tmp_path, os.fspath(dst))
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock_is_stale(lock_path: Path) -> bool:
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return not _pid_is_running(pid)
+
+
+@contextlib.contextmanager
+def _publish_lock(dst: Path):
+    lock_path = dst.parent / f".{dst.name}.publish.lock"
+    while True:
+        try:
+            lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if dst.exists():
+                raise FileExistsError(os.fspath(dst)) from None
+            if _lock_is_stale(lock_path):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(lock_path)
+                continue
+            raise
+        break
+    try:
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        yield
     finally:
         os.close(lock_fd)
         with contextlib.suppress(OSError):
             os.unlink(lock_path)
+
+
+def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
+    """Publish a complete temp copy under a per-destination lock."""
+    with _publish_lock(dst):
+        if dst.exists():
+            raise FileExistsError(os.fspath(dst))
+        os.replace(tmp_path, os.fspath(dst))
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:

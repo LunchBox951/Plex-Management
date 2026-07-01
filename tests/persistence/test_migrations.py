@@ -12,6 +12,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 from plex_manager.config import get_settings
 
@@ -121,6 +122,35 @@ def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
                 text("SELECT name FROM sqlite_master WHERE name = 'request_dedup_locks'")
             ).scalar_one()
             assert lock_table == "request_dedup_locks"
+
+            source_title_index = conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'ix_blocklist_source_title'"
+                )
+            ).scalar_one_or_none()
+            assert source_title_index is None
+
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO media_requests (tmdb_id, media_type, title, status)
+                        VALUES (1, 'not_media', 'Bad', 'pending')
+                        """
+                    )
+                )
+            conn.rollback()
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO blocklist (source_title, reason)
+                        VALUES ('Bad.Release', 'not_reason')
+                        """
+                    )
+                )
+            conn.rollback()
     finally:
         engine.dispose()
 
