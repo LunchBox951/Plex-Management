@@ -29,11 +29,12 @@ import logging
 import re
 import time
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Final, Literal, cast
 
 import httpx
 
-from plex_manager.ports.library import LibrarySection
+from plex_manager.ports.library import LibrarySection, WatchState
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
 
@@ -147,6 +148,19 @@ def _get_int(fields: Mapping[str, object], key: str) -> int | None:
     return None
 
 
+def _get_epoch_datetime(fields: Mapping[str, object], key: str) -> datetime | None:
+    """Decode a Plex unix-seconds field (e.g. ``lastViewedAt``) to a UTC ``datetime``.
+
+    Plex omits the field entirely for an item/season that has never been viewed,
+    which :func:`_get_int` already reports as ``None`` -- propagated through
+    honestly rather than a fabricated epoch.
+    """
+    value = _get_int(fields, key)
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, tz=UTC)
+
+
 def _media_container(payload: Mapping[str, object]) -> Mapping[str, object]:
     """Unwrap Plex's top-level ``MediaContainer`` envelope."""
     return _as_mapping(payload.get("MediaContainer"))
@@ -186,6 +200,52 @@ def _collect_item_tmdb_ids(item: Mapping[str, object], present: set[int]) -> Non
         gid = _get_str(_as_mapping(guid_entry), "id")
         if gid is not None:
             present.update(_extract_tmdb_ids(gid))
+
+
+def _item_matches_tmdb_id(item: Mapping[str, object], tmdb_id: int) -> bool:
+    """Whether one ``Metadata`` item's guid(s) resolve to ``tmdb_id``."""
+    ids: set[int] = set()
+    _collect_item_tmdb_ids(item, ids)
+    return tmdb_id in ids
+
+
+def _movie_watch_state_from_item(item: Mapping[str, object]) -> WatchState:
+    """Movie watch state (ADR-0012): watched = ``viewCount>0``, timestamp =
+    the item's ``lastViewedAt``.
+
+    Plex omits ``viewCount``/``lastViewedAt`` entirely for a never-played item,
+    which reads as unwatched here. ``watched`` is additionally forced ``False``
+    whenever ``last_viewed_at`` is ``None`` -- ``WatchState``'s own contract --
+    so the pair can never come out inconsistent even if Plex ever reported a
+    stray ``viewCount`` with no timestamp.
+    """
+    last_viewed_at = _get_epoch_datetime(item, "lastViewedAt")
+    view_count = _get_int(item, "viewCount")
+    watched = last_viewed_at is not None and view_count is not None and view_count > 0
+    return WatchState(watched=watched, last_viewed_at=last_viewed_at)
+
+
+def _season_watch_state_from_entry(entry: Mapping[str, object]) -> WatchState:
+    """Season watch state (ADR-0012): watched = every episode viewed
+    (``viewedLeafCount == leafCount``), timestamp = the season's ``lastViewedAt``.
+
+    ``leafCount`` must be present AND greater than zero -- an empty/announced
+    season (no episodes indexed yet) must never read as "watched" by the vacuous
+    truth of ``0 == 0``. As with the movie case, ``watched`` is forced ``False``
+    whenever ``last_viewed_at`` is ``None`` so the two signals stay honestly
+    aligned.
+    """
+    leaf_count = _get_int(entry, "leafCount")
+    viewed_leaf_count = _get_int(entry, "viewedLeafCount")
+    last_viewed_at = _get_epoch_datetime(entry, "lastViewedAt")
+    fully_viewed = (
+        leaf_count is not None
+        and leaf_count > 0
+        and viewed_leaf_count is not None
+        and viewed_leaf_count == leaf_count
+    )
+    watched = fully_viewed and last_viewed_at is not None
+    return WatchState(watched=watched, last_viewed_at=last_viewed_at)
 
 
 def _section_covers(section: LibrarySection, path: str) -> bool:
@@ -281,11 +341,22 @@ class PlexLibrary:
             raise PlexLibraryError(f"Plex returned a non-JSON body for {path}") from exc
         return _as_mapping(payload)
 
-    async def list_sections(self) -> list[LibrarySection]:
-        """Return the configured library sections (movie / show), cached briefly."""
-        cached = _SECTIONS_CACHE.get(self._cache_key)
-        if cached is not None:
-            return list(cached)
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+        """Return the configured library sections (movie / show), cached briefly.
+
+        ``use_cache=False`` skips the cache READ and re-pages Plex live -- the
+        health/"Test connection" probe (``setup_validation.validate_plex``) needs
+        this so an outage or a rejected token is reflected immediately rather than
+        served a stale "ok" from a healthy probe up to ``_CACHE_TTL_SECONDS``
+        (300s) earlier. A successful live call still SETS the cache below (never
+        just bypasses it), so the availability fast paths (``is_available``,
+        ``present_seasons``, ...) stay warm for the request-serving path that
+        follows a health check.
+        """
+        if use_cache:
+            cached = _SECTIONS_CACHE.get(self._cache_key)
+            if cached is not None:
+                return list(cached)
         payload = await self._get("/library/sections")
         container = _media_container(payload)
         sections: list[LibrarySection] = []
@@ -299,8 +370,21 @@ class PlexLibrary:
         # snapshot for the full TTL would make the immediate re-test read stale data
         # and leave setup wrongly blocked. Mirrors is_available's presence/absence
         # asymmetry — cache a positive, never a negative the operator can fix.
+        #
+        # But a PRIOR movie-bearing result may already be cached from an
+        # earlier page — if THIS page (esp. a live ``use_cache=False`` probe)
+        # finds no movie section, that old positive must not be left sitting
+        # in the cache: the movie library could genuinely have been removed
+        # from Plex, and default (``use_cache=True``) callers -- the Settings
+        # folder picker, the scan path -- would otherwise keep being handed
+        # the now-gone location for up to the full TTL after a live probe
+        # already saw it disappear. Invalidate rather than merely skip the
+        # ``set``, so the very next default call re-pages instead of serving
+        # a stale positive.
         if any(section.type == "movie" for section in sections):
             _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
+        else:
+            _SECTIONS_CACHE.invalidate(self._cache_key)
         return sections
 
     async def is_available(
@@ -523,3 +607,109 @@ class PlexLibrary:
                 _PRESENT_TMDB_CACHE.invalidate(self._cache_key)
             else:
                 _TV_SEASONS_CACHE.invalidate(self._cache_key)
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        season: int | None = None,
+    ) -> WatchState:
+        """Whether ``tmdb_id`` (optionally one TV season) has been watched.
+
+        Deliberately UNCACHED (unlike ``is_available``/``present_seasons``): the
+        disk-pressure eviction sweep that is this method's only caller runs
+        infrequently (its own web-editable interval, default 30 minutes) against a
+        small candidate set, so the extra request cost buys always-fresh data --
+        a stale "unwatched" would just delay an eviction, but a stale "watched"
+        held past a real rewatch could delete content the operator is actively
+        rewatching, which is the one direction this method must never be wrong in.
+
+        ``media_type='movie'``: crawls every movie section for the item whose
+        guid(s) match ``tmdb_id`` (same GUID matching ``is_available`` uses) and
+        reads its ``viewCount``/``lastViewedAt``. ``media_type='tv'`` REQUIRES
+        ``season`` (raises ``ValueError`` otherwise -- eviction is always
+        per-season, never whole-show): crawls show sections for the matching
+        show, then that show's ``/children`` for the season row matching
+        ``season``, and reads ``viewedLeafCount``/``leafCount``/``lastViewedAt``.
+
+        An item/show/season absent from the library reports
+        ``watched=False, last_viewed_at=None`` honestly rather than raising -- it
+        can never be an eviction candidate anyway.
+        """
+        if media_type == "tv":
+            if season is None:
+                raise ValueError("watch_state requires a season for media_type='tv'")
+            return await self._tv_watch_state(tmdb_id, season)
+        return await self._movie_watch_state(tmdb_id)
+
+    async def _movie_watch_state(self, tmdb_id: int) -> WatchState:
+        """The movie branch of :meth:`watch_state` -- see its docstring."""
+        for section in await self.list_sections():
+            if section.type != "movie":
+                continue
+            item = await self._find_section_item(section.key, tmdb_id)
+            if item is not None:
+                return _movie_watch_state_from_item(item)
+        return WatchState(watched=False, last_viewed_at=None)
+
+    async def _tv_watch_state(self, tmdb_id: int, season: int) -> WatchState:
+        """The tv branch of :meth:`watch_state` -- see its docstring."""
+        for section in await self.list_sections():
+            if section.type != "show":
+                continue
+            item = await self._find_section_item(section.key, tmdb_id)
+            if item is None:
+                continue
+            rating_key = _get_str(item, "ratingKey")
+            if rating_key is None:
+                return WatchState(watched=False, last_viewed_at=None)
+            season_entry = await self._find_season_entry(rating_key, season)
+            if season_entry is None:
+                return WatchState(watched=False, last_viewed_at=None)
+            return _season_watch_state_from_entry(season_entry)
+        return WatchState(watched=False, last_viewed_at=None)
+
+    async def _find_section_item(self, key: str, tmdb_id: int) -> Mapping[str, object] | None:
+        """Page one section's items, returning the raw entry matching ``tmdb_id``.
+
+        Shared by the movie and tv branches of ``watch_state`` -- both need the
+        full ``Metadata`` row (viewCount/lastViewedAt for a movie, ratingKey for a
+        show), not just the boolean presence ``_collect_section_tmdb_ids`` /
+        ``_collect_section_tv_seasons`` accumulate. Always re-pages fresh (see
+        ``watch_state``'s docstring on why this is deliberately uncached) --
+        returns ``None`` once the section is exhausted without a match.
+        """
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                entry = _as_mapping(item)
+                if _item_matches_tmdb_id(entry, tmdb_id):
+                    return entry
+            if len(items) < _PAGE_SIZE:
+                return None
+            start += _PAGE_SIZE
+
+    async def _find_season_entry(self, rating_key: str, season: int) -> Mapping[str, object] | None:
+        """Return the raw season row matching ``season`` for a show's ``ratingKey``.
+
+        Same ``/children`` endpoint ``_fetch_present_seasons`` reads, but returns
+        the full row (``viewedLeafCount``/``leafCount``/``lastViewedAt``) rather
+        than folding it into a presence set.
+        """
+        payload = await self._get(f"/library/metadata/{rating_key}/children")
+        items = _as_sequence(_media_container(payload).get("Metadata"))
+        for item in items:
+            entry = _as_mapping(item)
+            if _get_int(entry, "index") == season:
+                return entry
+        return None

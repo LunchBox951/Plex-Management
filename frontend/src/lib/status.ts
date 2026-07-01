@@ -28,6 +28,11 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   // single SeasonRequest only ever carries the statuses above.
   partially_available: { label: 'Partially available', intent: 'available' },
   failed: { label: 'Failed', intent: 'error' },
+  // ADR-0012: the disk-pressure sweep reclaimed this title's (or, for tv, this
+  // season's) file. Settled/re-requestable, same as available/failed — never an
+  // error (it is deliberate, honest space management), so this gets the neutral
+  // intent rather than red.
+  evicted: { label: 'Evicted', intent: 'neutral' },
 }
 
 const DOWNLOAD_STATUS: Record<string, StatusPresentation> = {

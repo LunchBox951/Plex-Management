@@ -18,6 +18,10 @@ describe('requestStatus', () => {
       intent: 'available',
     })
   })
+
+  it('maps evicted (ADR-0012) to a neutral intent, never error', () => {
+    expect(requestStatus('evicted')).toEqual({ label: 'Evicted', intent: 'neutral' })
+  })
 })
 
 describe('downloadStatus', () => {

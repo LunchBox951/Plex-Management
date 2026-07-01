@@ -22,7 +22,8 @@ Wiring rules:
 from __future__ import annotations
 
 import hmac
-from typing import Annotated
+import logging
+from typing import Annotated, cast
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
@@ -47,25 +48,45 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
+from plex_manager.services import log_capture_service
+from plex_manager.services.health_service import ReconcileStatus, SubsystemHealth, TtlCache
 
 __all__ = [
     "API_KEY_HEADER_NAME",
+    "DISK_PRESSURE_TARGET_PERCENT_DEFAULT",
+    "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
+    "EVICTION_ENABLED_DEFAULT",
+    "EVICTION_GRACE_DAYS_DEFAULT",
+    "EVICTION_INTERVAL_MINUTES_DEFAULT",
+    "EVICTION_PROACTIVE_ENABLED_DEFAULT",
     "KNOWN_SETTING_KEYS",
+    "LOG_RETENTION_DAYS_DEFAULT",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
     "ServiceNotConfiguredError",
     "SettingsStore",
     "ensure_system_settings",
+    "get_disk_pressure_target_percent",
+    "get_disk_pressure_threshold_percent",
+    "get_eviction_enabled",
+    "get_eviction_filesystem",
+    "get_eviction_grace_days",
+    "get_eviction_interval_minutes",
+    "get_eviction_proactive_enabled",
     "get_filesystem",
+    "get_health_cache",
     "get_http_client",
     "get_library",
     "get_library_optional",
+    "get_log_handler",
+    "get_log_retention_days",
     "get_movies_root",
     "get_movies_root_optional",
     "get_parser",
     "get_prowlarr",
     "get_qbittorrent",
     "get_quality_profile",
+    "get_reconcile_status",
     "get_session",
     "get_tmdb",
     "get_tv_root",
@@ -74,6 +95,8 @@ __all__ = [
     "require_api_key",
     "require_pre_init_or_api_key",
 ]
+
+_logger = logging.getLogger(__name__)
 
 # The bearer-token header. Declared via ``APIKeyHeader`` (below) so FastAPI emits
 # the security scheme + per-route requirement into the OpenAPI document — without
@@ -102,6 +125,18 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "tmdb_api_key",
     "movies_root",
     "tv_root",
+    # Operability beta (ADR-0012) — every one of these is web-editable, plain
+    # (never secret) config: disk-pressure eviction tuning + the log-retention
+    # window. Read via the typed getters below, each with a safe, honest
+    # fallback default when unset or unparsable (never a crash, never a silently
+    # wrong threshold) -- see ``docs/design/operability-beta-plan.md``.
+    "disk_pressure_threshold_percent",
+    "disk_pressure_target_percent",
+    "eviction_grace_days",
+    "eviction_enabled",
+    "eviction_proactive_enabled",
+    "eviction_interval_minutes",
+    "log_retention_days",
 )
 
 # Keys whose values are secrets: stored encrypted, masked on read. Everything
@@ -249,6 +284,68 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
     return client
 
 
+def get_health_cache(request: Request) -> TtlCache[SubsystemHealth]:
+    """Return the process-wide subsystem-probe TTL cache (ADR-0012).
+
+    Lazily created on first access and stashed on ``app.state`` so every
+    subsequent request in this process reuses the SAME cache instance (the
+    whole point — see ``health_service.SUBSYSTEM_PROBE_TTL_SECONDS``'s docstring
+    on why a per-request cache would never actually deduplicate anything).
+    Unlike ``reconcile_status``/``log_handler``, this is NOT created up front by
+    ``lifespan``: nothing outside ``GET /api/v1/ops/health`` ever reads or
+    mutates it, so it is a pure web-layer concern the dependency itself owns —
+    mirrors ``get_http_client``'s own ``app.state`` lookup/lazy-init shape.
+    """
+    cache = getattr(request.app.state, "health_cache", None)
+    if not isinstance(cache, TtlCache):
+        cache = TtlCache[SubsystemHealth]()
+        request.app.state.health_cache = cache
+    # ``isinstance`` against a generic runtime class can't narrow the type
+    # parameter (pyright sees ``TtlCache[Unknown]``); the cast is safe because
+    # this accessor is the ONLY place anything ever assigns ``app.state.
+    # health_cache``, always with this exact type.
+    return cast("TtlCache[SubsystemHealth]", cache)
+
+
+def get_log_handler(request: Request) -> log_capture_service.LogCaptureHandler:
+    """Return the process-wide :class:`LogCaptureHandler` ``lifespan`` created
+    (the ring-buffer + ``dropped_count`` source for ``GET /api/v1/ops/logs/tail``).
+
+    Mirrors :func:`get_http_client`'s ``app.state`` lookup and honest 503 when
+    absent -- a real deployment always has one (``lifespan`` sets it up before
+    serving traffic), so a missing handler here means logging genuinely was
+    never configured (e.g. a test driving the router without going through
+    ``lifespan`` and without setting one up itself), not a value worth
+    fabricating a placeholder for.
+    """
+    handler = getattr(request.app.state, "log_handler", None)
+    if not isinstance(handler, log_capture_service.LogCaptureHandler):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="log_handler_unavailable",
+        )
+    return handler
+
+
+def get_reconcile_status(request: Request) -> ReconcileStatus:
+    """Return ``app.state.reconcile_status`` for a read-only HTTP response
+    (``GET /api/v1/ops/health``'s reconcile panel).
+
+    Lazily creates + stores a fresh, never-run :class:`ReconcileStatus` if
+    absent so the health endpoint stays honest ("the loop hasn't run yet")
+    rather than 503ing -- a real deployment always has one by the time it
+    serves traffic (``lifespan`` sets it up front, mutated in place by
+    ``_reconcile_once``/``_reconcile_loop`` in ``web/app.py``); this lazy path
+    only matters for a test exercising the router without going through
+    ``lifespan``.
+    """
+    current = getattr(request.app.state, "reconcile_status", None)
+    if not isinstance(current, ReconcileStatus):
+        current = ReconcileStatus()
+        request.app.state.reconcile_status = current
+    return current
+
+
 # --------------------------------------------------------------------------- #
 # Authentication
 # --------------------------------------------------------------------------- #
@@ -358,8 +455,33 @@ async def get_qbittorrent(
 
 
 def get_filesystem() -> FileSystemPort:
-    """Return the local filesystem adapter (no credentials needed)."""
+    """Return the local filesystem adapter (no credentials needed).
+
+    Constructed with NO ``library_roots`` — every existing caller only ever uses
+    ``move``/``hardlink_or_copy``/``largest_video_file``/``list_video_files``,
+    none of which consult the root guard. ``delete()`` (ADR-0012's disk-pressure
+    eviction) refuses every path on an instance built this way BY DESIGN
+    (fail-closed, never open) — eviction must use
+    :func:`get_eviction_filesystem` instead, never this one.
+    """
     return LocalFileSystem()
+
+
+def get_eviction_filesystem(movies_root: str | None, tv_root: str | None) -> FileSystemPort:
+    """Build the ONLY :class:`FileSystemPort` instance eviction's ``delete()`` may
+    ever be handed (ADR-0012): scoped to whichever of the two library roots are
+    actually configured, so the containment guard has something real to check
+    against. :func:`get_filesystem`'s default instance has NO roots and refuses
+    everything — using it here would make every eviction sweep a silent no-op.
+
+    Takes plain values (not other ``Depends``) so it composes identically from
+    the periodic eviction loop (``web/app.py``) and a future manual
+    ``POST /api/v1/ops/evict`` trigger, both of which already resolve
+    ``movies_root``/``tv_root`` via :func:`get_movies_root_optional`/
+    :func:`get_tv_root_optional`.
+    """
+    roots = [root for root in (movies_root, tv_root) if root]
+    return LocalFileSystem(library_roots=roots)
 
 
 async def get_library(
@@ -457,3 +579,109 @@ def get_parser() -> ParserPort:
 def get_quality_profile() -> QualityProfile:
     """Return the alpha's hardcoded default quality profile (read-only)."""
     return default_profile()
+
+
+# --------------------------------------------------------------------------- #
+# Operability beta (ADR-0012): typed, web-editable numeric/boolean settings
+# --------------------------------------------------------------------------- #
+# Safe defaults per the blueprint (``docs/design/operability-beta-plan.md``).
+# Exported so the services layer / tests can reference the SAME numbers a fresh
+# install effectively runs with, without duplicating the literal.
+DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT: float = 90.0
+DISK_PRESSURE_TARGET_PERCENT_DEFAULT: float = 80.0
+EVICTION_GRACE_DAYS_DEFAULT: int = 30
+EVICTION_ENABLED_DEFAULT: bool = True
+EVICTION_PROACTIVE_ENABLED_DEFAULT: bool = False
+EVICTION_INTERVAL_MINUTES_DEFAULT: float = 30.0
+LOG_RETENTION_DAYS_DEFAULT: int = 7
+
+# Values that parse as boolean-true; anything else (including unset/unparsable)
+# is false. Matches the plain-string ``settings.value`` storage -- there is no
+# dedicated boolean column type here (mirrors ``is_secret``'s own dialect-portable
+# boolean handling being a DIFFERENT, ORM-level concern from this string parse).
+_TRUE_STRINGS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+async def _get_float_setting(session: AsyncSession, key: str, default: float) -> float:
+    """Return ``key`` parsed as ``float``, or ``default`` if unset/unparsable.
+
+    A parse failure is logged (never silent) but never raises -- a malformed
+    stored value must not crash the reconcile / eviction / log-retention loops
+    that read these; it falls back to the safe default instead (honesty over
+    silence: the fallback is visible in the log, not just silently applied).
+    """
+    raw = await SettingsStore(session).get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _logger.warning(
+            "setting %r has an unparsable value %r; using default %s", key, raw, default
+        )
+        return default
+
+
+async def _get_int_setting(session: AsyncSession, key: str, default: int) -> int:
+    """Return ``key`` parsed as ``int``, or ``default`` if unset/unparsable."""
+    raw = await SettingsStore(session).get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _logger.warning(
+            "setting %r has an unparsable value %r; using default %s", key, raw, default
+        )
+        return default
+
+
+async def _get_bool_setting(session: AsyncSession, key: str, default: bool) -> bool:
+    """Return ``key`` parsed as ``bool`` (case-insensitive ``1``/``true``/``yes``/``on``)."""
+    raw = await SettingsStore(session).get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_STRINGS
+
+
+async def get_disk_pressure_threshold_percent(session: AsyncSession) -> float:
+    """Used% at/above which a root's disk-pressure eviction sweep fires (default 90)."""
+    return await _get_float_setting(
+        session, "disk_pressure_threshold_percent", DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT
+    )
+
+
+async def get_disk_pressure_target_percent(session: AsyncSession) -> float:
+    """Used% the sweep evicts stalest-first candidates down towards (default 80)."""
+    return await _get_float_setting(
+        session, "disk_pressure_target_percent", DISK_PRESSURE_TARGET_PERCENT_DEFAULT
+    )
+
+
+async def get_eviction_grace_days(session: AsyncSession) -> int:
+    """Minimum days since ``last_viewed_at`` before a watched title is evictable (default 30)."""
+    return await _get_int_setting(session, "eviction_grace_days", EVICTION_GRACE_DAYS_DEFAULT)
+
+
+async def get_eviction_enabled(session: AsyncSession) -> bool:
+    """Whether the pressure-triggered eviction sweep may run at all (default true)."""
+    return await _get_bool_setting(session, "eviction_enabled", EVICTION_ENABLED_DEFAULT)
+
+
+async def get_eviction_proactive_enabled(session: AsyncSession) -> bool:
+    """Whether past-grace watched+unpinned content evicts even without pressure (default false)."""
+    return await _get_bool_setting(
+        session, "eviction_proactive_enabled", EVICTION_PROACTIVE_ENABLED_DEFAULT
+    )
+
+
+async def get_eviction_interval_minutes(session: AsyncSession) -> float:
+    """How often the eviction sweep's own periodic task runs (default 30 minutes)."""
+    return await _get_float_setting(
+        session, "eviction_interval_minutes", EVICTION_INTERVAL_MINUTES_DEFAULT
+    )
+
+
+async def get_log_retention_days(session: AsyncSession) -> int:
+    """How many days of captured ``log_events`` rows the retention sweep keeps (default 7)."""
+    return await _get_int_setting(session, "log_retention_days", LOG_RETENTION_DAYS_DEFAULT)

@@ -7,11 +7,12 @@ wiring is a drop-in later. All methods are async.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["LibraryPort", "LibrarySection"]
+__all__ = ["LibraryPort", "LibrarySection", "WatchState"]
 
 
 class LibrarySection(BaseModel):
@@ -23,6 +24,23 @@ class LibrarySection(BaseModel):
     title: str
     type: Literal["movie", "show"]
     locations: tuple[str, ...] = ()
+
+
+class WatchState(BaseModel):
+    """Plex watch status for one movie or TV season (ADR-0012 eviction input).
+
+    ``last_viewed_at`` is ``None`` when Plex has never recorded a view, in which
+    case ``watched`` MUST also be ``False`` -- an implementation must never report
+    an inconsistent ``watched=True`` with no timestamp; the eviction domain
+    (``domain/eviction.py``) treats a missing timestamp as never-eligible
+    regardless of ``watched``, so this keeps the two signals honestly aligned at
+    the source.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    watched: bool
+    last_viewed_at: datetime | None = None
 
 
 @runtime_checkable
@@ -76,4 +94,28 @@ class LibraryPort(Protocol):
 
     async def list_sections(self) -> list[LibrarySection]:
         """Return the configured library sections."""
+        raise NotImplementedError
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        season: int | None = None,
+    ) -> WatchState:
+        """Return whether ``tmdb_id`` (optionally one TV season) has been watched.
+
+        Movie (``media_type='movie'``): watched means Plex's ``viewCount>0`` for
+        the item; ``season`` is ignored. TV (``media_type='tv'``): ``season`` is
+        REQUIRED -- eviction is always per-season (mirroring ``is_available``'s
+        per-season granularity), never whole-show -- and watched means every
+        episode of that season has been viewed (``viewedLeafCount == leafCount``
+        on Plex's season metadata). ``last_viewed_at`` is the item's/season's Plex
+        ``lastViewedAt``.
+
+        An item absent from the library (never imported, or removed) reports
+        ``watched=False, last_viewed_at=None`` honestly rather than raising --
+        it can never be an eviction candidate anyway, so there is nothing to
+        recover from by treating it as an error.
+        """
         raise NotImplementedError

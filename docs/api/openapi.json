@@ -387,6 +387,295 @@
         "title": "DiscoverSearchResponse",
         "type": "object"
       },
+      "DiskGaugeItem": {
+        "description": "One configured library root's usage snapshot (health dashboard gauge).",
+        "properties": {
+          "available_bytes": {
+            "title": "Available Bytes",
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "root": {
+            "title": "Root",
+            "type": "string"
+          },
+          "total_bytes": {
+            "title": "Total Bytes",
+            "type": "integer"
+          },
+          "used_percent": {
+            "title": "Used Percent",
+            "type": "number"
+          }
+        },
+        "required": [
+          "root",
+          "path",
+          "total_bytes",
+          "available_bytes",
+          "used_percent"
+        ],
+        "title": "DiskGaugeItem",
+        "type": "object"
+      },
+      "DiskResponse": {
+        "description": "``GET /api/v1/ops/disk`` -- usage + a ranked eviction-candidate preview\nper configured root.",
+        "properties": {
+          "roots": {
+            "items": {
+              "$ref": "#/components/schemas/DiskRootItem"
+            },
+            "title": "Roots",
+            "type": "array"
+          }
+        },
+        "required": [
+          "roots"
+        ],
+        "title": "DiskResponse",
+        "type": "object"
+      },
+      "DiskRootItem": {
+        "description": "One configured library root's usage + its ranked eviction preview.",
+        "properties": {
+          "available_bytes": {
+            "title": "Available Bytes",
+            "type": "integer"
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/EvictionCandidateItem"
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "root": {
+            "title": "Root",
+            "type": "string"
+          },
+          "total_bytes": {
+            "title": "Total Bytes",
+            "type": "integer"
+          },
+          "used_percent": {
+            "title": "Used Percent",
+            "type": "number"
+          }
+        },
+        "required": [
+          "root",
+          "path",
+          "total_bytes",
+          "available_bytes",
+          "used_percent",
+          "candidates"
+        ],
+        "title": "DiskRootItem",
+        "type": "object"
+      },
+      "EvictErrorItem": {
+        "description": "One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --\na LATER root raising (e.g. a transient Plex error resolving TV watch\nstate) must never hide an EARLIER root's evictions that already deleted\nfiles and committed (honesty over silence: partial progress is surfaced,\nnot swallowed behind a 500).",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "root": {
+            "enum": [
+              "movies_root",
+              "tv_root"
+            ],
+            "title": "Root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "detail"
+        ],
+        "title": "EvictErrorItem",
+        "type": "object"
+      },
+      "EvictResponse": {
+        "description": "The result of a manual disk-pressure sweep (north-star #1: a button that\nfrees space on demand). Empty ``evicted`` is a normal, honest outcome (no\nroot was under pressure, or nothing was eligible). ``errors`` is populated\nper-root when THAT root's own sweep raised -- every other root's outcome\nin ``evicted`` still stands; the sweep never aborts one root's already\ncommitted work just because a sibling root failed.",
+        "properties": {
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/EvictErrorItem"
+            },
+            "title": "Errors",
+            "type": "array"
+          },
+          "evicted": {
+            "items": {
+              "$ref": "#/components/schemas/EvictionOutcomeItem"
+            },
+            "title": "Evicted",
+            "type": "array"
+          }
+        },
+        "required": [
+          "evicted"
+        ],
+        "title": "EvictResponse",
+        "type": "object"
+      },
+      "EvictionCandidateItem": {
+        "description": "One title/season a pressure sweep WOULD evict (the ``GET /ops/disk``\npreview), or one it DID evict (a ``POST /ops/evict`` outcome shares this\nshape's fields, see :class:`EvictionOutcomeItem`).",
+        "properties": {
+          "last_viewed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Viewed At"
+          },
+          "library_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Library Path"
+          },
+          "media_type": {
+            "enum": [
+              "movie",
+              "tv"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "integer"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          },
+          "size_percent": {
+            "title": "Size Percent",
+            "type": "number"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "media_type",
+          "title",
+          "status",
+          "size_percent"
+        ],
+        "title": "EvictionCandidateItem",
+        "type": "object"
+      },
+      "EvictionOutcomeItem": {
+        "description": "One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.",
+        "properties": {
+          "freed_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freed Bytes"
+          },
+          "library_path": {
+            "title": "Library Path",
+            "type": "string"
+          },
+          "media_type": {
+            "enum": [
+              "movie",
+              "tv"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "integer"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "media_type",
+          "title",
+          "library_path"
+        ],
+        "title": "EvictionOutcomeItem",
+        "type": "object"
+      },
       "GrabRequest": {
         "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; ``episodes`` further\nscopes it to those specific episode number(s) (``None``/empty = the whole\nseason). Every TV grab is per-season: the endpoint REJECTS (422) a tv request\ngrabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed\nWITH a ``season`` -- the branch is always the request's actual media type,\nnever merely whether ``season`` happens to be set.",
         "properties": {
@@ -459,6 +748,182 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "description": "``GET /api/v1/ops/health`` -- one read answering \"is every subsystem\nhealthy, is the reconcile loop running, how full is the disk\".",
+        "properties": {
+          "disks": {
+            "items": {
+              "$ref": "#/components/schemas/DiskGaugeItem"
+            },
+            "title": "Disks",
+            "type": "array"
+          },
+          "reconcile": {
+            "$ref": "#/components/schemas/ReconcileStatusItem"
+          },
+          "subsystems": {
+            "items": {
+              "$ref": "#/components/schemas/SubsystemHealthItem"
+            },
+            "title": "Subsystems",
+            "type": "array"
+          }
+        },
+        "required": [
+          "subsystems",
+          "disks",
+          "reconcile"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "KeepForeverBody": {
+        "description": "``POST /api/v1/requests/{id}/keep-forever`` -- set or clear the pin.",
+        "properties": {
+          "keep_forever": {
+            "title": "Keep Forever",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "keep_forever"
+        ],
+        "title": "KeepForeverBody",
+        "type": "object"
+      },
+      "LiveLogRecordItem": {
+        "description": "One entry from the in-memory, all-levels live tail ring buffer.\n\nUnlike :class:`LogEventItem`, this has no durable row id -- the ring buffer\nis lost on restart and never persisted (only INFO-and-above reaches\n``log_events``; this endpoint shows EVERY level, including DEBUG).",
+        "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "level": {
+            "title": "Level",
+            "type": "string"
+          },
+          "logger": {
+            "title": "Logger",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_at",
+          "level",
+          "logger",
+          "message"
+        ],
+        "title": "LiveLogRecordItem",
+        "type": "object"
+      },
+      "LogEventItem": {
+        "description": "One durably-stored ``log_events`` row, as the log viewer / export reads it.\n\n``context`` carries correlation ids (``request_id``/``download_id``/\n``tmdb_id``) set at the log call site -- never a secret-bearing field (see\n``models.LogEvent``).",
+        "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "level": {
+            "title": "Level",
+            "type": "string"
+          },
+          "logger": {
+            "title": "Logger",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "level",
+          "logger",
+          "message"
+        ],
+        "title": "LogEventItem",
+        "type": "object"
+      },
+      "LogsResponse": {
+        "description": "A filtered, paginated page of ``GET /api/v1/ops/logs``.\n\n``total`` is the count of rows matching the filter (not the whole table),\nso the client can tell whether more pages exist beyond ``events``.",
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/LogEventItem"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "events"
+        ],
+        "title": "LogsResponse",
+        "type": "object"
+      },
+      "LogsTailResponse": {
+        "description": "``GET /api/v1/ops/logs/tail`` -- the live ring buffer, newest first.\n\n``dropped_count`` is the capture handler's own honest signal: how many\nINFO+ records could not be enqueued for durable storage since startup\nbecause the drain queue was full (the ring buffer itself is unaffected --\nsee ``LogCaptureHandler``'s docstring).",
+        "properties": {
+          "dropped_count": {
+            "title": "Dropped Count",
+            "type": "integer"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/LiveLogRecordItem"
+            },
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "events",
+          "dropped_count"
+        ],
+        "title": "LogsTailResponse",
         "type": "object"
       },
       "PlexLibraryOption": {
@@ -752,6 +1217,65 @@
         "title": "QueueResponse",
         "type": "object"
       },
+      "ReconcileStatusItem": {
+        "description": "The background reconcile loop's own health, mirrored from\n``services.health_service.ReconcileStatusSnapshot``. Deliberately separate\nfrom the subsystem cards above -- a cycle can complete OK even while one\nupstream inside it degraded (see that class's docstring).",
+        "properties": {
+          "consecutive_failures": {
+            "default": 0,
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
+          "last_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Type"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Ok At"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          }
+        },
+        "title": "ReconcileStatusItem",
+        "type": "object"
+      },
       "RejectedRelease": {
         "description": "A discarded release paired with its surfaced rejection reason.",
         "properties": {
@@ -809,6 +1333,11 @@
           "is_anime": {
             "default": false,
             "title": "Is Anime",
+            "type": "boolean"
+          },
+          "keep_forever": {
+            "default": false,
+            "title": "Keep Forever",
             "type": "boolean"
           },
           "media_type": {
@@ -1061,6 +1590,83 @@
       "SettingsResponse": {
         "description": "Redacted view of stored service config.\n\nPlaintext (non-secret) values are returned as-is; secret values are shown as\n``\"***\"`` when configured and ``None`` when unset \u2014 the plaintext secret is\nNEVER serialized.",
         "properties": {
+          "disk_pressure_target_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Pressure Target Percent"
+          },
+          "disk_pressure_threshold_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Pressure Threshold Percent"
+          },
+          "eviction_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Enabled"
+          },
+          "eviction_grace_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Grace Days"
+          },
+          "eviction_interval_minutes": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Interval Minutes"
+          },
+          "eviction_proactive_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Proactive Enabled"
+          },
+          "log_retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Log Retention Days"
+          },
           "movies_root": {
             "anyOf": [
               {
@@ -1178,6 +1784,90 @@
       "SettingsUpdate": {
         "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
         "properties": {
+          "disk_pressure_target_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Pressure Target Percent"
+          },
+          "disk_pressure_threshold_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Pressure Threshold Percent"
+          },
+          "eviction_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Enabled"
+          },
+          "eviction_grace_days": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Grace Days"
+          },
+          "eviction_interval_minutes": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Interval Minutes"
+          },
+          "eviction_proactive_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eviction Proactive Enabled"
+          },
+          "log_retention_days": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Log Retention Days"
+          },
           "movies_root": {
             "anyOf": [
               {
@@ -1380,6 +2070,48 @@
           "initialized"
         ],
         "title": "SetupStatusResponse",
+        "type": "object"
+      },
+      "SubsystemHealthItem": {
+        "description": "One upstream's reachability, as ``services.health_service.SubsystemHealth``\nreports it. ``not_configured`` is honest -- never confused with ``down``.",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "title": "Checked At",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "degraded",
+              "down",
+              "not_configured"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status",
+          "checked_at"
+        ],
+        "title": "SubsystemHealthItem",
         "type": "object"
       },
       "TmdbValidateRequest": {
@@ -1702,6 +2434,356 @@
         "summary": "Discover Category",
         "tags": [
           "discovery"
+        ]
+      }
+    },
+    "/api/v1/ops/disk": {
+      "get": {
+        "description": "Disk usage per configured library root, plus a ranked preview of what a\npressure sweep WOULD evict from each (never evicts anything itself).\n\nTTL-cached per root (~15s) \u2014 see :func:`_disk_root_item` \u2014 so the Status\npage's ~15s poll never re-hammers Plex/the filesystem on every tick.",
+        "operationId": "disk_endpoint_api_v1_ops_disk_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiskResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Disk Endpoint",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/api/v1/ops/evict": {
+      "post": {
+        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.\n\nInvalidates :func:`_get_disk_preview_cache` after the sweep: without this,\n``GET /disk`` would keep serving the pre-eviction snapshot (stale\ncandidates the operator just deleted, stale free-space gauge) for up to\nits ~15s TTL, contradicting north-star #3 for the very endpoint that IS\nthe correction button.\n\nEach root's sweep is INDEPENDENT: one root raising (e.g. a transient\n``PlexLibraryError`` resolving TV watch state during candidate assembly)\nmust never abort a root that has not run yet, nor hide what an EARLIER\nroot already deleted and committed. A bare 500 here would do exactly that\n\u2014 the operator would see \"Free space failed\" with no indication that,\nsay, the movies root already freed real space \u2014 which is a dishonest,\nsilent-partial-success state north star #2 forbids. So every root's sweep\nis individually caught; a caught failure is logged and recorded in\n``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,\nand the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 \u2014\npartial completion is a first-class, visible outcome, not a terminal one.",
+        "operationId": "evict_endpoint_api_v1_ops_evict_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvictResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Evict Endpoint",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/api/v1/ops/health": {
+      "get": {
+        "description": "One read: per-subsystem reachability, disk gauges, and the reconcile\nloop's own health. Each upstream probe is TTL-cached (~15s) so polling this\nevery few seconds never hammers an upstream or burns the TMDB rate limit.",
+        "operationId": "health_endpoint_api_v1_ops_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Health Endpoint",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/api/v1/ops/logs": {
+      "get": {
+        "description": "Paginated, filtered read of the durable ``log_events`` store, newest\nfirst. ``correlation_id`` matches a ``request_id``/``download_id``/\n``tmdb_id`` carried in a record's context.",
+        "operationId": "list_logs_endpoint_api_v1_ops_logs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Level"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "logger",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Logger"
+            }
+          },
+          {
+            "in": "query",
+            "name": "correlation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Correlation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "List Logs Endpoint",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/api/v1/ops/logs/export": {
+      "get": {
+        "description": "The LLM-diagnosis affordance: one coherent, downloadable/copyable trail.\n\nEither a single correlation id's FULL history (``correlation_id`` \u2014 a\n``request_id``/``download_id``/``tmdb_id``), or a time window from\n``since`` through now (``since`` omitted defaults to the last 24h) \u2014 when\nboth are supplied, ``correlation_id`` wins (a specific id's whole trail is\nthe more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal\nsafety cap, not a policy setting) with an honest trailing note when\ntruncated. Rendered OLDEST-first (a coherent top-to-bottom story), unlike\nthe newest-first ``GET /logs`` list. ``Content-Disposition: attachment`` so\nnavigating straight to this URL downloads a file; a caller reading the body\nvia ``fetch`` (the frontend's \"copy to clipboard\") is unaffected by the header.",
+        "operationId": "export_logs_endpoint_api_v1_ops_logs_export_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "correlation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Correlation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "text",
+              "enum": [
+                "text",
+                "json"
+              ],
+              "title": "Format",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogsResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Either a `text/plain` line-per-event trail (default, `format=text`) or a JSON `LogsResponse` bundle (`format=json`) \u2014 the two shapes this endpoint actually serves, per the `format` query parameter."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Export Logs Endpoint",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/api/v1/ops/logs/tail": {
+      "get": {
+        "description": "The live, in-memory, ALL-levels ring-buffer tail (newest first) \u2014 lost on\nrestart, never persisted (only INFO+ reaches durable ``log_events``, see\n``GET /logs`` above). ``dropped_count`` is the capture handler's own honest\nsignal for how many INFO+ records missed durable storage since startup.",
+        "operationId": "tail_logs_endpoint_api_v1_ops_logs_tail_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 2000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogsTailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Tail Logs Endpoint",
+        "tags": [
+          "ops"
         ]
       }
     },
@@ -2032,6 +3114,64 @@
         ]
       }
     },
+    "/api/v1/requests/{request_id}/keep-forever": {
+      "post": {
+        "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op.",
+        "operationId": "keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeepForeverBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Keep Forever Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
     "/api/v1/search-preview": {
       "post": {
         "description": "Run the decision engine over the indexer results for this media.",
@@ -2106,7 +3246,7 @@
         ]
       },
       "put": {
-        "description": "Upsert the provided config and return the redacted result.\n\nA secret field whose incoming value is the redaction mask (``\"***\"``) is a\nno-op: GET returns ``\"***\"`` for a configured secret, so a FE that round-trips\nthe whole object back (e.g. after editing only ``plex_url``) must not clobber\nthe real credential with the mask \u2014 a silent secret-wipe that would only\nsurface later as an auth failure to the downstream service.",
+        "description": "Upsert the provided config and return the redacted result.\n\nA secret field whose incoming value is the redaction mask (``\"***\"``) is a\nno-op: GET returns ``\"***\"`` for a configured secret, so a FE that round-trips\nthe whole object back (e.g. after editing only ``plex_url``) must not clobber\nthe real credential with the mask \u2014 a silent secret-wipe that would only\nsurface later as an auth failure to the downstream service.\n\nThe disk-pressure pair is cross-checked against the EFFECTIVE (post-update)\nvalues, not just what this one request happens to carry: ``SettingsUpdate``'s\nown ``model_validator`` only catches a target above the threshold when BOTH\nare submitted together, but ``PUT`` is a PARTIAL update \u2014 sending just one\nside against an already-stored (and now-inverted) other side would otherwise\nsilently leave the whole threshold-to-target band unable to relieve pressure\n(see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).\nChecked, and rejected with the SAME 422 shape, BEFORE anything is written.",
         "operationId": "put_settings_endpoint_api_v1_settings_put",
         "requestBody": {
           "content": {

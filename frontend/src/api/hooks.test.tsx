@@ -3,14 +3,14 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi, type Mock } from 'vitest'
-import { useUpdateSettings } from './hooks'
+import { useEvict, useUpdateSettings } from './hooks'
 import { client } from './client'
 import { queryKeys } from '../lib/queryClient'
-import type { SettingsResponse } from './types'
+import type { EvictResponse, SettingsResponse } from './types'
 
-// No network: the typed client is replaced with a controllable PUT mock.
+// No network: the typed client is replaced with controllable PUT/POST mocks.
 vi.mock('./client', () => ({
-  client: { PUT: vi.fn() },
+  client: { PUT: vi.fn(), POST: vi.fn() },
 }))
 
 function createWrapper(qc: QueryClient) {
@@ -40,5 +40,40 @@ describe('useUpdateSettings', () => {
     )
     // The PUT body is written straight into the settings cache (no extra GET).
     expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
+  })
+})
+
+describe('useEvict', () => {
+  it('invalidates disk/health/requests even when the sweep reports per-root errors', async () => {
+    // R6-C: a partial sweep (one root evicted, a LATER root raised) is still a
+    // 200 -- a genuinely successful mutation, never a thrown error -- so the
+    // disk/health/requests views must refresh to reflect whatever the sweep
+    // actually accomplished, not be left stale just because `errors` is
+    // non-empty.
+    const partial: EvictResponse = {
+      evicted: [
+        {
+          request_id: 1,
+          media_type: 'movie',
+          title: 'Old Movie',
+          season: null,
+          library_path: '/library/movies/Old Movie',
+          freed_bytes: 1024,
+        },
+      ],
+      errors: [{ root: 'tv_root', detail: 'sweep failed (PlexLibraryError)' }],
+    }
+    ;(client.POST as unknown as Mock).mockResolvedValue({ data: partial, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useEvict(), { wrapper: createWrapper(qc) })
+    const outcome = await result.current.mutateAsync()
+
+    expect(outcome.errors).toEqual([{ root: 'tv_root', detail: 'sweep failed (PlexLibraryError)' }])
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsDisk }))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests })
   })
 })

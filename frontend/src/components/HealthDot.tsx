@@ -1,6 +1,17 @@
 import { useQuery } from '@tanstack/react-query'
 import { client } from '../api/client'
-import { cn } from '../lib/cn'
+import { Dot, type DotTone } from './ui/Dot'
+
+const TONE: Record<'checking' | 'online' | 'offline', DotTone> = {
+  checking: 'neutral',
+  online: 'ok',
+  offline: 'error',
+}
+const LABEL: Record<'checking' | 'online' | 'offline', string> = {
+  checking: 'checking…',
+  online: 'online',
+  offline: 'offline',
+}
 
 /** Tiny liveness indicator in the header — green when /health answers, red when not. */
 export function HealthDot() {
@@ -23,13 +34,5 @@ export function HealthDot() {
       ? 'online'
       : 'offline'
 
-  const dot = { checking: 'bg-faint', online: 'bg-available', offline: 'bg-error' }[state]
-  const label = { checking: 'checking…', online: 'online', offline: 'offline' }[state]
-
-  return (
-    <span className="flex items-center gap-2 font-mono text-[11px] text-faint">
-      <span aria-hidden className={cn('size-2 rounded-full', dot)} />
-      {label}
-    </span>
-  )
+  return <Dot tone={TONE[state]} label={LABEL[state]} />
 }

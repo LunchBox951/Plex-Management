@@ -622,6 +622,15 @@ async def _import_download_locked(
             message=f"imported {os.path.basename(src)} to {relative}",
         )
     )
+    # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
+    # the finalize -- ``dst.parent`` is the movie's own folder (Plex's
+    # ``Title (Year)/`` dir the file was placed into), the exact directory a
+    # later disk-pressure sweep's ``fs.delete()`` must remove. Without this,
+    # ``MediaRequest.library_path`` stays ``None`` forever and
+    # ``eviction_service._movie_candidates`` has no deletion target for this
+    # request (see that module's docstring on skipping a candidate with no
+    # stored breadcrumb).
+    await request_repo.set_library_path(request.id, str(dst.parent))
     await request_repo.mark_completed(request.id)
     await session.commit()
     return await download_repo.get_by_hash(torrent_hash)
@@ -904,6 +913,15 @@ async def _import_tv_locked(
                 message=f"imported {basename} to {relative}",
             )
         )
+    # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
+    # mark_completed -- ``season_dir`` is the season's own directory (the one
+    # this call just scanned), the exact directory a later disk-pressure sweep's
+    # ``fs.delete()`` must remove. Without this, ``SeasonRequest.library_path``
+    # stays ``None`` forever and ``eviction_service._season_candidates`` has no
+    # deletion target for this season.
+    await season_request_service.set_library_path(
+        session, media_request_id=request.id, season_number=season, library_path=str(season_dir)
+    )
     await season_request_service.mark_completed(
         session, media_request_id=request.id, season_number=season
     )

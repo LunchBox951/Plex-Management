@@ -104,6 +104,179 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/ops/disk": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Disk Endpoint
+         * @description Disk usage per configured library root, plus a ranked preview of what a
+         *     pressure sweep WOULD evict from each (never evicts anything itself).
+         *
+         *     TTL-cached per root (~15s) — see :func:`_disk_root_item` — so the Status
+         *     page's ~15s poll never re-hammers Plex/the filesystem on every tick.
+         */
+        get: operations["disk_endpoint_api_v1_ops_disk_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ops/evict": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Evict Endpoint
+         * @description Manually trigger a pressure-triggered eviction sweep across every
+         *     configured root — the north-star #1 button: free space on demand.
+         *
+         *     Runs REGARDLESS of the ``eviction_enabled`` master switch: that setting
+         *     gates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),
+         *     never this explicit, operator-initiated action — an operator who disabled
+         *     the background loop must still be able to free space on demand without
+         *     re-enabling it. Still pressure-gated (a root already below
+         *     ``disk_pressure_threshold_percent`` evicts nothing — an empty ``evicted``
+         *     is a normal, honest outcome) and still honours every other rule (watched,
+         *     past grace, un-pinned, not in flight): this is the SAME sweep the periodic
+         *     task runs, just invoked synchronously instead of on a timer. Requires Plex
+         *     (409 ``service_not_configured`` otherwise — watch state can't be resolved
+         *     without it); an unset root is simply skipped, not an error.
+         *
+         *     Invalidates :func:`_get_disk_preview_cache` after the sweep: without this,
+         *     ``GET /disk`` would keep serving the pre-eviction snapshot (stale
+         *     candidates the operator just deleted, stale free-space gauge) for up to
+         *     its ~15s TTL, contradicting north-star #3 for the very endpoint that IS
+         *     the correction button.
+         *
+         *     Each root's sweep is INDEPENDENT: one root raising (e.g. a transient
+         *     ``PlexLibraryError`` resolving TV watch state during candidate assembly)
+         *     must never abort a root that has not run yet, nor hide what an EARLIER
+         *     root already deleted and committed. A bare 500 here would do exactly that
+         *     — the operator would see "Free space failed" with no indication that,
+         *     say, the movies root already freed real space — which is a dishonest,
+         *     silent-partial-success state north star #2 forbids. So every root's sweep
+         *     is individually caught; a caught failure is logged and recorded in
+         *     ``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,
+         *     and the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 —
+         *     partial completion is a first-class, visible outcome, not a terminal one.
+         */
+        post: operations["evict_endpoint_api_v1_ops_evict_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ops/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Health Endpoint
+         * @description One read: per-subsystem reachability, disk gauges, and the reconcile
+         *     loop's own health. Each upstream probe is TTL-cached (~15s) so polling this
+         *     every few seconds never hammers an upstream or burns the TMDB rate limit.
+         */
+        get: operations["health_endpoint_api_v1_ops_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ops/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Logs Endpoint
+         * @description Paginated, filtered read of the durable ``log_events`` store, newest
+         *     first. ``correlation_id`` matches a ``request_id``/``download_id``/
+         *     ``tmdb_id`` carried in a record's context.
+         */
+        get: operations["list_logs_endpoint_api_v1_ops_logs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ops/logs/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export Logs Endpoint
+         * @description The LLM-diagnosis affordance: one coherent, downloadable/copyable trail.
+         *
+         *     Either a single correlation id's FULL history (``correlation_id`` — a
+         *     ``request_id``/``download_id``/``tmdb_id``), or a time window from
+         *     ``since`` through now (``since`` omitted defaults to the last 24h) — when
+         *     both are supplied, ``correlation_id`` wins (a specific id's whole trail is
+         *     the more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal
+         *     safety cap, not a policy setting) with an honest trailing note when
+         *     truncated. Rendered OLDEST-first (a coherent top-to-bottom story), unlike
+         *     the newest-first ``GET /logs`` list. ``Content-Disposition: attachment`` so
+         *     navigating straight to this URL downloads a file; a caller reading the body
+         *     via ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+         */
+        get: operations["export_logs_endpoint_api_v1_ops_logs_export_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ops/logs/tail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Tail Logs Endpoint
+         * @description The live, in-memory, ALL-levels ring-buffer tail (newest first) — lost on
+         *     restart, never persisted (only INFO+ reaches durable ``log_events``, see
+         *     ``GET /logs`` above). ``dropped_count`` is the capture handler's own honest
+         *     signal for how many INFO+ records missed durable storage since startup.
+         */
+        get: operations["tail_logs_endpoint_api_v1_ops_logs_tail_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/quality-profile": {
         parameters: {
             query?: never;
@@ -269,6 +442,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/requests/{request_id}/keep-forever": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Keep Forever Endpoint
+         * @description Set or clear the operator's "keep forever" pin (ADR-0012).
+         *
+         *     The north-star #1 correction path for "don't let the eviction sweep touch
+         *     this one": a pinned title (or, for a show, every one of its seasons -- the
+         *     pin lives on the parent) is never selected by ``domain/eviction.py``
+         *     regardless of watch state or disk pressure. A 404 for an unknown id, never
+         *     a silent no-op.
+         */
+        post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/search-preview": {
         parameters: {
             query?: never;
@@ -310,6 +509,15 @@ export interface paths {
          *     the whole object back (e.g. after editing only ``plex_url``) must not clobber
          *     the real credential with the mask — a silent secret-wipe that would only
          *     surface later as an auth failure to the downstream service.
+         *
+         *     The disk-pressure pair is cross-checked against the EFFECTIVE (post-update)
+         *     values, not just what this one request happens to carry: ``SettingsUpdate``'s
+         *     own ``model_validator`` only catches a target above the threshold when BOTH
+         *     are submitted together, but ``PUT`` is a PARTIAL update — sending just one
+         *     side against an already-stored (and now-inverted) other side would otherwise
+         *     silently leave the whole threshold-to-target band unable to relieve pressure
+         *     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
+         *     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
@@ -645,6 +853,133 @@ export interface components {
             results: components["schemas"]["DiscoverResult"][];
         };
         /**
+         * DiskGaugeItem
+         * @description One configured library root's usage snapshot (health dashboard gauge).
+         */
+        DiskGaugeItem: {
+            /** Available Bytes */
+            available_bytes: number;
+            /** Error */
+            error?: string | null;
+            /** Path */
+            path: string;
+            /** Root */
+            root: string;
+            /** Total Bytes */
+            total_bytes: number;
+            /** Used Percent */
+            used_percent: number;
+        };
+        /**
+         * DiskResponse
+         * @description ``GET /api/v1/ops/disk`` -- usage + a ranked eviction-candidate preview
+         *     per configured root.
+         */
+        DiskResponse: {
+            /** Roots */
+            roots: components["schemas"]["DiskRootItem"][];
+        };
+        /**
+         * DiskRootItem
+         * @description One configured library root's usage + its ranked eviction preview.
+         */
+        DiskRootItem: {
+            /** Available Bytes */
+            available_bytes: number;
+            /** Candidates */
+            candidates: components["schemas"]["EvictionCandidateItem"][];
+            /** Error */
+            error?: string | null;
+            /** Path */
+            path: string;
+            /** Root */
+            root: string;
+            /** Total Bytes */
+            total_bytes: number;
+            /** Used Percent */
+            used_percent: number;
+        };
+        /**
+         * EvictErrorItem
+         * @description One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --
+         *     a LATER root raising (e.g. a transient Plex error resolving TV watch
+         *     state) must never hide an EARLIER root's evictions that already deleted
+         *     files and committed (honesty over silence: partial progress is surfaced,
+         *     not swallowed behind a 500).
+         */
+        EvictErrorItem: {
+            /** Detail */
+            detail: string;
+            /**
+             * Root
+             * @enum {string}
+             */
+            root: "movies_root" | "tv_root";
+        };
+        /**
+         * EvictResponse
+         * @description The result of a manual disk-pressure sweep (north-star #1: a button that
+         *     frees space on demand). Empty ``evicted`` is a normal, honest outcome (no
+         *     root was under pressure, or nothing was eligible). ``errors`` is populated
+         *     per-root when THAT root's own sweep raised -- every other root's outcome
+         *     in ``evicted`` still stands; the sweep never aborts one root's already
+         *     committed work just because a sibling root failed.
+         */
+        EvictResponse: {
+            /** Errors */
+            errors?: components["schemas"]["EvictErrorItem"][];
+            /** Evicted */
+            evicted: components["schemas"]["EvictionOutcomeItem"][];
+        };
+        /**
+         * EvictionCandidateItem
+         * @description One title/season a pressure sweep WOULD evict (the ``GET /ops/disk``
+         *     preview), or one it DID evict (a ``POST /ops/evict`` outcome shares this
+         *     shape's fields, see :class:`EvictionOutcomeItem`).
+         */
+        EvictionCandidateItem: {
+            /** Last Viewed At */
+            last_viewed_at?: string | null;
+            /** Library Path */
+            library_path?: string | null;
+            /**
+             * Media Type
+             * @enum {string}
+             */
+            media_type: "movie" | "tv";
+            /** Request Id */
+            request_id: number;
+            /** Season */
+            season?: number | null;
+            /** Size Percent */
+            size_percent: number;
+            /** Status */
+            status: string;
+            /** Title */
+            title: string;
+        };
+        /**
+         * EvictionOutcomeItem
+         * @description One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.
+         */
+        EvictionOutcomeItem: {
+            /** Freed Bytes */
+            freed_bytes?: number | null;
+            /** Library Path */
+            library_path: string;
+            /**
+             * Media Type
+             * @enum {string}
+             */
+            media_type: "movie" | "tv";
+            /** Request Id */
+            request_id: number;
+            /** Season */
+            season?: number | null;
+            /** Title */
+            title: string;
+        };
+        /**
          * GrabRequest
          * @description Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.
          *
@@ -673,6 +1008,106 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /**
+         * HealthResponse
+         * @description ``GET /api/v1/ops/health`` -- one read answering "is every subsystem
+         *     healthy, is the reconcile loop running, how full is the disk".
+         */
+        HealthResponse: {
+            /** Disks */
+            disks: components["schemas"]["DiskGaugeItem"][];
+            reconcile: components["schemas"]["ReconcileStatusItem"];
+            /** Subsystems */
+            subsystems: components["schemas"]["SubsystemHealthItem"][];
+        };
+        /**
+         * KeepForeverBody
+         * @description ``POST /api/v1/requests/{id}/keep-forever`` -- set or clear the pin.
+         */
+        KeepForeverBody: {
+            /** Keep Forever */
+            keep_forever: boolean;
+        };
+        /**
+         * LiveLogRecordItem
+         * @description One entry from the in-memory, all-levels live tail ring buffer.
+         *
+         *     Unlike :class:`LogEventItem`, this has no durable row id -- the ring buffer
+         *     is lost on restart and never persisted (only INFO-and-above reaches
+         *     ``log_events``; this endpoint shows EVERY level, including DEBUG).
+         */
+        LiveLogRecordItem: {
+            /** Context */
+            context?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Level */
+            level: string;
+            /** Logger */
+            logger: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * LogEventItem
+         * @description One durably-stored ``log_events`` row, as the log viewer / export reads it.
+         *
+         *     ``context`` carries correlation ids (``request_id``/``download_id``/
+         *     ``tmdb_id``) set at the log call site -- never a secret-bearing field (see
+         *     ``models.LogEvent``).
+         */
+        LogEventItem: {
+            /** Context */
+            context?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Level */
+            level: string;
+            /** Logger */
+            logger: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * LogsResponse
+         * @description A filtered, paginated page of ``GET /api/v1/ops/logs``.
+         *
+         *     ``total`` is the count of rows matching the filter (not the whole table),
+         *     so the client can tell whether more pages exist beyond ``events``.
+         */
+        LogsResponse: {
+            /** Events */
+            events: components["schemas"]["LogEventItem"][];
+            /** Total */
+            total: number;
+        };
+        /**
+         * LogsTailResponse
+         * @description ``GET /api/v1/ops/logs/tail`` -- the live ring buffer, newest first.
+         *
+         *     ``dropped_count`` is the capture handler's own honest signal: how many
+         *     INFO+ records could not be enqueued for durable storage since startup
+         *     because the drain queue was full (the ring buffer itself is unaffected --
+         *     see ``LogCaptureHandler``'s docstring).
+         */
+        LogsTailResponse: {
+            /** Dropped Count */
+            dropped_count: number;
+            /** Events */
+            events: components["schemas"]["LiveLogRecordItem"][];
         };
         /**
          * PlexLibraryOption
@@ -808,6 +1243,28 @@ export interface components {
             queue: components["schemas"]["QueueItem"][];
         };
         /**
+         * ReconcileStatusItem
+         * @description The background reconcile loop's own health, mirrored from
+         *     ``services.health_service.ReconcileStatusSnapshot``. Deliberately separate
+         *     from the subsystem cards above -- a cycle can complete OK even while one
+         *     upstream inside it degraded (see that class's docstring).
+         */
+        ReconcileStatusItem: {
+            /**
+             * Consecutive Failures
+             * @default 0
+             */
+            consecutive_failures: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+        };
+        /**
          * RejectedRelease
          * @description A discarded release paired with its surfaced rejection reason.
          */
@@ -839,6 +1296,11 @@ export interface components {
              * @default false
              */
             is_anime: boolean;
+            /**
+             * Keep Forever
+             * @default false
+             */
+            keep_forever: boolean;
             /** Media Type */
             media_type: string;
             /** Poster Url */
@@ -929,6 +1391,20 @@ export interface components {
          *     NEVER serialized.
          */
         SettingsResponse: {
+            /** Disk Pressure Target Percent */
+            disk_pressure_target_percent?: number | null;
+            /** Disk Pressure Threshold Percent */
+            disk_pressure_threshold_percent?: number | null;
+            /** Eviction Enabled */
+            eviction_enabled?: boolean | null;
+            /** Eviction Grace Days */
+            eviction_grace_days?: number | null;
+            /** Eviction Interval Minutes */
+            eviction_interval_minutes?: number | null;
+            /** Eviction Proactive Enabled */
+            eviction_proactive_enabled?: boolean | null;
+            /** Log Retention Days */
+            log_retention_days?: number | null;
             /** Movies Root */
             movies_root?: string | null;
             /** Plex Token */
@@ -958,6 +1434,20 @@ export interface components {
          *     encrypted at rest. ``None`` / absent fields are left unchanged.
          */
         SettingsUpdate: {
+            /** Disk Pressure Target Percent */
+            disk_pressure_target_percent?: number | null;
+            /** Disk Pressure Threshold Percent */
+            disk_pressure_threshold_percent?: number | null;
+            /** Eviction Enabled */
+            eviction_enabled?: boolean | null;
+            /** Eviction Grace Days */
+            eviction_grace_days?: number | null;
+            /** Eviction Interval Minutes */
+            eviction_interval_minutes?: number | null;
+            /** Eviction Proactive Enabled */
+            eviction_proactive_enabled?: boolean | null;
+            /** Log Retention Days */
+            log_retention_days?: number | null;
             /** Movies Root */
             movies_root?: string | null;
             /** Plex Token */
@@ -1014,6 +1504,27 @@ export interface components {
             app_api_key?: string | null;
             /** Initialized */
             initialized: boolean;
+        };
+        /**
+         * SubsystemHealthItem
+         * @description One upstream's reachability, as ``services.health_service.SubsystemHealth``
+         *     reports it. ``not_configured`` is honest -- never confused with ``down``.
+         */
+        SubsystemHealthItem: {
+            /**
+             * Checked At
+             * Format: date-time
+             */
+            checked_at: string;
+            /** Detail */
+            detail?: string | null;
+            /** Name */
+            name: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "degraded" | "down" | "not_configured";
         };
         /**
          * TmdbValidateRequest
@@ -1177,6 +1688,167 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DiscoverListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    disk_endpoint_api_v1_ops_disk_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiskResponse"];
+                };
+            };
+        };
+    };
+    evict_endpoint_api_v1_ops_evict_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvictResponse"];
+                };
+            };
+        };
+    };
+    health_endpoint_api_v1_ops_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    list_logs_endpoint_api_v1_ops_logs_get: {
+        parameters: {
+            query?: {
+                level?: string | null;
+                since?: string | null;
+                logger?: string | null;
+                correlation_id?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_logs_endpoint_api_v1_ops_logs_export_get: {
+        parameters: {
+            query?: {
+                correlation_id?: string | null;
+                since?: string | null;
+                format?: "text" | "json";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Either a `text/plain` line-per-event trail (default, `format=text`) or a JSON `LogsResponse` bundle (`format=json`) — the two shapes this endpoint actually serves, per the `format` query parameter. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogsResponse"];
+                    "text/plain": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    tail_logs_endpoint_api_v1_ops_logs_tail_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogsTailResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1390,6 +2062,41 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeepForeverBody"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

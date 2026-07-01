@@ -6,6 +6,8 @@ match the spec, and a minimal fake satisfies each runtime-checkable Protocol.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from plex_manager.domain.release import (
     CandidateRelease,
     IndexerSearchRequest,
@@ -18,7 +20,7 @@ from plex_manager.ports.download_client import (
 )
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
-from plex_manager.ports.library import LibraryPort, LibrarySection
+from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState
 from plex_manager.ports.metadata import (
     MediaSearchResult,
     MetadataPort,
@@ -31,9 +33,15 @@ from plex_manager.ports.repositories import (
     BlocklistRepository,
     DownloadRecord,
     DownloadRepository,
+    LogEventCreate,
+    LogEventPage,
+    LogEventRecord,
+    LogEventRepository,
     RequestRecord,
     RequestRepository,
 )
+
+_EPOCH = datetime(2020, 1, 1, tzinfo=UTC)
 
 
 def test_download_status_defaults_match_qbit_conventions() -> None:
@@ -49,13 +57,26 @@ def test_metadata_and_library_dtos_construct() -> None:
     assert MovieMetadata(tmdb_id=1, title="x").imdb_id is None
     assert TvMetadata(tmdb_id=1, title="x").season_count == 0
     assert LibrarySection(key="1", title="Movies", type="movie").type == "movie"
+    assert WatchState(watched=False).last_viewed_at is None
 
 
 def test_repository_records_construct() -> None:
     request = RequestRecord(id=1, tmdb_id=5, media_type="movie", title="x", status="pending")
     assert request.is_anime is False
+    assert request.library_path is None
+    assert request.keep_forever is False
     assert DownloadRecord(id=1, torrent_hash="h", status="downloading").progress == 0.0
     assert BlocklistRecord(id=1, source_title="t", reason="failed").torrent_hash is None
+
+
+def test_log_event_dtos_construct() -> None:
+    record = LogEventRecord(
+        id=1, created_at=_EPOCH, level="INFO", logger="plex_manager.x", message="hi"
+    )
+    assert record.context is None
+    created = LogEventCreate(created_at=_EPOCH, level="INFO", logger="plex_manager.x", message="hi")
+    assert created.context is None
+    assert LogEventPage(total=0, results=[]).results == []
 
 
 class _FakeParser:
@@ -112,6 +133,7 @@ def test_port_protocols_are_importable() -> None:
         RequestRepository,
         DownloadRepository,
         BlocklistRepository,
+        LogEventRepository,
     ):
         assert proto is not None
 

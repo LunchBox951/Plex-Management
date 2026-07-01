@@ -258,6 +258,45 @@ async def test_create_request_redetects_removal_within_cache_ttl(
         assert pending_row.status is RequestStatus.pending
 
 
+async def test_create_request_after_eviction_creates_a_fresh_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """ADR-0012: once the disk-pressure sweep flips a request to ``evicted``, the
+    old (now off-disk) row must never shadow a re-request as if it were still
+    active. This exercises the SERVICE-level path (``create_request`` ->
+    ``find_active``), not just the DB partial-index backstop: without
+    ``evicted`` in ``repositories.requests._SETTLED_REQUEST_STATUSES``,
+    ``find_active`` would keep returning the evicted row and ``create_request``
+    would resolve to the stale row instead of creating a fresh one that
+    actually re-grabs the content."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=601,
+            media_type=MediaType.movie,
+            title="Evicted Movie",
+            status=RequestStatus.evicted,
+        )
+        session.add(evicted)
+        await session.commit()
+        evicted_id = evicted.id
+
+    tmdb = FakeTmdb(movies={601: MovieMetadata(tmdb_id=601, title="Evicted Movie", year=2019)})
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(session, tmdb, tmdb_id=601, media_type="movie")
+
+    assert fresh.id != evicted_id
+    assert fresh.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 601)))
+            .scalars()
+            .all()
+        )
+    statuses = sorted(r.status.value for r in rows)
+    assert statuses == ["evicted", "pending"]  # both rows survive, independently
+
+
 async def _season_numbers(sm: SessionMaker, media_request_id: int) -> set[int]:
     async with sm() as session:
         rows = (
@@ -460,3 +499,104 @@ async def test_create_request_tv_season_already_in_plex_rolls_up_partially_avail
     assert by_season == {1: "available", 2: "pending"}
     assert show is not None
     assert show.status is RequestStatus.partially_available
+
+
+# --------------------------------------------------------------------------- #
+# set_keep_forever (ADR-0012) — a per-TITLE pin, not a per-row one (R6-D)
+# --------------------------------------------------------------------------- #
+
+
+async def test_set_keep_forever_pins_every_row_sharing_the_title(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """R6-D regression: ``uq_media_requests_active`` only constrains ACTIVE
+    rows, so a single show commonly has SEVERAL ``MediaRequest`` rows over its
+    lifetime -- an older SETTLED ``available`` request (seasons 1-2) and a
+    newer ACTIVE request (season 3). The UI resolves the title to the visible
+    active row and toggles keep-forever THERE, but ``eviction_service.
+    _season_candidates`` reads ``keep_forever`` off EACH season's OWN parent
+    -- so pinning only the active row would leave the settled row's seasons
+    unpinned and still evictable. Pinning must apply to every row sharing
+    ``(tmdb_id, media_type)``."""
+    async with sessionmaker_() as session:
+        settled = MediaRequest(
+            tmdb_id=9001,
+            media_type=MediaType.tv,
+            title="Old Show",
+            status=RequestStatus.available,
+        )
+        active = MediaRequest(
+            tmdb_id=9001,
+            media_type=MediaType.tv,
+            title="Old Show",
+            status=RequestStatus.pending,
+        )
+        session.add_all([settled, active])
+        await session.commit()
+        settled_id, active_id = settled.id, active.id
+
+    async with sessionmaker_() as session:
+        updated = await request_service.set_keep_forever(
+            session=session, request_id=active_id, keep_forever=True
+        )
+    assert updated is not None
+    assert updated.id == active_id
+    assert updated.keep_forever is True
+
+    async with sessionmaker_() as session:
+        settled_row = await session.get(MediaRequest, settled_id)
+        active_row = await session.get(MediaRequest, active_id)
+    assert settled_row is not None
+    assert active_row is not None
+    assert settled_row.keep_forever is True  # the OLD settled row is pinned too
+    assert active_row.keep_forever is True
+
+
+async def test_unset_keep_forever_clears_every_row_sharing_the_title(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Symmetric to the pin above: unpinning the active row must clear the
+    pin on every sibling row too, not leave a settled row permanently pinned."""
+    async with sessionmaker_() as session:
+        settled = MediaRequest(
+            tmdb_id=9002,
+            media_type=MediaType.tv,
+            title="Another Show",
+            status=RequestStatus.available,
+            keep_forever=True,
+        )
+        active = MediaRequest(
+            tmdb_id=9002,
+            media_type=MediaType.tv,
+            title="Another Show",
+            status=RequestStatus.pending,
+            keep_forever=True,
+        )
+        session.add_all([settled, active])
+        await session.commit()
+        settled_id, active_id = settled.id, active.id
+
+    async with sessionmaker_() as session:
+        updated = await request_service.set_keep_forever(
+            session=session, request_id=active_id, keep_forever=False
+        )
+    assert updated is not None
+    assert updated.keep_forever is False
+
+    async with sessionmaker_() as session:
+        settled_row = await session.get(MediaRequest, settled_id)
+        active_row = await session.get(MediaRequest, active_id)
+    assert settled_row is not None
+    assert active_row is not None
+    assert settled_row.keep_forever is False
+    assert active_row.keep_forever is False
+
+
+async def test_set_keep_forever_missing_request_returns_none(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        result = await request_service.set_keep_forever(
+            session=session, request_id=999999, keep_forever=True
+        )
+    assert result is None

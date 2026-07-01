@@ -14,7 +14,9 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "${PLEX_MANAGER_PORT:-8000}:8000"
+      # PLEX_MANAGER_PORT is the app's bind port (config.port) AND the host
+      # port; the container side must match it, not a hardcoded 8000.
+      - "${PLEX_MANAGER_PORT:-8000}:${PLEX_MANAGER_PORT:-8000}"
     volumes:
       # Config + database persist across updates and rollbacks.
       - plex-manager-data:/app/data

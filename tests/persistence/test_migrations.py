@@ -45,6 +45,14 @@ def _tables_and_download_cols(db: Path) -> tuple[set[str], set[str]]:
     return tables, cols
 
 
+def _media_request_cols(db: Path) -> set[str]:
+    con = sqlite3.connect(db)
+    try:
+        return {r[1] for r in con.execute("PRAGMA table_info(media_requests)")}
+    finally:
+        con.close()
+
+
 def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> None:
     db = tmp_path / "fresh.db"
     up = _alembic(db, "upgrade", "head")
@@ -53,6 +61,15 @@ def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> No
     tables, dl_cols = _tables_and_download_cols(db)
     assert "season_requests" in tables
     assert {"season", "episodes_json"} <= dl_cols
+
+    # Operability beta (ADR-0012, migration ``6c7fca1436d8``) — this (and the
+    # existing-install regression below) are the ONLY tests that actually run
+    # that migration through Alembic rather than via ``Base.metadata.
+    # create_all``; closes the "never executed by a test" gap: the durable
+    # log_events table, and the eviction breadcrumb/pin columns on
+    # media_requests.
+    assert "log_events" in tables
+    assert {"library_path", "keep_forever"} <= _media_request_cols(db)
 
     down = _alembic(db, "downgrade", "base")
     assert down.returncode == 0, down.stderr
@@ -74,3 +91,9 @@ def test_existing_install_upgrades_across_the_tv_revision(tmp_path: Path) -> Non
     tables, dl_cols = _tables_and_download_cols(db)
     assert "season_requests" in tables
     assert {"season", "episodes_json"} <= dl_cols
+
+    # Same operability assertions as above — proves the migration also applies
+    # cleanly to an EXISTING install upgrading from before it existed, not just
+    # a fresh database.
+    assert "log_events" in tables
+    assert {"library_path", "keep_forever"} <= _media_request_cols(db)

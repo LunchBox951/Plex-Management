@@ -29,6 +29,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy.exc import IntegrityError
+
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.season_rollup import rollup_status
 from plex_manager.models import RequestStatus
@@ -46,7 +48,9 @@ __all__ = [
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
+    "set_library_path",
     "set_status",
+    "set_status_if_in",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -57,13 +61,31 @@ _logger = logging.getLogger(__name__)
 # a circular module dependency. Mirrors ``request_service.
 # TERMINAL_REQUEST_STATUS_VALUES`` at the season granularity: a finished season
 # must never be re-armed to a non-terminal status by a stale
-# ``mark_no_acceptable_release``.
+# ``mark_no_acceptable_release`` / a later, unrelated download's failure
+# (``set_status(skip_if_terminal=True)``).
+#
+# ``evicted`` (ADR-0012) belongs here for the SAME reason as the movie-level set:
+# there is nothing left on disk for THIS season to resume, so a stale signal must
+# never drag it back to ``searching``/``no_acceptable_release``. This does NOT
+# conflict with an evicted season being re-requestable -- :func:`ensure_seasons`
+# (the ``POST /requests`` re-request path, see C3) re-arms an ``evicted`` season
+# to ``pending``/``available`` through a SEPARATE, explicit code path that never
+# consults this set, exactly mirroring how a re-requested evicted MOVIE gets a
+# brand-new row rather than going through this guard.
 _TERMINAL_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
-    s.value for s in (RequestStatus.completed, RequestStatus.available, RequestStatus.failed)
+    s.value
+    for s in (
+        RequestStatus.completed,
+        RequestStatus.available,
+        RequestStatus.failed,
+        RequestStatus.evicted,
+    )
 )
 
 
-async def _recompute_parent(session: AsyncSession, media_request_id: int) -> None:
+async def _recompute_parent(
+    session: AsyncSession, media_request_id: int, *, tolerate_active_conflict: bool = False
+) -> None:
     """Re-read every tracked season's status, fold via ``rollup_status``, persist.
 
     Called after EVERY season-status transition, in the SAME transaction as the
@@ -72,13 +94,52 @@ async def _recompute_parent(session: AsyncSession, media_request_id: int) -> Non
     tracked seasons yet (should not happen once ``ensure_seasons`` has run at
     least once) is a no-op rather than a crash -- ``rollup_status`` itself raises
     on an empty sequence, so guard before calling it.
+
+    ``tolerate_active_conflict`` (default ``False`` -- unchanged for every normal
+    season transition, which must keep recomputing the rollup STRICTLY so dedup
+    never silently weakens): an OLD, already-SETTLED parent (rollup ``available``,
+    outside ``uq_media_requests_active``) can legitimately coexist with a NEWER,
+    genuinely active ``MediaRequest`` for the SAME ``(tmdb_id, media_type)`` (e.g.
+    a fresh request for a later season after the old one finished) -- see
+    ``RequestStatus.evicted``'s docstring and ``models.uq_media_requests_active``.
+    Evicting one of the old parent's remaining seasons folds its rollup back to
+    the active ``partially_available`` (``[evicted, available] ->
+    partially_available``, ``domain/season_rollup``), which would then collide
+    with the newer active row's slot in that same partial unique index. Only
+    ``eviction_service._evict_one`` opts into tolerating that: the season's own
+    CAS to ``evicted`` (+ its history row) is the source of truth for "the file
+    is gone" and MUST survive regardless of whether this coarser, best-effort
+    parent-rollup write succeeds -- so it runs inside its own SAVEPOINT
+    (``session.begin_nested()``) and an ``IntegrityError`` from JUST this write is
+    caught, logged, and discarded: the parent is left at its PRIOR (still
+    accurate -- the newer request is the authoritative active row for this show)
+    status, and the season CAS/history in the OUTER transaction is untouched and
+    still commits normally.
     """
     season_repo = SqlSeasonRequestRepository(session)
     seasons = await season_repo.list_for_request(media_request_id)
     if not seasons:
         return
     status = rollup_status([season.status for season in seasons])
-    await SqlRequestRepository(session).set_status(media_request_id, status)
+    if not tolerate_active_conflict:
+        await SqlRequestRepository(session).set_status(media_request_id, status)
+        return
+    try:
+        async with session.begin_nested():
+            await SqlRequestRepository(session).set_status(media_request_id, status)
+    except IntegrityError:
+        # A NEWER active request for the same (tmdb_id, media_type) already holds
+        # ``uq_media_requests_active``'s slot -- the parent rollup write collided,
+        # not the season CAS that triggered it. Only THIS savepoint is undone (the
+        # parent keeps its prior, still-honest status); the caller's season CAS +
+        # history row are unaffected and still commit. Never silently swallowed --
+        # logged so an operator can see the coarse rollup is momentarily stale.
+        _logger.warning(
+            "parent rollup write for media request %s skipped: a newer active "
+            "request already occupies the active-dedup slot for this show; the "
+            "season's own status/history are unaffected",
+            media_request_id,
+        )
 
 
 async def _present_seasons(library: LibraryPort, tmdb_id: int) -> frozenset[int]:
@@ -130,7 +191,8 @@ async def ensure_seasons(
     already-established season, so calling this on EVERY ``create_request`` call
     for a tv media_type -- including the dedup path, with a possibly-DIFFERENT
     season list -- only ever ADDS newly-named seasons; it never regresses one
-    already in flight or finished.
+    already in flight or finished. The ONE exception (C3, ADR-0012) is an
+    ``evicted`` season: see the re-arm note below.
 
     The parent rollup is recomputed ONCE after every season in ``seasons`` has
     been ensured, not once per season -- cheaper, and avoids persisting
@@ -140,6 +202,29 @@ async def ensure_seasons(
     per-season already-in-library decision is a membership test against that single
     fresh snapshot, so a whole-series request never re-pages the library N times
     inside the held write transaction.
+
+    Re-requesting an EVICTED season (ADR-0012): when the show has a mix of
+    seasons (some still ``available``/``completed``, one ``evicted``), the
+    parent's rollup is the non-terminal, active ``partially_available`` -- so
+    ``create_request``'s dedup finds the EXISTING ``MediaRequest`` and calls this
+    function again for the evicted season number, rather than creating a fresh
+    request (that fresh-row path is how a WHOLLY evicted show, rollup
+    ``evicted``, gets re-requested instead -- see ``request_service.
+    TERMINAL_REQUEST_STATUS_VALUES`` / ``_SETTLED_REQUEST_STATUSES``). Because
+    the season row ALREADY EXISTS, ``ensure()``'s get-or-create returns it
+    UNCHANGED -- without the re-arm below, "Request again" on that one season
+    would be a silent no-op forever (the sweep already deleted the file; nothing
+    would ever re-search/re-grab it). So: a season that comes back ``evicted``
+    from ``ensure()`` is explicitly re-armed to exactly the status a FRESH row
+    would have gotten just above (``available`` if Plex already has it again,
+    otherwise ``pending`` so search/grab picks it up) -- mirroring how
+    re-requesting an evicted MOVIE creates a fresh grabbable row. Scoped
+    EXCLUSIVELY to ``evicted``: ``ensure()`` never constructs a NEW row with that
+    status, so reaching it here always means a pre-existing row, and every other
+    terminal/in-flight season status (``available``/``completed``/``failed``/
+    ``searching``/``downloading``/``import_blocked``/``no_acceptable_release``/
+    ``pending``) is left completely untouched -- an in-flight or already-finished
+    season is never regressed by a re-request.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
@@ -152,9 +237,11 @@ async def ensure_seasons(
             if season_number in present
             else RequestStatus.pending.value
         )
-        records.append(
-            await season_repo.ensure(media_request_id, season_number, status=initial_status)
-        )
+        record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
+        if record.status == RequestStatus.evicted.value:
+            await season_repo.set_status(record.id, initial_status)
+            record = await season_repo.get(record.id) or record
+        records.append(record)
     await _recompute_parent(session, media_request_id)
     return records
 
@@ -202,6 +289,71 @@ async def set_status(
         return
     await season_repo.set_status(row.id, status)
     await _recompute_parent(session, media_request_id)
+
+
+async def set_status_if_in(
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_request_id: int,
+    status: str,
+    allowed_from: frozenset[str],
+    tolerate_active_conflict: bool = False,
+) -> bool:
+    """Compare-and-swap ONE season's status, recomputing the parent rollup ONLY when
+    the swap actually happened. Returns whether it happened.
+
+    The CAS-aware counterpart of :func:`set_status`, for a caller that already
+    holds the season's own id (not just a ``(media_request_id, season_number)``
+    tuple) and needs the database -- not this session's in-memory view -- to be
+    the authority on whether the transition still applies:
+    ``eviction_service._evict_one`` is the reason this exists (ADR-0012, C6) --
+    see ``SqlSeasonRequestRepository.set_status_if_in``'s docstring for the full
+    double-count race it closes. A losing CAS (``False``) must never recompute
+    (and persist) a rollup derived from a row it did not actually get to move.
+
+    ``tolerate_active_conflict`` (default ``False``, strict for every ordinary
+    caller) is passed straight through to :func:`_recompute_parent` -- see its
+    docstring. ``eviction_service._evict_one`` is the ONLY caller that opts in
+    (``True``): the season CAS above (and its history row, written by the
+    caller after this returns) is the authoritative "the file is gone" record
+    and must survive even when the coarser parent-rollup write below it
+    collides with a newer active request for the same show.
+    """
+    changed = await SqlSeasonRequestRepository(session).set_status_if_in(
+        season_request_id, status, allowed_from
+    )
+    if changed:
+        await _recompute_parent(
+            session, media_request_id, tolerate_active_conflict=tolerate_active_conflict
+        )
+    return changed
+
+
+async def set_library_path(
+    session: AsyncSession, *, media_request_id: int, season_number: int, library_path: str
+) -> None:
+    """Persist the final placed directory for one season (ADR-0012's eviction breadcrumb).
+
+    The season-level analogue of ``SqlRequestRepository.set_library_path``: called
+    once at import finalize (``import_service._import_tv_locked``, the SAME
+    transaction as :func:`mark_completed`), this is what lets a later disk-pressure
+    sweep discover an ``fs.delete()`` target for the season --
+    ``eviction_service._season_candidates`` reads ``SeasonRequest.library_path``
+    verbatim. Without this call the column stays ``None`` forever and the sweep
+    skips the season, logged, never guessing a path (see
+    ``eviction_service._evict_one``).
+
+    Resolves the row via ``ensure()`` (idempotent get-or-create) rather than
+    requiring a pre-known ``SeasonRequest`` id, mirroring every other function
+    here. Does NOT recompute the parent rollup -- the library path never feeds
+    ``rollup_status``, so touching it is not a status transition.
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.set_library_path(row.id, library_path)
 
 
 async def mark_completed(

@@ -11,7 +11,12 @@ import type {
   CreateRequestBody,
   DiscoverHomeResponse,
   DiscoverSearchResponse,
+  DiskResponse,
+  EvictResponse,
   GrabRequest,
+  HealthResponse,
+  LogsResponse,
+  LogsTailResponse,
   PlexLibraryOption,
   QualityProfileResponse,
   QueueItem,
@@ -27,6 +32,8 @@ import type {
   SetupStatusResponse,
 } from './types'
 import {
+  LOG_TAIL_POLL_INTERVAL_MS,
+  OPS_POLL_INTERVAL_MS,
   POLL_INTERVAL_MS,
   REQUESTS_POLL_INTERVAL_MS,
   queryKeys,
@@ -184,6 +191,32 @@ export function useCreateRequest() {
   })
 }
 
+/**
+ * Set or clear the "keep forever" pin (ADR-0012) — the north-star #1
+ * correction path for "don't let the eviction sweep touch this one". Also
+ * invalidates the disk preview: a newly-pinned title must drop out of (and a
+ * newly-unpinned one may re-enter) the eviction-candidate list immediately.
+ */
+export function useSetKeepForever() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (args: {
+      requestId: number
+      keepForever: boolean
+    }): Promise<RequestResponse> =>
+      unwrap(
+        await client.POST('/api/v1/requests/{request_id}/keep-forever', {
+          params: { path: { request_id: args.requestId } },
+          body: { keep_forever: args.keepForever },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+      void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
+    },
+  })
+}
+
 /* --------------------------------------------------------- search-preview -- */
 
 export function useSearchPreview() {
@@ -287,5 +320,128 @@ export function useQualityProfile() {
     queryKey: queryKeys.qualityProfile,
     queryFn: async (): Promise<QualityProfileResponse> =>
       unwrap(await client.GET('/api/v1/quality-profile')),
+  })
+}
+
+/* --------------------------------------------------------------------- ops -- */
+// ADR-0012 — Status page (health/reconcile/disk) + Logs page.
+
+/** One read: per-subsystem reachability, disk gauges, the reconcile loop's own
+ * health. Polled at `OPS_POLL_INTERVAL_MS` — matches the backend's own ~15s
+ * upstream-probe TTL cache, so a faster poll would just re-read the same
+ * cached snapshot. `poll` defaults on; the Status page turns it off on unmount
+ * via TanStack Query's own inactive-query GC, nothing extra needed here. */
+export function useOpsHealth(options?: { poll?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.opsHealth,
+    queryFn: async (): Promise<HealthResponse> => unwrap(await client.GET('/api/v1/ops/health')),
+    refetchInterval: options?.poll === false ? false : OPS_POLL_INTERVAL_MS,
+  })
+}
+
+/** Disk usage per configured library root, plus each root's ranked
+ * eviction-candidate preview (never evicts anything itself — see `useEvict`). */
+export function useOpsDisk(options?: { poll?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.opsDisk,
+    queryFn: async (): Promise<DiskResponse> => unwrap(await client.GET('/api/v1/ops/disk')),
+    refetchInterval: options?.poll === false ? false : OPS_POLL_INTERVAL_MS,
+  })
+}
+
+/**
+ * The north-star #1 button: manually trigger a disk-pressure eviction sweep
+ * across every configured root, right now. An empty `evicted` list is a
+ * normal, honest outcome (nothing was under pressure, or nothing eligible was
+ * found) — the caller decides how to phrase that, this hook just reports it.
+ */
+export function useEvict() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<EvictResponse> => unwrap(await client.POST('/api/v1/ops/evict')),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
+      void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
+      // Evicted titles flip to the visible `evicted` request status.
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+    },
+  })
+}
+
+/** Filters accepted by `GET /ops/logs` — every field is an EXACT match
+ * server-side (never a substring search); the Logs page's free-text search
+ * box filters the fetched page client-side on top of these. */
+export interface LogsFilter {
+  level?: string
+  since?: string
+  logger?: string
+  correlationId?: string
+  limit?: number
+  offset?: number
+}
+
+/** A paginated, filtered page of the durable `log_events` store, newest first. */
+export function useLogs(filter: LogsFilter, options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.opsLogs(filter),
+    enabled: options?.enabled ?? true,
+    queryFn: async (): Promise<LogsResponse> =>
+      unwrap(
+        await client.GET('/api/v1/ops/logs', {
+          params: {
+            query: {
+              level: filter.level ?? null,
+              since: filter.since ?? null,
+              logger: filter.logger ?? null,
+              correlation_id: filter.correlationId ?? null,
+              ...(filter.limit !== undefined ? { limit: filter.limit } : {}),
+              ...(filter.offset !== undefined ? { offset: filter.offset } : {}),
+            },
+          },
+        }),
+      ),
+  })
+}
+
+/** The live, in-memory, ALL-levels ring-buffer tail (newest first) — lost on
+ * restart, never persisted. Only polls while `enabled` (the Logs page's
+ * live-tail toggle); otherwise this is a dead, unfetched query. */
+export function useLogsTail(options?: { enabled?: boolean; limit?: number }) {
+  const enabled = options?.enabled ?? false
+  return useQuery({
+    queryKey: queryKeys.opsLogsTail,
+    enabled,
+    queryFn: async (): Promise<LogsTailResponse> =>
+      unwrap(
+        await client.GET('/api/v1/ops/logs/tail', {
+          params: { query: options?.limit !== undefined ? { limit: options.limit } : {} },
+        }),
+      ),
+    refetchInterval: enabled ? LOG_TAIL_POLL_INTERVAL_MS : false,
+  })
+}
+
+/**
+ * The LLM-diagnosis affordance: fetch one coherent, plain-text trail (oldest
+ * first) — either a single correlation id's FULL history, or a time window
+ * (omitted `since` defaults server-side to the last 24h). A mutation rather
+ * than a cached query: this is an on-demand export action (Copy/Download),
+ * never something the UI polls or re-renders from cache.
+ */
+export function useExportLogs() {
+  return useMutation({
+    mutationFn: async (args: { correlationId?: string; since?: string }): Promise<string> =>
+      unwrap(
+        await client.GET('/api/v1/ops/logs/export', {
+          params: {
+            query: {
+              correlation_id: args.correlationId ?? null,
+              since: args.since ?? null,
+              format: 'text',
+            },
+          },
+          parseAs: 'text',
+        }),
+      ),
   })
 }

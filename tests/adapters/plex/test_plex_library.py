@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -25,6 +26,7 @@ from plex_manager.adapters.plex.library import (
     PlexLibraryError,
     reset_caches,
 )
+from plex_manager.ports.library import WatchState
 
 PLEX_URL = "http://plex:32400"
 TOKEN = "super-secret-plex-token"  # noqa: S105
@@ -137,6 +139,44 @@ async def test_list_sections_is_cached_per_base_url() -> None:
     second = await adapter.list_sections()
     assert first == second
     assert calls["n"] == 1  # second call served from the module-level cache
+
+
+async def test_list_sections_use_cache_false_bypasses_the_cache_read() -> None:
+    # R5-4: the health/"Test connection" probe must always reflect reality, so
+    # it needs a cache-BYPASS -- a fresh call with use_cache=False re-pages Plex
+    # live even though a previous call already warmed the 300s cache.
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _main_handler(request)
+
+    adapter = _adapter(counting, base_url="http://bypass-plex:32400")
+    await adapter.list_sections()
+    assert calls["n"] == 1  # warms the cache
+    await adapter.list_sections(use_cache=False)
+    assert calls["n"] == 2  # bypassed the cache, re-hit Plex live
+    # A later default (cached) call is served from the cache the bypass call
+    # refreshed -- the bypass SETS the cache, it doesn't just skip it forever.
+    await adapter.list_sections()
+    assert calls["n"] == 2
+
+
+async def test_list_sections_use_cache_false_reflects_a_new_outage() -> None:
+    # The scenario the health probe exists to catch: a healthy call warms the
+    # cache, then Plex goes down (or the token is rejected) -- a use_cache=False
+    # call must see the CURRENT failure, not a cached "ok" sections list.
+    def flaky(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={})
+
+    adapter = _adapter(_main_handler, base_url="http://outage-plex:32400")
+    sections = await adapter.list_sections()
+    assert len(sections) == 2  # cache is warm
+
+    down_client = httpx.AsyncClient(transport=httpx.MockTransport(flaky))
+    down_adapter = PlexLibrary(down_client, base_url="http://outage-plex:32400", token=TOKEN)
+    with pytest.raises(PlexAuthError):
+        await down_adapter.list_sections(use_cache=False)
 
 
 async def test_list_sections_cache_is_keyed_by_token_not_just_url() -> None:
@@ -571,6 +611,47 @@ async def test_list_sections_does_not_cache_a_no_movie_result() -> None:
     assert third == second
 
 
+async def test_list_sections_invalidates_a_stale_movie_cache_when_the_library_is_removed() -> None:
+    # R6-E: list_sections only ever SET the cache on a movie-bearing result,
+    # never CLEARED it -- so once a movie-bearing snapshot was cached, a LATER
+    # re-page (esp. a live use_cache=False probe) that finds no movie section
+    # left the OLD positive sitting in the cache, untouched. Default
+    # (use_cache=True) callers -- the Settings folder picker, the scan path --
+    # kept being handed the removed movie location for up to the ~300s TTL. A
+    # no-movie page must INVALIDATE the cache key instead of merely skipping
+    # the ``set``, so the very next default call re-pages rather than serving
+    # the stale positive.
+    calls = {"n": 0}
+    state = {"has_movie": True}
+
+    def switching(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        if request.url.path == "/library/sections":
+            calls["n"] += 1
+            return httpx.Response(200, json=SECTIONS if state["has_movie"] else SECTIONS_NO_MOVIE)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(switching, base_url="http://movie-removed-plex:32400")
+    # Warm the cache with a movie-bearing result.
+    first = await adapter.list_sections()
+    assert any(s.type == "movie" for s in first)
+    assert calls["n"] == 1
+
+    # The operator removes the Movie library from Plex; a live use_cache=False
+    # probe (e.g. "Test connection") re-pages and sees it gone.
+    state["has_movie"] = False
+    second = await adapter.list_sections(use_cache=False)
+    assert all(s.type != "movie" for s in second)
+    assert calls["n"] == 2
+
+    # A DEFAULT (use_cache=True) call must re-page too -- the stale movie
+    # positive from the FIRST call must not still be sitting in the cache.
+    third = await adapter.list_sections()
+    assert calls["n"] == 3  # re-fetched -- never served from the stale cache
+    assert all(s.type != "movie" for s in third)
+
+
 async def test_is_available_no_cache_repages_despite_cached_presence() -> None:
     """G7: use_cache=False bypasses the cached-PRESENT fast path so a removal is seen
     immediately. The default (cached) lookup still trusts a cached present answer; the
@@ -634,3 +715,158 @@ async def test_is_available_tv_no_cache_repages_despite_cached_presence() -> Non
     assert await adapter.is_available(1399, "tv", season=1, use_cache=False) is False
     # The refreshed cache now reflects the removal for the default path too.
     assert await adapter.is_available(1399, "tv", season=1) is False
+
+
+# --------------------------------------------------------------------------- #
+# watch_state — ADR-0012 disk-pressure eviction input
+# --------------------------------------------------------------------------- #
+_WATCHED_EPOCH = 1_700_000_000
+_WATCHED_AT = datetime.fromtimestamp(_WATCHED_EPOCH, tz=UTC)
+_PARTIAL_EPOCH = 1_650_000_000
+_PARTIAL_AT = datetime.fromtimestamp(_PARTIAL_EPOCH, tz=UTC)
+
+MOVIES_WATCH_ALL: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 3,
+        "Metadata": [
+            # Watched: viewCount>0 with a recorded lastViewedAt.
+            {"Guid": [{"id": "tmdb://27205"}], "viewCount": 3, "lastViewedAt": _WATCHED_EPOCH},
+            # Never viewed: Plex omits viewCount/lastViewedAt entirely.
+            {"Guid": [{"id": "tmdb://129"}]},
+            # Defensive/malformed: a viewCount with no lastViewedAt must never
+            # read as watched (WatchState's own consistency contract).
+            {"Guid": [{"id": "tmdb://999"}], "viewCount": 1},
+        ],
+    }
+}
+
+
+def _movie_watch_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS)
+    if path == "/library/sections/1/all":
+        return httpx.Response(200, json=MOVIES_WATCH_ALL)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_movie_watched() -> None:
+    state = await _adapter(_movie_watch_handler).watch_state(27205, "movie")
+    assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+async def test_watch_state_movie_never_viewed() -> None:
+    state = await _adapter(_movie_watch_handler).watch_state(129, "movie")
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_movie_view_count_without_timestamp_is_not_watched() -> None:
+    # A stray viewCount with no lastViewedAt would be inconsistent; the adapter
+    # must force watched=False rather than trust the count alone.
+    state = await _adapter(_movie_watch_handler).watch_state(999, "movie")
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_movie_absent_from_library() -> None:
+    state = await _adapter(_movie_watch_handler).watch_state(55555, "movie")
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_movie_is_not_cached_across_calls() -> None:
+    # Unlike is_available, watch_state always re-pages the section's items -- a
+    # stale "watched" could delete content the operator is actively rewatching, so
+    # freshness wins over the extra request cost (the sweep runs on its own
+    # infrequent interval). The section LIST itself still legitimately uses the
+    # shared ``list_sections`` cache, so only the item-listing endpoint is counted.
+    item_calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections/1/all":
+            item_calls["n"] += 1
+        return _movie_watch_handler(request)
+
+    adapter = _adapter(counting, base_url="http://watch-uncached:32400")
+    await adapter.watch_state(27205, "movie")
+    await adapter.watch_state(27205, "movie")
+    assert item_calls["n"] == 2  # every call re-pages the item listing
+
+
+SEASONS_WATCH_FOR_SHOW_100: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 3,
+        "Metadata": [
+            # Specials: fully viewed.
+            {"index": 0, "leafCount": 3, "viewedLeafCount": 3, "lastViewedAt": _WATCHED_EPOCH},
+            # Season 1: partially viewed.
+            {"index": 1, "leafCount": 10, "viewedLeafCount": 4, "lastViewedAt": _PARTIAL_EPOCH},
+            # Season 2: announced but empty (leafCount=0) -- never "watched" by
+            # the vacuous 0 == 0 truth, even though viewedLeafCount also reads 0.
+            {"index": 2, "leafCount": 0, "viewedLeafCount": 0},
+        ],
+    }
+}
+
+
+def _tv_watch_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS)
+    if path == "/library/sections/2/all":
+        return httpx.Response(200, json=SHOWS_ALL)
+    if path == "/library/metadata/100/children":
+        return httpx.Response(200, json=SEASONS_WATCH_FOR_SHOW_100)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_tv_requires_season() -> None:
+    with pytest.raises(ValueError, match="requires a season"):
+        await _adapter(_tv_watch_handler).watch_state(1399, "tv")
+
+
+async def test_watch_state_tv_season_fully_viewed() -> None:
+    state = await _adapter(_tv_watch_handler).watch_state(1399, "tv", season=0)
+    assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+async def test_watch_state_tv_season_partially_viewed() -> None:
+    state = await _adapter(_tv_watch_handler).watch_state(1399, "tv", season=1)
+    assert state == WatchState(watched=False, last_viewed_at=_PARTIAL_AT)
+
+
+async def test_watch_state_tv_season_empty_leaf_count_never_watched() -> None:
+    state = await _adapter(_tv_watch_handler).watch_state(1399, "tv", season=2)
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_tv_season_not_listed() -> None:
+    state = await _adapter(_tv_watch_handler).watch_state(1399, "tv", season=7)
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_tv_show_absent_from_library() -> None:
+    state = await _adapter(_tv_watch_handler).watch_state(9999, "tv", season=1)
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_tv_is_not_cached_across_calls() -> None:
+    # Same freshness argument as the movie case; the show section's item listing
+    # AND the show's ``/children`` season listing must both re-fetch every call.
+    children_calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/metadata/100/children":
+            children_calls["n"] += 1
+        return _tv_watch_handler(request)
+
+    adapter = _adapter(counting, base_url="http://watch-tv-uncached:32400")
+    await adapter.watch_state(1399, "tv", season=0)
+    await adapter.watch_state(1399, "tv", season=0)
+    assert children_calls["n"] == 2  # every call re-fetches the season listing
+
+
+async def test_watch_state_adapter_conforms_to_library_port() -> None:
+    from plex_manager.ports.library import LibraryPort
+
+    assert isinstance(_adapter(_tv_watch_handler), LibraryPort)

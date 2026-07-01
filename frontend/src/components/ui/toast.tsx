@@ -2,7 +2,7 @@ import * as RadixToast from '@radix-ui/react-toast'
 import { createContext, use, useCallback, useMemo, useState, type ReactNode } from 'react'
 import { cn } from '../../lib/cn'
 
-export type ToastIntent = 'info' | 'success' | 'error'
+export type ToastIntent = 'info' | 'success' | 'warning' | 'error'
 
 interface ToastItem {
   id: number
@@ -26,6 +26,7 @@ const ToastContext = createContext<ToastContextValue | null>(null)
 const ACCENT: Record<ToastIntent, string> = {
   info: 'border-l-gold',
   success: 'border-l-available',
+  warning: 'border-l-downloading',
   error: 'border-l-error',
 }
 
