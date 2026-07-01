@@ -27,8 +27,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "TERMINAL_REQUEST_STATUS_VALUES",
+    "CreateRequestResult",
     "MediaNotFoundError",
+    "MediaTypeDeferredError",
     "create_request",
+    "create_request_result",
     "get_request",
     "list_requests",
     "mark_available",
@@ -61,6 +64,14 @@ class MediaNotFoundError(Exception):
         super().__init__(f"{media_type} tmdb_id={tmdb_id} not found")
 
 
+class MediaTypeDeferredError(Exception):
+    """The app cannot safely process this media type yet."""
+
+    def __init__(self, media_type: str) -> None:
+        self.media_type = media_type
+        super().__init__(f"{media_type} requests are deferred")
+
+
 class _Detail(NamedTuple):
     """Resolved TMDB detail needed to persist a request (incl. art for rows)."""
 
@@ -69,6 +80,13 @@ class _Detail(NamedTuple):
     is_anime: bool
     poster_url: str | None
     backdrop_url: str | None
+
+
+class CreateRequestResult(NamedTuple):
+    """The returned request plus whether this call created the returned row."""
+
+    record: RequestRecord
+    created: bool
 
 
 async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> _Detail:
@@ -121,6 +139,27 @@ async def create_request(
     user_id: int | None = None,
     library: LibraryPort | None = None,
 ) -> RequestRecord:
+    """Create a request and return only the request read model."""
+    result = await create_request_result(
+        session,
+        tmdb,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        user_id=user_id,
+        library=library,
+    )
+    return result.record
+
+
+async def create_request_result(
+    session: AsyncSession,
+    tmdb: MetadataPort,
+    *,
+    tmdb_id: int,
+    media_type: str,
+    user_id: int | None = None,
+    library: LibraryPort | None = None,
+) -> CreateRequestResult:
     """Create (or return the existing active) media request for this media.
 
     Dedups on the ``(tmdb_id, media_type)`` composite via
@@ -134,10 +173,13 @@ async def create_request(
     not a wasted grab. An unconfigured/unreachable Plex skips the check (see
     :func:`_already_in_library`).
     """
+    if media_type != "movie":
+        raise MediaTypeDeferredError(media_type)
+
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:
-        return existing
+        return CreateRequestResult(record=existing, created=False)
 
     detail = await _resolve_detail(tmdb, tmdb_id, media_type)
 
@@ -150,11 +192,14 @@ async def create_request(
         # Dedup the available short-circuit: if this movie is already recorded as
         # in-library, return that row rather than accumulating duplicate 'available'
         # rows (the active-dedup partial index excludes terminal statuses, so it
-        # would not catch this). A movie REMOVED from Plex reads not-available above
-        # and falls through to a normal pending request, so re-requests still work.
+        # would not catch this). Acquire a per-media DB lock first so PostgreSQL MVCC
+        # cannot let two concurrent transactions both miss each other's uncommitted
+        # terminal row. A movie REMOVED from Plex reads not-available above and falls
+        # through to a normal pending request, so re-requests still work.
+        await repo.acquire_media_lock(tmdb_id, media_type)
         in_library = await repo.find_in_library(tmdb_id, media_type)
         if in_library is not None:
-            return in_library
+            return CreateRequestResult(record=in_library, created=False)
         initial_status = RequestStatus.available.value
     try:
         record = await repo.create(
@@ -181,7 +226,7 @@ async def create_request(
         winner = await repo.find_active(tmdb_id, media_type)
         if winner is None:  # pragma: no cover - the conflicting active row must exist
             raise
-        return winner
+        return CreateRequestResult(record=winner, created=False)
     if initial_status == RequestStatus.available.value:
         # Collapse the concurrent in-library race (F9). The active-dedup partial
         # UNIQUE index excludes terminal 'available', so two POSTs that BOTH passed
@@ -199,8 +244,8 @@ async def create_request(
         if winner is not None and winner.id != record.id:
             await repo.delete(record.id)
             await session.commit()
-            return winner
-    return record
+            return CreateRequestResult(record=winner, created=False)
+    return CreateRequestResult(record=record, created=True)
 
 
 async def list_requests(

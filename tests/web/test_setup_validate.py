@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI
 
 from plex_manager.adapters.plex.library import reset_caches
+from plex_manager.config import get_settings
 from plex_manager.ports.library import LibrarySection
 from plex_manager.web import setup_validation
 from plex_manager.web.setup_validation import movie_library_options
@@ -75,6 +76,103 @@ async def test_validate_tmdb_bad_key(client: httpx.AsyncClient, app: FastAPI) ->
     assert "bad" not in response.text  # the rejected key never echoes back
 
 
+async def test_validate_requires_configured_setup_token_pre_init(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+
+    denied = await client.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+    assert denied.status_code == 401
+    assert denied.json()["detail"] == "invalid_setup_token"
+    assert outbound == []  # rejected before the caller-controlled outbound request
+
+    ok = await client.post(
+        "/api/v1/setup/validate/tmdb",
+        json={"api_key": "k"},
+        headers={"X-Setup-Token": "boot-token"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["ok"] is True
+    assert outbound == ["/3/search/multi"]
+
+
+async def test_validate_requires_setup_token_from_remote_pre_init(app: FastAPI) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
+async def test_validate_rejects_loopback_client_with_nonlocal_host(app: FastAPI) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://attacker.test") as remote:
+        response = await remote.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
+async def test_validate_rejects_loopback_client_with_cross_origin(app: FastAPI) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.post(
+            "/api/v1/setup/validate/tmdb",
+            json={"api_key": "k"},
+            headers={"Origin": "http://attacker.test"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
+def test_validate_contract_documents_setup_and_api_key_headers(app: FastAPI) -> None:
+    operation = app.openapi()["paths"]["/api/v1/setup/validate/tmdb"]["post"]
+    header_names = {
+        parameter["name"] for parameter in operation["parameters"] if parameter["in"] == "header"
+    }
+
+    assert header_names == {"X-Setup-Token", "X-Api-Key"}
+    assert operation["responses"]["401"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+
+
 async def test_validate_prowlarr_ok(client: httpx.AsyncClient, app: FastAPI) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/system/status"
@@ -96,6 +194,32 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
         json={"url": "http://prowlarr.local", "api_key": "bad"},
     )
     assert response.json()["ok"] is False
+
+
+async def test_validate_prowlarr_rejects_non_json_status_200(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    await _use_transport(app, lambda _r: httpx.Response(200, text="<h1>not prowlarr</h1>"))
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://prowlarr.local", "api_key": "pk"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Unexpected response from Prowlarr."
+
+
+async def test_validate_prowlarr_rejects_status_200_without_version(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    await _use_transport(app, lambda _r: httpx.Response(200, json={"appName": "not-prowlarr"}))
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://prowlarr.local", "api_key": "pk"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Unexpected response from Prowlarr."
 
 
 async def test_validate_plex_ok_returns_movie_libraries(

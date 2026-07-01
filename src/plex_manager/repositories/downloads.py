@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
 
-from plex_manager.models import Download
+from plex_manager.models import Download, MediaType
 from plex_manager.ports.repositories import DownloadRecord
 
 if TYPE_CHECKING:
@@ -55,6 +55,7 @@ def _to_record(row: Download) -> DownloadRecord:
         tmdb_id=row.tmdb_id,
         year=row.year,
         season=row.season,
+        media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
         download_path=row.download_path,
@@ -103,6 +104,7 @@ class SqlDownloadRepository:
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -112,6 +114,7 @@ class SqlDownloadRepository:
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            media_type=MediaType(media_type) if media_type is not None else None,
         )
         self._session.add(row)
         await self._session.flush()
@@ -132,6 +135,12 @@ class SqlDownloadRepository:
         clear_failed_reason: bool = False,
         clear_download_path: bool = False,
         media_request_id: int | None = None,
+        replace_grab_metadata: bool = False,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+        media_type: str | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -145,6 +154,12 @@ class SqlDownloadRepository:
             # Re-own a reused (terminal) row: a fresh grab from a different request
             # must point the row at the CURRENT request, not the stale prior owner.
             row.media_request_id = media_request_id
+        if replace_grab_metadata:
+            row.magnet_link = magnet_link
+            row.tmdb_id = tmdb_id
+            row.year = year
+            row.season = season
+            row.media_type = MediaType(media_type) if media_type is not None else None
         if clear_failed_reason:
             # A terminal row being reused for a fresh grab must not carry a stale
             # failure reason (honesty over silence: a Downloading row claiming a
@@ -176,6 +191,18 @@ class SqlDownloadRepository:
         download_path: str | None = None,
         failed_reason: str | None = None,
         clear_download_path: bool = False,
+        progress: float | None = None,
+        seed_ratio: float | None = None,
+        first_seen_at: datetime | None = None,
+        clear_first_seen_at: bool = False,
+        clear_failed_reason: bool = False,
+        media_request_id: int | None = None,
+        replace_grab_metadata: bool = False,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+        media_type: str | None = None,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -188,23 +215,41 @@ class SqlDownloadRepository:
         move still applies; ``False`` means the row moved out from under the caller and
         the transition must be abandoned, honoring whoever changed it.
 
-        ``failed_reason`` and ``clear_download_path`` mirror :meth:`update_status` so a
-        CONDITIONAL block can record its surfaced reason (and drop a rolled-back
-        placement breadcrumb) in the SAME compare-and-swap — never overwriting a row
-        that already left ``allowed_from`` (e.g. an operator's committed mark_failed).
-        ``clear_download_path`` takes precedence over ``download_path``.
+        The optional fields mirror :meth:`update_status` so a CONDITIONAL transition
+        can carry progress, missing-grace anchors, surfaced reasons, or breadcrumb
+        cleanup in the SAME compare-and-swap — never overwriting a row that already
+        left ``allowed_from``. ``clear_download_path`` / ``clear_first_seen_at`` /
+        ``clear_failed_reason`` take precedence over their corresponding set values.
 
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS
         status (and reason / cleared path).
         """
-        values: dict[str, str | None] = {"status": status}
+        values: dict[str, object] = {"status": status}
         if clear_download_path:
             values["download_path"] = None
         elif download_path is not None:
             values["download_path"] = download_path
-        if failed_reason is not None:
+        if clear_failed_reason:
+            values["failed_reason"] = None
+        elif failed_reason is not None:
             values["failed_reason"] = failed_reason
+        if progress is not None:
+            values["progress"] = progress
+        if seed_ratio is not None:
+            values["seed_ratio"] = seed_ratio
+        if media_request_id is not None:
+            values["media_request_id"] = media_request_id
+        if replace_grab_metadata:
+            values["magnet_link"] = magnet_link
+            values["tmdb_id"] = tmdb_id
+            values["year"] = year
+            values["season"] = season
+            values["media_type"] = MediaType(media_type) if media_type is not None else None
+        if clear_first_seen_at:
+            values["first_seen_at"] = None
+        elif first_seen_at is not None:
+            values["first_seen_at"] = first_seen_at
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))

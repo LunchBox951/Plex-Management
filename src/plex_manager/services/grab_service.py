@@ -45,6 +45,7 @@ __all__ = [
     "GrabError",
     "NoGrabSourceError",
     "RequestNotActiveError",
+    "TorrentAlreadyTrackedError",
     "grab",
 ]
 
@@ -121,12 +122,28 @@ class RequestNotActiveError(Exception):
         super().__init__(f"request {request_id} is terminal and cannot be grabbed")
 
 
+class TorrentAlreadyTrackedError(Exception):
+    """The same torrent hash is already active under another request."""
+
+    def __init__(self, torrent_hash: str, owner_request_id: int | None) -> None:
+        self.torrent_hash = torrent_hash
+        self.owner_request_id = owner_request_id
+        super().__init__(f"torrent {torrent_hash} is already tracked by request {owner_request_id}")
+
+
 async def _reuse_terminal_row(
+    session: AsyncSession,
     download_repo: SqlDownloadRepository,
     download_id: int,
     torrent_hash: str,
     request_id: int | None,
-) -> DownloadRecord:
+    *,
+    source: str,
+    tmdb_id: int | None,
+    year: int | None,
+    season: int | None,
+    media_type: str | None,
+) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
     A previously-failed (not blocklisted) release may legitimately be grabbed
@@ -150,20 +167,33 @@ async def _reuse_terminal_row(
     ``clear_download_path`` drops the breadcrumb so the re-grab tracks its own
     content.
     """
-    await download_repo.update_status(
+    claimed = await download_repo.update_status_if_in(
         download_id,
         DownloadState.Downloading.value,
+        _TERMINAL_STATUS_VALUES,
         progress=0.0,
         seed_ratio=0.0,
         clear_failed_reason=True,
         clear_first_seen_at=True,
         clear_download_path=True,
         media_request_id=request_id,
+        replace_grab_metadata=True,
+        magnet_link=source,
+        tmdb_id=tmdb_id,
+        year=year,
+        season=season,
+        media_type=media_type,
     )
+    if not claimed:
+        await session.rollback()
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is None:  # pragma: no cover - the row existed before the CAS
+            raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
+        return record, False
     record = await download_repo.get_by_hash(torrent_hash)
     if record is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
-    return record
+    return record, True
 
 
 async def grab(
@@ -190,6 +220,7 @@ async def grab(
     if source is None:
         raise NoGrabSourceError(candidate.guid)
 
+    request_media_type: str | None = None
     # Reject a stale/terminal request id BEFORE handing anything to the client. If
     # this request is already terminal, a newer ACTIVE request for the same media
     # owns the ``uq_media_requests_active`` slot, so re-arming this row to
@@ -199,6 +230,7 @@ async def grab(
         request = await SqlRequestRepository(session).get(request_id)
         if request is not None and request.status in TERMINAL_REQUEST_STATUS_VALUES:
             raise RequestNotActiveError(request_id)
+        request_media_type = request.media_type if request is not None else None
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
@@ -206,6 +238,8 @@ async def grab(
     if known_hash is not None:
         pre = await download_repo.get_by_hash(known_hash)
         if pre is not None and pre.status not in _TERMINAL_STATUS_VALUES:
+            if request_id is not None and pre.media_request_id != request_id:
+                raise TorrentAlreadyTrackedError(known_hash, pre.media_request_id)
             return pre
 
     # Parallel-grab guard: if this request already has an active (non-terminal)
@@ -230,10 +264,47 @@ async def grab(
 
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
+        if request_id is not None and existing.media_request_id != request_id:
+            raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
         return existing
 
     if existing is not None:
-        record = await _reuse_terminal_row(download_repo, existing.id, torrent_hash, request_id)
+        try:
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
+                download_repo,
+                existing.id,
+                torrent_hash,
+                request_id,
+                source=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+                media_type=request_media_type,
+            )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+                    return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+        except IntegrityError:
+            await session.rollback()
+            if request_id is not None:
+                active = await download_repo.find_active_for_request(request_id)
+                if active is not None and active.torrent_hash != torrent_hash:
+                    try:
+                        await qbt.remove(torrent_hash, delete_files=True)
+                    except Exception:
+                        _logger.warning(
+                            "failed to remove orphaned torrent %s after losing a "
+                            "terminal-row reuse race for request %s",
+                            torrent_hash,
+                            request_id,
+                            exc_info=True,
+                        )
+                    raise AlreadyDownloadingError(request_id) from None
+            raise
     else:
         try:
             record = await download_repo.create(
@@ -244,6 +315,7 @@ async def grab(
                 tmdb_id=tmdb_id,
                 year=year,
                 season=season,
+                media_type=request_media_type,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release
@@ -276,8 +348,31 @@ async def grab(
             if winner is None:  # pragma: no cover - the conflicting row must exist
                 raise
             if winner.status not in _TERMINAL_STATUS_VALUES:
+                if request_id is not None and winner.media_request_id != request_id:
+                    raise TorrentAlreadyTrackedError(
+                        torrent_hash, winner.media_request_id
+                    ) from None
                 return winner
-            record = await _reuse_terminal_row(download_repo, winner.id, torrent_hash, request_id)
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
+                download_repo,
+                winner.id,
+                torrent_hash,
+                request_id,
+                source=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+                media_type=request_media_type,
+            )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(
+                            torrent_hash, record.media_request_id
+                        ) from None
+                    return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
     session.add(
         DownloadHistory(
             tmdb_id=tmdb_id,

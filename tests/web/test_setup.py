@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import httpx
+import pytest
+from fastapi import FastAPI
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.config import get_settings
 from plex_manager.models import SystemSettings
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -29,6 +32,92 @@ async def test_status_pre_init_has_no_key(client: httpx.AsyncClient) -> None:
     body = response.json()
     assert body["initialized"] is False
     assert body["app_api_key"] is None
+    assert body["setup_token_required"] is False
+
+
+async def test_status_reports_setup_token_requirement(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+
+    response = await client.get("/api/v1/setup/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["initialized"] is False
+    assert body["app_api_key"] is None
+    assert body["setup_token_required"] is True
+
+
+async def test_status_reports_setup_token_requirement_for_remote_pre_init(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.get("/api/v1/setup/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["initialized"] is False
+    assert body["setup_token_required"] is True
+
+
+async def test_complete_requires_configured_setup_token_pre_init(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+
+    missing = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert missing.status_code == 401
+    assert missing.json()["detail"] == "invalid_setup_token"
+
+    wrong = await client.post(
+        "/api/v1/setup/complete",
+        json=_COMPLETE_BODY,
+        headers={"X-Setup-Token": "wrong"},
+    )
+    assert wrong.status_code == 401
+    assert wrong.json()["detail"] == "invalid_setup_token"
+
+    ok = await client.post(
+        "/api/v1/setup/complete",
+        json=_COMPLETE_BODY,
+        headers={"X-Setup-Token": "boot-token"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["initialized"] is True
+
+
+async def test_complete_rejects_remote_client_without_setup_token(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+
+
+async def test_complete_rejects_loopback_client_with_nonlocal_host(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://attacker.test") as remote:
+        response = await remote.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+
+
+async def test_complete_rejects_loopback_client_with_cross_origin(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.post(
+            "/api/v1/setup/complete",
+            json=_COMPLETE_BODY,
+            headers={"Origin": "http://attacker.test"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
 
 
 async def test_complete_flips_initialized_and_issues_key(client: httpx.AsyncClient) -> None:
@@ -94,6 +183,14 @@ async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> Non
     second = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
     assert second.status_code == 409
     assert second.json()["detail"] == "already_initialized"
+
+
+def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/setup/complete"]["post"]["responses"]
+
+    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
 
 
 async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(

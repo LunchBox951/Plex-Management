@@ -51,7 +51,6 @@ const Heading = () => <h1 className="font-display text-2xl font-extrabold">Setti
 export function Settings() {
   const { data, isLoading, isError, error, refetch } = useSettings()
   const update = useUpdateSettings()
-  const libraries = usePlexLibraries() // movie folders Plex reports (409 if unconfigured)
   const { toast } = useToast()
 
   // Controlled state, seeded once the settings have loaded.
@@ -61,6 +60,11 @@ export function Settings() {
   useEffect(() => {
     if (data && form === null) setForm(initialForm(data))
   }, [data, form])
+  const plexConnectionChanged =
+    data !== undefined &&
+    form !== null &&
+    (form.plex_url !== (data.plex_url ?? '') || form.plex_token.length > 0)
+  const libraries = usePlexLibraries(!plexConnectionChanged) // movie folders Plex reports
 
   if (isLoading || (data && form === null)) {
     return (
@@ -115,18 +119,9 @@ export function Settings() {
 
   const handleSave = async () => {
     // A library folder is discovered against a *specific* Plex server. If the
-    // operator just changed the Plex connection (URL or a freshly typed token)
-    // but hasn't re-picked a folder, don't carry the OLD server's movies_root
-    // over with the new creds: clear it. '' reads as unset server-side (a
-    // visible "library not configured" 409, not a silent wrong-path write), so
-    // the picker — refetched against the new connection on save — forces a
-    // fresh, valid selection before any import can scan a path off the old Plex.
-    // (Omitting movies_root would NOT fix this: the backend leaves absent fields
-    // unchanged, so the stale path would stay persisted.)
-    const plexConnectionChanged =
-      form.plex_url !== (data.plex_url ?? '') || form.plex_token.length > 0
-    const moviesRootReselected = form.movies_root !== (data.movies_root ?? '')
-    const clearMoviesRoot = plexConnectionChanged && !moviesRootReselected
+    // operator just changed the Plex connection, don't carry any folder from the
+    // OLD server's picker over with the new creds. '' reads as unset server-side.
+    const clearMoviesRoot = plexConnectionChanged
 
     // Plaintext fields always written; secrets only when the user typed a value,
     // so an untouched secret stays the backend's no-op (left unchanged).
@@ -208,7 +203,36 @@ export function Settings() {
           <h2 className="font-display text-sm font-semibold text-ink">Library</h2>
           <p className="mt-1 text-xs text-faint">Where imported movies are placed.</p>
           <div className="mt-4 flex flex-col gap-2">
-            {!manualPath && libraries.data && libraries.data.length > 0 ? (
+            {plexConnectionChanged ? (
+              <select
+                aria-label="Movies library folder"
+                className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                value=""
+                disabled
+                onChange={() => undefined}
+              >
+                <option value="">Choose a movie library folder…</option>
+              </select>
+            ) : !manualPath && libraries.isError ? (
+              <StateMessage
+                tone="error"
+                title="Couldn't load Plex libraries"
+                message={
+                  (libraries.error as ApiError | undefined)?.message ??
+                  'Library folders are unavailable right now.'
+                }
+                action={
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="secondary" onClick={() => void libraries.refetch()}>
+                      Retry
+                    </Button>
+                    <Button variant="secondary" onClick={() => setManualPath(true)}>
+                      Use custom path
+                    </Button>
+                  </div>
+                }
+              />
+            ) : !manualPath && libraries.data && libraries.data.length > 0 ? (
               <>
                 <select
                   aria-label="Movies library folder"

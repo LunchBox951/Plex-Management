@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
@@ -86,8 +86,10 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
       is_anime: false,
       year: 2021,
     }
-    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
-    ;(useSearchPreview as unknown as Mock).mockReturnValue(mutation(PREVIEW))
+    const createMutation = mutation(created)
+    const previewMutation = mutation(PREVIEW)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(previewMutation)
     ;(useGrab as unknown as Mock).mockReturnValue(mutation(undefined))
     ;(useMarkFailed as unknown as Mock).mockReturnValue(mutation(undefined))
     ;(useImportDownload as unknown as Mock).mockReturnValue(mutation(undefined))
@@ -96,17 +98,21 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    return { createMutation, previewMutation }
   }
 
   beforeEach(() => vi.clearAllMocks())
 
-  it('keeps Grab disabled when POST /requests returns a terminal row (available)', async () => {
-    setup('available')
+  it('skips preview when POST /requests returns a terminal row (available)', async () => {
+    const { createMutation, previewMutation } = setup('available')
     fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
-    const grab = await screen.findByRole('button', { name: /grab/i })
-    // Terminal create -> not grabbable -> Grab stays disabled, so no grab can hit the
-    // backend request_not_active guard. Fails before the fix (Grab enabled).
-    expect(grab).toBeDisabled()
+    await waitFor(() => {
+      expect(createMutation.mutateAsync).toHaveBeenCalled()
+    })
+    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+    expect(previewMutation.mutateAsync).not.toHaveBeenCalled()
+    // Terminal create -> not grabbable -> no release list / Grab button is generated.
+    expect(screen.queryByRole('button', { name: /grab/i })).not.toBeInTheDocument()
   })
 
   it('arms Grab when POST /requests returns a non-terminal row (pending)', async () => {
@@ -114,6 +120,33 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
     const grab = await screen.findByRole('button', { name: /grab/i })
     expect(grab).toBeEnabled()
+  })
+})
+
+describe('TitleDetailModal deferred media types', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  })
+
+  it('does not offer request or preview actions for TV titles while TV import is deferred', () => {
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, media_type: 'tv', title: 'Test Show' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.getByText(/TV requests are deferred/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
   })
 })
 
@@ -170,6 +203,22 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
   it('still offers "Report a problem" while genuinely downloading', () => {
     setDownloadStatus('downloading')
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('progressbar', { name: /download progress/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+  })
+
+  it('closes an open report dialog when polling makes the download non-actionable', async () => {
+    setDownloadStatus('downloading')
+    const view = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /report a problem/i }))
+    expect(screen.getByText(/Blocklist this release/i)).toBeInTheDocument()
+
+    setDownloadStatus('importing')
+    view.rerender(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Blocklist this release/i)).not.toBeInTheDocument()
+    })
   })
 })

@@ -187,7 +187,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await session.commit()
     prepare_encryption(initialized=initialized)
 
-    app.state.http_client = httpx.AsyncClient(timeout=30.0)
+    app.state.http_client = create_upstream_http_client()
     # The background reconciler closes the request -> grab -> import -> available
     # loop without a GET /queue poll having to do the heavy work.
     reconcile_task = asyncio.create_task(_reconcile_loop(app))
@@ -221,6 +221,11 @@ def create_app() -> FastAPI:
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
     mount_spa(app)
     return app
+
+
+def create_upstream_http_client() -> httpx.AsyncClient:
+    """Create the shared service-to-service client for configured integrations."""
+    return httpx.AsyncClient(timeout=30.0, trust_env=False)
 
 
 app = create_app()

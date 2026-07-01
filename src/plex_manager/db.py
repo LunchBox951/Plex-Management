@@ -3,7 +3,7 @@
 The schema is owned by versioned Alembic migrations (see ADR-0007); ORM models
 build on the :class:`Base` declared here. The application talks to the database
 asynchronously; Alembic runs its migrations synchronously against the URL
-returned by :func:`sync_database_url`.
+returned by :func:`alembic_database_url`.
 """
 
 from __future__ import annotations
@@ -107,6 +107,11 @@ def sync_database_url(async_url: str) -> str:
         if async_url.startswith(async_prefix):
             return sync_prefix + async_url[len(async_prefix) :]
     return async_url
+
+
+def alembic_database_url(async_url: str) -> str:
+    """Translate and escape a database URL for Alembic's ConfigParser storage."""
+    return sync_database_url(async_url).replace("%", "%%")
 
 
 def async_database_url(url: str) -> str:

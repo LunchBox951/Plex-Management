@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from plex_manager.domain.reconciler import (
+    StateTransition,
     failed_download_events,
     reconcile,
     unmapped_client_states,
@@ -113,14 +114,20 @@ async def _handle_failed(
         (r for r in rows if r.torrent_hash.lower() == event.torrent_hash.lower()),
         None,
     )
+    request = (
+        await request_repo.get(record.media_request_id)
+        if record is not None and record.media_request_id is not None
+        else None
+    )
     source_title = await _source_title_for(session, event.torrent_hash) or event.source_title
     indexer = await _indexer_for(session, event.torrent_hash)
     await blocklist_repo.create(
         source_title=source_title,
         reason=BlocklistReason.failed.value,
-        tmdb_id=event.tmdb_id,
+        tmdb_id=request.tmdb_id if request is not None else event.tmdb_id,
         torrent_hash=event.torrent_hash,
         indexer=indexer,
+        media_type=request.media_type if request is not None else None,
     )
     if record is not None and record.media_request_id is not None:
         await request_repo.set_status(record.media_request_id, RequestStatus.searching.value)
@@ -184,18 +191,22 @@ async def reconcile_and_list(
     # 10%->50%->90% while staying "Downloading" would otherwise show stale progress
     # in the queue forever (honesty over silence).
     transitions_by_id = {transition.download_id: transition for transition in transitions}
+    applied_transitions: list[StateTransition] = []
     for row in rows:
         live = snapshot.get(row.torrent_hash.lower())
         transition = transitions_by_id.get(row.id)
         if transition is not None:
-            await download_repo.update_status(
+            applied = await download_repo.update_status_if_in(
                 transition.download_id,
                 transition.to_state.value,
+                frozenset({transition.from_state}),
                 progress=live.progress if live is not None else None,
                 seed_ratio=live.ratio if live is not None else None,
                 first_seen_at=now if transition.set_first_seen_at else None,
                 clear_first_seen_at=transition.clear_first_seen_at,
             )
+            if applied:
+                applied_transitions.append(transition)
         elif live is not None:
             # Refresh live progress ONLY — never rewrite status. ``row.status`` is the
             # snapshot captured at list_active() time; an operator's import retry (or
@@ -207,7 +218,7 @@ async def reconcile_and_list(
                 row.id, progress=live.progress, seed_ratio=live.ratio
             )
 
-    for event in failed_download_events(transitions, rows, occurred_at=now):
+    for event in failed_download_events(applied_transitions, rows, occurred_at=now):
         await _handle_failed(session, event, rows)
 
     await session.commit()
@@ -230,28 +241,49 @@ async def mark_failed(
     if current.value in _TERMINAL_STATUS_VALUES:
         raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
 
+    async def _raise_current_transition() -> None:
+        await session.rollback()
+        latest = await session.get(Download, download_id, populate_existing=True)
+        actual = latest.status if latest is not None else current.value
+        raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
+
     # Route through FailedPending when the legal graph requires it (e.g. an
     # actively Downloading torrent cannot jump straight to Failed).
     if not is_legal_transition(current, DownloadState.Failed):
         if not is_legal_transition(current, DownloadState.FailedPending):
             raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
-        await download_repo.update_status(download_id, DownloadState.FailedPending.value)
+        pending = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.FailedPending.value,
+            frozenset({current.value}),
+        )
+        if not pending:
+            await _raise_current_transition()
 
-    await download_repo.update_status(
+    failed = await download_repo.update_status_if_in(
         download_id,
         DownloadState.Failed.value,
+        frozenset({DownloadState.FailedPending.value}),
         failed_reason="marked failed by operator",
     )
+    if not failed:
+        await _raise_current_transition()
 
     if blocklist:
         source_title = await _source_title_for(session, row.torrent_hash) or row.torrent_hash
         indexer = await _indexer_for(session, row.torrent_hash)
+        request = (
+            await SqlRequestRepository(session).get(row.media_request_id)
+            if row.media_request_id is not None
+            else None
+        )
         await SqlBlocklistRepository(session).create(
             source_title=source_title,
             reason=BlocklistReason.user_reported.value,
-            tmdb_id=row.tmdb_id,
+            tmdb_id=request.tmdb_id if request is not None else row.tmdb_id,
             torrent_hash=row.torrent_hash,
             indexer=indexer,
+            media_type=request.media_type if request is not None else None,
         )
 
     # Re-arm the owning request unconditionally — the blocklist flag governs ONLY

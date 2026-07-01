@@ -1,10 +1,10 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Ten tables back the alpha pipeline: ``users``, ``settings``, ``system_settings``,
-``audit_log``, ``media_requests``, ``season_requests``, ``downloads``,
-``download_history``, ``blocklist``, ``tmdb_cache``. Column shapes, indexes, and
-``ON DELETE`` behaviour follow the persistence design (see the analysis extract's
-"Persistence + Schema Migrations" section and ADR-0007).
+Eleven tables back the alpha pipeline: ``users``, ``settings``, ``system_settings``,
+``audit_log``, ``media_requests``, ``request_dedup_locks``, ``season_requests``,
+``downloads``, ``download_history``, ``blocklist``, ``tmdb_cache``. Column shapes,
+indexes, and ``ON DELETE`` behaviour follow the persistence design (see the
+analysis extract's "Persistence + Schema Migrations" section and ADR-0007).
 
 Conventions:
 
@@ -12,10 +12,11 @@ Conventions:
   from whether the ``Mapped`` type includes ``None``.
 * ``created_at``-style columns get ``server_default=func.now()`` so bulk inserts
   are timestamped by the database.
-* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False)`` (a portable
-  VARCHAR + CHECK on SQLite). ``downloads.status`` is a plain indexed ``String``:
-  the canonical ``DownloadState`` StrEnum is owned by the P4 state machine and
-  writes its values here, and the ``DownloadRecord`` DTO reads it as ``str``.
+* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)``
+  (a portable VARCHAR + CHECK on SQLite/PostgreSQL). ``downloads.status`` is a
+  plain indexed ``String``: the canonical ``DownloadState`` StrEnum is owned by
+  the P4 state machine and writes its values here, and the ``DownloadRecord`` DTO
+  reads it as ``str``.
 * Secrets (``users.encrypted_plex_token``) use :class:`EncryptedStr`.
 """
 
@@ -41,6 +42,7 @@ __all__ = [
     "DownloadHistoryEvent",
     "MediaRequest",
     "MediaType",
+    "RequestDedupLock",
     "RequestStatus",
     "SeasonRequest",
     "Setting",
@@ -97,7 +99,7 @@ class DownloadHistoryEvent(StrEnum):
 
 def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
     """Build a portable, non-native ``Enum`` column type for ``enum_cls``."""
-    return sa.Enum(enum_cls, native_enum=False)
+    return sa.Enum(enum_cls, native_enum=False, create_constraint=True, validate_strings=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +255,21 @@ class MediaRequest(Base):
     library_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class RequestDedupLock(Base):
+    """Serializable lock row for per-media request decisions.
+
+    PostgreSQL's MVCC can let two concurrent transactions both miss an uncommitted
+    terminal ``available`` row. The active partial unique index intentionally
+    excludes ``available``, so in-library short-circuits need a separate row to lock
+    before checking/inserting terminal request records.
+    """
+
+    __tablename__ = "request_dedup_locks"
+
+    tmdb_id: Mapped[int] = mapped_column(primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType), primary_key=True)
+
+
 class SeasonRequest(Base):
     """A per-season request belonging to a TV :class:`MediaRequest`."""
 
@@ -346,7 +363,7 @@ class Blocklist(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
-    source_title: Mapped[str] = mapped_column(Text, index=True)
+    source_title: Mapped[str] = mapped_column(Text)
     indexer: Mapped[str | None] = mapped_column(String)
     protocol: Mapped[str | None] = mapped_column(String)
     media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))

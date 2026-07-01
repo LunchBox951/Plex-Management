@@ -373,6 +373,20 @@
         "title": "DiscoverSearchResponse",
         "type": "object"
       },
+      "ErrorDetail": {
+        "description": "Machine-readable error body returned by manual HTTPException paths.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ErrorDetail",
+        "type": "object"
+      },
       "GrabRequest": {
         "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; it is ignored for\nmovies.",
         "properties": {
@@ -1232,6 +1246,11 @@
           "initialized": {
             "title": "Initialized",
             "type": "boolean"
+          },
+          "setup_token_required": {
+            "default": false,
+            "title": "Setup Token Required",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1329,6 +1348,23 @@
               ],
               "title": "Tmdb Id"
             }
+          },
+          {
+            "in": "query",
+            "name": "media_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(movie|tv)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Media Type"
+            }
           }
         ],
         "responses": {
@@ -1382,6 +1418,16 @@
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Blocklist entry not found"
           },
           "422": {
             "content": {
@@ -1640,6 +1686,26 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1687,6 +1753,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
           },
           "422": {
             "content": {
@@ -1745,6 +1831,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
           },
           "422": {
             "content": {
@@ -1808,6 +1914,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Existing matching request"
+          },
           "201": {
             "content": {
               "application/json": {
@@ -1817,6 +1933,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Media not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Media type deferred"
           },
           "422": {
             "content": {
@@ -1866,6 +2002,16 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Request not found"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1913,15 +2059,32 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Request not found"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Validation error or missing request descriptor"
           }
         },
         "security": [
@@ -2042,6 +2205,26 @@
       "post": {
         "description": "Persist the validated creds, mint the app api key, mark initialized.\n\nOne-shot AND concurrency-safe: rejected with 409 once initialized. Two\nconcurrent ``/complete`` calls can both pass an in-memory ``initialized`` check\nand double-write (a ``settings.key`` unique-constraint 500, or one overwriting\nthe other's just-issued ``app_api_key``). To prevent that, initialization is\nclaimed with a CONDITIONAL update (``... WHERE id = 1 AND initialized = false``):\nexactly one request flips the row, and the loser sees ``rowcount == 0`` and is\nrejected 409 \u2014 so only the winner mints the key and writes the creds. Re-running\nsetup post-init would also let an unauthenticated caller overwrite every stored\ncredential and re-disclose the app key, so post-init changes must go through the\nauthenticated ``PUT /settings``.",
         "operationId": "complete_api_v1_setup_complete_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2062,6 +2245,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Setup already initialized"
           },
           "422": {
             "content": {
@@ -2106,6 +2309,44 @@
       "post": {
         "description": "Test candidate Plex credentials.",
         "operationId": "validate_plex_endpoint_api_v1_setup_validate_plex_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2126,6 +2367,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -2148,6 +2399,44 @@
       "post": {
         "description": "Test candidate Prowlarr credentials.",
         "operationId": "validate_prowlarr_endpoint_api_v1_setup_validate_prowlarr_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2168,6 +2457,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -2190,6 +2489,44 @@
       "post": {
         "description": "Test candidate qBittorrent credentials.",
         "operationId": "validate_qbittorrent_endpoint_api_v1_setup_validate_qbittorrent_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2210,6 +2547,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {
@@ -2232,6 +2579,44 @@
       "post": {
         "description": "Test a candidate TMDB api key.",
         "operationId": "validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post",
+        "parameters": [
+          {
+            "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+            "in": "header",
+            "name": "X-Setup-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required before setup only when /api/v1/setup/status reports setup_token_required=true.",
+              "title": "X-Setup-Token"
+            }
+          },
+          {
+            "description": "Required after setup is initialized.",
+            "in": "header",
+            "name": "X-Api-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Required after setup is initialized.",
+              "title": "X-Api-Key"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2252,6 +2637,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Invalid setup token or API key"
           },
           "422": {
             "content": {

@@ -23,6 +23,7 @@ __all__ = [
     "DiscoverListResponse",
     "DiscoverResult",
     "DiscoverSearchResponse",
+    "ErrorDetail",
     "GrabRequest",
     "PlexLibraryOption",
     "PlexValidateRequest",
@@ -46,6 +47,14 @@ __all__ = [
 ]
 
 MediaTypeField = Literal["movie", "tv"]
+
+
+class ErrorDetail(BaseModel):
+    """Machine-readable error body returned by manual HTTPException paths."""
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +161,7 @@ class SetupStatusResponse(BaseModel):
 
     initialized: bool
     app_api_key: str | None = None
+    setup_token_required: bool = False
 
 
 # --------------------------------------------------------------------------- #

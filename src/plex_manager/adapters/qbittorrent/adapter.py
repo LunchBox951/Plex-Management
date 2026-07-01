@@ -32,8 +32,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
+import os
+import socket
 from datetime import UTC, datetime
 from typing import Final, cast
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -53,6 +56,7 @@ _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
+_MAX_TORRENT_BYTES: Final = 1_000_000
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
 
@@ -94,14 +98,31 @@ def _bencode_skip(data: bytes, idx: int) -> int:
         return data.index(b"e", idx + 1) + 1
     if ch in (b"l", b"d"):  # list / dict: container<elements>e
         idx += 1
-        while data[idx : idx + 1] != b"e":
+        while idx < len(data) and data[idx : idx + 1] != b"e":
             idx = _bencode_skip(data, idx)
+        if idx >= len(data):
+            raise ValueError("unterminated bencode container")
         return idx + 1
     if ch.isdigit():  # byte string: <length>:<bytes>
         colon = data.index(b":", idx)
         length = int(data[idx:colon])
-        return colon + 1 + length
+        end = colon + 1 + length
+        if end > len(data):
+            raise ValueError("bencode string extends past end of data")
+        return end
     raise ValueError(f"invalid bencode at position {idx}: {ch!r}")
+
+
+def _bencode_string(data: bytes, idx: int) -> tuple[bytes, int]:
+    if idx >= len(data) or not data[idx : idx + 1].isdigit():
+        raise ValueError(f"expected bencode string at position {idx}")
+    colon = data.index(b":", idx)
+    length = int(data[idx:colon])
+    start = colon + 1
+    end = start + length
+    if end > len(data):
+        raise ValueError("bencode string extends past end of data")
+    return data[start:end], end
 
 
 def _info_hash_from_torrent(data: bytes) -> str | None:
@@ -110,16 +131,22 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
     Returns the lowercased hex digest, or ``None`` if the structure can't be
     located (never raises — the caller treats ``None`` as "couldn't derive").
     """
-    marker = b"4:infod"
-    idx = data.find(marker)
-    if idx == -1:
-        return None
-    info_start = idx + len(marker) - 1  # position of the 'd' opening the dict
     try:
-        info_end = _bencode_skip(data, info_start)
+        if data[:1] != b"d":
+            return None
+        idx = 1
+        while True:
+            if idx >= len(data):
+                return None
+            if data[idx : idx + 1] == b"e":
+                return None
+            key, value_start = _bencode_string(data, idx)
+            value_end = _bencode_skip(data, value_start)
+            if key == b"info":
+                return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()  # noqa: S324
+            idx = value_end
     except ValueError:
         return None
-    return hashlib.sha1(data[info_start:info_end]).hexdigest().lower()  # noqa: S324
 
 
 def _normalize_btih(value: str) -> str:
@@ -244,6 +271,32 @@ def _parse_webapi_version(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _is_blocked_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return not ip.is_global or ip.is_multicast
+
+
+def _assert_safe_fetch_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise QbittorrentError("unsupported torrent source URL")
+    host = parsed.hostname
+    if _is_blocked_address(host):
+        raise QbittorrentError("unsafe torrent source URL")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port, type=socket.SOCK_STREAM)
+    except OSError:
+        # The request itself will surface an honest reachability error. This keeps
+        # mocked/unresolvable test hostnames usable while still rejecting resolvable
+        # private targets.
+        return
+    if any(isinstance(info[4][0], str) and _is_blocked_address(info[4][0]) for info in infos):
+        raise QbittorrentError("unsafe torrent source URL")
+
+
 def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     """Map one ``/torrents/info`` row to the port's ``DownloadStatus`` DTO.
 
@@ -252,7 +305,11 @@ def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     """
     save_path = _s(torrent.get("save_path"))
     content_path = _s(torrent.get("content_path")) or None
-    if content_path is not None and content_path == save_path:
+    if (
+        content_path is not None
+        and save_path
+        and os.path.realpath(content_path) == os.path.realpath(save_path)
+    ):
         content_path = None
     eta = _i(torrent.get("eta"))
     return DownloadStatus(
@@ -383,24 +440,41 @@ class QbittorrentClient:
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
+            _assert_safe_fetch_url(current)
             try:
-                response = await self._client.get(current, follow_redirects=False)
+                async with self._client.stream("GET", current, follow_redirects=False) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("Location", "")
+                        if not location:
+                            break
+                        if location.startswith("magnet:"):
+                            return location, None
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code == _HTTP_OK:
+                        content_length = response.headers.get("Content-Length")
+                        if content_length is not None:
+                            try:
+                                if int(content_length) > _MAX_TORRENT_BYTES:
+                                    raise QbittorrentError("torrent file is too large")
+                            except ValueError:
+                                pass
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > _MAX_TORRENT_BYTES:
+                                raise QbittorrentError("torrent file is too large")
+                            chunks.append(chunk)
+                        body = b"".join(chunks)
+                        if body[:1] == b"d":
+                            return None, body
+                    break
             except httpx.RequestError as exc:
                 # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):
                 # surface a retryable error rather than letting httpx's transport error
                 # escape as an opaque 500 on the grab path. No url/secret in the message.
                 raise QbittorrentError("qBittorrent request failed") from exc
-            if response.is_redirect:
-                location = response.headers.get("Location", "")
-                if not location:
-                    break
-                if location.startswith("magnet:"):
-                    return location, None
-                current = urljoin(current, location)
-                continue
-            if response.status_code == _HTTP_OK and response.content[:1] == b"d":
-                return None, response.content
-            break
         return None, None
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
@@ -412,10 +486,11 @@ class QbittorrentClient:
         torrent_bytes: bytes | None = None
         info_hash: str | None = None
 
-        if magnet_or_url.startswith("magnet:"):
+        scheme = urlparse(magnet_or_url).scheme.casefold()
+        if scheme == "magnet":
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
-        elif magnet_or_url.startswith("http"):
+        elif scheme in ("http", "https"):
             magnet, body = await self._resolve_http_source(magnet_or_url)
             if magnet is not None:
                 urls_value = magnet
@@ -424,9 +499,11 @@ class QbittorrentClient:
                 torrent_bytes = body
                 info_hash = _info_hash_from_torrent(body)
             else:
-                # Could not resolve; hand the original URL to qBittorrent and let
-                # it try (it can fetch plain .torrent URLs directly).
-                urls_value = magnet_or_url
+                # Could not resolve to a magnet or locally hashable .torrent. Do
+                # not ask qBittorrent to add an untrackable opaque URL.
+                raise QbittorrentError("could not determine torrent hash for HTTP source")
+        elif scheme:
+            raise QbittorrentError("unsupported torrent source URL")
         else:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)

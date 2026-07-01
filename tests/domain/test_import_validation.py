@@ -75,6 +75,12 @@ _FIELDS: dict[str, dict[str, object]] = {
         "source": "Blu-ray",
         "screen_size": "1080p",
     },
+    "Proof.2005.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Proof",
+        "year": "2005",
+        "source": "Web",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -279,3 +285,19 @@ def test_largest_video_is_chosen_as_feature() -> None:
     assert result.video is not None
     assert result.video.relative_path == "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     assert result.accepted is True
+
+
+def test_movie_title_named_proof_is_not_treated_as_sample_extra() -> None:
+    result = validate_import(
+        [VideoFile("Proof.2005.1080p.WEB-DL.x264-GRP.mkv", 8 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=67,
+    )
+
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.video is not None
+    assert result.video.relative_path == "Proof.2005.1080p.WEB-DL.x264-GRP.mkv"

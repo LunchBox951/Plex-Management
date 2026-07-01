@@ -9,6 +9,7 @@ real bytes.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from sqlalchemy import select
@@ -30,7 +31,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import queue_service
+from plex_manager.services import import_service, queue_service
 from plex_manager.services.import_service import (
     import_download,
     run_availability_cycle,
@@ -85,6 +86,8 @@ def _qbt(content_path: Path) -> FakeQbittorrent:
                 info_hash=_HASH,
                 name=content_path.name,
                 raw_state="stalledUP",
+                progress=1.0,
+                save_path=str(content_path.parent),
                 content_path=str(content_path),
             )
         ]
@@ -140,6 +143,117 @@ async def test_import_happy_path_places_file_scans_and_marks_completed(
         assert request.completed_at is not None
 
 
+async def test_import_blocks_content_path_without_save_path(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=video.name,
+                raw_state="stalledUP",
+                progress=1.0,
+                content_path=str(video),
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "download client reported content path without save path"
+    assert not any(movies_root.iterdir())
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_import_retry_success_clears_stale_failed_reason(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.import_blocked,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.failed_reason = "stale block reason"
+        await session.commit()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert record.failed_reason is None
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None
+    assert download.status == DownloadState.Imported.value
+    assert download.failed_reason is None
+
+
+async def test_import_defers_when_live_client_status_is_not_settled(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.import_blocked,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.failed_reason = "stale import block"
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=video.name,
+                raw_state="moving",
+                progress=0.5,
+                ratio=0.25,
+                save_path=str(video.parent),
+                content_path=str(video),
+            )
+        ]
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, library)
+
+    assert record is not None
+    assert record.status == DownloadState.Downloading.value
+    assert record.failed_reason is None
+    assert record.progress == 0.5
+    assert record.seed_ratio == 0.25
+    assert library.scanned == []
+    assert not any(movies_root.iterdir())
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status == RequestStatus.downloading
+
+
 async def test_import_generic_file_under_release_folder_succeeds(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -181,6 +295,18 @@ class _LosingRaceFs(LocalFileSystem):
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
         _make_video(dst, self._winner_size)
+        raise FileExistsError(str(dst))
+
+
+class _WrongSameSizeFs(LocalFileSystem):
+    """Loses placement to a same-size but different file."""
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        size = os.path.getsize(src)
+        with dst.open("wb") as handle:
+            handle.seek(size - 1)
+            handle.write(b"x")
         raise FileExistsError(str(dst))
 
 
@@ -282,6 +408,36 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
         assert request is not None and request.status == RequestStatus.import_blocked
 
 
+async def test_crash_resume_without_breadcrumb_rolls_back_orphaned_placement_on_scan_failure(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # Crash window: the prior attempt published dst but crashed before writing the
+    # download_path breadcrumb. A resumed Importing row that re-adopts the same-content
+    # destination must still own that orphan for scan-failure rollback.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    library = _ScanFailsLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path is None
+    assert not dst.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
 async def test_import_idempotent_when_placement_race_lost_to_same_size(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -313,6 +469,39 @@ async def test_import_idempotent_when_placement_race_lost_to_same_size(
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.completed
+
+
+async def test_import_blocks_when_placement_race_lost_to_same_size_different_content(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        _WrongSameSizeFs(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "different content" in record.failed_reason
+    assert library.scanned == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
 
 
 async def test_import_blocks_when_placement_race_lost_to_different_size(
@@ -421,6 +610,104 @@ async def test_import_with_no_video_file_is_blocked(
     assert record.status == DownloadState.ImportBlocked.value
     assert record.failed_reason is not None
     assert "no video file" in record.failed_reason
+
+
+async def test_import_rejects_content_path_outside_qbittorrent_save_path(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """qBittorrent-reported content_path is client data, not an authority to read
+    arbitrary local files. It must stay under the torrent save_path."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    save_path = tmp_path / "downloads" / "intended"
+    save_path.mkdir(parents=True)
+    outside = tmp_path / "outside" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(outside)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=outside.name,
+                raw_state="stalledUP",
+                progress=1.0,
+                save_path=str(save_path),
+                content_path=str(outside),
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "outside download save path" in record.failed_reason
+    assert not any(movies_root.iterdir())
+
+
+async def test_import_rejects_traversing_qbittorrent_name(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """When qBittorrent omits content_path, save_path + name must not be allowed to
+    escape through '..' or an absolute torrent name."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    save_path = tmp_path / "downloads" / "intended"
+    save_path.mkdir(parents=True)
+    outside = tmp_path / "downloads" / "outside" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(outside)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="../outside/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv",
+                raw_state="stalledUP",
+                progress=1.0,
+                save_path=str(save_path),
+                content_path=None,
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "outside download save path" in record.failed_reason
+    assert not any(movies_root.iterdir())
+
+
+def test_resolve_content_prefers_live_save_path_name_over_library_breadcrumb(
+    tmp_path: Path,
+) -> None:
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    live_release = downloads / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    stale_library_file = tmp_path / "library" / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    status = DownloadStatus(
+        info_hash=_HASH,
+        name=live_release.name,
+        raw_state="stalledUP",
+        save_path=str(downloads),
+        content_path=None,
+    )
+
+    resolved = import_service._resolve_content(  # pyright: ignore[reportPrivateUsage]
+        status, str(stale_library_file)
+    )
+
+    assert resolved == str(live_release)
 
 
 async def test_import_is_idempotent_on_an_already_imported_row(

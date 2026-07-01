@@ -32,6 +32,58 @@ def test_move_relocates_file_and_creates_parent(tmp_path: Path) -> None:
     assert dst.read_text() == "payload"
 
 
+def test_move_refuses_existing_destination_and_preserves_both_files(tmp_path: Path) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("new payload")
+    dst = tmp_path / "library" / "movie" / "dst.mkv"
+    dst.parent.mkdir(parents=True)
+    dst.write_text("existing payload")
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().move(src, dst)
+
+    assert src.read_text() == "new payload"
+    assert dst.read_text() == "existing payload"
+
+
+def test_move_cross_device_copy_removes_source_after_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "library" / "dst.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    LocalFileSystem().move(src, dst)
+
+    assert not src.exists()
+    assert dst.read_text() == "payload"
+
+
+def test_move_cross_device_copy_refuses_existing_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("new payload")
+    dst = tmp_path / "library" / "dst.mkv"
+    dst.parent.mkdir(parents=True)
+    dst.write_text("existing payload")
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().move(src, dst)
+
+    assert src.read_text() == "new payload"
+    assert dst.read_text() == "existing payload"
+
+
 def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     src = tmp_path / "src.mkv"
     src.write_text("payload")
@@ -45,7 +97,68 @@ def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     assert src.stat().st_ino == dst.stat().st_ino
 
 
+def test_hardlink_or_copy_hardlink_path_preserves_active_publish_lock(tmp_path: Path) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "linked" / "dst.mkv"
+    dst.parent.mkdir(parents=True)
+    lock = dst.parent / ".dst.mkv.publish.lock"
+    lock.write_text(str(os.getpid()))
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert src.exists()
+    assert not dst.exists()
+    assert lock.read_text() == str(os.getpid())
+
+
 def test_hardlink_or_copy_falls_back_to_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        if _src == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(_src, _dst)
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "payload"
+    assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
+
+
+def test_cross_device_copy_refuses_destination_created_during_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("copy-path-loser")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _race_link(_src: str, _dst: str) -> None:
+        if _src == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        if _dst == os.fspath(dst):
+            dst.write_text("race winner")
+            raise FileExistsError(os.fspath(dst))
+        real_link(_src, _dst)
+
+    monkeypatch.setattr(os, "link", _race_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert src.read_text() == "copy-path-loser"
+    assert dst.read_text() == "race winner"
+
+
+def test_hardlink_or_copy_falls_back_when_all_hardlinks_are_unsupported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     src = tmp_path / "src.mkv"
@@ -53,13 +166,86 @@ def test_hardlink_or_copy_falls_back_to_copy(
     dst = tmp_path / "copied.mkv"
 
     def _refuse_link(_src: str, _dst: str) -> None:
-        raise OSError(errno.EXDEV, "simulated cross-device link")
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
     LocalFileSystem().hardlink_or_copy(src, dst)
 
+    assert src.exists()
     assert dst.read_text() == "payload"
-    assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
+    assert src.stat().st_ino != dst.stat().st_ino
+
+
+def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+    observed_copy_dst: list[Path] = []
+    real_link = os.link
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        if _src == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(_src, _dst)
+
+    def _copy2(_src: str, dst_arg: str) -> None:
+        copy_dst = Path(dst_arg)
+        observed_copy_dst.append(copy_dst)
+        copy_dst.write_text("partial")
+        assert not dst.exists(), "final path must not exist while copy is in progress"
+        copy_dst.write_text("payload")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    monkeypatch.setattr(shutil, "copy2", _copy2)
+
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "payload"
+    assert observed_copy_dst and observed_copy_dst[0] != dst
+    assert not observed_copy_dst[0].exists()
+
+
+def test_cross_device_copy_recovers_stale_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+    lock = tmp_path / ".copied.mkv.publish.lock"
+    lock.write_text("999999999")
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_cross_device_copy_preserves_active_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+    lock = tmp_path / ".copied.mkv.publish.lock"
+    lock.write_text(str(os.getpid()))
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert not dst.exists()
+    assert lock.read_text() == str(os.getpid())
 
 
 def test_hardlink_or_copy_raises_when_destination_too_small(

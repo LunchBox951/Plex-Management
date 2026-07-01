@@ -25,13 +25,15 @@ ENV PATH="/opt/venv/bin:$PATH"
 # (CVE-2026-1703: path traversal when extracting a crafted wheel).
 RUN pip install --upgrade pip
 
-# Copy only what the build backend needs, then install.
+# Copy only what the build backend needs, then install against the committed
+# runtime constraints used by CI/audit.
 COPY pyproject.toml README.md ./
+COPY requirements ./requirements
 COPY src ./src
 # Drop the built SPA in BEFORE the install so hatchling packages it into the
 # wheel (via [tool.hatch.build.targets.wheel].artifacts) and it ships in the image.
 COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
-RUN pip install .
+RUN pip install -c requirements/runtime-constraints.txt ".[postgres]"
 
 # ---- runtime: slim image with just the venv + migration assets ----
 FROM python:3.14-slim AS runtime

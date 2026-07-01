@@ -17,9 +17,10 @@ __all__ = ["delete", "list_for_media"]
 async def list_for_media(
     session: AsyncSession,
     tmdb_id: int | None = None,
+    media_type: str | None = None,
 ) -> list[BlocklistRecord]:
     """List blocklist entries, optionally scoped to one media item."""
-    return await SqlBlocklistRepository(session).list_for_media(tmdb_id)
+    return await SqlBlocklistRepository(session).list_for_media(tmdb_id, media_type=media_type)
 
 
 async def delete(session: AsyncSession, blocklist_id: int) -> None:

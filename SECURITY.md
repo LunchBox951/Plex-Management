@@ -25,10 +25,11 @@ there is no bug-bounty program.
 ## How secrets are handled
 
 - Service credentials (Plex token, TMDB / Prowlarr / qBittorrent keys) are entered
-  through the in-app setup wizard and **will be stored encrypted at rest**, never
-  in the image or in `.env`. (The wizard + encryption land with v1; the foundation
-  already enforces the "never in the image or `.env`" half — `.env` is git- and
-  docker-ignored.)
+  through the in-app setup wizard and **stored encrypted at rest**, never in the
+  image or in `.env`.
+- First-run setup is guarded by `PLEX_MANAGER_SETUP_TOKEN` in the stock Docker
+  Compose deployment, and the default published host bind is loopback-only. Keep
+  that token out of issue reports, logs, screenshots, and public compose examples.
 - Secrets **must never be written to logs** — enforced in review today, and to be
   backed by a logging redaction filter and a test once the secrets code lands (a
   regression carried over from a prototype lesson).
@@ -59,7 +60,8 @@ committed. Current status:
       `.github/workflows/codeql.yml` (runs on every PR to `main` and on push) —
       do **not** also enable CodeQL *default* setup (the two conflict and default
       would disable the committed workflow).
-- [x] `main` is protected: a PR is required; the `quality`, `analyze` (CodeQL),
+- [x] `main` is protected: a PR is required; the `quality`, `tests-py314`,
+      `frontend`, `analyze (python)`, `analyze (javascript-typescript)`,
       `secret-scan`, `dependency-audit`, and `build` (container) checks must
       pass; branches must be up to date; and force-pushes and deletion are
       blocked. Admins are **not** forced through the gate, so the solo maintainer

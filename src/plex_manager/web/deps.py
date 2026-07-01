@@ -22,7 +22,9 @@ Wiring rules:
 from __future__ import annotations
 
 import hmac
+import ipaddress
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
@@ -53,6 +55,7 @@ __all__ = [
     "KNOWN_SETTING_KEYS",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
+    "SETUP_TOKEN_HEADER_NAME",
     "ServiceNotConfiguredError",
     "SettingsStore",
     "ensure_system_settings",
@@ -68,9 +71,11 @@ __all__ = [
     "get_quality_profile",
     "get_session",
     "get_tmdb",
+    "is_setup_token_required",
     "load_system_settings",
     "require_api_key",
     "require_pre_init_or_api_key",
+    "require_setup_token_pre_init",
 ]
 
 # The bearer-token header. Declared via ``APIKeyHeader`` (below) so FastAPI emits
@@ -78,6 +83,7 @@ __all__ = [
 # it, generated clients would treat protected routes as unauthenticated and omit
 # the key.
 API_KEY_HEADER_NAME = "X-Api-Key"
+SETUP_TOKEN_HEADER_NAME = "X-Setup-Token"  # noqa: S105 — header name, not a token
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
@@ -265,6 +271,63 @@ def _api_key_matches(provided: str | None, expected: str | None) -> bool:
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _configured_setup_token() -> str | None:
+    token = get_settings().setup_token
+    if token is None:
+        return None
+    value = token.get_secret_value().strip()
+    return value or None
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """True when the request comes from the local host."""
+    host = request.client.host if request.client is not None else None
+    return _is_loopback_hostname(host)
+
+
+def _is_loopback_hostname(host: str | None) -> bool:
+    if host is None:
+        return False
+    normalized = host.strip().strip("[]").rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin_matches_request(request: Request, origin: str) -> bool:
+    parsed = urlsplit(origin)
+    return (
+        parsed.scheme == request.url.scheme
+        and parsed.hostname == request.url.hostname
+        and parsed.port == request.url.port
+    )
+
+
+def _is_trusted_local_setup_request(request: Request) -> bool:
+    if not _is_loopback_client(request) or not _is_loopback_hostname(request.url.hostname):
+        return False
+    origin = request.headers.get("Origin")
+    return origin is None or _origin_matches_request(request, origin)
+
+
+def is_setup_token_required(request: Request | None = None) -> bool:
+    """Whether this request requires ``X-Setup-Token`` before initialization."""
+    if _configured_setup_token() is not None:
+        return True
+    return request is not None and not _is_trusted_local_setup_request(request)
+
+
+def _pre_init_setup_token_valid(request: Request) -> bool:
+    expected_setup_token = _configured_setup_token()
+    if expected_setup_token is None and _is_trusted_local_setup_request(request):
+        return True
+    provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
+    return _api_key_matches(provided_setup_token, expected_setup_token)
+
+
 async def require_api_key(
     provided: Annotated[str | None, Depends(_api_key_header)],
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -303,12 +366,32 @@ async def require_pre_init_or_api_key(
     """
     system = await load_system_settings(session)
     if system is None or not system.initialized:
+        if get_settings().dev_auth_bypass:
+            return
+        if not _pre_init_setup_token_valid(request):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token"
+            )
         return
     if get_settings().dev_auth_bypass:
         return
     provided = request.headers.get(API_KEY_HEADER_NAME)
     if not _api_key_matches(provided, system.app_api_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+
+
+async def require_setup_token_pre_init(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Require the bootstrap setup token only while the install is uninitialized."""
+    system = await load_system_settings(session)
+    if system is not None and system.initialized:
+        return
+    if get_settings().dev_auth_bypass:
+        return
+    if not _pre_init_setup_token_valid(request):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token")
 
 
 # --------------------------------------------------------------------------- #

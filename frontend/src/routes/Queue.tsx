@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useMarkFailed, useQueue } from '../api/hooks'
 import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
@@ -19,7 +19,7 @@ function isActive(status: string): boolean {
 
 /** What the confirm dialog is about to do, captured when a button is pressed. */
 interface PendingAction {
-  item: QueueItem
+  downloadId: number
   blocklist: boolean
 }
 
@@ -31,12 +31,22 @@ export function Queue() {
 
   const items = data?.queue ?? []
   const activeCount = items.filter((item) => isActive(item.status)).length
+  const pendingItem = pending ? (items.find((item) => item.id === pending.downloadId) ?? null) : null
+  const pendingActionable = pendingItem !== null && pendingItem.status !== 'importing'
+
+  useEffect(() => {
+    if (pending && !pendingActionable) {
+      setPending(null)
+    }
+  }, [pending, pendingActionable])
 
   async function runConfirm() {
-    if (!pending) return
-    const { item, blocklist } = pending
+    if (!pending || !pendingItem || pendingItem.status === 'importing') {
+      setPending(null)
+      return
+    }
     try {
-      await markFailed.mutateAsync({ downloadId: item.id, blocklist })
+      await markFailed.mutateAsync({ downloadId: pendingItem.id, blocklist: pending.blocklist })
       toast({ title: 'Marked failed', intent: 'success' })
       setPending(null)
     } catch (err) {
@@ -77,7 +87,7 @@ export function Queue() {
             key={item.id}
             item={item}
             disabled={markFailed.isPending}
-            onAction={(target, blocklist) => setPending({ item: target, blocklist })}
+            onAction={(target, blocklist) => setPending({ downloadId: target.id, blocklist })}
           />
         ))}
       </div>
@@ -109,7 +119,7 @@ export function Queue() {
 
       {content}
 
-      {pending ? (
+      {pending && pendingActionable ? (
         <Dialog
           open
           onOpenChange={(open) => {
@@ -150,6 +160,7 @@ function QueueCard({
 }) {
   const presentation = downloadStatus(item.status)
   const isDownloadingLike = presentation.intent === 'downloading'
+  const canMarkFailed = item.status !== 'importing'
   const pct = Math.round(Math.min(1, Math.max(0, item.progress ?? 0)) * 100)
   const shortHash = item.torrent_hash.slice(0, 12)
   const detail = isDownloadingLike ? `${pct}%` : undefined
@@ -164,29 +175,31 @@ function QueueCard({
             seed {(item.seed_ratio ?? 0).toFixed(2)}
           </span>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            variant="danger"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onAction(item, false)}
-          >
-            Mark failed
-          </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onAction(item, true)}
-          >
-            Blocklist &amp; fail
-          </Button>
-        </div>
+        {canMarkFailed ? (
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onAction(item, false)}
+            >
+              Mark failed
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onAction(item, true)}
+            >
+              Blocklist &amp; fail
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       {isDownloadingLike ? (
         <div className="mt-3 flex items-center gap-3">
-          <ProgressBar value={item.progress ?? 0} />
+          <ProgressBar value={item.progress ?? 0} label="Download progress" />
           <span className="font-mono text-xs text-muted tabular-nums">{pct}%</span>
         </div>
       ) : null}

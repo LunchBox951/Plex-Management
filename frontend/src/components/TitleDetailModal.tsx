@@ -187,6 +187,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   }, [queueQuery.data, title, effectiveRequestId])
 
   const state = deriveState(liveRequest, requestId !== null)
+  const reportTarget = reportFor
+    ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
+    : null
+  const reportActionable = reportTarget !== null && reportTarget.status !== 'importing'
+
+  useEffect(() => {
+    if (reportFor && !reportActionable) {
+      setReportFor(null)
+    }
+  }, [reportFor, reportActionable])
 
   const runPreview = useCallback(
     async (forRequestId: number | null) => {
@@ -224,9 +234,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       setRequestId(created.id)
       // A terminal create (Plex already has the title, or a reused completed/failed
       // request) must not arm Grab — gate on the returned status, not just the id.
-      setCreatedGrabbable(isGrabbableStatus(created.status))
+      const grabbable = isGrabbableStatus(created.status)
+      setCreatedGrabbable(grabbable)
       toast({ title: `Requested ${titleName}`, intent: 'success' })
-      await runPreview(created.id)
+      if (grabbable) {
+        await runPreview(created.id)
+      } else {
+        setPreview(null)
+      }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
@@ -261,7 +276,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // Blocklist the bad release and re-arm the request to search again. Mirrors the
   // Queue screen's mark-failed confirm; no separate "issues" record is created.
   const runReport = useCallback(async () => {
-    if (!reportFor) return
+    if (!reportFor || !reportActionable) {
+      setReportFor(null)
+      return
+    }
     try {
       await markFailed.mutateAsync({ downloadId: reportFor.downloadId, blocklist: true })
       toast({
@@ -277,7 +295,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         intent: 'error',
       })
     }
-  }, [reportFor, markFailed, toast])
+  }, [reportFor, reportActionable, markFailed, toast])
 
   // Retry a blocked import (operator fixed the infra, or it was a transient Plex
   // hiccup). The reconcile loop re-runs validate -> place -> scan; an idempotent
@@ -296,6 +314,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
+  const tvDeferred = title.media_type === 'tv'
 
   // For a settled (failed/available) title, grabbing a release needs a FRESH request
   // (the old id is terminal) — onRequest creates one, then previews.
@@ -338,16 +357,27 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
-  const showReleases =
+  const showReleases = !tvDeferred && (
     state.kind === 'none' ||
     state.kind === 'pending' ||
     state.kind === 'searching' ||
     state.kind === 'no_acceptable_release' ||
     state.kind === 'failed' ||
     state.kind === 'unknown'
+  )
 
   let actionZone: ReactNode
-  switch (state.kind) {
+  if (tvDeferred) {
+    actionZone = (
+      <div className="flex flex-wrap items-center gap-3">
+        <StatusBadge status={{ label: 'Deferred', intent: 'neutral' }} />
+        <span className="text-sm text-muted">
+          TV requests are deferred until TV import is available.
+        </span>
+      </div>
+    )
+  } else {
+    switch (state.kind) {
     case 'none':
       actionZone = (
         <div className="flex flex-wrap gap-2">
@@ -382,7 +412,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           <div className="flex items-center gap-3">
             <StatusBadge status={requestStatus('downloading')} />
             <div className="flex flex-1 items-center gap-3">
-              <ProgressBar value={queueItem?.progress ?? 0} />
+              <ProgressBar value={queueItem?.progress ?? 0} label="Download progress" />
               <span className="font-mono text-xs text-muted tabular-nums">
                 {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
               </span>
@@ -468,6 +498,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         </div>
       )
       break
+    }
   }
 
   return (
@@ -504,7 +535,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         ) : null}
       </div>
 
-      {reportFor ? (
+      {reportFor && reportActionable ? (
         <Dialog
           open
           onOpenChange={(next) => {

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,7 @@ from plex_manager.services.grab_service import (
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
+    TorrentAlreadyTrackedError,
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
@@ -37,6 +38,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.routers.search_preview import run_preview
 from plex_manager.web.schemas import (
+    ErrorDetail,
     GrabRequest,
     QueueItem,
     QueueResponse,
@@ -50,6 +52,11 @@ router = APIRouter(
     tags=["queue"],
     dependencies=[Depends(require_api_key)],
 )
+
+_QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {"model": ErrorDetail, "description": "Referenced queue resource not found"},
+    409: {"model": ErrorDetail, "description": "Queue action conflict"},
+}
 
 
 def _to_item(record: DownloadRecord) -> QueueItem:
@@ -98,7 +105,7 @@ async def get_queue(
     return QueueResponse(queue=[_to_item(r) for r in records])
 
 
-@router.post("/grab", status_code=status.HTTP_201_CREATED)
+@router.post("/grab", status_code=status.HTTP_201_CREATED, responses=_QUEUE_ERROR_RESPONSES)
 async def grab_endpoint(
     body: GrabRequest,
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -168,6 +175,13 @@ async def grab_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
         ) from exc
+    except TorrentAlreadyTrackedError as exc:
+        # The same torrent hash is already actively owned by a different request.
+        # Returning that row would claim this request was grabbed while leaving it
+        # untouched, so surface a conflict.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="torrent_already_tracked"
+        ) from exc
     except GrabError as exc:
         # qBittorrent took the grab but no real info-hash could be determined;
         # surfaced (not silently tracked by an unmatchable guid) so the operator
@@ -178,7 +192,7 @@ async def grab_endpoint(
     return _to_item(record)
 
 
-@router.post("/{download_id}/import")
+@router.post("/{download_id}/import", responses=_QUEUE_ERROR_RESPONSES)
 async def import_endpoint(
     download_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -209,7 +223,7 @@ async def import_endpoint(
     return _to_item(record)
 
 
-@router.post("/{download_id}/mark-failed")
+@router.post("/{download_id}/mark-failed", responses=_QUEUE_ERROR_RESPONSES)
 async def mark_failed_endpoint(
     download_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
