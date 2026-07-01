@@ -1758,13 +1758,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Successful Response */
+            /** @description Either a `text/plain` line-per-event trail (default, `format=text`) or a JSON `LogsResponse` bundle (`format=json`) — the two shapes this endpoint actually serves, per the `format` query parameter. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LogsResponse"];
+                    "text/plain": string;
                 };
             };
             /** @description Validation Error */

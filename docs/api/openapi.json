@@ -2672,10 +2672,17 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LogsResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Either a `text/plain` line-per-event trail (default, `format=text`) or a JSON `LogsResponse` bundle (`format=json`) \u2014 the two shapes this endpoint actually serves, per the `format` query parameter."
           },
           "422": {
             "content": {

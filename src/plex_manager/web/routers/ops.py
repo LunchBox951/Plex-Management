@@ -228,7 +228,22 @@ def _export_filename(fmt: Literal["text", "json"]) -> str:
     return f"plex-manager-logs-{stamp}.{extension}"
 
 
-@router.get("/logs/export")
+@router.get(
+    "/logs/export",
+    responses={
+        200: {
+            "description": (
+                "Either a `text/plain` line-per-event trail (default, `format=text`) "
+                "or a JSON `LogsResponse` bundle (`format=json`) — the two shapes this "
+                "endpoint actually serves, per the `format` query parameter."
+            ),
+            "content": {
+                "text/plain": {"schema": {"type": "string"}},
+                "application/json": {"schema": {"$ref": "#/components/schemas/LogsResponse"}},
+            },
+        },
+    },
+)
 async def export_logs_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     correlation_id: Annotated[str | None, Query()] = None,
