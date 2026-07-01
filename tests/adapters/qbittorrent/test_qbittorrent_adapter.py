@@ -51,7 +51,7 @@ INFO_ROWS: list[dict[str, Any]] = [
         "state": "metaDL",  # magnet metadata being fetched
         "progress": 0.0,
         "ratio": 0.0,
-        "save_path": "/downloads/movies",
+        "save_path": "/downloads/movies/",
         "content_path": "/downloads/movies",  # echoes save_path -> dropped to None
         "eta": -1,
         "ratio_limit": 1.5,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -930,6 +931,67 @@ class _CompetingActiveDuringAddQbt(FakeQbittorrent):
         return self._info_hash
 
 
+class _CompetingHashOwnerDuringAddQbt(FakeQbittorrent):
+    def __init__(self, sessionmaker_: SessionMaker, owner_request_id: int, info_hash: str) -> None:
+        super().__init__()
+        self._sessionmaker = sessionmaker_
+        self._owner_request_id = owner_request_id
+        self._info_hash = info_hash
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        self.added.append((magnet_or_url, save_path, category))
+        async with self._sessionmaker() as session:
+            session.add(
+                Download(
+                    torrent_hash=self._info_hash,
+                    status="downloading",
+                    media_request_id=self._owner_request_id,
+                    tmdb_id=100,
+                )
+            )
+            await session.commit()
+        return self._info_hash
+
+
+async def test_grab_insert_conflict_rejects_same_hash_owned_by_another_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """If another request wins the same torrent_hash UNIQUE race, recovery must
+    reject ownership transfer instead of returning the other request's active row
+    as if this request had grabbed successfully."""
+    async with sessionmaker_() as session:
+        owner = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Owner", status=RequestStatus.downloading
+        )
+        current = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add_all([owner, current])
+        await session.flush()
+        owner_id, current_id = owner.id, current.id
+        await session.commit()
+
+    qbt = _CompetingHashOwnerDuringAddQbt(sessionmaker_, owner_id, _HASH)
+    async with sessionmaker_() as session:
+        with pytest.raises(TorrentAlreadyTrackedError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=current_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.added != []
+    async with sessionmaker_() as session:
+        current = await session.get(MediaRequest, current_id)
+        assert current is not None and current.status == RequestStatus.searching
+        rows = (await session.execute(select(Download))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].media_request_id == owner_id
+        assert (await session.execute(select(DownloadHistory))).scalars().all() == []
+
+
 async def test_grab_terminal_reuse_removes_orphan_when_parallel_active_wins(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -965,3 +1027,72 @@ async def test_grab_terminal_reuse_removes_orphan_when_parallel_active_wins(
             )
 
     assert qbt.removed == [(_HASH, True)]
+
+
+async def test_grab_terminal_reuse_cas_lost_rejects_new_owner(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a terminal row is a CAS claim. If another request moves the row back
+    to active first, this grab must not return the newly active row as success."""
+    async with sessionmaker_() as session:
+        owner = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Owner", status=RequestStatus.downloading
+        )
+        current = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add_all([owner, current])
+        await session.flush()
+        owner_id, current_id = owner.id, current.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=None,
+                tmdb_id=999,
+            )
+        )
+        await session.commit()
+
+    real_update = grab_service.SqlDownloadRepository.update_status_if_in
+
+    async def racing_update(
+        self: grab_service.SqlDownloadRepository,
+        download_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        **kwargs: Any,
+    ) -> bool:
+        async with sessionmaker_() as other:
+            row = await other.get(Download, download_id)
+            assert row is not None
+            row.status = "downloading"
+            row.media_request_id = owner_id
+            row.tmdb_id = 100
+            await other.commit()
+        return await real_update(self, download_id, status, allowed_from, **kwargs)
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "update_status_if_in", racing_update)
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(TorrentAlreadyTrackedError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=current_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.added != []
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        current = await session.get(MediaRequest, current_id)
+        assert row.status == "downloading"
+        assert row.media_request_id == owner_id
+        assert current is not None and current.status == RequestStatus.searching
+        assert (await session.execute(select(DownloadHistory))).scalars().all() == []

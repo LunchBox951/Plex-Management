@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.config import get_settings
 from plex_manager.models import SystemSettings
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -29,6 +31,50 @@ async def test_status_pre_init_has_no_key(client: httpx.AsyncClient) -> None:
     body = response.json()
     assert body["initialized"] is False
     assert body["app_api_key"] is None
+    assert body["setup_token_required"] is False
+
+
+async def test_status_reports_setup_token_requirement(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+
+    response = await client.get("/api/v1/setup/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["initialized"] is False
+    assert body["app_api_key"] is None
+    assert body["setup_token_required"] is True
+
+
+async def test_complete_requires_configured_setup_token_pre_init(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+
+    missing = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert missing.status_code == 401
+    assert missing.json()["detail"] == "invalid_setup_token"
+
+    wrong = await client.post(
+        "/api/v1/setup/complete",
+        json=_COMPLETE_BODY,
+        headers={"X-Setup-Token": "wrong"},
+    )
+    assert wrong.status_code == 401
+    assert wrong.json()["detail"] == "invalid_setup_token"
+
+    ok = await client.post(
+        "/api/v1/setup/complete",
+        json=_COMPLETE_BODY,
+        headers={"X-Setup-Token": "boot-token"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["initialized"] is True
 
 
 async def test_complete_flips_initialized_and_issues_key(client: httpx.AsyncClient) -> None:

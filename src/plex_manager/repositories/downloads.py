@@ -214,6 +214,13 @@ class SqlDownloadRepository:
         first_seen_at: datetime | None = None,
         clear_first_seen_at: bool = False,
         clear_failed_reason: bool = False,
+        media_request_id: int | None = None,
+        replace_grab_metadata: bool = False,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+        media_type: str | None = None,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -249,6 +256,14 @@ class SqlDownloadRepository:
             values["progress"] = progress
         if seed_ratio is not None:
             values["seed_ratio"] = seed_ratio
+        if media_request_id is not None:
+            values["media_request_id"] = media_request_id
+        if replace_grab_metadata:
+            values["magnet_link"] = magnet_link
+            values["tmdb_id"] = tmdb_id
+            values["year"] = year
+            values["season"] = season
+            values["media_type"] = MediaType(media_type) if media_type is not None else None
         if clear_first_seen_at:
             values["first_seen_at"] = None
         elif first_seen_at is not None:

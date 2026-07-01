@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI
 
 from plex_manager.adapters.plex.library import reset_caches
+from plex_manager.config import get_settings
 from plex_manager.ports.library import LibrarySection
 from plex_manager.web import setup_validation
 from plex_manager.web.setup_validation import library_options
@@ -79,6 +80,36 @@ async def test_validate_tmdb_bad_key(client: httpx.AsyncClient, app: FastAPI) ->
     body = response.json()
     assert body["ok"] is False
     assert "bad" not in response.text  # the rejected key never echoes back
+
+
+async def test_validate_requires_configured_setup_token_pre_init(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+
+    denied = await client.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+    assert denied.status_code == 401
+    assert denied.json()["detail"] == "invalid_setup_token"
+    assert outbound == []  # rejected before the caller-controlled outbound request
+
+    ok = await client.post(
+        "/api/v1/setup/validate/tmdb",
+        json={"api_key": "k"},
+        headers={"X-Setup-Token": "boot-token"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["ok"] is True
+    assert outbound == ["/3/search/multi"]
 
 
 async def test_validate_prowlarr_ok(client: httpx.AsyncClient, app: FastAPI) -> None:

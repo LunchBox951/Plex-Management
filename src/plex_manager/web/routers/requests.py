@@ -12,7 +12,11 @@ from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import request_service
-from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
+from plex_manager.services.request_service import (
+    MediaNotFoundError,
+    MediaTypeDeferredError,
+    NoAiredSeasonsError,
+)
 from plex_manager.web.deps import (
     get_library_optional,
     get_session,
@@ -118,6 +122,11 @@ async def create_request_endpoint(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no_aired_seasons",
+        ) from exc
+    except MediaTypeDeferredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="media_type_deferred",
         ) from exc
     return await _to_response(session, record)
 

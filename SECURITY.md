@@ -25,10 +25,11 @@ there is no bug-bounty program.
 ## How secrets are handled
 
 - Service credentials (Plex token, TMDB / Prowlarr / qBittorrent keys) are entered
-  through the in-app setup wizard and **will be stored encrypted at rest**, never
-  in the image or in `.env`. (The wizard + encryption land with v1; the foundation
-  already enforces the "never in the image or `.env`" half — `.env` is git- and
-  docker-ignored.)
+  through the in-app setup wizard and **stored encrypted at rest**, never in the
+  image or in `.env`.
+- First-run setup is guarded by `PLEX_MANAGER_SETUP_TOKEN` in the stock Docker
+  Compose deployment, and the default published host bind is loopback-only. Keep
+  that token out of issue reports, logs, screenshots, and public compose examples.
 - Secrets **must never be written to logs** — enforced in review today, and to be
   backed by a logging redaction filter and a test once the secrets code lands (a
   regression carried over from a prototype lesson).

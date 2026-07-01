@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 __all__ = [
     "TERMINAL_REQUEST_STATUS_VALUES",
     "MediaNotFoundError",
+    "MediaTypeDeferredError",
     "NoAiredSeasonsError",
     "create_request",
     "get_request",
@@ -100,6 +101,14 @@ class NoAiredSeasonsError(Exception):
     def __init__(self, tmdb_id: int) -> None:
         self.tmdb_id = tmdb_id
         super().__init__(f"tv tmdb_id={tmdb_id} resolved to zero aired seasons")
+
+
+class MediaTypeDeferredError(Exception):
+    """The app cannot safely process this media type yet."""
+
+    def __init__(self, media_type: str) -> None:
+        self.media_type = media_type
+        super().__init__(f"{media_type} requests are deferred")
 
 
 class _Detail(NamedTuple):
@@ -269,6 +278,9 @@ async def create_request(
     this: an existing request resolving no NEW seasons there just means "nothing
     to add" to an already-viable request, not a dead end.
     """
+    if media_type != "movie":
+        raise MediaTypeDeferredError(media_type)
+
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:

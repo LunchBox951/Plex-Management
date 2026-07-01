@@ -2064,6 +2064,11 @@
           "initialized": {
             "title": "Initialized",
             "type": "boolean"
+          },
+          "setup_token_required": {
+            "default": false,
+            "title": "Setup Token Required",
+            "type": "boolean"
           }
         },
         "required": [

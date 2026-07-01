@@ -406,9 +406,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       // request) must not arm Grab — gate on the returned status, not just the id.
       // For tv this is the SELECTED (resolved) season's own status (`created.seasons`
       // is now populated), never the show-level rollup.
-      setCreatedGrabbable(isSeasonGrabbable(created, resolvedSeason))
+      const grabbable = isSeasonGrabbable(created, resolvedSeason)
+      setCreatedGrabbable(grabbable)
       toast({ title: `Requested ${titleName}`, intent: 'success' })
-      await runPreview(created.id, resolvedSeason)
+      if (grabbable) {
+        await runPreview(created.id, resolvedSeason)
+      } else {
+        setPreview(null)
+      }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
@@ -505,6 +510,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
+  const tvDeferred = title.media_type === 'tv'
 
   // tv only: before any request exists, let the operator name a single season (and
   // whether to track just it or the whole series); once seasons are tracked,
@@ -602,16 +608,27 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
-  const showReleases =
+  const showReleases = !tvDeferred && (
     state.kind === 'none' ||
     state.kind === 'pending' ||
     state.kind === 'searching' ||
     state.kind === 'no_acceptable_release' ||
     state.kind === 'failed' ||
     state.kind === 'unknown'
+  )
 
   let actionZone: ReactNode
-  switch (state.kind) {
+  if (tvDeferred) {
+    actionZone = (
+      <div className="flex flex-wrap items-center gap-3">
+        <StatusBadge status={{ label: 'Deferred', intent: 'neutral' }} />
+        <span className="text-sm text-muted">
+          TV requests are deferred until TV import is available.
+        </span>
+      </div>
+    )
+  } else {
+    switch (state.kind) {
     case 'none':
       actionZone = (
         <div className="flex flex-wrap gap-2">
@@ -646,7 +663,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           <div className="flex items-center gap-3">
             <StatusBadge status={requestStatus('downloading')} />
             <div className="flex flex-1 items-center gap-3">
-              <ProgressBar value={queueItem?.progress ?? 0} />
+              <ProgressBar value={queueItem?.progress ?? 0} label="Download progress" />
               <span className="font-mono text-xs text-muted tabular-nums">
                 {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
               </span>
@@ -748,6 +765,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         </div>
       )
       break
+    }
   }
 
   return (

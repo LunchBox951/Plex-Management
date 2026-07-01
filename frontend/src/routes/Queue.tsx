@@ -210,7 +210,7 @@ function QueueCard({
 
       {isDownloadingLike ? (
         <div className="mt-3 flex items-center gap-3">
-          <ProgressBar value={item.progress ?? 0} />
+          <ProgressBar value={item.progress ?? 0} label="Download progress" />
           <span className="font-mono text-xs text-muted tabular-nums">{pct}%</span>
         </div>
       ) : null}

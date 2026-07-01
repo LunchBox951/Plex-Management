@@ -29,8 +29,10 @@ from plex_manager.web.deps import (
     SettingsStore,
     ensure_system_settings,
     get_http_client,
+    is_setup_token_required,
     load_system_settings,
     require_pre_init_or_api_key,
+    require_setup_token_pre_init,
 )
 from plex_manager.web.schemas import (
     PlexValidateRequest,
@@ -91,7 +93,7 @@ async def validate_tmdb_endpoint(
     return await validate_tmdb(client, body.api_key)
 
 
-@router.post("/complete")
+@router.post("/complete", dependencies=[Depends(require_setup_token_pre_init)])
 async def complete(
     body: SetupCompleteRequest,
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -182,4 +184,8 @@ async def status(
     """
     system = await load_system_settings(session)
     initialized = system is not None and system.initialized
-    return SetupStatusResponse(initialized=initialized, app_api_key=None)
+    return SetupStatusResponse(
+        initialized=initialized,
+        app_api_key=None,
+        setup_token_required=not initialized and is_setup_token_required(),
+    )

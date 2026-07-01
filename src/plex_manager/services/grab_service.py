@@ -213,6 +213,7 @@ class TorrentAlreadyTrackedError(Exception):
 
 
 async def _reuse_terminal_row(
+    session: AsyncSession,
     download_repo: SqlDownloadRepository,
     download_id: int,
     torrent_hash: str,
@@ -224,7 +225,7 @@ async def _reuse_terminal_row(
     season: int | None,
     episodes: list[int] | None,
     media_type: str | None,
-) -> DownloadRecord:
+) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
     A previously-failed (not blocklisted) release may legitimately be grabbed
@@ -257,9 +258,10 @@ async def _reuse_terminal_row(
     Unconditional (not ``is not None``-gated) so a movie reuse correctly clears
     any stale season/episodes back to ``None`` too.
     """
-    await download_repo.update_status(
+    claimed = await download_repo.update_status_if_in(
         download_id,
         DownloadState.Downloading.value,
+        _TERMINAL_STATUS_VALUES,
         progress=0.0,
         seed_ratio=0.0,
         clear_failed_reason=True,
@@ -274,10 +276,16 @@ async def _reuse_terminal_row(
         episodes=episodes,
         media_type=media_type,
     )
+    if not claimed:
+        await session.rollback()
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is None:  # pragma: no cover - the row existed before the CAS
+            raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
+        return record, False
     record = await download_repo.get_by_hash(torrent_hash)
     if record is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
-    return record
+    return record, True
 
 
 async def grab(
@@ -410,7 +418,8 @@ async def grab(
 
     if existing is not None:
         try:
-            record = await _reuse_terminal_row(
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
                 download_repo,
                 existing.id,
                 torrent_hash,
@@ -422,6 +431,12 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
             )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+                    return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
         except IntegrityError:
             await session.rollback()
             if request_id is not None:
@@ -499,7 +514,8 @@ async def grab(
                         requested_episodes=episodes,
                     ) from None
                 return winner
-            record = await _reuse_terminal_row(
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
                 download_repo,
                 winner.id,
                 torrent_hash,
@@ -511,6 +527,14 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
             )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(
+                            torrent_hash, record.media_request_id
+                        ) from None
+                    return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
     session.add(
         DownloadHistory(
             tmdb_id=tmdb_id,

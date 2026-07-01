@@ -77,6 +77,12 @@ _FIELDS: dict[str, dict[str, object]] = {
         "source": "Blu-ray",
         "screen_size": "1080p",
     },
+    "Proof.2005.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Proof",
+        "year": "2005",
+        "source": "Web",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -542,3 +548,19 @@ def test_split_part_episode_rejected_others_in_pack_still_accepted() -> None:
     assert len(result.rejected) == 1
     assert result.rejected[0].reason is ImportRejectionReason.MULTI_PART
     assert result.rejected[0].relative_path == "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_movie_title_named_proof_is_not_treated_as_sample_extra() -> None:
+    result = validate_import(
+        [VideoFile("Proof.2005.1080p.WEB-DL.x264-GRP.mkv", 8 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=67,
+    )
+
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.video is not None
+    assert result.video.relative_path == "Proof.2005.1080p.WEB-DL.x264-GRP.mkv"

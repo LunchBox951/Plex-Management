@@ -69,7 +69,7 @@ __all__ = [
 # chosen as the largest-file feature when the real movie is also present.
 _SAMPLE_EXTRAS = re.compile(
     r"(?:^|[\s._\-])(?:sample|trailer|extras?|featurette|behind[\s._\-]?the[\s._\-]?scenes|"
-    r"deleted[\s._\-]?scene|proof|rarbg\.com)(?:$|[\s._\-])",
+    r"deleted[\s._\-]?scene|rarbg\.com)(?:$|[\s._\-])",
     re.IGNORECASE,
 )
 

@@ -35,6 +35,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
 import socket
 from datetime import UTC, datetime
 from typing import Final, cast
@@ -304,7 +305,11 @@ def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     """
     save_path = _s(torrent.get("save_path"))
     content_path = _s(torrent.get("content_path")) or None
-    if content_path is not None and content_path == save_path:
+    if (
+        content_path is not None
+        and save_path
+        and os.path.realpath(content_path) == os.path.realpath(save_path)
+    ):
         content_path = None
     eta = _i(torrent.get("eta"))
     return DownloadStatus(

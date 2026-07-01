@@ -176,6 +176,7 @@ class SetupStatusResponse(BaseModel):
 
     initialized: bool
     app_api_key: str | None = None
+    setup_token_required: bool = False
 
 
 # --------------------------------------------------------------------------- #
