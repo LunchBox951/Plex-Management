@@ -247,7 +247,10 @@ class FakeLibrary:
     is ``None`` for a movie entry -- to a canned :class:`WatchState`; a key with no
     entry answers ``watched=False, last_viewed_at=None`` (Plex has never recorded a
     view), matching the real adapter's honest default for an absent/never-viewed
-    item.
+    item. ``watch_state_calls`` records every ``(tmdb_id, media_type, season)`` a
+    caller resolved -- e.g. ``eviction_service``'s below-threshold pre-check test
+    asserts this stays EMPTY, proving the sweep never pays for a Plex round-trip
+    when there is no disk pressure to relieve.
     """
 
     def __init__(
@@ -264,6 +267,7 @@ class FakeLibrary:
         self.scanned: list[str] = []
         self.scan_calls: list[tuple[str, str]] = []
         self.watch_states = watch_states or {}
+        self.watch_state_calls: list[tuple[int, str, int | None]] = []
 
     async def is_available(
         self,
@@ -300,6 +304,7 @@ class FakeLibrary:
         *,
         season: int | None = None,
     ) -> WatchState:
+        self.watch_state_calls.append((tmdb_id, media_type, season))
         return self.watch_states.get(
             (tmdb_id, media_type, season), WatchState(watched=False, last_viewed_at=None)
         )

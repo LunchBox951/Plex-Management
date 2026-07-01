@@ -26,7 +26,6 @@ from starlette.status import HTTP_409_CONFLICT
 from plex_manager.db import get_session
 from plex_manager.models import SystemSettings
 from plex_manager.web.deps import (
-    KNOWN_SETTING_KEYS,
     SettingsStore,
     ensure_system_settings,
     get_http_client,
@@ -151,14 +150,18 @@ async def complete(
         "tmdb_api_key": body.tmdb_api_key,
         "movies_root": body.movies_root,
     }
-    # ``tv_root`` is optional (unlike every other KNOWN_SETTING_KEYS entry): an
-    # install may complete setup with only a Movies library configured. Write it
-    # only when the operator actually supplied one, mirroring how an unset
-    # ``tv_root`` reads back as None from GET /settings rather than an empty string.
-    for key in KNOWN_SETTING_KEYS:
-        if key == "tv_root":
-            continue
-        await store.set(key, values[key])
+    # Iterates ``values`` (exactly the fields the setup wizard collects), NOT
+    # ``KNOWN_SETTING_KEYS`` — that tuple also carries the operability-beta
+    # settings (disk-pressure thresholds, eviction tuning, log retention), which
+    # are never part of the wizard and must stay UNSET here so their typed
+    # getters (``web/deps.py``) fall back to their safe defaults, not a
+    # KeyError on a field this request body never had.
+    for key, value in values.items():
+        await store.set(key, value)
+    # ``tv_root`` is optional (unlike every field in ``values``): an install may
+    # complete setup with only a Movies library configured. Write it only when
+    # the operator actually supplied one, mirroring how an unset ``tv_root``
+    # reads back as None from GET /settings rather than an empty string.
     if body.tv_root:
         await store.set("tv_root", body.tv_root)
 

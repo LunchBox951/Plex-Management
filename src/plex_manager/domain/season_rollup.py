@@ -48,23 +48,38 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
 
     1. Any season in :data:`_PRECEDENCE_STATUSES` (``import_blocked`` /
        ``downloading`` / ``searching`` / ``no_acceptable_release``) wins outright.
-    2. Otherwise every remaining season is one of ``pending``/``available``/
-       ``completed``/``failed``. ``available`` and ``completed`` are the two DONE
-       states (``completed`` = imported, Plex-confirmation pending):
-       - every season done, all ``available`` -> ``"available"``
-       - every season done, at least one still ``completed`` -> ``"completed"``
-       - a done season mixed with any ``pending``/``failed`` ->
+    2. Every season ``evicted`` (ADR-0012's disk-pressure sweep reclaimed every
+       tracked season's file) -> the (non-terminal, re-requestable) ``"evicted"``,
+       mirroring the movie-level ``RequestStatus.evicted`` semantics.
+    3. Otherwise every remaining season is one of ``pending``/``available``/
+       ``completed``/``failed``/``evicted``. ``available`` and ``completed`` are
+       the two REAL-DONE states (``completed`` = imported, Plex-confirmation
+       pending) — something is actually watchable/imported right now.
+       ``"partially_available"`` must only ever be reported when at least one
+       season is REAL-DONE; an ``evicted`` season never earns it on its own,
+       because nothing about an eviction leaves anything watchable behind:
+       - every season done, all ``available``, none ``evicted`` -> ``"available"``
+       - every season done, at least one still ``completed`` (no ``evicted``) ->
+         ``"completed"``
+       - a done season mixed with an ``evicted`` one (no ``pending``/``failed``) ->
+         ``"partially_available"`` (some seasons present, one reclaimed)
+       - a REAL-DONE season mixed with any ``pending``/``failed``/``evicted`` ->
          ``"partially_available"`` (honest, and non-terminal so the unfinished
          season stays grabbable)
-       - only ``pending``/``failed`` remain, any ``pending`` -> ``"pending"``
-       - none of the above -> every season is ``failed`` -> ``"failed"``
+       - NO real-done season is present (only ``evicted``/``pending``/``failed``,
+         e.g. one season evicted and another failed) -> nothing is actually
+         watchable, so this must NOT read ``"partially_available"``; ``evicted``
+         folds in alongside ``failed`` for this purpose (both mean "nothing on
+         disk for this season right now") and the remaining ``pending``/
+         ``failed`` rule applies: any ``pending`` -> ``"pending"``, else
+         -> ``"failed"``
 
     Pure and total over the season-status vocabulary: every combination of
     ``pending``/``searching``/``no_acceptable_release``/``downloading``/
-    ``completed``/``available``/``failed``/``import_blocked`` resolves to exactly
-    one branch above. Raises :class:`ValueError` on an empty sequence — a TV
-    request always has at least one season once ``ensure_seasons`` has run, so an
-    empty rollup input is a caller bug, never a state to silently guess at.
+    ``completed``/``available``/``failed``/``import_blocked``/``evicted`` resolves
+    to exactly one branch above. Raises :class:`ValueError` on an empty sequence —
+    a TV request always has at least one season once ``ensure_seasons`` has run, so
+    an empty rollup input is a caller bug, never a state to silently guess at.
     """
     if not season_statuses:
         raise ValueError("rollup_status requires at least one season status")
@@ -75,15 +90,32 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         if status in statuses:
             return status
 
-    # Only pending/available/completed/failed remain among the season statuses.
+    if statuses == {"evicted"}:
+        # The whole show's tracked content was reclaimed by the disk-pressure
+        # sweep -- honest, non-terminal, re-requestable at the show level too.
+        return "evicted"
+
+    # Only pending/available/completed/failed/evicted remain among the season
+    # statuses. ``evicted`` folds alongside available/completed as "done" for the
+    # purposes of this branch, EXCEPT it must never let the whole show read as
+    # cleanly "available" (its file is gone) -- see the docstring above.
     _DONE = {"available", "completed"}
-    if statuses <= _DONE:
-        # Every season is done: all confirmed -> "available"; any still awaiting
-        # Plex confirmation -> the (terminal) "completed".
-        return "available" if statuses == {"available"} else "completed"
+    _DONE_OR_EVICTED = _DONE | {"evicted"}
+    if statuses <= _DONE_OR_EVICTED:
+        if statuses == {"available"}:
+            return "available"
+        if "evicted" in statuses:
+            return "partially_available"
+        # Every season is done (available/completed, no evicted) but at least one
+        # is still awaiting Plex confirmation -> the (terminal) "completed".
+        return "completed"
     if statuses & _DONE:
-        # Some seasons are done, but a pending/failed one remains: honestly partial,
-        # never a terminal status that would mask it or block its grab.
+        # At least one REAL-DONE season (available/completed) is mixed with a
+        # pending/failed/evicted one: honestly partial -- something is actually
+        # watchable right now, and never a terminal status that would mask the
+        # unfinished season or block its grab. Deliberately checked against
+        # ``_DONE`` (not ``_DONE_OR_EVICTED``): an ``evicted`` season must never
+        # by itself earn "partially_available" -- see the docstring.
         return "partially_available"
     if "pending" in statuses:
         return "pending"
