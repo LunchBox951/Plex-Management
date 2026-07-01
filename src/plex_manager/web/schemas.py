@@ -259,8 +259,12 @@ class SettingsUpdate(BaseModel):
         422 here makes that misconfiguration visible instead of a silent dead band.
         (Enforced when both fields are present in the same request — which the
         Settings form always sends together. A direct-API split update that changes
-        only ONE side against a stored other side is not cross-checked here; that
-        narrower path is a known residual.)
+        only ONE side against a stored other side is a SEPARATE, narrower window
+        this fast-path validator cannot see — it has no access to what is currently
+        persisted. That case is cross-checked against the STORED counterpart in
+        ``web.routers.settings._validate_disk_pressure_pair``, which the ``PUT``
+        endpoint runs before writing anything; this validator stays as the cheap,
+        no-DB-access fast path for the common both-sent case.)
         """
         threshold = self.disk_pressure_threshold_percent
         target = self.disk_pressure_target_percent

@@ -252,12 +252,24 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const effectiveRequestId = requestId ?? liveRequest?.id ?? null
 
   // The "keep forever" pin (ADR-0012): prefers the live (polled) request's own
-  // field — the canonical source — falling back to the just-created id before
-  // the next poll lands (a freshly created request always starts unpinned, so
-  // `false` there is correct, not merely a placeholder). `null` when there is
-  // no request at all yet: nothing exists to pin.
-  const pinRequestId = liveRequest?.id ?? requestId
-  const keepForever = liveRequest?.keep_forever ?? false
+  // field — the canonical source — EXCEPT right after "Request again"/"Request",
+  // where `requestId` updates synchronously (`setRequestId(created.id)`) but
+  // `liveRequest` can still resolve the OLD, now-SETTLED request until the next
+  // `/requests` poll (or the create's own cache invalidation refetch) lands —
+  // see `liveRequest`'s own docstring on that lag. Pinning during that transient
+  // window must target the freshly created (active) request, never the stale
+  // settled one it replaced: `pinTracksFreshRequest` is true exactly while
+  // `requestId` is known but `liveRequest` hasn't caught up to it yet (including
+  // `liveRequest === null`, the very-first-request case). A fresh request always
+  // starts unpinned, so `keepForever` reads `false` there too, rather than the
+  // OLD request's (possibly `true`) pin state under a checkbox that now targets
+  // a DIFFERENT id. Once the poll catches up (`liveRequest.id === requestId`),
+  // or `requestId` is `null` again (a fresh `titleKey`), this collapses back to
+  // the ordinary `liveRequest`-driven pin. `null` pinRequestId means no request
+  // exists at all yet: nothing to pin.
+  const pinTracksFreshRequest = requestId !== null && liveRequest?.id !== requestId
+  const pinRequestId = pinTracksFreshRequest ? requestId : (liveRequest?.id ?? requestId)
+  const keepForever = pinTracksFreshRequest ? false : (liveRequest?.keep_forever ?? false)
 
   // tv only: this show's per-season rollup — the live poll once it lands, else the
   // just-created request's own list (the same create-then-poll gap as

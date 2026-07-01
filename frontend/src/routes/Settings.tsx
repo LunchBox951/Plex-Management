@@ -455,7 +455,9 @@ export function Settings() {
               {checkboxField(
                 'eviction_proactive_enabled',
                 'Proactive eviction',
-                'Also evict below the pressure threshold, down to the target, instead of only when over it.',
+                'Reclaims eagerly: evicts every watched, past-grace, unpinned title or ' +
+                  'season it can find, regardless of disk pressure — not just enough to ' +
+                  "reach the target. Mark anything you don't want touched as \"Keep forever.\"",
               )}
             </div>
           </div>

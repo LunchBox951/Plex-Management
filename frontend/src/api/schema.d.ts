@@ -497,6 +497,15 @@ export interface paths {
          *     the whole object back (e.g. after editing only ``plex_url``) must not clobber
          *     the real credential with the mask — a silent secret-wipe that would only
          *     surface later as an auth failure to the downstream service.
+         *
+         *     The disk-pressure pair is cross-checked against the EFFECTIVE (post-update)
+         *     values, not just what this one request happens to carry: ``SettingsUpdate``'s
+         *     own ``model_validator`` only catches a target above the threshold when BOTH
+         *     are submitted together, but ``PUT`` is a PARTIAL update — sending just one
+         *     side against an already-stored (and now-inverted) other side would otherwise
+         *     silently leave the whole threshold-to-target band unable to relieve pressure
+         *     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
+         *     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;

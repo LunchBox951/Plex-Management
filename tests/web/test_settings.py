@@ -265,3 +265,67 @@ async def test_put_rejects_out_of_range_operability_settings(
         headers=headers,
     )
     assert negative_days.status_code == 422
+
+
+async def test_put_single_field_threshold_below_stored_target_rejects_and_does_not_persist(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """R4-2: ``SettingsUpdate``'s own ``model_validator`` only catches a target
+    above the threshold when BOTH fields are sent in the SAME request -- ``PUT``
+    is a PARTIAL update, so a request naming just ONE side against an
+    already-stored (now-inverted) other side must ALSO 422, cross-checked
+    against what is actually persisted (see
+    ``routers.settings._validate_disk_pressure_pair``), or the whole
+    threshold-to-target band silently stops relieving pressure."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+
+    # Establish a stored target of 80 (paired with a valid threshold of 95).
+    seeded = await client.put(
+        "/api/v1/settings",
+        json={"disk_pressure_threshold_percent": 95.0, "disk_pressure_target_percent": 80.0},
+        headers=headers,
+    )
+    assert seeded.status_code == 200
+
+    # A split update naming ONLY the threshold, now BELOW the stored target (80).
+    put = await client.put(
+        "/api/v1/settings",
+        json={"disk_pressure_threshold_percent": 70.0},
+        headers=headers,
+    )
+    assert put.status_code == 422
+
+    # Never persisted -- both sides stay at their last valid stored values.
+    async with sessionmaker_() as session:
+        assert await get_disk_pressure_threshold_percent(session) == 95.0
+        assert await get_disk_pressure_target_percent(session) == 80.0
+
+
+async def test_put_single_field_threshold_above_stored_target_still_succeeds(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The stored-value cross-check only rejects an INVERTED effective pair -- a
+    valid partial update (threshold alone, still above the stored target) must
+    succeed normally, never over-rejected by the new check."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+
+    seeded = await client.put(
+        "/api/v1/settings",
+        json={"disk_pressure_threshold_percent": 85.0, "disk_pressure_target_percent": 80.0},
+        headers=headers,
+    )
+    assert seeded.status_code == 200
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"disk_pressure_threshold_percent": 90.0},
+        headers=headers,
+    )
+    assert put.status_code == 200
+    assert put.json()["disk_pressure_threshold_percent"] == 90.0
+
+    async with sessionmaker_() as session:
+        assert await get_disk_pressure_threshold_percent(session) == 90.0
+        assert await get_disk_pressure_target_percent(session) == 80.0  # untouched

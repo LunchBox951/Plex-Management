@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
@@ -39,7 +40,7 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.library import WatchState
-from plex_manager.services import eviction_service
+from plex_manager.services import eviction_service, season_request_service
 from tests.web.fakes import FakeLibrary
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -621,6 +622,216 @@ async def test_pinning_the_show_protects_every_season(
 
 
 # --------------------------------------------------------------------------- #
+# R4-P1 (ADR-0012): a season eviction's parent-rollup write must tolerate
+# colliding with a NEWER active request for the same show, without losing the
+# season's own CAS-to-evicted + history row -- the honest "the file is gone"
+# record must never be rolled back just because the coarser parent rollup
+# couldn't also be written.
+# --------------------------------------------------------------------------- #
+
+
+async def test_evicting_a_season_of_a_settled_parent_tolerates_an_active_dedup_collision(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """An OLD parent whose rollup already settled to 'available' (OUTSIDE
+    ``uq_media_requests_active``'s predicate) can legitimately coexist with a
+    NEWER, genuinely active request for the SAME ``(tmdb_id, media_type)`` --
+    e.g. a fresh request naming a later season after the old one finished.
+    Evicting one of the OLD parent's remaining seasons folds its rollup back to
+    the ACTIVE ``partially_available`` (``[evicted, available] ->
+    partially_available``, ``domain/season_rollup``), which collides with the
+    newer row's slot in that same partial unique index. Before the fix, that
+    collision's ``IntegrityError`` bubbled out of ``_recompute_parent`` AFTER
+    ``fs.delete`` had already removed the file, was caught by the sweep's
+    per-candidate guard, and rolled back the season's own CAS + history along
+    with it -- leaving the DB honestly reporting 'available' for a season whose
+    file was already gone. This proves the season CAS/history now survive."""
+    s1_path = _movie_file(tmp_path, "Old Show S01.mkv")
+    s2_path = _movie_file(tmp_path, "Old Show S02.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=400, title="Old Show", seasons={1: s1_path, 2: s2_path}
+    )
+
+    # A NEWER, SEPARATE active request for the SAME (tmdb_id, media_type) --
+    # legal today because the OLD parent's rollup ('available') sits OUTSIDE
+    # uq_media_requests_active's predicate, so this insert does not collide.
+    async with sessionmaker_() as session:
+        newer = MediaRequest(
+            tmdb_id=400,
+            media_type=MediaType.tv,
+            title="Old Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(newer)
+        await session.commit()
+        newer_id = newer.id
+
+    library = FakeLibrary(
+        watch_states={
+            (400, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+            (400, "tv", 2): WatchState(watched=False, last_viewed_at=None),
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    # (c) freed bytes were counted -- a real EvictionOutcome, not a skip.
+    assert [(o.title, o.season) for o in outcomes] == [("Old Show", 1)]
+    assert outcomes[0].freed_bytes is not None
+    # The delete itself is the ultimate source of truth -- files-gone must match
+    # status-evicted, with no rollback undoing one but not the other.
+    assert not Path(s1_path).exists()
+    assert Path(s2_path).exists()  # unwatched season 2 untouched
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_season = {s.season_number: s.status for s in seasons}
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 400)))
+            .scalars()
+            .all()
+        )
+        old_show = await session.get(MediaRequest, show_id)
+        newer_row = await session.get(MediaRequest, newer_id)
+
+    # (a) the season CAS is the source of truth and it committed, despite the
+    # parent-rollup write colliding with the newer request's active slot.
+    assert by_season[1] is RequestStatus.evicted
+    assert by_season[2] is RequestStatus.available  # untouched
+    # (b) the eviction history row survived alongside the season CAS.
+    assert len(history) == 1
+    assert history[0].event_type is DownloadHistoryEvent.evicted
+    assert history[0].torrent_hash is None
+    # The coarser parent-rollup write failed SOFTLY: the old parent is left at
+    # its PRIOR (still-honest) status rather than a half-applied 'partially_
+    # available' that never actually made it past the collision.
+    assert old_show is not None
+    assert old_show.status is RequestStatus.available
+    # (d) the newer active request for the same show is completely untouched --
+    # same id, same active status, never resurrected/rewritten by the collision.
+    assert newer_row is not None
+    assert newer_row.id == newer_id
+    assert newer_row.status is RequestStatus.downloading
+    # (e) no IntegrityError escaped run_eviction_sweep -- the outcome above is
+    # not None/skipped, proving the sweep's per-candidate rollback guard never
+    # had to catch (and undo) this eviction.
+
+
+async def test_parent_rollup_collision_is_logged_when_tolerated(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The tolerated collision is never silently swallowed -- honesty over
+    silence: an operator can see the coarse rollup is momentarily stale even
+    though the season itself evicted cleanly."""
+    s1_path = _movie_file(tmp_path, "Quiet Show S01.mkv")
+    s2_path = _movie_file(tmp_path, "Quiet Show S02.mkv")
+    await _show_with_seasons(
+        sessionmaker_, tmdb_id=402, title="Quiet Show", seasons={1: s1_path, 2: s2_path}
+    )
+    async with sessionmaker_() as session:
+        session.add(
+            MediaRequest(
+                tmdb_id=402,
+                media_type=MediaType.tv,
+                title="Quiet Show",
+                status=RequestStatus.downloading,
+            )
+        )
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={
+            (402, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+            (402, "tv", 2): WatchState(watched=False, last_viewed_at=None),
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.season_request_service"):
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="tv",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+    assert [(o.title, o.season) for o in outcomes] == [("Quiet Show", 1)]
+    assert "active-dedup slot" in caplog.text
+
+
+async def test_normal_season_transition_still_raises_on_the_same_active_dedup_collision(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The tolerance is an OPT-IN scoped to eviction: a normal (non-eviction)
+    caller of ``season_request_service.set_status_if_in``
+    (``tolerate_active_conflict`` defaults to ``False``) must still see the
+    IDENTICAL parent-rollup collision as a hard failure -- proving the fix did
+    not weaken ``uq_media_requests_active``'s dedup guarantee for every other
+    season-transition call site, only eviction's."""
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=401, title="Another Old Show", seasons={1: None, 2: None}
+    )
+    async with sessionmaker_() as session:
+        session.add(
+            MediaRequest(
+                tmdb_id=401,
+                media_type=MediaType.tv,
+                title="Another Old Show",
+                status=RequestStatus.downloading,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == show_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        with pytest.raises(IntegrityError):
+            # Same collision as the tolerated test above, but WITHOUT the
+            # eviction-only opt-in -- must propagate, never be swallowed.
+            await season_request_service.set_status_if_in(
+                session,
+                media_request_id=show_id,
+                season_request_id=season_row.id,
+                status=RequestStatus.evicted.value,
+                allowed_from=frozenset({RequestStatus.available.value}),
+            )
+
+
+# --------------------------------------------------------------------------- #
 # Proactive sweep: no pressure gate
 # --------------------------------------------------------------------------- #
 
@@ -702,6 +913,155 @@ async def test_stops_once_the_target_is_reached(
 
 
 # --------------------------------------------------------------------------- #
+# R4-6 (ADR-0012): hardlink-aware freed-bytes accounting. A same-filesystem
+# import (``fs.hardlink_or_copy``) can leave the placed library file with
+# another hard link still present (the download client's own seed copy the
+# import never removes) -- deleting only the library path in that case
+# reclaims ~0 bytes. The eviction itself stays honest (the library copy IS
+# removed, status/history still flip to 'evicted'); only the freed-bytes
+# COUNT must reflect reality instead of the file's nominal size.
+# --------------------------------------------------------------------------- #
+
+
+async def test_hardlinked_movie_reports_zero_freed_bytes_but_still_evicts_honestly(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "Hardlinked.mkv", size=4096)
+    # A second directory entry pointing at the SAME inode -- simulating the
+    # download client's seed copy that hardlink_or_copy left behind at import.
+    seed_copy = tmp_path / "seed" / "Hardlinked.mkv"
+    seed_copy.parent.mkdir(parents=True)
+    os.link(library_path, seed_copy)
+    assert os.stat(library_path).st_nlink >= 2
+
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=500, title="Hardlinked", library_path=library_path
+    )
+    library = FakeLibrary(
+        watch_states={(500, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    # The library copy IS removed -- the eviction itself is still honest -- but
+    # the SEED copy (another hard link to the same inode) keeps the bytes
+    # allocated, so this reclaimed NOTHING.
+    assert [o.title for o in outcomes] == ["Hardlinked"]
+    assert outcomes[0].freed_bytes == 0
+    assert not Path(library_path).exists()
+    assert seed_copy.exists()  # the other link is untouched, and still holds the bytes
+    assert seed_copy.read_bytes() == b"0" * 4096
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        # Still flipped -- the LIBRARY no longer has it, regardless of what the
+        # freed-bytes accounting says.
+        assert row.status is RequestStatus.evicted
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 500)))
+            .scalars()
+            .all()
+        )
+    assert len(history) == 1
+    assert history[0].event_type is DownloadHistoryEvent.evicted
+
+
+async def test_single_link_movie_reports_its_full_size_as_freed_bytes(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "SingleLink.mkv", size=2048)
+    await _movie(sessionmaker_, tmdb_id=501, title="SingleLink", library_path=library_path)
+    library = FakeLibrary(
+        watch_states={(501, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert [o.title for o in outcomes] == ["SingleLink"]
+    assert outcomes[0].freed_bytes == 2048
+
+
+async def test_sweep_keeps_evicting_past_the_estimate_when_actual_freed_bytes_fall_short(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upfront (estimate-based) ``select_evictions`` projects the stalest
+    candidate alone ("HardlinkedBig") is enough to reach the target -- but it
+    actually frees ~0 bytes (hardlinked). The sweep must keep going, drawing
+    the NEXT stalest candidate, rather than stopping on a projection that never
+    actually happened -- the "keeps going until it actually reclaims enough"
+    half of R4-6."""
+    hardlinked_path = _movie_file(tmp_path, "HardlinkedBig (200b).mkv", size=200)
+    seed_copy = tmp_path / "seed" / "HardlinkedBig (200b).mkv"
+    seed_copy.parent.mkdir(parents=True)
+    os.link(hardlinked_path, seed_copy)
+    small_path = _movie_file(tmp_path, "Small (100b).mkv", size=100)
+    older_stale = _STALE - timedelta(days=5)  # the stalest -- picked FIRST
+    await _movie(
+        sessionmaker_, tmdb_id=502, title="HardlinkedBig (200b)", library_path=hardlinked_path
+    )
+    await _movie(sessionmaker_, tmdb_id=503, title="Small (100b)", library_path=small_path)
+
+    def _fake_disk_usage(_path: str) -> DiskUsage:
+        return DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=100)
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _fake_disk_usage)
+    library = FakeLibrary(
+        watch_states={
+            (502, "movie", None): WatchState(watched=True, last_viewed_at=older_stale),
+            (503, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=90.0,  # matches the faked used% (900/1000)
+            target_pct=70.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    # Before the fix: only HardlinkedBig would be evicted (the ESTIMATE alone
+    # projected 90-20=70<=70), leaving Small untouched despite HardlinkedBig
+    # having reclaimed nothing. After the fix: HardlinkedBig frees 0 bytes
+    # (hardlinked) -> the running total never reaches the target -> the sweep
+    # keeps going and also evicts Small.
+    assert [o.title for o in outcomes] == ["HardlinkedBig (200b)", "Small (100b)"]
+    assert outcomes[0].freed_bytes == 0
+    assert outcomes[1].freed_bytes == 100
+    assert not Path(hardlinked_path).exists()
+    assert not Path(small_path).exists()
+    assert seed_copy.exists()  # the other hard link survives, still holding the bytes
+
+
+# --------------------------------------------------------------------------- #
 # Non-blocking event loop (OP1): every blocking FS primitive this module calls
 # from an async function MUST run via ``asyncio.to_thread`` -- ``_size_bytes``
 # (candidate sizing), ``fs.delete`` (the actual eviction), and
@@ -721,8 +1081,9 @@ _MIN_TICKS_IF_OFFLOADED = 10  # ~0.3s / 0.01s tick, with generous scheduling sla
 class _SlowDeleteFileSystem:
     """A minimal :class:`~plex_manager.ports.filesystem.FileSystemPort` whose
     ``delete`` blocks synchronously for ``_SLOW_SECONDS`` (simulating a huge
-    ``shutil.rmtree``) -- every other method is unused by eviction and simply
-    never implemented."""
+    ``shutil.rmtree``) -- every other method except ``reclaimable_bytes`` (which
+    ``_evict_one`` now calls BEFORE every delete, see R4-6) is unused by
+    eviction and simply never implemented."""
 
     def __init__(self) -> None:
         self.deleted: list[str] = []
@@ -741,6 +1102,12 @@ class _SlowDeleteFileSystem:
 
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
+
+    def reclaimable_bytes(self, path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
 
     def delete(self, path: str) -> None:
         time.sleep(_SLOW_SECONDS)
@@ -1068,8 +1435,8 @@ class _PinsSecondCandidateOnFirstDeleteFs:
     commits ``keep_forever=True`` for a SECOND, not-yet-processed request via a
     genuinely separate session/connection on its FIRST call -- simulating an
     operator's pin landing MID-SWEEP, in the gap between two candidates'
-    deletes. Every other method is unused by eviction and simply never
-    implemented.
+    deletes. Every other method except ``reclaimable_bytes`` (called BEFORE
+    every delete, see R4-6) is unused by eviction and simply never implemented.
 
     The pin commit runs a real async DB write from a SYNCHRONOUS context
     (``delete`` executes off the event loop, inside ``asyncio.to_thread``): it
@@ -1107,6 +1474,12 @@ class _PinsSecondCandidateOnFirstDeleteFs:
 
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
+
+    def reclaimable_bytes(self, path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
 
     def delete(self, path: str) -> None:
         self._calls += 1
@@ -1233,6 +1606,12 @@ class _ConcurrentSecondEvictFs:
 
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
+
+    def reclaimable_bytes(self, path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
 
     def delete(self, path: str) -> None:
         self._calls += 1

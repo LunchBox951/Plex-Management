@@ -3216,7 +3216,7 @@
         ]
       },
       "put": {
-        "description": "Upsert the provided config and return the redacted result.\n\nA secret field whose incoming value is the redaction mask (``\"***\"``) is a\nno-op: GET returns ``\"***\"`` for a configured secret, so a FE that round-trips\nthe whole object back (e.g. after editing only ``plex_url``) must not clobber\nthe real credential with the mask \u2014 a silent secret-wipe that would only\nsurface later as an auth failure to the downstream service.",
+        "description": "Upsert the provided config and return the redacted result.\n\nA secret field whose incoming value is the redaction mask (``\"***\"``) is a\nno-op: GET returns ``\"***\"`` for a configured secret, so a FE that round-trips\nthe whole object back (e.g. after editing only ``plex_url``) must not clobber\nthe real credential with the mask \u2014 a silent secret-wipe that would only\nsurface later as an auth failure to the downstream service.\n\nThe disk-pressure pair is cross-checked against the EFFECTIVE (post-update)\nvalues, not just what this one request happens to carry: ``SettingsUpdate``'s\nown ``model_validator`` only catches a target above the threshold when BOTH\nare submitted together, but ``PUT`` is a PARTIAL update \u2014 sending just one\nside against an already-stored (and now-inverted) other side would otherwise\nsilently leave the whole threshold-to-target band unable to relieve pressure\n(see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).\nChecked, and rejected with the SAME 422 shape, BEFORE anything is written.",
         "operationId": "put_settings_endpoint_api_v1_settings_put",
         "requestBody": {
           "content": {

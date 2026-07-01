@@ -553,6 +553,50 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
     expect(screen.queryByRole('button', { name: /^grab/i })).not.toBeInTheDocument()
   })
 
+  it('pins the NEW request after "Request again", never the stale settled one it replaced', async () => {
+    // R4-5: the OLD request (id 7) is evicted AND was left pinned; it is what
+    // /requests still returns -- the poll has NOT yet caught up to the fresh
+    // re-request (mirrors G3's create-then-poll gap above, applied to the pin
+    // action instead of Grab). Before the fix, `pinRequestId` preferred
+    // `liveRequest?.id` unconditionally, so an immediate "Keep forever" toggle
+    // right after "Request again" would have pinned the OLD, now-off-disk
+    // request -- leaving the freshly re-grabbed copy unpinned (auto-evictable)
+    // despite the success toast.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ id: 7, status: 'evicted', keep_forever: true })] },
+    })
+    const created = movieRequest({ id: 9, status: 'pending', keep_forever: false })
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    const setKeepForeverMock = mutation(undefined)
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(setKeepForeverMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    // Before "Request again": the checkbox reflects the OLD (pinned) request.
+    expect(screen.getByRole('checkbox', { name: /keep forever/i })).toBeChecked()
+
+    fireEvent.click(screen.getByRole('button', { name: /request again/i }))
+
+    // The create resolves, requestId updates to 9 -- the pin target must follow
+    // it immediately, NOT wait for /requests to catch up: a fresh request
+    // always starts unpinned, so the checkbox flips to unchecked right away.
+    await waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: /keep forever/i })).not.toBeChecked(),
+    )
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /keep forever/i }))
+    await waitFor(() =>
+      expect(setKeepForeverMock.mutateAsync).toHaveBeenCalledWith({
+        requestId: 9,
+        keepForever: true,
+      }),
+    )
+    // Never targeted the stale, now-evicted request the operator just replaced.
+    expect(setKeepForeverMock.mutateAsync).not.toHaveBeenCalledWith(
+      expect.objectContaining({ requestId: 7 }),
+    )
+  })
+
   it('does not let a stale evicted row shadow a fresh re-request for the same title', () => {
     // Both an old evicted request AND a fresh one exist for this tmdb_id — the
     // fresh (non-settled) one must win, never the older evicted row (mirrors the

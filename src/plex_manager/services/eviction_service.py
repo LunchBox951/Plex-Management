@@ -380,6 +380,21 @@ async def _evict_one(
         )
         return None
 
+    # Hardlink-aware reclaimable-bytes measurement (R4-6, ADR-0012) -- MUST run
+    # BEFORE the delete below: a file's link count can only be read while the
+    # path still exists, and a same-filesystem import's hardlinked library copy
+    # (see ``fs.hardlink_or_copy``) genuinely frees NOTHING when only IT is
+    # removed (the download client's own seed copy keeps the inode alive). A
+    # measurement failure (mirrors ``_size_bytes``'s "unknown" fallback) counts
+    # as "nothing reclaimed" rather than aborting the eviction -- the delete
+    # below, not this accounting, is the authoritative, honest action. Offloaded
+    # for the same reason as every other blocking FS primitive in this module
+    # (a season directory walk is real, synchronous disk I/O).
+    try:
+        freed_bytes = await asyncio.to_thread(fs.reclaimable_bytes, library_path)
+    except OSError:
+        freed_bytes = 0
+
     try:
         # A whole directory tree (``shutil.rmtree``) or a large file -- real,
         # synchronous disk I/O -- so this ALWAYS runs off the event loop
@@ -418,12 +433,22 @@ async def _evict_one(
     # committed) and must skip the history/outcome entirely -- never a second
     # 'evicted' record for space that was only ever freed once.
     if isinstance(pending, _SeasonPending):
+        # tolerate_active_conflict=True: an OLD, already-settled parent (rollup
+        # 'available') can legitimately coexist with a NEWER active request for
+        # the same show (see season_request_service._recompute_parent's
+        # docstring) -- evicting one of the old parent's remaining seasons folds
+        # its rollup back to the active 'partially_available', which can collide
+        # with that newer row's slot in uq_media_requests_active. The season CAS
+        # just below (+ the history row/commit after it) is the source of truth
+        # for "the file is gone" and MUST survive that collision; only the
+        # coarser parent-rollup write is allowed to fail softly.
         changed = await season_request_service.set_status_if_in(
             session,
             media_request_id=pending.media_request_id,
             season_request_id=pending.season_request_id,
             status=RequestStatus.evicted.value,
             allowed_from=frozenset({RequestStatus.available.value}),
+            tolerate_active_conflict=True,
         )
     else:
         changed = await SqlRequestRepository(session).set_status_if_in(
@@ -489,7 +514,7 @@ async def _evict_one(
         title=candidate.title,
         season=candidate.season,
         library_path=library_path,
-        freed_bytes=pending.size_bytes,
+        freed_bytes=freed_bytes,
     )
 
 
@@ -554,15 +579,24 @@ async def run_eviction_sweep(
     ``threshold_pct`` used, even if eligible candidates exist; at/above it,
     stalest-``last_viewed_at``-first candidates are evicted down towards
     ``target_pct`` (:func:`~plex_manager.domain.eviction.select_evictions`).
+    That initial selection is only an ESTIMATE (built from each candidate's
+    walked-on-disk size, before anything is actually deleted); if the ACTUAL
+    (hardlink-aware, see :meth:`~plex_manager.ports.filesystem.FileSystemPort.
+    reclaimable_bytes`) bytes freed so far fall short of what the estimate
+    projected — same-filesystem hardlinked imports commonly reclaim far less
+    than their nominal size — this keeps drawing MORE candidates, in the SAME
+    stalest-first order, from beyond that initial cut until the real, running
+    freed total actually closes the gap to ``target_pct`` or every eligible
+    candidate is exhausted (R4-6, ADR-0012).
 
     Proactive (``proactive=True``, the opt-in ``eviction_proactive_enabled``
     setting): evicts EVERY past-grace, watched, un-pinned, not-in-flight
     candidate regardless of the root's current usage
     (:func:`~plex_manager.domain.eviction.rank_eviction_candidates` — no
-    pressure gate, no target-based early stop). A caller running BOTH modes for
-    the same root (pressure-triggered, then proactive) sees a naturally shrunk
-    candidate set the second time: anything the first pass already evicted no
-    longer reads ``available``.
+    pressure gate, no target-based early stop, so there is nothing to "extend"
+    beyond). A caller running BOTH modes for the same root (pressure-triggered,
+    then proactive) sees a naturally shrunk candidate set the second time:
+    anything the first pass already evicted no longer reads ``available``.
 
     An unreadable ``root_path`` (missing mount, permission denied) skips the
     WHOLE sweep for this root — logged, never a crash — since there is nothing
@@ -607,14 +641,24 @@ async def run_eviction_sweep(
     candidates = [candidate for candidate, _pending in pairs]
     grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
 
+    # The full stalest-first ranking, computed once: `select_evictions`'s result
+    # is always a PREFIX of this same ordering (it ranks internally via this
+    # exact function, then takes a prefix) -- so whatever it does NOT select is
+    # exactly the pool available to draw from below if the actual freed bytes
+    # come up short of the estimate.
+    ranked_all = rank_eviction_candidates(candidates, grace_cutoff)
     selected = (
-        rank_eviction_candidates(candidates, grace_cutoff)
+        ranked_all
         if proactive
         else select_evictions(candidates, disk_used_pct, threshold_pct, target_pct, grace_cutoff)
     )
+    extra_pool = [] if proactive else ranked_all[len(selected) :]
 
     outcomes: list[EvictionOutcome] = []
-    for candidate in selected:
+    freed_bytes_total = 0
+
+    async def _attempt(candidate: EvictionCandidate) -> None:
+        nonlocal freed_bytes_total
         try:
             outcome = await _evict_one(
                 session=session,
@@ -632,7 +676,26 @@ async def run_eviction_sweep(
             _logger.exception(
                 "eviction of %r failed unexpectedly; will retry next sweep", candidate.title
             )
-            continue
+            return
         if outcome is not None:
             outcomes.append(outcome)
+            if outcome.freed_bytes is not None:
+                freed_bytes_total += outcome.freed_bytes
+
+    for candidate in selected:
+        await _attempt(candidate)
+
+    # R4-6: the estimate-based selection above can under-deliver (a hardlinked
+    # candidate frees far less than its nominal size) -- keep going, stalest
+    # first, until the REAL running freed total actually reaches target_pct or
+    # every remaining eligible candidate has been tried. A no-op when the
+    # estimate matched reality (the common case): `extra_pool` is empty, or the
+    # very first check below already finds `projected <= target_pct`.
+    if extra_pool and disk.total_bytes > 0:
+        for candidate in extra_pool:
+            freed_pct = (freed_bytes_total / disk.total_bytes) * 100.0
+            if disk_used_pct - freed_pct <= target_pct:
+                break
+            await _attempt(candidate)
+
     return outcomes
