@@ -10,7 +10,10 @@ name: Container
 #               :edge        — moving, what the canary (beta) fleet tracks
 #               :edge-<sha>  — immutable, the handle promote.yml consumes
 #             This is the ONLY job granted packages: write, and it never runs on
-#             a pull request.
+#             a pull request or the schedule.
+#   rescan  — on a daily schedule: re-scan the existing :edge (read-only pull,
+#             packages: read) and re-upload the SARIF so the board stays fresh
+#             between merges, WITHOUT carrying the publisher's write token.
 # Releases are NOT built here — they are promoted (re-tagged by digest) from a
 # validated edge image by promote.yml, so the stable fleet runs identical bytes.
 # See ADR-0004.
@@ -19,8 +22,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Daily re-scan of :edge (via the read-only `rescan` job) so the Security
+    # board stays fresh BETWEEN merges: an OS CVE currently suppressed by
+    # ignore-unfixed re-surfaces the day Debian (or Trivy's DB) gains a fixed
+    # version. Without this a suppressed finding would stay invisible until some
+    # unrelated merge rebuilt and rescanned the image.
+    - cron: "17 6 * * *"
 
-# Least privilege by default; the publish job opts into more (below).
+# Least privilege by default; the publish/rescan jobs opt into more (below).
 permissions:
   contents: read
 
@@ -75,7 +85,8 @@ jobs:
 
   # Publish on merge to main: build + push, then scan by digest and upload the
   # SARIF to the Security tab. Only this job carries packages: write, and it is
-  # gated to push events so a pull-request run can never obtain registry write.
+  # gated to push events so neither a pull request nor the schedule can obtain
+  # registry write.
   publish:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -121,17 +132,83 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan image (Trivy — SARIF to the Security tab)
+      - name: Scan the published image (Trivy — SARIF to the Security tab)
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          # Trivy owns the OS layer here: scan ONLY OS packages (pkg-types=os) and
+          # drop the ones with no upstream fix (perl-base, glibc, util-linux,
+          # ncurses: Essential Debian packages this app never invokes and cannot
+          # remove). Library (pip) CVEs are deliberately NOT in scope here — they
+          # are owned by the required `dependency-audit` (pip-audit) job +
+          # Dependabot, which surface them (fixed AND unfixed) at the source; the
+          # runtime image ships only the Python venv. So ignore-unfixed can never
+          # hide a library CVE. Both the modern (pkg-types) and legacy (vuln-type)
+          # env names are set so the scope holds across Trivy versions. Cutting the
+          # OS CVE surface for real (a low-CVE base) is tracked as ADR follow-up #18.
+          TRIVY_PKG_TYPES: os
+          TRIVY_VULN_TYPE: os
+          TRIVY_IGNORE_UNFIXED: "true"
         with:
-          # The image is in the registry now; scan it by digest.
+          # Scan the exact bytes just published (by digest).
           image-ref: ${{ format('{0}@{1}', steps.img.outputs.name, steps.build.outputs.digest) }}
           format: sarif
           output: trivy-results.sarif
           severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
           exit-code: "0"
 
-      - name: Upload Trivy results
+      # One upload, no explicit category: continues the auto-derived category the
+      # old single step used, so the pre-existing Trivy alerts are updated and the
+      # no-upstream-fix OS ones are CLOSED (not orphaned under a new category).
+      - name: Upload Trivy results (SARIF to the Security tab)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+  # Scheduled daily rescan of the current :edge image so the Security board stays
+  # fresh between merges (see the `schedule:` trigger comment). Read-only: a
+  # registry PULL needs only packages: read, and this path must NOT carry the
+  # publisher's packages: write — it runs third-party scanner actions after a
+  # registry login, and a compromised/buggy action must not be able to overwrite
+  # GHCR tags. Mirrors publish's single scan + single uncategorized upload.
+  rescan:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve lowercase image name
+        id: img
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR (read-only pull)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rescan :edge (Trivy — SARIF to the Security tab)
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          # OS-only scan, ignore-unfixed (see the publish scan for the rationale:
+          # library CVEs are owned by pip-audit + Dependabot, not this image scan).
+          TRIVY_PKG_TYPES: os
+          TRIVY_VULN_TYPE: os
+          TRIVY_IGNORE_UNFIXED: "true"
+        with:
+          image-ref: ${{ steps.img.outputs.name }}:edge
+          format: sarif
+          output: trivy-results.sarif
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"
+
+      - name: Upload Trivy results (SARIF to the Security tab)
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
