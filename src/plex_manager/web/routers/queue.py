@@ -16,7 +16,13 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.services import grab_service, import_service, queue_service, request_service
+from plex_manager.services import (
+    grab_service,
+    import_service,
+    queue_service,
+    request_service,
+    season_request_service,
+)
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
@@ -142,10 +148,27 @@ async def grab_endpoint(
         # does not linger as 'downloading'/'searching' with nothing in flight.
         # BUT only when nothing is actually in flight: a re-search for a request
         # that ALREADY has an active download must not flip it to a dead-end status
-        # while that download is still running. Leave such a request untouched.
-        active = await SqlDownloadRepository(session).find_active_for_request(request.id)
+        # while that download is still running. Leave such a request untouched. The
+        # active check is season-SCOPED for a TV grab (body.season): another season
+        # still downloading must not suppress THIS season's honest dead-end, and a
+        # movie (season=None) keeps its whole-request guard unchanged.
+        active = await SqlDownloadRepository(session).find_active_for_request(
+            request.id, season=body.season
+        )
         if active is None:
-            await request_service.mark_no_acceptable_release(session, request.id)
+            if body.season is not None:
+                # TV: record the dead-end on the SEASON so it is visible + retryable
+                # per season, and let the parent MediaRequest.status stay a computed
+                # rollup (never a direct write _recompute_parent would clobber). The
+                # season service is FLUSH-ONLY by contract, so this caller owns the
+                # commit boundary (request_service.mark_no_acceptable_release, the
+                # movie path, commits internally instead).
+                await season_request_service.mark_no_acceptable_release(
+                    session, media_request_id=request.id, season_number=body.season
+                )
+                await session.commit()
+            else:
+                await request_service.mark_no_acceptable_release(session, request.id)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)

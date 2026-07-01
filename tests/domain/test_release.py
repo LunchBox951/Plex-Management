@@ -49,9 +49,7 @@ def test_parsed_release_episode_single() -> None:
 
 
 def test_parsed_release_episode_multi() -> None:
-    parsed = ParsedRelease(
-        raw_title="Show.S02E05E06", clean_title="Show", season=2, episode=[5, 6]
-    )
+    parsed = ParsedRelease(raw_title="Show.S02E05E06", clean_title="Show", season=2, episode=[5, 6])
     assert parsed.episode == [5, 6]
 
 

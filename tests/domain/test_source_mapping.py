@@ -30,7 +30,7 @@ from plex_manager.domain.quality import (
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.source_mapping import (
-    _coerce_episode,
+    _coerce_episode,  # pyright: ignore[reportPrivateUsage]
     map_modifier,
     map_source,
     resolve_quality,

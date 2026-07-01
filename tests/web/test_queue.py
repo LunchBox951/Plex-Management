@@ -232,6 +232,58 @@ async def test_grab_no_acceptable_release_marks_request(
     assert request.status.value == "no_acceptable_release"
 
 
+async def test_grab_no_acceptable_release_marks_the_season_not_the_show(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A TV grab that finds nothing acceptable records the dead-end on the SEASON
+    (a visible, retryable SeasonRequest.no_acceptable_release), while the parent
+    MediaRequest.status stays a computed rollup — never a direct write. The season
+    service is flush-only, so the endpoint owns the commit; without it the season
+    write would be silently rolled back."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={901: TvMetadata(tmdb_id=901, title="Dead End Show", year=2021, season_count=3)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 901, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = int(created.json()["id"])
+
+    # Only prerelease/CAM-grade candidates come back, so nothing is acceptable.
+    override_adapters(
+        app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=FakeQbittorrent()
+    )
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_acceptable_release"
+
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        ).scalar_one()
+        # The SEASON carries the honest dead-end (committed, not rolled back).
+        assert season.status.value == "no_acceptable_release"
+        # And the parent rolls up to match (single requested season).
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status.value == "no_acceptable_release"
+
+
 async def test_grab_recovers_from_concurrent_insert_conflict(
     app: FastAPI,
     client: httpx.AsyncClient,

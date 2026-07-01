@@ -7,7 +7,7 @@ from pathlib import PurePosixPath
 import pytest
 
 from plex_manager.domain.naming import (
-    _episode_token,
+    _episode_token,  # pyright: ignore[reportPrivateUsage]
     clean_title,
     plex_movie_relative_path,
     plex_tv_episode_relative_path,
