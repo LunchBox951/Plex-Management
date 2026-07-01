@@ -1560,6 +1560,7 @@ export interface operations {
         parameters: {
             query?: {
                 tmdb_id?: number | null;
+                media_type?: string | null;
             };
             header?: never;
             path?: never;

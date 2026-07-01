@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.models import Blocklist, BlocklistReason
+from plex_manager.models import Blocklist, BlocklistReason, MediaType
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -16,13 +16,16 @@ _API_KEY = "blocklist-key"
 _HEADERS = {"X-Api-Key": _API_KEY}
 
 
-async def _insert(sm: SessionMaker, *, source_title: str, tmdb_id: int) -> int:
+async def _insert(
+    sm: SessionMaker, *, source_title: str, tmdb_id: int, media_type: MediaType | None = None
+) -> int:
     async with sm() as session:
         row = Blocklist(
             source_title=source_title,
             reason=BlocklistReason.failed,
             tmdb_id=tmdb_id,
             torrent_hash=None,
+            media_type=media_type,
         )
         session.add(row)
         await session.commit()
@@ -43,6 +46,23 @@ async def test_list_and_scope_by_tmdb_id(
         await client.get("/api/v1/blocklist", params={"tmdb_id": 1}, headers=_HEADERS)
     ).json()["entries"]
     assert [e["source_title"] for e in scoped] == ["A"]
+
+
+async def test_list_can_scope_by_tmdb_id_and_media_type(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _insert(sessionmaker_, source_title="Movie", tmdb_id=424242, media_type=MediaType.movie)
+    await _insert(sessionmaker_, source_title="Show", tmdb_id=424242, media_type=MediaType.tv)
+
+    scoped = (
+        await client.get(
+            "/api/v1/blocklist",
+            params={"tmdb_id": 424242, "media_type": "tv"},
+            headers=_HEADERS,
+        )
+    ).json()["entries"]
+    assert [e["source_title"] for e in scoped] == ["Show"]
 
 
 async def test_delete_removes_entry_then_404(

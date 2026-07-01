@@ -71,6 +71,18 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _media_type_for_blocklist(
+    record: DownloadRecord | None, request_media_type: str | None
+) -> str | None:
+    if request_media_type is not None:
+        return request_media_type
+    if record is None:
+        return None
+    if record.media_type is not None:
+        return record.media_type
+    return "tv" if record.season is not None else "movie"
+
+
 async def _source_title_for(session: AsyncSession, torrent_hash: str) -> str | None:
     """Best-effort original release title from the download history (for blocklist)."""
     stmt = (
@@ -114,18 +126,25 @@ async def _handle_failed(
         (r for r in rows if r.torrent_hash.lower() == event.torrent_hash.lower()),
         None,
     )
+    request = (
+        await request_repo.get(record.media_request_id)
+        if record is not None and record.media_request_id is not None
+        else None
+    )
     source_title = await _source_title_for(session, event.torrent_hash) or event.source_title
     indexer = await _indexer_for(session, event.torrent_hash)
     await blocklist_repo.create(
         source_title=source_title,
         reason=BlocklistReason.failed.value,
-        tmdb_id=event.tmdb_id,
+        tmdb_id=request.tmdb_id if request is not None else event.tmdb_id,
         torrent_hash=event.torrent_hash,
         indexer=indexer,
         # Scope by media namespace so this entry can't reject a movie/show that
-        # happens to share the tmdb id. A TV download is always season-scoped, so a
-        # non-NULL season identifies it as tv (else movie).
-        media_type="tv" if record is not None and record.season is not None else "movie",
+        # happens to share the tmdb id. Prefer the owning request; fall back to the
+        # persisted download metadata or season scope for orphan rows.
+        media_type=_media_type_for_blocklist(
+            record, request.media_type if request is not None else None
+        ),
     )
     if record is not None and record.media_request_id is not None:
         if record.season is not None:
@@ -269,14 +288,23 @@ async def mark_failed(
     if blocklist:
         source_title = await _source_title_for(session, row.torrent_hash) or row.torrent_hash
         indexer = await _indexer_for(session, row.torrent_hash)
+        request = (
+            await SqlRequestRepository(session).get(row.media_request_id)
+            if row.media_request_id is not None
+            else None
+        )
         await SqlBlocklistRepository(session).create(
             source_title=source_title,
             reason=BlocklistReason.user_reported.value,
-            tmdb_id=row.tmdb_id,
+            tmdb_id=request.tmdb_id if request is not None else row.tmdb_id,
             torrent_hash=row.torrent_hash,
             indexer=indexer,
-            # Scope by media namespace (see _handle_failed) — season present => tv.
-            media_type="tv" if row.season is not None else "movie",
+            # Scope by media namespace (see _handle_failed). Prefer the owning
+            # request; fall back to the persisted download metadata or season scope.
+            media_type=_media_type_for_blocklist(
+                await download_repo.get_by_hash(row.torrent_hash),
+                request.media_type if request is not None else None,
+            ),
         )
 
     # Re-arm the owning request unconditionally — the blocklist flag governs ONLY

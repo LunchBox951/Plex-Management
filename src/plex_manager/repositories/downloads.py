@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
 
-from plex_manager.models import Download
+from plex_manager.models import Download, MediaType
 from plex_manager.ports.repositories import DownloadRecord
 
 if TYPE_CHECKING:
@@ -56,6 +56,7 @@ def _to_record(row: Download) -> DownloadRecord:
         year=row.year,
         season=row.season,
         episodes=row.episodes_json,
+        media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
         download_path=row.download_path,
@@ -114,6 +115,7 @@ class SqlDownloadRepository:
         year: int | None = None,
         season: int | None = None,
         episodes: list[int] | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -124,6 +126,7 @@ class SqlDownloadRepository:
             year=year,
             season=season,
             episodes_json=episodes,
+            media_type=MediaType(media_type) if media_type is not None else None,
         )
         self._session.add(row)
         await self._session.flush()
@@ -144,9 +147,13 @@ class SqlDownloadRepository:
         clear_failed_reason: bool = False,
         clear_download_path: bool = False,
         media_request_id: int | None = None,
+        replace_grab_metadata: bool = False,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
         season: int | None = None,
         episodes: list[int] | None = None,
-        set_scope: bool = False,
+        media_type: str | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -160,18 +167,17 @@ class SqlDownloadRepository:
             # Re-own a reused (terminal) row: a fresh grab from a different request
             # must point the row at the CURRENT request, not the stale prior owner.
             row.media_request_id = media_request_id
-        if set_scope:
-            # Rewrite the TV scope UNCONDITIONALLY (not an ``is not None`` gate):
-            # grab_service's terminal-row reuse opts in via this flag so a
-            # re-selected torrent's season/episodes reflect the CURRENT grab, not
-            # whatever it was created with -- otherwise the queue/importer would
-            # operate on stale episodes while the newly requested season shows
-            # downloading. Unconditional so a movie reuse correctly CLEARS a
-            # stale season/episodes back to ``None`` too. Every other caller
-            # (import/refresh/block) leaves this default False and never touches
-            # scope.
+        if replace_grab_metadata:
+            # Rewrite grab metadata UNCONDITIONALLY (not ``is not None`` gates):
+            # terminal-row reuse must reflect the CURRENT grab, not stale
+            # magnet/title/season/episode/media-type scope from the previous owner.
+            # This also lets a movie reuse clear stale TV scope back to NULL.
+            row.magnet_link = magnet_link
+            row.tmdb_id = tmdb_id
+            row.year = year
             row.season = season
             row.episodes_json = episodes
+            row.media_type = MediaType(media_type) if media_type is not None else None
         if clear_failed_reason:
             # A terminal row being reused for a fresh grab must not carry a stale
             # failure reason (honesty over silence: a Downloading row claiming a

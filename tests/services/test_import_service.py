@@ -530,6 +530,80 @@ async def test_import_movies_root_unset_is_an_honest_retryable_block(
     assert request is not None and request.status is RequestStatus.import_blocked
 
 
+async def test_import_rejects_content_path_outside_qbittorrent_save_path(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """qBittorrent-reported content_path is client data, not an authority to read
+    arbitrary local files. It must stay under the torrent save_path."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    save_path = tmp_path / "downloads" / "intended"
+    save_path.mkdir(parents=True)
+    outside = tmp_path / "outside" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(outside)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=outside.name,
+                raw_state="stalledUP",
+                save_path=str(save_path),
+                content_path=str(outside),
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "outside download save path" in record.failed_reason
+    assert not any(movies_root.iterdir())
+
+
+async def test_import_rejects_traversing_qbittorrent_name(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """When qBittorrent omits content_path, save_path + name must not be allowed to
+    escape through '..' or an absolute torrent name."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    save_path = tmp_path / "downloads" / "intended"
+    save_path.mkdir(parents=True)
+    outside = tmp_path / "downloads" / "outside" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(outside)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="../outside/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv",
+                raw_state="stalledUP",
+                save_path=str(save_path),
+                content_path=None,
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "outside download save path" in record.failed_reason
+    assert not any(movies_root.iterdir())
+
+
 async def test_import_is_idempotent_on_an_already_imported_row(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

@@ -100,6 +100,10 @@ class _NoVideoError(Exception):
     """No importable video file was found under the resolved content path."""
 
 
+class _UnsafeContentPathError(Exception):
+    """The download client reported a content path outside its save path."""
+
+
 def _is_within(root_real: str, candidate_real: str) -> bool:
     """True if ``candidate_real`` is ``root_real`` or sits under it (both realpaths).
 
@@ -108,6 +112,14 @@ def _is_within(root_real: str, candidate_real: str) -> bool:
     reach into a specific ``FileSystemPort`` implementation's internals).
     """
     return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
+
+
+def _ensure_under_save_path(save_path: str, candidate: str) -> str:
+    root_real = os.path.realpath(save_path)
+    candidate_real = os.path.realpath(candidate)
+    if not _is_within(root_real, candidate_real):
+        raise _UnsafeContentPathError("download content path is outside download save path")
+    return candidate
 
 
 def _resolve_content(status: DownloadStatus | None, download_path: str | None) -> str | None:
@@ -119,11 +131,17 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
     used — it can hold other torrents' files, which would scan the wrong tree.
     """
     if status is not None and status.content_path:
+        if status.save_path:
+            return _ensure_under_save_path(status.save_path, status.content_path)
         return status.content_path
     if download_path:
         return download_path
     if status is not None and status.save_path and status.name:
-        return os.path.join(status.save_path, status.name)
+        if os.path.isabs(status.name):
+            raise _UnsafeContentPathError("download content path is outside download save path")
+        return _ensure_under_save_path(
+            status.save_path, os.path.join(status.save_path, status.name)
+        )
     return None
 
 
@@ -460,7 +478,11 @@ async def _import_download_locked(
 
     # Locate the completed video file on disk.
     status = await qbt.get_status(row.torrent_hash)
-    content = _resolve_content(status, row.download_path)
+    try:
+        content = _resolve_content(status, row.download_path)
+    except _UnsafeContentPathError as exc:
+        await _block(session, download_repo, download_id, str(exc), request_id=request.id)
+        return await download_repo.get_by_hash(torrent_hash)
     if content is None:
         await _block(
             session,
