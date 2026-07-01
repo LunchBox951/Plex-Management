@@ -8,7 +8,6 @@ stays unauthenticated and outside the setup guard.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -196,8 +195,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         yield
     finally:
         reconcile_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await reconcile_task
+        # Await the cancelled task so its cleanup runs; return_exceptions=True
+        # absorbs the expected CancelledError without re-raising on shutdown.
+        await asyncio.gather(reconcile_task, return_exceptions=True)
         await app.state.http_client.aclose()
 
 

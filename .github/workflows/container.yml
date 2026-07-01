@@ -129,6 +129,16 @@ jobs:
           format: sarif
           output: trivy-results.sarif
           severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          # The persistent Security board tracks ACTIONABLE findings only:
+          # ignore-unfixed drops base-OS CVEs that have no upstream fix yet
+          # (perl-base, glibc, util-linux, ncurses — all Essential Debian
+          # packages this Python app never invokes and cannot remove). The PR
+          # `build` job still prints the complete, unfiltered tally to its log,
+          # so nothing is hidden where it is actionable — honesty over silence.
+          # A fixable CVE (or a fix landing upstream) re-surfaces on the board
+          # instantly. Shrinking the base-image CVE surface for real (a low-CVE
+          # base) is tracked separately as an ADR follow-up.
+          ignore-unfixed: true
           exit-code: "0"
 
       - name: Upload Trivy results
