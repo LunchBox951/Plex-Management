@@ -310,8 +310,11 @@ async def create_request(
         # Dedup the available short-circuit: if this movie is already recorded as
         # in-library, return that row rather than accumulating duplicate 'available'
         # rows (the active-dedup partial index excludes terminal statuses, so it
-        # would not catch this). A movie REMOVED from Plex reads not-available above
-        # and falls through to a normal pending request, so re-requests still work.
+        # would not catch this). Acquire a per-media DB lock first so PostgreSQL MVCC
+        # cannot let two concurrent transactions both miss each other's uncommitted
+        # terminal row. A movie REMOVED from Plex reads not-available above and falls
+        # through to a normal pending request, so re-requests still work.
+        await repo.acquire_media_lock(tmdb_id, media_type)
         in_library = await repo.find_in_library(tmdb_id, media_type)
         if in_library is not None:
             return in_library

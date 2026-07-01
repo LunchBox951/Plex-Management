@@ -104,6 +104,32 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
     assert response.json()["ok"] is False
 
 
+async def test_validate_prowlarr_rejects_non_json_status_200(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    await _use_transport(app, lambda _r: httpx.Response(200, text="<h1>not prowlarr</h1>"))
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://prowlarr.local", "api_key": "pk"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Unexpected response from Prowlarr."
+
+
+async def test_validate_prowlarr_rejects_status_200_without_version(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    await _use_transport(app, lambda _r: httpx.Response(200, json={"appName": "not-prowlarr"}))
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://prowlarr.local", "api_key": "pk"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Unexpected response from Prowlarr."
+
+
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(
     client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
 ) -> None:

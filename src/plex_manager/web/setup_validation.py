@@ -13,7 +13,7 @@ issued with the credential carried in a header (never in a logged URL).
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import httpx
 
@@ -148,6 +148,27 @@ async def validate_prowlarr(
             ok=False, message="Could not reach Prowlarr.", detail=str(exc)
         )
     if response.status_code == _HTTP_OK:
+        try:
+            payload_obj = cast(object, response.json())
+        except ValueError:
+            return ServiceValidateResponse(
+                ok=False,
+                message="Unexpected response from Prowlarr.",
+                detail="status endpoint did not return JSON",
+            )
+        if not isinstance(payload_obj, dict):
+            return ServiceValidateResponse(
+                ok=False,
+                message="Unexpected response from Prowlarr.",
+                detail="status endpoint did not look like Prowlarr",
+            )
+        payload = cast(dict[str, object], payload_obj)
+        if not isinstance(payload.get("version"), str):
+            return ServiceValidateResponse(
+                ok=False,
+                message="Unexpected response from Prowlarr.",
+                detail="status endpoint did not look like Prowlarr",
+            )
         return ServiceValidateResponse(ok=True, message="Connected to Prowlarr.")
     if response.status_code in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
         return ServiceValidateResponse(

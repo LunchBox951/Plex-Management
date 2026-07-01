@@ -1,12 +1,13 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Eleven tables back the alpha + beta pipeline: ``users``, ``settings``,
-``system_settings``, ``audit_log``, ``media_requests``, ``season_requests``,
-``downloads``, ``download_history``, ``blocklist``, ``tmdb_cache``,
-``log_events``. Column shapes, indexes, and ``ON DELETE`` behaviour follow the
-persistence design (see the analysis extract's "Persistence + Schema Migrations"
-section, ADR-0007, and — for ``log_events``/``library_path``/``keep_forever``/the
-``evicted`` status — ADR-0012).
+Twelve tables back the alpha + beta pipeline: ``users``, ``settings``,
+``system_settings``, ``audit_log``, ``media_requests``, ``request_dedup_locks``,
+``season_requests``, ``downloads``, ``download_history``, ``blocklist``,
+``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
+behaviour follow the persistence design (see the analysis extract's
+"Persistence + Schema Migrations" section, ADR-0007, and — for
+``log_events``/``library_path``/``keep_forever``/the ``evicted`` status —
+ADR-0012).
 
 Conventions:
 
@@ -44,6 +45,7 @@ __all__ = [
     "LogEvent",
     "MediaRequest",
     "MediaType",
+    "RequestDedupLock",
     "RequestStatus",
     "SeasonRequest",
     "Setting",
@@ -299,6 +301,21 @@ class MediaRequest(Base):
     # ``SeasonRequest``, but the pin itself lives on the parent show, so pinning a
     # series protects every one of its seasons.
     keep_forever: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+
+
+class RequestDedupLock(Base):
+    """Serializable lock row for per-media request decisions.
+
+    PostgreSQL's MVCC can let two concurrent transactions both miss an uncommitted
+    terminal ``available`` row. The active partial unique index intentionally
+    excludes ``available``, so in-library short-circuits need a separate row to lock
+    before checking/inserting terminal request records.
+    """
+
+    __tablename__ = "request_dedup_locks"
+
+    tmdb_id: Mapped[int] = mapped_column(primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType), primary_key=True)
 
 
 class SeasonRequest(Base):

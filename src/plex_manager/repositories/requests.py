@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from plex_manager.models import MediaRequest, MediaType, RequestStatus
+from plex_manager.models import MediaRequest, MediaType, RequestDedupLock, RequestStatus
 from plex_manager.ports.repositories import RequestRecord
 
 if TYPE_CHECKING:
@@ -114,6 +116,38 @@ class SqlRequestRepository:
         )
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
+
+    async def acquire_media_lock(self, tmdb_id: int, media_type: str) -> None:
+        """Serialize create-request decisions for one ``(tmdb_id, media_type)``.
+
+        The active unique index protects in-flight statuses, but terminal
+        ``available`` rows are intentionally excluded. A short-circuit that records a
+        movie already present in Plex must lock this stable per-media row before it
+        checks for an existing terminal row or creates a new one.
+        """
+        media = MediaType(media_type)
+        values = {"tmdb_id": tmdb_id, "media_type": media}
+        dialect_name = self._session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            await self._session.execute(
+                pg_insert(RequestDedupLock)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=["tmdb_id", "media_type"])
+            )
+        elif dialect_name == "sqlite":
+            await self._session.execute(
+                sqlite_insert(RequestDedupLock)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=["tmdb_id", "media_type"])
+            )
+        else:  # pragma: no cover - SQLite and PostgreSQL are the supported backends.
+            await self._session.execute(insert(RequestDedupLock).values(**values))
+        stmt = (
+            select(RequestDedupLock)
+            .where(RequestDedupLock.tmdb_id == tmdb_id, RequestDedupLock.media_type == media)
+            .with_for_update()
+        )
+        await self._session.execute(stmt)
 
     async def find_earliest_available(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return the OLDEST ``available`` request for this media (lowest id), or None.

@@ -11,6 +11,8 @@ const h = vi.hoisted(() => ({
   settingsData: null as SettingsResponse | null,
   libraries: [] as PlexLibraryOption[],
   toast: vi.fn(),
+  librariesError: null as Error | null,
+  librariesRefetch: vi.fn(),
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -22,7 +24,12 @@ vi.mock('../api/hooks', () => ({
     refetch: vi.fn(),
   }),
   useUpdateSettings: () => ({ mutateAsync: h.mutateAsync, isPending: false }),
-  usePlexLibraries: () => ({ data: h.libraries }),
+  usePlexLibraries: () => ({
+    data: h.libraries,
+    isError: h.librariesError !== null,
+    error: h.librariesError,
+    refetch: h.librariesRefetch,
+  }),
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -53,6 +60,9 @@ describe('Settings — movies_root save payload (G2)', () => {
     h.libraries = [
       { path: '/old-plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
     ]
+    h.librariesError = null
+    h.librariesRefetch.mockReset()
+    h.toast.mockReset()
   })
 
   it('clears movies_root when the Plex URL changes and no folder is re-picked', async () => {
@@ -99,6 +109,20 @@ describe('Settings — movies_root save payload (G2)', () => {
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().movies_root).toBe('')
+  })
+
+  it('shows Plex library picker failures instead of silently falling back to a manual path', () => {
+    h.libraries = []
+    h.librariesError = new Error('Plex unavailable')
+
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByText("Couldn't load Plex libraries")).toBeInTheDocument()
+    expect(screen.getByText('Plex unavailable')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('/old-plex/movies')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    expect(h.librariesRefetch).toHaveBeenCalledTimes(1)
   })
 })
 
