@@ -9,6 +9,7 @@ real bytes.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from sqlalchemy import select
@@ -30,7 +31,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import queue_service
+from plex_manager.services import import_service, queue_service
 from plex_manager.services.import_service import (
     import_download,
     run_availability_cycle,
@@ -184,6 +185,18 @@ class _LosingRaceFs(LocalFileSystem):
         raise FileExistsError(str(dst))
 
 
+class _WrongSameSizeFs(LocalFileSystem):
+    """Loses placement to a same-size but different file."""
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        size = os.path.getsize(src)
+        with dst.open("wb") as handle:
+            handle.seek(size - 1)
+            handle.write(b"x")
+        raise FileExistsError(str(dst))
+
+
 async def _import_with_fs(
     sessionmaker_: SessionMaker,
     download_id: int,
@@ -313,6 +326,39 @@ async def test_import_idempotent_when_placement_race_lost_to_same_size(
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.completed
+
+
+async def test_import_blocks_when_placement_race_lost_to_same_size_different_content(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        _WrongSameSizeFs(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "different content" in record.failed_reason
+    assert library.scanned == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
 
 
 async def test_import_blocks_when_placement_race_lost_to_different_size(
@@ -495,6 +541,28 @@ async def test_import_rejects_traversing_qbittorrent_name(
     assert record.failed_reason is not None
     assert "outside download save path" in record.failed_reason
     assert not any(movies_root.iterdir())
+
+
+def test_resolve_content_prefers_live_save_path_name_over_library_breadcrumb(
+    tmp_path: Path,
+) -> None:
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    live_release = downloads / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    stale_library_file = tmp_path / "library" / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    status = DownloadStatus(
+        info_hash=_HASH,
+        name=live_release.name,
+        raw_state="stalledUP",
+        save_path=str(downloads),
+        content_path=None,
+    )
+
+    resolved = import_service._resolve_content(  # pyright: ignore[reportPrivateUsage]
+        status, str(stale_library_file)
+    )
+
+    assert resolved == str(live_release)
 
 
 async def test_import_is_idempotent_on_an_already_imported_row(

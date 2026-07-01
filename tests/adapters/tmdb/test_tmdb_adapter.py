@@ -181,6 +181,11 @@ async def test_search_returns_movie_and_tv_rows_only() -> None:
     assert tv.year == 2011
 
 
+async def test_search_year_filters_mixed_year_results() -> None:
+    results = await _adapter().search("inception", year=2010)
+    assert [(r.tmdb_id, r.media_type, r.year) for r in results] == [(27205, "movie", 2010)]
+
+
 async def test_get_movie_maps_imdb_and_year() -> None:
     movie = await _adapter().get_movie(27205)
     assert movie is not None

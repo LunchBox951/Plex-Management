@@ -278,3 +278,40 @@ async def test_reconcile_applies_completed_and_keeps_client_missing_within_grace
     by_id = {item.id: item.status for item in queue}
     assert by_id[completed_id] == "import_pending"
     assert by_id[missing_id] == "client_missing"
+
+
+async def test_reconcile_transition_does_not_overwrite_concurrent_status_change(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Reconcile snapshots active rows, then awaits qBittorrent. A status committed
+    during that await must win over the stale transition computed from the old row."""
+    async with sessionmaker_() as session:
+        download = Download(torrent_hash=_HASH, status="downloading", tmdb_id=603)
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+
+    class _ConcurrentChangeQbt(FakeQbittorrent):
+        async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+            async with sessionmaker_() as session:
+                row = await session.get(Download, download_id)
+                assert row is not None
+                row.status = "failed"
+                await session.commit()
+            return [
+                DownloadStatus(
+                    info_hash=_HASH,
+                    name="Some.Movie",
+                    raw_state="stoppedUP",
+                    progress=1.0,
+                    ratio=1.0,
+                )
+            ]
+
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(_ConcurrentChangeQbt(), session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status == "failed"

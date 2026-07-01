@@ -150,6 +150,7 @@ function QueueCard({
 }) {
   const presentation = downloadStatus(item.status)
   const isDownloadingLike = presentation.intent === 'downloading'
+  const canMarkFailed = item.status !== 'importing'
   const pct = Math.round(Math.min(1, Math.max(0, item.progress ?? 0)) * 100)
   const shortHash = item.torrent_hash.slice(0, 12)
   const detail = isDownloadingLike ? `${pct}%` : undefined
@@ -164,24 +165,26 @@ function QueueCard({
             seed {(item.seed_ratio ?? 0).toFixed(2)}
           </span>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            variant="danger"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onAction(item, false)}
-          >
-            Mark failed
-          </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onAction(item, true)}
-          >
-            Blocklist &amp; fail
-          </Button>
-        </div>
+        {canMarkFailed ? (
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onAction(item, false)}
+            >
+              Mark failed
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onAction(item, true)}
+            >
+              Blocklist &amp; fail
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       {isDownloadingLike ? (

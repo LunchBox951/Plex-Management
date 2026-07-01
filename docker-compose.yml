@@ -13,14 +13,18 @@ services:
     container_name: plex-manager
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Keep the in-container app and healthcheck on 8000. Use
+      # PLEX_MANAGER_HOST_PORT below to choose the host-facing port.
+      PLEX_MANAGER_PORT: "8000"
     ports:
-      - "${PLEX_MANAGER_PORT:-8000}:8000"
+      - "${PLEX_MANAGER_HOST_PORT:-8000}:8000"
     volumes:
       # Config + database persist across updates and rollbacks.
       - plex-manager-data:/app/data
-      # In v1, media + download paths are mounted here and selected in the wizard:
-      # - /srv/media:/media
-      # - /srv/downloads:/downloads
+      # Required: paths selected in setup must be visible inside the container.
+      - ${PLEX_MANAGER_MEDIA_ROOT:?set PLEX_MANAGER_MEDIA_ROOT in .env}:/media
+      - ${PLEX_MANAGER_DOWNLOADS_ROOT:?set PLEX_MANAGER_DOWNLOADS_ROOT in .env}:/downloads
 
 volumes:
   plex-manager-data:

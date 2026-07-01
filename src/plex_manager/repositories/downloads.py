@@ -191,6 +191,10 @@ class SqlDownloadRepository:
         download_path: str | None = None,
         failed_reason: str | None = None,
         clear_download_path: bool = False,
+        progress: float | None = None,
+        seed_ratio: float | None = None,
+        first_seen_at: datetime | None = None,
+        clear_first_seen_at: bool = False,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -203,23 +207,31 @@ class SqlDownloadRepository:
         move still applies; ``False`` means the row moved out from under the caller and
         the transition must be abandoned, honoring whoever changed it.
 
-        ``failed_reason`` and ``clear_download_path`` mirror :meth:`update_status` so a
-        CONDITIONAL block can record its surfaced reason (and drop a rolled-back
-        placement breadcrumb) in the SAME compare-and-swap — never overwriting a row
-        that already left ``allowed_from`` (e.g. an operator's committed mark_failed).
-        ``clear_download_path`` takes precedence over ``download_path``.
+        The optional fields mirror :meth:`update_status` so a CONDITIONAL transition
+        can carry progress, missing-grace anchors, surfaced reasons, or breadcrumb
+        cleanup in the SAME compare-and-swap — never overwriting a row that already
+        left ``allowed_from``. ``clear_download_path`` / ``clear_first_seen_at`` take
+        precedence over their corresponding set values.
 
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS
         status (and reason / cleared path).
         """
-        values: dict[str, str | None] = {"status": status}
+        values: dict[str, object] = {"status": status}
         if clear_download_path:
             values["download_path"] = None
         elif download_path is not None:
             values["download_path"] = download_path
         if failed_reason is not None:
             values["failed_reason"] = failed_reason
+        if progress is not None:
+            values["progress"] = progress
+        if seed_ratio is not None:
+            values["seed_ratio"] = seed_ratio
+        if clear_first_seen_at:
+            values["first_seen_at"] = None
+        elif first_seen_at is not None:
+            values["first_seen_at"] = first_seen_at
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))

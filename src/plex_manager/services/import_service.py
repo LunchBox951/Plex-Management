@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -104,14 +105,14 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
         if status.save_path:
             return _ensure_under_save_path(status.save_path, status.content_path)
         return status.content_path
-    if download_path:
-        return download_path
     if status is not None and status.save_path and status.name:
         if os.path.isabs(status.name):
             raise _UnsafeContentPathError("download content path is outside download save path")
         return _ensure_under_save_path(
             status.save_path, os.path.join(status.save_path, status.name)
         )
+    if download_path:
+        return download_path
     return None
 
 
@@ -154,7 +155,7 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     """
     os.makedirs(dst.parent, exist_ok=True)
     if dst.exists():
-        if dst.stat().st_size == os.path.getsize(src):
+        if _same_file_content(src, dst):
             return False  # already fully imported here — idempotent skip; not ours
         # A differently-sized file is already at the destination: a user's
         # manually-managed library file, or a title Plex availability missed. NEVER
@@ -169,10 +170,29 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
         # exists() check above and this link. Same content (same size) is an
         # idempotent win for the other attempt, NOT a failure to block on; a
         # different size is a genuine conflict, surfaced like the pre-existing case.
-        if dst.exists() and dst.stat().st_size == os.path.getsize(src):
+        if dst.exists() and _same_file_content(src, dst):
             return False  # the race winner's file — not ours to roll back
-        raise
+        raise FileExistsError(f"destination already exists with different content: {dst}") from None
     return True  # we created dst; a later failure may roll it back
+
+
+def _file_digest(path: str | Path) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _same_file_content(src: str, dst: Path) -> bool:
+    try:
+        if os.path.samefile(src, dst):
+            return True
+    except OSError:
+        pass
+    if dst.stat().st_size != os.path.getsize(src):
+        return False
+    return _file_digest(src) == _file_digest(dst)
 
 
 def _remove_quietly(path: Path) -> None:

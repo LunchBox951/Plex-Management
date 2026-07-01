@@ -23,10 +23,14 @@ test: ## Run the test suite with coverage
 	pytest
 
 check: ## Run all CI gates locally
+	python -m plex_manager.web.openapi_export
+	git diff --exit-code docs/api/openapi.json
 	ruff check .
 	ruff format --check .
 	pyright
 	pytest
+	$(MAKE) ui-check
+	$(MAKE) ui-build
 
 run: ## Run the app locally
 	python -m plex_manager

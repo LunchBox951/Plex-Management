@@ -1,0 +1,129 @@
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ReactNode } from 'react'
+import { MemoryRouter } from 'react-router-dom'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { PlexLibraryOption, ServiceValidateResponse } from '../api/types'
+import { SetupWizard } from './SetupWizard'
+
+const h = vi.hoisted(() => ({
+  validate: vi.fn(),
+  complete: vi.fn(),
+  setApiKey: vi.fn(),
+  initialized: false,
+}))
+
+vi.mock('../api/hooks', () => ({
+  useSetupStatus: () => ({
+    data: { initialized: h.initialized },
+    isLoading: false,
+  }),
+  useValidateService: () => ({ mutateAsync: h.validate, isPending: false }),
+  useCompleteSetup: () => ({ mutateAsync: h.complete, isPending: false }),
+}))
+
+vi.mock('../lib/apiKey', () => ({
+  setApiKey: h.setApiKey,
+}))
+
+vi.mock('../components/ui/toast', () => ({
+  useToast: () => ({ toast: vi.fn() }),
+}))
+
+const Wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
+function plexOk(libraries: PlexLibraryOption[] = []): ServiceValidateResponse {
+  return { ok: true, message: 'Plex ok', libraries }
+}
+
+describe('SetupWizard', () => {
+  beforeEach(() => {
+    h.validate.mockReset()
+    h.complete.mockReset()
+    h.setApiKey.mockReset()
+    h.initialized = false
+  })
+
+  it('ignores a stale validation success after fields are edited', async () => {
+    const pending = deferred<ServiceValidateResponse>()
+    h.validate.mockReturnValueOnce(pending.promise)
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    fireEvent.change(screen.getByLabelText('Server URL'), {
+      target: { value: 'http://old-plex:32400' },
+    })
+    fireEvent.change(screen.getByLabelText('Plex token'), { target: { value: 'old-token' } })
+    fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
+    fireEvent.change(screen.getByLabelText('Server URL'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+
+    await act(async () => {
+      pending.resolve(plexOk([{ path: '/old/movies', section_key: '1', title: 'Movies' }]))
+      await pending.promise
+    })
+
+    expect(screen.queryByText('Plex ok')).not.toBeInTheDocument()
+    expect(screen.getByText('0/4 verified')).toBeInTheDocument()
+    expect(screen.getByText(/Verify Plex above/i)).toBeInTheDocument()
+  })
+
+  it('stores and reveals the one-time setup key before navigating away', async () => {
+    h.validate.mockImplementation(async ({ service }: { service: string }) => {
+      if (service === 'plex') {
+        return plexOk([{ path: '/media/movies', section_key: '1', title: 'Movies' }])
+      }
+      return { ok: true, message: `${service} ok` }
+    })
+    h.complete.mockResolvedValue({ app_api_key: 'one-time-key' })
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    fireEvent.change(screen.getByLabelText('Server URL'), {
+      target: { value: 'http://plex:32400' },
+    })
+    fireEvent.change(screen.getByLabelText('Plex token'), { target: { value: 'plex-token' } })
+    fireEvent.change(screen.getAllByLabelText('URL')[0]!, {
+      target: { value: 'http://prowlarr:9696' },
+    })
+    fireEvent.change(screen.getAllByLabelText('API key')[0]!, {
+      target: { value: 'prowlarr-key' },
+    })
+    fireEvent.change(screen.getAllByLabelText('URL')[1]!, {
+      target: { value: 'http://qbittorrent:8080' },
+    })
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'admin' } })
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'password' } })
+    fireEvent.change(screen.getAllByLabelText('API key')[1]!, {
+      target: { value: 'tmdb-key' },
+    })
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    fireEvent.click(testButtons[0]!)
+    await screen.findByText('Plex ok')
+    fireEvent.change(screen.getByLabelText('Movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+    fireEvent.click(testButtons[1]!)
+    await screen.findByText('prowlarr ok')
+    fireEvent.click(testButtons[2]!)
+    await screen.findByText('qbittorrent ok')
+    fireEvent.click(testButtons[3]!)
+    await screen.findByText('tmdb ok')
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
+
+    await waitFor(() => expect(h.setApiKey).toHaveBeenCalledWith('one-time-key'))
+    expect(await screen.findByText('one-time-key')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /continue/i })).toBeInTheDocument()
+  })
+})

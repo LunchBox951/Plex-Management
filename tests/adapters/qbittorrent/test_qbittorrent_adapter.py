@@ -339,6 +339,29 @@ async def test_add_opaque_http_url_is_rejected_before_client_add() -> None:
     assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
 
 
+async def test_add_uppercase_http_url_uses_resolver_before_client_add() -> None:
+    """URI schemes are case-insensitive. Uppercase HTTP(S) must not bypass the
+    local resolver/safety checks and get handed to qBittorrent as an opaque URL."""
+    seen: list[str] = []
+    upper_url = "HTTP://indexer.local/file.torrent"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == upper_url:
+            return httpx.Response(200, content=b"not a torrent")
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(upper_url, "/downloads", "plex-manager")
+
+    assert any(url.lower() == upper_url.lower() for url in seen)
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
 async def test_add_oversized_torrent_body_is_rejected_before_buffering_to_client() -> None:
     """A malicious indexer response must not be buffered and uploaded to qBittorrent
     without a small .torrent size cap."""
