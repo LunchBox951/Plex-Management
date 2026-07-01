@@ -13,13 +13,16 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.db import get_session
+from plex_manager.ports.library import LibraryPort
 from plex_manager.web.deps import (
     SECRET_MASK,
     SECRET_SETTING_KEYS,
     SettingsStore,
+    get_library,
     require_api_key,
 )
-from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
+from plex_manager.web.schemas import PlexLibraryOption, SettingsResponse, SettingsUpdate
+from plex_manager.web.setup_validation import movie_library_options
 
 __all__ = ["router"]
 
@@ -40,6 +43,20 @@ async def get_settings_endpoint(
 ) -> SettingsResponse:
     """Return the redacted service config (secrets shown as ``"***"``)."""
     return await _redacted(SettingsStore(session))
+
+
+@router.get("/plex-libraries")
+async def plex_libraries_endpoint(
+    library: Annotated[LibraryPort, Depends(get_library)],
+) -> list[PlexLibraryOption]:
+    """Movie library folders Plex reports, for the Settings ``movies_root`` picker.
+
+    Uses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.
+    """
+    # probe_writable=True (the default): authenticated, and the Plex creds are the
+    # operator's own stored config — so the real writability signal is legitimate
+    # here (unlike the pre-init validate/plex step, which must NOT probe).
+    return movie_library_options(await library.list_sections(), probe_writable=True)
 
 
 @router.put("")

@@ -11,7 +11,11 @@ from plex_manager.domain.release import (
     IndexerSearchRequest,
     ParsedRelease,
 )
-from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
+from plex_manager.ports.download_client import (
+    DownloadClientPort,
+    DownloadedFile,
+    DownloadStatus,
+)
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort, LibrarySection
@@ -88,6 +92,9 @@ class _FakeDownloadClient:
 
     async def get_save_path(self, info_hash: str) -> str | None:
         return None
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        return []
 
 
 def test_fakes_satisfy_runtime_checkable_protocols() -> None:

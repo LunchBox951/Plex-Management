@@ -1,0 +1,9 @@
+name: "Plex Manager CodeQL config"
+
+# Alembic migrations are generated, reviewed boilerplate. The security-and-quality
+# suite flags their framework-required module globals (revision / down_revision /
+# branch_labels / depends_on) as "unused" because Alembic reads them via module
+# introspection, which static analysis can't see. Exclude the directory so those
+# false positives don't bury real findings.
+paths-ignore:
+  - migrations

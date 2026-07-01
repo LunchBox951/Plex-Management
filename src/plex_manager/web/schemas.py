@@ -18,9 +18,13 @@ __all__ = [
     "BlocklistEntry",
     "BlocklistResponse",
     "CreateRequestBody",
+    "DiscoverHomeResponse",
+    "DiscoverHomeRow",
+    "DiscoverListResponse",
     "DiscoverResult",
     "DiscoverSearchResponse",
     "GrabRequest",
+    "PlexLibraryOption",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -83,15 +87,43 @@ class TmdbValidateRequest(BaseModel):
     api_key: str
 
 
+class PlexLibraryOption(BaseModel):
+    """One movie-library folder Plex reports, with whether the app can write to it.
+
+    ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
+    choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
+    section mismatch that breaks a targeted scan). ``writable`` is the app's own
+    check (``None`` when not probed — see the field): a known-not-writable location
+    is the split-mount signal — surfaced, not hidden.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    section_key: str
+    title: str
+    path: str
+    # ``None`` = writability was NOT probed. The pre-init ``validate/plex`` wizard
+    # step never touches the filesystem for a caller-supplied Plex server (that would
+    # be a pre-auth local-FS existence/writability oracle); a real ``True``/``False``
+    # is set only by the authenticated Settings picker, where the operator's own
+    # stored creds make the probe legitimate.
+    writable: bool | None = None
+
+
 class ServiceValidateResponse(BaseModel):
     """Result of a connection check. ``message`` is operator-facing; ``detail``
-    is an optional diagnostic. Neither ever contains a secret value."""
+    is an optional diagnostic. Neither ever contains a secret value.
+
+    For Plex, ``libraries`` carries the movie library folders so the UI can offer a
+    pick-list for ``movies_root`` instead of a typed path. ``None`` for every other
+    service (and for a failed Plex check)."""
 
     model_config = ConfigDict(frozen=True)
 
     ok: bool
     message: str
     detail: str | None = None
+    libraries: list[PlexLibraryOption] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +142,7 @@ class SetupCompleteRequest(BaseModel):
     qbittorrent_username: str
     qbittorrent_password: str
     tmdb_api_key: str
+    movies_root: str
 
 
 class SetupStatusResponse(BaseModel):
@@ -142,6 +175,7 @@ class SettingsResponse(BaseModel):
     qbittorrent_username: str | None = None
     qbittorrent_password: str | None = None
     tmdb_api_key: str | None = None
+    movies_root: str | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -161,6 +195,7 @@ class SettingsUpdate(BaseModel):
     qbittorrent_username: str | None = Field(default=None)
     qbittorrent_password: str | None = Field(default=None)
     tmdb_api_key: str | None = Field(default=None)
+    movies_root: str | None = Field(default=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +212,7 @@ class DiscoverResult(BaseModel):
     year: int | None = None
     overview: str | None = None
     poster_url: str | None = None
+    backdrop_url: str | None = None
 
 
 class DiscoverSearchResponse(BaseModel):
@@ -184,6 +220,41 @@ class DiscoverSearchResponse(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    results: list[DiscoverResult]
+
+
+class DiscoverHomeRow(BaseModel):
+    """One server-composed Discover row: a title + its items.
+
+    ``row_type`` is an OPEN string (e.g. ``trending`` / ``popular`` / ``upcoming``)
+    so the frontend renders rows generically and stays dumb about WHY a row exists
+    — TV and recommendation rows slot in later with no contract change.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    row_type: str
+    title: str
+    items: list[DiscoverResult]
+
+
+class DiscoverHomeResponse(BaseModel):
+    """The composed Discover home: an optional spotlight + ordered rows."""
+
+    model_config = ConfigDict(frozen=True)
+
+    spotlight: DiscoverResult | None = None
+    rows: list[DiscoverHomeRow]
+
+
+class DiscoverListResponse(BaseModel):
+    """A paginated category listing (trending / popular / upcoming)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    page: int
+    total_pages: int
+    total_results: int
     results: list[DiscoverResult]
 
 
@@ -211,6 +282,8 @@ class RequestResponse(BaseModel):
     status: str
     year: int | None = None
     is_anime: bool = False
+    poster_url: str | None = None
+    backdrop_url: str | None = None
 
 
 class RequestListResponse(BaseModel):

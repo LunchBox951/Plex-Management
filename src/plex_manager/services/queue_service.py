@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.repositories import DownloadRecord
 
-__all__ = ["InvalidStateTransitionError", "mark_failed", "reconcile_and_list"]
+__all__ = ["InvalidStateTransitionError", "list_queue", "mark_failed", "reconcile_and_list"]
 
 _logger = logging.getLogger(__name__)
 
@@ -137,6 +137,22 @@ async def _handle_failed(
         )
 
 
+async def list_queue(session: AsyncSession) -> list[DownloadRecord]:
+    """Read-only snapshot of the active queue — NO reconcile, NO writes.
+
+    The background reconcile loop (``web.app._reconcile_loop``) is the single owner
+    of cross-system truth (overview §5, north-star #5): it reconciles the client and
+    refreshes progress/seed_ratio on a fixed cadence. A GET /queue poll must NOT also
+    reconcile — running ``reconcile_and_list`` concurrently with the loop can clobber
+    the importer's CAS-claimed ``importing`` status (the per-download import lock does
+    not cover this write path), stranding a placed file until a later cycle. So the
+    read path is passive: it returns the currently persisted ``DownloadRecord`` rows
+    and writes nothing. The loop's frequent refresh keeps the listed progress/status
+    fresh enough for display.
+    """
+    return await SqlDownloadRepository(session).list_active()
+
+
 async def reconcile_and_list(
     qbt: DownloadClientPort,
     session: AsyncSession,
@@ -181,11 +197,14 @@ async def reconcile_and_list(
                 clear_first_seen_at=transition.clear_first_seen_at,
             )
         elif live is not None:
-            await download_repo.update_status(
-                row.id,
-                row.status,  # unchanged state — only progress/seed_ratio move
-                progress=live.progress,
-                seed_ratio=live.ratio,
+            # Refresh live progress ONLY — never rewrite status. ``row.status`` is the
+            # snapshot captured at list_active() time; an operator's import retry (or
+            # the importer) may have CAS-claimed the row to ``importing`` during the
+            # qbt.get_all_statuses() await above, and writing the stale snapshot status
+            # back would clobber that claim (defeating the import finalize CAS). A
+            # progress-only update leaves any concurrent transition intact (G5).
+            await download_repo.refresh_progress(
+                row.id, progress=live.progress, seed_ratio=live.ratio
             )
 
     for event in failed_download_events(transitions, rows, occurred_at=now):

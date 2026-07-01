@@ -7,11 +7,17 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.services import request_service
 from plex_manager.services.request_service import MediaNotFoundError
-from plex_manager.web.deps import get_session, get_tmdb, require_api_key
+from plex_manager.web.deps import (
+    get_library_optional,
+    get_session,
+    get_tmdb,
+    require_api_key,
+)
 from plex_manager.web.schemas import (
     CreateRequestBody,
     RequestListResponse,
@@ -36,6 +42,8 @@ def _to_response(record: RequestRecord) -> RequestResponse:
         status=record.status,
         year=record.year,
         is_anime=record.is_anime,
+        poster_url=record.poster_url,
+        backdrop_url=record.backdrop_url,
     )
 
 
@@ -44,14 +52,20 @@ async def create_request_endpoint(
     body: CreateRequestBody,
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
+    library: Annotated[LibraryPort | None, Depends(get_library_optional)],
 ) -> RequestResponse:
-    """Create a request (or return the existing active one for this media)."""
+    """Create a request (or return the existing active one for this media).
+
+    If Plex is configured and the movie is already in the library, the request is
+    recorded directly as ``available`` (no needless search/grab).
+    """
     try:
         record = await request_service.create_request(
             session,
             tmdb,
             tmdb_id=body.tmdb_id,
             media_type=body.media_type,
+            library=library,
         )
     except MediaNotFoundError as exc:
         raise HTTPException(

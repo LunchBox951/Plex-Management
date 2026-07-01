@@ -10,21 +10,35 @@ faked.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import FastAPI
 
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
-from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
+from plex_manager.ports.download_client import (
+    DownloadClientPort,
+    DownloadedFile,
+    DownloadStatus,
+)
 from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.library import LibraryPort, LibrarySection
 from plex_manager.ports.metadata import (
+    MediaPage,
     MediaSearchResult,
     MetadataPort,
     MovieMetadata,
     TvMetadata,
 )
-from plex_manager.web.deps import get_prowlarr, get_qbittorrent, get_tmdb
+from plex_manager.web.deps import (
+    get_library,
+    get_library_optional,
+    get_prowlarr,
+    get_qbittorrent,
+    get_tmdb,
+)
 
 __all__ = [
+    "FakeLibrary",
     "FakeProwlarr",
     "FakeQbittorrent",
     "FakeTmdb",
@@ -100,10 +114,18 @@ class FakeTmdb:
         movies: dict[int, MovieMetadata] | None = None,
         shows: dict[int, TvMetadata] | None = None,
         results: list[MediaSearchResult] | None = None,
+        trending: list[MediaSearchResult] | None = None,
+        popular: list[MediaSearchResult] | None = None,
+        upcoming: list[MediaSearchResult] | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
         self.results = results or []
+        # Discover rows default to the search results so a test that only sets
+        # ``results`` still gets populated trending/popular/upcoming pages.
+        self.trending = list(trending) if trending is not None else list(self.results)
+        self.popular = list(popular) if popular is not None else list(self.results)
+        self.upcoming = list(upcoming) if upcoming is not None else list(self.results)
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -113,6 +135,19 @@ class FakeTmdb:
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
         return self.shows.get(tmdb_id)
+
+    @staticmethod
+    def _page(items: list[MediaSearchResult]) -> MediaPage:
+        return MediaPage(page=1, total_pages=1, total_results=len(items), results=list(items))
+
+    async def trending_movies(self, page: int = 1) -> MediaPage:
+        return self._page(self.trending)
+
+    async def popular_movies(self, page: int = 1) -> MediaPage:
+        return self._page(self.popular)
+
+    async def upcoming_movies(self, page: int = 1) -> MediaPage:
+        return self._page(self.upcoming)
 
 
 class FakeProwlarr:
@@ -130,8 +165,14 @@ class FakeProwlarr:
 class FakeQbittorrent:
     """In-memory :class:`DownloadClientPort` recording adds + canned statuses."""
 
-    def __init__(self, statuses: list[DownloadStatus] | None = None) -> None:
+    def __init__(
+        self,
+        statuses: list[DownloadStatus] | None = None,
+        *,
+        files: dict[str, list[DownloadedFile]] | None = None,
+    ) -> None:
         self.statuses = statuses or []
+        self.files = files or {}
         self.added: list[tuple[str, str, str]] = []
         self.removed: list[tuple[str, bool]] = []
 
@@ -167,6 +208,37 @@ class FakeQbittorrent:
     async def get_save_path(self, info_hash: str) -> str | None:
         return None
 
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        return list(self.files.get(info_hash.lower(), []))
+
+
+class FakeLibrary:
+    """In-memory :class:`LibraryPort`: a set of in-library tmdb ids + scan recorder."""
+
+    def __init__(
+        self,
+        *,
+        available: set[int] | None = None,
+        sections: list[LibrarySection] | None = None,
+    ) -> None:
+        self.available_ids = available or set()
+        self.sections = sections or []
+        self.scanned: list[str] = []
+
+    async def is_available(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+    ) -> bool:
+        # No cache to bypass; ``use_cache`` is accepted to match LibraryPort.
+        if media_type == "tv":
+            raise NotImplementedError("tv availability deferred to next beta")
+        return tmdb_id in self.available_ids
+
+    async def trigger_scan(self, path: str) -> None:
+        self.scanned.append(path)
+
+    async def list_sections(self) -> list[LibrarySection]:
+        return list(self.sections)
+
 
 def override_adapters(
     app: FastAPI,
@@ -174,11 +246,20 @@ def override_adapters(
     tmdb: MetadataPort | None = None,
     prowlarr: IndexerPort | None = None,
     qbt: DownloadClientPort | None = None,
+    library: LibraryPort | None = None,
 ) -> None:
-    """Point the adapter dependencies at the supplied fakes."""
+    """Point the adapter dependencies at the supplied fakes.
+
+    ``library`` overrides BOTH the required (``get_library``) and optional
+    (``get_library_optional``) Plex dependencies, so the request-dedupe and import
+    endpoints see the same fake.
+    """
     if tmdb is not None:
         app.dependency_overrides[get_tmdb] = lambda: tmdb
     if prowlarr is not None:
         app.dependency_overrides[get_prowlarr] = lambda: prowlarr
     if qbt is not None:
         app.dependency_overrides[get_qbittorrent] = lambda: qbt
+    if library is not None:
+        app.dependency_overrides[get_library] = lambda: library
+        app.dependency_overrides[get_library_optional] = lambda: library

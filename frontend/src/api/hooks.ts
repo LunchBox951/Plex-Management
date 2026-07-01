@@ -9,8 +9,10 @@ import { unwrap, ensureOk } from './http'
 import type {
   BlocklistResponse,
   CreateRequestBody,
+  DiscoverHomeResponse,
   DiscoverSearchResponse,
   GrabRequest,
+  PlexLibraryOption,
   QualityProfileResponse,
   QueueItem,
   QueueResponse,
@@ -105,11 +107,34 @@ export function useUpdateSettings() {
       unwrap(await client.PUT('/api/v1/settings', { body })),
     onSuccess: (data) => {
       qc.setQueryData(queryKeys.settings, data)
+      // The Plex URL/token may have changed; the movies_root picker must refetch
+      // against the newly-saved connection — and clear any prior unconfigured/auth
+      // error, which retry:false otherwise leaves stuck until the page remounts.
+      void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
     },
   })
 }
 
+/** Movie library folders Plex reports, for the Settings movies_root picker. */
+export function usePlexLibraries(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.plexLibraries,
+    enabled,
+    retry: false, // a 409 (Plex unconfigured) is a normal state, not worth retrying
+    queryFn: async (): Promise<PlexLibraryOption[]> =>
+      unwrap(await client.GET('/api/v1/settings/plex-libraries')),
+  })
+}
+
 /* --------------------------------------------------------------- discover -- */
+
+export function useDiscoverHome() {
+  return useQuery({
+    queryKey: queryKeys.discoverHome,
+    queryFn: async (): Promise<DiscoverHomeResponse> =>
+      unwrap(await client.GET('/api/v1/discover/home')),
+  })
+}
 
 export function useDiscoverSearch(query: string, year?: number) {
   const trimmed = query.trim()
@@ -205,6 +230,22 @@ export function useMarkFailed() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.queue })
       void qc.invalidateQueries({ queryKey: ['blocklist'] })
+    },
+  })
+}
+
+export function useImportDownload() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (downloadId: number): Promise<QueueItem> =>
+      unwrap(
+        await client.POST('/api/v1/queue/{download_id}/import', {
+          params: { path: { download_id: downloadId } },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
     },
   })
 }

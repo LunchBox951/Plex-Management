@@ -42,7 +42,9 @@ _RAW_STATE_EXPECTATIONS: list[tuple[str, DownloadState]] = [
     ("queuedUP", DownloadState.ImportPending),
     ("checkingUP", DownloadState.ImportPending),
     ("forcedUP", DownloadState.ImportPending),
-    ("moving", DownloadState.ImportPending),
+    # 'moving' is qBittorrent still relocating files (not settled) -> stays active,
+    # NOT import-eligible, so the importer never reads a half-moved file.
+    ("moving", DownloadState.Downloading),
     ("error", DownloadState.FailedPending),
     ("missingFiles", DownloadState.FailedPending),
 ]

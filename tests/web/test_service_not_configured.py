@@ -47,7 +47,11 @@ async def test_search_preview_unconfigured_prowlarr_returns_409(
 async def test_queue_unconfigured_qbittorrent_returns_409(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
+    # GET /queue is now a passive DB read (no qBittorrent dependency). The
+    # import-retry endpoint still resolves get_qbittorrent (its qbt parameter is
+    # declared before library / movies_root, so it is the first SNC-raising adapter),
+    # so an unconfigured client is an honest 409 service_not_configured there.
     await seed(initialized=True, app_api_key=_API_KEY)
-    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    response = await client.post("/api/v1/queue/1/import", headers=_HEADERS)
     assert response.status_code == 409
     assert response.json() == {"detail": "service_not_configured", "service": "qbittorrent"}

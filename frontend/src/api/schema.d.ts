@@ -44,6 +44,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/discover/home": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Discover Home
+         * @description Return the server-composed Discover home (spotlight + ordered rows).
+         */
+        get: operations["discover_home_api_v1_discover_home_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/discover/search": {
         parameters: {
             query?: never;
@@ -56,6 +76,26 @@ export interface paths {
          * @description Search TMDB for movies / shows matching ``query`` (optional ``year``).
          */
         get: operations["discover_search_api_v1_discover_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/discover/{category}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Discover Category
+         * @description Return a paginated movie category (``trending`` / ``popular`` / ``upcoming``).
+         */
+        get: operations["discover_category_api_v1_discover__category__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -93,7 +133,13 @@ export interface paths {
         };
         /**
          * Get Queue
-         * @description Reconcile active downloads against the client and return the live queue.
+         * @description Return the live download queue (read-only).
+         *
+         *     Passive by design: the background reconcile loop is the single owner of
+         *     cross-system truth, so a queue poll never reconciles — doing so could race the
+         *     loop's importer CAS and clobber an ``importing`` claim. The loop refreshes
+         *     frequently, so the persisted progress/status is fresh enough to display, and the
+         *     queue stays viewable even while qBittorrent is unreachable.
          */
         get: operations["get_queue_api_v1_queue_get"];
         put?: never;
@@ -118,6 +164,29 @@ export interface paths {
          * @description Grab a release for a request: a chosen one, or the top accepted pick.
          */
         post: operations["grab_endpoint_api_v1_queue_grab_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/queue/{download_id}/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Endpoint
+         * @description Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
+         *
+         *     Requires Plex + the Movies root configured (409 ``service_not_configured``
+         *     otherwise). The correction-without-a-terminal button for a blocked import.
+         */
+        post: operations["import_endpoint_api_v1_queue__download_id__import_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -160,6 +229,9 @@ export interface paths {
         /**
          * Create Request Endpoint
          * @description Create a request (or return the existing active one for this media).
+         *
+         *     If Plex is configured and the movie is already in the library, the request is
+         *     recorded directly as ``available`` (no needless search/grab).
          */
         post: operations["create_request_endpoint_api_v1_requests_post"];
         delete?: never;
@@ -231,6 +303,28 @@ export interface paths {
          *     surface later as an auth failure to the downstream service.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/plex-libraries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Plex Libraries Endpoint
+         * @description Movie library folders Plex reports, for the Settings ``movies_root`` picker.
+         *
+         *     Uses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.
+         */
+        get: operations["plex_libraries_endpoint_api_v1_settings_plex_libraries_get"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -468,10 +562,51 @@ export interface components {
             tmdb_id: number;
         };
         /**
+         * DiscoverHomeResponse
+         * @description The composed Discover home: an optional spotlight + ordered rows.
+         */
+        DiscoverHomeResponse: {
+            /** Rows */
+            rows: components["schemas"]["DiscoverHomeRow"][];
+            spotlight?: components["schemas"]["DiscoverResult"] | null;
+        };
+        /**
+         * DiscoverHomeRow
+         * @description One server-composed Discover row: a title + its items.
+         *
+         *     ``row_type`` is an OPEN string (e.g. ``trending`` / ``popular`` / ``upcoming``)
+         *     so the frontend renders rows generically and stays dumb about WHY a row exists
+         *     — TV and recommendation rows slot in later with no contract change.
+         */
+        DiscoverHomeRow: {
+            /** Items */
+            items: components["schemas"]["DiscoverResult"][];
+            /** Row Type */
+            row_type: string;
+            /** Title */
+            title: string;
+        };
+        /**
+         * DiscoverListResponse
+         * @description A paginated category listing (trending / popular / upcoming).
+         */
+        DiscoverListResponse: {
+            /** Page */
+            page: number;
+            /** Results */
+            results: components["schemas"]["DiscoverResult"][];
+            /** Total Pages */
+            total_pages: number;
+            /** Total Results */
+            total_results: number;
+        };
+        /**
          * DiscoverResult
          * @description One discovery search row.
          */
         DiscoverResult: {
+            /** Backdrop Url */
+            backdrop_url?: string | null;
             /**
              * Media Type
              * @enum {string}
@@ -519,6 +654,26 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /**
+         * PlexLibraryOption
+         * @description One movie-library folder Plex reports, with whether the app can write to it.
+         *
+         *     ``path`` is a Plex library location (from Plex's own ``/library/sections``), so
+         *     choosing it for ``movies_root`` avoids a typed path entirely (and the path↔
+         *     section mismatch that breaks a targeted scan). ``writable`` is the app's own
+         *     check (``None`` when not probed — see the field): a known-not-writable location
+         *     is the split-mount signal — surfaced, not hidden.
+         */
+        PlexLibraryOption: {
+            /** Path */
+            path: string;
+            /** Section Key */
+            section_key: string;
+            /** Title */
+            title: string;
+            /** Writable */
+            writable?: boolean | null;
         };
         /**
          * PlexValidateRequest
@@ -645,6 +800,8 @@ export interface components {
          * @description A media request as returned to the client.
          */
         RequestResponse: {
+            /** Backdrop Url */
+            backdrop_url?: string | null;
             /** Id */
             id: number;
             /**
@@ -654,6 +811,8 @@ export interface components {
             is_anime: boolean;
             /** Media Type */
             media_type: string;
+            /** Poster Url */
+            poster_url?: string | null;
             /** Status */
             status: string;
             /** Title */
@@ -701,10 +860,16 @@ export interface components {
          * ServiceValidateResponse
          * @description Result of a connection check. ``message`` is operator-facing; ``detail``
          *     is an optional diagnostic. Neither ever contains a secret value.
+         *
+         *     For Plex, ``libraries`` carries the movie library folders so the UI can offer a
+         *     pick-list for ``movies_root`` instead of a typed path. ``None`` for every other
+         *     service (and for a failed Plex check).
          */
         ServiceValidateResponse: {
             /** Detail */
             detail?: string | null;
+            /** Libraries */
+            libraries?: components["schemas"]["PlexLibraryOption"][] | null;
             /** Message */
             message: string;
             /** Ok */
@@ -719,6 +884,8 @@ export interface components {
          *     NEVER serialized.
          */
         SettingsResponse: {
+            /** Movies Root */
+            movies_root?: string | null;
             /** Plex Token */
             plex_token?: string | null;
             /** Plex Url */
@@ -744,6 +911,8 @@ export interface components {
          *     encrypted at rest. ``None`` / absent fields are left unchanged.
          */
         SettingsUpdate: {
+            /** Movies Root */
+            movies_root?: string | null;
             /** Plex Token */
             plex_token?: string | null;
             /** Plex Url */
@@ -766,6 +935,8 @@ export interface components {
          * @description The validated credential set written on ``POST /setup/complete``.
          */
         SetupCompleteRequest: {
+            /** Movies Root */
+            movies_root: string;
             /** Plex Token */
             plex_token: string;
             /** Plex Url */
@@ -883,6 +1054,26 @@ export interface operations {
             };
         };
     };
+    discover_home_api_v1_discover_home_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiscoverHomeResponse"];
+                };
+            };
+        };
+    };
     discover_search_api_v1_discover_search_get: {
         parameters: {
             query: {
@@ -902,6 +1093,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DiscoverSearchResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    discover_category_api_v1_discover__category__get: {
+        parameters: {
+            query?: {
+                page?: number;
+            };
+            header?: never;
+            path: {
+                category: "trending" | "popular" | "upcoming";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiscoverListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -970,6 +1194,37 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_endpoint_api_v1_queue__download_id__import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                download_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1187,6 +1442,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    plex_libraries_endpoint_api_v1_settings_plex_libraries_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLibraryOption"][];
                 };
             };
         };

@@ -40,7 +40,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
-from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 
 __all__ = ["QbittorrentAuthError", "QbittorrentClient", "QbittorrentError"]
 
@@ -535,6 +535,24 @@ class QbittorrentClient:
             return None
         save_path = _s(properties.get("save_path"))
         return save_path or None
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        """Return the torrent's files (relative path + size) for the importer.
+
+        Reads ``/torrents/files``; maps each entry's ``name`` (path relative to the
+        save path) and ``size`` (bytes). An empty/normal no-files response yields
+        ``[]``; transport / auth failures surface the typed error (never swallowed).
+        """
+        response = await self._request("GET", "/torrents/files", params={"hash": info_hash.lower()})
+        self._raise_for_status(response)
+        out: list[DownloadedFile] = []
+        for row in _as_list(_decode_json(response, "/torrents/files")):
+            entry = _as_dict(row)
+            if entry:
+                out.append(
+                    DownloadedFile(name=_s(entry.get("name")), size_bytes=_i(entry.get("size")))
+                )
+        return out
 
     async def _fetch_properties(self, info_hash: str) -> dict[str, object] | None:
         """Fetch ``/torrents/properties`` for ``info_hash``, cached briefly.

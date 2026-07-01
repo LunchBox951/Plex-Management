@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useSettings, useUpdateSettings } from '../api/hooks'
+import { usePlexLibraries, useSettings, useUpdateSettings } from '../api/hooks'
 import type { SettingsResponse, SettingsUpdate } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { Button } from '../components/ui/Button'
@@ -20,6 +20,7 @@ interface FormState {
   qbittorrent_username: string
   qbittorrent_password: string
   tmdb_api_key: string
+  movies_root: string
 }
 
 /** Plaintext fields prefill from current values; secret inputs always start empty. */
@@ -33,10 +34,16 @@ function initialForm(data: SettingsResponse): FormState {
     qbittorrent_username: data.qbittorrent_username ?? '',
     qbittorrent_password: '',
     tmdb_api_key: '',
+    movies_root: data.movies_root ?? '',
   }
 }
 
-type TextKey = 'plex_url' | 'prowlarr_url' | 'qbittorrent_url' | 'qbittorrent_username'
+type TextKey =
+  | 'plex_url'
+  | 'prowlarr_url'
+  | 'qbittorrent_url'
+  | 'qbittorrent_username'
+  | 'movies_root'
 type SecretKey = 'plex_token' | 'prowlarr_api_key' | 'qbittorrent_password' | 'tmdb_api_key'
 
 const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
@@ -44,10 +51,13 @@ const Heading = () => <h1 className="font-display text-2xl font-extrabold">Setti
 export function Settings() {
   const { data, isLoading, isError, error, refetch } = useSettings()
   const update = useUpdateSettings()
+  const libraries = usePlexLibraries() // movie folders Plex reports (409 if unconfigured)
   const { toast } = useToast()
 
   // Controlled state, seeded once the settings have loaded.
   const [form, setForm] = useState<FormState | null>(null)
+  // Reveal a typed override instead of the Plex pick-list.
+  const [manualPath, setManualPath] = useState(false)
   useEffect(() => {
     if (data && form === null) setForm(initialForm(data))
   }, [data, form])
@@ -104,6 +114,20 @@ export function Settings() {
   )
 
   const handleSave = async () => {
+    // A library folder is discovered against a *specific* Plex server. If the
+    // operator just changed the Plex connection (URL or a freshly typed token)
+    // but hasn't re-picked a folder, don't carry the OLD server's movies_root
+    // over with the new creds: clear it. '' reads as unset server-side (a
+    // visible "library not configured" 409, not a silent wrong-path write), so
+    // the picker — refetched against the new connection on save — forces a
+    // fresh, valid selection before any import can scan a path off the old Plex.
+    // (Omitting movies_root would NOT fix this: the backend leaves absent fields
+    // unchanged, so the stale path would stay persisted.)
+    const plexConnectionChanged =
+      form.plex_url !== (data.plex_url ?? '') || form.plex_token.length > 0
+    const moviesRootReselected = form.movies_root !== (data.movies_root ?? '')
+    const clearMoviesRoot = plexConnectionChanged && !moviesRootReselected
+
     // Plaintext fields always written; secrets only when the user typed a value,
     // so an untouched secret stays the backend's no-op (left unchanged).
     const body: SettingsUpdate = {
@@ -111,6 +135,7 @@ export function Settings() {
       prowlarr_url: form.prowlarr_url,
       qbittorrent_url: form.qbittorrent_url,
       qbittorrent_username: form.qbittorrent_username,
+      movies_root: clearMoviesRoot ? '' : form.movies_root,
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -120,7 +145,10 @@ export function Settings() {
     try {
       await update.mutateAsync(body)
       toast({ title: 'Settings saved', intent: 'success' })
-      // Clear secret inputs so they reflect the now-masked stored values.
+      // Clear secret inputs so they reflect the now-masked stored values, and
+      // drop movies_root from the form when we cleared it server-side so the
+      // refreshed picker shows the placeholder (and a follow-up save can't
+      // re-write the stale path).
       setForm((prev) =>
         prev
           ? {
@@ -129,6 +157,7 @@ export function Settings() {
               prowlarr_api_key: '',
               qbittorrent_password: '',
               tmdb_api_key: '',
+              ...(clearMoviesRoot ? { movies_root: '' } : {}),
             }
           : prev,
       )
@@ -172,6 +201,55 @@ export function Settings() {
           <h2 className="font-display text-sm font-semibold text-ink">TMDB</h2>
           <div className="mt-4 flex flex-col gap-4">
             {secretField('tmdb_api_key', 'API key', data.tmdb_api_key === SECRET_SET)}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-hairline bg-surface p-5">
+          <h2 className="font-display text-sm font-semibold text-ink">Library</h2>
+          <p className="mt-1 text-xs text-faint">Where imported movies are placed.</p>
+          <div className="mt-4 flex flex-col gap-2">
+            {!manualPath && libraries.data && libraries.data.length > 0 ? (
+              <>
+                <select
+                  aria-label="Movies library folder"
+                  className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                  value={form.movies_root}
+                  onChange={(e) => setField('movies_root', e.target.value)}
+                >
+                  <option value="">Choose a movie library folder…</option>
+                  {libraries.data.map((lib) => (
+                    <option
+                      key={`${lib.section_key}:${lib.path}`}
+                      value={lib.path}
+                      disabled={lib.writable === false}
+                    >
+                      {lib.title} — {lib.path}
+                      {lib.writable === false ? ' · not writable by the app' : ''}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="self-start text-xs text-gold hover:underline"
+                  onClick={() => setManualPath(true)}
+                >
+                  Use a custom path instead
+                </button>
+              </>
+            ) : (
+              <>
+                {textField('movies_root', 'Movies library folder', '/library/movies')}
+                {libraries.data && libraries.data.length > 0 ? (
+                  <button
+                    type="button"
+                    className="self-start text-xs text-gold hover:underline"
+                    onClick={() => setManualPath(false)}
+                  >
+                    ← Pick from a Plex library instead
+                  </button>
+                ) : null}
+              </>
+            )}
           </div>
         </section>
       </div>

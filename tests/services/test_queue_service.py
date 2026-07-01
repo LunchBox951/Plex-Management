@@ -239,3 +239,32 @@ async def test_mark_failed_without_blocklist_rearms_request(
     assert request is not None
     assert request.status is RequestStatus.searching  # re-armed despite blocklist=False
     assert blocklist == []  # but no blocklist row was written
+
+
+async def test_reconcile_applies_completed_and_keeps_client_missing_within_grace(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The background path (reconcile_and_list) still advances a completed torrent to
+    import_pending and keeps an absent-but-in-grace torrent as client_missing. These
+    write semantics moved OFF GET /queue (now passive) onto the reconcile loop."""
+    async with sessionmaker_() as session:
+        completed = Download(torrent_hash="a" * 40, status="downloading", tmdb_id=603)
+        missing = Download(
+            torrent_hash="b" * 40,
+            status="client_missing",
+            tmdb_id=603,
+            first_seen_at=datetime.now(UTC),  # within the 10-minute grace
+        )
+        session.add_all([completed, missing])
+        await session.commit()
+        completed_id, missing_id = completed.id, missing.id
+
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash="a" * 40, name="done.torrent", raw_state="stoppedUP")]
+    )
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    by_id = {item.id: item.status for item in queue}
+    assert by_id[completed_id] == "import_pending"
+    assert by_id[missing_id] == "client_missing"

@@ -23,11 +23,13 @@ export const queryClient = new QueryClient({
 export const queryKeys = {
   setupStatus: ['setup', 'status'] as const,
   settings: ['settings'] as const,
+  plexLibraries: ['settings', 'plex-libraries'] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
   queue: ['queue'] as const,
   blocklist: (tmdbId?: number) => ['blocklist', tmdbId ?? 'all'] as const,
   qualityProfile: ['quality-profile'] as const,
   discover: (query: string, year?: number) => ['discover', query, year ?? null] as const,
+  discoverHome: ['discover', 'home'] as const,
   searchPreview: ['search-preview'] as const,
 }

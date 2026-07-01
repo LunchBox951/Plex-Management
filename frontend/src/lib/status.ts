@@ -20,7 +20,8 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   searching: { label: 'Searching', intent: 'searching' },
   no_acceptable_release: { label: 'No release', intent: 'error' },
   downloading: { label: 'Downloading', intent: 'downloading' },
-  completed: { label: 'Completed', intent: 'available' },
+  import_blocked: { label: 'Import blocked', intent: 'error' },
+  completed: { label: 'Finalizing', intent: 'downloading' },
   available: { label: 'In library', intent: 'available' },
   failed: { label: 'Failed', intent: 'error' },
 }

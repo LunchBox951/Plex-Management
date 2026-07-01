@@ -149,6 +149,7 @@ async def complete(
         "qbittorrent_username": body.qbittorrent_username,
         "qbittorrent_password": body.qbittorrent_password,
         "tmdb_api_key": body.tmdb_api_key,
+        "movies_root": body.movies_root,
     }
     for key in KNOWN_SETTING_KEYS:
         await store.set(key, values[key])

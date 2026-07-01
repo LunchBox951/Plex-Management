@@ -22,14 +22,23 @@ class LibrarySection(BaseModel):
     key: str
     title: str
     type: Literal["movie", "show"]
+    locations: tuple[str, ...] = ()
 
 
 @runtime_checkable
 class LibraryPort(Protocol):
     """Query availability, trigger scans, and list sections on the media server."""
 
-    async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
-        """Return whether the item is already present in the library."""
+    async def is_available(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+    ) -> bool:
+        """Return whether the item is already present in the library.
+
+        ``use_cache=False`` forces a fresh read of the server, bypassing any
+        cached-presence fast path. The request-dedup path passes it so a title just
+        REMOVED from the library is seen as absent immediately, instead of a stale
+        "present" answer held for the cache TTL.
+        """
         raise NotImplementedError
 
     async def trigger_scan(self, path: str) -> None:

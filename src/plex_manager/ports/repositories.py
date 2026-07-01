@@ -39,6 +39,8 @@ class RequestRecord(BaseModel):
     year: int | None = None
     is_anime: bool = False
     user_id: int | None = None
+    poster_url: str | None = None
+    backdrop_url: str | None = None
 
 
 class DownloadRecord(BaseModel):
@@ -91,6 +93,14 @@ class RequestRepository(Protocol):
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return an existing non-terminal request for this media, for dedup."""
 
+    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
+        """Return the latest already-in-library (available/completed) request.
+
+        Dedups the Plex-availability short-circuit: a repeat request for a movie
+        already recorded as available returns that row instead of a duplicate.
+        """
+        raise NotImplementedError
+
     async def create(
         self,
         *,
@@ -101,12 +111,30 @@ class RequestRepository(Protocol):
         year: int | None = None,
         is_anime: bool = False,
         user_id: int | None = None,
+        poster_url: str | None = None,
+        backdrop_url: str | None = None,
     ) -> RequestRecord:
         """Insert a new request and return the persisted record."""
         raise NotImplementedError
 
     async def set_status(self, request_id: int, status: str) -> None:
         """Update a request's status."""
+
+    async def mark_completed(self, request_id: int) -> None:
+        """Mark a request ``completed`` (imported, scan triggered) + stamp the time.
+
+        The honest pre-``available`` state: the file is in the library and a Plex
+        scan was triggered, but Plex has not yet confirmed it is indexed.
+        """
+        raise NotImplementedError
+
+    async def mark_available(self, request_id: int) -> None:
+        """Mark a request ``available`` + stamp ``library_verified_at``.
+
+        Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
+        the title — never asserts watchable before Plex actually has it.
+        """
+        raise NotImplementedError
 
 
 @runtime_checkable

@@ -12,17 +12,27 @@ issued with the credential carried in a header (never in a logged URL).
 
 from __future__ import annotations
 
+import os
+from typing import TYPE_CHECKING
+
 import httpx
 
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
 from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
-from plex_manager.web.schemas import ServiceValidateResponse
+from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from plex_manager.ports.library import LibrarySection
 
 __all__ = [
+    "movie_library_options",
     "validate_plex",
     "validate_prowlarr",
     "validate_qbittorrent",
@@ -34,31 +44,82 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_FORBIDDEN = 403
 
 
-async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
-    """Check a Plex server + token via ``GET /identity`` (token in header)."""
-    try:
-        response = await client.get(
-            f"{url.rstrip('/')}/identity",
-            headers={"X-Plex-Token": token, "Accept": "application/json"},
+def _is_writable(path: str) -> bool:
+    """Whether the app's OWN process can write into ``path`` (a Plex library dir).
+
+    Deliberately read-only (``os.access``): it never writes, so a Plex an attacker
+    pointed us at cannot be turned into an arbitrary-write probe. It can be
+    optimistic under NFS root-squash / a container-UID mismatch — a false positive
+    surfaces later as an honest, retryable ``ImportBlocked``, never a silent fail.
+    """
+    return os.path.isdir(path) and os.access(path, os.W_OK)
+
+
+def movie_library_options(
+    sections: Sequence[LibrarySection], *, probe_writable: bool = True
+) -> list[PlexLibraryOption]:
+    """Map Plex's movie sections to pickable ``movies_root`` folders + writability.
+
+    The paths come from Plex's own ``/library/sections`` (not a typed request
+    value), so choosing one avoids a path-injection sink AND guarantees the
+    targeted-scan path match. Every movie-section location is offered; the UI marks
+    (and disables) the non-writable ones, which is the split-mount signal.
+
+    ``probe_writable`` gates the only filesystem touch. The authenticated Settings
+    picker leaves it True (the operator's own stored creds make the probe theirs).
+    The PRE-INIT ``validate/plex`` wizard step passes False: there the Plex server
+    is caller-supplied and unauthenticated, so probing its reported locations would
+    turn this into a pre-auth local-FS existence/writability oracle. With it False
+    we report ``writable=None`` (UNKNOWN) — honest, never a faked bool — and never
+    call ``_is_writable`` / ``os.access`` on an attacker-chosen path.
+    """
+    return [
+        PlexLibraryOption(
+            section_key=section.key,
+            title=section.title,
+            path=path,
+            writable=_is_writable(path) if probe_writable else None,
         )
-    except httpx.HTTPError as exc:
-        # The token travels in a header, not the URL, so str(exc) cannot leak it.
+        for section in sections
+        if section.type == "movie"
+        for path in section.locations
+    ]
+
+
+async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
+    """Validate Plex + token AND return the movie library folders to pick from.
+
+    Uses the real adapter (``list_sections``): one call both proves connectivity +
+    token and yields the library locations, so the wizard offers a writable-folder
+    pick-list for ``movies_root`` instead of a typed, mismatch-prone path. The token
+    rides the ``X-Plex-Token`` header, never the URL.
+    """
+    try:
+        sections = await PlexLibrary(client, url, token).list_sections()
+    except PlexAuthError:
+        return ServiceValidateResponse(ok=False, message="Plex rejected the token.")
+    except PlexLibraryError as exc:
         return ServiceValidateResponse(
             ok=False, message="Could not reach the Plex server.", detail=str(exc)
         )
-    if response.status_code == _HTTP_OK:
-        return ServiceValidateResponse(ok=True, message="Connected to Plex.")
-    if response.status_code in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
+    # probe_writable=False: this endpoint is reachable PRE-INIT against a
+    # caller-supplied Plex server, so never touch the local filesystem here (no
+    # pre-auth existence/writability oracle). Writability is reported UNKNOWN
+    # (None); the authenticated Settings picker fills in the real signal later.
+    libraries = movie_library_options(sections, probe_writable=False)
+    if not libraries:
+        # Connectivity + token are fine, but an install with no Movie library cannot
+        # import anything (every scan would raise "no Plex movie library section").
+        # Report ok=False so the wizard stops here instead of letting the operator
+        # finish into a configured-but-unusable state — north-star: honest, with a
+        # next step, never a silent pass.
         return ServiceValidateResponse(
             ok=False,
-            message="Plex rejected the token.",
-            detail=f"HTTP {response.status_code}",
+            message="Connected to Plex, but no Movie library exists yet — "
+            "add a Movie library in Plex, then test again.",
+            libraries=[],
         )
-    return ServiceValidateResponse(
-        ok=False,
-        message="Unexpected response from Plex.",
-        detail=f"HTTP {response.status_code}",
-    )
+    return ServiceValidateResponse(ok=True, message="Connected to Plex.", libraries=libraries)
 
 
 async def validate_prowlarr(

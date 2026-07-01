@@ -66,7 +66,8 @@ _RAW_STATE_MAP: Mapping[str, DownloadState] = {
     # fetching metadata (magnet without .torrent yet)
     "metaDL": DownloadState.MetadataFetching,
     "forcedMetaDL": DownloadState.MetadataFetching,
-    # download complete -> seeding / checking-up / moving: import deferred in alpha
+    # download complete -> seeding / checking-up: bytes are settled on disk, ready
+    # to import.
     "uploading": DownloadState.ImportPending,
     "stalledUP": DownloadState.ImportPending,
     "pausedUP": DownloadState.ImportPending,
@@ -74,7 +75,10 @@ _RAW_STATE_MAP: Mapping[str, DownloadState] = {
     "queuedUP": DownloadState.ImportPending,
     "checkingUP": DownloadState.ImportPending,
     "forcedUP": DownloadState.ImportPending,
-    "moving": DownloadState.ImportPending,
+    # ``moving`` is qBittorrent actively relocating the files: NOT settled. Keep it
+    # an active (non-import) state so the importer never reads a half-moved file and
+    # blesses a truncated copy; it advances to an *UP state once the move completes.
+    "moving": DownloadState.Downloading,
     # hard client-side failure
     "error": DownloadState.FailedPending,
     "missingFiles": DownloadState.FailedPending,

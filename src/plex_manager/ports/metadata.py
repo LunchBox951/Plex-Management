@@ -12,6 +12,7 @@ from typing import Literal, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "MediaPage",
     "MediaSearchResult",
     "MetadataPort",
     "MovieMetadata",
@@ -32,6 +33,18 @@ class MediaSearchResult(BaseModel):
     year: int | None = None
     overview: str | None = None
     poster_url: str | None = None
+    backdrop_url: str | None = None
+
+
+class MediaPage(BaseModel):
+    """One page of a paginated discovery list (trending / popular / upcoming)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    page: int
+    total_pages: int
+    total_results: int
+    results: list[MediaSearchResult]
 
 
 class MovieMetadata(BaseModel):
@@ -45,6 +58,7 @@ class MovieMetadata(BaseModel):
     year: int | None = None
     overview: str | None = None
     poster_url: str | None = None
+    backdrop_url: str | None = None
     is_anime: bool = False
 
 
@@ -60,6 +74,7 @@ class TvMetadata(BaseModel):
     year: int | None = None
     overview: str | None = None
     poster_url: str | None = None
+    backdrop_url: str | None = None
     season_count: int = 0
     is_anime: bool = False
 
@@ -77,3 +92,15 @@ class MetadataPort(Protocol):
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
         """Resolve a TV show by tmdb id, or ``None`` if not found."""
+
+    async def trending_movies(self, page: int = 1) -> MediaPage:
+        """List the week's trending movies, one page at a time."""
+        raise NotImplementedError
+
+    async def popular_movies(self, page: int = 1) -> MediaPage:
+        """List currently popular movies, one page at a time."""
+        raise NotImplementedError
+
+    async def upcoming_movies(self, page: int = 1) -> MediaPage:
+        """List upcoming movie releases, one page at a time."""
+        raise NotImplementedError
