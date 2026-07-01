@@ -11,7 +11,7 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.services import request_service
-from plex_manager.services.request_service import MediaNotFoundError
+from plex_manager.services.request_service import MediaNotFoundError, MediaTypeDeferredError
 from plex_manager.web.deps import (
     get_library_optional,
     get_session,
@@ -71,6 +71,11 @@ async def create_request_endpoint(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="media_not_found",
+        ) from exc
+    except MediaTypeDeferredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="media_type_deferred",
         ) from exc
     return _to_response(record)
 

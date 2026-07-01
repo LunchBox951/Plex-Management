@@ -963,6 +963,11 @@ export interface components {
             app_api_key?: string | null;
             /** Initialized */
             initialized: boolean;
+            /**
+             * Setup Token Required
+             * @default false
+             */
+            setup_token_required: boolean;
         };
         /**
          * TmdbValidateRequest

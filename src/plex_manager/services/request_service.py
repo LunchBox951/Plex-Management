@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 __all__ = [
     "TERMINAL_REQUEST_STATUS_VALUES",
     "MediaNotFoundError",
+    "MediaTypeDeferredError",
     "create_request",
     "get_request",
     "list_requests",
@@ -59,6 +60,14 @@ class MediaNotFoundError(Exception):
         self.tmdb_id = tmdb_id
         self.media_type = media_type
         super().__init__(f"{media_type} tmdb_id={tmdb_id} not found")
+
+
+class MediaTypeDeferredError(Exception):
+    """The app cannot safely process this media type yet."""
+
+    def __init__(self, media_type: str) -> None:
+        self.media_type = media_type
+        super().__init__(f"{media_type} requests are deferred")
 
 
 class _Detail(NamedTuple):
@@ -134,6 +143,9 @@ async def create_request(
     not a wasted grab. An unconfigured/unreachable Plex skips the check (see
     :func:`_already_in_library`).
     """
+    if media_type != "movie":
+        raise MediaTypeDeferredError(media_type)
+
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:

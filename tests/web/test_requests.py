@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 import httpx
 from fastapi import FastAPI
 
-from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from tests.web.fakes import FakeLibrary, FakeTmdb, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -100,6 +100,22 @@ async def test_create_unknown_media_is_404(
     )
     assert response.status_code == 404
     assert response.json()["detail"] == "media_not_found"
+
+
+async def test_create_tv_request_is_deferred(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=FakeTmdb(shows={44: TvMetadata(tmdb_id=44, title="Show")}))
+
+    response = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 44, "media_type": "tv"}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "media_type_deferred"
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.json()["requests"] == []
 
 
 async def test_get_missing_request_is_404(client: httpx.AsyncClient, seed: SeedFn) -> None:

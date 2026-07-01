@@ -66,15 +66,21 @@ recovery, troubleshooting — happens in the browser** (see
 [ADR-0005](docs/adr/0005-zero-terminal-web-operability.md)).
 
 ```bash
-cp .env.example .env      # adjust host port, image, bind mounts, database URL
-docker compose up -d      # pulls the image and starts the service
-# then open http://<host>:8000 and complete the setup wizard
+cp .env.example .env
+python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+# adjust image, bind mounts, database URL, and host bind/port as needed
+docker compose up -d
+# then open http://127.0.0.1:8000 and enter the setup token from .env
 ```
 
 Before starting the container, set `PLEX_MANAGER_MEDIA_ROOT` and
 `PLEX_MANAGER_DOWNLOADS_ROOT` in `.env` to host directories that contain the Plex
 libraries and qBittorrent downloads. They are mounted as `/media` and `/downloads`
 inside the container; the setup wizard paths must use those in-container paths.
+The stock compose file publishes only on `127.0.0.1` and requires
+`PLEX_MANAGER_SETUP_TOKEN` so a fresh uninitialized install cannot be claimed
+remotely. Use an SSH tunnel or reverse proxy for first setup; only set
+`PLEX_MANAGER_HOST_BIND=0.0.0.0` when the host is intentionally exposed.
 
 Each host is *designed* to auto-pull its release channel (the updater mechanism —
 Watchtower vs. a systemd timer — is an open decision and is not bundled in the

@@ -9,12 +9,15 @@ const h = vi.hoisted(() => ({
   validate: vi.fn(),
   complete: vi.fn(),
   setApiKey: vi.fn(),
+  setSetupToken: vi.fn(),
+  clearSetupToken: vi.fn(),
   initialized: false,
+  setupTokenRequired: false,
 }))
 
 vi.mock('../api/hooks', () => ({
   useSetupStatus: () => ({
-    data: { initialized: h.initialized },
+    data: { initialized: h.initialized, setup_token_required: h.setupTokenRequired },
     isLoading: false,
   }),
   useValidateService: () => ({ mutateAsync: h.validate, isPending: false }),
@@ -23,6 +26,8 @@ vi.mock('../api/hooks', () => ({
 
 vi.mock('../lib/apiKey', () => ({
   setApiKey: h.setApiKey,
+  setSetupToken: h.setSetupToken,
+  clearSetupToken: h.clearSetupToken,
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -48,7 +53,10 @@ describe('SetupWizard', () => {
     h.validate.mockReset()
     h.complete.mockReset()
     h.setApiKey.mockReset()
+    h.setSetupToken.mockReset()
+    h.clearSetupToken.mockReset()
     h.initialized = false
+    h.setupTokenRequired = false
   })
 
   it('ignores a stale validation success after fields are edited', async () => {
@@ -125,5 +133,33 @@ describe('SetupWizard', () => {
     await waitFor(() => expect(h.setApiKey).toHaveBeenCalledWith('one-time-key'))
     expect(await screen.findByText('one-time-key')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /continue/i })).toBeInTheDocument()
+  })
+
+  it('requires the configured setup token before validation or completion', async () => {
+    h.setupTokenRequired = true
+    h.validate.mockResolvedValue({ ok: true, message: 'Plex ok', libraries: [] })
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    expect(screen.getByLabelText('Setup token')).toBeInTheDocument()
+    expect(testButtons[0]).toBeDisabled()
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeDisabled()
+
+    fireEvent.change(screen.getByLabelText('Setup token'), {
+      target: { value: 'boot-token' },
+    })
+
+    expect(h.setSetupToken).toHaveBeenCalledWith('boot-token')
+    expect(testButtons[0]).toBeEnabled()
+
+    fireEvent.click(testButtons[0]!)
+    await waitFor(() => expect(h.validate).toHaveBeenCalled())
+
+    fireEvent.change(screen.getByLabelText('Setup token'), {
+      target: { value: '' },
+    })
+    expect(h.clearSetupToken).toHaveBeenCalled()
+    expect(testButtons[0]).toBeDisabled()
   })
 })

@@ -55,6 +55,7 @@ describe('Queue actions', () => {
 
     render(<Queue />)
 
+    expect(screen.getByRole('progressbar', { name: /download progress/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^mark failed$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /blocklist & fail/i })).toBeInTheDocument()
   })

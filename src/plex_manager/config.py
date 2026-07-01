@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     # the :stable deployment leaves this False.
     dev_auth_bypass: bool = False
 
+    # Optional one-time bootstrap token for first-run setup. Docker Compose requires
+    # this so an uninitialized host cannot be claimed over the published port.
+    setup_token: SecretStr | None = None
+
     log_level: str = "INFO"
 
 
