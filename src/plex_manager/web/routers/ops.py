@@ -372,7 +372,13 @@ async def _disk_root_item(
     (logged), the same honest degraded-preview posture as an unreadable root,
     rather than 500ing the WHOLE ``/ops/disk`` response over one root's preview.
     """
-    cached = cache.get(root_path)
+    # Key by media_type AND path: movies_root and tv_root can be configured to the
+    # SAME directory, and the movie vs TV preview of that path is different
+    # (different candidate sets). Keying on root_path alone would serve the first
+    # role's cached DiskRootItem for the second, duplicating one root and never
+    # computing the other's preview until the TTL expired.
+    cache_key = f"{media_type}:{root_path}"
+    cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -390,7 +396,7 @@ async def _disk_root_item(
             error=str(exc),
             candidates=[],
         )
-        cache.set(root_path, result)
+        cache.set(cache_key, result)
         return result
 
     candidates: list[EvictionCandidateItem] = []
@@ -442,7 +448,7 @@ async def _disk_root_item(
         error=None,
         candidates=candidates,
     )
-    cache.set(root_path, result)
+    cache.set(cache_key, result)
     return result
 
 

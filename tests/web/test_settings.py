@@ -42,6 +42,20 @@ def test_every_known_setting_key_has_a_response_and_update_field() -> None:
         assert key in SettingsUpdate.model_fields, f"{key} missing from SettingsUpdate"
 
 
+def test_settings_update_rejects_target_above_threshold() -> None:
+    # R2-2: a disk_pressure_target above the trigger threshold makes every root in the
+    # [threshold, target] band read "under pressure" yet select nothing -> a silent
+    # dead band. When both are sent together it must be a visible 422, not accepted.
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=90.0)
+    # equal and below the threshold are both fine.
+    SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=80.0)
+    SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=70.0)
+
+
 async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})

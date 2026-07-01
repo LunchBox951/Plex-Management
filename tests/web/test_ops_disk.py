@@ -96,6 +96,29 @@ async def test_disk_reports_usage_and_ranked_candidate_when_plex_configured(
     assert movie_file.exists()
 
 
+async def test_disk_keys_preview_cache_by_media_type_not_just_path(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # R2-1: movies_root and tv_root configured to the SAME directory. The per-root
+    # preview cache must key by (media_type, path); keyed on path alone, the tv call
+    # would return the cached movie DiskRootItem -> two 'movies_root' entries and no
+    # tv preview. Both distinct labels must come back.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _set_movies_root(sessionmaker_, str(tmp_path))
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("tv_root", str(tmp_path))
+        await session.commit()
+    override_adapters(app, library=FakeLibrary())
+
+    response = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    labels = [r["root"] for r in response.json()["roots"]]
+    assert labels == ["movies_root", "tv_root"]
+
+
 async def test_disk_candidates_empty_when_plex_unconfigured(
     client: httpx.AsyncClient,
     seed: SeedFn,

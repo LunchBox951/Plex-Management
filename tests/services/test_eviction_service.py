@@ -180,6 +180,9 @@ async def test_evicts_a_watched_past_grace_movie_and_deletes_the_file(
 
     assert [o.title for o in outcomes] == ["Old Movie"]
     assert not Path(library_path).exists()
+    # R2-3: Plex is refreshed for the deleted path so a later "Request again" sees it
+    # gone (pending) rather than a stale in-library 'available'.
+    assert (library_path, "movie") in library.scan_calls
 
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
@@ -915,7 +918,7 @@ async def test_recheck_honors_a_keep_forever_pin_that_lands_after_assembly(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, candidate=stale, pending=pending
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
         )
 
     assert outcome is None
@@ -984,7 +987,7 @@ async def test_recheck_honors_a_keep_forever_pin_on_the_parent_for_a_tv_season(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, candidate=stale, pending=pending
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
         )
 
     assert outcome is None
@@ -1047,7 +1050,7 @@ async def test_recheck_skips_a_row_a_concurrent_sweep_already_evicted(
 
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, candidate=stale, pending=pending
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
         )
 
     assert outcome is None  # never double-counted
@@ -1287,7 +1290,11 @@ async def test_concurrent_evict_one_calls_for_the_same_row_never_double_count(
     async def _second_call() -> eviction_service.EvictionOutcome | None:
         async with sm() as second_session:
             return await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-                session=second_session, fs=fs, candidate=stale, pending=pending
+                session=second_session,
+                fs=fs,
+                library=FakeLibrary(),
+                candidate=stale,
+                pending=pending,
             )
 
     fs = _ConcurrentSecondEvictFs(loop=asyncio.get_running_loop(), second_call=_second_call)
@@ -1295,7 +1302,11 @@ async def test_concurrent_evict_one_calls_for_the_same_row_never_double_count(
     try:
         async with sm() as first_session:
             first_outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-                session=first_session, fs=fs, candidate=stale, pending=pending
+                session=first_session,
+                fs=fs,
+                library=FakeLibrary(),
+                candidate=stale,
+                pending=pending,
             )
 
         # EXACTLY ONE of the two overlapping calls actually recorded the

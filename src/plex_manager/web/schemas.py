@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "AcceptedRelease",
@@ -247,6 +247,31 @@ class SettingsUpdate(BaseModel):
     eviction_proactive_enabled: bool | None = Field(default=None)
     eviction_interval_minutes: float | None = Field(default=None, gt=0)
     log_retention_days: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _target_at_or_below_threshold(self) -> SettingsUpdate:
+        """Reject a target ABOVE the trigger threshold when both are set together.
+
+        ``select_evictions`` starts ``projected = used_pct`` and stops the moment
+        ``used_pct <= target_pct``. So a target above the threshold makes every root
+        in the ``[threshold, target]`` band read "under pressure" yet select NOTHING
+        — a valid-looking settings update that silently disables pressure relief. A
+        422 here makes that misconfiguration visible instead of a silent dead band.
+        (Enforced when both fields are present in the same request — which the
+        Settings form always sends together. A direct-API split update that changes
+        only ONE side against a stored other side is not cross-checked here; that
+        narrower path is a known residual.)
+        """
+        threshold = self.disk_pressure_threshold_percent
+        target = self.disk_pressure_target_percent
+        if threshold is not None and target is not None and target > threshold:
+            msg = (
+                "disk_pressure_target_percent must be <= disk_pressure_threshold_percent "
+                "(a target above the trigger leaves the whole threshold-to-target band "
+                "under 'pressure' with nothing to evict)"
+            )
+            raise ValueError(msg)
+        return self
 
 
 # --------------------------------------------------------------------------- #

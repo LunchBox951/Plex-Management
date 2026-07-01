@@ -44,6 +44,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.domain.eviction import (
     EvictionCandidate,
@@ -344,6 +345,7 @@ async def _evict_one(
     *,
     session: AsyncSession,
     fs: FileSystemPort,
+    library: LibraryPort,
     candidate: EvictionCandidate,
     pending: _Pending,
 ) -> EvictionOutcome | None:
@@ -454,6 +456,26 @@ async def _evict_one(
         )
     )
     await session.commit()
+
+    # Tell Plex the media is gone, so a subsequent "Request again" sees it as ABSENT
+    # (a fresh pending request that re-grabs), not a stale in-library 'available'. A
+    # Plex install keeps a removed item in metadata until a library refresh, and
+    # create_request's is_available / present_seasons (use_cache=False) would
+    # otherwise trust that stale item and record the re-request as 'available' -> the
+    # deleted files are never re-fetched. Best-effort + symmetric with the import
+    # pipeline's post-place scan: the eviction itself already committed, so a Plex
+    # outage here is logged (Plex will catch up on its next scheduled scan), never a
+    # failure that undoes a completed eviction.
+    try:
+        await library.trigger_scan(library_path, candidate.media_type)
+    except (PlexLibraryError, PlexAuthError) as exc:
+        _logger.warning(
+            "post-eviction Plex refresh failed for %r (%s); Plex may briefly still "
+            "report it present until its next scheduled scan",
+            candidate.title,
+            type(exc).__name__,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
 
     _logger.info(
         "evicted %r%s: watched, past grace period, disk-pressure relief",
@@ -595,7 +617,11 @@ async def run_eviction_sweep(
     for candidate in selected:
         try:
             outcome = await _evict_one(
-                session=session, fs=fs, candidate=candidate, pending=pending_by_id[id(candidate)]
+                session=session,
+                fs=fs,
+                library=library,
+                candidate=candidate,
+                pending=pending_by_id[id(candidate)],
             )
         except Exception:
             # Mirrors import_service.run_import_cycle / run_availability_cycle:
