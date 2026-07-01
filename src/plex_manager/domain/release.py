@@ -59,6 +59,12 @@ class ParsedRelease(BaseModel):
     # a multi-season pack (``S01-S03``) yields a ``list[int]``; ``None`` when the
     # name exposes no season at all. The wrong-season gate reads this.
     season: int | list[int] | None = None
+    # Parsed episode(s), same shape as ``season``. A single ``SxxExx`` yields an
+    # ``int``; a multi-episode file (``S02E05E06`` / ``S02E05-E06``) yields a
+    # ``list[int]``; ``None`` when the name exposes no episode at all — a whole
+    # season pack has a season but no episode. ``classify_release_scope`` and the
+    # import-validation episode gate both read this.
+    episode: int | list[int] | None = None
     source: QualitySource = QualitySource.UNKNOWN
     resolution: Resolution = Resolution.UNKNOWN
     modifier: Modifier = Modifier.NONE
