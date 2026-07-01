@@ -333,6 +333,16 @@ _TV_FIELDS: dict[str, dict[str, object]] = {
         "screen_size": "1080p",
     },
     "Breaking.Bad.S02.sample.mkv": {"title": "sample"},
+    # A split-disk chunk of a single episode: it STILL parses with a valid
+    # episode number, so without the same MULTI_PART guard validate_import uses
+    # it would otherwise reach an accepted result.
+    "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -452,3 +462,33 @@ def test_multi_episode_file_skipped_when_no_overlap_at_all() -> None:
     assert result.rejected == ()
     assert len(result.skipped_not_requested) == 1
     assert result.skipped_not_requested[0].episodes == (4, 5)
+
+
+def test_split_part_episode_rejects_multi_part() -> None:
+    # F5: a split TV episode chunk (S02E01.CD1) still parses with a valid episode
+    # number, so without applying the SAME split-part guard validate_import uses,
+    # it would reach an accepted result here; the duplicate-destination logic
+    # would then keep only the largest chunk and mark the season completed with
+    # an incomplete episode file. It must be rejected MULTI_PART instead.
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert result.accepted == ()
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.MULTI_PART
+    assert result.rejected[0].relative_path == "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_split_part_episode_rejected_others_in_pack_still_accepted() -> None:
+    # Partial success stays legit: a split chunk for E01 is rejected while a
+    # clean E02 file in the SAME pack is still accepted -- the season import is
+    # not all-or-nothing.
+    result = _validate_season(
+        VideoFile("Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        VideoFile("Breaking.Bad.S02E02.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].episodes == (2,)
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.MULTI_PART
+    assert result.rejected[0].relative_path == "Breaking.Bad.S02E01.CD1.1080p.WEB-DL.x264-GRP.mkv"

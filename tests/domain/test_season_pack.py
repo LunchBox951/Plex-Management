@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from plex_manager.domain.release import ParsedRelease
-from plex_manager.domain.season_pack import classify_release_scope
+from plex_manager.domain.season_pack import classify_release_scope, covers_requested_episodes
 
 
 def _parsed(
@@ -47,3 +47,42 @@ def test_single_element_season_list_treated_as_single_season() -> None:
     # A one-element season list behaves exactly like the equivalent int.
     assert classify_release_scope(_parsed(season=[2], episode=None)) == "season_pack"
     assert classify_release_scope(_parsed(season=[2], episode=5)) == "single_episode"
+
+
+# -- covers_requested_episodes (F4: episode-overlap gate) --
+
+
+def test_covers_requested_episodes_single_episode_matching() -> None:
+    assert covers_requested_episodes(_parsed(season=2, episode=4), requested=[4]) is True
+
+
+def test_covers_requested_episodes_single_episode_wrong_episode_is_the_core_bug() -> None:
+    # S02E01 does not cover a request for E04 -- the exact wrong-torrent bug F4
+    # exists to stop: a tracker returning the wrong episode of the right season.
+    assert covers_requested_episodes(_parsed(season=2, episode=1), requested=[4]) is False
+
+
+def test_covers_requested_episodes_whole_season_pack_never_rejected() -> None:
+    # A whole-season pack (no episode token) inherently contains whatever episode
+    # is requested -- packs are never rejected by this gate.
+    assert covers_requested_episodes(_parsed(season=2, episode=None), requested=[4]) is True
+
+
+def test_covers_requested_episodes_multi_season_pack_never_rejected() -> None:
+    assert covers_requested_episodes(_parsed(season=[1, 2, 3], episode=None), requested=[4]) is True
+
+
+def test_covers_requested_episodes_multi_episode_file_partial_overlap_kept() -> None:
+    # A multi-episode file overlapping even partially with the requested set is
+    # kept -- a file cannot be split, mirroring validate_season_import's posture.
+    assert covers_requested_episodes(_parsed(season=2, episode=[4, 5]), requested=[4]) is True
+
+
+def test_covers_requested_episodes_multi_episode_file_no_overlap_rejected() -> None:
+    assert covers_requested_episodes(_parsed(season=2, episode=[1, 2]), requested=[4]) is False
+
+
+def test_covers_requested_episodes_unknown_scope_conservative_reject() -> None:
+    # No season at all -> "unknown" scope -- conservative reject, mirroring the
+    # missing-season posture already used elsewhere.
+    assert covers_requested_episodes(_parsed(season=None, episode=None), requested=[4]) is False

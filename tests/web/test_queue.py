@@ -909,3 +909,112 @@ async def test_grab_threads_season_and_episodes_into_search_and_queue_item(
     # The indexer search itself was narrowed to the single named episode.
     assert prowlarr.searched[-1].season == 2
     assert prowlarr.searched[-1].episode == "5"
+
+
+async def test_grab_tv_without_season_rejected_422_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """F1: a tv request grabbed with NO season is rejected up front (422), BEFORE
+    run_preview even runs an unscoped search -- no Download row, no SeasonRequest
+    spuriously created, the parent's computed rollup status is untouched, and
+    NOTHING is handed to qBittorrent (an unscoped tv grab would otherwise update
+    the parent MediaRequest directly instead of a SeasonRequest, corrupting the
+    computed-rollup invariant, and the importer would later block it as
+    season-less)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    async with sessionmaker_() as session:
+        pre_request = await session.get(MediaRequest, request_id)
+        assert pre_request is not None
+        pre_status = pre_request.status
+        pre_season_count = len(
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Show.S02E05.1080p.WEB-DL.x264-GROUP", info_hash="5" * 40)]
+        ),
+        qbt=qbt,
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "tv_grab_requires_season"
+
+    # Nothing was ever handed to the download client.
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+        assert downloads == []  # no Download row created at all
+
+        post_request = await session.get(MediaRequest, request_id)
+        assert post_request is not None
+        assert post_request.status == pre_status  # unchanged computed rollup
+
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(seasons) == pre_season_count  # no season rows spuriously created
+
+
+async def test_grab_movie_with_season_rejected_422_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """F6: a movie grab carrying a ``season`` is rejected up front (422) rather
+    than silently treated as tv -- a movie must never spawn a SeasonRequest row
+    or have its one-active-download guard scoped to a fake season."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 1},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "movie_grab_rejects_season"
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+        assert downloads == []
+        seasons = (await session.execute(select(SeasonRequest))).scalars().all()
+        assert seasons == []

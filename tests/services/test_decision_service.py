@@ -233,6 +233,89 @@ async def test_preview_rejects_wrong_season_pack(sessionmaker_: SessionMaker) ->
     assert rejected["The.Mandalorian.S01.1080p.WEB-DL.x264-GROUP"] is RejectionReason.WRONG_MEDIA
 
 
+async def test_preview_rejects_wrong_episode_even_at_top_quality(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """F4: a request scoped to a specific episode (E04) must never accept/rank a
+    same-season release for a DIFFERENT episode (E01), even when a tracker
+    returns it at a HIGHER quality that would otherwise win the top pick. The
+    right episode and the season pack both still accept."""
+    wrong_episode_top_quality = candidate(
+        "The.Mandalorian.S02E01.2160p.WEB-DL.x264-GROUP", info_hash="1" * 40, seeders=999
+    )
+    right_episode = candidate(
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="2" * 40, seeders=10
+    )
+    pack = candidate("The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="3" * 40, seeders=10)
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([wrong_episode_top_quality, right_episode, pack]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+            episodes=[4],
+        )
+
+    accepted_titles = [s.candidate.title for s in result.accepted]
+    assert wrong_episode_top_quality.title not in accepted_titles
+    assert right_episode.title in accepted_titles
+    assert pack.title in accepted_titles
+    # Critically, the top pick (what _select_release/grab would default to) is
+    # never the wrong-episode release, even though it is the highest quality.
+    assert result.accepted[0].candidate.title != wrong_episode_top_quality.title
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert rejected[wrong_episode_top_quality.title] is RejectionReason.WRONG_MEDIA
+
+
+async def test_preview_whole_season_request_still_accepts_all_episodes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """No-regression: with NO specific episodes named (a whole-season request),
+    the episode-overlap gate must not fire -- every episode of the season,
+    including one that would be "wrong" under an episode-scoped request, is a
+    legitimate accept."""
+    e01 = candidate("The.Mandalorian.S02E01.2160p.WEB-DL.x264-GROUP", info_hash="1" * 40)
+    e04 = candidate("The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="2" * 40)
+    pack = candidate("The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="3" * 40)
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([e01, e04, pack]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+        )
+    assert {s.candidate.title for s in result.accepted} == {e01.title, e04.title, pack.title}
+
+
+async def test_preview_movie_unaffected_by_episode_overlap_gate(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """No-regression: a movie preview (``episodes`` always ``None``) is untouched
+    by the TV-only episode-overlap gate."""
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr(good_and_cam_candidates()),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=603,
+            title="Some Movie",
+            media_type="movie",
+            year=2020,
+        )
+    assert [s.quality.name for s in result.accepted] == ["WEBDL-1080p"]
+
+
 async def test_preview_rejects_mismatched_tmdb_id(sessionmaker_: SessionMaker) -> None:
     # A candidate whose own tmdb id disagrees with the request's tmdb id is a
     # definitive wrong-media reject — the title looks right but the id is decisive.

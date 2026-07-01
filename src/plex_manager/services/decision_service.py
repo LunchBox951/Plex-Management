@@ -15,7 +15,12 @@ The ``media_match`` hook is built from the request's expected (title, year, tmdb
 id) and delegates to the pure :func:`plex_manager.domain.media_match.matches_media`
 helper, so a release Prowlarr returned for a *different* title (an indexer that
 ignored the ``tmdbid`` param, or a stale mapping) is rejected ``WRONG_MEDIA``
-before it can be scored — never silently grabbed.
+before it can be scored — never silently grabbed. For a TV request naming
+specific ``episodes``, the same hook additionally gates on
+:func:`plex_manager.domain.season_pack.covers_requested_episodes`, so a
+single-episode release for the right show/season but the WRONG episode (a
+tracker that ignored or couldn't narrow to the requested episode) is rejected
+before it can rank/grab, rather than caught only later at import time.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from plex_manager.domain.blocklist import is_blocklisted as _is_blocklisted
 from plex_manager.domain.decision_engine import DecisionResult, decide
 from plex_manager.domain.media_match import matches_media
 from plex_manager.domain.release import IndexerSearchRequest, MediaType
+from plex_manager.domain.season_pack import covers_requested_episodes
 
 if TYPE_CHECKING:
     from plex_manager.domain.quality_profile import QualityProfile
@@ -117,14 +123,29 @@ async def preview(
     match_season = season if media_type == "tv" else None
 
     def _media_match(candidate: CandidateRelease, parsed: ParsedRelease) -> bool:
-        return matches_media(
+        if not matches_media(
             parsed,
             expected_title=title,
             expected_year=match_year,
             candidate_tmdb_id=candidate.tmdb_id,
             expected_tmdb_id=tmdb_id,
             expected_season=match_season,
-        )
+        ):
+            return False
+        # Episode-overlap gate (TV only, specific episodes named): the season
+        # gate above only confirms the release covers the right SEASON -- a
+        # tracker that ignores (or can't narrow to) the requested episode(s) can
+        # still return a single-episode release for a DIFFERENT episode of that
+        # same season (e.g. S02E01 when E04 was requested). Without this, that
+        # wrong-episode release would rank/grab like any other accepted
+        # candidate, and the importer would only catch it after the wrong
+        # torrent was already added (skipped_not_requested, a blocked download).
+        # A whole-season pack always passes (it inherently contains whatever
+        # episode is requested); movies and whole-season requests (no specific
+        # episodes named) are unaffected since ``episodes`` is empty/None then.
+        if media_type != "tv" or not episodes:
+            return True
+        return covers_requested_episodes(parsed, episodes)
 
     # "Whole season" only: a season-scoped tv request with NO specific episodes
     # named. Naming episode(s) means the operator wants those episodes, not

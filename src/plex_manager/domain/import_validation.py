@@ -41,6 +41,7 @@ from plex_manager.domain.media_match import matches_media
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.release import ParsedRelease
+from plex_manager.domain.season_pack import episode_numbers as _episode_numbers
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.ports.parser import ParserPort
@@ -370,19 +371,6 @@ def validate_import(
     )
 
 
-def _episode_numbers(episode: int | list[int] | None) -> tuple[int, ...]:
-    """Normalize a parsed ``episode`` field to a sorted, deduplicated tuple.
-
-    ``None`` (no episode number at all) collapses to an empty tuple, which is
-    exactly the caller's :attr:`~ImportRejectionReason.NO_EPISODE_NUMBER` trigger.
-    """
-    if episode is None:
-        return ()
-    if isinstance(episode, int):
-        return (episode,)
-    return tuple(sorted(set(episode)))
-
-
 def validate_season_import(
     files: Sequence[VideoFile],
     *,
@@ -420,11 +408,18 @@ def validate_season_import(
     4. Quality hard gate, identical to :func:`validate_import` (PROFILE-ALLOWED,
        not equal-to-grabbed).
     5. Sample / indeterminate-size floor, identical to :func:`validate_import`.
-    6. NEW: episode-number gate — a file that parses with NO episode number at all
+    6. Multi-part / split-disk shape, identical to :func:`validate_import`
+       (:func:`_is_multi_part`): a split TV episode (``S02E01.CD1``/``Disc 1``)
+       still parses with a valid episode number, so without this gate it would
+       otherwise reach an ``accepted`` result and the caller's duplicate-
+       destination handling would keep only the largest chunk, completing the
+       season with an incomplete episode file. Rejected
+       :attr:`~ImportRejectionReason.MULTI_PART`, same as a movie split.
+    7. Episode-number gate — a file that parses with NO episode number at all
        cannot be placed as a named episode:
        :attr:`~ImportRejectionReason.NO_EPISODE_NUMBER`.
 
-    ALL applicable reasons (3-6) are collected for a file — one
+    ALL applicable reasons (3-7) are collected for a file — one
     :class:`EpisodeImportRejection` per reason, never just the first.
 
     When ``requested_episodes`` is given (the operator asked for specific
@@ -491,7 +486,20 @@ def validate_season_import(
                 )
             )
 
-        # 6. Episode-number gate (TV-only, new).
+        # 6. Multi-part / split-disk shape — a split TV chunk still parses with a
+        #    valid episode number, so without this gate it would slip through as
+        #    a legitimate accepted episode and the duplicate-destination logic
+        #    would keep only the largest chunk, completing the season with an
+        #    incomplete episode file. Identical rule to validate_import's step 6.
+        if _is_multi_part(video.relative_path, expected_title):
+            reasons.append(
+                (
+                    ImportRejectionReason.MULTI_PART,
+                    f"path {video.relative_path!r} carries a multi-part / split-disk marker",
+                )
+            )
+
+        # 7. Episode-number gate (TV-only).
         episodes = _episode_numbers(parsed.episode)
         if not episodes:
             reasons.append(

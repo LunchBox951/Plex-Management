@@ -28,6 +28,7 @@ from plex_manager.services.grab_service import (
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
+    SeasonRequiredError,
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
@@ -131,6 +132,29 @@ async def grab_endpoint(
         # Mirrors grab_service's RequestNotActiveError guard so both paths agree.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
 
+    # Branch on the request's ACTUAL media type, never on whether ``body.season``
+    # happens to be set -- a grab is always per-season for tv and never scoped
+    # for a movie, so the two invalid combinations are rejected up front, BEFORE
+    # run_preview runs an (unscoped, for tv) search or grab persists a bad row:
+    #   - tv with no season: an unscoped preview would run and, if accepted,
+    #     grab_service would update the parent MediaRequest directly instead of a
+    #     SeasonRequest (breaking the computed-rollup invariant), and the
+    #     importer would later block the download as season-less. And on the
+    #     empty-preview branch the season-scoped dead-end marker never fires
+    #     either, since there is no season to mark.
+    #   - movie with a season: would masquerade as a tv grab downstream (a fake
+    #     SeasonRequest, a season-scoped active-download guard bypassing the
+    #     real one-active-per-movie guard).
+    if request.media_type == "tv":
+        if body.season is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+            )
+    elif body.season is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
+        )
+
     result = await run_preview(
         # Carry season/episodes so a TV grab searches (and later records) the
         # right scope; both are None for a movie and so leave movie behaviour
@@ -185,6 +209,13 @@ async def grab_endpoint(
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
+    except SeasonRequiredError as exc:
+        # Defense in depth: the endpoint guard above already rejects this before
+        # run_preview even runs, but the service-level invariant holds
+        # regardless of caller (never a season=None tv download persisted).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+        ) from exc
     except RequestNotActiveError as exc:
         # A stale terminal request id was grabbed while a newer active request owns
         # the media. Refused before anything was added to the client (no untracked

@@ -144,6 +144,9 @@ class SqlDownloadRepository:
         clear_failed_reason: bool = False,
         clear_download_path: bool = False,
         media_request_id: int | None = None,
+        season: int | None = None,
+        episodes: list[int] | None = None,
+        set_scope: bool = False,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -157,6 +160,18 @@ class SqlDownloadRepository:
             # Re-own a reused (terminal) row: a fresh grab from a different request
             # must point the row at the CURRENT request, not the stale prior owner.
             row.media_request_id = media_request_id
+        if set_scope:
+            # Rewrite the TV scope UNCONDITIONALLY (not an ``is not None`` gate):
+            # grab_service's terminal-row reuse opts in via this flag so a
+            # re-selected torrent's season/episodes reflect the CURRENT grab, not
+            # whatever it was created with -- otherwise the queue/importer would
+            # operate on stale episodes while the newly requested season shows
+            # downloading. Unconditional so a movie reuse correctly CLEARS a
+            # stale season/episodes back to ``None`` too. Every other caller
+            # (import/refresh/block) leaves this default False and never touches
+            # scope.
+            row.season = season
+            row.episodes_json = episodes
         if clear_failed_reason:
             # A terminal row being reused for a fresh grab must not carry a stale
             # failure reason (honesty over silence: a Downloading row claiming a

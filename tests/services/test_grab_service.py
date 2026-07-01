@@ -16,6 +16,7 @@ from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
     RequestNotActiveError,
+    SeasonRequiredError,
 )
 from tests.web.fakes import FakeQbittorrent, candidate
 
@@ -407,3 +408,200 @@ async def test_grab_rejects_a_second_release_for_the_same_season(
                 tmdb_id=900,
                 season=1,
             )
+
+
+async def test_grab_tv_request_missing_season_raises_season_required(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """F1 (defense in depth): a tv request grabbed with no season is refused
+    BEFORE anything reaches the client -- the domain-boundary backstop holds
+    even if a future caller bypasses the endpoint's own 422 guard, so an
+    unscoped tv download (which would update the parent MediaRequest directly
+    instead of a SeasonRequest) can never be persisted."""
+    request_id = await _make_tv_request(sessionmaker_)
+    qbt = FakeQbittorrent()
+
+    async with sessionmaker_() as session:
+        with pytest.raises(SeasonRequiredError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored_tv("5" * 40, "Some.Show.S01.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=None,
+            )
+    # Nothing was handed to the client, and no row was tracked.
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert rows == []
+
+
+async def test_grab_movie_with_season_is_coerced_and_still_enforces_one_active_guard(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """F6: a movie grab carrying a (bogus, caller-supplied) ``season`` is coerced
+    back to ``None`` rather than trusted -- so it can never spawn a
+    ``SeasonRequest`` row, and the one-active-download guard is never bypassed
+    by branching on ``season is not None`` instead of the request's ACTUAL media
+    type: a second release tagged with a DIFFERENT bogus season must still
+    collide with the (season-agnostic-for-movies) guard, not slip through as a
+    "different season"."""
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.searching
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            qbt,
+            session,
+            scored=_scored("1" * 40),
+            request_id=req_id,
+            tmdb_id=100,
+            season=7,  # bogus -- must be coerced to None, never trusted
+        )
+    assert first.status == "downloading"
+    assert first.season is None
+
+    # A DIFFERENT release for the SAME movie, tagged with a DIFFERENT bogus
+    # season: if season were trusted instead of coerced, the one-active guard's
+    # find_active_for_request(season=9) would miss the season=None row above and
+    # wrongly let a second active download through.
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored("2" * 40),
+                request_id=req_id,
+                tmdb_id=100,
+                season=9,
+            )
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.media_request_id == req_id)))
+            .scalars()
+            .all()
+        )
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == req_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].season is None
+    assert seasons == []  # no SeasonRequest ever spawned for a movie
+
+
+async def test_grab_reuse_refreshes_tv_scope_to_current_grab(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """F2: a terminal (Imported) row for a torrent hash previously scoped to
+    season=1/episodes=None must have its TV scope REFRESHED when the SAME hash
+    is re-selected for a DIFFERENT season (e.g. a multi-season pack) -- not
+    silently keep serving the stale scope while the newly requested season is
+    marked downloading."""
+    async with sessionmaker_() as session:
+        old = MediaRequest(
+            tmdb_id=100, media_type=MediaType.tv, title="Old Show", status=RequestStatus.completed
+        )
+        new = MediaRequest(
+            tmdb_id=900, media_type=MediaType.tv, title="Some Show", status=RequestStatus.pending
+        )
+        session.add_all([old, new])
+        await session.flush()
+        old_id, new_id = old.id, new.id
+        session.add(SeasonRequest(media_request_id=new_id, season_number=2, status="pending"))
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="imported",
+                media_request_id=old_id,
+                tmdb_id=100,
+                season=1,
+                episodes_json=None,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=new_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[3, 4],
+        )
+    assert record.status == "downloading"
+    assert record.season == 2
+    assert record.episodes == [3, 4]
+    assert record.media_request_id == new_id  # re-owned to the CURRENT request
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.season == 2
+    assert row.episodes_json == [3, 4]
+    assert row.media_request_id == new_id
+
+
+async def test_grab_reuse_refreshes_episodes_for_same_season_regrab(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """F2 (second case): re-selecting the SAME hash for the SAME season but a
+    DIFFERENT episode filter must also rewrite ``episodes_json``, not keep
+    serving the prior grab's episode list."""
+    request_id = await _make_tv_request(sessionmaker_)
+    hash_ = "6" * 40
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(hash_, "Some.Show.S01E01E02E03.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+            episodes=[1, 2, 3],
+        )
+    # Fail it (not blocklisted) so it becomes a terminal row eligible for reuse.
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == hash_))
+        ).scalar_one()
+        row.status = "failed"
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(hash_, "Some.Show.S01E04E05.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+            episodes=[4, 5],
+        )
+    assert record.status == "downloading"
+    assert record.episodes == [4, 5]
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == hash_))
+        ).scalar_one()
+    assert row.episodes_json == [4, 5]

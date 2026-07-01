@@ -423,7 +423,10 @@ class GrabRequest(BaseModel):
     release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
     indexer search and the stored download to that season; ``episodes`` further
     scopes it to those specific episode number(s) (``None``/empty = the whole
-    season). Both are ignored for movies.
+    season). Every TV grab is per-season: the endpoint REJECTS (422) a tv request
+    grabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed
+    WITH a ``season`` -- the branch is always the request's actual media type,
+    never merely whether ``season`` happens to be set.
     """
 
     model_config = ConfigDict(frozen=True)

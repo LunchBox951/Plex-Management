@@ -17,11 +17,17 @@ Pure domain: stdlib only. No I/O, no adapter/web imports.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 from plex_manager.domain.release import ParsedRelease
 
-__all__ = ["ReleaseScope", "classify_release_scope"]
+__all__ = [
+    "ReleaseScope",
+    "classify_release_scope",
+    "covers_requested_episodes",
+    "episode_numbers",
+]
 
 ReleaseScope = Literal["single_episode", "season_pack", "multi_season_pack", "unknown"]
 
@@ -55,3 +61,52 @@ def classify_release_scope(parsed: ParsedRelease) -> ReleaseScope:
     if parsed.episode is None:
         return "season_pack"
     return "single_episode"
+
+
+def episode_numbers(episode: int | list[int] | None) -> tuple[int, ...]:
+    """Normalize a parsed ``episode`` field to a sorted, deduplicated tuple.
+
+    ``None`` (no episode number at all) collapses to an empty tuple. Shared by
+    :func:`covers_requested_episodes` and
+    :mod:`plex_manager.domain.import_validation` (imported there as
+    ``_episode_numbers``) so the two never disagree about what a parsed
+    ``episode`` field means.
+    """
+    if episode is None:
+        return ()
+    if isinstance(episode, int):
+        return (episode,)
+    return tuple(sorted(set(episode)))
+
+
+def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -> bool:
+    """Return ``True`` when ``parsed`` plausibly contains one of ``requested``.
+
+    Used by :func:`plex_manager.services.decision_service.preview` to stop a
+    release that names the RIGHT season but the WRONG episode from ever being
+    grab-selectable, even when a tracker ignores (or can't narrow to) the
+    requested episode(s) in its search results.
+
+    Decision, via :func:`classify_release_scope`:
+
+    - ``"season_pack"`` / ``"multi_season_pack"`` -> ``True``. A pack covering
+      the requested season inherently contains the requested episode(s); packs
+      are never rejected here (the season gate in
+      :mod:`plex_manager.domain.media_match` already confirms season identity).
+    - ``"single_episode"`` -> ``True`` iff the file's own episode number(s)
+      (normalized via :func:`episode_numbers`) overlap ``requested`` at all — a
+      multi-episode file with even partial overlap is kept, mirroring
+      :func:`plex_manager.domain.import_validation.validate_season_import`'s
+      ``skipped_not_requested`` posture at import time.
+    - ``"unknown"`` (no season at all) -> ``False``. Conservative: mirrors the
+      posture already used by the missing-season identity gate and the
+      importer's ``NO_EPISODE_NUMBER`` rule -- an unparseable release is never
+      proof that it covers the wanted episode.
+    """
+    scope = classify_release_scope(parsed)
+    if scope in ("season_pack", "multi_season_pack"):
+        return True
+    if scope == "single_episode":
+        requested_set = set(requested)
+        return not requested_set.isdisjoint(episode_numbers(parsed.episode))
+    return False

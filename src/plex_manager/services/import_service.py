@@ -659,6 +659,15 @@ async def _import_tv_locked(
     largest one BEFORE placing, so one duplicate can never roll back / block
     every OTHER genuinely-distinct episode in the pack.
 
+    Per-episode ``imported`` :class:`DownloadHistory` rows are staged in memory
+    while files are placed and only durably committed once the scan AND the
+    finalize compare-and-swap have BOTH succeeded -- mirroring the movie path,
+    which likewise writes its ``imported`` row only after a successful scan. A
+    later file's copy failure or a scan failure rolls placed files back via
+    :func:`_remove_quietly_many`/:func:`_block` before any of those rows are ever
+    added to the session, so the audit trail can never claim an episode was
+    imported when it was in fact deleted moments later.
+
     Unlike the movie path's single ``download_path`` breadcrumb (which lets a
     crash-resumed run re-adopt a placement it made before a prior crash), a TV
     import that crashes mid-copy is simply retried by a fresh run: each file's
@@ -793,7 +802,16 @@ async def _import_tv_locked(
     )
     await session.commit()
 
+    # ``imported`` history rows are staged (basename, relative) here rather than
+    # written immediately: they are committed to ``session`` ONLY after the scan
+    # AND the finalize CAS below have both succeeded (mirrors the movie path,
+    # which likewise writes its ``imported`` row only once the scan succeeds). A
+    # later file's copy failure OR a scan failure both roll placed files back via
+    # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
+    # the audit trail claim an episode was imported when it was in fact deleted
+    # moments later (honesty over silence: history must never lie about a rollback).
     placed_paths: list[Path] = []
+    imported: list[tuple[str, PurePosixPath]] = []
     for relative, result in by_relative.items():
         src = abs_by_rel[result.video.relative_path]
         dst = Path(tv_root) / relative
@@ -812,15 +830,7 @@ async def _import_tv_locked(
             return await download_repo.get_by_hash(torrent_hash)
         if placed:
             placed_paths.append(dst)
-        session.add(
-            DownloadHistory(
-                tmdb_id=request.tmdb_id,
-                torrent_hash=torrent_hash,
-                event_type=DownloadHistoryEvent.imported,
-                source_title=None,
-                message=f"imported {os.path.basename(src)} to {relative}",
-            )
-        )
+        imported.append((os.path.basename(src), relative))
 
     # download_path is stamped with the SEASON folder (not one file) purely for
     # queue-display observability -- unlike the movie path, it is never consulted
@@ -858,6 +868,19 @@ async def _import_tv_locked(
     if not finalized:
         await session.rollback()
         return await download_repo.get_by_hash(torrent_hash)
+    # Only now -- after the scan AND the finalize CAS have both succeeded -- is the
+    # per-episode ``imported`` history durably recorded. See the staging comment
+    # above the loop for why this cannot happen any earlier.
+    for basename, relative in imported:
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,
+                message=f"imported {basename} to {relative}",
+            )
+        )
     await season_request_service.mark_completed(
         session, media_request_id=request.id, season_number=season
     )

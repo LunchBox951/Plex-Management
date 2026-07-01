@@ -1131,6 +1131,126 @@ async def test_import_tv_root_unset_is_an_honest_retryable_block(
     assert request is not None and request.status is RequestStatus.import_blocked
 
 
+async def test_import_tv_scan_failure_never_leaves_a_lying_imported_history_row(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """F3: when the Plex scan fails after every episode in a season pack was
+    placed, the placed files are rolled back -- the ``imported`` DownloadHistory
+    rows for those SAME episodes must never have been committed either. Before
+    the fix, each episode's ``imported`` row was added to the session (and
+    committed alongside the download_path bookkeeping) BEFORE the scan ran, so a
+    scan failure left the audit trail claiming episodes were imported when they
+    had in fact just been deleted (honesty over silence)."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = _ScanFailsLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    # Rolled back: neither placed episode survives the scan failure.
+    assert not (season_dir / "Some Show - S02E01.mkv").exists()
+    assert not (season_dir / "Some Show - S02E02.mkv").exists()
+
+    async with sessionmaker_() as session:
+        events = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(DownloadHistory.torrent_hash == _HASH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Honesty over silence: no "imported" row for a file that was just deleted.
+    assert events  # import_started was still recorded, honestly
+    assert all(e.event_type != DownloadHistoryEvent.imported for e in events)
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+class _FailsOnSecondCallFs(LocalFileSystem):
+    """A LocalFileSystem whose ``hardlink_or_copy`` succeeds for the FIRST file
+    placed (whichever one the loop visits first -- directory iteration order is
+    not guaranteed across filesystems) and fails for the SECOND, simulating a
+    mid-loop copy failure on a LATER file in a season pack after an earlier
+    file already placed successfully."""
+
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+        self._calls += 1
+        if self._calls >= 2:
+            raise OSError("simulated copy failure")
+        super().hardlink_or_copy(src, dst)
+
+
+async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """F3 (second case): when a LATER episode's copy fails mid-loop, the earlier
+    episode already placed in THIS SAME loop is rolled back too (existing
+    behaviour) -- and, likewise, its ``imported`` history row must never have
+    been committed. Before the fix, the earlier file's ``imported`` row was
+    added to the session inside the loop and got flushed to the DB by the
+    failure path's own ``_block`` commit, lying about a file that had just been
+    unlinked."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=_FailsOnSecondCallFs(),
+            library=library,
+            qbt=_qbt(release_dir),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root="/unused",
+            tv_root=str(tv_root),
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    # Whichever episode placed first was rolled back too; no *.mkv survives.
+    if season_dir.exists():
+        assert not list(season_dir.glob("*.mkv"))
+
+    async with sessionmaker_() as session:
+        events = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(DownloadHistory.torrent_hash == _HASH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert all(e.event_type != DownloadHistoryEvent.imported for e in events)
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
 async def test_run_import_cycle_drains_a_tv_download_to_a_completed_season(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

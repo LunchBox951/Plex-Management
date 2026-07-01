@@ -46,6 +46,7 @@ __all__ = [
     "GrabError",
     "NoGrabSourceError",
     "RequestNotActiveError",
+    "SeasonRequiredError",
     "grab",
 ]
 
@@ -122,11 +123,31 @@ class RequestNotActiveError(Exception):
         super().__init__(f"request {request_id} is terminal and cannot be grabbed")
 
 
+class SeasonRequiredError(Exception):
+    """A TV request was grabbed with no ``season`` — every TV grab is per-season.
+
+    Surfaced (HTTP 422 ``tv_grab_requires_season``), never a silent unscoped grab.
+    An unscoped TV download would persist with ``season=None``, so
+    :func:`grab` would update the parent ``MediaRequest`` directly instead of a
+    ``SeasonRequest`` (breaking the "status is a computed rollup" invariant), and
+    the importer would later block the download as season-less. The endpoint
+    already rejects this before even previewing; this is the domain-boundary
+    backstop so the invariant holds regardless of caller.
+    """
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(f"request {request_id} is tv and requires a season to grab")
+
+
 async def _reuse_terminal_row(
     download_repo: SqlDownloadRepository,
     download_id: int,
     torrent_hash: str,
     request_id: int | None,
+    *,
+    season: int | None,
+    episodes: list[int] | None,
 ) -> DownloadRecord:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -150,6 +171,15 @@ async def _reuse_terminal_row(
     completing the new request without importing it if it still exists.
     ``clear_download_path`` drops the breadcrumb so the re-grab tracks its own
     content.
+
+    The TV scope (``season``/``episodes_json``) is likewise REFRESHED to the
+    CURRENT grab's scope, unconditionally (``set_scope=True``): a resurrected row
+    otherwise keeps whatever season/episodes it was created with, so re-selecting
+    the SAME torrent hash under a different season (a multi-season pack) or a
+    narrower episode filter would leave the queue/importer operating on the
+    WRONG episodes while the newly requested season is marked downloading.
+    Unconditional (not ``is not None``-gated) so a movie reuse correctly clears
+    any stale season/episodes back to ``None`` too.
     """
     await download_repo.update_status(
         download_id,
@@ -160,6 +190,9 @@ async def _reuse_terminal_row(
         clear_first_seen_at=True,
         clear_download_path=True,
         media_request_id=request_id,
+        season=season,
+        episodes=episodes,
+        set_scope=True,
     )
     record = await download_repo.get_by_hash(torrent_hash)
     if record is None:  # pragma: no cover - just updated this row
@@ -191,6 +224,15 @@ async def grab(
     ``Download.episodes_json`` -- ``None`` means import every valid video file
     found for the season, an explicit list scopes the import to those episode
     numbers only (a season-pack grab scoped to specific missing episodes).
+
+    When ``request_id`` resolves to a real request, ``season``/``episodes`` are
+    validated (and, for a movie, silently coerced) against the request's ACTUAL
+    ``media_type`` rather than trusted at face value: a ``tv`` request with no
+    ``season`` raises :class:`SeasonRequiredError` (a grab is always per-season,
+    never a whole-series scan), and a non-``tv`` request has ``season``/
+    ``episodes`` forced back to ``None`` regardless of what the caller passed, so
+    a movie can never spawn a ``SeasonRequest`` row or scope its active-download
+    guard to a fake season.
     """
     download_repo = SqlDownloadRepository(session)
     candidate = scored.candidate
@@ -206,8 +248,23 @@ async def grab(
     # already created an untracked torrent. Refuse up front so nothing is added.
     if request_id is not None:
         request = await SqlRequestRepository(session).get(request_id)
-        if request is not None and request.status in TERMINAL_REQUEST_STATUS_VALUES:
-            raise RequestNotActiveError(request_id)
+        if request is not None:
+            if request.status in TERMINAL_REQUEST_STATUS_VALUES:
+                raise RequestNotActiveError(request_id)
+            # Domain-boundary backstop: branch on the request's ACTUAL media
+            # type, never on whether the caller merely passed a ``season``. The
+            # endpoint already enforces this (422 before even previewing), but
+            # this invariant must hold regardless of caller.
+            if request.media_type == "tv":
+                if season is None:
+                    raise SeasonRequiredError(request_id)
+            else:
+                # Non-tv (movie): season/episodes are meaningless -- coerce
+                # rather than trust the caller, so a movie can never spawn a
+                # SeasonRequest row or have its one-active guard scoped to a
+                # fake season.
+                season = None
+                episodes = None
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
@@ -242,7 +299,14 @@ async def grab(
         return existing
 
     if existing is not None:
-        record = await _reuse_terminal_row(download_repo, existing.id, torrent_hash, request_id)
+        record = await _reuse_terminal_row(
+            download_repo,
+            existing.id,
+            torrent_hash,
+            request_id,
+            season=season,
+            episodes=episodes,
+        )
     else:
         try:
             record = await download_repo.create(
@@ -287,7 +351,14 @@ async def grab(
                 raise
             if winner.status not in _TERMINAL_STATUS_VALUES:
                 return winner
-            record = await _reuse_terminal_row(download_repo, winner.id, torrent_hash, request_id)
+            record = await _reuse_terminal_row(
+                download_repo,
+                winner.id,
+                torrent_hash,
+                request_id,
+                season=season,
+                episodes=episodes,
+            )
     session.add(
         DownloadHistory(
             tmdb_id=tmdb_id,
@@ -299,6 +370,11 @@ async def grab(
         )
     )
     if request_id is not None:
+        # ``season is not None`` here is exactly "this is a tv request": the guard
+        # above raises SeasonRequiredError for a tv request with no season, and
+        # coerces season back to None for a non-tv request -- so this never
+        # branches on a caller-supplied season alone, only on the media type it
+        # was already validated against.
         if season is not None:
             # TV: the request's status is a COMPUTED rollup of its seasons, never a
             # direct target -- route through season_request_service so the season
