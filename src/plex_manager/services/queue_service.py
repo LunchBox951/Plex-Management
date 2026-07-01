@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from plex_manager.domain.reconciler import (
+    StateTransition,
     failed_download_events,
     reconcile,
     unmapped_client_states,
@@ -226,18 +227,22 @@ async def reconcile_and_list(
     # 10%->50%->90% while staying "Downloading" would otherwise show stale progress
     # in the queue forever (honesty over silence).
     transitions_by_id = {transition.download_id: transition for transition in transitions}
+    applied_transitions: list[StateTransition] = []
     for row in rows:
         live = snapshot.get(row.torrent_hash.lower())
         transition = transitions_by_id.get(row.id)
         if transition is not None:
-            await download_repo.update_status(
+            applied = await download_repo.update_status_if_in(
                 transition.download_id,
                 transition.to_state.value,
+                frozenset({transition.from_state}),
                 progress=live.progress if live is not None else None,
                 seed_ratio=live.ratio if live is not None else None,
                 first_seen_at=now if transition.set_first_seen_at else None,
                 clear_first_seen_at=transition.clear_first_seen_at,
             )
+            if applied:
+                applied_transitions.append(transition)
         elif live is not None:
             # Refresh live progress ONLY — never rewrite status. ``row.status`` is the
             # snapshot captured at list_active() time; an operator's import retry (or
@@ -249,7 +254,7 @@ async def reconcile_and_list(
                 row.id, progress=live.progress, seed_ratio=live.ratio
             )
 
-    for event in failed_download_events(transitions, rows, occurred_at=now):
+    for event in failed_download_events(applied_transitions, rows, occurred_at=now):
         await _handle_failed(session, event, rows)
 
     await session.commit()

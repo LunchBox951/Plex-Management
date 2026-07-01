@@ -17,6 +17,7 @@ import errno
 import os
 import shutil
 from collections.abc import Iterable, Iterator
+import tempfile
 from pathlib import Path
 
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
@@ -179,28 +180,38 @@ class LocalFileSystem:
                     f"insufficient space to copy {src.name}: need {src_size} bytes, "
                     f"{free} available on destination filesystem"
                 ) from None
+            tmp_path: str | None = None
             try:
-                shutil.copy2(os.fspath(src), os.fspath(dst))
+                with tempfile.NamedTemporaryFile(
+                    prefix=f".{dst.name}.",
+                    suffix=".tmp",
+                    dir=dst.parent,
+                    delete=False,
+                ) as tmp:
+                    tmp_path = tmp.name
+                shutil.copy2(os.fspath(src), tmp_path)
+                # Verify the copy is complete before exposing it at the final path.
+                copied_size = Path(tmp_path).stat().st_size
+                if copied_size != src_size:
+                    raise OSError(
+                        f"copy of {src.name} is incomplete: expected {src_size} bytes, "
+                        f"wrote {copied_size}; partial destination removed"
+                    )
+                # Atomic no-overwrite publish: linking a temp file into place either
+                # creates dst whole or raises FileExistsError if another writer won.
+                os.link(tmp_path, os.fspath(dst))
             except OSError:
-                # copy2 can raise AFTER it created/truncated dst (e.g. ENOSPC
-                # mid-write when another writer consumed the preflighted space).
-                # dst did not pre-exist here — EEXIST is not a copy-fallback errno —
-                # so any partial file is OURS to remove. Clean it up best-effort so a
-                # retry sees a clean slate, not a differently-sized file that
-                # _place_file would surface as a PERSISTENT FileExistsError conflict.
-                # Re-raise the ORIGINAL error, unmasked (north-star #3: honesty).
-                with contextlib.suppress(OSError):
-                    os.unlink(os.fspath(dst))
+                # The copy target is a temp file in dst.parent, never the final path,
+                # so a process crash cannot leave a partial library file that blocks
+                # every retry. Clean the temp best-effort and re-raise the original
+                # error, unmasked (north-star #3: honesty).
+                if tmp_path is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_path)
                 raise
-            # Verify the copy is complete; a short write means a truncated /
-            # corrupt import, so roll back the partial file and surface it.
-            copied_size = dst.stat().st_size
-            if copied_size != src_size:
-                os.unlink(os.fspath(dst))
-                raise OSError(
-                    f"copy of {src.name} is incomplete: expected {src_size} bytes, "
-                    f"wrote {copied_size}; partial destination removed"
-                ) from None
+            else:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.

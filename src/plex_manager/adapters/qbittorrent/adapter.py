@@ -465,10 +465,11 @@ class QbittorrentClient:
         torrent_bytes: bytes | None = None
         info_hash: str | None = None
 
-        if magnet_or_url.startswith("magnet:"):
+        scheme = urlparse(magnet_or_url).scheme.casefold()
+        if scheme == "magnet":
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
-        elif magnet_or_url.startswith("http"):
+        elif scheme in ("http", "https"):
             magnet, body = await self._resolve_http_source(magnet_or_url)
             if magnet is not None:
                 urls_value = magnet
@@ -480,6 +481,8 @@ class QbittorrentClient:
                 # Could not resolve to a magnet or locally hashable .torrent. Do
                 # not ask qBittorrent to add an untrackable opaque URL.
                 raise QbittorrentError("could not determine torrent hash for HTTP source")
+        elif scheme:
+            raise QbittorrentError("unsupported torrent source URL")
         else:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)

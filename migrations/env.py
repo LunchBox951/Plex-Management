@@ -19,7 +19,7 @@ from plex_manager.db import Base, sync_database_url
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Inject the application's database URL. Migrations run synchronously, so the
 # app's async URL (sqlite+aiosqlite://) is translated to its sync form.
