@@ -30,6 +30,13 @@ _FIELDS: dict[str, dict[str, object]] = {
     },
     "Movie.2024.TELESYNC.x264-GRP": {"source": "Telesync"},
     "Movie.2024.HQCAM.x264-GRP": {"alternative_title": "HQCAM"},
+    "Show.S02.1080p.WEB-DL.x264-GRP": {"source": "Web", "screen_size": "1080p", "season": 2},
+    "Show.S02E05.1080p.WEB-DL.x264-GRP": {
+        "source": "Web",
+        "screen_size": "1080p",
+        "season": 2,
+        "episode": 5,
+    },
 }
 
 
@@ -166,6 +173,68 @@ def test_empty_candidate_set_surfaces_no_acceptable_release() -> None:
     assert result.accepted == []
     assert result.no_acceptable_release is True
     assert result.rejected == []
+
+
+def test_prefer_season_pack_default_is_byte_identical_to_no_season_pack_ranking() -> None:
+    # Same quality, same seeders, DIFFERENT size: the plain size tiebreak (unaware
+    # of season-pack scope) must decide, exactly as before prefer_season_pack
+    # existed -- the bigger single-episode release ranks first.
+    pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10, size_bytes=1_000_000_000)
+    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=10, size_bytes=2_000_000_000)
+    result = decide(
+        [pack, single], FakeParser(), default_profile(), _always_media, _never_blocklisted
+    )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "Show.S02E05.1080p.WEB-DL.x264-GRP",
+        "Show.S02.1080p.WEB-DL.x264-GRP",
+    ]
+
+
+def test_prefer_season_pack_breaks_ties_toward_the_pack() -> None:
+    # Identical quality + seeders, and the pack is even SMALLER (so the default
+    # size tiebreak would rank it second) -- with prefer_season_pack=True the
+    # scope tiebreak fires BEFORE seeders/size and the pack wins outright.
+    pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10, size_bytes=1_000_000_000)
+    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=10, size_bytes=2_000_000_000)
+    result = decide(
+        [pack, single],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "Show.S02.1080p.WEB-DL.x264-GRP",
+        "Show.S02E05.1080p.WEB-DL.x264-GRP",
+    ]
+    # The scope bonus never overrides the profile-order comparator: it is a purely
+    # additive score component that must not itself decide acceptance/rejection.
+    assert result.no_acceptable_release is False
+
+
+def test_prefer_season_pack_never_beats_a_higher_quality_release() -> None:
+    # prefer_season_pack only breaks a tie AFTER profile order -- a lower-quality
+    # season pack must still lose to a higher-quality single episode.
+    pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
+    higher_quality_single = _candidate(
+        "Movie.2024.1080p.BluRay.x264-GRP", seeders=10
+    )  # BluRay-1080p outranks WEBDL-1080p in the default profile
+    result = decide(
+        [pack, higher_quality_single],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "Movie.2024.1080p.BluRay.x264-GRP",
+        "Show.S02.1080p.WEB-DL.x264-GRP",
+    ]
 
 
 def test_wrong_media_is_rejected_before_quality_even_if_top_quality() -> None:

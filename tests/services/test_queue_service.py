@@ -15,6 +15,7 @@ from plex_manager.models import (
     MediaRequest,
     MediaType,
     RequestStatus,
+    SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -268,3 +269,202 @@ async def test_reconcile_applies_completed_and_keeps_client_missing_within_grace
     by_id = {item.id: item.status for item in queue}
     assert by_id[completed_id] == "import_pending"
     assert by_id[missing_id] == "client_missing"
+
+
+async def _seed_tv_request_with_download(
+    sm: SessionMaker, *, season: int, first_seen_at: datetime
+) -> tuple[int, int]:
+    """Insert a tv show + one tracked season + a download for that season."""
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=request.id, season_number=season, status="downloading"
+        )
+        session.add(season_row)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request.id,
+                tmdb_id=603,
+                season=season,
+                first_seen_at=first_seen_at,
+            )
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=603,
+                torrent_hash=_HASH,
+                event_type=DownloadHistoryEvent.grabbed,
+                source_title=_TITLE,
+                indexer=_INDEXER,
+            )
+        )
+        await session.commit()
+        return request.id, season_row.id
+
+
+async def test_missing_beyond_grace_for_tv_rearms_the_season_not_the_request_directly(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``_handle_failed`` routes a TV download's re-arm through
+    ``season_request_service`` -- the OWNING SEASON moves to 'searching' and the
+    parent's computed rollup reflects that, rather than the request being set
+    directly (which would fight the rollup on the next season transition)."""
+    request_id, season_id = await _seed_tv_request_with_download(
+        sessionmaker_, season=2, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None
+    assert season_row.status.value == "searching"
+    assert request is not None
+    assert request.status is RequestStatus.searching  # rollup of the one tracked season
+
+
+async def test_mark_failed_for_tv_rearms_the_season_not_the_request_directly(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``mark_failed`` mirrors the reconcile-driven re-arm for a TV download: the
+    SEASON re-arms to 'searching', and the parent's rollup reflects it."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=request.id, season_number=1, status="downloading"
+        )
+        session.add(season_row)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=603,
+            season=1,
+        )
+        session.add(download)
+        await session.commit()
+        request_id, season_id, download_id = request.id, season_row.id, download.id
+
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+    assert record.status == "failed"
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None
+    assert season_row.status.value == "searching"
+    assert request is not None
+    assert request.status is RequestStatus.searching
+
+
+async def test_missing_beyond_grace_never_regresses_an_already_available_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A season a PRIOR download already finished (``available``) must never be
+    dragged back to 'searching' by a LATER, unrelated download for that same
+    season (e.g. a supplementary per-episode re-grab) going missing beyond grace.
+    The failing download's OWN row still moves to Failed -- fully visible in the
+    queue -- but the season/parent rollup is protected from regressing past a
+    state Plex already confirmed."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.available,
+        )
+        session.add(request)
+        await session.flush()
+        season_row = SeasonRequest(media_request_id=request.id, season_number=1, status="available")
+        session.add(season_row)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request.id,
+                tmdb_id=603,
+                season=1,
+                first_seen_at=datetime.now(UTC) - timedelta(minutes=11),
+            )
+        )
+        await session.commit()
+        request_id, season_id = request.id, season_row.id
+
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert season_row is not None
+    assert season_row.status.value == "available"  # untouched -- never regressed
+    assert request is not None
+    assert request.status is RequestStatus.available  # rollup unaffected
+    assert download.status == "failed"  # this attempt's own failure stays visible
+
+
+async def test_mark_failed_never_regresses_an_already_available_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``mark_failed`` mirrors the reconcile-driven guard above: an operator
+    failing a SECOND, later download for an already-``available`` season must not
+    re-arm that season to 'searching'."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.available,
+        )
+        session.add(request)
+        await session.flush()
+        season_row = SeasonRequest(media_request_id=request.id, season_number=1, status="available")
+        session.add(season_row)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=603,
+            season=1,
+        )
+        session.add(download)
+        await session.commit()
+        request_id, season_id, download_id = request.id, season_row.id, download.id
+
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+    assert record.status == "failed"
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None
+    assert season_row.status.value == "available"  # untouched -- never regressed
+    assert request is not None
+    assert request.status is RequestStatus.available

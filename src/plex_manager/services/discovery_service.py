@@ -28,14 +28,19 @@ __all__ = ["DiscoverCategory", "HomeFeed", "HomeRow", "home", "list_category", "
 
 _logger = logging.getLogger(__name__)
 
-DiscoverCategory = Literal["trending", "popular", "upcoming"]
+DiscoverCategory = Literal["trending", "popular", "upcoming", "trending_tv", "popular_tv"]
 
 # Ordered rows the home composes. Order + titles live here (a code constant, no DB)
-# — the recommendation engine that decides rows dynamically is deferred.
+# — the recommendation engine that decides rows dynamically is deferred. The tv
+# rows are appended after the movie rows (no reordering of the existing three, so
+# an established home feed's row order is unchanged); there is no tv "upcoming"
+# row -- TMDB has no tv endpoint comparable to its movie release-date listing.
 _ROWS: tuple[tuple[DiscoverCategory, str], ...] = (
     ("trending", "Trending this week"),
     ("popular", "Popular movies"),
     ("upcoming", "Coming soon"),
+    ("trending_tv", "Trending TV this week"),
+    ("popular_tv", "Popular TV shows"),
 )
 
 
@@ -68,11 +73,15 @@ async def list_category(
     category: DiscoverCategory,
     page: int = 1,
 ) -> MediaPage:
-    """Return one page of a movie category (trending / popular / upcoming)."""
+    """Return one page of a discover category (movie or tv)."""
     if category == "trending":
         return await tmdb.trending_movies(page)
     if category == "popular":
         return await tmdb.popular_movies(page)
+    if category == "trending_tv":
+        return await tmdb.trending_tv(page)
+    if category == "popular_tv":
+        return await tmdb.popular_tv(page)
     return await tmdb.upcoming_movies(page)
 
 

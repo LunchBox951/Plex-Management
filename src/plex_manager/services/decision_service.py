@@ -49,8 +49,25 @@ async def preview(
     media_type: str,
     year: int | None = None,
     season: int | None = None,
+    episodes: list[int] | None = None,
 ) -> DecisionResult:
-    """Search the indexers and run the decision engine; return the ranked result."""
+    """Search the indexers and run the decision engine; return the ranked result.
+
+    ``episodes`` (TV only) names the specific episode number(s) an operator wants
+    out of ``season`` -- ``None``/empty means "the whole season". When exactly one
+    episode is named, it is wired onto ``IndexerSearchRequest.episode`` so the
+    indexer search itself narrows (the Prowlarr adapter already forwards
+    season/episode params); more than one episode still searches the whole season
+    (a multi-episode indexer query has no single-value slot) and relies on the
+    later import-time per-file filter instead.
+
+    ``prefer_season_pack`` is derived, never a caller-supplied flag: it is True
+    only for a season-scoped tv request with NO specific episodes named -- an
+    operator asking for "the whole season" should rank a season-pack release over
+    an equivalent-quality single-episode one; naming specific episodes (or a
+    movie, or an unscoped tv search) leaves the engine's default ranking
+    untouched.
+    """
     search_media_type: MediaType
     if media_type == "movie":
         search_media_type = "movie"
@@ -64,6 +81,7 @@ async def preview(
         tmdb_id=tmdb_id or None,
         year=year,
         season=season,
+        episode=str(episodes[0]) if episodes and len(episodes) == 1 else None,
     )
     candidates = await prowlarr.search(request)
 
@@ -108,4 +126,15 @@ async def preview(
             expected_season=match_season,
         )
 
-    return decide(candidates, parser, profile, _media_match, _blocklisted)
+    # "Whole season" only: a season-scoped tv request with NO specific episodes
+    # named. Naming episode(s) means the operator wants those episodes, not
+    # necessarily the pack, so the tiebreak stays off.
+    prefer_season_pack = media_type == "tv" and season is not None and not episodes
+    return decide(
+        candidates,
+        parser,
+        profile,
+        _media_match,
+        _blocklisted,
+        prefer_season_pack=prefer_season_pack,
+    )

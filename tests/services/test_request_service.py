@@ -15,8 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex import PlexLibrary
 from plex_manager.adapters.plex.library import reset_caches
-from plex_manager.models import MediaRequest, MediaType, RequestStatus
-from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import request_service
@@ -256,3 +256,128 @@ async def test_create_request_redetects_removal_within_cache_ttl(
         pending_row = await session.get(MediaRequest, reacquired.id)
         assert pending_row is not None
         assert pending_row.status is RequestStatus.pending
+
+
+async def _season_numbers(sm: SessionMaker, media_request_id: int) -> set[int]:
+    async with sm() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == media_request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return {row.season_number for row in rows}
+
+
+async def test_create_request_tv_ensures_every_aired_season_when_seasons_omitted(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={
+            5001: TvMetadata(tmdb_id=5001, title="Some Show", year=2020, season_count=3),
+        }
+    )
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(session, tmdb, tmdb_id=5001, media_type="tv")
+
+    assert await _season_numbers(sessionmaker_, record.id) == {1, 2, 3}
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, record.id)
+        assert row is not None
+        assert row.status is RequestStatus.pending  # nothing in Plex, no library check
+
+
+async def test_create_request_tv_seasons_param_creates_only_named_seasons(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5002: TvMetadata(tmdb_id=5002, title="Some Show", year=2020, season_count=10)}
+    )
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=5002, media_type="tv", seasons=[2]
+        )
+
+    # Only the NAMED season is tracked, even though the show has 10 aired seasons.
+    assert await _season_numbers(sessionmaker_, record.id) == {2}
+
+
+async def test_create_request_tv_second_post_with_new_seasons_grows_the_tracked_set(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5003: TvMetadata(tmdb_id=5003, title="Some Show", year=2020, season_count=10)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5003, media_type="tv", seasons=[1]
+        )
+    assert await _season_numbers(sessionmaker_, first.id) == {1}
+
+    # A second POST for the SAME show, naming a DIFFERENT season: the dedup path
+    # returns the SAME request, but the tracked season set must GROW, not be
+    # silently dropped by the request-level dedup.
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(
+            session, tmdb, tmdb_id=5003, media_type="tv", seasons=[2]
+        )
+    assert second.id == first.id
+    assert await _season_numbers(sessionmaker_, first.id) == {1, 2}
+
+
+async def test_create_request_tv_whole_series_with_zero_aired_seasons_raises(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A whole-series tv request (no explicit ``seasons``) whose TMDB
+    ``season_count`` resolves to 0 (a TMDB gap, or a specials-only show) must
+    never persist a 'pending' request with ZERO tracked seasons -- nothing would
+    ever drive search/grab for it, and it would show 'pending' forever (a silent
+    dead request). Surfaced honestly as NoAiredSeasonsError instead."""
+    tmdb = FakeTmdb(
+        shows={5005: TvMetadata(tmdb_id=5005, title="Gap Show", year=2020, season_count=0)}
+    )
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.NoAiredSeasonsError):
+            await request_service.create_request(session, tmdb, tmdb_id=5005, media_type="tv")
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 5005)))
+            .scalars()
+            .all()
+        )
+    assert rows == []  # nothing was persisted -- no dead-end ghost request
+
+
+async def test_create_request_tv_season_already_in_plex_rolls_up_partially_available(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5004: TvMetadata(tmdb_id=5004, title="Some Show", year=2020, season_count=2)}
+    )
+    library = FakeLibrary(available_tv_seasons={5004: frozenset({1})})
+
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=5004, media_type="tv", library=library
+        )
+
+    async with sessionmaker_() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_season = {row.season_number: row.status.value for row in rows}
+        show = await session.get(MediaRequest, record.id)
+    assert by_season == {1: "available", 2: "pending"}
+    assert show is not None
+    assert show.status is RequestStatus.partially_available

@@ -42,6 +42,7 @@ from plex_manager.models import (
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -123,7 +124,25 @@ async def _handle_failed(
         indexer=indexer,
     )
     if record is not None and record.media_request_id is not None:
-        await request_repo.set_status(record.media_request_id, RequestStatus.searching.value)
+        if record.season is not None:
+            # TV: route through season_request_service so the SEASON re-arms to
+            # 'searching' and the parent's computed rollup is recomputed in the
+            # same transaction, rather than stomping the request status directly.
+            # ``skip_if_terminal``: a season a PRIOR download already finished
+            # (completed/available/failed) must never be dragged back to
+            # 'searching' by THIS (later, unrelated) download's failure -- e.g. a
+            # supplementary per-episode re-grab for an already-available season.
+            # This download's own row still moves to Failed (+ blocklist) below
+            # regardless, so the failure stays fully visible in the queue.
+            await season_request_service.set_status(
+                session,
+                media_request_id=record.media_request_id,
+                season_number=record.season,
+                status=RequestStatus.searching.value,
+                skip_if_terminal=True,
+            )
+        else:
+            await request_repo.set_status(record.media_request_id, RequestStatus.searching.value)
 
     # Complete the FailedPending -> Failed transition. The reconciler only moves
     # the row as far as ``failed_pending``; without this advance the row would be
@@ -262,9 +281,20 @@ async def mark_failed(
     # no longer exists, with nothing to re-search or re-fail it. Mirrors the
     # reconcile-driven ``_handle_failed`` re-arm.
     if row.media_request_id is not None:
-        await SqlRequestRepository(session).set_status(
-            row.media_request_id, RequestStatus.searching.value
-        )
+        if row.season is not None:
+            # TV: same rollup-aware routing (and the same terminal-season guard)
+            # as _handle_failed above.
+            await season_request_service.set_status(
+                session,
+                media_request_id=row.media_request_id,
+                season_number=row.season,
+                status=RequestStatus.searching.value,
+                skip_if_terminal=True,
+            )
+        else:
+            await SqlRequestRepository(session).set_status(
+                row.media_request_id, RequestStatus.searching.value
+            )
 
     await session.commit()
     failed = await download_repo.get_by_hash(row.torrent_hash)

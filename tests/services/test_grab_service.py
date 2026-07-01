@@ -10,9 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.release import ParsedRelease, ScoredRelease
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.services import grab_service
-from plex_manager.services.grab_service import GrabError, RequestNotActiveError
+from plex_manager.services.grab_service import (
+    AlreadyDownloadingError,
+    GrabError,
+    RequestNotActiveError,
+)
 from tests.web.fakes import FakeQbittorrent, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -226,3 +230,132 @@ async def test_grab_reuse_clears_stale_download_path(
         ).scalar_one()
     assert row.media_request_id == new_id  # re-owned to the CURRENT request
     assert row.download_path is None  # stale library breadcrumb cleared on re-grab
+
+
+def _scored_tv(info_hash: str, title: str) -> ScoredRelease:
+    cand = candidate(title, info_hash=info_hash)
+    parsed = ParsedRelease(
+        raw_title=cand.title, clean_title="Some Show", source=QualitySource.WEBDL
+    )
+    return ScoredRelease(
+        candidate=cand, parsed=parsed, quality=WEBDL1080P, profile_index=19, score=1.0
+    )
+
+
+async def _make_tv_request(sm: SessionMaker, tmdb_id: int = 900) -> int:
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.pending,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(SeasonRequest(media_request_id=request_id, season_number=1, status="pending"))
+        session.add(SeasonRequest(media_request_id=request_id, season_number=2, status="pending"))
+        await session.commit()
+        return request_id
+
+
+async def test_grab_tv_persists_season_and_episodes_and_advances_season_rollup(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A TV grab threads ``season``/``episodes`` onto the Download row and moves
+    the OWNING SEASON (not the request directly) to 'downloading' -- the parent's
+    computed rollup then reflects that season's transition."""
+    request_id = await _make_tv_request(sessionmaker_)
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(_HASH, "Some.Show.S02E05.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[5],
+        )
+    assert record.status == "downloading"
+    assert record.season == 2
+    assert record.episodes == [5]
+
+    async with sessionmaker_() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_season = {row.season_number: row.status.value for row in rows}
+        show = await session.get(MediaRequest, request_id)
+    assert by_season == {1: "pending", 2: "downloading"}
+    assert show is not None
+    # Rollup precedence: 'downloading' (season 2) wins outright over 'pending' (season 1).
+    assert show.status is RequestStatus.downloading
+
+
+async def test_grab_allows_concurrent_downloads_for_different_seasons_of_one_show(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The one-active-download guard is scoped PER SEASON for tv: a whole-series
+    request can have season 1 and season 2 downloading at once."""
+    request_id = await _make_tv_request(sessionmaker_)
+    hash_s1 = "1" * 40
+    hash_s2 = "2" * 40
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(hash_s1, "Some.Show.S01.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+    async with sessionmaker_() as session:
+        second = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(hash_s2, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+    assert second.status == "downloading"
+
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert {(row.season, row.status) for row in rows} == {(1, "downloading"), (2, "downloading")}
+
+
+async def test_grab_rejects_a_second_release_for_the_same_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Unlike different seasons, a SECOND release for the SAME season still
+    collides with the one-active-download-per-season guard."""
+    request_id = await _make_tv_request(sessionmaker_)
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv("3" * 40, "Some.Show.S01.720p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv("4" * 40, "Some.Show.S01.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )

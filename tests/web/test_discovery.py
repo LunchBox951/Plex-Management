@@ -72,7 +72,13 @@ async def test_home_composes_rows_and_picks_a_spotlight(
     body = response.json()
     # The first item with a backdrop becomes the spotlight.
     assert body["spotlight"]["tmdb_id"] == 1
-    assert [row["row_type"] for row in body["rows"]] == ["trending", "popular", "upcoming"]
+    assert [row["row_type"] for row in body["rows"]] == [
+        "trending",
+        "popular",
+        "upcoming",
+        "trending_tv",
+        "popular_tv",
+    ]
     assert body["rows"][0]["items"][0]["backdrop_url"] == "http://img/a.jpg"
     assert body["rows"][2]["items"] == []  # upcoming was empty — an honest empty row
 

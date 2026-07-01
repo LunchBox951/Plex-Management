@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 __all__ = [
     "TERMINAL_REQUEST_STATUS_VALUES",
     "MediaNotFoundError",
+    "NoAiredSeasonsError",
     "create_request",
     "get_request",
     "list_requests",
@@ -61,14 +63,39 @@ class MediaNotFoundError(Exception):
         super().__init__(f"{media_type} tmdb_id={tmdb_id} not found")
 
 
+class NoAiredSeasonsError(Exception):
+    """A whole-series tv request resolved to ZERO trackable seasons.
+
+    Raised when the caller named no explicit ``seasons`` (a "track the whole
+    aired series" request) and TMDB's ``season_count`` is ``0`` — a TMDB data
+    gap, or a specials-only show. Without this guard, ``create_request`` would
+    persist a ``pending`` :class:`~plex_manager.models.MediaRequest` with ZERO
+    ``SeasonRequest`` rows: nothing would ever drive search/grab for it (the
+    parent's rollup has no seasons to fold), and the request would show
+    ``pending`` forever — a silent dead request, the exact dishonesty
+    north-star #3 forbids. Surfaced as HTTP 404, the same posture as
+    :class:`MediaNotFoundError` ("resolved, but nothing to act on"), never a
+    persisted ghost request.
+    """
+
+    def __init__(self, tmdb_id: int) -> None:
+        self.tmdb_id = tmdb_id
+        super().__init__(f"tv tmdb_id={tmdb_id} resolved to zero aired seasons")
+
+
 class _Detail(NamedTuple):
-    """Resolved TMDB detail needed to persist a request (incl. art for rows)."""
+    """Resolved TMDB detail needed to persist a request (incl. art for rows).
+
+    ``season_count`` is movie-irrelevant (defaults to ``0``); for tv it feeds
+    :func:`_season_numbers` when the caller omitted an explicit season list.
+    """
 
     title: str
     year: int | None
     is_anime: bool
     poster_url: str | None
     backdrop_url: str | None
+    season_count: int = 0
 
 
 async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> _Detail:
@@ -83,7 +110,36 @@ async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> 
     tv = await tmdb.get_tv_show(tmdb_id)
     if tv is None:
         raise MediaNotFoundError(tmdb_id, media_type)
-    return _Detail(tv.title, tv.year, tv.is_anime, tv.poster_url, tv.backdrop_url)
+    return _Detail(tv.title, tv.year, tv.is_anime, tv.poster_url, tv.backdrop_url, tv.season_count)
+
+
+def _season_numbers(seasons: list[int] | None, season_count: int) -> list[int]:
+    """Resolve the season numbers a tv request should track.
+
+    ``seasons`` verbatim when the caller named specific seasons (an out-of-range
+    season is harmless -- it just tracks one Plex/TMDB doesn't have). Omitted or
+    empty means "the whole aired series": every season ``1..season_count``,
+    SPECIALS (season 0) excluded -- a whole-show request never auto-tracks the
+    specials bucket.
+    """
+    return seasons if seasons else list(range(1, season_count + 1))
+
+
+async def _resolve_tv_seasons(
+    tmdb: MetadataPort, tmdb_id: int, seasons: list[int] | None
+) -> list[int]:
+    """Like :func:`_season_numbers`, but fetches ``season_count`` from TMDB itself.
+
+    For call sites that never resolved a ``_Detail`` (the dedup / integrity-race
+    paths below skip that TMDB round-trip when an explicit ``seasons`` list makes
+    it unnecessary) -- fetches only when ``seasons`` is falsy.
+    """
+    if seasons:
+        return seasons
+    tv = await tmdb.get_tv_show(tmdb_id)
+    if tv is None:
+        raise MediaNotFoundError(tmdb_id, "tv")
+    return _season_numbers(seasons, tv.season_count)
 
 
 async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
@@ -120,6 +176,7 @@ async def create_request(
     media_type: str,
     user_id: int | None = None,
     library: LibraryPort | None = None,
+    seasons: list[int] | None = None,
 ) -> RequestRecord:
     """Create (or return the existing active) media request for this media.
 
@@ -133,13 +190,48 @@ async def create_request(
     short-circuiting the search/grab — a visible "already in your library" record,
     not a wasted grab. An unconfigured/unreachable Plex skips the check (see
     :func:`_already_in_library`).
+
+    For a tv ``media_type``, ``season_request_service.ensure_seasons`` runs on
+    EVERY call -- including the dedup (early-return) path -- for ``seasons``
+    verbatim, or every aired season when omitted/empty (see
+    :func:`_season_numbers`). So a second POST for the same show with a NEW season
+    list grows the tracked set rather than being silently dropped by the
+    request-level dedup; the parent's rollup status (never a movie-style
+    already-in-library short-circuit) is computed by ``ensure_seasons`` itself.
+
+    Raises :class:`NoAiredSeasonsError` for a FRESH (not dedup) whole-series tv
+    request whose resolved season list is empty (see :func:`_season_numbers`) --
+    never persists a request with nothing to track. The dedup path never raises
+    this: an existing request resolving no NEW seasons there just means "nothing
+    to add" to an already-viable request, not a dead end.
     """
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:
+        if media_type == "tv":
+            season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
+            await season_request_service.ensure_seasons(
+                session,
+                library,
+                media_request_id=existing.id,
+                tmdb_id=tmdb_id,
+                seasons=season_numbers,
+            )
+            await session.commit()
         return existing
 
     detail = await _resolve_detail(tmdb, tmdb_id, media_type)
+
+    # Resolve the season list BEFORE anything is persisted: a whole-series
+    # request (no explicit ``seasons``) that resolves to NOTHING trackable must
+    # never become a 'pending' request with zero SeasonRequest rows (see
+    # NoAiredSeasonsError). An explicit (even out-of-range) season list is left
+    # alone -- tracking a season Plex/TMDB doesn't have yet is harmless.
+    season_numbers: list[int] = []
+    if media_type == "tv":
+        season_numbers = _season_numbers(seasons, detail.season_count)
+        if not season_numbers:
+            raise NoAiredSeasonsError(tmdb_id)
 
     initial_status = RequestStatus.pending.value
     if (
@@ -171,6 +263,20 @@ async def create_request(
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.
             await repo.mark_available(record.id)
+        if media_type == "tv":
+            # Always starts 'pending' above (the movie-only in-library short-circuit
+            # never applies to tv); ensure_seasons' own per-season availability check
+            # recomputes the honest rollup (possibly 'available'/'partially_available')
+            # onto the SAME row, in the SAME transaction, before it is committed below.
+            # ``season_numbers`` was already resolved (and guaranteed non-empty)
+            # above, before this request row was even created.
+            await season_request_service.ensure_seasons(
+                session,
+                library,
+                media_request_id=record.id,
+                tmdb_id=tmdb_id,
+                seasons=season_numbers,
+            )
         await session.commit()
     except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
@@ -181,6 +287,16 @@ async def create_request(
         winner = await repo.find_active(tmdb_id, media_type)
         if winner is None:  # pragma: no cover - the conflicting active row must exist
             raise
+        if media_type == "tv":
+            season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
+            await season_request_service.ensure_seasons(
+                session,
+                library,
+                media_request_id=winner.id,
+                tmdb_id=tmdb_id,
+                seasons=season_numbers,
+            )
+            await session.commit()
         return winner
     if initial_status == RequestStatus.available.value:
         # Collapse the concurrent in-library race (F9). The active-dedup partial

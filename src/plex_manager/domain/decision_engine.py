@@ -39,6 +39,7 @@ from plex_manager.domain.quality_service import (
     compare_by_profile,
 )
 from plex_manager.domain.release import CandidateRelease, ParsedRelease, ScoredRelease
+from plex_manager.domain.season_pack import classify_release_scope
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
@@ -54,9 +55,14 @@ BlocklistCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 MediaMatchCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 
 # Weighting so the composite score reproduces the comparator ordering: profile
-# index dominates seeders, which dominates size. The gaps are far larger than any
-# realistic field value (seeders < 1e9, size < 1e15 bytes => contribution < 1e6).
+# index dominates the season-pack scope preference, which dominates seeders,
+# which dominates size. The gaps are far larger than any realistic field value
+# (seeders < 1e9, size < 1e15 bytes => contribution < 1e6).
 _INDEX_WEIGHT = 1e12
+# Only ever added when the caller opts in via ``prefer_season_pack`` (see
+# :func:`decide`); with the default ``prefer_season_pack=False`` every candidate's
+# contribution is 0, so the score is BYTE-IDENTICAL to the pre-season-pack engine.
+_SCOPE_WEIGHT = 1e9
 _SEEDER_WEIGHT = 1e3
 _SIZE_WEIGHT = 1e-9
 
@@ -75,10 +81,12 @@ class DecisionResult:
     no_acceptable_release: bool
 
 
-def _score(profile_index: int, candidate: CandidateRelease) -> float:
+def _score(profile_index: int, candidate: CandidateRelease, *, is_season_pack: bool) -> float:
     seeders = candidate.seeders or 0
+    scope_bonus = _SCOPE_WEIGHT if is_season_pack else 0.0
     return (
         profile_index * _INDEX_WEIGHT
+        + scope_bonus
         + seeders * _SEEDER_WEIGHT
         + candidate.size_bytes * _SIZE_WEIGHT
     )
@@ -90,8 +98,19 @@ def decide(
     profile: QualityProfile,
     media_match: MediaMatchCheck,
     is_blocklisted: BlocklistCheck,
+    *,
+    prefer_season_pack: bool = False,
 ) -> DecisionResult:
-    """Run the parse -> match -> gate -> filter -> rank pipeline over ``candidates``."""
+    """Run the parse -> match -> gate -> filter -> rank pipeline over ``candidates``.
+
+    ``prefer_season_pack`` (default ``False``, byte-identical to the pre-season-pack
+    engine) is set by the caller only when the operator explicitly requested a
+    whole TV season: it adds a tiebreak (after profile order, before seeders) that
+    prefers a release :func:`~plex_manager.domain.season_pack.classify_release_scope`
+    classifies as a ``"season_pack"`` over one it does not. It never overrides the
+    quality/identity/blocklist gates -- a season pack that fails the profile gate is
+    still rejected.
+    """
     accepted: list[ScoredRelease] = []
     rejected: list[tuple[CandidateRelease, RejectionReason]] = []
 
@@ -118,13 +137,14 @@ def decide(
         # The quality passed the gate, so it is present in the profile.
         index = profile.get_index(quality.id)
         profile_index = index if index is not None else -1
+        is_season_pack = prefer_season_pack and classify_release_scope(parsed) == "season_pack"
         accepted.append(
             ScoredRelease(
                 candidate=candidate,
                 parsed=parsed,
                 quality=quality,
                 profile_index=profile_index,
-                score=_score(profile_index, candidate),
+                score=_score(profile_index, candidate, is_season_pack=is_season_pack),
             )
         )
 
@@ -132,6 +152,11 @@ def decide(
         by_quality = compare_by_profile(left.quality, right.quality, profile)
         if by_quality != 0:
             return by_quality
+        if prefer_season_pack:
+            left_pack = classify_release_scope(left.parsed) == "season_pack"
+            right_pack = classify_release_scope(right.parsed) == "season_pack"
+            if left_pack != right_pack:
+                return 1 if left_pack else -1
         left_seeders = left.candidate.seeders or 0
         right_seeders = right.candidate.seeders or 0
         if left_seeders != right_seeders:

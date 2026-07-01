@@ -30,6 +30,7 @@ from plex_manager.models import (
 )
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.services import season_request_service
 from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
 if TYPE_CHECKING:
@@ -173,6 +174,7 @@ async def grab(
     tmdb_id: int | None = None,
     year: int | None = None,
     season: int | None = None,
+    episodes: list[int] | None = None,
     save_path: str = "",
     category: str = DEFAULT_CATEGORY,
 ) -> DownloadRecord:
@@ -180,6 +182,13 @@ async def grab(
 
     Returns the existing record (without re-adding to the client a second time)
     when a non-terminal download for the same hash already exists.
+
+    ``season`` (TV only) scopes the one-active-download guard PER SEASON (a
+    whole-series request can have S1 and S2 downloading at once) and is threaded
+    onto the persisted ``Download`` row; ``episodes`` (TV only) persists to
+    ``Download.episodes_json`` -- ``None`` means import every valid video file
+    found for the season, an explicit list scopes the import to those episode
+    numbers only (a season-pack grab scoped to specific missing episodes).
     """
     download_repo = SqlDownloadRepository(session)
     candidate = scored.candidate
@@ -213,7 +222,7 @@ async def grab(
     # indexer gave no hash) is a genuine second grab. Checked BEFORE handing the
     # torrent to the client, so nothing is added on rejection.
     if request_id is not None:
-        active = await download_repo.find_active_for_request(request_id)
+        active = await download_repo.find_active_for_request(request_id, season=season)
         if active is not None and active.torrent_hash != known_hash:
             raise AlreadyDownloadingError(request_id)
 
@@ -242,6 +251,7 @@ async def grab(
                 tmdb_id=tmdb_id,
                 year=year,
                 season=season,
+                episodes=episodes,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release
@@ -251,7 +261,7 @@ async def grab(
             # 500: a different-release conflict is the honest ``already_downloading``.
             await session.rollback()
             if request_id is not None:
-                active = await download_repo.find_active_for_request(request_id)
+                active = await download_repo.find_active_for_request(request_id, season=season)
                 if active is not None and active.torrent_hash != torrent_hash:
                     # The other release won the request's single active slot. The
                     # torrent we just added to qBittorrent is now orphaned — nothing
@@ -287,6 +297,21 @@ async def grab(
         )
     )
     if request_id is not None:
-        await SqlRequestRepository(session).set_status(request_id, RequestStatus.downloading.value)
+        if season is not None:
+            # TV: the request's status is a COMPUTED rollup of its seasons, never a
+            # direct target -- route through season_request_service so the season
+            # row (created lazily here, like the Download row) moves to
+            # 'downloading' and the parent's rollup is recomputed in the same
+            # transaction, rather than stomping the request status directly.
+            await season_request_service.set_status(
+                session,
+                media_request_id=request_id,
+                season_number=season,
+                status=RequestStatus.downloading.value,
+            )
+        else:
+            await SqlRequestRepository(session).set_status(
+                request_id, RequestStatus.downloading.value
+            )
     await session.commit()
     return record

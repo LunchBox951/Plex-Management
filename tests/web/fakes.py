@@ -117,6 +117,8 @@ class FakeTmdb:
         trending: list[MediaSearchResult] | None = None,
         popular: list[MediaSearchResult] | None = None,
         upcoming: list[MediaSearchResult] | None = None,
+        trending_tv_results: list[MediaSearchResult] | None = None,
+        popular_tv_results: list[MediaSearchResult] | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
@@ -126,6 +128,15 @@ class FakeTmdb:
         self.trending = list(trending) if trending is not None else list(self.results)
         self.popular = list(popular) if popular is not None else list(self.results)
         self.upcoming = list(upcoming) if upcoming is not None else list(self.results)
+        # Named ``_tv`` (not ``trending_tv``/``popular_tv``) to avoid colliding with
+        # the like-named PORT METHODS below -- unlike the movie rows, the tv port
+        # methods carry no distinguishing suffix beyond ``_tv``.
+        self._trending_tv = (
+            list(trending_tv_results) if trending_tv_results is not None else list(self.results)
+        )
+        self._popular_tv = (
+            list(popular_tv_results) if popular_tv_results is not None else list(self.results)
+        )
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -148,6 +159,12 @@ class FakeTmdb:
 
     async def upcoming_movies(self, page: int = 1) -> MediaPage:
         return self._page(self.upcoming)
+
+    async def trending_tv(self, page: int = 1) -> MediaPage:
+        return self._page(self._trending_tv)
+
+    async def popular_tv(self, page: int = 1) -> MediaPage:
+        return self._page(self._popular_tv)
 
 
 class FakeProwlarr:

@@ -126,6 +126,84 @@ async def test_preview_accepts_tv_episode_despite_series_year(
     assert result.rejected == []
 
 
+async def test_preview_prefers_season_pack_when_whole_season_requested(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Same quality, same seeders, and the pack is even SMALLER (so the plain size
+    # tiebreak would otherwise rank it second) -- a whole-season request (season
+    # set, no specific episodes) must still prefer the pack.
+    pack = candidate(
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP",
+        info_hash="e" * 40,
+        seeders=10,
+        size_bytes=1_000_000_000,
+    )
+    single = candidate(
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP",
+        info_hash="f" * 40,
+        seeders=10,
+        size_bytes=2_000_000_000,
+    )
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([single, pack]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+        )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP",
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP",
+    ]
+
+
+async def test_preview_does_not_prefer_season_pack_when_episodes_are_named(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # The SAME two candidates as above, but the operator named a specific episode:
+    # prefer_season_pack must NOT fire, so the plain size tiebreak decides (the
+    # bigger single-episode release ranks first) -- and the named episode is wired
+    # onto the search request itself.
+    pack = candidate(
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP",
+        info_hash="e" * 40,
+        seeders=10,
+        size_bytes=1_000_000_000,
+    )
+    single = candidate(
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP",
+        info_hash="f" * 40,
+        seeders=10,
+        size_bytes=2_000_000_000,
+    )
+    prowlarr = FakeProwlarr([pack, single])
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            prowlarr,
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+            episodes=[4],
+        )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP",
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP",
+    ]
+    assert prowlarr.searched[-1].episode == "4"
+
+
 async def test_preview_rejects_wrong_season_pack(sessionmaker_: SessionMaker) -> None:
     # A tracker ignored Prowlarr's season param and returned an S01 pack for an S02
     # request. The pack still carries the show's correct identity, so only the
