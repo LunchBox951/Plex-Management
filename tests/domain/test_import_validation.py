@@ -333,6 +333,31 @@ _TV_FIELDS: dict[str, dict[str, object]] = {
         "screen_size": "1080p",
     },
     "Breaking.Bad.S02.sample.mkv": {"title": "sample"},
+    # A multi-season pack FOLDER (S01-S03): parsing the FULL path yields a season
+    # LIST. A file whose OWN name is S01E01 must NOT be placed under a requested
+    # S02; a genuine S02E05 in the same pack must still import. The basename entries
+    # (S01E01 -> season 1 above, S02E05 below) carry each file's OWN season.
+    "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": [1, 2, 3],
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S02E05.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": [1, 2, 3],
+        "episode": 5,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Breaking.Bad.S02E05.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Breaking Bad",
+        "season": 2,
+        "episode": 5,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
     # A split-disk chunk of a single episode: it STILL parses with a valid
     # episode number, so without the same MULTI_PART guard validate_import uses
     # it would otherwise reach an accepted result.
@@ -403,6 +428,31 @@ def test_wrong_season_in_pack_rejects_wrong_media() -> None:
     assert len(result.rejected) == 1
     assert result.rejected[0].reason is ImportRejectionReason.WRONG_MEDIA
     assert result.rejected[0].relative_path == "Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_ambiguous_multi_season_pack_placed_by_each_file_own_season() -> None:
+    # A completed multi-season pack (folder "S01-S03") imported for the requested
+    # season 2. Parsing the full path yields a season LIST that ``_season_covers``
+    # treats as covering S02, so a file whose OWN name is S01E01 would clear the
+    # season gate and be mis-placed under S02 as S02E01. The per-file guard rejects
+    # it (WRONG_MEDIA) while a genuine S02E05 file in the same pack still imports.
+    result = _validate_season(
+        VideoFile(
+            "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S02E05.1080p.WEB-DL.x264-GRP.mkv",
+            2 * _GIB,
+        ),
+        VideoFile(
+            "Breaking.Bad.S01-S03.COMPLETE/Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv",
+            2 * _GIB,
+        ),
+    )
+    assert len(result.accepted) == 1
+    assert frozenset(result.accepted[0].episodes) == frozenset({5})
+    assert len(result.rejected) == 1
+    assert result.rejected[0].reason is ImportRejectionReason.WRONG_MEDIA
+    assert result.rejected[0].relative_path.endswith(
+        "Breaking.Bad.S01E01.1080p.WEB-DL.x264-GRP.mkv"
+    )
 
 
 def test_no_episode_number_rejects() -> None:

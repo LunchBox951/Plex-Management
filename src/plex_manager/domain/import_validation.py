@@ -464,6 +464,31 @@ def validate_season_import(
                 )
             )
 
+        # 3b. Ambiguous multi-season pack guard (placement precision). Step 3 parses
+        #     the FULL path so a season carried only by the folder is still seen, but
+        #     a MULTI-season folder (``S01-S03``) yields a season LIST that
+        #     ``_season_covers`` treats as covering the requested season -- so a file
+        #     whose OWN name says S01E01 would clear the season gate for a requested
+        #     S02 and then be PLACED under S02 as S02E01 (mis-routed, silently
+        #     completing the wrong season with the wrong file). When the parse is
+        #     multi-season, fall back to the file's OWN season (basename alone) and
+        #     require it to equal the requested season; an own-season that differs OR
+        #     cannot be determined is ambiguous -> WRONG_MEDIA, never placed. (A
+        #     single-season or folder-only ``int`` season is unambiguous and skips
+        #     this; season packs are still grab-selectable -- only per-file PLACEMENT
+        #     is tightened here.)
+        if isinstance(parsed.season, list):
+            own_season = parser.parse(name).season
+            if own_season != expected_season:
+                reasons.append(
+                    (
+                        ImportRejectionReason.WRONG_MEDIA,
+                        f"file {name!r} sits in a multi-season pack (parsed seasons "
+                        f"{parsed.season!r}); its own season {own_season!r} does not "
+                        f"unambiguously match requested season {expected_season}",
+                    )
+                )
+
         # 4. Quality hard gate — key on PROFILE-ALLOWED, not equal-to-grabbed.
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
         verdict = check_quality(quality, profile)
