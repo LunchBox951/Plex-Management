@@ -454,6 +454,53 @@ async def test_grab_rejects_same_hash_active_for_a_different_season(
     assert rows[0].season == 1
 
 
+async def test_grab_rejects_same_hash_active_for_uncovered_episodes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Same-hash reuse compares the full scope, not just the season: an active row
+    scoped to S02 episode [4], re-grabbed for the SAME hash + season but an UNCOVERED
+    episode [5], must conflict (not a no-op that leaves E05 untracked). A COVERED
+    request (the same [4], or a subset) stays an idempotent no-op."""
+    request_id = await _make_tv_request(sessionmaker_)
+    h = "8" * 40
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02E04.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[4],
+        )
+    assert first.episodes == [4]
+
+    async with sessionmaker_() as session:
+        with pytest.raises(DownloadScopeConflictError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv(h, "Some.Show.S02E05.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+                episodes=[5],
+            )
+
+    # The already-requested episode [4] is COVERED -> idempotent no-op, same row.
+    async with sessionmaker_() as session:
+        again = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02E04.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[4],
+        )
+    assert again.id == first.id
+
+
 async def test_grab_tv_request_missing_season_raises_season_required(
     sessionmaker_: SessionMaker,
 ) -> None:

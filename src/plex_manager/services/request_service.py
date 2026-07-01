@@ -362,7 +362,23 @@ async def create_request(
                 # (outside the active-dedup index), so two racing creates can each
                 # leave an available row. Collapse to the oldest, same as the movie
                 # path below (which never runs for tv: its initial_status is pending).
-                record = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
+                winner = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
+                if winner.id != record.id:
+                    # THIS row (the loser) was deleted, cascading ITS SeasonRequests.
+                    # The two racers may have named DIFFERENT seasons, so ensure the
+                    # winner also tracks the seasons THIS request asked for -- else the
+                    # caller gets back a request that doesn't track the season it just
+                    # requested. Then re-read past the merged rollup.
+                    await season_request_service.ensure_seasons(
+                        session,
+                        library,
+                        media_request_id=winner.id,
+                        tmdb_id=tmdb_id,
+                        seasons=season_numbers,
+                    )
+                    await session.commit()
+                    winner = await repo.get(winner.id) or winner
+                record = winner
     except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
         # race: the partial UNIQUE index over active statuses rejected this insert.

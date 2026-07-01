@@ -51,8 +51,11 @@ async def test_blocklist_is_scoped_by_media_type(session: AsyncSession) -> None:
 
     tv = {e.source_title for e in await repo.list_for_media(100, media_type="tv")}
     movie = {e.source_title for e in await repo.list_for_media(100, media_type="movie")}
-    assert tv == {"Show.S02.1080p.x264", "Legacy.Untyped.x264"}  # typed-tv + legacy NULL
-    assert movie == {"Legacy.Untyped.x264"}  # the tv entry is excluded from a movie query
+    # A tv query matches ONLY typed-tv rows: a legacy NULL row is movie-era and must
+    # NOT leak into a tv scope (that would re-introduce the cross-namespace block).
+    assert tv == {"Show.S02.1080p.x264"}
+    # A movie query matches typed-movie rows PLUS legacy NULL (movie-era) rows.
+    assert movie == {"Legacy.Untyped.x264"}
 
     # is_blocklisted honours the same scope: the tv entry's hash doesn't match a movie.
     assert await repo.is_blocklisted(100, "a" * 40, "x", None, media_type="tv") is True

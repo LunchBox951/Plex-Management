@@ -29,14 +29,19 @@ def _media_type_scope(media_type: str | None) -> ColumnElement[bool] | None:
 
     TMDB movie and TV ids are SEPARATE namespaces, so a movie and a show can share
     the same numeric ``tmdb_id``; scoping only by ``tmdb_id`` lets a TV blocklist
-    entry match a movie candidate (and vice versa). When a concrete ``media_type`` is
-    given, match rows of THAT media type OR the legacy ``NULL`` (movie-era entries,
-    predating the column) so pre-existing blocklists keep working; a typed entry for
-    the OTHER media type is excluded. ``None`` (an untyped "search") imposes no scope.
+    entry match a movie candidate (and vice versa). Match rows of the requested media
+    type. Legacy ``NULL``-media_type rows predate BOTH the column and the TV feature,
+    so they are movie-era: fold them into the ``movie`` scope ONLY (keeping old movie
+    blocklists working) and NEVER into a ``tv`` scope (that would re-introduce exactly
+    the cross-namespace false block for legacy rows). ``None`` (an untyped "search")
+    imposes no scope.
     """
     if media_type is None:
         return None
-    return or_(Blocklist.media_type == MediaType(media_type), Blocklist.media_type.is_(None))
+    typed = Blocklist.media_type == MediaType(media_type)
+    if media_type == "movie":
+        return or_(typed, Blocklist.media_type.is_(None))
+    return typed
 
 
 def _to_record(row: Blocklist) -> BlocklistRecord:

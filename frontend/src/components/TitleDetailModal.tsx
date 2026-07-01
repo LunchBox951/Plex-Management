@@ -333,8 +333,17 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       // "whole series" checked (the default) omits it entirely, which the backend
       // reads as "track every aired season" (request_service._season_numbers).
       // Movies never set this field — identical payload to before.
-      if (title.media_type === 'tv' && !wholeSeries) {
-        body.seasons = [currentSeason ?? 1]
+      //
+      // A title that ALREADY has tracked seasons hides the "whole series" checkbox
+      // (the season PICKER drives selection instead), so `wholeSeries` is stale-true
+      // there: a "Request again" for a failed S2 must scope to the SELECTED season,
+      // not silently re-request the whole show. Only the pre-request flow (no tracked
+      // seasons yet, checkbox visible) honours `wholeSeries`.
+      if (title.media_type === 'tv') {
+        const hasTrackedSeasons = (effectiveSeasons?.length ?? 0) > 0
+        if (hasTrackedSeasons || !wholeSeries) {
+          body.seasons = [currentSeason ?? 1]
+        }
       }
       const created = await createRequest.mutateAsync(body)
       if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
@@ -362,7 +371,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason])
+  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons])
 
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {

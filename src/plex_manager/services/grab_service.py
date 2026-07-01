@@ -142,29 +142,64 @@ class SeasonRequiredError(Exception):
 
 
 class DownloadScopeConflictError(Exception):
-    """The same torrent is already active for a DIFFERENT season — refuse the reuse.
+    """The same torrent is already active for an INCOMPATIBLE scope — refuse the reuse.
 
     Surfaced (HTTP 409 ``download_scope_conflict``), never a silent no-op. A
     ``Download.torrent_hash`` is UNIQUE (one physical torrent = one row with one
-    ``season``), so an already-active MULTI-season pack grabbed for a second season
-    cannot be tracked as a second row. Without this guard the known-hash precheck
-    returned the FIRST season's row as an idempotent no-op: the second season was
-    never marked ``downloading`` and the import only ever processed the first
-    season, silently stranding the rest. Honesty over silence: tell the operator
-    the torrent is already downloading for another season (representing one download
-    that satisfies many seasons is a tracked follow-up, not this row's job).
+    ``(season, episodes)`` scope), so an already-active pack grabbed for a DIFFERENT
+    season — or a different episode subset the active row does not cover — cannot be
+    tracked as a second row. Without this guard the same-hash reuse returned the
+    FIRST scope's row as an idempotent no-op: the newly requested season/episodes
+    were never marked ``downloading`` and the import only ever processed the stale
+    scope, silently stranding the rest. Honesty over silence: tell the operator the
+    torrent is already downloading a different scope (one download satisfying many
+    seasons/episodes is a tracked follow-up, not this row's job).
     """
 
     def __init__(
-        self, torrent_hash: str, active_season: int | None, requested_season: int | None
+        self,
+        torrent_hash: str,
+        *,
+        active_season: int | None,
+        active_episodes: list[int] | None,
+        requested_season: int | None,
+        requested_episodes: list[int] | None,
     ) -> None:
         self.torrent_hash = torrent_hash
         self.active_season = active_season
         self.requested_season = requested_season
         super().__init__(
-            f"torrent {torrent_hash} is already active for season {active_season}; "
-            f"cannot re-track it for season {requested_season}"
+            f"torrent {torrent_hash} is already active with an incompatible scope "
+            f"(active season={active_season} episodes={active_episodes}; "
+            f"requested season={requested_season} episodes={requested_episodes})"
         )
+
+
+def _reuse_conflicts(
+    existing: DownloadRecord, season: int | None, episodes: list[int] | None
+) -> bool:
+    """Whether an active same-hash row's scope fails to COVER the requested one.
+
+    Returning a non-covering row as an idempotent no-op would silently leave the new
+    scope untracked (the importer only ever processes the active row's stored scope):
+
+    - a DIFFERENT ``season`` always conflicts (a different ``SeasonRequest``);
+    - same season, the active row's EPISODE scope must cover the request:
+      ``episodes_json is None`` imports the whole season -> covers any request; a
+      whole-season request (``episodes is None``) is covered ONLY by a whole-season
+      active row; otherwise the request's episodes must be a SUBSET of the active
+      row's episodes.
+
+    Movies (both seasons ``None``, both episode lists ``None``) always cover -> the
+    reuse stays an idempotent no-op, unchanged.
+    """
+    if existing.season != season:
+        return True
+    if existing.episodes is None:
+        return False
+    if episodes is None:
+        return True
+    return not set(episodes).issubset(set(existing.episodes))
 
 
 async def _reuse_terminal_row(
@@ -304,8 +339,14 @@ async def grab(
             # season) must not be returned as a no-op -- that leaves the new season
             # untracked (see DownloadScopeConflictError). A movie (both None) or the
             # same season returns the row unchanged.
-            if pre.season != season:
-                raise DownloadScopeConflictError(known_hash, pre.season, season)
+            if _reuse_conflicts(pre, season, episodes):
+                raise DownloadScopeConflictError(
+                    known_hash,
+                    active_season=pre.season,
+                    active_episodes=pre.episodes,
+                    requested_season=season,
+                    requested_episodes=episodes,
+                )
             return pre
 
     # Parallel-grab guard: if this request already has an active (non-terminal)
@@ -333,8 +374,14 @@ async def grab(
         # Same scope-match guard as the known-hash precheck, for the case the indexer
         # gave no hash so this is the first time we see the real one from qbt.add.
         # Re-adding the same magnet is a qBittorrent no-op, so nothing is orphaned.
-        if existing.season != season:
-            raise DownloadScopeConflictError(torrent_hash, existing.season, season)
+        if _reuse_conflicts(existing, season, episodes):
+            raise DownloadScopeConflictError(
+                torrent_hash,
+                active_season=existing.season,
+                active_episodes=existing.episodes,
+                requested_season=season,
+                requested_episodes=episodes,
+            )
         return existing
 
     if existing is not None:
@@ -389,6 +436,19 @@ async def grab(
             if winner is None:  # pragma: no cover - the conflicting row must exist
                 raise
             if winner.status not in _TERMINAL_STATUS_VALUES:
+                # Same scope-conflict guard as the non-race precheck: two grabs for
+                # the same hash but a DIFFERENT tv scope can race past the prechecks,
+                # the loser hitting UNIQUE(torrent_hash) here. Returning the winner's
+                # (first-scope) row as a no-op would leave the loser's season/episodes
+                # untracked, so refuse it honestly rather than silently stranding it.
+                if _reuse_conflicts(winner, season, episodes):
+                    raise DownloadScopeConflictError(
+                        torrent_hash,
+                        active_season=winner.season,
+                        active_episodes=winner.episodes,
+                        requested_season=season,
+                        requested_episodes=episodes,
+                    ) from None
                 return winner
             record = await _reuse_terminal_row(
                 download_repo,
