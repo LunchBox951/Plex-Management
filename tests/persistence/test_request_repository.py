@@ -83,6 +83,32 @@ async def test_find_active_treats_completed_finalizing_as_active(session: AsyncS
         await repo.create(tmdb_id=77, media_type="movie", title="Dup", status="pending")
 
 
+async def test_partially_available_round_trips_and_blocks_dedup(session: AsyncSession) -> None:
+    """``partially_available`` is a TV-only rollup status (some seasons available,
+    others still in flight). It must round-trip through the DB like any other
+    status, be found by ``find_active`` (still in-flight, not settled), and keep
+    blocking a duplicate request for the same show at the DB level — exactly like
+    ``completed`` already does."""
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=88, media_type="tv", title="Partial Show", status="partially_available"
+    )
+    assert created.status == "partially_available"
+
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.status == "partially_available"
+
+    active = await repo.find_active(88, "tv")
+    assert active is not None
+    assert active.status == "partially_available"
+
+    # The DB backstop refuses a duplicate request while a show is still
+    # partially available (not yet fully available or failed).
+    with pytest.raises(IntegrityError):
+        await repo.create(tmdb_id=88, media_type="tv", title="Dup", status="pending")
+
+
 async def test_partial_unique_index_blocks_second_active_request(
     session: AsyncSession,
 ) -> None:

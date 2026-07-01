@@ -69,6 +69,15 @@ class RequestStatus(StrEnum):
     downloading = "downloading"
     completed = "completed"
     available = "available"
+    # TV-only rollup: some seasons of the show are `available`, others are still
+    # in flight. Computed (never set directly by a single-season transition) by
+    # the pure ``domain/season_rollup.rollup_status`` and persisted onto the
+    # parent ``MediaRequest`` after every season transition. Still "in progress"
+    # from the requester's point of view — a season can move it back to fully
+    # `available` later — so it stays IN ``uq_media_requests_active`` (keeps
+    # blocking a duplicate request for the same show) but stays OUT of
+    # ``TERMINAL_REQUEST_STATUS_VALUES`` / ``_SETTLED_REQUEST_STATUSES``.
+    partially_available = "partially_available"
     failed = "failed"
     # The download finished but the import was blocked (a bad file or an import
     # error). A surfaced, retryable "needs attention" state — never a silent fail,
@@ -224,11 +233,11 @@ class MediaRequest(Base):
             unique=True,
             sqlite_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed')"
+                "'downloading', 'import_blocked', 'completed', 'partially_available')"
             ),
             postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed')"
+                "'downloading', 'import_blocked', 'completed', 'partially_available')"
             ),
         ),
     )
@@ -257,6 +266,20 @@ class SeasonRequest(Base):
     """A per-season request belonging to a TV :class:`MediaRequest`."""
 
     __tablename__ = "season_requests"
+    __table_args__ = (
+        # A show can never have two rows for the same season, regardless of
+        # status — unconditional (no WHERE), unlike the request/download active
+        # indexes. This is what makes ``SeasonRequestRepository.ensure()``
+        # race-safe: two concurrent grabs racing to lazily-create the SAME season
+        # row raise IntegrityError, caught and resolved to a re-read (mirrors the
+        # IntegrityError-catch-and-reread pattern at ``request_service.py:159-184``).
+        Index(
+            "uq_season_requests_media_season",
+            "media_request_id",
+            "season_number",
+            unique=True,
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     media_request_id: Mapped[int] = mapped_column(
@@ -272,14 +295,26 @@ class Download(Base):
 
     __tablename__ = "downloads"
     __table_args__ = (
-        # At most one ACTIVE download per request — the DB backstop for the
-        # app-level parallel-grab guard (which is otherwise a TOCTOU check).
+        # At most one ACTIVE download per (request, season) — the DB backstop for
+        # the app-level parallel-grab guard (which is otherwise a TOCTOU check).
         # Mirrors uq_media_requests_active: terminal statuses are excluded so a
         # fresh grab after one finishes/fails is still allowed, and the predicate
         # is supplied per-dialect so the partial index is honoured on Postgres too.
+        #
+        # Widened from a plain (media_request_id) unique to (media_request_id,
+        # COALESCE(season, -1)) so whole-series TV requests can grab S1 and S2
+        # concurrently (two DIFFERENT SeasonRequest rows under the SAME
+        # MediaRequest) without tripping the guard. A bare (media_request_id,
+        # season) unique index would NOT work for movies: SQL NULL is never equal
+        # to NULL, so two movie downloads (season IS NULL on both) would no longer
+        # collide, silently reopening the very TOCTOU the index exists to close.
+        # The COALESCE(-1) sentinel folds every movie row onto the SAME synthetic
+        # key, restoring the single-active-movie-download guarantee, while real
+        # (non-NULL) season values keep TV downloads scoped per season.
         Index(
             "uq_downloads_active_request",
             "media_request_id",
+            sa.func.coalesce(sa.column("season", sa.Integer()), -1),
             unique=True,
             sqlite_where=sa.text(
                 "media_request_id IS NOT NULL "

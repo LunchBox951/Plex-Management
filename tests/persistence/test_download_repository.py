@@ -28,6 +28,53 @@ async def test_at_most_one_active_download_per_request(session: AsyncSession) ->
         await repo.create(torrent_hash="active_b", status="downloading", media_request_id=mr.id)
 
 
+async def test_concurrent_movie_downloads_still_collide_after_season_coalesce(
+    session: AsyncSession,
+) -> None:
+    """Regression guard for the ``uq_downloads_active_request`` widening.
+
+    The index moved from a plain unique on ``media_request_id`` to a unique on
+    ``(media_request_id, COALESCE(season, -1))`` so TV can grab season 1 and
+    season 2 concurrently. A naive ``(media_request_id, season)`` unique index
+    (no COALESCE) would have silently BROKEN the movie guarantee this index
+    exists for: SQL NULL is never equal to NULL, so two movie downloads (both
+    ``season IS NULL``) would stop colliding. This pins the COALESCE(-1)
+    sentinel actually folds every movie row onto the same synthetic key.
+    """
+    mr = MediaRequest(
+        tmdb_id=2, media_type=MediaType.movie, title="Movie", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    # Both downloads are movies: season is NULL on both.
+    await repo.create(torrent_hash="movie_a", status="downloading", media_request_id=mr.id)
+    with pytest.raises(IntegrityError):
+        await repo.create(torrent_hash="movie_b", status="downloading", media_request_id=mr.id)
+
+
+async def test_concurrent_tv_downloads_for_different_seasons_do_not_collide(
+    session: AsyncSession,
+) -> None:
+    """The widened index scopes uniqueness PER SEASON, so a whole-series TV
+    request can have season 1 and season 2 downloading at the same time —
+    while a second release for the SAME season still collides."""
+    mr = MediaRequest(
+        tmdb_id=3, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    await repo.create(torrent_hash="s1", status="downloading", media_request_id=mr.id, season=1)
+    # A DIFFERENT season for the same request must NOT collide.
+    await repo.create(torrent_hash="s2", status="downloading", media_request_id=mr.id, season=2)
+    # A SECOND release for the SAME season must still collide.
+    with pytest.raises(IntegrityError):
+        await repo.create(
+            torrent_hash="s1_again", status="downloading", media_request_id=mr.id, season=1
+        )
+
+
 async def test_create_then_get_by_hash(session: AsyncSession) -> None:
     repo = SqlDownloadRepository(session)
     created = await repo.create(

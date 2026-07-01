@@ -12,10 +12,9 @@ from pathlib import Path
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+import plex_manager.models  # noqa: F401  (register ORM metadata for autogenerate)
 from plex_manager.config import get_settings
 from plex_manager.db import Base, sync_database_url
-
-import plex_manager.models  # noqa: F401  (register ORM metadata for autogenerate)
 
 config = context.config
 
