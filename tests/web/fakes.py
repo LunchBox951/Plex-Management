@@ -225,7 +225,10 @@ class FakeLibrary:
         self.sections = sections or []
         self.scanned: list[str] = []
 
-    async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
+    async def is_available(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+    ) -> bool:
+        # No cache to bypass; ``use_cache`` is accepted to match LibraryPort.
         if media_type == "tv":
             raise NotImplementedError("tv availability deferred to next beta")
         return tmdb_id in self.available_ids

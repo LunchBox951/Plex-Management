@@ -133,7 +133,13 @@ export interface paths {
         };
         /**
          * Get Queue
-         * @description Reconcile active downloads against the client and return the live queue.
+         * @description Return the live download queue (read-only).
+         *
+         *     Passive by design: the background reconcile loop is the single owner of
+         *     cross-system truth, so a queue poll never reconciles — doing so could race the
+         *     loop's importer CAS and clobber an ``importing`` claim. The loop refreshes
+         *     frequently, so the persisted progress/status is fresh enough to display, and the
+         *     queue stays viewable even while qBittorrent is unreachable.
          */
         get: operations["get_queue_api_v1_queue_get"];
         put?: never;

@@ -114,6 +114,20 @@ export function Settings() {
   )
 
   const handleSave = async () => {
+    // A library folder is discovered against a *specific* Plex server. If the
+    // operator just changed the Plex connection (URL or a freshly typed token)
+    // but hasn't re-picked a folder, don't carry the OLD server's movies_root
+    // over with the new creds: clear it. '' reads as unset server-side (a
+    // visible "library not configured" 409, not a silent wrong-path write), so
+    // the picker — refetched against the new connection on save — forces a
+    // fresh, valid selection before any import can scan a path off the old Plex.
+    // (Omitting movies_root would NOT fix this: the backend leaves absent fields
+    // unchanged, so the stale path would stay persisted.)
+    const plexConnectionChanged =
+      form.plex_url !== (data.plex_url ?? '') || form.plex_token.length > 0
+    const moviesRootReselected = form.movies_root !== (data.movies_root ?? '')
+    const clearMoviesRoot = plexConnectionChanged && !moviesRootReselected
+
     // Plaintext fields always written; secrets only when the user typed a value,
     // so an untouched secret stays the backend's no-op (left unchanged).
     const body: SettingsUpdate = {
@@ -121,7 +135,7 @@ export function Settings() {
       prowlarr_url: form.prowlarr_url,
       qbittorrent_url: form.qbittorrent_url,
       qbittorrent_username: form.qbittorrent_username,
-      movies_root: form.movies_root,
+      movies_root: clearMoviesRoot ? '' : form.movies_root,
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -131,7 +145,10 @@ export function Settings() {
     try {
       await update.mutateAsync(body)
       toast({ title: 'Settings saved', intent: 'success' })
-      // Clear secret inputs so they reflect the now-masked stored values.
+      // Clear secret inputs so they reflect the now-masked stored values, and
+      // drop movies_root from the form when we cleared it server-side so the
+      // refreshed picker shows the placeholder (and a follow-up save can't
+      // re-write the stale path).
       setForm((prev) =>
         prev
           ? {
@@ -140,6 +157,7 @@ export function Settings() {
               prowlarr_api_key: '',
               qbittorrent_password: '',
               tmdb_api_key: '',
+              ...(clearMoviesRoot ? { movies_root: '' } : {}),
             }
           : prev,
       )

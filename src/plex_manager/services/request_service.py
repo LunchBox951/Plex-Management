@@ -93,9 +93,16 @@ async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
     the deferred-TV ``NotImplementedError`` must not block a request. The failure is
     logged and treated as "can't prove it's a dup", so the request proceeds normally
     — an explicit decision, not a swallowed ``False`` (the prototype's bug).
+
+    ``use_cache=False``: the dedup decision must reflect Plex as it is NOW. The
+    cached-presence fast path would otherwise return a stale True after an operator
+    REMOVES a movie and immediately re-requests it (within the cache TTL), returning
+    the old 'available' row instead of a fresh pending request (G7). The cost — one
+    section-page walk per interactive create — is bounded by library size and only on
+    this low-frequency path; the reconcile loop keeps the cached fast path.
     """
     try:
-        return await library.is_available(tmdb_id, "movie")
+        return await library.is_available(tmdb_id, "movie", use_cache=False)
     except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
         _logger.warning(
             "plex availability check failed for tmdb %s (%s); proceeding with a request",

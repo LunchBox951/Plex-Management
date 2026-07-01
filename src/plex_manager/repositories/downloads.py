@@ -174,6 +174,8 @@ class SqlDownloadRepository:
         allowed_from: frozenset[str],
         *,
         download_path: str | None = None,
+        failed_reason: str | None = None,
+        clear_download_path: bool = False,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -186,13 +188,23 @@ class SqlDownloadRepository:
         move still applies; ``False`` means the row moved out from under the caller and
         the transition must be abandoned, honoring whoever changed it.
 
+        ``failed_reason`` and ``clear_download_path`` mirror :meth:`update_status` so a
+        CONDITIONAL block can record its surfaced reason (and drop a rolled-back
+        placement breadcrumb) in the SAME compare-and-swap — never overwriting a row
+        that already left ``allowed_from`` (e.g. an operator's committed mark_failed).
+        ``clear_download_path`` takes precedence over ``download_path``.
+
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS
-        status.
+        status (and reason / cleared path).
         """
-        values: dict[str, str] = {"status": status}
-        if download_path is not None:
+        values: dict[str, str | None] = {"status": status}
+        if clear_download_path:
+            values["download_path"] = None
+        elif download_path is not None:
             values["download_path"] = download_path
+        if failed_reason is not None:
+            values["failed_reason"] = failed_reason
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))
@@ -205,3 +217,28 @@ class SqlDownloadRepository:
         # ``CursorResult``/``Any`` as unused imports.
         result = cast(CursorResult[Any], await self._session.execute(stmt))
         return result.rowcount == 1
+
+    async def refresh_progress(
+        self,
+        download_id: int,
+        *,
+        progress: float | None = None,
+        seed_ratio: float | None = None,
+    ) -> None:
+        """Update ONLY live progress / seed_ratio — never status.
+
+        The reconcile loop refreshes progress on rows with no state transition. It must
+        NOT rewrite status: an operator's import retry (or the importer) may have
+        CAS-claimed the row to ``importing`` between the loop's ``list_active`` snapshot
+        and this write, and rewriting the stale snapshot status would clobber that claim
+        (defeating the import finalize CAS and stranding the placed file). Touching only
+        progress/seed_ratio leaves any concurrent status transition intact.
+        """
+        row = await self._session.get(Download, download_id)
+        if row is None:
+            return
+        if progress is not None:
+            row.progress = progress
+        if seed_ratio is not None:
+            row.seed_ratio = seed_ratio
+        await self._session.flush()

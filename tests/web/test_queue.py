@@ -120,34 +120,49 @@ async def test_grab_creates_download_and_history_and_is_idempotent(
     assert len(qbt.added) == 1
 
 
-async def test_reconcile_applies_completed_and_keeps_client_missing_within_grace(
+async def test_get_queue_is_passive_and_does_not_reconcile(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
+    """G5: GET /queue is read-only. The background reconcile loop is the single owner
+    of cross-system truth; a queue poll must NOT reconcile — a concurrent write could
+    clobber the importer's CAS-claimed ``importing`` status. So GET /queue lists the
+    queue WITHOUT mutating any row: a ``downloading`` row whose client snapshot reports
+    complete is NOT advanced to import_pending by the read, and an ``importing`` row
+    stays ``importing``. (Reconcile transitions are proven on the background path in
+    tests/services/test_queue_service.py.)"""
     await seed(initialized=True, app_api_key=_API_KEY)
-    completed_id = await _insert_download(
+    downloading_id = await _insert_download(
         sessionmaker_, torrent_hash="a" * 40, status="downloading"
     )
-    missing_id = await _insert_download(
-        sessionmaker_,
-        torrent_hash="b" * 40,
-        status="client_missing",
-        first_seen_at=datetime.now(UTC),  # within the 10-minute grace
-    )
+    importing_id = await _insert_download(sessionmaker_, torrent_hash="b" * 40, status="importing")
 
-    qbt = FakeQbittorrent(
-        statuses=[
-            DownloadStatus(info_hash="a" * 40, name="completed.torrent", raw_state="stoppedUP"),
-        ]
+    # A snapshot that, IF the read reconciled, would advance the downloading row to
+    # import_pending (stoppedUP). Passive GET never consults it — the endpoint no
+    # longer depends on qBittorrent, so this override is inert by design.
+    override_adapters(
+        app,
+        qbt=FakeQbittorrent(
+            statuses=[
+                DownloadStatus(info_hash="a" * 40, name="done.torrent", raw_state="stoppedUP"),
+                DownloadStatus(info_hash="b" * 40, name="imp.torrent", raw_state="stoppedUP"),
+            ]
+        ),
     )
-    override_adapters(app, qbt=qbt)
 
     response = await client.get("/api/v1/queue", headers=_HEADERS)
     assert response.status_code == 200
     by_id = {item["id"]: item for item in response.json()["queue"]}
 
-    # Completed torrent -> import_pending; absent-but-in-grace stays client_missing.
-    assert by_id[completed_id]["status"] == "import_pending"
-    assert by_id[missing_id]["status"] == "client_missing"
+    # Both rows are returned, with their persisted status UNCHANGED by the read.
+    assert by_id[downloading_id]["status"] == "downloading"
+    assert by_id[importing_id]["status"] == "importing"
+
+    # And the DB rows were not mutated — no reconcile clobber from a poll.
+    async with sessionmaker_() as session:
+        downloading = await session.get(Download, downloading_id)
+        importing = await session.get(Download, importing_id)
+    assert downloading is not None and downloading.status == "downloading"
+    assert importing is not None and importing.status == "importing"
 
 
 async def test_mark_failed_blocklists(

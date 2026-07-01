@@ -140,12 +140,22 @@ async def _reuse_terminal_row(
     ``Downloading`` without clearing it would let the reconciler fast-fail this
     fresh grab against the long-expired window. ``clear_first_seen_at`` gives the
     re-grab a clean grace window.
+
+    The stale ``download_path`` breadcrumb is likewise cleared: an ``Imported`` row
+    carries ``download_path`` pointing at the OLD Plex library file. Left in place,
+    the next import's ``_resolve_content`` would fall back to that stale library
+    path when the client reports no ``content_path`` and validate the wrong file —
+    blocking the fresh download as no-video if the old file is gone, or wrongly
+    completing the new request without importing it if it still exists.
+    ``clear_download_path`` drops the breadcrumb so the re-grab tracks its own
+    content.
     """
     await download_repo.update_status(
         download_id,
         DownloadState.Downloading.value,
         clear_failed_reason=True,
         clear_first_seen_at=True,
+        clear_download_path=True,
         media_request_id=request_id,
     )
     record = await download_repo.get_by_hash(torrent_hash)

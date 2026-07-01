@@ -797,3 +797,44 @@ async def test_import_history_events_keep_basename_in_message_not_source_title(
     imported = by_type[DownloadHistoryEvent.imported]
     assert started.source_title is None and "movie.mkv" in (started.message or "")
     assert imported.source_title is None and "movie.mkv" in (imported.message or "")
+
+
+async def test_block_does_not_overwrite_operator_mark_failed_during_gap(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # G1: the PRE-claim ``_block`` sites must honor an operator's mark_failed too. A CAM
+    # file is rejected by the validator, driving import_download into the
+    # validation-reject ``_block`` BEFORE it ever claims ``Importing`` (so the round-8
+    # claim-CAS never runs). If the operator rejected the release (mark_failed -> Failed
+    # + blocklist + re-search) during qbt.get_status, the compare-and-swap inside
+    # ``_block`` must see the row left ``_RESUMABLE`` and abort: it must NOT overwrite
+    # ``failed`` with ``import_blocked`` and must NOT re-arm the request away from
+    # ``searching``. The operator's correction is honored (north-star).
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.CAM.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _MarkFailedMidImportQbt(
+        _qbt(video).statuses, sessionmaker_=sessionmaker_, download_id=download_id
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    # The operator's failed state stands; the rejected CAM was NOT re-blocked over it.
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert record.failed_reason == "marked failed by operator"
+    assert not any(movies_root.iterdir())  # nothing copied into the library
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.searching  # operator's re-search stands
+        blocklisted = (await session.execute(select(Blocklist))).scalars().all()
+        assert len(blocklisted) == 1  # operator's blocklist stands
+        download = await session.get(Download, download_id)
+        assert download is not None and download.status == DownloadState.Failed.value

@@ -85,10 +85,16 @@ def _select_release(
 @router.get("")
 async def get_queue(
     session: Annotated[AsyncSession, Depends(get_session)],
-    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
 ) -> QueueResponse:
-    """Reconcile active downloads against the client and return the live queue."""
-    records = await queue_service.reconcile_and_list(qbt, session)
+    """Return the live download queue (read-only).
+
+    Passive by design: the background reconcile loop is the single owner of
+    cross-system truth, so a queue poll never reconciles — doing so could race the
+    loop's importer CAS and clobber an ``importing`` claim. The loop refreshes
+    frequently, so the persisted progress/status is fresh enough to display, and the
+    queue stays viewable even while qBittorrent is unreachable.
+    """
+    records = await queue_service.list_queue(session)
     return QueueResponse(queue=[_to_item(r) for r in records])
 
 

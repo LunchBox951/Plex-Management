@@ -8,10 +8,13 @@ index over active statuses rejects the loser; ``create_request`` catches the
 
 from __future__ import annotations
 
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.plex import PlexLibrary
+from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.ports.repositories import RequestRecord
@@ -189,3 +192,67 @@ async def test_removed_then_reacquired_yields_a_second_available_row(
         )
     available_ids = sorted(r.id for r in rows if r.status is RequestStatus.available)
     assert available_ids == sorted([stale.id, reacquired.id])  # BOTH survive
+
+
+async def test_create_request_redetects_removal_within_cache_ttl(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """G7: the request-dedup path must not trust a cached PRESENT answer from the real
+    Plex adapter. A movie recorded as available fills the presence cache; after it is
+    REMOVED from Plex and immediately re-requested (within the cache TTL), create_request
+    must re-page Plex (use_cache=False), see it absent, and create a fresh pending
+    request — not return the stale 'available' row."""
+    reset_caches()
+    present: set[int] = {99}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Directory": [
+                            {
+                                "key": "1",
+                                "title": "Movies",
+                                "type": "movie",
+                                "Location": [{"path": "/data/movies"}],
+                            }
+                        ]
+                    }
+                },
+            )
+        if path == "/library/sections/1/all":
+            meta = [{"Guid": [{"id": f"tmdb://{i}"}]} for i in sorted(present)]
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": meta}})
+        return httpx.Response(404, json={})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    library = PlexLibrary(client, base_url="http://g7-plex:32400", token="tok")  # noqa: S106
+    tmdb = FakeTmdb(movies={99: MovieMetadata(tmdb_id=99, title="Tenet", year=2020)})
+
+    # 1. In Plex -> recorded as available; this pages Plex and fills the presence cache.
+    async with sessionmaker_() as session:
+        available = await request_service.create_request(
+            session, tmdb, tmdb_id=99, media_type="movie", library=library
+        )
+    async with sessionmaker_() as session:
+        avail_row = await session.get(MediaRequest, available.id)
+        assert avail_row is not None
+        assert avail_row.status is RequestStatus.available
+
+    # 2. Removed from Plex — but the presence cache still holds tmdb 99 (within TTL).
+    present.discard(99)
+
+    # 3. Re-requested immediately. The dedup path must re-page, see it absent, and
+    #    create a NEW pending request rather than returning the stale available row.
+    async with sessionmaker_() as session:
+        reacquired = await request_service.create_request(
+            session, tmdb, tmdb_id=99, media_type="movie", library=library
+        )
+    assert reacquired.id != available.id
+    async with sessionmaker_() as session:
+        pending_row = await session.get(MediaRequest, reacquired.id)
+        assert pending_row is not None
+        assert pending_row.status is RequestStatus.pending

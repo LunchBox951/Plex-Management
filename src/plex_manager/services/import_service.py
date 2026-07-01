@@ -190,17 +190,36 @@ async def _block(
 ) -> None:
     """Move a download to the retryable ``ImportBlocked`` state, honestly.
 
+    The block is a COMPARE-AND-SWAP, conditional on the row still being resumable.
+    Every pre-claim caller runs after a long async gap (qbt status, source resolve,
+    parse) during which an operator can ``mark_failed`` the row in a SEPARATE session
+    — committing ``failed`` + blocklist + re-search. An unconditional block would
+    overwrite that committed decision (``failed`` -> ``import_blocked``) and re-arm the
+    request away from ``searching``, undoing the operator. So we block ONLY while the
+    row is still in ``_RESUMABLE``; if it left (the operator failed it), do nothing and
+    return — honoring the operator's decision.
+
     The owning request (when known) is moved to ``import_blocked`` — a surfaced,
     retryable "needs attention" state — so it never lies as ``downloading`` while
-    nothing is downloading (north-star #3). The operator retries the import or
-    rejects the release (mark-failed -> blocklist + re-search).
+    nothing is downloading (north-star #3) — but ONLY when the block actually applied,
+    so a row the operator already re-armed to ``searching`` is left alone. The operator
+    retries the import or rejects the release (mark-failed -> blocklist + re-search).
     """
-    await download_repo.update_status(
+    blocked = await download_repo.update_status_if_in(
         download_id,
         DownloadState.ImportBlocked.value,
+        _RESUMABLE,
         failed_reason=reason,
         clear_download_path=clear_download_path,
     )
+    if not blocked:
+        # The row left ``_RESUMABLE`` underneath us (an operator's mark_failed
+        # committed ``failed`` + blocklist + re-search during the validation gap).
+        # Honor that: don't overwrite it and don't re-arm the request. Roll back so the
+        # caller's get_by_hash reads the operator's committed state, not this
+        # transaction's stale snapshot.
+        await session.rollback()
+        return
     if request_id is not None:
         await SqlRequestRepository(session).set_status(
             request_id, RequestStatus.import_blocked.value

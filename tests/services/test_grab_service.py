@@ -178,3 +178,51 @@ async def test_grab_raises_when_no_info_hash_can_be_determined(
     async with sessionmaker_() as session:
         rows = (await session.execute(select(Download))).scalars().all()
     assert rows == []
+
+
+async def test_grab_reuse_clears_stale_download_path(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """G4: a terminal (Imported) row carries a download_path pointing at the OLD Plex
+    library file. Re-grabbing the same hash for a fresh request must clear that
+    breadcrumb, or import's _resolve_content would fall back to the stale library path
+    and validate the wrong file (block the fresh download as no-video, or wrongly
+    complete the new request without importing the new download)."""
+    stale_library_path = "/movies/Old Movie (2020)/Old Movie (2020).mkv"
+    async with sessionmaker_() as session:
+        old = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.completed
+        )
+        new = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="B", status=RequestStatus.searching
+        )
+        session.add_all([old, new])
+        await session.flush()
+        old_id, new_id = old.id, new.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="imported",
+                media_request_id=old_id,
+                tmdb_id=100,
+                download_path=stale_library_path,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=new_id,
+            tmdb_id=200,
+        )
+    assert record.status == "downloading"
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.media_request_id == new_id  # re-owned to the CURRENT request
+    assert row.download_path is None  # stale library breadcrumb cleared on re-grab

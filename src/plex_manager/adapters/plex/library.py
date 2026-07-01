@@ -288,11 +288,18 @@ class PlexLibrary:
             _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
         return sections
 
-    async def is_available(self, tmdb_id: int, media_type: Literal["movie", "tv"]) -> bool:
+    async def is_available(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+    ) -> bool:
         """Whether ``tmdb_id`` is already present in the library.
 
         TV availability needs per-season presence logic and is deferred — it raises
         honestly rather than returning a misleading ``False``.
+
+        The availability reconcile cycle keeps the cached-presence fast path
+        (``use_cache=True``); the request-dedup path passes ``use_cache=False`` so a
+        movie just REMOVED from Plex is seen as absent immediately and a re-request is
+        not blocked by a stale "present" answer for the cache TTL (G7).
         """
         if media_type == "tv":
             raise NotImplementedError("tv availability deferred to next beta")
@@ -300,9 +307,13 @@ class PlexLibrary:
         # cached ABSENCE: right after an import+scan the first page commonly precedes
         # Plex indexing, so caching that miss would keep the title "Finalizing" for
         # the whole TTL. On a cache miss OR a cached-absent answer, re-page Plex.
-        cached = _PRESENT_TMDB_CACHE.get(self._cache_key)
-        if cached is not None and tmdb_id in cached:
-            return True
+        # ``use_cache=False`` skips even a cached PRESENT: a dedup decision must reflect
+        # the library as it is NOW, not a pre-removal snapshot. The re-page still
+        # refreshes the cache below, so the reconcile cycle also sees the removal.
+        if use_cache:
+            cached = _PRESENT_TMDB_CACHE.get(self._cache_key)
+            if cached is not None and tmdb_id in cached:
+                return True
         present = await self._collect_present_tmdb_ids()
         _PRESENT_TMDB_CACHE.set(self._cache_key, present)
         return tmdb_id in present

@@ -424,3 +424,33 @@ async def test_list_sections_does_not_cache_a_no_movie_result() -> None:
     third = await adapter.list_sections()
     assert calls["n"] == 2  # served from cache; no extra fetch
     assert third == second
+
+
+async def test_is_available_no_cache_repages_despite_cached_presence() -> None:
+    """G7: use_cache=False bypasses the cached-PRESENT fast path so a removal is seen
+    immediately. The default (cached) lookup still trusts a cached present answer; the
+    dedup path passes use_cache=False so a removed-then-re-requested movie is not read
+    as stale-True for the whole cache TTL."""
+    present = {"there": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=ONE_MOVIE_SECTION)
+        if path == "/library/sections/1/all":
+            meta = [{"Guid": [{"id": "tmdb://4242"}]}] if present["there"] else []
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": meta}})
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://nocache-plex:32400")
+    # Present -> caches the presence set {4242}.
+    assert await adapter.is_available(4242, "movie") is True
+    # Removed from Plex, but the cache still holds 4242: the DEFAULT lookup is stale-True.
+    present["there"] = False
+    assert await adapter.is_available(4242, "movie") is True
+    # use_cache=False re-pages and sees the removal -> False (and refreshes the cache).
+    assert await adapter.is_available(4242, "movie", use_cache=False) is False
+    # The refreshed cache now reflects the removal for the default path too.
+    assert await adapter.is_available(4242, "movie") is False

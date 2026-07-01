@@ -79,6 +79,18 @@ function deriveState(request: RequestResponse | null, optimistic: boolean): Deri
   }
 }
 
+/**
+ * A request is grabbable only while it is non-terminal: the backend rejects a
+ * terminal request id in /queue/grab (`request_not_active`). Terminal statuses are
+ * `available` (already in the library), `completed` (imported, finalizing) and
+ * `failed`. POST /requests can itself hand back a terminal row — Plex already owns
+ * the title, or an existing completed/failed request is reused — so the create
+ * path must gate Grab on the returned status, not merely the presence of an id.
+ */
+function isGrabbableStatus(status: string): boolean {
+  return status !== 'available' && status !== 'completed' && status !== 'failed'
+}
+
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
 const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'error' }
 
@@ -103,6 +115,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const queueQuery = useQueue({ poll: open })
 
   const [requestId, setRequestId] = useState<number | null>(null)
+  // Whether the just-created `requestId` is still grabbable. Tracked separately from
+  // the id because POST /requests can return a TERMINAL row, and Grab must not arm
+  // for it in the window before the /requests poll reveals the live status.
+  const [createdGrabbable, setCreatedGrabbable] = useState(false)
   const [preview, setPreview] = useState<SearchPreviewResponse | null>(null)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
   // The confirm dialog for "report a problem"; carries the download to re-arm.
@@ -118,6 +134,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   latestTitleKey.current = titleKey
   useEffect(() => {
     setRequestId(null)
+    setCreatedGrabbable(false)
     setPreview(null)
     setGrabbingGuid(null)
     setReportFor(null)
@@ -141,15 +158,20 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const effectiveRequestId = requestId ?? liveRequest?.id ?? null
 
   // Grabbing needs a NON-terminal request: the backend rejects a terminal request id
-  // in /queue/grab (request_not_active). A just-created request, or the live one
-  // while still active, qualifies; a failed/available/completed one does not — for
-  // those the user must "Request again" (create a fresh request) before grabbing.
-  const liveRequestGrabbable =
-    liveRequest != null &&
-    liveRequest.status !== 'available' &&
-    liveRequest.status !== 'failed' &&
-    liveRequest.status !== 'completed'
-  const grabRequestId = requestId ?? (liveRequestGrabbable ? liveRequest.id : null)
+  // in /queue/grab (request_not_active). A just-created request that came back active,
+  // or the live one while still active, qualifies; a failed/available/completed one
+  // does not — for those the user must "Request again" (a fresh request) before grabbing.
+  const liveRequestGrabbable = liveRequest != null && isGrabbableStatus(liveRequest.status)
+  // Prefer the just-created request (it shows before the next poll lands), but only
+  // while it is grabbable AND the live request (once the poll has landed) has not since
+  // gone terminal; otherwise fall through to the live request, itself gated on a
+  // non-terminal status. A terminal create yields grabRequestId=null (Grab disabled).
+  const grabRequestId =
+    requestId !== null && createdGrabbable && (liveRequest === null || liveRequestGrabbable)
+      ? requestId
+      : liveRequestGrabbable
+        ? liveRequest.id
+        : null
 
   // The matching download. Prefer the request linkage (collision-free); fall back
   // to tmdb_id only when no request is known yet.
@@ -200,6 +222,9 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       })
       if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
       setRequestId(created.id)
+      // A terminal create (Plex already has the title, or a reused completed/failed
+      // request) must not arm Grab — gate on the returned status, not just the id.
+      setCreatedGrabbable(isGrabbableStatus(created.status))
       toast({ title: `Requested ${titleName}`, intent: 'success' })
       await runPreview(created.id)
     } catch (error) {
@@ -280,8 +305,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     </Button>
   )
 
-  // The report button only makes sense when there's a real download to act on.
-  const canReport = queueItem !== null
+  // The report button only makes sense when there's a real download to act on,
+  // AND when mark-failed is a legal move. During the import copy/scan window the
+  // download sits in 'importing' (raw DownloadState) while its owning request still
+  // reads 'downloading'; the state machine only allows Importing -> Imported/
+  // ImportBlocked, so a mark-failed there always 409s (invalid_state_transition).
+  // Don't offer an action that can't succeed — once the import lands the title
+  // re-renders as completed or import_blocked, where the correction paths reappear.
+  const canReport = queueItem !== null && queueItem.status !== 'importing'
   const reportButton =
     canReport && queueItem ? (
       <Button variant="danger" onClick={() => setReportFor({ downloadId: queueItem.id })}>
