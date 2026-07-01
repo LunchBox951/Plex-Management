@@ -35,12 +35,18 @@ async def test_blocklist_is_scoped_by_media_type(session: AsyncSession) -> None:
     versa); a legacy NULL-media_type entry (movie-era) still matches both."""
     repo = SqlBlocklistRepository(session)
     await repo.create(
-        source_title="Show.S02.1080p.x264", reason="failed", tmdb_id=100,
-        torrent_hash="a" * 40, media_type="tv",
+        source_title="Show.S02.1080p.x264",
+        reason="failed",
+        tmdb_id=100,
+        torrent_hash="a" * 40,
+        media_type="tv",
     )
     await repo.create(
-        source_title="Legacy.Untyped.x264", reason="failed", tmdb_id=100,
-        torrent_hash="c" * 40, media_type=None,  # pre-column entry
+        source_title="Legacy.Untyped.x264",
+        reason="failed",
+        tmdb_id=100,
+        torrent_hash="c" * 40,
+        media_type=None,  # pre-column entry
     )
 
     tv = {e.source_title for e in await repo.list_for_media(100, media_type="tv")}
