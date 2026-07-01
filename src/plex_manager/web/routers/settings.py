@@ -22,7 +22,7 @@ from plex_manager.web.deps import (
     require_api_key,
 )
 from plex_manager.web.schemas import PlexLibraryOption, SettingsResponse, SettingsUpdate
-from plex_manager.web.setup_validation import movie_library_options
+from plex_manager.web.setup_validation import library_options
 
 __all__ = ["router"]
 
@@ -49,14 +49,16 @@ async def get_settings_endpoint(
 async def plex_libraries_endpoint(
     library: Annotated[LibraryPort, Depends(get_library)],
 ) -> list[PlexLibraryOption]:
-    """Movie library folders Plex reports, for the Settings ``movies_root`` picker.
+    """Library folders (movie AND tv) Plex reports, for the Settings
+    ``movies_root`` / ``tv_root`` pickers -- each option is tagged by
+    ``section_type`` so the frontend can filter to the picker it's rendering.
 
     Uses the stored Plex creds (no re-typing the token); 409 if Plex is unconfigured.
     """
     # probe_writable=True (the default): authenticated, and the Plex creds are the
     # operator's own stored config — so the real writability signal is legitimate
     # here (unlike the pre-init validate/plex step, which must NOT probe).
-    return movie_library_options(await library.list_sections(), probe_writable=True)
+    return library_options(await library.list_sections(), probe_writable=True)
 
 
 @router.put("")

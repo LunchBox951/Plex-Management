@@ -151,8 +151,16 @@ async def complete(
         "tmdb_api_key": body.tmdb_api_key,
         "movies_root": body.movies_root,
     }
+    # ``tv_root`` is optional (unlike every other KNOWN_SETTING_KEYS entry): an
+    # install may complete setup with only a Movies library configured. Write it
+    # only when the operator actually supplied one, mirroring how an unset
+    # ``tv_root`` reads back as None from GET /settings rather than an empty string.
     for key in KNOWN_SETTING_KEYS:
+        if key == "tv_root":
+            continue
         await store.set(key, values[key])
+    if body.tv_root:
+        await store.set("tv_root", body.tv_root)
 
     await session.commit()
     return SetupStatusResponse(initialized=True, app_api_key=app_api_key)

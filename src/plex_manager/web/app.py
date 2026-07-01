@@ -35,6 +35,7 @@ from plex_manager.web.deps import (
     get_parser,
     get_qbittorrent,
     get_quality_profile,
+    get_tv_root_optional,
 )
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import blocklist as blocklist_router
@@ -66,9 +67,14 @@ def health() -> dict[str, str]:
 async def _reconcile_once(app: FastAPI) -> None:
     """One reconcile + import + availability pass with a fresh session.
 
-    Best-effort: if the download client isn't configured yet, the cycle is a no-op;
-    import + availability only run when Plex and the Movies root are configured too.
-    The reconciler is the single owner of cross-system truth (overview §5,
+    Best-effort: if the download client isn't configured yet, the cycle is a
+    no-op. The import drain runs whenever Plex is configured, REGARDLESS of
+    whether either library root is set: ``movies_root`` / ``tv_root`` are each
+    independently optional, and a row of that media type reaching
+    ``import_download`` while its own root is unset surfaces its own honest,
+    per-row ``ImportBlocked`` (never silently skipped, never gating the OTHER
+    media type's import) — see ``import_service.run_import_cycle``. The
+    reconciler is the single owner of cross-system truth (overview §5,
     north-star #5), so this — not a GET /queue poll — drives the loop, keeping the
     queue read fast and never blocking a request on a multi-GB copy.
     """
@@ -77,8 +83,8 @@ async def _reconcile_once(app: FastAPI) -> None:
     async with sessionmaker() as session:
         library = await get_library_optional(session, client)
 
-        # Download-client reconcile + import drain — needs qBittorrent (+ the Movies
-        # root for the drain). Skipped when qBittorrent isn't configured.
+        # Download-client reconcile + import drain — needs qBittorrent. Skipped
+        # when qBittorrent isn't configured.
         try:
             qbt = await get_qbittorrent(session, client)
         except ServiceNotConfiguredError:
@@ -96,8 +102,9 @@ async def _reconcile_once(app: FastAPI) -> None:
             # while qBittorrent is down.
             try:
                 await queue_service.reconcile_and_list(qbt, session)
-                movies_root = await get_movies_root_optional(session)
-                if library is not None and movies_root:
+                if library is not None:
+                    movies_root = await get_movies_root_optional(session)
+                    tv_root = await get_tv_root_optional(session)
                     await import_service.run_import_cycle(
                         fs=get_filesystem(),
                         library=library,
@@ -106,6 +113,7 @@ async def _reconcile_once(app: FastAPI) -> None:
                         profile=get_quality_profile(),
                         session=session,
                         movies_root=movies_root,
+                        tv_root=tv_root,
                     )
             except QbittorrentError as exc:
                 await session.rollback()

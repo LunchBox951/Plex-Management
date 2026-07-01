@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.ports.library import LibrarySection
 from plex_manager.web import setup_validation
-from plex_manager.web.setup_validation import movie_library_options
+from plex_manager.web.setup_validation import library_options
 from tests.web.fakes import FakeLibrary, override_adapters
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -34,20 +34,26 @@ def reset_plex_caches() -> Iterator[None]:
     reset_caches()
 
 
-def test_movie_library_options_filters_movies_and_flags_writable(tmp_path: Path) -> None:
+def test_library_options_includes_both_kinds_tagged_by_type(tmp_path: Path) -> None:
+    tv_path = tmp_path / "tv"
+    tv_path.mkdir()
     sections = [
         LibrarySection(
             key="1", title="Movies", type="movie", locations=(str(tmp_path), "/no/such/dir")
         ),
-        LibrarySection(key="2", title="Shows", type="show", locations=("/tv",)),
+        LibrarySection(key="2", title="Shows", type="show", locations=(str(tv_path),)),
     ]
-    options = movie_library_options(sections)
-    # Only movie sections; one option per location; writability is per-path.
-    assert [(o.title, o.path, o.writable) for o in options] == [
-        ("Movies", str(tmp_path), True),
-        ("Movies", "/no/such/dir", False),
+    options = library_options(sections)
+    # BOTH movie and show sections are returned, one option per location, each
+    # tagged with the app's own section_type ("show" -> "tv"); writability is
+    # per-path.
+    assert [(o.title, o.path, o.section_type, o.writable) for o in options] == [
+        ("Movies", str(tmp_path), "movie", True),
+        ("Movies", "/no/such/dir", "movie", False),
+        ("Shows", str(tv_path), "tv", True),
     ]
-    assert all(o.section_key == "1" for o in options)
+    assert options[0].section_key == "1"
+    assert options[2].section_key == "2"
 
 
 async def _use_transport(app: FastAPI, handler: Handler) -> None:
@@ -98,7 +104,7 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
     assert response.json()["ok"] is False
 
 
-async def test_validate_plex_ok_returns_movie_libraries(
+async def test_validate_plex_ok_returns_movie_and_tv_libraries(
     client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -133,20 +139,49 @@ async def test_validate_plex_ok_returns_movie_libraries(
     )
     body = response.json()
     assert body["ok"] is True
-    # Only the movie library is offered. Pre-init we do NOT probe the filesystem of
-    # a caller-supplied Plex server (no pre-auth oracle), so writability is UNKNOWN.
-    assert len(body["libraries"]) == 1
-    assert body["libraries"][0]["title"] == "Movies"
-    assert body["libraries"][0]["path"] == str(tmp_path)
-    assert body["libraries"][0]["writable"] is None
+    # BOTH the movie and tv libraries are offered, each tagged by section_type.
+    # Pre-init we do NOT probe the filesystem of a caller-supplied Plex server (no
+    # pre-auth oracle), so writability is UNKNOWN for either.
+    assert [(lib["title"], lib["path"], lib["section_type"]) for lib in body["libraries"]] == [
+        ("Movies", str(tmp_path), "movie"),
+        ("Shows", "/tv", "tv"),
+    ]
+    assert all(lib["writable"] is None for lib in body["libraries"])
 
 
-async def test_validate_plex_no_movie_library_blocks_setup(
-    client: httpx.AsyncClient, app: FastAPI
-) -> None:
-    # Plex is reachable and the token is valid, but there is no Movie library: an
-    # install that cannot import anything must be reported as not-ok so the wizard
-    # stops here instead of finishing into a configured-but-unusable state.
+async def test_validate_plex_movie_only_is_legit(client: httpx.AsyncClient, app: FastAPI) -> None:
+    # A movie-only Plex (no tv library at all) is a legitimate, complete config --
+    # the hard fail is reserved for NEITHER kind existing.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/library/sections"
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "Directory": [
+                        {
+                            "key": "1",
+                            "title": "Movies",
+                            "type": "movie",
+                            "Location": [{"path": "/movies"}],
+                        }
+                    ]
+                }
+            },
+        )
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": "tok"},
+    )
+    body = response.json()
+    assert body["ok"] is True
+    assert [lib["section_type"] for lib in body["libraries"]] == ["movie"]
+
+
+async def test_validate_plex_tv_only_is_legit(client: httpx.AsyncClient, app: FastAPI) -> None:
+    # Symmetric to the movie-only case: a tv-only Plex is also a legitimate config.
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/library/sections"
         return httpx.Response(
@@ -171,9 +206,30 @@ async def test_validate_plex_no_movie_library_blocks_setup(
         json={"url": "http://plex.local:32400", "token": "tok"},
     )
     body = response.json()
+    assert body["ok"] is True
+    assert [lib["section_type"] for lib in body["libraries"]] == ["tv"]
+
+
+async def test_validate_plex_no_library_at_all_blocks_setup(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # Plex is reachable and the token is valid, but there is NEITHER a Movie NOR a
+    # TV library: an install that cannot import anything must be reported as
+    # not-ok so the wizard stops here instead of finishing into a
+    # configured-but-unusable state.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/library/sections"
+        return httpx.Response(200, json={"MediaContainer": {"Directory": []}})
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": "tok"},
+    )
+    body = response.json()
     assert body["ok"] is False
     assert body["libraries"] == []
-    assert "Movie library" in body["message"]
+    assert "Movie or TV library" in body["message"]
 
 
 async def test_validate_plex_bad_token(client: httpx.AsyncClient, app: FastAPI) -> None:
@@ -278,17 +334,17 @@ async def test_validate_plex_does_not_probe_filesystem(
     assert [lib["writable"] for lib in body["libraries"]] == [None, None]
 
 
-def test_movie_library_options_probe_flag(tmp_path: Path) -> None:
+def test_library_options_probe_flag(tmp_path: Path) -> None:
     writable = LibrarySection(key="1", title="Movies", type="movie", locations=(str(tmp_path),))
     missing = LibrarySection(key="2", title="More", type="movie", locations=("/no/such/dir",))
 
     # Default (what the authenticated Settings picker uses): the filesystem IS probed.
-    probed = movie_library_options([writable, missing])
+    probed = library_options([writable, missing])
     assert [o.writable for o in probed] == [True, False]
 
     # probe_writable=False (the pre-init validate path): NOT probed -> UNKNOWN (None),
     # never a fabricated bool — even for a path that does not exist.
-    unprobed = movie_library_options([writable, missing], probe_writable=False)
+    unprobed = library_options([writable, missing], probe_writable=False)
     assert [o.writable for o in unprobed] == [None, None]
 
 
@@ -298,13 +354,30 @@ async def test_plex_libraries_picker_probes_writability(
     # The AUTHENTICATED Settings picker uses the operator's OWN stored Plex creds, so
     # the real writability signal is legitimate there and must still be probed — the
     # opposite of the pre-init validate/plex step, which must not touch the filesystem.
+    # A tv section is included too, proving the generalized picker returns BOTH kinds.
     await seed(initialized=True, app_api_key=_API_KEY)
-    section = LibrarySection(key="1", title="Movies", type="movie", locations=(str(tmp_path),))
-    override_adapters(app, library=FakeLibrary(sections=[section]))
+    movies_section = LibrarySection(
+        key="1", title="Movies", type="movie", locations=(str(tmp_path),)
+    )
+    shows_section = LibrarySection(key="2", title="Shows", type="show", locations=("/no/tv",))
+    override_adapters(app, library=FakeLibrary(sections=[movies_section, shows_section]))
 
     response = await client.get("/api/v1/settings/plex-libraries", headers=_HEADERS)
 
     assert response.status_code == 200
     assert response.json() == [
-        {"section_key": "1", "title": "Movies", "path": str(tmp_path), "writable": True}
+        {
+            "section_key": "1",
+            "title": "Movies",
+            "path": str(tmp_path),
+            "section_type": "movie",
+            "writable": True,
+        },
+        {
+            "section_key": "2",
+            "title": "Shows",
+            "path": "/no/tv",
+            "section_type": "tv",
+            "writable": False,
+        },
     ]

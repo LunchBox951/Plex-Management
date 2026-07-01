@@ -27,12 +27,13 @@ from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
     get_filesystem,
     get_library,
-    get_movies_root,
+    get_movies_root_optional,
     get_parser,
     get_prowlarr,
     get_qbittorrent,
     get_quality_profile,
     get_session,
+    get_tv_root_optional,
     require_api_key,
 )
 from plex_manager.web.routers.search_preview import run_preview
@@ -61,6 +62,8 @@ def _to_item(record: DownloadRecord) -> QueueItem:
         seed_ratio=record.seed_ratio,
         media_request_id=record.media_request_id,
         tmdb_id=record.tmdb_id,
+        season=record.season,
+        episodes=record.episodes,
         failed_reason=record.failed_reason,
     )
 
@@ -123,9 +126,12 @@ async def grab_endpoint(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
 
     result = await run_preview(
-        # Carry the season so a TV grab searches (and later records) the right
-        # season; it is None for a movie and so leaves movie behaviour unchanged.
-        SearchPreviewRequest(request_id=body.request_id, season=body.season),
+        # Carry season/episodes so a TV grab searches (and later records) the
+        # right scope; both are None for a movie and so leave movie behaviour
+        # unchanged.
+        SearchPreviewRequest(
+            request_id=body.request_id, season=body.season, episodes=body.episodes
+        ),
         session,
         prowlarr,
         parser,
@@ -152,6 +158,7 @@ async def grab_endpoint(
             tmdb_id=request.tmdb_id,
             year=request.year,
             season=body.season,
+            episodes=body.episodes,
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
@@ -187,12 +194,18 @@ async def import_endpoint(
     fs: Annotated[FileSystemPort, Depends(get_filesystem)],
     parser: Annotated[ParserPort, Depends(get_parser)],
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
-    movies_root: Annotated[str, Depends(get_movies_root)],
+    movies_root: Annotated[str | None, Depends(get_movies_root_optional)],
+    tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
 ) -> QueueItem:
     """Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
 
-    Requires Plex + the Movies root configured (409 ``service_not_configured``
-    otherwise). The correction-without-a-terminal button for a blocked import.
+    Requires Plex + qBittorrent configured (409 ``service_not_configured``
+    otherwise); the Movies/TV roots are each OPTIONAL here -- no upfront 409 for
+    either. A download whose media type's root is unset gets its own honest,
+    retryable ``ImportBlocked`` (surfaced in the returned ``QueueItem``, a normal
+    200) instead of the endpoint refusing to even try, so an install with only
+    ONE root configured can still retry-import that type. The
+    correction-without-a-terminal button for a blocked import.
     """
     record = await import_service.import_download(
         download_id=download_id,
@@ -203,6 +216,7 @@ async def import_endpoint(
         profile=profile,
         session=session,
         movies_root=movies_root,
+        tv_root=tv_root,
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found")

@@ -119,3 +119,79 @@ async def test_reconcile_runs_availability_when_qbittorrent_is_down(
     # The outage was surfaced, not swallowed (honesty over silence): the log names
     # the exception TYPE only — never a url, username, password or session id.
     assert type(outage).__name__ in caplog.text
+
+
+async def test_reconcile_imports_when_only_movies_root_unset(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the old ``if library and movies_root:`` gate, which
+    skipped the WHOLE import cycle (including any tv rows) whenever movies_root
+    was unset. The cycle must now run unconditionally once Plex is configured,
+    so a movie download reaching the drain with its OWN root unset gets an
+    honest, retryable ImportBlocked -- never left forgotten in ImportPending."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            year=1999,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash="deadbeef02",
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=1999,
+        )
+        session.add(download)
+        await session.commit()
+        download_id, request_id = download.id, request.id
+
+    library = FakeLibrary()
+    # A matching client snapshot -- so the reconcile pass that runs BEFORE the
+    # import drain sees the torrent as present (still seeding) and leaves it
+    # ImportPending, rather than surfacing the unrelated ClientMissing this test
+    # isn't about.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="deadbeef02", name="The.Matrix.1999.mkv", raw_state="stalledUP"
+            )
+        ]
+    )
+
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
+    )
+
+    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+        return qbt
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    # movies_root / tv_root are left to the REAL (optional) dependency, reading
+    # from a settings store where neither was ever configured -- both resolve to
+    # None naturally, no monkeypatch needed to prove the "unset" case.
+
+    try:
+        await app_module._reconcile_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+    assert download is not None
+    assert download.status == DownloadState.ImportBlocked.value
+    assert download.failed_reason == "movies library root is not configured"
+    assert request is not None
+    assert request.status == RequestStatus.import_blocked
