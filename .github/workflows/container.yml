@@ -5,12 +5,15 @@ name: Container
 #             base-image bump or Dockerfile change is validated before it can
 #             merge. Findings print to the job log (table format). The token is
 #             read-only — a PR validation job never needs registry write.
-#   publish — on a merge to main: build + push two tags, then scan by digest and
-#             upload the SARIF to the Security tab:
+#   publish — on a merge to main (and on a daily schedule): on a push it builds +
+#             pushes two tags, then scans and uploads the SARIF to the Security
+#             tab; on the schedule it re-scans the existing :edge (no build/push)
+#             so the board stays fresh between merges. Tags:
 #               :edge        — moving, what the canary (beta) fleet tracks
 #               :edge-<sha>  — immutable, the handle promote.yml consumes
 #             This is the ONLY job granted packages: write, and it never runs on
-#             a pull request.
+#             a pull request. Push and schedule share the one job (hence one SARIF
+#             analysis category), so a scheduled rescan updates the same board.
 # Releases are NOT built here — they are promoted (re-tagged by digest) from a
 # validated edge image by promote.yml, so the stable fleet runs identical bytes.
 # See ADR-0004.
@@ -20,11 +23,12 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Daily rescan of :edge so the Security board stays fresh BETWEEN merges: an
-    # OS CVE currently suppressed by ignore-unfixed re-surfaces the day Debian (or
-    # Trivy's DB) gains a fixed version, and a newly-disclosed library CVE is
-    # caught even when no push happened. Without this, a suppressed finding would
-    # stay invisible until some unrelated merge rebuilt and rescanned the image.
+    # Daily re-scan of :edge (via the `publish` job) so the Security board stays
+    # fresh BETWEEN merges: an OS CVE currently suppressed by ignore-unfixed
+    # re-surfaces the day Debian (or Trivy's DB) gains a fixed version, and a
+    # newly-disclosed library CVE is caught even when no push happened. Without
+    # this a suppressed finding would stay invisible until some unrelated merge
+    # rebuilt and rescanned the image.
     - cron: "17 6 * * *"
 
 # Least privilege by default; the publish job opts into more (below).
@@ -80,11 +84,14 @@ jobs:
           severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
           exit-code: "0"
 
-  # Publish on merge to main: build + push, then scan by digest and upload the
-  # SARIF to the Security tab. Only this job carries packages: write, and it is
-  # gated to push events so a pull-request run can never obtain registry write.
+  # Publish (push) + rescan (schedule) — ONE job so both events upload under the
+  # SAME auto-derived SARIF category (workflow + job name), which means: (a) the
+  # scheduled rescan updates the same Security-tab analysis instead of forking a
+  # second one, and (b) the pre-existing Trivy alerts (uploaded by the old,
+  # uncategorized step) are continued/closed rather than orphaned. Only this job
+  # carries packages: write, and it never runs on a pull request.
   publish:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -108,8 +115,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build + push only on a merge to main. On the schedule we re-scan the
+      # already-published :edge, so there is nothing to build or push.
       - name: Compute tags
         id: meta
+        if: github.event_name == 'push'
         uses: docker/metadata-action@v6
         with:
           images: ${{ steps.img.outputs.name }}
@@ -119,6 +129,7 @@ jobs:
 
       - name: Build and push
         id: build
+        if: github.event_name == 'push'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -128,47 +139,76 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Scan the just-published image by digest. The scoped composite action
-      # uploads TWO SARIF categories: `trivy-os` (ignore-unfixed — only
-      # actionable base-OS CVEs; the no-upstream-fix Essential Debian packages
-      # this Python app never invokes are dropped) and `trivy-library` (pip/npm,
-      # UNFILTERED — every library CVE stays visible, including unfixed ones,
-      # since a dependency CVE is ours to pin/patch/drop). The PR `build` job
-      # still prints the complete, unfiltered tally to its log. Shrinking the
-      # base-image CVE surface for real (a low-CVE base) is tracked as ADR
-      # follow-up #18.
-      - name: Scan the published image (Trivy — SARIF to the Security tab)
-        uses: ./.github/actions/trivy-scan
-        with:
-          image-ref: ${{ format('{0}@{1}', steps.img.outputs.name, steps.build.outputs.digest) }}
-
-  # Scheduled rescan of the current :edge image so the Security board stays fresh
-  # between merges (see the `schedule:` trigger comment). Read-only registry
-  # pull; never builds, never pushes. Runs only on the schedule event.
-  rescan:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Resolve lowercase image name
-        id: img
+      # On push: scan the exact bytes just published (by digest). On schedule:
+      # scan the current :edge from the registry (read-only pull).
+      - name: Resolve scan target
+        id: target
         env:
-          OWNER: ${{ github.repository_owner }}
-        run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
+          NAME: ${{ steps.img.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            echo "ref=${NAME}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${NAME}:edge" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Log in to GHCR (read-only pull)
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare SARIF directory
+        run: mkdir -p "${{ github.workspace }}/trivy-sarif"
 
-      - name: Rescan :edge (Trivy — SARIF to the Security tab)
-        uses: ./.github/actions/trivy-scan
+      # Three Trivy passes, all written into trivy-sarif/ and uploaded together as
+      # ONE analysis (single upload, no explicit category) so the OS/library/secret
+      # results share the board without double-listing:
+      #   * OS vulns, ignore-unfixed — drops base-OS CVEs with no upstream fix
+      #     (perl-base, glibc, util-linux, ncurses: Essential Debian packages this
+      #     Python app never invokes and cannot remove). scanners=vuln so this pass
+      #     does not also run the secret scanner.
+      - name: Trivy — OS vulnerabilities (ignore-unfixed)
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_SCANNERS: vuln
+          TRIVY_PKG_TYPES: os
+          TRIVY_IGNORE_UNFIXED: "true"
         with:
-          image-ref: ${{ steps.img.outputs.name }}:edge
+          image-ref: ${{ steps.target.outputs.ref }}
+          format: sarif
+          output: trivy-sarif/os.sarif
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"
+
+      #   * Library vulns, UNFILTERED — a pip/npm CVE is ours to pin/patch/drop,
+      #     so unfixed ones must stay visible; ignore-unfixed is NOT applied here.
+      - name: Trivy — library vulnerabilities (unfiltered)
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_SCANNERS: vuln
+          TRIVY_PKG_TYPES: library
+        with:
+          image-ref: ${{ steps.target.outputs.ref }}
+          format: sarif
+          output: trivy-sarif/library.sarif
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"
+
+      #   * Secrets — a SINGLE dedicated pass, so an image secret is reported once
+      #     (not once per pkg-type split). Complements the gitleaks source scan.
+      - name: Trivy — image secrets
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_SCANNERS: secret
+        with:
+          image-ref: ${{ steps.target.outputs.ref }}
+          format: sarif
+          output: trivy-sarif/secret.sarif
+          exit-code: "0"
+
+      # ONE upload, no explicit category: preserves the auto-derived category the
+      # old single step used, so the pre-existing Trivy alerts are continued and
+      # the no-upstream-fix OS ones are CLOSED (not orphaned under a new category).
+      # The PR `build` job still prints the complete, unfiltered tally to its log.
+      # Shrinking the base-image CVE surface for real is tracked as ADR #18.
+      - name: Upload Trivy results (SARIF to the Security tab)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-sarif
