@@ -40,6 +40,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
@@ -139,14 +140,38 @@ def _size_bytes(path: str) -> int | None:
         return None
 
 
+def _under_root(library_path: str | None, root_path: str) -> bool:
+    """Whether ``library_path`` is ``root_path`` itself or a descendant (lexical).
+
+    Scopes a per-root sweep to content actually stored UNDER that root. A sweep runs
+    for one ``(media_type, root_path)``; a stale/moved row whose ``library_path`` sits
+    under a DIFFERENT configured root (or an old, since-changed root) must not be a
+    candidate for THIS root: it would either consume the projected target here without
+    being deletable (starving valid candidates for the pressured root), or — worse —
+    delete space from the wrong filesystem while THIS root's pressure is measured. The
+    ``fs.delete`` escape guard is the symlink-safe filesystem check; this is the
+    cheaper candidate-selection scope, applied BEFORE the per-row Plex/os.walk work.
+    A ``None`` breadcrumb is a SEPARATE concern (a row predating the breadcrumb, or
+    not yet imported): callers keep those as candidates so ``_evict_one`` skips them
+    with its honest "no breadcrumb" log rather than dropping them silently here.
+    """
+    if library_path is None:
+        return False
+    try:
+        return PurePosixPath(library_path).is_relative_to(PurePosixPath(root_path))
+    except ValueError:  # pragma: no cover - is_relative_to only raises on bad args
+        return False
+
+
 async def _movie_candidates(
-    session: AsyncSession, library: LibraryPort, root_total_bytes: int
+    session: AsyncSession, library: LibraryPort, root_total_bytes: int, root_path: str
 ) -> list[tuple[EvictionCandidate, _Pending]]:
-    """Every ``available`` movie request as an :class:`EvictionCandidate`.
+    """Every ``available`` movie request UNDER ``root_path`` as an :class:`EvictionCandidate`.
 
     ``partially_available`` is deliberately NOT queried here: it is a TV-only
     rollup status a plain movie request can never reach (see ``RequestStatus``),
-    so ``available`` is the complete "fully imported" set for movies.
+    so ``available`` is the complete "fully imported" set for movies. Rows whose
+    ``library_path`` is not under ``root_path`` are skipped (see :func:`_under_root`).
     """
     request_repo = SqlRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
@@ -154,6 +179,7 @@ async def _movie_candidates(
         row
         for row in await request_repo.list_by_status(RequestStatus.available.value)
         if row.media_type == "movie"
+        and (row.library_path is None or _under_root(row.library_path, root_path))
     ]
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row in rows:
@@ -186,19 +212,24 @@ async def _movie_candidates(
 
 
 async def _season_candidates(
-    session: AsyncSession, library: LibraryPort, root_total_bytes: int
+    session: AsyncSession, library: LibraryPort, root_total_bytes: int, root_path: str
 ) -> list[tuple[EvictionCandidate, _Pending]]:
-    """Every ``available`` TV season as an :class:`EvictionCandidate`.
+    """Every ``available`` TV season UNDER ``root_path`` as an :class:`EvictionCandidate`.
 
     The pin (``keep_forever``) and the title live on the PARENT show
     (``MediaRequest``), never on the season row itself, so pinning a series
     protects every one of its seasons — each parent is fetched once (cached in
-    ``parents``) even when a show has several tracked seasons.
+    ``parents``) even when a show has several tracked seasons. Season rows whose
+    ``library_path`` is not under ``root_path`` are skipped (see :func:`_under_root`).
     """
     season_repo = SqlSeasonRequestRepository(session)
     request_repo = SqlRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
-    rows = await season_repo.list_by_status(RequestStatus.available.value)
+    rows = [
+        row
+        for row in await season_repo.list_by_status(RequestStatus.available.value)
+        if row.library_path is None or _under_root(row.library_path, root_path)
+    ]
     parents: dict[int, RequestRecord] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row in rows:
@@ -474,9 +505,9 @@ async def preview_candidates(
         return []
 
     pairs = (
-        await _movie_candidates(session, library, disk.total_bytes)
+        await _movie_candidates(session, library, disk.total_bytes, root_path)
         if media_type == "movie"
-        else await _season_candidates(session, library, disk.total_bytes)
+        else await _season_candidates(session, library, disk.total_bytes, root_path)
     )
     candidates = [candidate for candidate, _pending in pairs]
     grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
@@ -543,9 +574,9 @@ async def run_eviction_sweep(
         return []
 
     pairs = (
-        await _movie_candidates(session, library, disk.total_bytes)
+        await _movie_candidates(session, library, disk.total_bytes, root_path)
         if media_type == "movie"
-        else await _season_candidates(session, library, disk.total_bytes)
+        else await _season_candidates(session, library, disk.total_bytes, root_path)
     )
     if not pairs:
         return []

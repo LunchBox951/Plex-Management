@@ -197,6 +197,48 @@ async def test_evicts_a_watched_past_grace_movie_and_deletes_the_file(
     assert history[0].source_title == "Old Movie"
 
 
+async def test_candidate_outside_the_swept_root_is_not_evicted(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # A watched, past-grace, un-pinned movie whose library_path is under a DIFFERENT
+    # root than the one being swept must NOT be a candidate for THIS root's sweep --
+    # otherwise it could consume the target here (starving valid candidates) or delete
+    # from the wrong filesystem while this root's pressure is measured. The fs guard
+    # would ALLOW the delete (the file is under the allowed tmp_path root), so only the
+    # candidate-scope filter stops it.
+    swept_root = tmp_path / "movies"
+    swept_root.mkdir()
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    outside = other_root / "Elsewhere.mkv"
+    outside.write_bytes(b"0" * 1024)
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=99, title="Elsewhere", library_path=str(outside)
+    )
+    library = FakeLibrary(
+        watch_states={(99, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(swept_root),  # sweeping movies/, but the file lives under other/
+            threshold_pct=0.0,  # always-evict pressure, so only the scope filter can stop it
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []  # excluded from this root's candidates
+    assert outside.exists()  # the wrong-root file is untouched
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None and row.status is RequestStatus.available
+
+
 async def test_never_evicts_an_unwatched_movie(sessionmaker_: SessionMaker, tmp_path: Path) -> None:
     library_path = _movie_file(tmp_path, "Unwatched.mkv")
     await _movie(sessionmaker_, tmdb_id=2, title="Unwatched", library_path=library_path)
