@@ -262,6 +262,25 @@ class RequestRepository(Protocol):
         """
         raise NotImplementedError
 
+    async def set_keep_forever_for_title(
+        self, tmdb_id: int, media_type: str, keep_forever: bool
+    ) -> None:
+        """Set the pin on EVERY ``MediaRequest`` row for this ``(tmdb_id,
+        media_type)``, not just one (ADR-0012).
+
+        ``uq_media_requests_active`` only constrains ACTIVE rows, so a title
+        commonly has several rows over its lifetime -- e.g. an older SETTLED
+        ``available`` request covering seasons 1-2 and a newer ACTIVE request
+        for season 3. ``domain/eviction.py``'s ``_season_candidates`` reads
+        ``keep_forever`` off EACH season's OWN parent row, so pinning only the
+        one row the UI resolved to (the active one) would leave the settled
+        sibling's seasons unpinned and still evictable after the operator
+        believes they pinned the whole show. Keep-forever is a per-TITLE
+        intent, so this updates every row sharing the key, symmetric for both
+        pin and unpin.
+        """
+        raise NotImplementedError
+
 
 @runtime_checkable
 class DownloadRepository(Protocol):

@@ -370,8 +370,21 @@ class PlexLibrary:
         # snapshot for the full TTL would make the immediate re-test read stale data
         # and leave setup wrongly blocked. Mirrors is_available's presence/absence
         # asymmetry — cache a positive, never a negative the operator can fix.
+        #
+        # But a PRIOR movie-bearing result may already be cached from an
+        # earlier page — if THIS page (esp. a live ``use_cache=False`` probe)
+        # finds no movie section, that old positive must not be left sitting
+        # in the cache: the movie library could genuinely have been removed
+        # from Plex, and default (``use_cache=True``) callers -- the Settings
+        # folder picker, the scan path -- would otherwise keep being handed
+        # the now-gone location for up to the full TTL after a live probe
+        # already saw it disappear. Invalidate rather than merely skip the
+        # ``set``, so the very next default call re-pages instead of serving
+        # a stale positive.
         if any(section.type == "movie" for section in sections):
             _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
+        else:
+            _SECTIONS_CACHE.invalidate(self._cache_key)
         return sections
 
     async def is_available(

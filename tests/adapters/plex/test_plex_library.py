@@ -611,6 +611,47 @@ async def test_list_sections_does_not_cache_a_no_movie_result() -> None:
     assert third == second
 
 
+async def test_list_sections_invalidates_a_stale_movie_cache_when_the_library_is_removed() -> None:
+    # R6-E: list_sections only ever SET the cache on a movie-bearing result,
+    # never CLEARED it -- so once a movie-bearing snapshot was cached, a LATER
+    # re-page (esp. a live use_cache=False probe) that finds no movie section
+    # left the OLD positive sitting in the cache, untouched. Default
+    # (use_cache=True) callers -- the Settings folder picker, the scan path --
+    # kept being handed the removed movie location for up to the ~300s TTL. A
+    # no-movie page must INVALIDATE the cache key instead of merely skipping
+    # the ``set``, so the very next default call re-pages rather than serving
+    # the stale positive.
+    calls = {"n": 0}
+    state = {"has_movie": True}
+
+    def switching(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        if request.url.path == "/library/sections":
+            calls["n"] += 1
+            return httpx.Response(200, json=SECTIONS if state["has_movie"] else SECTIONS_NO_MOVIE)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(switching, base_url="http://movie-removed-plex:32400")
+    # Warm the cache with a movie-bearing result.
+    first = await adapter.list_sections()
+    assert any(s.type == "movie" for s in first)
+    assert calls["n"] == 1
+
+    # The operator removes the Movie library from Plex; a live use_cache=False
+    # probe (e.g. "Test connection") re-pages and sees it gone.
+    state["has_movie"] = False
+    second = await adapter.list_sections(use_cache=False)
+    assert all(s.type != "movie" for s in second)
+    assert calls["n"] == 2
+
+    # A DEFAULT (use_cache=True) call must re-page too -- the stale movie
+    # positive from the FIRST call must not still be sitting in the cache.
+    third = await adapter.list_sections()
+    assert calls["n"] == 3  # re-fetched -- never served from the stale cache
+    assert all(s.type != "movie" for s in third)
+
+
 async def test_is_available_no_cache_repages_despite_cached_presence() -> None:
     """G7: use_cache=False bypasses the cached-PRESENT fast path so a removal is seen
     immediately. The default (cached) lookup still trusts a cached present answer; the

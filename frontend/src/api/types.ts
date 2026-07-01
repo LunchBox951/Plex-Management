@@ -64,6 +64,7 @@ export type EvictionCandidateItem = Schemas['EvictionCandidateItem']
 export type DiskRootItem = Schemas['DiskRootItem']
 export type DiskResponse = Schemas['DiskResponse']
 export type EvictionOutcomeItem = Schemas['EvictionOutcomeItem']
+export type EvictErrorItem = Schemas['EvictErrorItem']
 export type EvictResponse = Schemas['EvictResponse']
 
 /** `media_type` is a free string in the contract; the UI only ever sets these. */

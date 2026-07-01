@@ -25,6 +25,7 @@ __all__ = [
     "DiscoverSearchResponse",
     "DiskResponse",
     "DiskRootItem",
+    "EvictErrorItem",
     "EvictResponse",
     "EvictionCandidateItem",
     "EvictionOutcomeItem",
@@ -737,14 +738,31 @@ class EvictionOutcomeItem(BaseModel):
     freed_bytes: int | None = None
 
 
+class EvictErrorItem(BaseModel):
+    """One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --
+    a LATER root raising (e.g. a transient Plex error resolving TV watch
+    state) must never hide an EARLIER root's evictions that already deleted
+    files and committed (honesty over silence: partial progress is surfaced,
+    not swallowed behind a 500)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    root: Literal["movies_root", "tv_root"]
+    detail: str
+
+
 class EvictResponse(BaseModel):
     """The result of a manual disk-pressure sweep (north-star #1: a button that
     frees space on demand). Empty ``evicted`` is a normal, honest outcome (no
-    root was under pressure, or nothing was eligible)."""
+    root was under pressure, or nothing was eligible). ``errors`` is populated
+    per-root when THAT root's own sweep raised -- every other root's outcome
+    in ``evicted`` still stands; the sweep never aborts one root's already
+    committed work just because a sibling root failed."""
 
     model_config = ConfigDict(frozen=True)
 
     evicted: list[EvictionOutcomeItem]
+    errors: list[EvictErrorItem] = Field(default_factory=list[EvictErrorItem])
 
 
 # --------------------------------------------------------------------------- #

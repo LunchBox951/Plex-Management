@@ -70,6 +70,7 @@ from plex_manager.web.schemas import (
     DiskGaugeItem,
     DiskResponse,
     DiskRootItem,
+    EvictErrorItem,
     EvictionCandidateItem,
     EvictionOutcomeItem,
     EvictResponse,
@@ -522,6 +523,18 @@ async def evict_endpoint(
     candidates the operator just deleted, stale free-space gauge) for up to
     its ~15s TTL, contradicting north-star #3 for the very endpoint that IS
     the correction button.
+
+    Each root's sweep is INDEPENDENT: one root raising (e.g. a transient
+    ``PlexLibraryError`` resolving TV watch state during candidate assembly)
+    must never abort a root that has not run yet, nor hide what an EARLIER
+    root already deleted and committed. A bare 500 here would do exactly that
+    — the operator would see "Free space failed" with no indication that,
+    say, the movies root already freed real space — which is a dishonest,
+    silent-partial-success state north star #2 forbids. So every root's sweep
+    is individually caught; a caught failure is logged and recorded in
+    ``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,
+    and the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 —
+    partial completion is a first-class, visible outcome, not a terminal one.
     """
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
@@ -530,26 +543,45 @@ async def evict_endpoint(
     grace_days = await get_eviction_grace_days(session)
     fs = get_eviction_filesystem(movies_root, tv_root)
 
-    roots: tuple[tuple[Literal["movie", "tv"], str | None], ...] = (
-        ("movie", movies_root),
-        ("tv", tv_root),
+    roots: tuple[
+        tuple[Literal["movie", "tv"], Literal["movies_root", "tv_root"], str | None], ...
+    ] = (
+        ("movie", "movies_root", movies_root),
+        ("tv", "tv_root", tv_root),
     )
     outcomes: list[EvictionOutcome] = []
-    for media_type, root in roots:
+    errors: list[EvictErrorItem] = []
+    for media_type, root_label, root in roots:
         if not root:
             continue
-        outcomes.extend(
-            await eviction_service.run_eviction_sweep(
-                session=session,
-                library=library,
-                fs=fs,
-                media_type=media_type,
-                root_path=root,
-                threshold_pct=threshold_pct,
-                target_pct=target_pct,
-                grace_days=grace_days,
+        try:
+            outcomes.extend(
+                await eviction_service.run_eviction_sweep(
+                    session=session,
+                    library=library,
+                    fs=fs,
+                    media_type=media_type,
+                    root_path=root,
+                    threshold_pct=threshold_pct,
+                    target_pct=target_pct,
+                    grace_days=grace_days,
+                )
             )
-        )
+        except Exception as exc:
+            # Never re-raise: a later root's failure must not hide an earlier
+            # root's already-committed evictions (see the docstring above).
+            # The detail names only the exception TYPE, never ``str(exc)`` --
+            # the same secret-safety discipline ``_adapter_error_handler``
+            # uses, since this except is broad enough to catch more than the
+            # typed adapter errors that discipline was written for.
+            _logger.exception(
+                "eviction sweep failed for %s root %s; continuing with remaining roots",
+                media_type,
+                root,
+            )
+            errors.append(
+                EvictErrorItem(root=root_label, detail=f"sweep failed ({type(exc).__name__})")
+            )
 
     # The sweep just deleted files and/or changed watch-derived eligibility
     # for whatever it touched — the cached preview (candidates + free-space
@@ -557,6 +589,8 @@ async def evict_endpoint(
     # (freed space shifts the usage gauge too). Clear it so the very next
     # GET /disk reflects this sweep instead of serving up to ~15s of
     # pre-eviction state back to the operator who just clicked the button.
+    # Always reached -- even a per-root failure above never skips this, so a
+    # partial sweep's freed space is still visible on the very next poll.
     cache.clear()
 
     return EvictResponse(
@@ -570,5 +604,6 @@ async def evict_endpoint(
                 freed_bytes=o.freed_bytes,
             )
             for o in outcomes
-        ]
+        ],
+        errors=errors,
     )

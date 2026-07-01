@@ -198,9 +198,21 @@ async def _log_drain_loop(app: FastAPI) -> None:
     caught and logged, never left to kill the loop — a queue that cannot be
     drained this tick simply carries its backlog into the next one (bounded by
     the queue's own ``maxsize``, see the handler's docstring). ``drain_once`` is
-    passed ``handler`` so a failed insert's whole (already-dequeued) batch is
-    added to ``handler.dropped_count`` — never re-queued, but always honestly
-    counted — before the exception below is caught.
+    passed ``handler`` so a failed ``create_many`` insert's whole
+    (already-dequeued) batch is added to ``handler.dropped_count`` — never
+    re-queued, but always honestly counted.
+
+    That covers a failed INSERT, but not a failed COMMIT of an otherwise
+    successful insert: ``drain_once`` has already dequeued the batch from the
+    in-memory queue by the time it returns, so if the commit right below THIS
+    loop's call then raises (transient DB hiccup, full disk), the transaction
+    rolls back and those records are just as lost — yet uncounted, since
+    ``drain_once`` only ever saw ``create_many`` succeed. The drain commit is
+    wrapped separately from the prune commit below so exactly that batch size
+    is attributed to ``handler.dropped_count`` before the exception is
+    re-raised into the ``except`` at the bottom of this loop — a prune-commit
+    failure, by contrast, loses no log records (nothing new was inserted), so
+    it is never counted here.
     """
     handler = app.state.log_handler
     sessionmaker = app.state.sessionmaker
@@ -209,8 +221,13 @@ async def _log_drain_loop(app: FastAPI) -> None:
         try:
             async with sessionmaker() as session:
                 repo = SqlLogEventRepository(session)
-                await log_capture_service.drain_once(handler.queue, repo, handler=handler)
-                await session.commit()
+                drained = await log_capture_service.drain_once(handler.queue, repo, handler=handler)
+                try:
+                    await session.commit()
+                except Exception:
+                    if drained:
+                        handler.dropped_count += drained
+                    raise
                 if (
                     time.monotonic() - last_pruned_at
                     >= log_capture_service.LOG_PRUNE_INTERVAL_SECONDS

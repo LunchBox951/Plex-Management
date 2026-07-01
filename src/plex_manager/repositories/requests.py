@@ -265,3 +265,32 @@ class SqlRequestRepository:
             raise LookupError(f"media request {request_id} does not exist")
         row.keep_forever = keep_forever
         await self._session.flush()
+
+    async def set_keep_forever_for_title(
+        self, tmdb_id: int, media_type: str, keep_forever: bool
+    ) -> None:
+        """See ``RequestRepository.set_keep_forever_for_title``'s docstring: pins
+        or unpins EVERY row sharing ``(tmdb_id, media_type)``, not just one.
+
+        A single ``UPDATE ... WHERE tmdb_id = ? AND media_type = ?`` -- no
+        status filter, deliberately every row (active AND settled) sharing the
+        key, since a settled row's own season rows are exactly what an older
+        request's ``keep_forever`` protects (``eviction_service.
+        _season_candidates`` reads the pin off each season's OWN parent, which
+        may be a different, settled row than the one the operator toggled from
+        the UI). ``synchronize_session="fetch"`` keeps any already-loaded
+        identity-map instance for this title (e.g. the caller's own ``get``
+        moments earlier, in the SAME session/transaction) in sync with the
+        DB, mirroring ``set_status_if_in``'s same discipline.
+        """
+        stmt = (
+            update(MediaRequest)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+            )
+            .values(keep_forever=keep_forever)
+            .execution_options(synchronize_session="fetch")
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()

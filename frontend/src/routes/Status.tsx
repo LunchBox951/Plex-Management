@@ -206,6 +206,23 @@ export function Status() {
             : 'No root is under pressure, or nothing eligible was found.',
         intent: 'success',
       })
+      // `errors` is optional in the generated type (it has a server-side
+      // default of `[]`) but always present on the wire -- guard anyway so a
+      // contract regen never turns this into a runtime crash.
+      const sweepErrors = result.errors ?? []
+      if (sweepErrors.length > 0) {
+        // A root's sweep can fail AFTER an earlier root already deleted files
+        // and committed — the success toast above already reflects whatever
+        // freed, so this is a SEPARATE, additional warning naming exactly
+        // which root(s) failed, never a silent partial outcome (north star
+        // #2). Queries were already invalidated on success above, so the
+        // disk/requests views reflect whatever the sweep DID accomplish.
+        toast({
+          title: `Sweep failed for ${sweepErrors.map((e) => e.root).join(', ')}`,
+          description: sweepErrors.map((e) => e.detail).join('; '),
+          intent: 'warning',
+        })
+      }
     } catch (error) {
       toast({
         title: 'Free space failed',

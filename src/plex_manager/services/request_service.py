@@ -487,20 +487,31 @@ async def mark_available(session: AsyncSession, request_id: int) -> None:
 async def set_keep_forever(
     session: AsyncSession, request_id: int, *, keep_forever: bool
 ) -> RequestRecord | None:
-    """Toggle the operator's "keep forever" pin (ADR-0012).
+    """Toggle the operator's "keep forever" pin (ADR-0012) for the WHOLE title.
 
-    Movie or (whole) show granularity: the pin lives on the parent
-    ``MediaRequest`` regardless of media type, so pinning a series protects
-    every one of its seasons (``domain/eviction.py`` reads it off the parent —
-    see ``eviction_service._season_candidates``). Returns ``None`` when the
-    request does not exist (the router surfaces 404); otherwise commits and
-    returns the freshly updated record so the endpoint can hand back the new
-    state without a second round trip.
+    Keep-forever is a per-TITLE intent, not a per-row one: because
+    ``uq_media_requests_active`` only constrains ACTIVE rows, a single
+    ``(tmdb_id, media_type)`` can have several ``MediaRequest`` rows over its
+    lifetime -- e.g. an older SETTLED ``available`` request covering seasons
+    1-2 and a newer ACTIVE request for season 3. The UI resolves a title to
+    its (visible) active row and passes that row's ``request_id`` here, but
+    ``eviction_service._season_candidates`` reads ``keep_forever`` off EACH
+    season's OWN parent -- so pinning only the active row would leave the
+    settled sibling's seasons unpinned and still evictable even though the
+    operator believes they just pinned the whole show. This resolves the
+    target row first (for its ``tmdb_id``/``media_type``), then applies the
+    pin to EVERY row sharing that key via
+    :meth:`~plex_manager.ports.repositories.RequestRepository.
+    set_keep_forever_for_title` -- symmetric for both pin and unpin.
+
+    Returns ``None`` when the request does not exist (the router surfaces
+    404); otherwise commits and returns the freshly updated TARGET record so
+    the endpoint can hand back the new state without a second round trip.
     """
     repo = SqlRequestRepository(session)
     current = await repo.get(request_id)
     if current is None:
         return None
-    await repo.set_keep_forever(request_id, keep_forever)
+    await repo.set_keep_forever_for_title(current.tmdb_id, current.media_type, keep_forever)
     await session.commit()
     return await repo.get(request_id)

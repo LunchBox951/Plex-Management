@@ -213,6 +213,48 @@ async def test_configure_logging_attaches_and_sets_level(test_logger: logging.Lo
     assert attached not in test_logger.handlers
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected_level"),
+    [
+        ("debug", logging.DEBUG),
+        ("info", logging.INFO),
+        ("WARNING", logging.WARNING),
+        ("10", logging.DEBUG),
+    ],
+)
+async def test_configure_logging_normalizes_case_and_numeric_levels(
+    test_logger: logging.Logger, configured: str, expected_level: int
+) -> None:
+    """R6-A regression: ``logging.Logger.setLevel`` only recognizes UPPERCASE
+    names from its own level table (or a bare int) -- a lowercase
+    ``PLEX_MANAGER_LOG_LEVEL=debug``/``=info`` used to raise ``ValueError``
+    straight out of ``configure_logging``, aborting the FastAPI lifespan
+    before it could serve traffic. Every case here -- lowercase, already
+    uppercase, and an already-numeric level string -- must configure without
+    raising and land on the expected effective level."""
+    attached = configure_logging(configured, logger=test_logger)
+    try:
+        assert test_logger.level == expected_level
+    finally:
+        stop_logging(attached, logger=test_logger)
+
+
+async def test_configure_logging_falls_back_to_info_on_an_unrecognized_level(
+    test_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unrecognized ``log_level`` (typo, garbage env value) must never crash
+    startup: it degrades to INFO with a warning surfaced through this module's
+    own logger -- honesty over silence, never a silent guess and never a fatal
+    ``ValueError`` out of the lifespan."""
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.log_capture_service"):
+        attached = configure_logging("not-a-real-level", logger=test_logger)
+    try:
+        assert test_logger.level == logging.INFO
+        assert "not-a-real-level" in caplog.text
+    finally:
+        stop_logging(attached, logger=test_logger)
+
+
 async def test_configure_logging_quiets_httpx_and_httpcore_even_at_debug(
     test_logger: logging.Logger,
 ) -> None:

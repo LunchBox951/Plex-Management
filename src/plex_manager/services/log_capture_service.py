@@ -113,6 +113,14 @@ _THIRD_PARTY_LOGGER_LEVEL: Final = logging.WARNING
 # never used for full record formatting (this module builds its own message).
 _EXC_FORMATTER: Final = logging.Formatter()
 
+_logger = logging.getLogger(__name__)
+
+#: Fallback effective level when ``config.log_level`` cannot be resolved to a
+#: real stdlib level (see :func:`_resolve_log_level`) — INFO, the same default
+#: ``config.py`` ships, so an unrecognized override degrades to "as if unset"
+#: rather than to something surprising.
+_DEFAULT_LOG_LEVEL: Final = logging.INFO
+
 
 @dataclass(frozen=True)
 class CapturedLogRecord:
@@ -265,9 +273,48 @@ class LogCaptureHandler(logging.Handler):
             self.dropped_count += 1
 
 
+def _resolve_log_level(level: str) -> int:
+    """Normalize a configured level string to a valid stdlib numeric level.
+
+    ``logging``'s level-name table is keyed by UPPERCASE names ('DEBUG',
+    'INFO', ...), but ``config.log_level`` commonly arrives lowercase (e.g.
+    ``PLEX_MANAGER_LOG_LEVEL=debug``) — an env var, not a Python literal, so
+    nothing enforces case. Accepted, in order:
+
+    1. Any case of a standard level name (``debug``, ``Info``, ``WARNING``, ...).
+    2. An already-numeric level string (e.g. ``'10'``), passed straight to
+       ``setLevel`` the same way an ``int`` argument would be.
+
+    Anything else is UNRECOGNIZED and must never crash startup: raising here
+    (the old behaviour, via ``logging.Logger.setLevel``'s own ``ValueError``)
+    would abort the FastAPI lifespan before it can serve traffic over one bad
+    config value. Honesty over silence means the bad value is surfaced (a
+    warning, through this module's own logger) rather than either dying or
+    quietly pretending the value was fine — it falls back to
+    :data:`_DEFAULT_LOG_LEVEL`.
+    """
+    candidate = level.strip()
+    by_name = logging.getLevelNamesMapping().get(candidate.upper())
+    if by_name is not None:
+        return by_name
+    try:
+        return int(candidate)
+    except ValueError:
+        pass
+    _logger.warning(
+        "invalid log_level %r (expected a standard level name or a numeric "
+        "level); falling back to %s",
+        level,
+        logging.getLevelName(_DEFAULT_LOG_LEVEL),
+    )
+    return _DEFAULT_LOG_LEVEL
+
+
 def configure_logging(level: str, *, logger: logging.Logger | None = None) -> LogCaptureHandler:
     """Attach a fresh :class:`LogCaptureHandler` to ``logger`` (default: the root
-    logger) and set its effective level from ``level`` (``config.log_level``).
+    logger) and set its effective level from ``level`` (``config.log_level``),
+    normalized by :func:`_resolve_log_level` so a case mismatch or unrecognized
+    value never raises out of here (see that function's docstring).
 
     Also pins :data:`_THIRD_PARTY_LOGGERS_TO_QUIET` (``httpx``/``httpcore``) to
     :data:`_THIRD_PARTY_LOGGER_LEVEL` — see that constant's docstring for why this
@@ -286,7 +333,7 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target = logger if logger is not None else logging.getLogger()
     handler = LogCaptureHandler()
     target.addHandler(handler)
-    target.setLevel(level)
+    target.setLevel(_resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
     return handler

@@ -154,6 +154,49 @@ describe('Status', () => {
     )
   })
 
+  it('shows a warning toast naming the failed root(s) on a partial sweep, while still reporting freed space', async () => {
+    // R6-C: the movies root evicted, but the tv root's OWN sweep raised (e.g.
+    // a transient PlexLibraryError). The backend still returns 200 with the
+    // movie outcome in `evicted` AND the tv failure in `errors` -- the UI
+    // must surface BOTH: the success toast for whatever freed, plus a
+    // SEPARATE warning naming exactly which root(s) failed, never silently
+    // dropping the failure just because something else succeeded.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    const partial: EvictResponse = {
+      evicted: [
+        {
+          request_id: 1,
+          media_type: 'movie',
+          title: 'Old Watched Movie',
+          season: null,
+          library_path: '/library/movies/Old Watched Movie',
+          freed_bytes: 1024,
+        },
+      ],
+      errors: [{ root: 'tv_root', detail: 'sweep failed (PlexLibraryError)' }],
+    }
+    const mutateAsync = vi.fn().mockResolvedValue(partial)
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync, isPending: false })
+
+    render(<Status />)
+    fireEvent.click(screen.getByRole('button', { name: /free space now/i }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Freed 1 title', intent: 'success' }),
+      ),
+    )
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: expect.stringContaining('tv_root'),
+          intent: 'warning',
+        }),
+      ),
+    )
+  })
+
   it('does not overstate reconcile health before the first cycle has run', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       data: health({

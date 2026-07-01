@@ -502,9 +502,39 @@
         "title": "DiskRootItem",
         "type": "object"
       },
-      "EvictResponse": {
-        "description": "The result of a manual disk-pressure sweep (north-star #1: a button that\nfrees space on demand). Empty ``evicted`` is a normal, honest outcome (no\nroot was under pressure, or nothing was eligible).",
+      "EvictErrorItem": {
+        "description": "One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --\na LATER root raising (e.g. a transient Plex error resolving TV watch\nstate) must never hide an EARLIER root's evictions that already deleted\nfiles and committed (honesty over silence: partial progress is surfaced,\nnot swallowed behind a 500).",
         "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "root": {
+            "enum": [
+              "movies_root",
+              "tv_root"
+            ],
+            "title": "Root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "detail"
+        ],
+        "title": "EvictErrorItem",
+        "type": "object"
+      },
+      "EvictResponse": {
+        "description": "The result of a manual disk-pressure sweep (north-star #1: a button that\nfrees space on demand). Empty ``evicted`` is a normal, honest outcome (no\nroot was under pressure, or nothing was eligible). ``errors`` is populated\nper-root when THAT root's own sweep raised -- every other root's outcome\nin ``evicted`` still stands; the sweep never aborts one root's already\ncommitted work just because a sibling root failed.",
+        "properties": {
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/EvictErrorItem"
+            },
+            "title": "Errors",
+            "type": "array"
+          },
           "evicted": {
             "items": {
               "$ref": "#/components/schemas/EvictionOutcomeItem"
@@ -2436,7 +2466,7 @@
     },
     "/api/v1/ops/evict": {
       "post": {
-        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.\n\nInvalidates :func:`_get_disk_preview_cache` after the sweep: without this,\n``GET /disk`` would keep serving the pre-eviction snapshot (stale\ncandidates the operator just deleted, stale free-space gauge) for up to\nits ~15s TTL, contradicting north-star #3 for the very endpoint that IS\nthe correction button.",
+        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.\n\nInvalidates :func:`_get_disk_preview_cache` after the sweep: without this,\n``GET /disk`` would keep serving the pre-eviction snapshot (stale\ncandidates the operator just deleted, stale free-space gauge) for up to\nits ~15s TTL, contradicting north-star #3 for the very endpoint that IS\nthe correction button.\n\nEach root's sweep is INDEPENDENT: one root raising (e.g. a transient\n``PlexLibraryError`` resolving TV watch state during candidate assembly)\nmust never abort a root that has not run yet, nor hide what an EARLIER\nroot already deleted and committed. A bare 500 here would do exactly that\n\u2014 the operator would see \"Free space failed\" with no indication that,\nsay, the movies root already freed real space \u2014 which is a dishonest,\nsilent-partial-success state north star #2 forbids. So every root's sweep\nis individually caught; a caught failure is logged and recorded in\n``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,\nand the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 \u2014\npartial completion is a first-class, visible outcome, not a terminal one.",
         "operationId": "evict_endpoint_api_v1_ops_evict_post",
         "responses": {
           "200": {

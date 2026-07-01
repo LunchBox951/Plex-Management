@@ -13,7 +13,8 @@ import httpx
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.models import MediaRequest, MediaType, RequestStatus
+from plex_manager.adapters.plex.library import PlexLibraryError
+from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.library import WatchState
 from plex_manager.web.deps import SettingsStore
 from tests.web.fakes import FakeLibrary, override_adapters
@@ -204,3 +205,106 @@ async def test_evict_never_touches_a_pinned_keep_forever_title(
     assert response.status_code == 200
     assert response.json()["evicted"] == []
     assert movie_file.exists()
+
+
+_TV_TMDB_ID = 6161
+
+
+class _RaisesForTvWatchState(FakeLibrary):
+    """A :class:`FakeLibrary` whose ``watch_state`` raises ``PlexLibraryError``
+    for TV -- simulating a transient failure resolving TV watch state during
+    the TV root's candidate assembly -- while movie watch-state lookups still
+    succeed normally (so the movies root sweep is unaffected)."""
+
+    async def watch_state(
+        self, tmdb_id: int, media_type: str, *, season: int | None = None
+    ) -> WatchState:
+        if media_type == "tv":
+            raise PlexLibraryError("simulated Plex outage resolving TV watch state")
+        return await super().watch_state(tmdb_id, media_type, season=season)  # type: ignore[arg-type]
+
+
+async def test_evict_one_roots_failure_does_not_hide_another_roots_evictions(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """R6-C regression: the movies root evicts and commits FIRST; the tv root
+    then raises assembling its own candidates (a transient Plex error). The
+    endpoint must still return 200 with the movie outcome in ``evicted`` AND
+    the tv failure surfaced in ``errors`` -- never a bare 500 that hides the
+    movie root's already-committed eviction -- and the disk-preview cache must
+    still be cleared so a following ``GET /disk`` is fresh."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+
+    movie_file = movies_root / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(
+        sessionmaker_, movies_root=str(movies_root), library_path=str(movie_file)
+    )
+
+    season_file = tv_root / "Some Show" / "Season 01"
+    season_file.mkdir(parents=True)
+    (season_file / "episode.mkv").write_bytes(b"0" * 1024)
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=_TV_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.available,
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=1,
+                status=RequestStatus.available,
+                library_path=str(season_file),
+            )
+        )
+        store = SettingsStore(session)
+        await store.set("tv_root", str(tv_root))
+        await session.commit()
+
+    library = _RaisesForTvWatchState(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    # Warm the disk-preview cache first, so we can prove it was cleared below.
+    before = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    assert before.status_code == 200
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+
+    # The movies root's eviction is still reported -- the tv root's failure
+    # never hid it.
+    assert len(body["evicted"]) == 1
+    assert body["evicted"][0]["request_id"] == request_id
+    assert not movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.evicted
+
+    # The tv root's failure is surfaced, not swallowed.
+    assert body["errors"] == [{"root": "tv_root", "detail": "sweep failed (PlexLibraryError)"}]
+    # The tv season was never touched -- the failure happened assembling
+    # candidates, before any delete was attempted.
+    assert (season_file / "episode.mkv").exists()
+
+    # cache.clear() was still reached despite the tv root's exception -- a
+    # following GET /disk is fresh, not the pre-sweep snapshot.
+    after = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    assert after.status_code == 200
+    movies_after = next(r for r in after.json()["roots"] if r["root"] == "movies_root")
+    assert movies_after["candidates"] == []

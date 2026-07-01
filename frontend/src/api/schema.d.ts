@@ -159,6 +159,18 @@ export interface paths {
          *     candidates the operator just deleted, stale free-space gauge) for up to
          *     its ~15s TTL, contradicting north-star #3 for the very endpoint that IS
          *     the correction button.
+         *
+         *     Each root's sweep is INDEPENDENT: one root raising (e.g. a transient
+         *     ``PlexLibraryError`` resolving TV watch state during candidate assembly)
+         *     must never abort a root that has not run yet, nor hide what an EARLIER
+         *     root already deleted and committed. A bare 500 here would do exactly that
+         *     — the operator would see "Free space failed" with no indication that,
+         *     say, the movies root already freed real space — which is a dishonest,
+         *     silent-partial-success state north star #2 forbids. So every root's sweep
+         *     is individually caught; a caught failure is logged and recorded in
+         *     ``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,
+         *     and the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 —
+         *     partial completion is a first-class, visible outcome, not a terminal one.
          */
         post: operations["evict_endpoint_api_v1_ops_evict_post"];
         delete?: never;
@@ -888,12 +900,34 @@ export interface components {
             used_percent: number;
         };
         /**
+         * EvictErrorItem
+         * @description One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --
+         *     a LATER root raising (e.g. a transient Plex error resolving TV watch
+         *     state) must never hide an EARLIER root's evictions that already deleted
+         *     files and committed (honesty over silence: partial progress is surfaced,
+         *     not swallowed behind a 500).
+         */
+        EvictErrorItem: {
+            /** Detail */
+            detail: string;
+            /**
+             * Root
+             * @enum {string}
+             */
+            root: "movies_root" | "tv_root";
+        };
+        /**
          * EvictResponse
          * @description The result of a manual disk-pressure sweep (north-star #1: a button that
          *     frees space on demand). Empty ``evicted`` is a normal, honest outcome (no
-         *     root was under pressure, or nothing was eligible).
+         *     root was under pressure, or nothing was eligible). ``errors`` is populated
+         *     per-root when THAT root's own sweep raised -- every other root's outcome
+         *     in ``evicted`` still stands; the sweep never aborts one root's already
+         *     committed work just because a sibling root failed.
          */
         EvictResponse: {
+            /** Errors */
+            errors?: components["schemas"]["EvictErrorItem"][];
             /** Evicted */
             evicted: components["schemas"]["EvictionOutcomeItem"][];
         };
