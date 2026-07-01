@@ -154,6 +154,8 @@ async def _reuse_terminal_row(
     await download_repo.update_status(
         download_id,
         DownloadState.Downloading.value,
+        progress=0.0,
+        seed_ratio=0.0,
         clear_failed_reason=True,
         clear_first_seen_at=True,
         clear_download_path=True,

@@ -259,6 +259,54 @@ async def _make_tv_request(sm: SessionMaker, tmdb_id: int = 900) -> int:
         return request_id
 
 
+async def test_grab_reuse_resets_stale_progress_and_seed_ratio(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #16: a terminal (Imported) row carries stale progress~1.0 and
+    seed_ratio~1.0 from the completed download. Re-grabbing the same hash for a
+    fresh request must reset both to 0, or the queue UI shows 100% on a fresh
+    grab until the reconciler self-heals (cosmetic, but a 15s blip)."""
+    async with sessionmaker_() as session:
+        old = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.completed
+        )
+        new = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="B", status=RequestStatus.searching
+        )
+        session.add_all([old, new])
+        await session.flush()
+        old_id, new_id = old.id, new.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="imported",
+                media_request_id=old_id,
+                tmdb_id=100,
+                progress=1.0,
+                seed_ratio=1.0,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=new_id,
+            tmdb_id=200,
+        )
+    assert record.status == "downloading"
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.media_request_id == new_id  # re-owned to the CURRENT request
+    assert row.progress == 0.0  # stale progress reset on re-grab
+    assert row.seed_ratio == 0.0  # stale seed_ratio reset on re-grab
+
+
 async def test_grab_tv_persists_season_and_episodes_and_advances_season_rollup(
     sessionmaker_: SessionMaker,
 ) -> None:
