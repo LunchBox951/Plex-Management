@@ -2293,6 +2293,16 @@
           "204": {
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Blocklist entry not found"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2902,6 +2912,26 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2949,6 +2979,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
           },
           "422": {
             "content": {
@@ -3007,6 +3057,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
           },
           "422": {
             "content": {
@@ -3158,6 +3228,16 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Request not found"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -3263,15 +3343,32 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Request not found"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Validation error or missing request descriptor"
           }
         },
         "security": [
@@ -3442,6 +3539,16 @@
               }
             },
             "description": "Invalid setup token or API key"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Setup already initialized"
           },
           "422": {
             "content": {

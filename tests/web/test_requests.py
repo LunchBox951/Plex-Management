@@ -139,6 +139,14 @@ def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
     )
 
 
+def test_get_request_contract_documents_not_found(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/requests/{request_id}"]["get"]["responses"]
+
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+
+
 async def test_get_missing_request_is_404(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/requests/12345", headers=_HEADERS)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 import httpx
+from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import Blocklist, BlocklistReason, MediaType
@@ -76,6 +77,14 @@ async def test_delete_removes_entry_then_404(
 
     missing = await client.delete(f"/api/v1/blocklist/{entry_id}", headers=_HEADERS)
     assert missing.status_code == 404
+
+
+def test_delete_contract_documents_not_found(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/blocklist/{blocklist_id}"]["delete"]["responses"]
+
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
 
 
 async def test_blocklist_requires_api_key(client: httpx.AsyncClient, seed: SeedFn) -> None:

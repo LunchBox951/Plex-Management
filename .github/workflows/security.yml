@@ -37,7 +37,7 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install shipped runtime dependencies
-        run: pip install -e ".[postgres]"
+        run: pip install -c requirements/runtime-constraints.txt -e ".[postgres]"
       - name: Audit dependencies for known vulnerabilities
         run: |
           pip install pip-audit
@@ -47,4 +47,4 @@ jobs:
         run: npm ci
       - name: Audit shipped frontend dependencies
         working-directory: frontend
-        run: npm audit --omit=dev --audit-level=high
+        run: npm audit --audit-level=high

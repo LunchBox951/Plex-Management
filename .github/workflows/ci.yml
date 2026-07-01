@@ -27,7 +27,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -c requirements/runtime-constraints.txt -e ".[dev]"
       # Prove the committed OpenAPI doc still matches the wired backend. Combined
       # with the frontend job's client drift check, this gates the whole contract
       # chain: backend -> docs/api/openapi.json -> generated TS client. The
@@ -60,7 +60,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -c requirements/runtime-constraints.txt -e ".[dev]"
       - name: Tests
         run: pytest
 

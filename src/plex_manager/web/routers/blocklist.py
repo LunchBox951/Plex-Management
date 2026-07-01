@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from plex_manager.ports.repositories import BlocklistRecord
 from plex_manager.services import blocklist_service
 from plex_manager.web.deps import get_session, require_api_key
-from plex_manager.web.schemas import BlocklistEntry, BlocklistResponse
+from plex_manager.web.schemas import BlocklistEntry, BlocklistResponse, ErrorDetail
 
 __all__ = ["router"]
 
@@ -46,7 +46,11 @@ async def list_blocklist(
     return BlocklistResponse(entries=[_to_entry(r) for r in records])
 
 
-@router.delete("/{blocklist_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{blocklist_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"model": ErrorDetail, "description": "Blocklist entry not found"}},
+)
 async def delete_blocklist(
     blocklist_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
