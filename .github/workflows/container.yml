@@ -135,14 +135,18 @@ jobs:
       - name: Scan the published image (Trivy — SARIF to the Security tab)
         uses: aquasecurity/trivy-action@v0.36.0
         env:
-          # Suppress CVEs with no upstream fix. In practice these are the base-OS
-          # packages (perl-base, glibc, util-linux, ncurses: Essential Debian
-          # packages this app never invokes and cannot remove). Library (pip)
-          # CVEs — fixed AND unfixed — are independently surfaced by the required
-          # `dependency-audit` (pip-audit) job and Dependabot at the source, and
-          # the runtime image ships only the Python venv, so this image-scan
-          # filter creates no dependency blind spot. Shrinking the base-image CVE
-          # surface for real (a low-CVE base) is tracked as ADR follow-up #18.
+          # Trivy owns the OS layer here: scan ONLY OS packages (pkg-types=os) and
+          # drop the ones with no upstream fix (perl-base, glibc, util-linux,
+          # ncurses: Essential Debian packages this app never invokes and cannot
+          # remove). Library (pip) CVEs are deliberately NOT in scope here — they
+          # are owned by the required `dependency-audit` (pip-audit) job +
+          # Dependabot, which surface them (fixed AND unfixed) at the source; the
+          # runtime image ships only the Python venv. So ignore-unfixed can never
+          # hide a library CVE. Both the modern (pkg-types) and legacy (vuln-type)
+          # env names are set so the scope holds across Trivy versions. Cutting the
+          # OS CVE surface for real (a low-CVE base) is tracked as ADR follow-up #18.
+          TRIVY_PKG_TYPES: os
+          TRIVY_VULN_TYPE: os
           TRIVY_IGNORE_UNFIXED: "true"
         with:
           # Scan the exact bytes just published (by digest).
@@ -192,6 +196,10 @@ jobs:
       - name: Rescan :edge (Trivy — SARIF to the Security tab)
         uses: aquasecurity/trivy-action@v0.36.0
         env:
+          # OS-only scan, ignore-unfixed (see the publish scan for the rationale:
+          # library CVEs are owned by pip-audit + Dependabot, not this image scan).
+          TRIVY_PKG_TYPES: os
+          TRIVY_VULN_TYPE: os
           TRIVY_IGNORE_UNFIXED: "true"
         with:
           image-ref: ${{ steps.img.outputs.name }}:edge
