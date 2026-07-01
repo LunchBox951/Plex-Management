@@ -87,6 +87,7 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
 
     assert len(blocklist) == 1
     assert blocklist[0].torrent_hash == _HASH
+    assert blocklist[0].media_type == MediaType.movie
     # The blocklist entry carries the real grabbed title (from history), not the hash.
     assert blocklist[0].source_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
     assert request is not None
@@ -116,12 +117,20 @@ async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate
         # A re-searched candidate that exposes NO info_hash (only title+indexer) is
         # still rejected via tier 2 — the bug was an indexer=None blocklist row.
         blocked = await repo.is_blocklisted(
-            tmdb_id=603, torrent_hash=None, source_title=_TITLE, indexer=_INDEXER
+            tmdb_id=603,
+            torrent_hash=None,
+            source_title=_TITLE,
+            indexer=_INDEXER,
+            media_type="movie",
         )
         assert blocked is True
         # A different indexer with the same title is NOT blocked (tier-2 is scoped).
         other = await repo.is_blocklisted(
-            tmdb_id=603, torrent_hash=None, source_title=_TITLE, indexer="OtherIndexer"
+            tmdb_id=603,
+            torrent_hash=None,
+            source_title=_TITLE,
+            indexer="OtherIndexer",
+            media_type="movie",
         )
         assert other is False
 
@@ -201,6 +210,7 @@ async def test_mark_failed_routes_import_pending_through_failed_pending(
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
     assert len(blocklist) == 1
     assert blocklist[0].torrent_hash == _HASH
+    assert blocklist[0].media_type is None
 
 
 async def test_mark_failed_without_blocklist_rearms_request(

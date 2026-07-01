@@ -25,6 +25,8 @@ async def test_create_and_list_for_media(session: AsyncSession) -> None:
 
     scoped = await repo.list_for_media(100)
     assert [e.id for e in scoped] == [created.id]
+    assert [e.id for e in await repo.list_for_media(100, media_type="movie")] == [created.id]
+    assert await repo.list_for_media(100, media_type="tv") == []
     assert await repo.list_for_media(999) == []
     assert len(await repo.list_for_media()) == 1
 
@@ -74,6 +76,20 @@ async def test_is_blocklisted_scopes_by_tmdb_id(session: AsyncSession) -> None:
     # Same hash, but a different media item must not be blocked.
     assert await repo.is_blocklisted(1, "hash1", "Shared.Title", "idx")
     assert not await repo.is_blocklisted(2, "hash1", "Shared.Title", "idx")
+
+
+async def test_is_blocklisted_scopes_by_media_type(session: AsyncSession) -> None:
+    repo = SqlBlocklistRepository(session)
+    await repo.create(
+        source_title="Shared.Title",
+        reason="failed",
+        tmdb_id=424242,
+        torrent_hash="HASH1",
+        indexer="idx",
+        media_type="movie",
+    )
+    assert await repo.is_blocklisted(424242, "hash1", "Shared.Title", "idx", media_type="movie")
+    assert not await repo.is_blocklisted(424242, "hash1", "Shared.Title", "idx", media_type="tv")
 
 
 async def test_delete_removes_entry(session: AsyncSession) -> None:

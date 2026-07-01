@@ -317,6 +317,71 @@ async def test_add_http_redirect_to_magnet_is_followed() -> None:
     assert info_hash == REDIRECT_HASH
 
 
+async def test_add_opaque_http_url_is_rejected_before_client_add() -> None:
+    """An HTTP release URL that is neither a magnet redirect nor a locally hashable
+    .torrent must fail before /torrents/add. Otherwise the app returns an error
+    after qBittorrent already accepted an untracked torrent."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=b"not a torrent")
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_oversized_torrent_body_is_rejected_before_buffering_to_client() -> None:
+    """A malicious indexer response must not be buffered and uploaded to qBittorrent
+    without a small .torrent size cap."""
+    seen: list[str] = []
+    oversized_len = 2_000_001
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(
+                200,
+                content=b"d" + (b"x" * (oversized_len - 1)),
+                headers={"Content-Length": str(oversized_len)},
+            )
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_loopback_http_url_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add("http://127.0.0.1/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
 def _control_handler(seen: list[str], *, webapi_version: str) -> Any:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":

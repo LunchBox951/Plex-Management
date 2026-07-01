@@ -67,7 +67,7 @@ async def preview(
     )
     candidates = await prowlarr.search(request)
 
-    records = await blocklist_repo.list_for_media(tmdb_id)
+    records = await blocklist_repo.list_for_media(tmdb_id, media_type=media_type)
     entries = [
         BlocklistedRelease(
             source_title=record.source_title,

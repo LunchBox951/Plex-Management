@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
 
-from plex_manager.models import Download
+from plex_manager.models import Download, MediaType
 from plex_manager.ports.repositories import DownloadRecord
 
 if TYPE_CHECKING:
@@ -55,6 +55,7 @@ def _to_record(row: Download) -> DownloadRecord:
         tmdb_id=row.tmdb_id,
         year=row.year,
         season=row.season,
+        media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
         download_path=row.download_path,
@@ -103,6 +104,7 @@ class SqlDownloadRepository:
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -112,6 +114,7 @@ class SqlDownloadRepository:
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            media_type=MediaType(media_type) if media_type is not None else None,
         )
         self._session.add(row)
         await self._session.flush()
@@ -132,6 +135,12 @@ class SqlDownloadRepository:
         clear_failed_reason: bool = False,
         clear_download_path: bool = False,
         media_request_id: int | None = None,
+        replace_grab_metadata: bool = False,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+        media_type: str | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -145,6 +154,12 @@ class SqlDownloadRepository:
             # Re-own a reused (terminal) row: a fresh grab from a different request
             # must point the row at the CURRENT request, not the stale prior owner.
             row.media_request_id = media_request_id
+        if replace_grab_metadata:
+            row.magnet_link = magnet_link
+            row.tmdb_id = tmdb_id
+            row.year = year
+            row.season = season
+            row.media_type = MediaType(media_type) if media_type is not None else None
         if clear_failed_reason:
             # A terminal row being reused for a fresh grab must not carry a stale
             # failure reason (honesty over silence: a Downloading row claiming a

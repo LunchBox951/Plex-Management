@@ -260,6 +260,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -273,6 +274,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
                         status=status,
                         media_request_id=media_request_id,
                         tmdb_id=tmdb_id,
+                        media_type=media_type,
                     )
                 )
                 await winner.commit()
@@ -290,6 +292,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            media_type=media_type,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -653,6 +656,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -666,6 +670,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
                         status="downloading",
                         media_request_id=media_request_id,
                         tmdb_id=tmdb_id,
+                        media_type=media_type,
                     )
                 )
                 await winner.commit()
@@ -683,6 +688,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            media_type=media_type,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)

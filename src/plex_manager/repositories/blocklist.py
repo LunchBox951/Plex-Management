@@ -50,10 +50,14 @@ class SqlBlocklistRepository:
         torrent_hash: str | None,
         source_title: str,
         indexer: str | None,
+        *,
+        media_type: str | None = None,
     ) -> bool:
-        # Pre-scope to the same media item (tmdb_id, with NULL matching NULL) so
-        # the pure identity check never crosses media boundaries.
+        # Pre-scope to the same media item (tmdb_id + media_type) so the pure
+        # identity check never crosses movie/TV boundaries that share numeric ids.
         stmt = select(Blocklist).where(Blocklist.tmdb_id == tmdb_id)
+        if media_type is not None:
+            stmt = stmt.where(Blocklist.media_type == MediaType(media_type))
         rows = (await self._session.execute(stmt)).scalars().all()
         entries = [
             BlocklistedRelease(
@@ -70,10 +74,14 @@ class SqlBlocklistRepository:
             entries=entries,
         )
 
-    async def list_for_media(self, tmdb_id: int | None = None) -> list[BlocklistRecord]:
+    async def list_for_media(
+        self, tmdb_id: int | None = None, *, media_type: str | None = None
+    ) -> list[BlocklistRecord]:
         stmt = select(Blocklist)
         if tmdb_id is not None:
             stmt = stmt.where(Blocklist.tmdb_id == tmdb_id)
+        if media_type is not None:
+            stmt = stmt.where(Blocklist.media_type == MediaType(media_type))
         stmt = stmt.order_by(Blocklist.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]

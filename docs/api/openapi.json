@@ -1329,6 +1329,23 @@
               ],
               "title": "Tmdb Id"
             }
+          },
+          {
+            "in": "query",
+            "name": "media_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(movie|tv)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Media Type"
+            }
           }
         ],
         "responses": {

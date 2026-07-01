@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
+import socket
 from datetime import UTC, datetime
 from typing import Final, cast
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -53,6 +55,7 @@ _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
+_MAX_TORRENT_BYTES: Final = 1_000_000
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
 
@@ -244,6 +247,39 @@ def _parse_webapi_version(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _is_blocked_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _assert_safe_fetch_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise QbittorrentError("unsupported torrent source URL")
+    host = parsed.hostname
+    if _is_blocked_address(host):
+        raise QbittorrentError("unsafe torrent source URL")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port, type=socket.SOCK_STREAM)
+    except OSError:
+        # The request itself will surface an honest reachability error. This keeps
+        # mocked/unresolvable test hostnames usable while still rejecting resolvable
+        # private targets.
+        return
+    if any(isinstance(info[4][0], str) and _is_blocked_address(info[4][0]) for info in infos):
+        raise QbittorrentError("unsafe torrent source URL")
+
+
 def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     """Map one ``/torrents/info`` row to the port's ``DownloadStatus`` DTO.
 
@@ -383,24 +419,41 @@ class QbittorrentClient:
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
+            _assert_safe_fetch_url(current)
             try:
-                response = await self._client.get(current, follow_redirects=False)
+                async with self._client.stream("GET", current, follow_redirects=False) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("Location", "")
+                        if not location:
+                            break
+                        if location.startswith("magnet:"):
+                            return location, None
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code == _HTTP_OK:
+                        content_length = response.headers.get("Content-Length")
+                        if content_length is not None:
+                            try:
+                                if int(content_length) > _MAX_TORRENT_BYTES:
+                                    raise QbittorrentError("torrent file is too large")
+                            except ValueError:
+                                pass
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > _MAX_TORRENT_BYTES:
+                                raise QbittorrentError("torrent file is too large")
+                            chunks.append(chunk)
+                        body = b"".join(chunks)
+                        if body[:1] == b"d":
+                            return None, body
+                    break
             except httpx.RequestError as exc:
                 # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):
                 # surface a retryable error rather than letting httpx's transport error
                 # escape as an opaque 500 on the grab path. No url/secret in the message.
                 raise QbittorrentError("qBittorrent request failed") from exc
-            if response.is_redirect:
-                location = response.headers.get("Location", "")
-                if not location:
-                    break
-                if location.startswith("magnet:"):
-                    return location, None
-                current = urljoin(current, location)
-                continue
-            if response.status_code == _HTTP_OK and response.content[:1] == b"d":
-                return None, response.content
-            break
         return None, None
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
@@ -424,9 +477,9 @@ class QbittorrentClient:
                 torrent_bytes = body
                 info_hash = _info_hash_from_torrent(body)
             else:
-                # Could not resolve; hand the original URL to qBittorrent and let
-                # it try (it can fetch plain .torrent URLs directly).
-                urls_value = magnet_or_url
+                # Could not resolve to a magnet or locally hashable .torrent. Do
+                # not ask qBittorrent to add an untrackable opaque URL.
+                raise QbittorrentError("could not determine torrent hash for HTTP source")
         else:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)

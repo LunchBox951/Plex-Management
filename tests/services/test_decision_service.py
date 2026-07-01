@@ -44,6 +44,7 @@ async def test_preview_skips_blocklisted_release(sessionmaker_: SessionMaker) ->
                 source_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
                 reason=BlocklistReason.failed,
                 tmdb_id=603,
+                media_type="movie",
                 torrent_hash="3" * 40,
             )
         )
@@ -65,6 +66,49 @@ async def test_preview_skips_blocklisted_release(sessionmaker_: SessionMaker) ->
     assert result.no_acceptable_release is True
     reasons = {reason.value for _, reason in result.rejected}
     assert "blocklisted" in reasons
+
+
+async def test_preview_does_not_cross_blocklist_movie_and_tv_with_same_tmdb_id(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """TMDB ids are scoped by media type. A failed movie release must not block a TV
+    release that happens to use the same numeric id."""
+    shared_id = 424242
+    tv_hash = "d" * 40
+    async with sessionmaker_() as session:
+        session.add(
+            Blocklist(
+                source_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+                reason=BlocklistReason.failed,
+                tmdb_id=shared_id,
+                media_type="movie",
+                torrent_hash=tv_hash,
+                indexer="FakeIndexer",
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr(
+                [
+                    candidate(
+                        "Some.Show.S01.1080p.WEB-DL.x264-GROUP",
+                        info_hash=tv_hash,
+                    )
+                ]
+            ),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=shared_id,
+            title="Some Show",
+            media_type="tv",
+            season=1,
+        )
+
+    assert [s.candidate.title for s in result.accepted] == ["Some.Show.S01.1080p.WEB-DL.x264-GROUP"]
+    assert result.rejected == []
 
 
 async def test_preview_rejects_wrong_title_even_at_top_quality(

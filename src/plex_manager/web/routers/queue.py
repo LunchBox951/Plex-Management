@@ -22,6 +22,7 @@ from plex_manager.services.grab_service import (
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
+    TorrentAlreadyTrackedError,
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
@@ -167,6 +168,13 @@ async def grab_endpoint(
         # refuse the parallel grab instead of spawning a second active row.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
+        ) from exc
+    except TorrentAlreadyTrackedError as exc:
+        # The same torrent hash is already actively owned by a different request.
+        # Returning that row would claim this request was grabbed while leaving it
+        # untouched, so surface a conflict.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="torrent_already_tracked"
         ) from exc
     except GrabError as exc:
         # qBittorrent took the grab but no real info-hash could be determined;

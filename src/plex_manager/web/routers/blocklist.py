@@ -39,9 +39,10 @@ def _to_entry(record: BlocklistRecord) -> BlocklistEntry:
 async def list_blocklist(
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb_id: Annotated[int | None, Query()] = None,
+    media_type: Annotated[str | None, Query(pattern="^(movie|tv)$")] = None,
 ) -> BlocklistResponse:
     """List blocklist entries, optionally scoped to one media item."""
-    records = await blocklist_service.list_for_media(session, tmdb_id)
+    records = await blocklist_service.list_for_media(session, tmdb_id, media_type)
     return BlocklistResponse(entries=[_to_entry(r) for r in records])
 
 

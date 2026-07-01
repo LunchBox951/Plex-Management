@@ -113,14 +113,20 @@ async def _handle_failed(
         (r for r in rows if r.torrent_hash.lower() == event.torrent_hash.lower()),
         None,
     )
+    request = (
+        await request_repo.get(record.media_request_id)
+        if record is not None and record.media_request_id is not None
+        else None
+    )
     source_title = await _source_title_for(session, event.torrent_hash) or event.source_title
     indexer = await _indexer_for(session, event.torrent_hash)
     await blocklist_repo.create(
         source_title=source_title,
         reason=BlocklistReason.failed.value,
-        tmdb_id=event.tmdb_id,
+        tmdb_id=request.tmdb_id if request is not None else event.tmdb_id,
         torrent_hash=event.torrent_hash,
         indexer=indexer,
+        media_type=request.media_type if request is not None else None,
     )
     if record is not None and record.media_request_id is not None:
         await request_repo.set_status(record.media_request_id, RequestStatus.searching.value)
@@ -246,12 +252,18 @@ async def mark_failed(
     if blocklist:
         source_title = await _source_title_for(session, row.torrent_hash) or row.torrent_hash
         indexer = await _indexer_for(session, row.torrent_hash)
+        request = (
+            await SqlRequestRepository(session).get(row.media_request_id)
+            if row.media_request_id is not None
+            else None
+        )
         await SqlBlocklistRepository(session).create(
             source_title=source_title,
             reason=BlocklistReason.user_reported.value,
-            tmdb_id=row.tmdb_id,
+            tmdb_id=request.tmdb_id if request is not None else row.tmdb_id,
             torrent_hash=row.torrent_hash,
             indexer=indexer,
+            media_type=request.media_type if request is not None else None,
         )
 
     # Re-arm the owning request unconditionally — the blocklist flag governs ONLY
