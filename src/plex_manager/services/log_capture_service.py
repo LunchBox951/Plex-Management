@@ -67,7 +67,6 @@ __all__ = [
     "stop_logging",
 ]
 
-_logger = logging.getLogger(__name__)
 
 #: Live all-levels tail size (``GET /ops/logs/tail``). Bounded so a busy install
 #: can never grow this without limit; the oldest entries fall off as new ones

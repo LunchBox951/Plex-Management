@@ -5,7 +5,6 @@ reconcile status — each piece plus the full aggregate.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC
@@ -69,8 +68,7 @@ async def _heartbeat_ticks_during[T](
     finally:
         stop = True
         heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
     return result, ticks
 
 

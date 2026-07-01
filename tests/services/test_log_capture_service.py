@@ -173,7 +173,7 @@ async def test_snapshot_tail_survives_concurrent_emit_from_another_thread(
         while time.monotonic() < deadline:
             try:
                 records = handler.snapshot_tail(200)
-            except BaseException as exc:  # pragma: no cover - the regression itself
+            except Exception as exc:  # pragma: no cover - the regression itself
                 errors.append(exc)
                 break
             assert len(records) <= 200

@@ -179,6 +179,7 @@ class _LosingRaceFs(LocalFileSystem):
     on EEXIST when another import won the race."""
 
     def __init__(self, winner_size: int) -> None:
+        super().__init__()
         self._winner_size = winner_size
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
@@ -1213,6 +1214,7 @@ class _FailsOnSecondCallFs(LocalFileSystem):
     file already placed successfully."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._calls = 0
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]

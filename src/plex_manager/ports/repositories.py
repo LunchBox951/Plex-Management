@@ -21,6 +21,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "LOG_EVENT_CORRELATION_KEYS",
     "BlocklistRecord",
     "BlocklistRepository",
     "DownloadRecord",

@@ -38,7 +38,6 @@ already used by ``web/app.py``'s reconcile loop.
 from __future__ import annotations
 
 import asyncio
-import logging
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -77,7 +76,6 @@ __all__ = [
     "snapshot_reconcile",
 ]
 
-_logger = logging.getLogger(__name__)
 
 # How long a subsystem probe result stays fresh before the next poll re-hits the
 # upstream (~15s per the blueprint) — short enough that "Test connection" style

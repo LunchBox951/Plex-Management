@@ -13,7 +13,6 @@ controlled, small total so each candidate's ``size_percent`` is meaningful.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import time
 from collections.abc import Awaitable
@@ -79,8 +78,7 @@ async def _heartbeat_ticks_during[T](
     finally:
         stop = True
         heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
     return result, ticks
 
 
