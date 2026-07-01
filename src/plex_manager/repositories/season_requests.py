@@ -33,6 +33,7 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         season_number=row.season_number,
         status=row.status.value,
         tmdb_id=tmdb_id,
+        library_path=row.library_path,
     )
 
 
@@ -164,3 +165,11 @@ class SqlSeasonRequestRepository:
     async def mark_available(self, season_request_id: int) -> None:
         """Set ``available`` (Plex-confirmed: ``leafCount>0`` for this season)."""
         await self.set_status(season_request_id, RequestStatus.available.value)
+
+    async def set_library_path(self, season_request_id: int, library_path: str) -> None:
+        """Store the final placed path this season's import wrote into (ADR-0012)."""
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.library_path = library_path
+        await self._session.flush()

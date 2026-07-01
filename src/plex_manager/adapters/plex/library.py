@@ -33,7 +33,7 @@ from typing import Final, Literal, cast
 
 import httpx
 
-from plex_manager.ports.library import LibrarySection
+from plex_manager.ports.library import LibrarySection, WatchState
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
 
@@ -523,3 +523,22 @@ class PlexLibrary:
                 _PRESENT_TMDB_CACHE.invalidate(self._cache_key)
             else:
                 _TV_SEASONS_CACHE.invalidate(self._cache_key)
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        season: int | None = None,
+    ) -> WatchState:
+        """Whether ``tmdb_id`` (optionally one TV season) has been watched.
+
+        The ``viewCount``/``lastViewedAt``/``viewedLeafCount`` lookup this needs
+        (ADR-0012's disk-pressure eviction) is deferred to the operability
+        adapters build layer — it raises honestly rather than returning a
+        misleading ``watched=False``, mirroring how ``is_available``'s ``tv``
+        branch was staged during the TV beta.
+        """
+        raise NotImplementedError(
+            "plex watch-state lookup deferred to the operability adapters layer"
+        )

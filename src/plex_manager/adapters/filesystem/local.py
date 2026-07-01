@@ -213,3 +213,15 @@ class LocalFileSystem:
         video file is not handled here -- a TV import always walks a directory.
         """
         return list(_iter_video_files(root))
+
+    def delete(self, path: str) -> None:
+        """Delete ``path`` (a file or a whole directory tree) from local disk.
+
+        The root-guarded containment check (only deleting within a configured
+        library root, reusing the symlink-escape guard above) is deferred to the
+        operability adapters build layer -- it raises honestly rather than
+        deleting without that guard in place, mirroring how ``PlexLibrary.
+        watch_state`` and ``is_available``'s ``tv`` branch were staged before
+        their real implementations landed.
+        """
+        raise NotImplementedError("root-guarded delete deferred to the operability adapters layer")

@@ -164,3 +164,53 @@ async def test_set_status_updates(session: AsyncSession) -> None:
     fetched = await repo.get(created.id)
     assert fetched is not None
     assert fetched.status == "downloading"
+
+
+async def test_new_request_defaults_library_path_none_and_keep_forever_false(
+    session: AsyncSession,
+) -> None:
+    repo = SqlRequestRepository(session)
+    created = await repo.create(tmdb_id=12, media_type="movie", title="X", status="pending")
+    assert created.library_path is None
+    assert created.keep_forever is False
+
+
+async def test_set_library_path_round_trips(session: AsyncSession) -> None:
+    """The breadcrumb the disk-pressure eviction sweep later ``fs.delete()``s (ADR-0012)."""
+    repo = SqlRequestRepository(session)
+    created = await repo.create(tmdb_id=13, media_type="movie", title="X", status="completed")
+
+    await repo.set_library_path(created.id, "/data/library/movies/X (2024)/X.mkv")
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.library_path == "/data/library/movies/X (2024)/X.mkv"
+
+
+async def test_set_library_path_missing_row_raises(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    with pytest.raises(LookupError):
+        await repo.set_library_path(999, "/data/library/movies/Ghost/Ghost.mkv")
+
+
+async def test_set_keep_forever_round_trips(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    created = await repo.create(tmdb_id=14, media_type="movie", title="Pin me", status="available")
+    assert created.keep_forever is False
+
+    await repo.set_keep_forever(created.id, True)
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.keep_forever is True
+
+    # Toggling back off is just as explicit -- the caller (not this method)
+    # decides the target value, so a double-submit is idempotent either way.
+    await repo.set_keep_forever(created.id, False)
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.keep_forever is False
+
+
+async def test_set_keep_forever_missing_row_raises(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    with pytest.raises(LookupError):
+        await repo.set_keep_forever(999, True)

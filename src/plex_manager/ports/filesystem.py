@@ -75,3 +75,19 @@ class FileSystemPort(Protocol):
         directory (a season pack or a whole-show download).
         """
         raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        """Delete ``path`` (a file or a whole directory tree) from local disk.
+
+        The disk-pressure eviction sweep's ONLY write operation (ADR-0012): it is
+        the sole caller, always with a title's/season's stored ``library_path``
+        breadcrumb, never a reconstructed-from-naming guess. Implementations MUST
+        refuse (raise, never silently ignore) a ``path`` that does not resolve
+        within one of the app's configured library roots -- eviction must never
+        be able to delete an arbitrary filesystem path, mirroring the symlink-
+        escape containment ``LocalFileSystem`` already applies to imports. A
+        ``path`` that does not exist is a no-op, not an error: an eviction retried
+        after a previous partial success (or a breadcrumb pointing at something
+        already removed out-of-band) must not fail honestly-idempotent cleanup.
+        """
+        raise NotImplementedError

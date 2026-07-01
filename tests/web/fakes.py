@@ -21,7 +21,7 @@ from plex_manager.ports.download_client import (
     DownloadStatus,
 )
 from plex_manager.ports.indexer import IndexerPort
-from plex_manager.ports.library import LibraryPort, LibrarySection
+from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState
 from plex_manager.ports.metadata import (
     MediaPage,
     MediaSearchResult,
@@ -242,6 +242,12 @@ class FakeLibrary:
     records the ``media_type`` passed to each :meth:`trigger_scan` call, so a test
     can assert a TV import scans with ``"tv"`` (and a movie import with
     ``"movie"``) rather than only checking that some path was scanned.
+
+    ``watch_states`` (ADR-0012) maps ``(tmdb_id, media_type, season)`` -- ``season``
+    is ``None`` for a movie entry -- to a canned :class:`WatchState`; a key with no
+    entry answers ``watched=False, last_viewed_at=None`` (Plex has never recorded a
+    view), matching the real adapter's honest default for an absent/never-viewed
+    item.
     """
 
     def __init__(
@@ -250,12 +256,14 @@ class FakeLibrary:
         available: set[int] | None = None,
         available_tv_seasons: dict[int, frozenset[int]] | None = None,
         sections: list[LibrarySection] | None = None,
+        watch_states: dict[tuple[int, str, int | None], WatchState] | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
         self.sections = sections or []
         self.scanned: list[str] = []
         self.scan_calls: list[tuple[str, str]] = []
+        self.watch_states = watch_states or {}
 
     async def is_available(
         self,
@@ -284,6 +292,17 @@ class FakeLibrary:
 
     async def list_sections(self) -> list[LibrarySection]:
         return list(self.sections)
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        season: int | None = None,
+    ) -> WatchState:
+        return self.watch_states.get(
+            (tmdb_id, media_type, season), WatchState(watched=False, last_viewed_at=None)
+        )
 
 
 def override_adapters(

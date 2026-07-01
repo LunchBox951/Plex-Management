@@ -44,6 +44,8 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         user_id=row.user_id,
         poster_url=row.poster_url,
         backdrop_url=row.backdrop_url,
+        library_path=row.library_path,
+        keep_forever=bool(row.keep_forever),
     )
 
 
@@ -179,4 +181,20 @@ class SqlRequestRepository:
         row.library_verified_at = now
         if row.completed_at is None:
             row.completed_at = now
+        await self._session.flush()
+
+    async def set_library_path(self, request_id: int, library_path: str) -> None:
+        """Store the final placed path this request's import wrote into (ADR-0012)."""
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.library_path = library_path
+        await self._session.flush()
+
+    async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:
+        """Set the operator's "keep forever" pin (ADR-0012)."""
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.keep_forever = keep_forever
         await self._session.flush()
