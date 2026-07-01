@@ -47,8 +47,26 @@ _logger = logging.getLogger(__name__)
 # slot, so resurrecting an old terminal row as active would re-block dedup against
 # a dead-end ghost. The canonical source for the string-valued set (the SQL-side
 # enum set lives in ``repositories.requests``); ``grab_service`` reuses this.
+#
+# ``evicted`` (ADR-0012) belongs here too: it is terminal FOR GRAB PURPOSES --
+# there is nothing left on disk for this exact row to resume -- even though it is
+# re-requestable (a fresh ``POST /requests`` creates a brand-new row, since
+# ``evicted`` is excluded from ``uq_media_requests_active``'s predicate, exactly
+# like ``available``/``failed`` above). Without this, a stale/evicted request id
+# handed to ``/queue/grab`` would pass this gate, qbt.add() a torrent, and only
+# THEN fail trying to move this row to ``downloading`` -- if a fresh request for
+# the same media already exists (a new active row owns the unique slot), that
+# update collides with ``uq_media_requests_active`` and the just-added torrent is
+# left untracked. Rejecting up front (``RequestNotActiveError``, HTTP 409) means
+# nothing is ever added to the client for an evicted row.
 TERMINAL_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
-    s.value for s in (RequestStatus.completed, RequestStatus.available, RequestStatus.failed)
+    s.value
+    for s in (
+        RequestStatus.completed,
+        RequestStatus.available,
+        RequestStatus.failed,
+        RequestStatus.evicted,
+    )
 )
 
 

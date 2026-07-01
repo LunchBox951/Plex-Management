@@ -108,6 +108,105 @@ async def test_ensure_seasons_is_idempotent_and_grows_the_tracked_set(
         assert show.status is RequestStatus.downloading
 
 
+async def test_ensure_seasons_re_arms_an_evicted_season_to_pending(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """C3 regression (ADR-0012): a re-request for a show with a mix of seasons
+    (season 1 done, season 2 evicted) must RE-ARM the evicted season to
+    'pending' so it becomes grabbable again. Before the fix, 'Request again' on
+    an evicted season was a silent no-op forever -- ``ensure()``'s get-or-create
+    returns an already-established row unchanged, and the disk-pressure sweep
+    already deleted the file, so nothing would ever re-search/re-grab it."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=710)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=710, seasons=[1, 2]
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=2, status="evicted"
+        )
+        await session.commit()
+
+    # A fresh re-request tracking the SAME two seasons -- exactly what
+    # create_request's dedup path calls on every POST /requests, including the
+    # "Request again" flow the UI drives for a partially_available show.
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=710, seasons=[1, 2]
+        )
+        await session.commit()
+
+    by_season = {r.season_number: r.status for r in records}
+    assert by_season == {1: "available", 2: "pending"}  # season 2 re-armed, not stuck
+    async with sessionmaker_() as session:
+        stmt = select(SeasonRequest).where(
+            SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 2
+        )
+        season_row = (await session.execute(stmt)).scalars().one()
+        show = await session.get(MediaRequest, show_id)
+    assert season_row.status.value == "pending"
+    assert show is not None
+    assert show.status is RequestStatus.partially_available
+
+
+async def test_ensure_seasons_re_arms_an_evicted_season_straight_to_available_when_present(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The re-arm mirrors a FRESH row's already-in-library short-circuit: if Plex
+    already has the evicted season again, re-requesting goes straight to
+    'available', not 'pending'."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=711)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=711, seasons=[1]
+        )
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=1, status="evicted"
+        )
+        await session.commit()
+
+    library = FakeLibrary(available_tv_seasons={711: frozenset({1})})
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, library, media_request_id=show_id, tmdb_id=711, seasons=[1]
+        )
+        await session.commit()
+
+    assert {(r.season_number, r.status) for r in records} == {(1, "available")}
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+    assert show is not None
+    assert show.status is RequestStatus.available
+
+
+async def test_ensure_seasons_never_regresses_a_non_evicted_terminal_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The C3 re-arm is scoped EXCLUSIVELY to 'evicted': a season that is
+    'failed' (or any other terminal/in-flight status) must be left completely
+    untouched by a re-request -- never regressed to 'pending'."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=712)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=712, seasons=[1]
+        )
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=1, status="failed"
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=712, seasons=[1]
+        )
+        await session.commit()
+
+    assert {(r.season_number, r.status) for r in records} == {(1, "failed")}
+
+
 async def test_set_status_updates_one_season_and_recomputes_precedence_rollup(
     sessionmaker_: SessionMaker,
 ) -> None:

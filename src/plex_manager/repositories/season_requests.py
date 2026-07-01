@@ -9,9 +9,9 @@ itself carries no ``tmdb_id`` column.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
@@ -62,6 +62,20 @@ class SqlSeasonRequestRepository:
 
     async def get(self, season_request_id: int) -> SeasonRequestRecord | None:
         row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            return None
+        return _to_record(row, await self._tmdb_id_for(row.media_request_id))
+
+    async def get_fresh(self, season_request_id: int) -> SeasonRequestRecord | None:
+        """Like :meth:`get`, but bypasses THIS session's identity-map staleness.
+
+        Same ``populate_existing=True`` TOCTOU fix as ``SqlRequestRepository.
+        get_fresh`` (see its docstring), at season granularity — the eviction
+        re-check needs the season's CURRENT status (a concurrent sweep may have
+        already evicted it, or an import may have re-armed it) immediately
+        before deleting its file.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id, populate_existing=True)
         if row is None:
             return None
         return _to_record(row, await self._tmdb_id_for(row.media_request_id))
@@ -157,6 +171,32 @@ class SqlSeasonRequestRepository:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.status = RequestStatus(status)
         await self._session.flush()
+
+    async def set_status_if_in(
+        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
+        status is in ``allowed_from``. Returns whether a row was actually updated.
+
+        The season-granularity mirror of ``SqlRequestRepository.set_status_if_in``
+        (see its docstring for the full rationale) -- the eviction sweep's
+        AUTHORITATIVE double-count guard (ADR-0012, C6) for TV. Backs
+        ``season_request_service.set_status_if_in``, which additionally
+        recomputes the parent rollup, but ONLY when this CAS actually changed
+        the row -- a losing sweep must never re-derive (and re-persist) a
+        rollup off a row it did not actually get to move.
+        """
+        stmt = (
+            update(SeasonRequest)
+            .where(
+                SeasonRequest.id == season_request_id,
+                SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
+            )
+            .values(status=RequestStatus(status))
+            .execution_options(synchronize_session="fetch")
+        )
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
 
     async def mark_completed(self, season_request_id: int) -> None:
         """Set ``completed`` (imported, scan triggered) -- the honest pre-``available`` state."""

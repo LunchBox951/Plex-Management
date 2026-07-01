@@ -162,6 +162,43 @@ async def test_grab_rejects_terminal_request_and_adds_nothing(
     assert rows == []
 
 
+async def test_grab_rejects_an_evicted_request_and_adds_nothing(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """C2 regression: an ``evicted`` request id (ADR-0012's disk-pressure sweep
+    already deleted the file) must be refused BEFORE anything reaches the
+    client, exactly like any other terminal status. Before the fix, ``evicted``
+    was missing from ``TERMINAL_REQUEST_STATUS_VALUES`` -- a stale client could
+    grab an old evicted request id, qbt.add() a torrent, and only then fail
+    trying to move this row to ``downloading`` if a FRESH request for the same
+    media already owns the ``uq_media_requests_active`` slot, leaving an
+    untracked torrent behind."""
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.evicted
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(RequestNotActiveError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=req_id,
+                tmdb_id=100,
+            )
+    # Nothing was handed to the client, and no row was tracked.
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert rows == []
+
+
 async def test_grab_raises_when_no_info_hash_can_be_determined(
     sessionmaker_: SessionMaker,
 ) -> None:

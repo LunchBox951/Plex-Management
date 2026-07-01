@@ -12,6 +12,7 @@ import httpx
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.library import WatchState
 from plex_manager.web.deps import SettingsStore
@@ -111,6 +112,50 @@ async def test_disk_candidates_empty_when_plex_unconfigured(
     response = await client.get("/api/v1/ops/disk", headers=_HEADERS)
     root = response.json()["roots"][0]
     assert root["error"] is None
+    assert root["candidates"] == []
+
+
+class _UnreachablePlexLibrary(FakeLibrary):
+    """A configured-but-unreachable Plex: every ``watch_state`` call raises,
+    mirroring a real outage or a bad token (``get_library_optional`` only checks
+    that a url/token are SET, not that they actually work) -- ``PlexLibraryError``
+    is exactly what the real adapter raises in both cases."""
+
+    async def watch_state(
+        self, tmdb_id: int, media_type: str, *, season: int | None = None
+    ) -> WatchState:
+        raise PlexLibraryError("plex request failed")
+
+
+async def test_disk_gauges_survive_a_plex_outage_during_the_candidate_preview(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """C4 regression: a configured-but-unreachable Plex must not take down the
+    WHOLE ``/ops/disk`` response. Before the fix, ``preview_candidates`` let a
+    ``PlexLibraryError`` from ``watch_state`` propagate uncaught, 500ing the
+    endpoint and losing the disk-usage gauges exactly during a Plex outage --
+    the one time an operator most needs to see how full the disk is."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _set_movies_root(sessionmaker_, str(tmp_path))
+    await _seed_watched_movie(sessionmaker_, library_path=str(movie_file))
+
+    override_adapters(app, library=_UnreachablePlexLibrary())
+
+    response = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+
+    assert response.status_code == 200
+    root = response.json()["roots"][0]
+    # The disk gauge is honestly reported even though Plex is unreachable...
+    assert root["error"] is None
+    assert root["total_bytes"] > 0
+    # ...but the candidate preview honestly degrades to empty rather than
+    # taking the whole endpoint down with it.
     assert root["candidates"] == []
 
 

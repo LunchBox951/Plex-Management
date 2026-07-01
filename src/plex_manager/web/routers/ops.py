@@ -25,6 +25,7 @@ it).
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final, Literal, cast
 
@@ -33,6 +34,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -81,6 +83,8 @@ from plex_manager.web.schemas import (
 )
 
 __all__ = ["router"]
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/ops",
@@ -357,6 +361,16 @@ async def _disk_root_item(
     (``library is None``) still shows the usage gauge, just with an empty
     candidate list: honest ("we can't check watch state"), never a fabricated
     preview.
+
+    The usage read and the candidate preview are deliberately ISOLATED from each
+    other: usage is read (and, on failure, reported) first, unconditionally: a
+    Plex outage must never cost the operator the disk-usage gauges they need
+    exactly when eviction can't run automatically. A configured-but-unreachable
+    Plex (``get_library_optional`` only checks that a url/token are SET, not that
+    they actually work) makes ``preview_candidates`` raise while resolving
+    ``watch_state`` — caught here and downgraded to an empty candidate list
+    (logged), the same honest degraded-preview posture as an unreadable root,
+    rather than 500ing the WHOLE ``/ops/disk`` response over one root's preview.
     """
     cached = cache.get(root_path)
     if cached is not None:
@@ -381,13 +395,30 @@ async def _disk_root_item(
 
     candidates: list[EvictionCandidateItem] = []
     if library is not None:
-        ranked = await eviction_service.preview_candidates(
-            session=session,
-            library=library,
-            media_type=media_type,
-            root_path=root_path,
-            grace_days=grace_days,
-        )
+        try:
+            ranked = await eviction_service.preview_candidates(
+                session=session,
+                library=library,
+                media_type=media_type,
+                root_path=root_path,
+                grace_days=grace_days,
+            )
+        except (PlexLibraryError, PlexAuthError) as exc:
+            # Plex IS configured but unreachable/rejecting the token: the disk
+            # gauge above is already resolved and must still be returned --
+            # only the candidate preview degrades, honestly, to empty rather
+            # than taking down the whole endpoint (and every OTHER root) with
+            # it. ``error`` is deliberately left unset: it drives the frontend's
+            # "hide the usage gauge" branch (Status.tsx), which must stay
+            # visible here -- this is a preview-only degradation, not an
+            # unreadable root.
+            _logger.warning(
+                "eviction candidate preview skipped for %s root %s (%s)",
+                media_type,
+                root_path,
+                type(exc).__name__,
+            )
+            ranked = []
         candidates = [
             EvictionCandidateItem(
                 request_id=c.request_id,

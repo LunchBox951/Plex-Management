@@ -247,6 +247,68 @@ async def _season_candidates(
     return pairs
 
 
+async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
+    """Re-read the pin + status for ``pending`` right now, bypassing this session's
+    identity-map staleness (:meth:`SqlRequestRepository.get_fresh` /
+    :meth:`SqlSeasonRequestRepository.get_fresh`).
+
+    The TOCTOU close for C7 (a ``keep_forever`` pin landing after candidate
+    assembly): candidate assembly (:func:`_movie_candidates`/
+    :func:`_season_candidates`) ran several AWAITED Plex/FS calls before the
+    caller ever reaches here, during which an operator may have committed a
+    fresh ``keep_forever`` pin in a SEPARATE session/transaction.
+    ``get_fresh``'s ``populate_existing=True`` forces this session to actually
+    see that commit rather than silently re-reading its own stale snapshot (or
+    this candidate's own now-stale in-memory fields). This check ALSO covers
+    ``in_flight`` (an active download racing in) and an already-evicted row, so
+    it is a genuinely useful early filter for C6 (overlapping sweeps) too — but
+    it is a plain READ, not a compare-and-swap: two genuinely concurrent sweeps
+    can both pass it in their own uncommitted transactions before either
+    commits. It is NOT what makes C6 safe; :meth:`SqlRequestRepository.
+    set_status_if_in` / :meth:`SqlSeasonRequestRepository.set_status_if_in`
+    (a real, DATABASE-enforced compare-and-swap on the status flip in
+    :func:`_evict_one`) is the actual double-count guard — this function only
+    means fewer wasted deletes reach that point, and it is what stops a pin
+    from ever being silently ignored (a plain status CAS alone cannot see
+    ``keep_forever``, which lives outside the compared column, or the
+    PARENT's pin for a TV season).
+
+    Movies: the request itself must still be ``available``, unpinned, and have
+    no active download. TV: the pin lives on the PARENT (fetched separately),
+    and the SEASON row itself must still be ``available`` with no active
+    download for ``(request, season)``. Either side missing entirely (deleted
+    out from under the sweep) is honestly ``False`` — nothing left to evict.
+    """
+    download_repo = SqlDownloadRepository(session)
+    if isinstance(pending, _SeasonPending):
+        parent = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
+        season = await SqlSeasonRequestRepository(session).get_fresh(pending.season_request_id)
+        if parent is None or season is None:
+            return False
+        in_flight = (
+            await download_repo.find_active_for_request(
+                pending.media_request_id, season=pending.season_number
+            )
+        ) is not None
+        return (
+            not parent.keep_forever
+            and season.status == RequestStatus.available.value
+            and not in_flight
+        )
+
+    request = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
+    if request is None:
+        return False
+    in_flight = (
+        await download_repo.find_active_for_request(pending.media_request_id, season=None)
+    ) is not None
+    return (
+        not request.keep_forever
+        and request.status == RequestStatus.available.value
+        and not in_flight
+    )
+
+
 async def _evict_one(
     *,
     session: AsyncSession,
@@ -263,6 +325,24 @@ async def _evict_one(
         _logger.warning(
             "skipping eviction of %r: no stored library_path breadcrumb",
             candidate.title,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return None
+
+    # Re-check IMMEDIATELY before the delete (see _still_evictable's docstring):
+    # closes the TOCTOU window between candidate assembly and this exact delete,
+    # so a keep_forever pin that lands after assembly actually stops this
+    # eviction (north-star #1: the correction button must work even in-flight).
+    # This is a cheap early filter, NOT the double-count guard for C6 (two
+    # genuinely concurrent sweeps can both pass this plain read before either
+    # commits) -- the real CAS below is what makes that safe.
+    if not await _still_evictable(session, pending):
+        season_note = f" season {candidate.season}" if candidate.season is not None else ""
+        _logger.info(
+            "skipping eviction of %r%s: now pinned/keep_forever, already evicted, "
+            "or no longer an eviction candidate (re-checked immediately before delete)",
+            candidate.title,
+            season_note,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
         )
         return None
@@ -292,19 +372,44 @@ async def _evict_one(
         )
         return None
 
+    season_note = f" season {candidate.season}" if candidate.season is not None else ""
+
+    # THE double-count guard (ADR-0012, C6): a real, database-enforced
+    # compare-and-swap -- ``UPDATE ... WHERE status = 'available'`` -- not a
+    # read-then-write. ``fs.delete`` above is idempotent (a missing path is a
+    # no-op success, see ``LocalFileSystem.delete``), so BOTH racing sweeps can
+    # harmlessly reach this point after having "deleted" the same already-gone
+    # file; this CAS is what ensures only ONE of them ever flips the status,
+    # writes the history row, and counts the freed bytes. The loser's CAS
+    # returns ``False`` (the row already left ``available`` once the winner
+    # committed) and must skip the history/outcome entirely -- never a second
+    # 'evicted' record for space that was only ever freed once.
     if isinstance(pending, _SeasonPending):
-        await season_request_service.set_status(
+        changed = await season_request_service.set_status_if_in(
             session,
             media_request_id=pending.media_request_id,
-            season_number=pending.season_number,
+            season_request_id=pending.season_request_id,
             status=RequestStatus.evicted.value,
+            allowed_from=frozenset({RequestStatus.available.value}),
         )
     else:
-        await SqlRequestRepository(session).set_status(
-            pending.media_request_id, RequestStatus.evicted.value
+        changed = await SqlRequestRepository(session).set_status_if_in(
+            pending.media_request_id,
+            RequestStatus.evicted.value,
+            frozenset({RequestStatus.available.value}),
         )
 
-    season_note = f" season {candidate.season}" if candidate.season is not None else ""
+    if not changed:
+        await session.rollback()
+        _logger.info(
+            "lost the eviction race for %r%s to a concurrent writer (status changed "
+            "out from under the compare-and-swap); not double-counting",
+            candidate.title,
+            season_note,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return None
+
     session.add(
         DownloadHistory(
             tmdb_id=pending.tmdb_id,

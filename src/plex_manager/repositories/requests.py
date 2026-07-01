@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.repositories import RequestRecord
@@ -57,6 +57,26 @@ class SqlRequestRepository:
 
     async def get(self, request_id: int) -> RequestRecord | None:
         row = await self._session.get(MediaRequest, request_id)
+        return _to_record(row) if row is not None else None
+
+    async def get_fresh(self, request_id: int) -> RequestRecord | None:
+        """Like :meth:`get`, but bypasses THIS session's identity-map staleness.
+
+        ``populate_existing=True`` forces a real SELECT that overwrites any
+        already-loaded ORM attributes for this row, even when it is already
+        present in this session's identity map from an earlier read in the SAME
+        transaction. A plain ``session.get()`` would otherwise silently hand
+        back the already-cached (stale) instance and never see a commit written
+        by a DIFFERENT session in the meantime.
+
+        The eviction TOCTOU re-check (ADR-0012, :func:`~plex_manager.services.
+        eviction_service._evict_one`) is the reason this exists: candidate
+        assembly runs several awaited Plex/FS calls before a candidate is
+        actually deleted, and an operator's ``keep_forever`` pin committed in
+        that window (a SEPARATE request's session) must be seen immediately
+        before the delete, not silently missed.
+        """
+        row = await self._session.get(MediaRequest, request_id, populate_existing=True)
         return _to_record(row) if row is not None else None
 
     async def list_by_status(self, status: str | None = None) -> list[RequestRecord]:
@@ -161,6 +181,53 @@ class SqlRequestRepository:
             raise LookupError(f"media request {request_id} does not exist")
         row.status = RequestStatus(status)
         await self._session.flush()
+
+    async def set_status_if_in(
+        self, request_id: int, status: str, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
+        status is in ``allowed_from``. Returns whether a row was actually updated.
+
+        Mirrors ``SqlDownloadRepository.update_status_if_in`` (see its docstring): a
+        single ``UPDATE ... WHERE id = ? AND status IN (...)`` lets the DATABASE --
+        not this session's (possibly stale) in-memory view -- decide whether the
+        transition still applies. ``False`` means a genuinely concurrent writer
+        already moved the row out of ``allowed_from``; the caller must honor that,
+        never overwrite it.
+
+        This is the eviction sweep's AUTHORITATIVE double-count guard (ADR-0012,
+        C6): ``eviction_service._still_evictable``'s pre-delete re-read closes the
+        keep_forever/in-flight races (C7) but is itself only a read-then-act check,
+        not a real compare-and-swap -- two genuinely concurrent sweeps (the
+        periodic loop racing a manual trigger) can each pass THAT check in their
+        own uncommitted transaction before either commits. This CAS is what
+        actually stops the SECOND one from also recording an ``evicted`` history
+        row / freed-bytes count for the same request: only the winning UPDATE
+        (``rowcount == 1``) is allowed to proceed; the loser sees ``rowcount == 0``
+        (the row already left ``available`` once the winner committed) and must
+        skip rather than double-count.
+
+        ``synchronize_session="fetch"`` keeps any already-loaded identity-map
+        instance (e.g. from this session's own ``get_fresh`` re-check moments
+        earlier) consistent with the DB result, so anything read afterwards in
+        THIS session (an eviction sweep never re-reads the row again, but mirrors
+        ``update_status_if_in`` for consistency) sees the honest post-CAS status.
+        """
+        stmt = (
+            update(MediaRequest)
+            .where(
+                MediaRequest.id == request_id,
+                MediaRequest.status.in_([RequestStatus(s) for s in allowed_from]),
+            )
+            .values(status=RequestStatus(status))
+            .execution_options(synchronize_session="fetch")
+        )
+        # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
+        # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it). The
+        # cast target is referenced at runtime (not a string) so CodeQL does not read
+        # ``CursorResult``/``Any`` as unused imports.
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
 
     async def mark_completed(self, request_id: int) -> None:
         """Set ``completed`` + stamp ``completed_at`` (imported, scan triggered)."""

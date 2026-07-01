@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.models import (
     Download,
@@ -815,3 +819,462 @@ async def test_read_disk_usage_in_preview_candidates_is_offloaded(
 
     assert candidates == []
     assert ticks >= _MIN_TICKS_IF_OFFLOADED
+
+
+# --------------------------------------------------------------------------- #
+# C6/C7: the TOCTOU re-check immediately before delete. Candidate assembly runs
+# several awaited Plex/FS calls before a candidate is actually deleted; the
+# tests below build a STALE ``EvictionCandidate`` (as assembly would have
+# produced it) and then change the underlying row out from under it -- via a
+# genuinely separate commit -- before calling ``_evict_one`` directly, proving
+# the re-check (not the stale candidate's own fields) is what governs the
+# outcome.
+# --------------------------------------------------------------------------- #
+
+
+async def test_recheck_honors_a_keep_forever_pin_that_lands_after_assembly(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """C7: an operator's keep_forever pin committed AFTER candidate assembly
+    (but before the delete) must stop the eviction -- the correction button
+    must actually work even in-flight (north-star #1). Fails before the fix
+    (the file is deleted, the status flips to evicted) and passes after the
+    ``get_fresh`` re-read."""
+    library_path = _movie_file(tmp_path, "Recently Pinned.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=300, title="Recently Pinned", library_path=library_path
+    )
+    # A stale candidate exactly as assembly would have produced it BEFORE the pin.
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Recently Pinned",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=300, size_bytes=1024
+    )
+
+    # The operator's pin lands in a SEPARATE session -- simulating it landing
+    # AFTER the stale candidate above was assembled.
+    async with sessionmaker_() as pin_session:
+        row = await pin_session.get(MediaRequest, request_id)
+        assert row is not None
+        row.keep_forever = True
+        await pin_session.commit()
+
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(library_path).exists(), "a late keep_forever pin must stop the delete"
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available  # never flipped to evicted
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 300)))
+            .scalars()
+            .all()
+        )
+    assert history == []  # no eviction was ever recorded
+
+
+async def test_recheck_honors_a_keep_forever_pin_on_the_parent_for_a_tv_season(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """C7, tv side: the pin lives on the PARENT show, not the season row -- a
+    pin committed on the parent after a season candidate was assembled must
+    still stop that season's eviction."""
+    s1_path = _movie_file(tmp_path, "Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=301, title="Some Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_request_id = season_row.id
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Some Show",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=s1_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=301,
+        size_bytes=1024,
+    )
+
+    async with sessionmaker_() as pin_session:
+        parent = await pin_session.get(MediaRequest, show_id)
+        assert parent is not None
+        parent.keep_forever = True
+        await pin_session.commit()
+
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        assert season_row.status is RequestStatus.available
+
+
+async def test_recheck_skips_a_row_a_concurrent_sweep_already_evicted(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """C6: overlapping sweeps must never double-count an eviction. A stale
+    candidate assembled before a CONCURRENT sweep already evicted the same row
+    (deleted its file, flipped its status, recorded its history) must be
+    skipped -- not re-recorded as a second successful eviction with the same
+    freed_bytes."""
+    library_path = _movie_file(tmp_path, "Double Swept.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=302, title="Double Swept", library_path=library_path
+    )
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Double Swept",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=302, size_bytes=1024
+    )
+
+    # A CONCURRENT sweep already evicted this exact row in a SEPARATE
+    # session/commit -- deleted the file, flipped the status, logged the
+    # history -- simulating the overlapping-sweeps race (a manual /ops/evict
+    # racing the periodic loop).
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    fs.delete(library_path)
+    async with sessionmaker_() as other_session:
+        row = await other_session.get(MediaRequest, request_id)
+        assert row is not None
+        row.status = RequestStatus.evicted
+        other_session.add(
+            DownloadHistory(
+                tmdb_id=302,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.evicted,
+                source_title="Double Swept",
+                message="evicted by the other sweep",
+            )
+        )
+        await other_session.commit()
+
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, candidate=stale, pending=pending
+        )
+
+    assert outcome is None  # never double-counted
+    async with sessionmaker_() as session:
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 302)))
+            .scalars()
+            .all()
+        )
+    assert len(history) == 1  # still just the ONE real eviction, never two
+
+
+class _PinsSecondCandidateOnFirstDeleteFs:
+    """A :class:`~plex_manager.ports.filesystem.FileSystemPort` whose ``delete``
+    commits ``keep_forever=True`` for a SECOND, not-yet-processed request via a
+    genuinely separate session/connection on its FIRST call -- simulating an
+    operator's pin landing MID-SWEEP, in the gap between two candidates'
+    deletes. Every other method is unused by eviction and simply never
+    implemented.
+
+    The pin commit runs a real async DB write from a SYNCHRONOUS context
+    (``delete`` executes off the event loop, inside ``asyncio.to_thread``): it
+    schedules the write coroutine onto the CALLER's event loop via
+    ``asyncio.run_coroutine_threadsafe`` and blocks this worker thread on the
+    result -- the standard, safe pattern for a sync callback to drive async
+    code on a loop that is concurrently idle (awaiting this very ``to_thread``
+    call).
+    """
+
+    def __init__(
+        self,
+        *,
+        sessionmaker: SessionMaker,
+        loop: asyncio.AbstractEventLoop,
+        second_request_id: int,
+    ) -> None:
+        self._sessionmaker = sessionmaker
+        self._loop = loop
+        self._second_request_id = second_request_id
+        self._calls = 0
+        self.deleted: list[str] = []
+
+    def available_bytes(self, path: Path) -> int:
+        raise NotImplementedError
+
+    def move(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def largest_video_file(self, root: str) -> str | None:
+        raise NotImplementedError
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        self._calls += 1
+        if self._calls == 1:
+
+            async def _pin() -> None:
+                async with self._sessionmaker() as session:
+                    row = await session.get(MediaRequest, self._second_request_id)
+                    assert row is not None
+                    row.keep_forever = True
+                    await session.commit()
+
+            future = asyncio.run_coroutine_threadsafe(_pin(), self._loop)
+            future.result(timeout=5)
+        real = os.path.realpath(path)
+        if os.path.isdir(real):
+            shutil.rmtree(real)
+        else:
+            os.remove(real)
+        self.deleted.append(path)
+
+
+async def test_mid_sweep_pin_stops_the_in_flight_eviction_of_a_later_candidate(
+    tmp_path: Path,
+) -> None:
+    """Integration variant of C7: drives the FULL ``run_eviction_sweep`` (not
+    just ``_evict_one`` directly) against a REAL file-backed database -- so a
+    genuinely separate connection can land a write mid-sweep -- to prove a pin
+    landing BETWEEN the first and second candidate's deletes actually stops the
+    second candidate's eviction. Uses its own file-backed engine (not the
+    shared in-memory ``StaticPool`` fixture): two AsyncSessions truly open at
+    once needs two real connections, exactly like production.
+    """
+    db_path = tmp_path / "eviction_race.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    enable_sqlite_fk_enforcement(engine)  # also sets busy_timeout, like production
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm: SessionMaker = async_sessionmaker(engine, expire_on_commit=False)
+
+    first_path = _movie_file(tmp_path, "First (older stale).mkv")
+    second_path = _movie_file(tmp_path, "Second (about to be pinned).mkv")
+    older_stale = _STALE - timedelta(days=5)  # stalest-first -> processed FIRST
+    first_id = await _movie(sm, tmdb_id=310, title="First", library_path=first_path)
+    second_id = await _movie(sm, tmdb_id=311, title="Second", library_path=second_path)
+
+    library = FakeLibrary(
+        watch_states={
+            (310, "movie", None): WatchState(watched=True, last_viewed_at=older_stale),
+            (311, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+    fs = _PinsSecondCandidateOnFirstDeleteFs(
+        sessionmaker=sm, loop=asyncio.get_running_loop(), second_request_id=second_id
+    )
+
+    try:
+        async with sm() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+        # The first (stalest) candidate was genuinely evicted...
+        assert [o.title for o in outcomes] == ["First"]
+        assert not Path(first_path).exists()
+        # ...but the mid-sweep pin stopped the SECOND candidate's eviction: its
+        # file survives and its status is untouched.
+        assert Path(second_path).exists()
+        async with sm() as session:
+            first_row = await session.get(MediaRequest, first_id)
+            second_row = await session.get(MediaRequest, second_id)
+        assert first_row is not None and first_row.status is RequestStatus.evicted
+        assert second_row is not None and second_row.status is RequestStatus.available
+    finally:
+        await engine.dispose()
+
+
+class _ConcurrentSecondEvictFs:
+    """A :class:`~plex_manager.ports.filesystem.FileSystemPort` whose ``delete``
+    spawns a genuinely CONCURRENT ``_evict_one`` call for the SAME candidate, in
+    a SEPARATE session, on its FIRST call -- simulating two truly overlapping
+    sweeps (the periodic loop racing a manual ``POST /ops/evict`` trigger) both
+    reaching the delete step for the SAME row before EITHER has committed
+    anything. Proves the compare-and-swap status flip (not just the pre-delete
+    ``_still_evictable`` read-recheck, which both racers pass identically) is
+    what stops the second one from also recording an eviction.
+
+    Mirrors ``_PinsSecondCandidateOnFirstDeleteFs``'s technique: the nested call
+    runs on the event loop via ``asyncio.run_coroutine_threadsafe`` (this method
+    executes off-loaded in a worker thread, per ``_evict_one``'s
+    ``asyncio.to_thread``), and this thread blocks on its result before doing
+    its OWN (by-then redundant, idempotent) file removal.
+    """
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        second_call: Callable[[], Coroutine[Any, Any, eviction_service.EvictionOutcome | None]],
+    ) -> None:
+        self._loop = loop
+        self._second_call = second_call
+        self._calls = 0
+        self.second_outcome: eviction_service.EvictionOutcome | None = None
+
+    def available_bytes(self, path: Path) -> int:
+        raise NotImplementedError
+
+    def move(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def largest_video_file(self, root: str) -> str | None:
+        raise NotImplementedError
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        self._calls += 1
+        if self._calls == 1:
+            future = asyncio.run_coroutine_threadsafe(self._second_call(), self._loop)
+            self.second_outcome = future.result(timeout=5)
+        real = os.path.realpath(path)
+        if os.path.isdir(real):
+            shutil.rmtree(real, ignore_errors=True)
+        elif os.path.exists(real):
+            os.remove(real)
+
+
+async def test_concurrent_evict_one_calls_for_the_same_row_never_double_count(
+    tmp_path: Path,
+) -> None:
+    """C6, closed: two genuinely concurrent ``_evict_one`` calls for the SAME
+    candidate -- each in its OWN uncommitted session, each having independently
+    passed its OWN pre-delete ``_still_evictable`` re-check (both see
+    ``available``, since neither has committed anything yet) -- must still
+    result in EXACTLY ONE eviction: one ``evicted`` status flip, one
+    ``download_history`` row, one non-``None`` outcome. Before the CAS fix this
+    doubled: both proceeded to flip + log unconditionally. Uses a real
+    file-backed engine (not the shared in-memory ``StaticPool`` fixture): two
+    AsyncSessions truly open at once needs two real connections.
+    """
+    db_path = tmp_path / "eviction_double_count.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm: SessionMaker = async_sessionmaker(engine, expire_on_commit=False)
+
+    library_path = _movie_file(tmp_path, "Raced By Two Sweeps.mkv")
+    request_id = await _movie(
+        sm, tmdb_id=320, title="Raced By Two Sweeps", library_path=library_path
+    )
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Raced By Two Sweeps",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=320, size_bytes=1024
+    )
+
+    async def _second_call() -> eviction_service.EvictionOutcome | None:
+        async with sm() as second_session:
+            return await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=second_session, fs=fs, candidate=stale, pending=pending
+            )
+
+    fs = _ConcurrentSecondEvictFs(loop=asyncio.get_running_loop(), second_call=_second_call)
+
+    try:
+        async with sm() as first_session:
+            first_outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=first_session, fs=fs, candidate=stale, pending=pending
+            )
+
+        # EXACTLY ONE of the two overlapping calls actually recorded the
+        # eviction -- never both, never neither.
+        outcomes = [o for o in (first_outcome, fs.second_outcome) if o is not None]
+        assert len(outcomes) == 1
+
+        assert not Path(library_path).exists()  # the file IS gone (idempotent double-delete)
+        async with sm() as session:
+            row = await session.get(MediaRequest, request_id)
+            assert row is not None
+            assert row.status is RequestStatus.evicted  # flipped exactly once
+            history = (
+                (
+                    await session.execute(
+                        select(DownloadHistory).where(DownloadHistory.tmdb_id == 320)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(history) == 1  # one eviction, one history row -- never double-counted
+    finally:
+        await engine.dispose()

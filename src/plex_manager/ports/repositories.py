@@ -215,6 +215,18 @@ class RequestRepository(Protocol):
     async def set_status(self, request_id: int, status: str) -> None:
         """Update a request's status."""
 
+    async def set_status_if_in(
+        self, request_id: int, status: str, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+
+        Returns whether the row was actually updated -- ``False`` means a
+        genuinely concurrent writer already moved it elsewhere. The eviction
+        sweep's authoritative double-count guard (ADR-0012, C6): see
+        ``SqlRequestRepository.set_status_if_in``'s docstring.
+        """
+        raise NotImplementedError
+
     async def mark_completed(self, request_id: int) -> None:
         """Mark a request ``completed`` (imported, scan triggered) + stamp the time.
 
@@ -383,6 +395,16 @@ class SeasonRequestRepository(Protocol):
 
     async def set_status(self, season_request_id: int, status: str) -> None:
         """Update a season request's status."""
+        raise NotImplementedError
+
+    async def set_status_if_in(
+        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+
+        The season-granularity mirror of ``RequestRepository.set_status_if_in``;
+        see ``SqlSeasonRequestRepository.set_status_if_in``'s docstring.
+        """
         raise NotImplementedError
 
     async def mark_completed(self, season_request_id: int) -> None:
