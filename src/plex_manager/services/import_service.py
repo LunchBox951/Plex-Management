@@ -104,7 +104,7 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
     if status is not None and status.content_path:
         if status.save_path:
             return _ensure_under_save_path(status.save_path, status.content_path)
-        return status.content_path
+        raise _UnsafeContentPathError("download client reported content path without save path")
     if status is not None and status.save_path and status.name:
         if os.path.isabs(status.name):
             raise _UnsafeContentPathError("download content path is outside download save path")
@@ -406,7 +406,10 @@ async def _import_download_locked(
     # current state without importing. (The per-download lock already excludes a second
     # concurrent import; this CAS handles the separate mark_failed path.)
     claimed = await download_repo.update_status_if_in(
-        download_id, DownloadState.Importing.value, _RESUMABLE
+        download_id,
+        DownloadState.Importing.value,
+        _RESUMABLE,
+        clear_failed_reason=True,
     )
     if not claimed:
         await session.rollback()
@@ -498,6 +501,7 @@ async def _import_download_locked(
         DownloadState.Imported.value,
         frozenset({DownloadState.Importing.value}),
         download_path=str(dst),
+        clear_failed_reason=True,
     )
     if not finalized:
         await session.rollback()

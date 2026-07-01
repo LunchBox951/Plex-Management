@@ -282,6 +282,8 @@ async def test_relogin_on_403() -> None:
 _INFO_DICT = b"d6:lengthi100e4:name8:test.txt12:piece lengthi16384ee"
 _TORRENT_BYTES = b"d8:announce14:http://x/annce4:info" + _INFO_DICT + b"e"
 _TORRENT_HASH = hashlib.sha1(_INFO_DICT).hexdigest()  # noqa: S324
+_FAKE_INFO_DICT = b"d6:lengthi1e4:name8:fake.txte"
+_NESTED_INFO_TORRENT_BYTES = b"d3:food4:info" + _FAKE_INFO_DICT + b"e4:info" + _INFO_DICT + b"e"
 
 DOWNLOAD_URL = "http://indexer.local/file.torrent"
 REDIRECT_URL = "http://indexer.local/redirect"
@@ -301,6 +303,23 @@ async def test_add_torrent_file_url_computes_bencode_hash() -> None:
 
     info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
     assert info_hash == _TORRENT_HASH
+
+
+async def test_add_torrent_file_hashes_top_level_info_dict() -> None:
+    """A nested key named ``info`` must not shadow the torrent's top-level info dict."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=_NESTED_INFO_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    assert info_hash == _TORRENT_HASH
+    assert info_hash != hashlib.sha1(_FAKE_INFO_DICT).hexdigest()  # noqa: S324
 
 
 async def test_add_http_redirect_to_magnet_is_followed() -> None:
@@ -401,6 +420,23 @@ async def test_add_loopback_http_url_is_rejected_before_fetch() -> None:
 
     with pytest.raises(QbittorrentError):
         await _client(handler).add("http://127.0.0.1/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_add_cgnat_http_url_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add("http://100.64.0.1/file.torrent", "/downloads", "plex-manager")
 
     assert seen == []
 

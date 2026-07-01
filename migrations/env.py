@@ -13,7 +13,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from plex_manager.config import get_settings
-from plex_manager.db import Base, sync_database_url
+from plex_manager.db import Base, alembic_database_url
 
 import plex_manager.models  # noqa: F401  (register ORM metadata for autogenerate)
 
@@ -24,7 +24,7 @@ if config.config_file_name is not None:
 
 # Inject the application's database URL. Migrations run synchronously, so the
 # app's async URL (sqlite+aiosqlite://) is translated to its sync form.
-config.set_main_option("sqlalchemy.url", sync_database_url(get_settings().database_url))
+config.set_main_option("sqlalchemy.url", alembic_database_url(get_settings().database_url))
 
 
 def _ensure_sqlite_parent(url: str | None) -> None:

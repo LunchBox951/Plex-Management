@@ -195,6 +195,7 @@ class SqlDownloadRepository:
         seed_ratio: float | None = None,
         first_seen_at: datetime | None = None,
         clear_first_seen_at: bool = False,
+        clear_failed_reason: bool = False,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -210,8 +211,8 @@ class SqlDownloadRepository:
         The optional fields mirror :meth:`update_status` so a CONDITIONAL transition
         can carry progress, missing-grace anchors, surfaced reasons, or breadcrumb
         cleanup in the SAME compare-and-swap — never overwriting a row that already
-        left ``allowed_from``. ``clear_download_path`` / ``clear_first_seen_at`` take
-        precedence over their corresponding set values.
+        left ``allowed_from``. ``clear_download_path`` / ``clear_first_seen_at`` /
+        ``clear_failed_reason`` take precedence over their corresponding set values.
 
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS
@@ -222,7 +223,9 @@ class SqlDownloadRepository:
             values["download_path"] = None
         elif download_path is not None:
             values["download_path"] = download_path
-        if failed_reason is not None:
+        if clear_failed_reason:
+            values["failed_reason"] = None
+        elif failed_reason is not None:
             values["failed_reason"] = failed_reason
         if progress is not None:
             values["progress"] = progress

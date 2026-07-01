@@ -83,20 +83,18 @@ describe('Settings — movies_root save payload (G2)', () => {
     expect(lastBody().movies_root).toBe('/old-plex/movies')
   })
 
-  it('honors an explicit folder re-selection made alongside a Plex change', async () => {
+  it('does not save a stale library re-selection after a Plex change', async () => {
     h.libraries = [
       { path: '/old-plex/movies', section_key: '1', title: 'Movies', writable: true },
-      { path: '/new-plex/movies', section_key: '2', title: 'Films', writable: true },
+      { path: '/old-plex/films', section_key: '2', title: 'Films', writable: true },
     ]
     render(<Settings />, { wrapper: Wrapper })
     fireEvent.change(screen.getByDisplayValue('http://old-plex:32400'), {
       target: { value: 'http://new-plex:32400' },
     })
-    fireEvent.change(screen.getByLabelText('Movies library folder'), {
-      target: { value: '/new-plex/movies' },
-    })
+    expect(screen.getByLabelText('Movies library folder')).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
-    expect(lastBody().movies_root).toBe('/new-plex/movies')
+    expect(lastBody().movies_root).toBe('')
   })
 })

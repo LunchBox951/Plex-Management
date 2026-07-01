@@ -97,14 +97,31 @@ def _bencode_skip(data: bytes, idx: int) -> int:
         return data.index(b"e", idx + 1) + 1
     if ch in (b"l", b"d"):  # list / dict: container<elements>e
         idx += 1
-        while data[idx : idx + 1] != b"e":
+        while idx < len(data) and data[idx : idx + 1] != b"e":
             idx = _bencode_skip(data, idx)
+        if idx >= len(data):
+            raise ValueError("unterminated bencode container")
         return idx + 1
     if ch.isdigit():  # byte string: <length>:<bytes>
         colon = data.index(b":", idx)
         length = int(data[idx:colon])
-        return colon + 1 + length
+        end = colon + 1 + length
+        if end > len(data):
+            raise ValueError("bencode string extends past end of data")
+        return end
     raise ValueError(f"invalid bencode at position {idx}: {ch!r}")
+
+
+def _bencode_string(data: bytes, idx: int) -> tuple[bytes, int]:
+    if idx >= len(data) or not data[idx : idx + 1].isdigit():
+        raise ValueError(f"expected bencode string at position {idx}")
+    colon = data.index(b":", idx)
+    length = int(data[idx:colon])
+    start = colon + 1
+    end = start + length
+    if end > len(data):
+        raise ValueError("bencode string extends past end of data")
+    return data[start:end], end
 
 
 def _info_hash_from_torrent(data: bytes) -> str | None:
@@ -113,16 +130,22 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
     Returns the lowercased hex digest, or ``None`` if the structure can't be
     located (never raises — the caller treats ``None`` as "couldn't derive").
     """
-    marker = b"4:infod"
-    idx = data.find(marker)
-    if idx == -1:
-        return None
-    info_start = idx + len(marker) - 1  # position of the 'd' opening the dict
     try:
-        info_end = _bencode_skip(data, info_start)
+        if data[:1] != b"d":
+            return None
+        idx = 1
+        while True:
+            if idx >= len(data):
+                return None
+            if data[idx : idx + 1] == b"e":
+                return None
+            key, value_start = _bencode_string(data, idx)
+            value_end = _bencode_skip(data, value_start)
+            if key == b"info":
+                return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()  # noqa: S324
+            idx = value_end
     except ValueError:
         return None
-    return hashlib.sha1(data[info_start:info_end]).hexdigest().lower()  # noqa: S324
 
 
 def _normalize_btih(value: str) -> str:
@@ -252,14 +275,7 @@ def _is_blocked_address(address: str) -> bool:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return False
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+    return not ip.is_global or ip.is_multicast
 
 
 def _assert_safe_fetch_url(url: str) -> None:
