@@ -36,6 +36,7 @@ from plex_manager.services import (
 )
 from plex_manager.services.health_service import ReconcileStatus
 from plex_manager.web.deps import (
+    EVICTION_INTERVAL_MINUTES_DEFAULT,
     ServiceNotConfiguredError,
     ensure_system_settings,
     get_disk_pressure_target_percent,
@@ -319,14 +320,32 @@ async def _eviction_loop(app: FastAPI) -> None:
     bad tick never kills the loop; a failed tick falls back to re-reading the
     interval setting directly so a broken tick can never wedge the loop at some
     stale sleep duration.
+
+    That fallback read opens its OWN session (the tick's session is already
+    gone/rolled back by the time we're in the ``except``) — so it can raise
+    too, e.g. the same transient DB hiccup that failed the tick in the first
+    place. The outer ``try`` covers BOTH the tick attempt and that fallback: if
+    either one raises, the iteration falls all the way back to the hardcoded
+    ``EVICTION_INTERVAL_MINUTES_DEFAULT``. Nothing here is allowed to escape
+    the loop (mirroring ``_reconcile_loop``'s "one bad cycle never kills the
+    loop") — automatic disk-pressure eviction staying dead until a process
+    restart would be a silent, terminal-requiring failure, which north star #2
+    forbids.
     """
     while True:
         try:
-            sleep_seconds = await _eviction_tick(app)
+            try:
+                sleep_seconds = await _eviction_tick(app)
+            except Exception:
+                _logger.exception("eviction sweep tick failed; continuing")
+                async with app.state.sessionmaker() as session:
+                    sleep_seconds = (await get_eviction_interval_minutes(session)) * 60.0
         except Exception:
-            _logger.exception("eviction sweep tick failed; continuing")
-            async with app.state.sessionmaker() as session:
-                sleep_seconds = (await get_eviction_interval_minutes(session)) * 60.0
+            _logger.exception(
+                "eviction loop iteration failed even in its fallback path; "
+                "sleeping the default interval and continuing"
+            )
+            sleep_seconds = EVICTION_INTERVAL_MINUTES_DEFAULT * 60.0
         await asyncio.sleep(sleep_seconds)
 
 

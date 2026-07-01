@@ -10,6 +10,7 @@ on the app module (the only dependency this sweep cannot exercise for real).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.library import LibraryPort, WatchState
 from plex_manager.web import app as app_module
-from plex_manager.web.deps import SettingsStore
+from plex_manager.web.deps import EVICTION_INTERVAL_MINUTES_DEFAULT, SettingsStore
 from tests.web.fakes import FakeLibrary
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -135,3 +136,58 @@ async def test_eviction_disabled_setting_is_a_master_kill_switch(
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status is RequestStatus.available
+
+
+class _StopLoop(Exception):
+    """Sentinel raised from the patched ``asyncio.sleep`` to end the (real)
+    ``while True`` in ``_eviction_loop`` after a bounded number of iterations,
+    without ever needing the loop to actually sleep in real time."""
+
+
+async def test_eviction_loop_survives_a_tick_and_fallback_read_that_both_raise(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-2 regression: ``_eviction_tick`` failing is already handled by a
+    fallback that re-reads ``eviction_interval_minutes`` in a fresh session --
+    but if THAT read also raises (the same transient DB hiccup that failed the
+    tick), the old code let the exception escape ``_eviction_loop`` entirely,
+    silently killing automatic disk-pressure eviction until a process restart.
+
+    Both the tick AND the fallback's settings read are made to raise on every
+    iteration; the loop must still log each failure, fall back to the
+    hardcoded ``EVICTION_INTERVAL_MINUTES_DEFAULT``, and keep ticking.
+    """
+
+    async def _boom_tick(_app: FastAPI) -> float:
+        raise RuntimeError("tick failed")
+
+    async def _boom_get_interval(_session: AsyncSession) -> float:
+        raise RuntimeError("settings read failed too")
+
+    monkeypatch.setattr(app_module, "_eviction_tick", _boom_tick)
+    monkeypatch.setattr(app_module, "get_eviction_interval_minutes", _boom_get_interval)
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        # Stop the (otherwise infinite) loop once it has proven it survives
+        # more than one bad iteration -- never by letting the injected
+        # RuntimeErrors above propagate.
+        if len(sleep_calls) >= 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    app = _app(sessionmaker_)
+    try:
+        with pytest.raises(_StopLoop):
+            await app_module._eviction_loop(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    # The loop kept ticking for 3 iterations -- never died on the first (or
+    # any) transient failure -- and every one fell all the way back to the
+    # safe hardcoded default interval, since even the fallback's own settings
+    # read was made to fail.
+    assert sleep_calls == [EVICTION_INTERVAL_MINUTES_DEFAULT * 60.0] * 3
