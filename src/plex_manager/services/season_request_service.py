@@ -81,28 +81,30 @@ async def _recompute_parent(session: AsyncSession, media_request_id: int) -> Non
     await SqlRequestRepository(session).set_status(media_request_id, status)
 
 
-async def _already_available(library: LibraryPort, tmdb_id: int, season_number: int) -> bool:
-    """Best-effort per-season Plex availability check; an error is an explicit 'no'.
+async def _present_seasons(library: LibraryPort, tmdb_id: int) -> frozenset[int]:
+    """The show's already-in-Plex seasons in ONE crawl; an error is an explicit empty set.
 
-    Mirrors ``request_service._already_in_library``: a transient Plex outage or the
-    still-partial per-episode NotImplementedError must never block tracking a
-    season, so the failure is logged and treated as "can't prove it's already
-    there" -- an explicit decision, not a swallowed ``False``.
+    Mirrors ``request_service._already_in_library``'s best-effort posture, but for
+    the WHOLE show at once: a transient Plex outage or the still-partial per-episode
+    ``NotImplementedError`` must never block tracking, so a failure is logged and
+    treated as "can't prove anything is already there" -- every season falls through
+    to ``pending`` -- an explicit decision, not a swallowed error.
 
-    ``use_cache=False`` for the same reason ``_already_in_library`` uses it: a
-    season just REMOVED from Plex must read as absent immediately on a fresh
-    ``ensure_seasons`` call, not a stale cached "present" held for the cache TTL.
+    ``present_seasons`` always reflects the library as it is NOW (like
+    ``is_available(use_cache=False)`` -- a season just REMOVED reads absent on a fresh
+    ``ensure_seasons`` call, never a stale cached "present"). Resolving all seasons
+    from ONE crawl (vs ``is_available`` per season) keeps ``ensure_seasons`` from
+    holding the request's SQLite write transaction open across N full library reads.
     """
     try:
-        return await library.is_available(tmdb_id, "tv", use_cache=False, season=season_number)
+        return await library.present_seasons(tmdb_id)
     except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
         _logger.warning(
-            "plex availability check failed for tmdb %s season %s (%s); proceeding with a request",
+            "plex season-availability crawl failed for tmdb %s (%s); proceeding with a request",
             tmdb_id,
-            season_number,
             type(exc).__name__,
         )
-        return False
+        return frozenset()
 
 
 async def ensure_seasons(
@@ -116,12 +118,13 @@ async def ensure_seasons(
     """Idempotently create every season row in ``seasons``, then recompute the rollup.
 
     Per season: when ``library`` is supplied and Plex already has that season
-    (``is_available(tv, season=n)``), the row is created straight to
-    ``available`` rather than ``pending`` -- a season already in the library
-    skips search/grab, exactly mirroring ``create_request``'s already-in-library
-    short-circuit for movies, but PER SEASON. An unconfigured/unreachable Plex (or
-    the still-partial per-episode check) is treated as "not proven available", so
-    the season is created ``pending`` and search proceeds normally.
+    (it is in the single ``present_seasons`` snapshot taken up front), the row is
+    created straight to ``available`` rather than ``pending`` -- a season already in
+    the library skips search/grab, exactly mirroring ``create_request``'s
+    already-in-library short-circuit for movies, but PER SEASON. An
+    unconfigured/unreachable Plex (or the still-partial per-episode check) is treated
+    as "not proven available", so the season is created ``pending`` and search
+    proceeds normally.
 
     ``SeasonRequestRepository.ensure`` never re-applies ``status`` to an
     already-established season, so calling this on EVERY ``create_request`` call
@@ -132,13 +135,23 @@ async def ensure_seasons(
     The parent rollup is recomputed ONCE after every season in ``seasons`` has
     been ensured, not once per season -- cheaper, and avoids persisting
     transient intermediate rollups.
+
+    Plex is crawled ONCE per call (``_present_seasons``), not once per season: the
+    per-season already-in-library decision is a membership test against that single
+    fresh snapshot, so a whole-series request never re-pages the library N times
+    inside the held write transaction.
     """
+    present: frozenset[int] = (
+        await _present_seasons(library, tmdb_id) if library is not None else frozenset()
+    )
     season_repo = SqlSeasonRequestRepository(session)
     records: list[SeasonRequestRecord] = []
     for season_number in seasons:
-        initial_status = RequestStatus.pending.value
-        if library is not None and await _already_available(library, tmdb_id, season_number):
-            initial_status = RequestStatus.available.value
+        initial_status = (
+            RequestStatus.available.value
+            if season_number in present
+            else RequestStatus.pending.value
+        )
         records.append(
             await season_repo.ensure(media_request_id, season_number, status=initial_status)
         )

@@ -273,6 +273,32 @@ async def test_is_available_tv_absent_when_show_not_in_library() -> None:
     assert await _adapter(_tv_handler).is_available(9999, "tv", season=1) is False
 
 
+async def test_present_seasons_returns_seasons_with_episodes() -> None:
+    # Show 1399 has season 0 (specials) and season 1 with episodes, season 2 empty
+    # (leafCount=0) -- present_seasons returns exactly the leafCount>0 seasons.
+    assert await _adapter(_tv_handler).present_seasons(1399) == frozenset({0, 1})
+
+
+async def test_present_seasons_empty_for_absent_show() -> None:
+    assert await _adapter(_tv_handler).present_seasons(9999) == frozenset()
+
+
+async def test_present_seasons_resolves_every_season_in_a_single_crawl() -> None:
+    # The whole point of present_seasons: ONE library crawl answers for all of a
+    # show's seasons, vs is_available(season=n) which re-pages per season.
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _tv_handler(request)
+
+    adapter = _adapter(counting, base_url="http://present-seasons-once:32400")
+    seasons = await adapter.present_seasons(1399)
+    assert seasons == frozenset({0, 1})
+    # sections (1) + the show section's /all (1) + the show's /children (1) = 3.
+    assert calls["n"] == 3
+
+
 async def test_is_available_tv_caches_presence_but_repages_absence() -> None:
     calls = {"n": 0}
 

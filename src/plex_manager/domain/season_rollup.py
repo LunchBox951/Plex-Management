@@ -26,12 +26,18 @@ __all__ = ["rollup_status"]
 # merely "pending" or "available" because its other seasons are further along (or
 # behind). Mirrors (as bare literals) ``models.RequestStatus`` members of the same
 # name; order is for readability only, membership is what is tested.
+#
+# ``completed`` is deliberately NOT here: it is a DONE state (imported, awaiting
+# Plex confirmation), and a done season must never outrank an unstarted/failed
+# sibling. If it won precedence, ``[completed, pending]`` would roll the parent up
+# to the TERMINAL ``completed`` — both lying that the whole show is finished and
+# blocking the pending season's grab (grab_endpoint gates on the parent's terminal
+# status). ``completed`` is folded into the done/partial branch below instead.
 _PRECEDENCE_STATUSES: tuple[str, ...] = (
     "import_blocked",
     "downloading",
     "searching",
     "no_acceptable_release",
-    "completed",
 )
 
 
@@ -41,14 +47,16 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
     Precedence, in order:
 
     1. Any season in :data:`_PRECEDENCE_STATUSES` (``import_blocked`` /
-       ``downloading`` / ``searching`` / ``no_acceptable_release`` /
-       ``completed``) wins outright.
+       ``downloading`` / ``searching`` / ``no_acceptable_release``) wins outright.
     2. Otherwise every remaining season is one of ``pending``/``available``/
-       ``failed``:
-       - all ``available`` -> ``"available"``
-       - ``available`` mixed with ``pending``/``failed`` ->
-         ``"partially_available"``
-       - any ``pending`` (with no ``available`` present) -> ``"pending"``
+       ``completed``/``failed``. ``available`` and ``completed`` are the two DONE
+       states (``completed`` = imported, Plex-confirmation pending):
+       - every season done, all ``available`` -> ``"available"``
+       - every season done, at least one still ``completed`` -> ``"completed"``
+       - a done season mixed with any ``pending``/``failed`` ->
+         ``"partially_available"`` (honest, and non-terminal so the unfinished
+         season stays grabbable)
+       - only ``pending``/``failed`` remain, any ``pending`` -> ``"pending"``
        - none of the above -> every season is ``failed`` -> ``"failed"``
 
     Pure and total over the season-status vocabulary: every combination of
@@ -67,10 +75,15 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         if status in statuses:
             return status
 
-    # Only pending/available/failed remain among the season statuses.
-    if statuses == {"available"}:
-        return "available"
-    if "available" in statuses:
+    # Only pending/available/completed/failed remain among the season statuses.
+    _DONE = {"available", "completed"}
+    if statuses <= _DONE:
+        # Every season is done: all confirmed -> "available"; any still awaiting
+        # Plex confirmation -> the (terminal) "completed".
+        return "available" if statuses == {"available"} else "completed"
+    if statuses & _DONE:
+        # Some seasons are done, but a pending/failed one remains: honestly partial,
+        # never a terminal status that would mask it or block its grab.
         return "partially_available"
     if "pending" in statuses:
         return "pending"

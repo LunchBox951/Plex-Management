@@ -52,6 +52,19 @@ class LibraryPort(Protocol):
         """
         raise NotImplementedError
 
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Return the season numbers already present for a show, from ONE library read.
+
+        A season is "present" when it has at least one episode indexed
+        (``leafCount>0``) — the same per-season granularity as :meth:`is_available`
+        with a ``season``. Provided ALONGSIDE ``is_available`` so a caller checking
+        many seasons of one show (``season_request_service.ensure_seasons``) pays a
+        SINGLE library crawl instead of one per season. Always reflects the library
+        as it is NOW (like ``is_available(use_cache=False)`` — never trusts a cached
+        absence); empty when the show is absent or has no indexed season.
+        """
+        raise NotImplementedError
+
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         """Ask the media server to scan ``path`` (partial-scan when supported).
 

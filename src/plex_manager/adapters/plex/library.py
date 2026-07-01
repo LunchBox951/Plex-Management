@@ -393,6 +393,23 @@ class PlexLibrary:
                 break
             start += _PAGE_SIZE
 
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """The seasons already present for ``tmdb_id`` — resolved in ONE fresh crawl.
+
+        A season is "present" when its ``leafCount>0`` (>=1 episode indexed), the
+        same per-season granularity as :meth:`is_available` with a ``season``. This
+        exists alongside ``is_available`` so ``ensure_seasons`` can resolve EVERY
+        requested season of a show from a single library read: calling
+        ``is_available(season=n, use_cache=False)`` once per season would re-page the
+        whole library N times (and hold the request's write transaction open across
+        all N). Always re-pages (never trusts a cached absence, mirroring
+        ``use_cache=False``) and refreshes the shared snapshot so a later cache read
+        stays consistent. Empty when the show is absent or has no indexed season.
+        """
+        present = await self._collect_present_tv_seasons()
+        _TV_SEASONS_CACHE.set(self._cache_key, present)
+        return present.get(tmdb_id, frozenset())
+
     async def _collect_present_tv_seasons(self) -> dict[int, frozenset[int]]:
         """Page every show section and gather each show's present seasons.
 

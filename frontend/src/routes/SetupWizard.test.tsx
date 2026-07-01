@@ -78,6 +78,35 @@ describe('SetupWizard — tv library picker', () => {
     expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
   })
 
+  it('completes a tv-only install: tv folder chosen, movies left unset', async () => {
+    // ADR-0011: a tv-only Plex is legit. The completion gate must accept a tv_root
+    // with an empty movies_root — otherwise a tv-only operator (no movie library to
+    // point at) can never finish setup.
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+
+    // Choose ONLY the tv folder; never touch the movie picker.
+    const tvSelect = await screen.findByLabelText('TV library folder')
+    fireEvent.change(tvSelect, { target: { value: '/media/tv' } })
+
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
+  })
+
+  it('disables completion until at least one library root is chosen', async () => {
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+
+    // All services verified but neither library root chosen -> still blocked.
+    await screen.findByLabelText('Movies library folder')
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeDisabled()
+  })
+
   it('shows the tv section as optional when no folder is chosen', async () => {
     render(<SetupWizard />, { wrapper: MemoryRouter })
     fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)

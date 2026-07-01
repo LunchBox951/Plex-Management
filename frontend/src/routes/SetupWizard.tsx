@@ -232,10 +232,13 @@ export function SetupWizard() {
   // `section_type` — split per-picker below.
   const movieLibraries = plexLibraries?.filter((l) => l.section_type === 'movie') ?? null
   const tvLibraries = plexLibraries?.filter((l) => l.section_type === 'tv') ?? null
-  // Completion needs a chosen MOVIE library folder (Plex-derived or override).
-  // `tv_root` is optional (ADR-0011): a movie-only install must not be forced to
-  // configure a tv library, so it is never part of this gate.
-  const allVerified = servicesVerified && form.movies_root.trim() !== ''
+  // Completion needs at least ONE library root — movies OR tv. Both roots are
+  // independently optional (ADR-0011: a movie-only OR a tv-only Plex is legit; the
+  // backend normalizes an empty root to None and surfaces a per-type ImportBlocked
+  // only for the missing kind). Forcing movies_root would lock a tv-only operator
+  // out of setup entirely — they have no movie library to point at.
+  const hasLibraryRoot = form.movies_root.trim() !== '' || (form.tv_root ?? '').trim() !== ''
+  const allVerified = servicesVerified && hasLibraryRoot
 
   const onComplete = async () => {
     try {
@@ -384,8 +387,8 @@ export function SetupWizard() {
               </button>
             ) : (
               <p className="text-xs text-faint">
-                Plex reports no movie library — enter the folder the app writes movies into (it must
-                be writable).
+                Plex reports no movie library — leave this unset if you don't request movies, or enter
+                a writable folder the app places movies into.
               </p>
             )}
           </div>

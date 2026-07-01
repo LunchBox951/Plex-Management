@@ -218,6 +218,10 @@ async def create_request(
                 seasons=season_numbers,
             )
             await session.commit()
+            # ensure_seasons recomputed + persisted the parent rollup; re-read so the
+            # returned record's top-level status matches the seasons the response will
+            # embed. ``existing`` was captured by find_active BEFORE that rollup write.
+            existing = await repo.get(existing.id) or existing
         return existing
 
     detail = await _resolve_detail(tmdb, tmdb_id, media_type)
@@ -278,6 +282,12 @@ async def create_request(
                 seasons=season_numbers,
             )
         await session.commit()
+        if media_type == "tv":
+            # ``record`` was captured at repo.create (status 'pending') before
+            # ensure_seasons recomputed the parent rollup onto the SAME row; re-read
+            # so the returned top-level status matches the seasons the response embeds
+            # (e.g. all-already-in-Plex -> 'available', a mix -> 'partially_available').
+            record = await repo.get(record.id) or record
     except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
         # race: the partial UNIQUE index over active statuses rejected this insert.
@@ -297,6 +307,9 @@ async def create_request(
                 seasons=season_numbers,
             )
             await session.commit()
+            # Re-read past the rollup ensure_seasons just persisted (``winner`` was
+            # captured before it), so the returned status matches the response's seasons.
+            winner = await repo.get(winner.id) or winner
         return winner
     if initial_status == RequestStatus.available.value:
         # Collapse the concurrent in-library race (F9). The active-dedup partial

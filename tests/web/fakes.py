@@ -273,6 +273,11 @@ class FakeLibrary:
             return True if season is None else season in seasons
         return tmdb_id in self.available_ids
 
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        # The show's present seasons in one lookup (mirrors PlexLibrary's single
+        # crawl); empty for an absent show, matching the real adapter.
+        return self.available_tv_seasons.get(tmdb_id, frozenset())
+
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         self.scanned.append(path)
         self.scan_calls.append((path, media_type))
