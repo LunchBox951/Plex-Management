@@ -149,6 +149,38 @@ async def test_create_request_collapses_racing_in_library_available_rows(
     assert rows[0].status is RequestStatus.available
 
 
+async def test_in_library_short_circuit_locks_before_terminal_dedup_lookup(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def acquire_media_lock(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        assert tmdb_id == 556
+        assert media_type == "movie"
+        calls.append("lock")
+
+    async def find_in_library(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        assert calls == ["lock"]
+        calls.append("find")
+        return None
+
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", acquire_media_lock)
+    monkeypatch.setattr(SqlRequestRepository, "find_in_library", find_in_library)
+
+    tmdb = FakeTmdb(movies={556: MovieMetadata(tmdb_id=556, title="Nope", year=2022)})
+    library = FakeLibrary(available={556})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=556, media_type="movie", library=library
+        )
+
+    assert calls == ["lock", "find"]
+    assert record.status == RequestStatus.available.value
+
+
 async def test_removed_then_reacquired_yields_a_second_available_row(
     sessionmaker_: SessionMaker,
 ) -> None:

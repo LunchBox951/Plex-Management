@@ -213,6 +213,25 @@ export function Settings() {
               >
                 <option value="">Choose a movie library folder…</option>
               </select>
+            ) : !manualPath && libraries.isError ? (
+              <StateMessage
+                tone="error"
+                title="Couldn't load Plex libraries"
+                message={
+                  (libraries.error as ApiError | undefined)?.message ??
+                  'Library folders are unavailable right now.'
+                }
+                action={
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="secondary" onClick={() => void libraries.refetch()}>
+                      Retry
+                    </Button>
+                    <Button variant="secondary" onClick={() => setManualPath(true)}>
+                      Use custom path
+                    </Button>
+                  </div>
+                }
+              />
             ) : !manualPath && libraries.data && libraries.data.length > 0 ? (
               <>
                 <select

@@ -229,6 +229,7 @@ export function useMarkFailed() {
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
       void qc.invalidateQueries({ queryKey: ['blocklist'] })
     },
   })

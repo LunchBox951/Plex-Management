@@ -1,10 +1,10 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Ten tables back the alpha pipeline: ``users``, ``settings``, ``system_settings``,
-``audit_log``, ``media_requests``, ``season_requests``, ``downloads``,
-``download_history``, ``blocklist``, ``tmdb_cache``. Column shapes, indexes, and
-``ON DELETE`` behaviour follow the persistence design (see the analysis extract's
-"Persistence + Schema Migrations" section and ADR-0007).
+Eleven tables back the alpha pipeline: ``users``, ``settings``, ``system_settings``,
+``audit_log``, ``media_requests``, ``request_dedup_locks``, ``season_requests``,
+``downloads``, ``download_history``, ``blocklist``, ``tmdb_cache``. Column shapes,
+indexes, and ``ON DELETE`` behaviour follow the persistence design (see the
+analysis extract's "Persistence + Schema Migrations" section and ADR-0007).
 
 Conventions:
 
@@ -41,6 +41,7 @@ __all__ = [
     "DownloadHistoryEvent",
     "MediaRequest",
     "MediaType",
+    "RequestDedupLock",
     "RequestStatus",
     "SeasonRequest",
     "Setting",
@@ -251,6 +252,21 @@ class MediaRequest(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RequestDedupLock(Base):
+    """Serializable lock row for per-media request decisions.
+
+    PostgreSQL's MVCC can let two concurrent transactions both miss an uncommitted
+    terminal ``available`` row. The active partial unique index intentionally
+    excludes ``available``, so in-library short-circuits need a separate row to lock
+    before checking/inserting terminal request records.
+    """
+
+    __tablename__ = "request_dedup_locks"
+
+    tmdb_id: Mapped[int] = mapped_column(primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType), primary_key=True)
 
 
 class SeasonRequest(Base):

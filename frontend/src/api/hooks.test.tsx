@@ -2,15 +2,15 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { describe, expect, it, vi, type Mock } from 'vitest'
-import { useUpdateSettings } from './hooks'
+import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { useMarkFailed, useUpdateSettings } from './hooks'
 import { client } from './client'
 import { queryKeys } from '../lib/queryClient'
-import type { SettingsResponse } from './types'
+import type { QueueItem, SettingsResponse } from './types'
 
-// No network: the typed client is replaced with a controllable PUT mock.
+// No network: the typed client is replaced with controllable mutation mocks.
 vi.mock('./client', () => ({
-  client: { PUT: vi.fn() },
+  client: { POST: vi.fn(), PUT: vi.fn() },
 }))
 
 function createWrapper(qc: QueryClient) {
@@ -18,6 +18,11 @@ function createWrapper(qc: QueryClient) {
     return <QueryClientProvider client={qc}>{children}</QueryClientProvider>
   }
 }
+
+beforeEach(() => {
+  vi.mocked(client.POST).mockReset()
+  vi.mocked(client.PUT).mockReset()
+})
 
 describe('useUpdateSettings', () => {
   it('invalidates the Plex library picker so it refetches against the just-saved connection', async () => {
@@ -40,5 +45,33 @@ describe('useUpdateSettings', () => {
     )
     // The PUT body is written straight into the settings cache (no extra GET).
     expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
+  })
+})
+
+describe('useMarkFailed', () => {
+  it('invalidates requests after rejecting a queued release', async () => {
+    const item: QueueItem = {
+      id: 7,
+      media_request_id: 4,
+      progress: 0,
+      seed_ratio: 0,
+      status: 'failed',
+      tmdb_id: 603,
+      torrent_hash: 'deadbeef',
+    }
+    ;(client.POST as unknown as Mock).mockResolvedValue({ data: item, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useMarkFailed(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({ downloadId: 7, blocklist: true })
+
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests }),
+    )
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue })
   })
 })

@@ -31,7 +31,7 @@ COPY src ./src
 # Drop the built SPA in BEFORE the install so hatchling packages it into the
 # wheel (via [tool.hatch.build.targets.wheel].artifacts) and it ships in the image.
 COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
-RUN pip install .
+RUN pip install ".[postgres]"
 
 # ---- runtime: slim image with just the venv + migration assets ----
 FROM python:3.14-slim AS runtime
