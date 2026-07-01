@@ -55,6 +55,7 @@ def _to_record(row: Download) -> DownloadRecord:
         tmdb_id=row.tmdb_id,
         year=row.year,
         season=row.season,
+        episodes=row.episodes_json,
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
         download_path=row.download_path,
@@ -72,11 +73,20 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
-    async def find_active_for_request(self, media_request_id: int) -> DownloadRecord | None:
+    async def find_active_for_request(
+        self, media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        # ``Download.season == season`` renders ``IS NULL`` when ``season`` is
+        # ``None`` (SQLAlchemy's standard ``== None`` -> ``IS NULL`` translation),
+        # so movie callers (``season=None``) keep matching only the NULL-season
+        # rows they always create -- identical to the pre-widen behaviour, since a
+        # movie never has a non-NULL ``season``. TV callers pass the season being
+        # grabbed, scoping the guard to that season only.
         stmt = (
             select(Download)
             .where(
                 Download.media_request_id == media_request_id,
+                Download.season == season,
                 Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
             )
             .order_by(Download.id)
@@ -103,6 +113,7 @@ class SqlDownloadRepository:
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        episodes: list[int] | None = None,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -112,6 +123,7 @@ class SqlDownloadRepository:
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            episodes_json=episodes,
         )
         self._session.add(row)
         await self._session.flush()

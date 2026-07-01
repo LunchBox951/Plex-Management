@@ -75,6 +75,71 @@ async def test_concurrent_tv_downloads_for_different_seasons_do_not_collide(
         )
 
 
+async def test_find_active_for_request_scopes_by_season(session: AsyncSession) -> None:
+    """The widened parallel-grab guard filters PER SEASON: a whole-series TV
+    request with season 1 and season 2 both downloading must see EACH season's
+    OWN active download, never the other's."""
+    mr = MediaRequest(
+        tmdb_id=4, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    await repo.create(torrent_hash="s1", status="downloading", media_request_id=mr.id, season=1)
+    await repo.create(torrent_hash="s2", status="downloading", media_request_id=mr.id, season=2)
+
+    s1_active = await repo.find_active_for_request(mr.id, season=1)
+    assert s1_active is not None
+    assert s1_active.torrent_hash == "s1"
+
+    s2_active = await repo.find_active_for_request(mr.id, season=2)
+    assert s2_active is not None
+    assert s2_active.torrent_hash == "s2"
+
+    # A season with no active download of its own finds nothing, even though the
+    # request has active downloads for OTHER seasons.
+    assert await repo.find_active_for_request(mr.id, season=3) is None
+
+
+async def test_find_active_for_request_default_season_matches_movie_null_season(
+    session: AsyncSession,
+) -> None:
+    """The default ``season=None`` renders ``IS NULL`` -- the movie call sites that
+    never pass ``season`` keep matching their (always NULL-season) rows exactly as
+    before this method was widened."""
+    mr = MediaRequest(
+        tmdb_id=5, media_type=MediaType.movie, title="Movie", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    await repo.create(torrent_hash="movie_active", status="downloading", media_request_id=mr.id)
+
+    active = await repo.find_active_for_request(mr.id)
+    assert active is not None
+    assert active.torrent_hash == "movie_active"
+
+
+async def test_create_stores_and_round_trips_episodes_json(session: AsyncSession) -> None:
+    """``episodes`` (TV only) persists to ``Download.episodes_json`` and round-trips
+    through the repository -- ``None`` means "import every valid file found"; an
+    explicit list scopes the import to those episode numbers."""
+    repo = SqlDownloadRepository(session)
+    whole_season = await repo.create(
+        torrent_hash="pack", status="downloading", season=1, episodes=None
+    )
+    assert whole_season.episodes is None
+
+    scoped = await repo.create(
+        torrent_hash="scoped", status="downloading", season=1, episodes=[4, 5, 6]
+    )
+    assert scoped.episodes == [4, 5, 6]
+
+    fetched = await repo.get_by_hash("scoped")
+    assert fetched is not None
+    assert fetched.episodes == [4, 5, 6]
+
+
 async def test_create_then_get_by_hash(session: AsyncSession) -> None:
     repo = SqlDownloadRepository(session)
     created = await repo.create(

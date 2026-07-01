@@ -16,6 +16,7 @@ import contextlib
 import errno
 import os
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
@@ -40,6 +41,61 @@ _EXTRAS_DIR_NAMES: frozenset[str] = frozenset(
 def _is_within(root_real: str, candidate_real: str) -> bool:
     """True if ``candidate_real`` is ``root_real`` or sits under it (both realpaths)."""
     return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
+
+
+def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
+    """Walk directory ``root``, yielding every eligible video file: ``(abs, size, rel)``.
+
+    Shared by :meth:`LocalFileSystem.largest_video_file` (directory case) and
+    :meth:`LocalFileSystem.list_video_files` -- the symlink/mount containment
+    checks and the extras/sample pruning are identical for both callers. ``abs``
+    is the realpath-resolved file (the actual bytes an import copies); ``rel`` is
+    the LITERAL (unresolved) path relative to ``root``, preserving the download's
+    own directory names (e.g. ``"Season 01/Show.S01E01.mkv"``) for token parsing.
+    Yields nothing when ``root`` itself is a symlink escaping its own parent
+    directory, or when ``root`` does not exist / is not a directory.
+    """
+    root_path = Path(root)
+    # Containment anchor: a symlink (or nested mount) inside the download tree
+    # must never let a yielded file resolve OUTSIDE it, or the importer would
+    # copy an arbitrary file (e.g. /etc/passwd) into the public library.
+    root_real = os.path.realpath(root)
+    # Reject a content root that is ITSELF a symlink escaping its own parent
+    # directory (e.g. /downloads/release -> /etc): root_real would become the
+    # symlink target and every file beneath it would spuriously satisfy the
+    # per-file containment check below, copying arbitrary files into the public
+    # library. A legitimately symlinked *parent* (e.g. /downloads -> /mnt/store)
+    # is unaffected, because realpath(parent) still contains root_real. At the
+    # filesystem root the parent check is vacuous (everything is under it), so
+    # skip it there rather than spuriously rejecting a top-level download dir.
+    parent_real = os.path.realpath(root_path.parent)
+    if parent_real != os.sep and not _is_within(parent_real, root_real):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune extras / sample directories in place so os.walk skips them.
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name.lower() not in _EXTRAS_DIR_NAMES and "sample" not in name.lower()
+        ]
+        for filename in filenames:
+            if "sample" in filename.lower():
+                continue
+            if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            literal_path = Path(dirpath) / filename
+            candidate = os.path.realpath(literal_path)
+            if not _is_within(root_real, candidate):
+                # Symlink (or mount) escaping the download tree — skip honestly.
+                continue
+            try:
+                size = os.path.getsize(candidate)
+            except OSError:
+                # A broken symlink or vanished file: skip it honestly rather
+                # than letting it abort the whole scan.
+                continue
+            rel = os.path.relpath(literal_path, root)
+            yield candidate, size, rel
 
 
 class LocalFileSystem:
@@ -136,46 +192,24 @@ class LocalFileSystem:
                 return resolved
             return None
 
-        # Containment anchor: a symlink (or nested mount) inside the download tree
-        # must never let the chosen source resolve OUTSIDE it, or the importer would
-        # copy an arbitrary file (e.g. /etc/passwd) into the public library.
-        root_real = os.path.realpath(root)
-        # Reject a content root that is ITSELF a symlink escaping its own parent
-        # directory (e.g. /downloads/release -> /etc): root_real would become the
-        # symlink target and every file beneath it would spuriously satisfy the
-        # per-file containment check below, copying arbitrary files into the public
-        # library. A legitimately symlinked *parent* (e.g. /downloads -> /mnt/store)
-        # is unaffected, because realpath(parent) still contains root_real. At the
-        # filesystem root the parent check is vacuous (everything is under it), so
-        # skip it there rather than spuriously rejecting a top-level download dir.
-        parent_real = os.path.realpath(root_path.parent)
-        if parent_real != os.sep and not _is_within(parent_real, root_real):
-            return None
         best_path: str | None = None
         best_size = -1
-        for dirpath, dirnames, filenames in os.walk(root):
-            # Prune extras / sample directories in place so os.walk skips them.
-            dirnames[:] = [
-                name
-                for name in dirnames
-                if name.lower() not in _EXTRAS_DIR_NAMES and "sample" not in name.lower()
-            ]
-            for filename in filenames:
-                if "sample" in filename.lower():
-                    continue
-                if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
-                    continue
-                candidate = os.path.realpath(Path(dirpath) / filename)
-                if not _is_within(root_real, candidate):
-                    # Symlink (or mount) escaping the download tree — skip honestly.
-                    continue
-                try:
-                    size = os.path.getsize(candidate)
-                except OSError:
-                    # A broken symlink or vanished file: skip it honestly rather
-                    # than letting it abort the whole scan.
-                    continue
-                if size > best_size:
-                    best_size = size
-                    best_path = candidate
+        for candidate, size, _rel in _iter_video_files(root):
+            if size > best_size:
+                best_size = size
+                best_path = candidate
         return best_path
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        """Return every eligible video file under ``root``, for TV imports.
+
+        Each entry is ``(absolute_path, size_bytes, relative_path)``, where
+        ``relative_path`` is folder-qualified relative to ``root`` (e.g.
+        ``"Season 01/Show.S01E01.mkv"``) -- needed to parse the season/episode out
+        of a season-pack's directory structure, not just the filename. Sample
+        files and extras folders are skipped, mirroring
+        :meth:`largest_video_file`. Returns an empty list when no eligible video is
+        found. Unlike :meth:`largest_video_file`, ``root`` being itself a single
+        video file is not handled here -- a TV import always walks a directory.
+        """
+        return list(_iter_video_files(root))

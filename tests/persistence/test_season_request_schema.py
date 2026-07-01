@@ -1,8 +1,10 @@
 """``uq_season_requests_media_season`` — the per-(show, season) uniqueness backstop.
 
-No ``SeasonRequestRepository`` exists yet (a later build phase), so this pins the
-DB-level constraint directly via the ORM, the same way ``test_fk_enforcement.py``
-pins FK behaviour directly rather than through a repository.
+Pins the DB-level constraint directly via the ORM, the same way
+``test_fk_enforcement.py`` pins FK behaviour directly rather than through a
+repository. ``SqlSeasonRequestRepository`` (which relies on this same index to
+make ``ensure()`` race-safe) is exercised separately in
+``test_season_request_repository.py``.
 """
 
 from __future__ import annotations

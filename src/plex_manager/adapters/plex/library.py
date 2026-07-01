@@ -289,12 +289,18 @@ class PlexLibrary:
         return sections
 
     async def is_available(
-        self, tmdb_id: int, media_type: Literal["movie", "tv"], *, use_cache: bool = True
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        use_cache: bool = True,
+        season: int | None = None,
     ) -> bool:
         """Whether ``tmdb_id`` is already present in the library.
 
-        TV availability needs per-season presence logic and is deferred — it raises
-        honestly rather than returning a misleading ``False``.
+        TV availability (including the per-``season`` scoped lookup) needs
+        per-season presence logic and is deferred — it raises honestly rather than
+        returning a misleading ``False``.
 
         The availability reconcile cycle keeps the cached-presence fast path
         (``use_cache=True``); the request-dedup path passes ``use_cache=False`` so a
@@ -346,23 +352,31 @@ class PlexLibrary:
                 break
             start += _PAGE_SIZE
 
-    async def trigger_scan(self, path: str) -> None:
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         """Ask Plex to scan ``path`` (a targeted partial-scan on the owning section).
 
-        The movie section whose location is a parent of ``path`` gets a partial
-        refresh of just that path. If NO section covers it (a path-mapping
-        difference between the app and Plex, or Plex didn't report locations), we
-        do a real FULL refresh of each movie section instead — heavier, but it
-        actually indexes the new file, unlike refreshing with a path Plex does not
-        own (a silent no-op that would strand the request at "Finalizing"). With no
-        movie section at all, raise so the import blocks honestly. A 2xx (possibly
-        empty body) is success. After scanning, the presence cache is invalidated so
-        the availability check re-pages Plex instead of returning a pre-import snapshot.
+        ``media_type`` scopes the candidate sections to movie sections for movies
+        and show sections for TV, so a TV season folder is never matched against a
+        movie section (or vice versa). TV scanning is otherwise deferred — the
+        section-scoping is honored now so the guard is in place before the TV import
+        path lands.
+
+        The section whose location is a parent of ``path`` gets a partial refresh
+        of just that path. If NO section covers it (a path-mapping difference
+        between the app and Plex, or Plex didn't report locations), we do a real
+        FULL refresh of each candidate section instead — heavier, but it actually
+        indexes the new file, unlike refreshing with a path Plex does not own (a
+        silent no-op that would strand the request at "Finalizing"). With no
+        candidate section at all, raise so the import blocks honestly. A 2xx
+        (possibly empty body) is success. After scanning, the presence cache is
+        invalidated so the availability check re-pages Plex instead of returning a
+        pre-import snapshot.
         """
-        movie_sections = [s for s in await self.list_sections() if s.type == "movie"]
-        if not movie_sections:
-            raise PlexLibraryError("no Plex movie library section to scan into")
-        matched = [s for s in movie_sections if _section_covers(s, path)]
+        section_type: Literal["movie", "show"] = "movie" if media_type == "movie" else "show"
+        candidate_sections = [s for s in await self.list_sections() if s.type == section_type]
+        if not candidate_sections:
+            raise PlexLibraryError(f"no Plex {section_type} library section to scan into")
+        matched = [s for s in candidate_sections if _section_covers(s, path)]
         try:
             if matched:
                 # The raw path is handed to httpx as a query param so it is
@@ -371,10 +385,12 @@ class PlexLibrary:
                     await self._request(f"/library/sections/{section.key}/refresh", {"path": path})
             else:
                 _logger.warning(
-                    "import path is not under any Plex movie section location; "
-                    "full-scanning every movie section instead of a no-op partial scan"
+                    "import path is not under any Plex %s section location; "
+                    "full-scanning every %s section instead of a no-op partial scan",
+                    section_type,
+                    section_type,
                 )
-                for section in movie_sections:
+                for section in candidate_sections:
                     await self._request(f"/library/sections/{section.key}/refresh", {})
         finally:
             # Bust the per-credential presence index so completed -> available

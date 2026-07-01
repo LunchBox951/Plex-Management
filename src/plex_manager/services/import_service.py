@@ -419,7 +419,7 @@ async def _import_download_locked(
     # left intact. Clear the breadcrumb on rollback so the deleted path can't shadow
     # the torrent's content on a later retry.
     try:
-        await library.trigger_scan(str(dst.parent))
+        await library.trigger_scan(str(dst.parent), "movie")
     except (PlexLibraryError, PlexAuthError) as exc:
         # ``row.download_path`` is read live here (the breadcrumb commit set it for a
         # placed=True attempt; a crash-resume loaded it as dst). Safe only because the

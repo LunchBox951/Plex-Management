@@ -60,3 +60,18 @@ class FileSystemPort(Protocol):
         returned.
         """
         raise NotImplementedError
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        """Return every eligible video file under ``root``, for TV imports.
+
+        Each entry is ``(absolute_path, size_bytes, relative_path)``, where
+        ``relative_path`` is folder-qualified relative to ``root`` (e.g.
+        ``"Season 01/Show.S01E01.mkv"``) -- needed to parse the season/episode
+        out of a season-pack's directory structure, not just the filename.
+        Sample files and extras folders are skipped, mirroring
+        :meth:`largest_video_file`. Returns an empty list when no eligible video is
+        found. Unlike :meth:`largest_video_file`, ``root`` being itself a single
+        video file is not a case this method handles -- a TV import always walks a
+        directory (a season pack or a whole-show download).
+        """
+        raise NotImplementedError
