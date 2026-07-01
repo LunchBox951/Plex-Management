@@ -168,6 +168,26 @@ async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
         return False
 
 
+async def _present_seasons_or_empty(library: LibraryPort, tmdb_id: int) -> frozenset[int]:
+    """Best-effort per-season Plex presence; an error is an explicit, logged empty set.
+
+    The TV analogue of :func:`_already_in_library`: ONE fresh crawl (never a stale
+    cache) yields the seasons already in Plex so an all-present re-request can dedup
+    to the existing in-library record. A transient outage / deferred check must not
+    block a request, so a failure is logged and treated as "prove nothing present"
+    (fall through to a normal tracked request), not a swallowed empty set.
+    """
+    try:
+        return await library.present_seasons(tmdb_id)
+    except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
+        _logger.warning(
+            "plex season-presence check failed for tmdb %s (%s); proceeding with a request",
+            tmdb_id,
+            type(exc).__name__,
+        )
+        return frozenset()
+
+
 async def create_request(
     session: AsyncSession,
     tmdb: MetadataPort,
@@ -252,6 +272,30 @@ async def create_request(
         if in_library is not None:
             return in_library
         initial_status = RequestStatus.available.value
+
+    if media_type == "tv" and library is not None and season_numbers:
+        # TV in-library dedup — the per-season analogue of the movie short-circuit
+        # above. When EVERY requested season is already in Plex AND an
+        # available/completed request for this show already exists, return it
+        # (tracking any of these seasons it doesn't already list) instead of
+        # inserting a duplicate terminal 'available' MediaRequest + season rows: the
+        # active-dedup partial index excludes terminal 'available'/'completed', and
+        # the movie collapse below is movie-only, so nothing else would catch the
+        # duplicate. A show with a NEW (not-yet-present) season falls through to a
+        # normal tracked request so the missing season is still searched/grabbed.
+        present = await _present_seasons_or_empty(library, tmdb_id)
+        if present.issuperset(season_numbers):
+            in_library = await repo.find_in_library(tmdb_id, media_type)
+            if in_library is not None:
+                await season_request_service.ensure_seasons(
+                    session,
+                    library,
+                    media_request_id=in_library.id,
+                    tmdb_id=tmdb_id,
+                    seasons=season_numbers,
+                )
+                await session.commit()
+                return await repo.get(in_library.id) or in_library
     try:
         record = await repo.create(
             tmdb_id=tmdb_id,

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_CATEGORY",
     "AlreadyDownloadingError",
+    "DownloadScopeConflictError",
     "GrabError",
     "NoGrabSourceError",
     "RequestNotActiveError",
@@ -138,6 +139,32 @@ class SeasonRequiredError(Exception):
     def __init__(self, request_id: int) -> None:
         self.request_id = request_id
         super().__init__(f"request {request_id} is tv and requires a season to grab")
+
+
+class DownloadScopeConflictError(Exception):
+    """The same torrent is already active for a DIFFERENT season — refuse the reuse.
+
+    Surfaced (HTTP 409 ``download_scope_conflict``), never a silent no-op. A
+    ``Download.torrent_hash`` is UNIQUE (one physical torrent = one row with one
+    ``season``), so an already-active MULTI-season pack grabbed for a second season
+    cannot be tracked as a second row. Without this guard the known-hash precheck
+    returned the FIRST season's row as an idempotent no-op: the second season was
+    never marked ``downloading`` and the import only ever processed the first
+    season, silently stranding the rest. Honesty over silence: tell the operator
+    the torrent is already downloading for another season (representing one download
+    that satisfies many seasons is a tracked follow-up, not this row's job).
+    """
+
+    def __init__(
+        self, torrent_hash: str, active_season: int | None, requested_season: int | None
+    ) -> None:
+        self.torrent_hash = torrent_hash
+        self.active_season = active_season
+        self.requested_season = requested_season
+        super().__init__(
+            f"torrent {torrent_hash} is already active for season {active_season}; "
+            f"cannot re-track it for season {requested_season}"
+        )
 
 
 async def _reuse_terminal_row(
@@ -272,6 +299,13 @@ async def grab(
     if known_hash is not None:
         pre = await download_repo.get_by_hash(known_hash)
         if pre is not None and pre.status not in _TERMINAL_STATUS_VALUES:
+            # Idempotent only when the SCOPE matches. The same physical torrent
+            # active for a DIFFERENT season (a multi-season pack re-grabbed per
+            # season) must not be returned as a no-op -- that leaves the new season
+            # untracked (see DownloadScopeConflictError). A movie (both None) or the
+            # same season returns the row unchanged.
+            if pre.season != season:
+                raise DownloadScopeConflictError(known_hash, pre.season, season)
             return pre
 
     # Parallel-grab guard: if this request already has an active (non-terminal)
@@ -296,6 +330,11 @@ async def grab(
 
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
+        # Same scope-match guard as the known-hash precheck, for the case the indexer
+        # gave no hash so this is the first time we see the real one from qbt.add.
+        # Re-adding the same magnet is a qBittorrent no-op, so nothing is orphaned.
+        if existing.season != season:
+            raise DownloadScopeConflictError(torrent_hash, existing.season, season)
         return existing
 
     if existing is not None:

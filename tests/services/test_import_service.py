@@ -1033,6 +1033,33 @@ async def test_import_tv_blocks_the_whole_season_when_every_file_is_rejected(
     assert request.status is RequestStatus.import_blocked
 
 
+async def test_import_tv_episode_scoped_grab_blocks_when_incomplete(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """A grab scoped to episodes [4, 5] whose download only contains E04 must NOT be
+    finalized as a completed season with E05 silently missing (no retry). It is an
+    honest, retryable ImportBlocked, and NOTHING is placed -- a scoped grab is never
+    half-imported."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02E04.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E04.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2, episodes=[4, 5])
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None and "incomplete" in record.failed_reason
+    assert not any(tv_root.iterdir())  # E04 was NOT placed -- no half-import
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
 async def test_import_tv_dedupes_two_files_for_the_same_episode_keeping_the_largest(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

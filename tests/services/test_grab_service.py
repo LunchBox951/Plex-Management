@@ -14,6 +14,7 @@ from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
 from plex_manager.services import grab_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
+    DownloadScopeConflictError,
     GrabError,
     RequestNotActiveError,
     SeasonRequiredError,
@@ -408,6 +409,49 @@ async def test_grab_rejects_a_second_release_for_the_same_season(
                 tmdb_id=900,
                 season=1,
             )
+
+
+async def test_grab_rejects_same_hash_active_for_a_different_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A multi-season pack (one hash) already downloading for season 1, grabbed again
+    for season 2, must NOT be returned as an idempotent no-op: the hash is UNIQUE per
+    Download row, so season 2 would never be tracked. Reject with
+    DownloadScopeConflictError instead of silently stranding season 2."""
+    request_id = await _make_tv_request(sessionmaker_)
+    pack_hash = "7" * 40
+
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(pack_hash, "Some.Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+    assert first.season == 1
+
+    async with sessionmaker_() as session:
+        with pytest.raises(DownloadScopeConflictError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv(pack_hash, "Some.Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+            )
+
+    # Season 1's row is untouched and remains the only download for this hash.
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.torrent_hash == pack_hash)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].season == 1
 
 
 async def test_grab_tv_request_missing_season_raises_season_required(

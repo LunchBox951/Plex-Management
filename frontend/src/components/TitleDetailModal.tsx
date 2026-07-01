@@ -133,6 +133,23 @@ function isGrabbableStatus(status: string): boolean {
   return status !== 'available' && status !== 'completed' && status !== 'failed'
 }
 
+/**
+ * Whether the Grab button should be live for the SELECTED season (or, for a movie,
+ * the request itself). A season is grabbable when its own status is non-terminal —
+ * OR when it is `failed` but the PARENT request is still non-terminal. The backend
+ * gates /queue/grab on the parent, so a failed season under an active (e.g.
+ * `partially_available`) show can be re-searched from the UI; without this it would
+ * dead-end into "Request again", which dedups straight back to the same failed
+ * season (an active show is never re-created), leaving the user unable to retry it.
+ * A movie (`season == null` → `seasonStatusFor` returns `request.status`) never
+ * enters the failed branch: its failed status equals the parent's terminal one.
+ */
+function isSeasonGrabbable(request: RequestResponse, season: number | null): boolean {
+  const seasonStatus = seasonStatusFor(request, season)
+  if (isGrabbableStatus(seasonStatus)) return true
+  return season != null && seasonStatus === 'failed' && isGrabbableStatus(request.status)
+}
+
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
 const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'error' }
 
@@ -237,8 +254,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // For tv this is judged against the SELECTED season's own status, never the
   // show-level rollup (`seasonStatusFor`) — `currentSeason` is `null` for a movie,
   // so this is byte-identical to the movie-only check it replaces.
-  const liveRequestGrabbable =
-    liveRequest != null && isGrabbableStatus(seasonStatusFor(liveRequest, currentSeason))
+  const liveRequestGrabbable = liveRequest != null && isSeasonGrabbable(liveRequest, currentSeason)
   // Prefer the just-created request (it shows before the next poll lands), but only
   // while it is grabbable AND the live request (once the poll has landed) has not since
   // gone terminal; otherwise fall through to the live request, itself gated on a
@@ -339,7 +355,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       // request) must not arm Grab — gate on the returned status, not just the id.
       // For tv this is the SELECTED (resolved) season's own status (`created.seasons`
       // is now populated), never the show-level rollup.
-      setCreatedGrabbable(isGrabbableStatus(seasonStatusFor(created, resolvedSeason)))
+      setCreatedGrabbable(isSeasonGrabbable(created, resolvedSeason))
       toast({ title: `Requested ${titleName}`, intent: 'success' })
       await runPreview(created.id, resolvedSeason)
     } catch (error) {

@@ -274,6 +274,57 @@ describe('TitleDetailModal — tv season selector', () => {
     )
   })
 
+  it('keeps a failed TV season grabbable under an active (partially_available) show', async () => {
+    // S1 available + S2 failed rolls up to partially_available (non-terminal), so the
+    // backend would accept a re-grab of S2. The modal must ARM Grab for the failed
+    // season, not dead-end into "Request again" (which dedups back to the same failed
+    // season on an active show). Before the fix, failed -> Grab disabled.
+    const created: RequestResponse = {
+      id: 15,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'partially_available',
+      is_anime: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'failed' },
+      ],
+    }
+    const release = {
+      guid: 'g3',
+      indexer: 'Indexer A',
+      quality_name: 'WEBDL-1080p',
+      resolution: '1080p',
+      score: 1000,
+      source: 'WEBDL',
+      title: 'Test.Show.S02.1080p.WEB-DL',
+      seeders: 10,
+      info_hash: 'hash3',
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(
+      mutation({
+        accepted: [release],
+        rejected: [],
+        no_acceptable_release: false,
+      } satisfies SearchPreviewResponse),
+    )
+    ;(useGrab as unknown as Mock).mockReturnValue(mutation(undefined))
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+    fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
+    fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+
+    const grab = await screen.findByRole('button', { name: /grab/i })
+    expect(grab).toBeEnabled()
+  })
+
   it('previews and arms Grab against the season the create RESOLVED to, not the click-time default (whole-series request, season 1 already in the library)', async () => {
     // "Whole series" stays checked (the default) — no season exists to pick before
     // the request is created, so the click-time default is season 1. The create

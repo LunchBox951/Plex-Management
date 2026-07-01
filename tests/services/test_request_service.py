@@ -328,6 +328,41 @@ async def test_create_request_tv_second_post_with_new_seasons_grows_the_tracked_
     assert await _season_numbers(sessionmaker_, first.id) == {1, 2}
 
 
+async def test_create_request_tv_all_seasons_in_library_dedups_to_existing(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A repeat request for a TV show whose requested seasons are ALL already in
+    Plex returns the existing in-library record instead of inserting a duplicate
+    terminal 'available' MediaRequest -- the active-dedup index excludes 'available',
+    and the movie in-library collapse is movie-only, so nothing else would catch it."""
+    tmdb = FakeTmdb(
+        shows={5010: TvMetadata(tmdb_id=5010, title="Done Show", year=2020, season_count=3)}
+    )
+    library = FakeLibrary(available_tv_seasons={5010: frozenset({1, 2})})
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5010, media_type="tv", seasons=[1, 2], library=library
+        )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, first.id)
+        assert row is not None and row.status is RequestStatus.available
+
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(
+            session, tmdb, tmdb_id=5010, media_type="tv", seasons=[1, 2], library=library
+        )
+    assert second.id == first.id  # deduped to the existing available record
+    assert second.status == RequestStatus.available.value  # the DTO status is a plain string
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 5010)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # no duplicate available MediaRequest
+
+
 async def test_create_request_tv_whole_series_with_zero_aired_seasons_raises(
     sessionmaker_: SessionMaker,
 ) -> None:

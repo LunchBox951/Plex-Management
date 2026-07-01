@@ -743,6 +743,29 @@ async def _import_tv_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
+    # Episode-SCOPED completeness gate. When the grab named specific episodes
+    # (``episodes`` is a concrete list, not a whole-season ``None``), finalizing on a
+    # PARTIAL set would place those files and mark the season completed/available
+    # while a REQUESTED episode is still missing -- with no retry, a dishonest
+    # "done". Require the union of accepted episodes to COVER every requested
+    # episode; otherwise block honestly as a retryable ``ImportBlocked`` (never
+    # place a partial set), so the operator can re-search for a release carrying the
+    # rest. A whole-season grab (``episodes`` falsy) imposes no coverage requirement.
+    if episodes:
+        accepted_episodes = {ep for result in validation.accepted for ep in result.episodes}
+        missing = sorted(set(episodes) - accepted_episodes)
+        if missing:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"episode-scoped grab is incomplete: requested {sorted(set(episodes))}, "
+                f"missing {missing} (accepted {sorted(accepted_episodes)})",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
     # Multiple accepted files can resolve to the SAME destination -- e.g. an
     # episode alongside its PROPER/REPACK, or a mixed-resolution pack shipping the
     # same episode twice (identical episode number(s) AND extension). Collapse to

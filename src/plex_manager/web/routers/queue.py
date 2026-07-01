@@ -25,6 +25,7 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
+    DownloadScopeConflictError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
@@ -228,6 +229,13 @@ async def grab_endpoint(
         # refuse the parallel grab instead of spawning a second active row.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
+        ) from exc
+    except DownloadScopeConflictError as exc:
+        # The same physical torrent is already downloading for a DIFFERENT season
+        # (a multi-season pack re-grabbed per season). Refused honestly rather than
+        # returned as a no-op that would leave this season untracked.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="download_scope_conflict"
         ) from exc
     except GrabError as exc:
         # qBittorrent took the grab but no real info-hash could be determined;
