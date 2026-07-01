@@ -65,6 +65,24 @@ def test_hardlink_or_copy_falls_back_to_copy(
     assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
 
 
+def test_hardlink_or_copy_falls_back_when_all_hardlinks_are_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "copied.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert src.exists()
+    assert dst.read_text() == "payload"
+    assert src.stat().st_ino != dst.stat().st_ino
+
+
 def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -16,8 +16,8 @@ import contextlib
 import errno
 import os
 import shutil
-from collections.abc import Iterable, Iterator
 import tempfile
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
@@ -51,6 +51,20 @@ class LocalFileSystemError(RuntimeError):
     guard, which is to make it structurally impossible for eviction to delete
     anything outside a configured library root.
     """
+
+
+def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
+    """Publish a complete temp copy under a per-destination lock."""
+    lock_path = dst.parent / f".{dst.name}.publish.lock"
+    lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        if dst.exists():
+            raise FileExistsError(os.fspath(dst))
+        os.replace(tmp_path, os.fspath(dst))
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            os.unlink(lock_path)
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -197,9 +211,8 @@ class LocalFileSystem:
                         f"copy of {src.name} is incomplete: expected {src_size} bytes, "
                         f"wrote {copied_size}; partial destination removed"
                     )
-                # Atomic no-overwrite publish: linking a temp file into place either
-                # creates dst whole or raises FileExistsError if another writer won.
-                os.link(tmp_path, os.fspath(dst))
+                _publish_temp_no_overwrite(tmp_path, dst)
+                tmp_path = None
             except OSError:
                 # The copy target is a temp file in dst.parent, never the final path,
                 # so a process crash cannot leave a partial library file that blocks
@@ -210,8 +223,9 @@ class LocalFileSystem:
                         os.unlink(tmp_path)
                 raise
             else:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
+                if tmp_path is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_path)
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.

@@ -277,18 +277,33 @@ async def mark_failed(
     if current.value in _TERMINAL_STATUS_VALUES:
         raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
 
+    async def _raise_current_transition() -> None:
+        await session.rollback()
+        latest = await session.get(Download, download_id, populate_existing=True)
+        actual = latest.status if latest is not None else current.value
+        raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
+
     # Route through FailedPending when the legal graph requires it (e.g. an
     # actively Downloading torrent cannot jump straight to Failed).
     if not is_legal_transition(current, DownloadState.Failed):
         if not is_legal_transition(current, DownloadState.FailedPending):
             raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
-        await download_repo.update_status(download_id, DownloadState.FailedPending.value)
+        pending = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.FailedPending.value,
+            frozenset({current.value}),
+        )
+        if not pending:
+            await _raise_current_transition()
 
-    await download_repo.update_status(
+    failed = await download_repo.update_status_if_in(
         download_id,
         DownloadState.Failed.value,
+        frozenset({DownloadState.FailedPending.value}),
         failed_reason="marked failed by operator",
     )
+    if not failed:
+        await _raise_current_transition()
 
     if blocklist:
         source_title = await _source_title_for(session, row.torrent_hash) or row.torrent_hash

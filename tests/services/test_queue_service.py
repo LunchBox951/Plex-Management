@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,6 +20,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import queue_service
 from tests.web.fakes import FakeQbittorrent
 
@@ -212,6 +214,52 @@ async def test_mark_failed_routes_import_pending_through_failed_pending(
     assert len(blocklist) == 1
     assert blocklist[0].torrent_hash == _HASH
     assert blocklist[0].media_type is None
+
+
+async def test_mark_failed_does_not_overwrite_importing_claim_from_stale_session(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="import_pending",
+            media_request_id=request.id,
+            tmdb_id=603,
+        )
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+
+    async with sessionmaker_() as stale_session:
+        stale = await stale_session.get(Download, download_id)
+        assert stale is not None and stale.status == "import_pending"
+
+        async with sessionmaker_() as importer_session:
+            claimed = await SqlDownloadRepository(importer_session).update_status_if_in(
+                download_id,
+                "importing",
+                frozenset({"import_pending"}),
+            )
+            assert claimed is True
+            await importer_session.commit()
+
+        with pytest.raises(queue_service.InvalidStateTransitionError):
+            await queue_service.mark_failed(stale_session, download_id=download_id, blocklist=True)
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert row is not None and row.status == "importing"
+    assert row.failed_reason is None
+    assert blocklist == []
 
 
 async def test_mark_failed_without_blocklist_rearms_request(
