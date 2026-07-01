@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import CursorResult, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
@@ -213,6 +213,7 @@ async def complete(
 
 @router.get("/status")
 async def status(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SetupStatusResponse:
     """Report install state only — never the app api key.
@@ -227,5 +228,5 @@ async def status(
     return SetupStatusResponse(
         initialized=initialized,
         app_api_key=None,
-        setup_token_required=not initialized and is_setup_token_required(),
+        setup_token_required=not initialized and is_setup_token_required(request),
     )

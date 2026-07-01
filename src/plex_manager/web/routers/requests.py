@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.ports.library import LibraryPort
@@ -42,7 +42,8 @@ router = APIRouter(
     dependencies=[Depends(require_api_key)],
 )
 
-_MEDIA_TYPE_DEFERRED_RESPONSES: dict[int | str, dict[str, Any]] = {
+_CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {"model": RequestResponse, "description": "Existing matching request"},
     409: {"description": "Media type deferred"},
 }
 
@@ -92,10 +93,11 @@ async def _to_response(
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    responses=_MEDIA_TYPE_DEFERRED_RESPONSES,
+    responses=_CREATE_REQUEST_RESPONSES,
 )
 async def create_request_endpoint(
     body: CreateRequestBody,
+    response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
@@ -110,7 +112,7 @@ async def create_request_endpoint(
     with a NEW season list grows the tracked set rather than being dropped.
     """
     try:
-        record = await request_service.create_request(
+        result = await request_service.create_request_result(
             session,
             tmdb,
             tmdb_id=body.tmdb_id,
@@ -136,7 +138,9 @@ async def create_request_endpoint(
             status_code=status.HTTP_409_CONFLICT,
             detail="media_type_deferred",
         ) from exc
-    return await _to_response(session, record)
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return await _to_response(session, result.record)
 
 
 @router.get("")

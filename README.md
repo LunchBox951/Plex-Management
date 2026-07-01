@@ -91,12 +91,13 @@ untouched by updates. See
 
 ## Developing
 
-Requires Python 3.12+.
+Requires Python 3.12+ and Node.js 22+ with npm.
 
 ```bash
 make install   # editable install + dev tools + pre-commit
+make ui-install # install frontend dependencies
 make migrate   # apply Alembic migrations (creates ./data and the schema)
-make check     # ruff (lint+format), pyright --strict, pytest
+make check     # backend + frontend lint, typecheck, tests, and build
 make run       # http://localhost:8000  (/health to verify, /docs for the API)
 make openapi   # regenerate docs/api/openapi.json from the live app
 ```
@@ -106,7 +107,8 @@ Project layout and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Tech stack
 
 Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) + Alembic · `httpx` ·
-`guessit` (release parsing) · pyright (strict) · ruff · pytest · Docker / GHCR.
+`guessit` (release parsing) · React · TanStack Query · Vite · pyright (strict) ·
+ruff · pytest · Docker / GHCR.
 See [ADR-0002](docs/adr/0002-python-typed-stack.md) and
 [ADR-0008](docs/adr/0008-release-parser-guessit.md).
 

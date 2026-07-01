@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { useEvict, useMarkFailed, useUpdateSettings } from './hooks'
 import { client } from './client'
 import { queryKeys } from '../lib/queryClient'
-import type { EvictResponse, QueueItem, SettingsResponse } from './types'
+import type { EvictResponse, PlexLibraryOption, QueueItem, SettingsResponse } from './types'
 
 vi.mock('./client', () => ({
   client: { POST: vi.fn(), PUT: vi.fn() },
@@ -24,17 +24,49 @@ beforeEach(() => {
 })
 
 describe('useUpdateSettings', () => {
-  it('invalidates the Plex library picker so it refetches against the just-saved connection', async () => {
+  it('removes stale Plex library picker data when the Plex connection changes', async () => {
     const saved: SettingsResponse = { plex_url: 'http://new-plex:32400' }
     ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
-    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    const oldLibraries: PlexLibraryOption[] = [
+      {
+        path: '/old-plex/movies',
+        section_key: '1',
+        section_type: 'movie',
+        title: 'Movies',
+        writable: true,
+      },
+    ]
+    qc.setQueryData(queryKeys.settings, { plex_url: 'http://old-plex:32400' })
+    qc.setQueryData(queryKeys.plexLibraries, oldLibraries)
+    const remove = vi.spyOn(qc, 'removeQueries')
 
     const { result } = renderHook(() => useUpdateSettings(), {
       wrapper: createWrapper(qc),
     })
     await result.current.mutateAsync({ plex_url: 'http://new-plex:32400' })
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries }))
+    expect(qc.getQueryData(queryKeys.plexLibraries)).toBeUndefined()
+    expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
+  })
+
+  it('invalidates the Plex library picker when the Plex connection is unchanged', async () => {
+    const saved: SettingsResponse = { plex_url: 'http://plex:32400', qbittorrent_username: 'next' }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    qc.setQueryData(queryKeys.settings, { plex_url: 'http://plex:32400' })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({
+      plex_url: 'http://plex:32400',
+      qbittorrent_username: 'next',
+    })
 
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries }),

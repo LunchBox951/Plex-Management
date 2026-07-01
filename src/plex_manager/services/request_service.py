@@ -28,10 +28,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "TERMINAL_REQUEST_STATUS_VALUES",
+    "CreateRequestResult",
     "MediaNotFoundError",
     "MediaTypeDeferredError",
     "NoAiredSeasonsError",
     "create_request",
+    "create_request_result",
     "get_request",
     "list_requests",
     "mark_available",
@@ -124,6 +126,13 @@ class _Detail(NamedTuple):
     poster_url: str | None
     backdrop_url: str | None
     season_count: int = 0
+
+
+class CreateRequestResult(NamedTuple):
+    """The returned request plus whether this call created the returned row."""
+
+    record: RequestRecord
+    created: bool
 
 
 async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> _Detail:
@@ -251,6 +260,29 @@ async def create_request(
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
 ) -> RequestRecord:
+    """Create a request and return only the request read model."""
+    result = await create_request_result(
+        session,
+        tmdb,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        user_id=user_id,
+        library=library,
+        seasons=seasons,
+    )
+    return result.record
+
+
+async def create_request_result(
+    session: AsyncSession,
+    tmdb: MetadataPort,
+    *,
+    tmdb_id: int,
+    media_type: str,
+    user_id: int | None = None,
+    library: LibraryPort | None = None,
+    seasons: list[int] | None = None,
+) -> CreateRequestResult:
     """Create (or return the existing active) media request for this media.
 
     Dedups on the ``(tmdb_id, media_type)`` composite via
@@ -278,7 +310,7 @@ async def create_request(
     this: an existing request resolving no NEW seasons there just means "nothing
     to add" to an already-viable request, not a dead end.
     """
-    if media_type != "movie":
+    if media_type not in {"movie", "tv"}:
         raise MediaTypeDeferredError(media_type)
 
     repo = SqlRequestRepository(session)
@@ -298,7 +330,7 @@ async def create_request(
             # returned record's top-level status matches the seasons the response will
             # embed. ``existing`` was captured by find_active BEFORE that rollup write.
             existing = await repo.get(existing.id) or existing
-        return existing
+        return CreateRequestResult(record=existing, created=False)
 
     detail = await _resolve_detail(tmdb, tmdb_id, media_type)
 
@@ -329,7 +361,7 @@ async def create_request(
         await repo.acquire_media_lock(tmdb_id, media_type)
         in_library = await repo.find_in_library(tmdb_id, media_type)
         if in_library is not None:
-            return in_library
+            return CreateRequestResult(record=in_library, created=False)
         initial_status = RequestStatus.available.value
 
     if media_type == "tv" and library is not None and season_numbers:
@@ -354,7 +386,11 @@ async def create_request(
                     seasons=season_numbers,
                 )
                 await session.commit()
-                return await repo.get(in_library.id) or in_library
+                return CreateRequestResult(
+                    record=await repo.get(in_library.id) or in_library,
+                    created=False,
+                )
+    created = True
     try:
         record = await repo.create(
             tmdb_id=tmdb_id,
@@ -412,6 +448,7 @@ async def create_request(
                     )
                     await session.commit()
                     winner = await repo.get(winner.id) or winner
+                    created = False
                 record = winner
     except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
@@ -435,15 +472,16 @@ async def create_request(
             # Re-read past the rollup ensure_seasons just persisted (``winner`` was
             # captured before it), so the returned status matches the response's seasons.
             winner = await repo.get(winner.id) or winner
-        return winner
+        return CreateRequestResult(record=winner, created=False)
     if initial_status == RequestStatus.available.value:
         # Collapse the concurrent movie in-library race (F9) via the shared helper.
         # The remove-then-re-acquire flow is unaffected: when a movie was removed from
         # Plex, _already_in_library() reads False and this branch is skipped, so the
         # legitimate SECOND available row from the normal pending -> download ->
         # mark_available path is never reconciled away.
-        record = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
-    return record
+        collapsed = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
+        return CreateRequestResult(record=collapsed, created=collapsed.id == record.id)
+    return CreateRequestResult(record=record, created=created)
 
 
 async def list_requests(

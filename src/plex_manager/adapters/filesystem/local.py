@@ -199,9 +199,15 @@ class LocalFileSystem:
         return shutil.disk_usage(probe).free
 
     def move(self, src: Path, dst: Path) -> None:
-        """Move ``src`` to ``dst`` (atomic rename when on the same device)."""
+        """Move ``src`` to ``dst`` without replacing an existing destination file."""
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(os.fspath(src), os.fspath(dst))
+        try:
+            os.link(os.fspath(src), os.fspath(dst))
+        except OSError as exc:
+            if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                raise
+            self._copy_no_overwrite(src, dst)
+        src.unlink()
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
@@ -223,45 +229,48 @@ class LocalFileSystem:
             # Cross-device (or hardlink-refusing) filesystem: copy instead. A
             # copy actually consumes space, so preflight that the destination
             # filesystem can hold the source before writing a partial file.
-            src_size = src.stat().st_size
-            free = self.available_bytes(dst.parent)
-            if free < src_size:
+            self._copy_no_overwrite(src, dst)
+
+    def _copy_no_overwrite(self, src: Path, dst: Path) -> None:
+        src_size = src.stat().st_size
+        free = self.available_bytes(dst.parent)
+        if free < src_size:
+            raise OSError(
+                f"insufficient space to copy {src.name}: need {src_size} bytes, "
+                f"{free} available on destination filesystem"
+            ) from None
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{dst.name}.",
+                suffix=".tmp",
+                dir=dst.parent,
+                delete=False,
+            ) as tmp:
+                tmp_path = tmp.name
+            shutil.copy2(os.fspath(src), tmp_path)
+            # Verify the copy is complete before exposing it at the final path.
+            copied_size = Path(tmp_path).stat().st_size
+            if copied_size != src_size:
                 raise OSError(
-                    f"insufficient space to copy {src.name}: need {src_size} bytes, "
-                    f"{free} available on destination filesystem"
-                ) from None
-            tmp_path: str | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    prefix=f".{dst.name}.",
-                    suffix=".tmp",
-                    dir=dst.parent,
-                    delete=False,
-                ) as tmp:
-                    tmp_path = tmp.name
-                shutil.copy2(os.fspath(src), tmp_path)
-                # Verify the copy is complete before exposing it at the final path.
-                copied_size = Path(tmp_path).stat().st_size
-                if copied_size != src_size:
-                    raise OSError(
-                        f"copy of {src.name} is incomplete: expected {src_size} bytes, "
-                        f"wrote {copied_size}; partial destination removed"
-                    )
-                _publish_temp_no_overwrite(tmp_path, dst)
-                tmp_path = None
-            except OSError:
-                # The copy target is a temp file in dst.parent, never the final path,
-                # so a process crash cannot leave a partial library file that blocks
-                # every retry. Clean the temp best-effort and re-raise the original
-                # error, unmasked (north-star #3: honesty).
-                if tmp_path is not None:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp_path)
-                raise
-            else:
-                if tmp_path is not None:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp_path)
+                    f"copy of {src.name} is incomplete: expected {src_size} bytes, "
+                    f"wrote {copied_size}; partial destination removed"
+                )
+            _publish_temp_no_overwrite(tmp_path, dst)
+            tmp_path = None
+        except OSError:
+            # The copy target is a temp file in dst.parent, never the final path,
+            # so a process crash cannot leave a partial library file that blocks
+            # every retry. Clean the temp best-effort and re-raise the original
+            # error, unmasked (north-star #3: honesty).
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+            raise
+        else:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.

@@ -2038,6 +2038,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Existing matching request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {

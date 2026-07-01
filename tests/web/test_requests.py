@@ -64,6 +64,8 @@ async def test_create_dedups_active_request(
     second = await client.post(
         "/api/v1/requests", json={"tmdb_id": 603, "media_type": "movie"}, headers=_HEADERS
     )
+    assert first.status_code == 201
+    assert second.status_code == 200
     assert first.json()["id"] == second.json()["id"]
 
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
