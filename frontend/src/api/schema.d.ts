@@ -115,6 +115,9 @@ export interface paths {
          * Disk Endpoint
          * @description Disk usage per configured library root, plus a ranked preview of what a
          *     pressure sweep WOULD evict from each (never evicts anything itself).
+         *
+         *     TTL-cached per root (~15s) — see :func:`_disk_root_item` — so the Status
+         *     page's ~15s poll never re-hammers Plex/the filesystem on every tick.
          */
         get: operations["disk_endpoint_api_v1_ops_disk_get"];
         put?: never;
@@ -150,6 +153,12 @@ export interface paths {
          *     task runs, just invoked synchronously instead of on a timer. Requires Plex
          *     (409 ``service_not_configured`` otherwise — watch state can't be resolved
          *     without it); an unset root is simply skipped, not an error.
+         *
+         *     Invalidates :func:`_get_disk_preview_cache` after the sweep: without this,
+         *     ``GET /disk`` would keep serving the pre-eviction snapshot (stale
+         *     candidates the operator just deleted, stale free-space gauge) for up to
+         *     its ~15s TTL, contradicting north-star #3 for the very endpoint that IS
+         *     the correction button.
          */
         post: operations["evict_endpoint_api_v1_ops_evict_post"];
         delete?: never;

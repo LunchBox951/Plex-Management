@@ -2409,7 +2409,7 @@
     },
     "/api/v1/ops/disk": {
       "get": {
-        "description": "Disk usage per configured library root, plus a ranked preview of what a\npressure sweep WOULD evict from each (never evicts anything itself).",
+        "description": "Disk usage per configured library root, plus a ranked preview of what a\npressure sweep WOULD evict from each (never evicts anything itself).\n\nTTL-cached per root (~15s) \u2014 see :func:`_disk_root_item` \u2014 so the Status\npage's ~15s poll never re-hammers Plex/the filesystem on every tick.",
         "operationId": "disk_endpoint_api_v1_ops_disk_get",
         "responses": {
           "200": {
@@ -2436,7 +2436,7 @@
     },
     "/api/v1/ops/evict": {
       "post": {
-        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.",
+        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.\n\nInvalidates :func:`_get_disk_preview_cache` after the sweep: without this,\n``GET /disk`` would keep serving the pre-eviction snapshot (stale\ncandidates the operator just deleted, stale free-space gauge) for up to\nits ~15s TTL, contradicting north-star #3 for the very endpoint that IS\nthe correction button.",
         "operationId": "evict_endpoint_api_v1_ops_evict_post",
         "responses": {
           "200": {
