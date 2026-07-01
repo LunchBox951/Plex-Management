@@ -136,6 +136,44 @@ UPCOMING_MOVIES: dict[str, Any] = {
     "total_results": 95,
 }
 
+TRENDING_TV: dict[str, Any] = {
+    "page": 1,
+    "results": [
+        {
+            # Same tmdb id as a trending MOVIE row, to prove the per-kind page cache
+            # never conflates a tv page with a movie page of the same number.
+            "id": 27205,
+            "name": "Inception: The Series",
+            "first_air_date": "2022-03-01",
+            "poster_path": "/inception_tv.jpg",
+            "backdrop_path": "/inception_tv_bg.jpg",
+        },
+        {
+            # A stray person row (no name) must still be dropped even though the
+            # endpoint forces media_type='tv'.
+            "id": 287,
+            "title": "Brad Pitt",
+        },
+    ],
+    "total_pages": 500,
+    "total_results": 9999,
+}
+
+POPULAR_TV: dict[str, Any] = {
+    "page": 1,
+    "results": [
+        {
+            "id": 1399,
+            "name": "Game of Thrones",
+            "first_air_date": "2011-04-17",
+            "poster_path": "/got.jpg",
+            "backdrop_path": "/got_bg.jpg",
+        }
+    ],
+    "total_pages": 12,
+    "total_results": 240,
+}
+
 
 def _handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
@@ -149,6 +187,10 @@ def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=POPULAR_MOVIES)
     if path == "/3/movie/upcoming":
         return httpx.Response(200, json=UPCOMING_MOVIES)
+    if path == "/3/trending/tv/week":
+        return httpx.Response(200, json=TRENDING_TV)
+    if path == "/3/tv/popular":
+        return httpx.Response(200, json=POPULAR_TV)
     if path == "/3/movie/27205":
         return httpx.Response(200, json=MOVIE_DETAIL)
     if path == "/3/movie/129":
@@ -332,6 +374,58 @@ async def test_upcoming_movies_maps_envelope() -> None:
     assert len(page.results) == 1
     assert page.results[0].media_type == "movie"
     assert page.results[0].title == "Future Film"
+
+
+async def test_trending_tv_maps_envelope_and_kind() -> None:
+    page = await _adapter().trending_tv()
+    assert page.page == 1
+    assert page.total_pages == 500
+    assert page.total_results == 9999
+    assert len(page.results) == 1  # the person row (no name) is dropped
+    show = page.results[0]
+    assert show.media_type == "tv"
+    assert show.tmdb_id == 27205
+    assert show.title == "Inception: The Series"
+    assert show.year == 2022
+    assert show.poster_url == "https://image.tmdb.org/t/p/w500/inception_tv.jpg"
+    assert show.backdrop_url == "https://image.tmdb.org/t/p/w780/inception_tv_bg.jpg"
+
+
+async def test_popular_tv_maps_envelope() -> None:
+    page = await _adapter().popular_tv()
+    assert page.total_pages == 12
+    assert page.total_results == 240
+    assert len(page.results) == 1
+    assert page.results[0].media_type == "tv"
+    assert page.results[0].title == "Game of Thrones"
+    assert page.results[0].backdrop_url == "https://image.tmdb.org/t/p/w780/got_bg.jpg"
+
+
+async def test_tv_and_movie_page_caches_are_isolated() -> None:
+    # Both trending_movies() and trending_tv() are page 1 of a "trending:*:week"
+    # cache prefix; a row with the SAME tmdb id (27205) sits on both. If the cache
+    # key omitted the kind, one lookup would wrongly serve the other's cached page.
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _handler(request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(counting))
+    adapter = TmdbMetadata(client, API_KEY)
+
+    movies_page = await adapter.trending_movies()
+    tv_page = await adapter.trending_tv()
+    assert calls["n"] == 2  # each kind fetched once, neither served the other's data
+    assert movies_page.results[0].media_type == "movie"
+    assert movies_page.results[0].title == "Inception"
+    assert tv_page.results[0].media_type == "tv"
+    assert tv_page.results[0].title == "Inception: The Series"
+
+    # Repeating both lookups is served entirely from cache -- no extra network.
+    assert await adapter.trending_movies() == movies_page
+    assert await adapter.trending_tv() == tv_page
+    assert calls["n"] == 2
 
 
 async def test_discover_page_clamped_to_valid_window() -> None:

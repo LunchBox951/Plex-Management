@@ -218,3 +218,85 @@ def test_largest_video_file_allows_symlinked_downloads_parent(
 
     assert result is not None
     assert Path(result) == (release / "feature.mkv").resolve()
+
+
+# --------------------------------------------------------------------------- #
+# list_video_files — TV season-pack enumeration
+# --------------------------------------------------------------------------- #
+def test_list_video_files_returns_folder_qualified_relative_paths(
+    tmp_path: Path,
+) -> None:
+    # A whole-season pack: two episodes nested under a "Season 01" directory, the
+    # shape a TV import needs to parse season/episode out of the folder token, not
+    # just the filename.
+    season_dir = tmp_path / "Season 01"
+    season_dir.mkdir()
+    (season_dir / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (season_dir / "Show.S01E02.mkv").write_bytes(b"x" * 200)
+
+    files = LocalFileSystem().list_video_files(os.fspath(tmp_path))
+
+    by_rel = {rel: (abs_path, size) for abs_path, size, rel in files}
+    assert set(by_rel) == {
+        os.path.join("Season 01", "Show.S01E01.mkv"),
+        os.path.join("Season 01", "Show.S01E02.mkv"),
+    }
+    ep1_abs, ep1_size = by_rel[os.path.join("Season 01", "Show.S01E01.mkv")]
+    assert Path(ep1_abs) == (season_dir / "Show.S01E01.mkv").resolve()
+    assert ep1_size == 100
+
+
+def test_list_video_files_skips_sample_and_extras(tmp_path: Path) -> None:
+    (tmp_path / "Show.S01E01.mkv").write_bytes(b"x" * 1000)
+    (tmp_path / "Show.S01E01.sample.mkv").write_bytes(b"x" * 5000)  # name-filtered
+    (tmp_path / "notes.nfo").write_bytes(b"x" * 10)  # non-video
+    extras = tmp_path / "Featurettes"
+    extras.mkdir()
+    (extras / "bonus.mkv").write_bytes(b"x" * 8000)  # extras dir, skipped
+
+    files = LocalFileSystem().list_video_files(os.fspath(tmp_path))
+
+    assert [rel for _abs, _size, rel in files] == ["Show.S01E01.mkv"]
+
+
+def test_list_video_files_returns_empty_list_without_video(tmp_path: Path) -> None:
+    (tmp_path / "readme.txt").write_text("no video here")
+
+    assert LocalFileSystem().list_video_files(os.fspath(tmp_path)) == []
+
+
+def test_list_video_files_rejects_symlinked_root_escaping_its_parent(
+    tmp_path: Path,
+) -> None:
+    # Mirrors largest_video_file's containment guard: a content root that is
+    # ITSELF a symlink escaping its own parent must yield nothing, not the
+    # outside directory's files.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.mkv").write_bytes(b"x" * 5000)
+
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    evil_root = downloads / "release"
+    os.symlink(outside, evil_root)
+
+    assert LocalFileSystem().list_video_files(os.fspath(evil_root)) == []
+
+
+def test_list_video_files_allows_symlinked_downloads_parent(tmp_path: Path) -> None:
+    store = tmp_path / "store"
+    release = store / "Show.2020" / "Season 01"
+    release.mkdir(parents=True)
+    (release / "Show.S01E01.mkv").write_bytes(b"x" * 1000)
+
+    downloads = tmp_path / "downloads"
+    os.symlink(store, downloads)  # symlinked PARENT, not an escaping root
+    root = downloads / "Show.2020"
+
+    files = LocalFileSystem().list_video_files(os.fspath(root))
+
+    assert len(files) == 1
+    abs_path, size, rel = files[0]
+    assert Path(abs_path) == (release / "Show.S01E01.mkv").resolve()
+    assert size == 1000
+    assert rel == os.path.join("Season 01", "Show.S01E01.mkv")

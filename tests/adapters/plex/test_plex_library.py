@@ -179,11 +179,6 @@ async def test_is_available_false_when_absent() -> None:
     assert await _adapter(_main_handler).is_available(55555, "movie") is False
 
 
-async def test_is_available_tv_raises_not_implemented() -> None:
-    with pytest.raises(NotImplementedError, match="tv availability deferred"):
-        await _adapter(_main_handler).is_available(1399, "tv")
-
-
 async def test_is_available_caches_presence_but_repages_absence() -> None:
     calls = {"n": 0}
 
@@ -203,6 +198,100 @@ async def test_is_available_caches_presence_but_repages_absence() -> None:
     # section contents (the section list stays cached).
     assert await adapter.is_available(55555, "movie") is False
     assert calls["n"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# is_available — TV, per-season presence
+# --------------------------------------------------------------------------- #
+# One show (tmdb 1399, ratingKey "100") with three season rows: specials (index 0,
+# present), season 1 (present), season 2 (announced but leafCount=0 -- NOT present,
+# distinct from a season that Plex doesn't list at all).
+SHOWS_ALL: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "ratingKey": "100",
+                "guid": "plex://show/5d9c086c46115600020198a9",
+                "Guid": [{"id": "tmdb://1399"}],
+            },
+        ],
+    }
+}
+
+SEASONS_FOR_SHOW_100: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 3,
+        "Metadata": [
+            {"index": 0, "leafCount": 3},  # specials, present
+            {"index": 1, "leafCount": 10},  # season 1, present
+            {"index": 2, "leafCount": 0},  # season 2 announced, no episodes yet
+        ],
+    }
+}
+
+
+def _tv_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    assert TOKEN not in str(request.url)
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS)
+    if path == "/library/sections/2/all":
+        assert request.url.params.get("includeGuids") == "1"
+        return httpx.Response(200, json=SHOWS_ALL)
+    if path == "/library/metadata/100/children":
+        return httpx.Response(200, json=SEASONS_FOR_SHOW_100)
+    return httpx.Response(404, json={})
+
+
+async def test_is_available_tv_season_present() -> None:
+    assert await _adapter(_tv_handler).is_available(1399, "tv", season=1) is True
+
+
+async def test_is_available_tv_season_zero_specials_present() -> None:
+    assert await _adapter(_tv_handler).is_available(1399, "tv", season=0) is True
+
+
+async def test_is_available_tv_season_absent_when_leaf_count_zero() -> None:
+    # Season 2 IS listed on the show but has no episodes yet (leafCount=0) -- must
+    # read as absent, not merely "unknown".
+    assert await _adapter(_tv_handler).is_available(1399, "tv", season=2) is False
+
+
+async def test_is_available_tv_season_absent_when_not_listed() -> None:
+    # Season 5 never appears in the show's children response at all.
+    assert await _adapter(_tv_handler).is_available(1399, "tv", season=5) is False
+
+
+async def test_is_available_tv_whole_show_present_without_season_filter() -> None:
+    assert await _adapter(_tv_handler).is_available(1399, "tv") is True
+
+
+async def test_is_available_tv_absent_when_show_not_in_library() -> None:
+    assert await _adapter(_tv_handler).is_available(9999, "tv") is False
+    assert await _adapter(_tv_handler).is_available(9999, "tv", season=1) is False
+
+
+async def test_is_available_tv_caches_presence_but_repages_absence() -> None:
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _tv_handler(request)
+
+    adapter = _adapter(counting, base_url="http://cached-tv-avail:32400")
+    # First lookup pages sections (1) + the show section's /all (1) + the show's
+    # /children (1), then caches the per-show season map.
+    assert await adapter.is_available(1399, "tv", season=1) is True
+    assert calls["n"] == 3
+    # A repeated PRESENT lookup (same show, same season) is served from cache.
+    assert await adapter.is_available(1399, "tv", season=1) is True
+    assert calls["n"] == 3
+    # An ABSENT answer (season 2, leafCount=0) is NEVER trusted from cache -- it
+    # re-pages (the section list itself stays cached, so only 2 more calls).
+    assert await adapter.is_available(1399, "tv", season=2) is False
+    assert calls["n"] == 5
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +374,7 @@ async def test_trigger_scan_refreshes_only_owning_section() -> None:
     record: list[tuple[str, str | None]] = []
     adapter = _adapter(_make_trigger_handler(record), base_url="http://scan-one:32400")
     scan_path = "/data/movies/Foo (2020)/foo.mkv"
-    await adapter.trigger_scan(scan_path)
+    await adapter.trigger_scan(scan_path, "movie")
     # Only section 1 (whose /data/movies location is a parent) is refreshed, and the
     # path is round-tripped intact (single percent-encoding via httpx params).
     assert record == [("1", scan_path)]
@@ -294,9 +383,39 @@ async def test_trigger_scan_refreshes_only_owning_section() -> None:
 async def test_trigger_scan_falls_back_to_all_movie_sections() -> None:
     record: list[tuple[str, str | None]] = []
     adapter = _adapter(_make_trigger_handler(record), base_url="http://scan-all:32400")
-    await adapter.trigger_scan("/somewhere/unmapped/x.mkv")
+    await adapter.trigger_scan("/somewhere/unmapped/x.mkv", "movie")
     # No location matches -> every movie section (1 and 4, not the show section).
     assert {key for key, _ in record} == {"1", "4"}
+
+
+async def test_trigger_scan_tv_refreshes_only_owning_show_section() -> None:
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_trigger_handler(record), base_url="http://scan-tv-one:32400")
+    scan_path = "/data/tv/Some Show (2020)/Season 01"
+    await adapter.trigger_scan(scan_path, "tv")
+    # Only the show section (key 2) is refreshed -- never a movie section, even
+    # though movie section 1's location does not prefix-match this path either.
+    assert record == [("2", scan_path)]
+
+
+async def test_trigger_scan_tv_falls_back_to_all_show_sections() -> None:
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_trigger_handler(record), base_url="http://scan-tv-all:32400")
+    await adapter.trigger_scan("/somewhere/unmapped/show", "tv")
+    # No location matches -> every show section (just key 2 here; movie sections
+    # 1 and 4 are never touched by a tv-scoped scan).
+    assert {key for key, _ in record} == {"2"}
+
+
+async def test_trigger_scan_tv_raises_when_no_show_section_exists() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=ONE_MOVIE_SECTION)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://scan-no-show:32400")
+    with pytest.raises(PlexLibraryError, match="no Plex show library section"):
+        await adapter.trigger_scan("/data/tv/anything", "tv")
 
 
 # --------------------------------------------------------------------------- #
@@ -454,3 +573,38 @@ async def test_is_available_no_cache_repages_despite_cached_presence() -> None:
     assert await adapter.is_available(4242, "movie", use_cache=False) is False
     # The refreshed cache now reflects the removal for the default path too.
     assert await adapter.is_available(4242, "movie") is False
+
+
+async def test_is_available_tv_no_cache_repages_despite_cached_presence() -> None:
+    """G7, TV side: use_cache=False bypasses the cached-PRESENT fast path for a
+    show/season answer too, so a season just REMOVED from Plex is seen as absent
+    immediately instead of trusting the cached per-show season map for the whole
+    cache TTL. Mirrors ``test_is_available_no_cache_repages_despite_cached_presence``
+    above (movies)."""
+    present = {"there": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL)
+        if path == "/library/metadata/100/children":
+            leaf_count = 10 if present["there"] else 0
+            meta = [{"index": 1, "leafCount": leaf_count}]
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": meta}})
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://nocache-tv-plex:32400")
+    # Present -> caches the per-show season map with season 1 present.
+    assert await adapter.is_available(1399, "tv", season=1) is True
+    # Season 1 removed from Plex, but the cache still holds it: the DEFAULT lookup is
+    # stale-True (same asymmetry as the movie case).
+    present["there"] = False
+    assert await adapter.is_available(1399, "tv", season=1) is True
+    # use_cache=False re-pages and sees the removal -> False (and refreshes the cache).
+    assert await adapter.is_available(1399, "tv", season=1, use_cache=False) is False
+    # The refreshed cache now reflects the removal for the default path too.
+    assert await adapter.is_available(1399, "tv", season=1) is False
