@@ -331,7 +331,7 @@ async def import_download(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
-    movies_root: str,
+    movies_root: str | None = None,
     tv_root: str | None = None,
 ) -> DownloadRecord | None:
     """Validate, import, and scan a single completed download.
@@ -340,9 +340,12 @@ async def import_download(
     row is a no-op. Returns the resulting :class:`DownloadRecord`, or ``None`` if
     the download id no longer exists.
 
-    ``tv_root`` is optional (mirrors ``movies_root``'s sibling setting): a tv
-    download reaching this function while it is unset is an honest, retryable
-    ``ImportBlocked`` ("tv library root is not configured"), never a crash.
+    Both roots are optional and independently honest: a movie download reaching
+    this function while ``movies_root`` is unset gets a retryable ``ImportBlocked``
+    ("movies library root is not configured"); a tv download reaching it while
+    ``tv_root`` is unset gets the same treatment ("tv library root is not
+    configured"). Neither ever crashes, and an install that has only ONE of the
+    two roots configured still imports that type normally.
 
     Serialized per download id: the reconcile loop and an operator's
     POST /queue/{id}/import retry must never import the SAME row concurrently.
@@ -370,7 +373,7 @@ async def _import_download_locked(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
-    movies_root: str,
+    movies_root: str | None = None,
     tv_root: str | None = None,
 ) -> DownloadRecord | None:
     download_repo = SqlDownloadRepository(session)
@@ -438,6 +441,19 @@ async def _import_download_locked(
             download_repo,
             download_id,
             f"unsupported media_type {request.media_type!r}",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    if movies_root is None:
+        # Mirrors the tv branch's ``tv_root is None`` guard above: an honest,
+        # retryable block rather than gating this whole cycle on movies_root being
+        # set (an install with only the TV root configured must still import TV).
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "movies library root is not configured",
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
@@ -857,15 +873,18 @@ async def run_import_cycle(
     parser: ParserPort,
     profile: QualityProfile,
     session: AsyncSession,
-    movies_root: str,
+    movies_root: str | None = None,
     tv_root: str | None = None,
 ) -> None:
     """Drain freshly-completed (and crash-stranded) imports. Needs the download
-    client + the Movies root. One item failing never aborts the cycle.
+    client; the Movies/TV roots are each optional. One item failing never aborts
+    the cycle.
 
-    ``tv_root`` is optional: a tv row reaching ``import_download`` while it is
-    unset gets its own honest, retryable ``ImportBlocked`` (never a crash, never
-    silently skipped) rather than gating the whole cycle on it being set.
+    ``movies_root`` / ``tv_root`` are each optional: a row of that media type
+    reaching ``import_download`` while its root is unset gets its own honest,
+    retryable ``ImportBlocked`` (never a crash, never silently skipped) rather
+    than gating the whole cycle — an install with only ONE root configured still
+    drains that type normally.
 
     The completed -> available promotion is a SEPARATE pass
     (:func:`run_availability_cycle`) that needs only Plex, so it keeps working even

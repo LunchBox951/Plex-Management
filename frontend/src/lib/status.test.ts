@@ -11,6 +11,13 @@ describe('requestStatus', () => {
   it('falls back to a humanized neutral label for unknown values', () => {
     expect(requestStatus('some_new_state')).toEqual({ label: 'Some new state', intent: 'neutral' })
   })
+
+  it('maps the tv-only rollup partially_available to the available intent', () => {
+    expect(requestStatus('partially_available')).toEqual({
+      label: 'Partially available',
+      intent: 'available',
+    })
+  })
 })
 
 describe('downloadStatus', () => {

@@ -17,6 +17,21 @@ function isActive(status: string): boolean {
   return intent === 'downloading' || intent === 'searching'
 }
 
+/**
+ * tv only: "S02E05" (a single episode), "S02E05-E07" (a multi-episode file) or
+ * "S02 pack" (the whole season, no episodes named) — `null` for a movie
+ * (`item.season` is always null there). Mirrors the naming convention in
+ * `domain/naming.py::_episode_token`, but this is cosmetic only: nothing here
+ * feeds back into a request.
+ */
+function seasonBadge(item: QueueItem): string | null {
+  if (item.season == null) return null
+  const season = `S${String(item.season).padStart(2, '0')}`
+  if (!item.episodes || item.episodes.length === 0) return `${season} pack`
+  const episodes = item.episodes.map((e) => `E${String(e).padStart(2, '0')}`).join('-')
+  return `${season}${episodes}`
+}
+
 /** What the confirm dialog is about to do, captured when a button is pressed. */
 interface PendingAction {
   item: QueueItem
@@ -153,12 +168,18 @@ function QueueCard({
   const pct = Math.round(Math.min(1, Math.max(0, item.progress ?? 0)) * 100)
   const shortHash = item.torrent_hash.slice(0, 12)
   const detail = isDownloadingLike ? `${pct}%` : undefined
+  const season = seasonBadge(item)
 
   return (
     <div className="rounded-xl border border-hairline bg-surface p-4">
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 flex-wrap items-center gap-3">
           <StatusBadge status={presentation} {...(detail ? { detail } : {})} />
+          {season ? (
+            <span className="rounded bg-white/8 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-muted ring-1 ring-white/10">
+              {season}
+            </span>
+          ) : null}
           <span className="font-mono text-xs text-faint">{shortHash}</span>
           <span className="font-mono text-xs text-faint tabular-nums">
             seed {(item.seed_ratio ?? 0).toFixed(2)}

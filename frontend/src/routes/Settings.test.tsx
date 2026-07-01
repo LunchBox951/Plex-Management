@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -49,7 +49,9 @@ describe('Settings — movies_root save payload (G2)', () => {
       tmdb_api_key: '***',
       movies_root: '/old-plex/movies',
     }
-    h.libraries = [{ path: '/old-plex/movies', section_key: '1', title: 'Movies', writable: true }]
+    h.libraries = [
+      { path: '/old-plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
+    ]
   })
 
   it('clears movies_root when the Plex URL changes and no folder is re-picked', async () => {
@@ -85,8 +87,8 @@ describe('Settings — movies_root save payload (G2)', () => {
 
   it('honors an explicit folder re-selection made alongside a Plex change', async () => {
     h.libraries = [
-      { path: '/old-plex/movies', section_key: '1', title: 'Movies', writable: true },
-      { path: '/new-plex/movies', section_key: '2', title: 'Films', writable: true },
+      { path: '/old-plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
+      { path: '/new-plex/movies', section_key: '2', section_type: 'movie', title: 'Films', writable: true },
     ]
     render(<Settings />, { wrapper: Wrapper })
     fireEvent.change(screen.getByDisplayValue('http://old-plex:32400'), {
@@ -98,5 +100,68 @@ describe('Settings — movies_root save payload (G2)', () => {
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().movies_root).toBe('/new-plex/movies')
+  })
+})
+
+describe('Settings — tv_root library picker (optional)', () => {
+  beforeEach(() => {
+    h.mutateAsync.mockReset()
+    h.mutateAsync.mockResolvedValue({})
+    h.settingsData = {
+      plex_url: 'http://plex:32400',
+      plex_token: '***',
+      prowlarr_url: 'http://prowlarr:9696',
+      prowlarr_api_key: '***',
+      qbittorrent_url: 'http://qb:8080',
+      qbittorrent_username: 'admin',
+      qbittorrent_password: '***',
+      tmdb_api_key: '***',
+      movies_root: '/plex/movies',
+      tv_root: null,
+    }
+    h.libraries = [
+      { path: '/plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
+      { path: '/plex/tv', section_key: '2', section_type: 'tv', title: 'TV Shows', writable: true },
+    ]
+  })
+
+  it('filters the movie picker to section_type "movie" and the tv picker to "tv"', () => {
+    render(<Settings />, { wrapper: Wrapper })
+    const movieSelect = screen.getByLabelText('Movies library folder')
+    const tvSelect = screen.getByLabelText('TV library folder')
+
+    expect(within(movieSelect).getByText(/Movies —/)).toBeInTheDocument()
+    expect(within(movieSelect).queryByText(/TV Shows/)).not.toBeInTheDocument()
+
+    expect(within(tvSelect).getByText(/TV Shows —/)).toBeInTheDocument()
+    expect(within(tvSelect).queryByText(/^Movies —/)).not.toBeInTheDocument()
+  })
+
+  it('saves with an empty tv_root when none is chosen (never required)', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().tv_root).toBe('')
+    // Saving never fails / gets blocked for having no tv_root.
+    expect(lastBody().movies_root).toBe('/plex/movies')
+  })
+
+  it('clears tv_root when the Plex connection changes and no folder is re-picked', async () => {
+    h.settingsData = { ...h.settingsData!, tv_root: '/plex/tv' }
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().tv_root).toBe('')
+  })
+
+  it('keeps tv_root when the Plex connection is untouched', async () => {
+    h.settingsData = { ...h.settingsData!, tv_root: '/plex/tv' }
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().tv_root).toBe('/plex/tv')
   })
 })

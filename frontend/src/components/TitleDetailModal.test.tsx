@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
@@ -12,6 +12,7 @@ import {
 } from '../api/hooks'
 import type {
   DiscoverResult,
+  GrabRequest,
   QueueItem,
   RequestResponse,
   SearchPreviewResponse,
@@ -171,5 +172,243 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
     setDownloadStatus('downloading')
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — movie path is unchanged by the tv season selector', () => {
+  it('renders no season UI and sends no season/seasons fields for a movie', async () => {
+    const created: RequestResponse = {
+      id: 55,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'pending',
+      is_anime: false,
+    }
+    const createRequestMock = mutation(created)
+    const searchPreviewMock = mutation({
+      accepted: [],
+      rejected: [],
+      no_acceptable_release: true,
+    } satisfies SearchPreviewResponse)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(searchPreviewMock)
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    // No season/whole-series controls exist at all for a movie.
+    expect(screen.queryByText(/whole series/i)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Season')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/season to search/i)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+
+    // The exact payloads below prove no `season`/`seasons` field snuck in.
+    await waitFor(() =>
+      expect(createRequestMock.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 42,
+        media_type: 'movie',
+      }),
+    )
+    await waitFor(() =>
+      expect(searchPreviewMock.mutateAsync).toHaveBeenCalledWith({ request_id: 55 }),
+    )
+  })
+})
+
+describe('TitleDetailModal — tv season selector', () => {
+  const TV_TITLE: DiscoverResult = {
+    media_type: 'tv',
+    tmdb_id: 100,
+    title: 'Test Show',
+    year: 2022,
+  }
+
+  beforeEach(() => vi.clearAllMocks())
+
+  it('threads the chosen season into CreateRequestBody.seasons and SearchPreviewRequest.season', async () => {
+    const created: RequestResponse = {
+      id: 9,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'pending',
+      is_anime: false,
+      seasons: [{ season_number: 2, status: 'pending' }],
+    }
+    const createRequestMock = mutation(created)
+    const searchPreviewMock = mutation({
+      accepted: [],
+      rejected: [],
+      no_acceptable_release: true,
+    } satisfies SearchPreviewResponse)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(searchPreviewMock)
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    // Uncheck "whole series" and pick season 2 before requesting.
+    fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
+    fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+
+    await waitFor(() =>
+      expect(createRequestMock.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 100,
+        media_type: 'tv',
+        seasons: [2],
+      }),
+    )
+    await waitFor(() =>
+      expect(searchPreviewMock.mutateAsync).toHaveBeenCalledWith({ request_id: 9, season: 2 }),
+    )
+  })
+
+  it('previews and arms Grab against the season the create RESOLVED to, not the click-time default (whole-series request, season 1 already in the library)', async () => {
+    // "Whole series" stays checked (the default) — no season exists to pick before
+    // the request is created, so the click-time default is season 1. The create
+    // comes back tracking season 1 as already available (terminal) and season 2 as
+    // the real actionable one — exactly the shape that exposed the bug.
+    const created: RequestResponse = {
+      id: 12,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'partially_available',
+      is_anime: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'pending' },
+      ],
+    }
+    const release = {
+      guid: 'g2',
+      indexer: 'Indexer A',
+      quality_name: 'WEBDL-1080p',
+      resolution: '1080p',
+      score: 1000,
+      source: 'WEBDL',
+      title: 'Test.Show.S02.1080p.WEB-DL',
+      seeders: 10,
+      info_hash: 'hash2',
+    }
+    const createRequestMock = mutation(created)
+    const searchPreviewMock = mutation({
+      accepted: [release],
+      rejected: [],
+      no_acceptable_release: false,
+    } satisfies SearchPreviewResponse)
+    const grabMock = mutation(undefined)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(searchPreviewMock)
+    ;(useGrab as unknown as Mock).mockReturnValue(grabMock)
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+
+    // The preview must search season 2 (the season the create resolved to) —
+    // NEVER season 1, the stale click-time default.
+    await waitFor(() =>
+      expect(searchPreviewMock.mutateAsync).toHaveBeenCalledWith({ request_id: 12, season: 2 }),
+    )
+
+    // The selector settles on season 2 too, so the release list and the selector
+    // agree (both season 2), rather than a season-2 selector over season-1 releases.
+    const select = (await screen.findByLabelText('Season')) as HTMLSelectElement
+    expect(select.value).toBe('2')
+
+    // Season 2 is 'pending' (grabbable) — Grab must be armed, not disabled by
+    // having been judged against season 1's terminal ('available') status.
+    const grabButton = await screen.findByRole('button', { name: /grab/i })
+    expect(grabButton).toBeEnabled()
+
+    // And the grab itself must be scoped to season 2 — the season actually shown —
+    // never silently recorded against season 1.
+    fireEvent.click(grabButton)
+    await waitFor(() =>
+      expect(grabMock.mutateAsync).toHaveBeenCalledWith({
+        request_id: 12,
+        guid: 'g2',
+        season: 2,
+      } satisfies GrabRequest),
+    )
+  })
+
+  it('enumerates every tracked season in the picker, with its own status label', () => {
+    const request: RequestResponse = {
+      id: 5,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'partially_available',
+      is_anime: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'pending' },
+      ],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    expect(screen.getByRole('option', { name: /season 1.*in library/i })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /season 2.*requested/i })).toBeInTheDocument()
+  })
+
+  it('derives the action zone from the SELECTED season, not the show-level rollup', async () => {
+    // The show-level rollup is 'partially_available' — a value that never appears
+    // on an individual SeasonRequest and, if it leaked into the per-season check,
+    // would fall through to the generic 'unknown' UI for every season instead of
+    // each season's own honest state.
+    const request: RequestResponse = {
+      id: 5,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'partially_available',
+      is_anime: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'pending' },
+      ],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    // Defaults to the first ACTIONABLE tracked season (season 2, still pending) —
+    // never season 1 (already terminal/available).
+    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+
+    // Switching to season 1 reveals ITS real state — already in the library —
+    // rather than the show's 'partially_available' rollup leaking through.
+    fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
+    expect(await screen.findByText(/in your library/i)).toBeInTheDocument()
   })
 })

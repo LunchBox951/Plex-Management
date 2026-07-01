@@ -153,6 +153,38 @@ async def test_list_by_status_filters_across_shows(session: AsyncSession) -> Non
     assert len(await repo.list_by_status()) == 3
 
 
+async def test_list_for_requests_batches_multiple_shows_in_one_call(
+    session: AsyncSession,
+) -> None:
+    """The batch read the ``GET /requests`` list endpoint uses to avoid an N+1
+    query per tv row: one call returns every named show's season rows, grouped."""
+    show_a = await _make_show(session, tmdb_id=920)
+    show_b = await _make_show(session, tmdb_id=921)
+    show_c = await _make_show(session, tmdb_id=922)  # untracked -- no season rows
+    repo = SqlSeasonRequestRepository(session)
+
+    await repo.ensure(show_a.id, 1, status="pending")
+    await repo.ensure(show_a.id, 2, status="downloading")
+    await repo.ensure(show_b.id, 1, status="available")
+
+    grouped = await repo.list_for_requests([show_a.id, show_b.id, show_c.id])
+
+    assert {(s.season_number, s.status) for s in grouped[show_a.id]} == {
+        (1, "pending"),
+        (2, "downloading"),
+    }
+    assert [(s.season_number, s.status) for s in grouped[show_b.id]] == [(1, "available")]
+    # tmdb_id is the PARENT show's, denormalized via the join -- not a lookup per row.
+    assert all(s.tmdb_id == show_a.tmdb_id for s in grouped[show_a.id])
+    # A show with no tracked seasons is simply absent, not mapped to [].
+    assert show_c.id not in grouped
+
+
+async def test_list_for_requests_empty_input_returns_empty_dict(session: AsyncSession) -> None:
+    repo = SqlSeasonRequestRepository(session)
+    assert await repo.list_for_requests([]) == {}
+
+
 async def test_set_status_updates(session: AsyncSession) -> None:
     show = await _make_show(session)
     repo = SqlSeasonRequestRepository(session)

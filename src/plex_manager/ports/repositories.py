@@ -11,6 +11,7 @@ Method sets are intentionally minimal — sufficient for the alpha pipeline
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
@@ -255,6 +256,20 @@ class SeasonRequestRepository(Protocol):
 
     async def list_for_request(self, media_request_id: int) -> list[SeasonRequestRecord]:
         """List every season row belonging to ``media_request_id``, ordered by season."""
+        raise NotImplementedError
+
+    async def list_for_requests(
+        self, media_request_ids: Sequence[int]
+    ) -> dict[int, list[SeasonRequestRecord]]:
+        """Batch-list season rows for MULTIPLE requests in a single query.
+
+        Returns ``{media_request_id: [SeasonRequestRecord, ...]}``; a request id
+        with no tracked seasons (a movie, or absent from ``media_request_ids``)
+        is simply absent from the mapping rather than present with an empty list.
+        Lets ``GET /requests`` embed every tv row's per-season rollup WITHOUT one
+        query per row (the ``_to_response`` N+1 :meth:`list_for_request` would
+        otherwise cause on a list endpoint).
+        """
         raise NotImplementedError
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:

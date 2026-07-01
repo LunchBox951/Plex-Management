@@ -426,6 +426,41 @@ async def test_import_with_no_video_file_is_blocked(
     assert "no video file" in record.failed_reason
 
 
+async def test_import_movies_root_unset_is_an_honest_retryable_block(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Mirrors ``test_import_tv_root_unset_is_an_honest_retryable_block``: an
+    install with the tv root configured but NOT the movies root must still block
+    a movie import honestly (never a crash from ``Path(None)``), and never gate
+    on movies_root being set to import the OTHER media type."""
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=FakeQbittorrent(),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=None,
+            tv_root="/unused",
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "movies library root is not configured"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
 async def test_import_is_idempotent_on_an_already_imported_row(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

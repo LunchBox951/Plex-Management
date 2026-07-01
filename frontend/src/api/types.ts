@@ -16,6 +16,7 @@ export type DiscoverListResponse = Schemas['DiscoverListResponse']
 export type RequestResponse = Schemas['RequestResponse']
 export type RequestListResponse = Schemas['RequestListResponse']
 export type CreateRequestBody = Schemas['CreateRequestBody']
+export type SeasonStatus = Schemas['SeasonStatus']
 
 export type SearchPreviewRequest = Schemas['SearchPreviewRequest']
 export type SearchPreviewResponse = Schemas['SearchPreviewResponse']

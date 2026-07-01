@@ -18,6 +18,8 @@ from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
 from plex_manager.ports.repositories import SeasonRequestRecord
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlSeasonRequestRepository"]
@@ -74,6 +76,25 @@ class SqlSeasonRequestRepository:
             return []
         tmdb_id = await self._tmdb_id_for(media_request_id)
         return [_to_record(row, tmdb_id) for row in rows]
+
+    async def list_for_requests(
+        self, media_request_ids: Sequence[int]
+    ) -> dict[int, list[SeasonRequestRecord]]:
+        if not media_request_ids:
+            return {}
+        # JOIN straight to the parent's tmdb_id in ONE query -- avoids both an N+1
+        # per request row AND the per-distinct-show follow-up lookup
+        # ``list_by_status`` needs (there ``tmdb_id`` isn't otherwise in hand).
+        stmt = (
+            select(SeasonRequest, MediaRequest.tmdb_id)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(SeasonRequest.media_request_id.in_(media_request_ids))
+            .order_by(SeasonRequest.media_request_id, SeasonRequest.season_number)
+        )
+        grouped: dict[int, list[SeasonRequestRecord]] = {}
+        for row, tmdb_id in (await self._session.execute(stmt)).all():
+            grouped.setdefault(row.media_request_id, []).append(_to_record(row, tmdb_id))
+        return grouped
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         stmt = select(SeasonRequest)
