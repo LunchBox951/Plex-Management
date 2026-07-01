@@ -123,6 +123,56 @@ async def test_validate_requires_setup_token_from_remote_pre_init(app: FastAPI) 
     assert outbound == []
 
 
+async def test_validate_rejects_loopback_client_with_nonlocal_host(app: FastAPI) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://attacker.test") as remote:
+        response = await remote.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
+async def test_validate_rejects_loopback_client_with_cross_origin(app: FastAPI) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.post(
+            "/api/v1/setup/validate/tmdb",
+            json={"api_key": "k"},
+            headers={"Origin": "http://attacker.test"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
+def test_validate_contract_documents_setup_and_api_key_headers(app: FastAPI) -> None:
+    operation = app.openapi()["paths"]["/api/v1/setup/validate/tmdb"]["post"]
+    header_names = {
+        parameter["name"] for parameter in operation["parameters"] if parameter["in"] == "header"
+    }
+
+    assert header_names == {"X-Setup-Token", "X-Api-Key"}
+    assert operation["responses"]["401"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+
+
 async def test_validate_prowlarr_ok(client: httpx.AsyncClient, app: FastAPI) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/system/status"

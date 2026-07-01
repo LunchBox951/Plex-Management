@@ -120,6 +120,17 @@ async def test_create_tv_request_is_deferred(
     assert listed.json()["requests"] == []
 
 
+def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/requests"]["post"]["responses"]
+
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+
+
 async def test_get_missing_request_is_404(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/requests/12345", headers=_HEADERS)

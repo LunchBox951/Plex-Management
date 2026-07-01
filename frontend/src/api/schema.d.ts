@@ -632,6 +632,14 @@ export interface components {
             results: components["schemas"]["DiscoverResult"][];
         };
         /**
+         * ErrorDetail
+         * @description Machine-readable error body returned by manual HTTPException paths.
+         */
+        ErrorDetail: {
+            /** Detail */
+            detail: string;
+        };
+        /**
          * GrabRequest
          * @description Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.
          *
@@ -1333,12 +1341,23 @@ export interface operations {
                     "application/json": components["schemas"]["RequestResponse"];
                 };
             };
+            /** @description Media not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Media type deferred */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -1513,12 +1532,14 @@ export interface operations {
                     "application/json": components["schemas"]["SetupStatusResponse"];
                 };
             };
-            /** @description Invalid setup token */
+            /** @description Invalid setup token or API key */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -1557,6 +1578,8 @@ export interface operations {
             header?: {
                 /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
                 "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -1576,12 +1599,14 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token */
+            /** @description Invalid setup token or API key */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -1600,6 +1625,8 @@ export interface operations {
             header?: {
                 /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
                 "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -1619,12 +1646,14 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token */
+            /** @description Invalid setup token or API key */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -1643,6 +1672,8 @@ export interface operations {
             header?: {
                 /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
                 "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -1662,12 +1693,14 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token */
+            /** @description Invalid setup token or API key */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -1686,6 +1719,8 @@ export interface operations {
             header?: {
                 /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
                 "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -1705,12 +1740,14 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token */
+            /** @description Invalid setup token or API key */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {

@@ -26,6 +26,7 @@ from starlette.status import HTTP_409_CONFLICT
 from plex_manager.db import get_session
 from plex_manager.models import SystemSettings
 from plex_manager.web.deps import (
+    API_KEY_HEADER_NAME,
     KNOWN_SETTING_KEYS,
     SETUP_TOKEN_HEADER_NAME,
     SettingsStore,
@@ -37,6 +38,7 @@ from plex_manager.web.deps import (
     require_setup_token_pre_init,
 )
 from plex_manager.web.schemas import (
+    ErrorDetail,
     PlexValidateRequest,
     ProwlarrValidateRequest,
     QbittorrentValidateRequest,
@@ -67,8 +69,15 @@ SetupTokenHeader = Annotated[
         ),
     ),
 ]
+ApiKeyHeader = Annotated[
+    str | None,
+    Header(
+        alias=API_KEY_HEADER_NAME,
+        description="Required after setup is initialized.",
+    ),
+]
 _SETUP_TOKEN_RESPONSES: dict[int | str, dict[str, Any]] = {
-    401: {"description": "Invalid setup token"},
+    401: {"model": ErrorDetail, "description": "Invalid setup token or API key"},
 }
 
 
@@ -81,6 +90,7 @@ async def validate_plex_endpoint(
     body: PlexValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     _setup_token: SetupTokenHeader = None,
+    _api_key: ApiKeyHeader = None,
 ) -> ServiceValidateResponse:
     """Test candidate Plex credentials."""
     return await validate_plex(client, body.url, body.token)
@@ -95,6 +105,7 @@ async def validate_prowlarr_endpoint(
     body: ProwlarrValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     _setup_token: SetupTokenHeader = None,
+    _api_key: ApiKeyHeader = None,
 ) -> ServiceValidateResponse:
     """Test candidate Prowlarr credentials."""
     return await validate_prowlarr(client, body.url, body.api_key)
@@ -109,6 +120,7 @@ async def validate_qbittorrent_endpoint(
     body: QbittorrentValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     _setup_token: SetupTokenHeader = None,
+    _api_key: ApiKeyHeader = None,
 ) -> ServiceValidateResponse:
     """Test candidate qBittorrent credentials."""
     return await validate_qbittorrent(client, body.url, body.username, body.password)
@@ -123,6 +135,7 @@ async def validate_tmdb_endpoint(
     body: TmdbValidateRequest,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     _setup_token: SetupTokenHeader = None,
+    _api_key: ApiKeyHeader = None,
 ) -> ServiceValidateResponse:
     """Test a candidate TMDB api key."""
     return await validate_tmdb(client, body.api_key)
