@@ -34,6 +34,7 @@ trigger) is expected to call it once per configured root. Per call:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -115,6 +116,13 @@ def _size_bytes(path: str) -> int | None:
     walking a directory is skipped (best-effort partial total) rather than
     aborting the whole size lookup — a single unreadable episode file must not
     hide the fact that the OTHER nine are reclaimable.
+
+    Synchronous, real disk I/O (``os.walk``/``os.path.getsize``) — a multi-GB
+    library directory tree makes this genuinely slow. Every caller is an
+    ``async def`` on the app's single event loop, so this is ALWAYS invoked as
+    ``await asyncio.to_thread(_size_bytes, ...)``, never called inline — mirrors
+    ``import_service``'s ``asyncio.to_thread``-wrapped copy verbatim (see its
+    module docstring).
     """
     try:
         if os.path.isfile(path):
@@ -151,7 +159,9 @@ async def _movie_candidates(
     for row in rows:
         watch = await library.watch_state(row.tmdb_id, "movie")
         in_flight = (await download_repo.find_active_for_request(row.id, season=None)) is not None
-        size_bytes = _size_bytes(row.library_path) if row.library_path else None
+        size_bytes = (
+            await asyncio.to_thread(_size_bytes, row.library_path) if row.library_path else None
+        )
         size_percent = (
             (size_bytes / root_total_bytes) * 100.0
             if size_bytes is not None and root_total_bytes > 0
@@ -205,7 +215,9 @@ async def _season_candidates(
                 row.media_request_id, season=row.season_number
             )
         ) is not None
-        size_bytes = _size_bytes(row.library_path) if row.library_path else None
+        size_bytes = (
+            await asyncio.to_thread(_size_bytes, row.library_path) if row.library_path else None
+        )
         size_percent = (
             (size_bytes / root_total_bytes) * 100.0
             if size_bytes is not None and root_total_bytes > 0
@@ -256,7 +268,10 @@ async def _evict_one(
         return None
 
     try:
-        fs.delete(library_path)
+        # A whole directory tree (``shutil.rmtree``) or a large file -- real,
+        # synchronous disk I/O -- so this ALWAYS runs off the event loop
+        # (mirrors ``import_service``'s ``asyncio.to_thread``-wrapped copy).
+        await asyncio.to_thread(fs.delete, library_path)
     except LocalFileSystemError as exc:
         # The root-containment guard refused (a stale/misconfigured breadcrumb
         # pointing outside every currently-configured library root) -- never
@@ -340,7 +355,10 @@ async def preview_candidates(
     uses -- never a crash of the whole health/disk dashboard over one bad root.
     """
     try:
-        disk = read_disk_usage(root_path)
+        # ``shutil.disk_usage`` (a ``statvfs`` syscall) can stall on a hung
+        # NFS/SMB mount -- offload it, mirroring every other blocking FS
+        # primitive in this module (see ``_evict_one``/``_movie_candidates``).
+        disk = await asyncio.to_thread(read_disk_usage, root_path)
     except OSError as exc:
         _logger.warning(
             "eviction candidate preview skipped for %s root %s (%s)",
@@ -395,7 +413,9 @@ async def run_eviction_sweep(
     a mid-sweep crash only loses progress on the one candidate in flight.
     """
     try:
-        disk = read_disk_usage(root_path)
+        # Offloaded for the same reason as ``preview_candidates`` above: a
+        # hung/unresponsive mount must never freeze the whole event loop.
+        disk = await asyncio.to_thread(read_disk_usage, root_path)
     except OSError as exc:
         _logger.warning(
             "eviction sweep skipped for %s root %s (%s)",

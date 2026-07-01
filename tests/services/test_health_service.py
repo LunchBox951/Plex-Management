@@ -4,7 +4,10 @@ reconcile status — each piece plus the full aggregate.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+import asyncio
+import contextlib
+import time
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC
 from pathlib import Path
 
@@ -13,6 +16,8 @@ import pytest
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.domain.disk_usage import DiskUsage
+from plex_manager.services import health_service
 from plex_manager.services.health_service import (
     HealthCredentials,
     ReconcileStatus,
@@ -36,6 +41,37 @@ Handler = (
 
 def _client(handler: Handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _heartbeat_ticks_during[T](
+    awaitable: Awaitable[T], *, tick_seconds: float = 0.01
+) -> tuple[T, int]:
+    """Run ``awaitable`` while counting a concurrent ``asyncio.sleep`` heartbeat's
+    completed ticks — proves ``awaitable`` never blocks the event loop even
+    when it calls a genuinely slow, synchronous primitive (a real
+    ``time.sleep``, never ``asyncio.sleep``) internally: a near-zero tick
+    count is the "blocks the loop" regression signature; a healthy tick count
+    means that primitive ran off-loop (``asyncio.to_thread``). Mirrors
+    ``tests/services/test_eviction_service.py``'s identical helper.
+    """
+    ticks = 0
+    stop = False
+
+    async def _heartbeat() -> None:
+        nonlocal ticks
+        while not stop:
+            await asyncio.sleep(tick_seconds)
+            ticks += 1
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        result = await awaitable
+    finally:
+        stop = True
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+    return result, ticks
 
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +271,43 @@ def test_collect_disk_gauges_reports_an_unreadable_root_honestly(tmp_path: Path)
 
 def test_collect_disk_gauges_empty_when_every_root_unset() -> None:
     assert collect_disk_gauges({"movies_root": None, "tv_root": None}) == []
+
+
+# --------------------------------------------------------------------------- #
+# OP2 regression: collect_health_snapshot must never block the event loop on a
+# slow/hung disk read (shutil.disk_usage / statvfs on an unresponsive NFS/SMB
+# mount) -- it is offloaded via asyncio.to_thread, never called inline.
+# --------------------------------------------------------------------------- #
+
+
+async def test_collect_health_snapshot_offloads_disk_reads_and_never_blocks(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fail(_request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no upstream configured -> no request expected")
+
+    def _slow_read_disk_usage(_path: str) -> DiskUsage:
+        time.sleep(0.3)  # a real, blocking syscall stand-in -- never asyncio.sleep
+        return read_disk_usage(str(tmp_path))
+
+    monkeypatch.setattr(health_service, "read_disk_usage", _slow_read_disk_usage)
+
+    async with sessionmaker_() as session, _client(_fail) as client:
+        (snapshot, ticks) = await _heartbeat_ticks_during(
+            collect_health_snapshot(
+                session=session,
+                client=client,
+                cache=TtlCache(),
+                creds=HealthCredentials(),
+                reconcile_status=ReconcileStatus(),
+                library_roots={"movies_root": str(tmp_path), "tv_root": None},
+            )
+        )
+
+    assert [g.root for g in snapshot.disks] == ["movies_root"]
+    # The heartbeat kept ticking WHILE the (slow, synchronous) disk read ran --
+    # proof it executed off the event loop (asyncio.to_thread), not inline.
+    assert ticks >= 10
 
 
 # --------------------------------------------------------------------------- #

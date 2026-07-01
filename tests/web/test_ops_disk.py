@@ -145,3 +145,66 @@ async def test_disk_reports_error_for_an_unreadable_root(
     assert root["error"] is not None
     assert root["total_bytes"] == 0
     assert root["candidates"] == []
+
+
+# --------------------------------------------------------------------------- #
+# OP3: the disk/candidate preview is TTL-cached per root so a Status-page-style
+# poll never maps 1:1 onto a fresh Plex watch_state() call + os.walk per title.
+# --------------------------------------------------------------------------- #
+
+
+async def test_disk_preview_is_cached_and_a_second_poll_never_re_hits_plex(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _set_movies_root(sessionmaker_, str(tmp_path))
+    await _seed_watched_movie(sessionmaker_, library_path=str(movie_file))
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    first = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    assert first.status_code == 200
+    calls_after_first = len(library.watch_state_calls)
+    assert calls_after_first == 1
+
+    second = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    assert second.status_code == 200
+    # A second poll within the ~15s TTL must be served entirely from cache --
+    # NO additional Plex watch_state() round trip, and the SAME body.
+    assert len(library.watch_state_calls) == calls_after_first
+    assert second.json() == first.json()
+
+
+async def test_disk_preview_cache_is_scoped_per_root(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # Regression guard for a cache keyed on something coarser than the root
+    # path (e.g. a single shared key): movies_root and tv_root must each be
+    # cached and served independently.
+    movies_dir = tmp_path / "movies"
+    tv_dir = tmp_path / "tv"
+    movies_dir.mkdir()
+    tv_dir.mkdir()
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("movies_root", str(movies_dir))
+        await store.set("tv_root", str(tv_dir))
+        await session.commit()
+
+    response = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    labels = {root["root"]: root["path"] for root in response.json()["roots"]}
+    assert labels == {"movies_root": str(movies_dir), "tv_root": str(tv_dir)}

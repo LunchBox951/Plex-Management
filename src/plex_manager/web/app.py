@@ -196,7 +196,10 @@ async def _log_drain_loop(app: FastAPI) -> None:
     LogCaptureHandler` feeds; a DB failure on either the drain or the prune is
     caught and logged, never left to kill the loop — a queue that cannot be
     drained this tick simply carries its backlog into the next one (bounded by
-    the queue's own ``maxsize``, see the handler's docstring).
+    the queue's own ``maxsize``, see the handler's docstring). ``drain_once`` is
+    passed ``handler`` so a failed insert's whole (already-dequeued) batch is
+    added to ``handler.dropped_count`` — never re-queued, but always honestly
+    counted — before the exception below is caught.
     """
     handler = app.state.log_handler
     sessionmaker = app.state.sessionmaker
@@ -205,7 +208,7 @@ async def _log_drain_loop(app: FastAPI) -> None:
         try:
             async with sessionmaker() as session:
                 repo = SqlLogEventRepository(session)
-                await log_capture_service.drain_once(handler.queue, repo)
+                await log_capture_service.drain_once(handler.queue, repo, handler=handler)
                 await session.commit()
                 if (
                     time.monotonic() - last_pruned_at

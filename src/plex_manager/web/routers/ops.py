@@ -10,6 +10,10 @@ Three groups, matching the blueprint's three components:
   LLM-diagnosis export bundle (:mod:`services.log_capture_service`).
 * ``GET /disk``, ``POST /evict`` — per-root usage + a ranked eviction-candidate
   preview, and a manual pressure-sweep trigger (:mod:`services.eviction_service`).
+  ``GET /disk``'s preview is TTL-cached per root (~15s, see
+  ``_get_disk_preview_cache``) exactly like ``GET /health``'s subsystem probes —
+  it is polled on the same cadence and would otherwise re-run an uncached Plex
+  ``watch_state`` call plus an ``os.walk`` per available title on every poll.
 
 Every endpoint here is read-only or an idempotent operator action; none of them
 ever return a secret (subsystem ``detail`` strings and log messages carry
@@ -20,11 +24,12 @@ it).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
@@ -307,6 +312,29 @@ async def export_logs_endpoint(
 # --------------------------------------------------------------------------- #
 # Component 3 — disk-pressure eviction: preview + manual trigger
 # --------------------------------------------------------------------------- #
+def _get_disk_preview_cache(request: Request) -> TtlCache[DiskRootItem]:
+    """Return the process-wide, per-root disk/candidate-preview TTL cache.
+
+    Mirrors ``web.deps.get_health_cache``'s lazy ``app.state`` init verbatim —
+    same "create once, stash on ``app.state``, every subsequent request in this
+    process reuses the SAME cache instance" shape, same default TTL
+    (:data:`~plex_manager.services.health_service.SUBSYSTEM_PROBE_TTL_SECONDS`,
+    ~15s). The Status page polls ``GET /disk`` on that same ~15s cadence;
+    without this cache EVERY poll would re-run an uncached ``LibraryPort.
+    watch_state()`` per available title plus an ``os.walk`` per title
+    (:func:`eviction_service.preview_candidates`) — hammering Plex and the
+    filesystem for a view that only needs to be fresh to within ~15s, exactly
+    like the subsystem probes this mirrors.
+    """
+    cache = getattr(request.app.state, "disk_preview_cache", None)
+    if not isinstance(cache, TtlCache):
+        cache = TtlCache[DiskRootItem]()
+        request.app.state.disk_preview_cache = cache
+    # Same generic-narrowing cast ``get_health_cache`` uses -- this accessor is
+    # the ONLY place anything ever assigns ``app.state.disk_preview_cache``.
+    return cast("TtlCache[DiskRootItem]", cache)
+
+
 async def _disk_root_item(
     *,
     session: AsyncSession,
@@ -315,18 +343,31 @@ async def _disk_root_item(
     media_type: Literal["movie", "tv"],
     root_path: str,
     grace_days: int,
+    cache: TtlCache[DiskRootItem],
 ) -> DiskRootItem:
     """One configured root's usage gauge + its ranked eviction preview.
 
+    TTL-cached (~15s, keyed on ``root_path`` — see :func:`_get_disk_preview_cache`)
+    so a dashboard polling every ~15s never maps 1:1 onto a fresh Plex
+    ``watch_state`` call per title plus an ``os.walk`` per title on every poll.
+
     An unreadable root reports ``error`` set (zeroed gauges, no candidates —
-    there is nothing to preview against). An unconfigured Plex (``library is
-    None``) still shows the usage gauge, just with an empty candidate list:
-    honest ("we can't check watch state"), never a fabricated preview.
+    there is nothing to preview against); this is cached too, so a persistently
+    broken mount is not re-stat'd on every poll either. An unconfigured Plex
+    (``library is None``) still shows the usage gauge, just with an empty
+    candidate list: honest ("we can't check watch state"), never a fabricated
+    preview.
     """
+    cached = cache.get(root_path)
+    if cached is not None:
+        return cached
+
     try:
-        usage = read_disk_usage(root_path)
+        # shutil.disk_usage (a statvfs syscall) can stall on a hung NFS/SMB
+        # mount -- offload it so that never freezes the event loop.
+        usage = await asyncio.to_thread(read_disk_usage, root_path)
     except OSError as exc:
-        return DiskRootItem(
+        result = DiskRootItem(
             root=label,
             path=root_path,
             total_bytes=0,
@@ -335,6 +376,8 @@ async def _disk_root_item(
             error=str(exc),
             candidates=[],
         )
+        cache.set(root_path, result)
+        return result
 
     candidates: list[EvictionCandidateItem] = []
     if library is not None:
@@ -359,7 +402,7 @@ async def _disk_root_item(
             for c in ranked
         ]
 
-    return DiskRootItem(
+    result = DiskRootItem(
         root=label,
         path=root_path,
         total_bytes=usage.total_bytes,
@@ -368,15 +411,22 @@ async def _disk_root_item(
         error=None,
         candidates=candidates,
     )
+    cache.set(root_path, result)
+    return result
 
 
 @router.get("/disk")
 async def disk_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
+    cache: Annotated[TtlCache[DiskRootItem], Depends(_get_disk_preview_cache)],
 ) -> DiskResponse:
     """Disk usage per configured library root, plus a ranked preview of what a
-    pressure sweep WOULD evict from each (never evicts anything itself)."""
+    pressure sweep WOULD evict from each (never evicts anything itself).
+
+    TTL-cached per root (~15s) — see :func:`_disk_root_item` — so the Status
+    page's ~15s poll never re-hammers Plex/the filesystem on every tick.
+    """
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
     grace_days = await get_eviction_grace_days(session)
@@ -391,6 +441,7 @@ async def disk_endpoint(
                 media_type="movie",
                 root_path=movies_root,
                 grace_days=grace_days,
+                cache=cache,
             )
         )
     if tv_root:
@@ -402,6 +453,7 @@ async def disk_endpoint(
                 media_type="tv",
                 root_path=tv_root,
                 grace_days=grace_days,
+                cache=cache,
             )
         )
     return DiskResponse(roots=roots)
@@ -411,6 +463,7 @@ async def disk_endpoint(
 async def evict_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort, Depends(get_library)],
+    cache: Annotated[TtlCache[DiskRootItem], Depends(_get_disk_preview_cache)],
 ) -> EvictResponse:
     """Manually trigger a pressure-triggered eviction sweep across every
     configured root — the north-star #1 button: free space on demand.
@@ -426,6 +479,12 @@ async def evict_endpoint(
     task runs, just invoked synchronously instead of on a timer. Requires Plex
     (409 ``service_not_configured`` otherwise — watch state can't be resolved
     without it); an unset root is simply skipped, not an error.
+
+    Invalidates :func:`_get_disk_preview_cache` after the sweep: without this,
+    ``GET /disk`` would keep serving the pre-eviction snapshot (stale
+    candidates the operator just deleted, stale free-space gauge) for up to
+    its ~15s TTL, contradicting north-star #3 for the very endpoint that IS
+    the correction button.
     """
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
@@ -454,6 +513,14 @@ async def evict_endpoint(
                 grace_days=grace_days,
             )
         )
+
+    # The sweep just deleted files and/or changed watch-derived eligibility
+    # for whatever it touched — the cached preview (candidates + free-space
+    # gauge) is now stale for every root, not just the ones with outcomes
+    # (freed space shifts the usage gauge too). Clear it so the very next
+    # GET /disk reflects this sweep instead of serving up to ~15s of
+    # pre-eviction state back to the operator who just clicked the button.
+    cache.clear()
 
     return EvictResponse(
         evicted=[

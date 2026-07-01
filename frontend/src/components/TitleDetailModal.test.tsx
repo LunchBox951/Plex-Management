@@ -296,6 +296,7 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test Show',
       status: 'partially_available',
       is_anime: false,
+      keep_forever: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'failed' },

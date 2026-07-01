@@ -12,7 +12,11 @@ controlled, small total so each candidate's ``size_percent`` is meaningful.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import time
+from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -41,6 +45,43 @@ _NOW = datetime.now(UTC)
 _GRACE_DAYS = 30
 _STALE = _NOW - timedelta(days=_GRACE_DAYS + 10)
 _RECENT = _NOW - timedelta(days=1)
+
+
+async def _heartbeat_ticks_during[T](
+    awaitable: Awaitable[T], *, tick_seconds: float = 0.01
+) -> tuple[T, int]:
+    """Run ``awaitable`` while counting a concurrent ``asyncio.sleep`` heartbeat's
+    completed ticks -- the non-blocking-event-loop regression guard shared by
+    every ``asyncio.to_thread`` offload test below.
+
+    If ``awaitable`` truly never blocks the loop (every synchronous FS/disk
+    primitive it calls is off-loaded via ``asyncio.to_thread`` onto a worker
+    thread), the heartbeat keeps ticking on its own schedule throughout,
+    regardless of how long a *blocking* primitive (a real ``time.sleep``, not
+    ``asyncio.sleep``) takes inside that thread. If ``awaitable`` instead calls
+    that same blocking primitive INLINE (no thread offload), the single event
+    loop is frozen for its whole duration and the heartbeat cannot advance at
+    all until ``awaitable`` returns -- so a near-zero tick count is the
+    regression signature this catches.
+    """
+    ticks = 0
+    stop = False
+
+    async def _heartbeat() -> None:
+        nonlocal ticks
+        while not stop:
+            await asyncio.sleep(tick_seconds)
+            ticks += 1
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        result = await awaitable
+    finally:
+        stop = True
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+    return result, ticks
 
 
 async def _movie(
@@ -611,3 +652,168 @@ async def test_stops_once_the_target_is_reached(
     assert [o.title for o in outcomes] == ["Big (200b)"]
     assert not Path(big_path).exists()
     assert Path(small_path).exists()
+
+
+# --------------------------------------------------------------------------- #
+# Non-blocking event loop (OP1): every blocking FS primitive this module calls
+# from an async function MUST run via ``asyncio.to_thread`` -- ``_size_bytes``
+# (candidate sizing), ``fs.delete`` (the actual eviction), and
+# ``read_disk_usage`` (the pressure check + the preview). Each test below
+# monkeypatches the relevant primitive with a REAL, synchronous ``time.sleep``
+# (never ``asyncio.sleep``, which would never block the loop either way,
+# threaded or not) and proves a concurrent heartbeat coroutine keeps ticking
+# throughout -- the regression this guards against is exactly the "candidate
+# sizing / the delete / disk reads are called synchronously inside async
+# functions, blocking the event loop" bug.
+# --------------------------------------------------------------------------- #
+
+_SLOW_SECONDS = 0.3
+_MIN_TICKS_IF_OFFLOADED = 10  # ~0.3s / 0.01s tick, with generous scheduling slack
+
+
+class _SlowDeleteFileSystem:
+    """A minimal :class:`~plex_manager.ports.filesystem.FileSystemPort` whose
+    ``delete`` blocks synchronously for ``_SLOW_SECONDS`` (simulating a huge
+    ``shutil.rmtree``) -- every other method is unused by eviction and simply
+    never implemented."""
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def available_bytes(self, path: Path) -> int:
+        raise NotImplementedError
+
+    def move(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def largest_video_file(self, root: str) -> str | None:
+        raise NotImplementedError
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        time.sleep(_SLOW_SECONDS)
+        self.deleted.append(path)
+
+
+async def test_size_bytes_lookup_is_offloaded_and_never_blocks_the_event_loop(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_path = _movie_file(tmp_path, "Old Movie.mkv")
+    await _movie(sessionmaker_, tmdb_id=200, title="Old Movie", library_path=library_path)
+    library = FakeLibrary(
+        watch_states={(200, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    def _slow_size_bytes(_path: str) -> int | None:
+        time.sleep(_SLOW_SECONDS)
+        return 1024
+
+    monkeypatch.setattr(eviction_service, "_size_bytes", _slow_size_bytes)
+
+    async with sessionmaker_() as session:
+        outcomes, ticks = await _heartbeat_ticks_during(
+            eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+        )
+
+    assert [o.title for o in outcomes] == ["Old Movie"]
+    assert ticks >= _MIN_TICKS_IF_OFFLOADED
+
+
+async def test_fs_delete_is_offloaded_and_never_blocks_the_event_loop(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "Old Movie.mkv")
+    await _movie(sessionmaker_, tmdb_id=201, title="Old Movie", library_path=library_path)
+    library = FakeLibrary(
+        watch_states={(201, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = _SlowDeleteFileSystem()
+
+    async with sessionmaker_() as session:
+        outcomes, ticks = await _heartbeat_ticks_during(
+            eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+        )
+
+    assert [o.title for o in outcomes] == ["Old Movie"]
+    assert fs.deleted == [library_path]
+    assert ticks >= _MIN_TICKS_IF_OFFLOADED
+
+
+async def test_read_disk_usage_in_run_eviction_sweep_is_offloaded(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    def _slow_disk_usage(_path: str) -> DiskUsage:
+        time.sleep(_SLOW_SECONDS)
+        return DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=900)
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _slow_disk_usage)
+
+    async with sessionmaker_() as session:
+        outcomes, ticks = await _heartbeat_ticks_during(
+            eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+        )
+
+    assert outcomes == []  # no candidates seeded -- only the offload matters here
+    assert ticks >= _MIN_TICKS_IF_OFFLOADED
+
+
+async def test_read_disk_usage_in_preview_candidates_is_offloaded(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = FakeLibrary()
+
+    def _slow_disk_usage(_path: str) -> DiskUsage:
+        time.sleep(_SLOW_SECONDS)
+        return DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=900)
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _slow_disk_usage)
+
+    async with sessionmaker_() as session:
+        candidates, ticks = await _heartbeat_ticks_during(
+            eviction_service.preview_candidates(
+                session=session,
+                library=library,
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+            )
+        )
+
+    assert candidates == []
+    assert ticks >= _MIN_TICKS_IF_OFFLOADED

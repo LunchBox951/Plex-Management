@@ -37,6 +37,7 @@ already used by ``web/app.py``'s reconcile loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import time
@@ -117,7 +118,13 @@ class TtlCache[V]:
         self._store[key] = (time.monotonic() + self._ttl, value)
 
     def clear(self) -> None:
-        """Drop every cached entry. Test-isolation helper, not used in production."""
+        """Drop every cached entry.
+
+        A test-isolation helper AND the production invalidation hook
+        ``POST /evict`` calls on the disk-preview cache after a sweep — see
+        ``web.routers.ops.evict_endpoint`` — so a stale pre-eviction snapshot
+        is never served back to the operator who just triggered the sweep.
+        """
         self._store.clear()
 
 
@@ -389,6 +396,16 @@ def read_disk_usage(path: str) -> DiskUsage:
     Shared verbatim by the health dashboard's per-root gauge and the eviction
     pressure check (:mod:`plex_manager.services.eviction_service`) — see the
     module docstring on why the two features must read the SAME number.
+
+    Synchronous (a plain ``statvfs`` syscall under the hood) — a hung/
+    unresponsive NFS/SMB mount can stall this call indefinitely, so every
+    ``async def`` caller MUST run it via ``await asyncio.to_thread(...)``
+    rather than inline, or it would freeze the whole event loop, not just its
+    own request. :func:`collect_disk_gauges` (below) is itself plain/sync for
+    the same reason :func:`_size_bytes` in ``eviction_service`` is: it is the
+    caller's job to offload the whole thing in one hop (mirrors
+    ``import_service``'s ``asyncio.to_thread``-wrapped copy) rather than
+    threading each individual root one at a time.
     """
     usage = shutil.disk_usage(path)
     return DiskUsage(root=path, total_bytes=usage.total, available_bytes=usage.free)
@@ -401,6 +418,12 @@ def collect_disk_gauges(roots: dict[str, str | None]) -> list[DiskGauge]:
     gauge. A configured-but-unreadable root is NOT skipped: it is reported with
     ``error`` set and zeroed byte counts, so a broken mount is visible on the
     dashboard rather than silently vanishing from it.
+
+    Deliberately plain ``def`` (not ``async``): it may call :func:`read_disk_usage`
+    (blocking) once per configured root. :func:`collect_health_snapshot` is the
+    ONLY caller and runs the whole thing via ``await asyncio.to_thread(...)`` —
+    see that function — so a stalled mount blocks a worker thread, never the
+    event loop.
     """
     gauges: list[DiskGauge] = []
     for label, path in roots.items():
@@ -449,10 +472,15 @@ async def collect_health_snapshot(
 
     ``library_roots`` is a label -> path mapping (e.g.
     ``{"movies_root": ..., "tv_root": ...}``); see :func:`collect_disk_gauges`.
+
+    ``collect_disk_gauges`` is run via ``asyncio.to_thread`` -- it calls the
+    blocking ``shutil.disk_usage`` once per configured root, and a hung/
+    unresponsive NFS/SMB mount must never freeze this (or any other request's)
+    event-loop turn while a health poll waits on it.
     """
     subsystems = await check_subsystems(client, creds, cache)
     subsystems.append(await check_database(session))
-    disks = collect_disk_gauges(library_roots)
+    disks = await asyncio.to_thread(collect_disk_gauges, library_roots)
     return HealthSnapshot(
         subsystems=tuple(subsystems),
         disks=tuple(disks),

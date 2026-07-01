@@ -8,11 +8,14 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.ports.repositories import LogEventCreate, LogEventPage, LogEventRecord
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services.log_capture_service import (
     CapturedLogRecord,
@@ -273,6 +276,85 @@ async def test_drain_once_batch_inserts_every_queued_record(sessionmaker_: Sessi
         page = await repo.list_events(limit=10)
     assert page.total == 2
     assert queue.empty()
+
+
+class _FailingRepo:
+    """A :class:`~plex_manager.ports.repositories.LogEventRepository` whose
+    ``create_many`` always raises -- simulates a DB failure mid-drain (a lock
+    timeout, a connection drop). Every other method is unused by ``drain_once``
+    and simply never implemented."""
+
+    async def create(
+        self,
+        *,
+        level: str,
+        logger: str,
+        message: str,
+        created_at: datetime | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> LogEventRecord:
+        raise NotImplementedError
+
+    async def create_many(self, events: Sequence[LogEventCreate]) -> None:
+        raise RuntimeError("db unavailable")
+
+    async def list_events(
+        self,
+        *,
+        level: str | None = None,
+        since: datetime | None = None,
+        logger: str | None = None,
+        correlation_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> LogEventPage:
+        raise NotImplementedError
+
+    async def prune_older_than(self, cutoff: datetime) -> int:
+        raise NotImplementedError
+
+
+async def test_drain_failure_counts_the_whole_lost_batch_as_dropped(
+    test_logger: logging.Logger,
+) -> None:
+    """Regression: before this fix, a drain-tick DB failure silently discarded
+    the whole dequeued batch WITHOUT touching ``dropped_count`` -- ``GET
+    /ops/logs/tail`` would report ``dropped_count=0`` even though records were
+    genuinely lost. ``drain_once`` must both (a) still propagate the failure
+    (the caller logs it and keeps looping) and (b) add the lost batch's size to
+    ``handler.dropped_count`` so that counter stays honest."""
+    handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+    test_logger.addHandler(handler)
+    test_logger.info("one -- will be lost")
+    test_logger.warning("two -- will be lost")
+    await asyncio.sleep(0)
+    assert handler.queue.qsize() == 2
+    assert handler.dropped_count == 0
+
+    with pytest.raises(RuntimeError, match="db unavailable"):
+        await drain_once(handler.queue, _FailingRepo(), handler=handler)
+
+    # The batch was dequeued (drain_once always pulls everything currently
+    # queued before attempting the insert) and is now gone -- but the failure
+    # is still counted, not silently swallowed.
+    assert handler.queue.empty()
+    assert handler.dropped_count == 2
+
+
+async def test_drain_failure_without_a_handler_still_propagates(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``handler`` is optional (defaults to ``None``) -- a caller that only
+    cares about the insert itself (no handler in scope) still sees the
+    failure propagate, it just has nothing to increment."""
+    queue: asyncio.Queue[CapturedLogRecord] = asyncio.Queue()
+    queue.put_nowait(
+        CapturedLogRecord(
+            created_at=datetime.now(UTC), level="INFO", logger="x", message="one", context=None
+        )
+    )
+    with pytest.raises(RuntimeError, match="db unavailable"):
+        await drain_once(queue, _FailingRepo())
 
 
 async def test_prune_once_removes_only_records_older_than_retention(

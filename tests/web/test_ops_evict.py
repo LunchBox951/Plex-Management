@@ -137,6 +137,51 @@ async def test_evict_still_runs_when_the_automatic_switch_is_disabled(
     assert not movie_file.exists()
 
 
+async def test_evict_invalidates_the_cached_disk_preview(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # Regression guard: GET /disk's preview is TTL-cached (~15s, see
+    # ``_get_disk_preview_cache``). Without invalidating it here, a poll
+    # immediately after this manual sweep would keep serving the pre-eviction
+    # snapshot -- the just-deleted title still listed as an evictable
+    # candidate, and the stale (lower) free-space gauge -- for up to that
+    # whole TTL, right after the operator clicked the very button meant to
+    # correct it.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    # Populate the cache with the pre-eviction snapshot.
+    before = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    assert before.status_code == 200
+    before_root = before.json()["roots"][0]
+    assert len(before_root["candidates"]) == 1
+    assert before_root["candidates"][0]["title"] == "Stale Movie"
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 200
+    assert len(response.json()["evicted"]) == 1
+    assert not movie_file.exists()
+
+    # A poll immediately after -- well within the ~15s TTL -- must reflect the
+    # sweep (the just-deleted title dropped from the candidate list), never
+    # the cached pre-eviction snapshot the reviewer flagged.
+    after = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    assert after.status_code == 200
+    after_root = after.json()["roots"][0]
+    assert after_root["candidates"] == []
+
+
 async def test_evict_never_touches_a_pinned_keep_forever_title(
     client: httpx.AsyncClient,
     app: FastAPI,

@@ -21,6 +21,9 @@ three pieces:
    (deliberately NOT re-entering this module's own handler in a way that could
    recurse: the drain task logs through the SAME root logger, but a DB failure
    during drain does not re-attempt a synchronous DB write from inside emit()).
+   The whole lost batch is also added to :attr:`LogCaptureHandler.dropped_count`
+   (via ``drain_once``'s ``handler`` argument) so that counter stays honest
+   about EVERY INFO+ record that missed durable storage, not just a full queue.
 3. A **retention sweep** (:func:`prune_once`) deletes ``log_events`` rows older
    than the web-editable ``log_retention_days`` setting, keeping the table's
    growth bounded.
@@ -173,11 +176,16 @@ class LogCaptureHandler(logging.Handler):
     via ``call_soon_threadsafe`` rather than touching the queue directly.
 
     ``dropped_count`` is incremented (never raised, never itself logged — that
-    would risk a self-feeding loop under sustained pressure) whenever the queue
-    is full; it is exposed for the health/log-viewer surfaces to report honestly
-    that some INFO+ records did not make it to durable storage this tick. The
-    ring buffer (the live tail) is unaffected by queue pressure — it is a
-    separate, always-appended structure.
+    would risk a self-feeding loop under sustained pressure) whenever an INFO+
+    record fails to reach durable storage: either the queue is full (here, in
+    :meth:`_enqueue`) OR a drain tick's batch insert itself fails (an entire
+    dequeued batch is discarded on a DB error — see :func:`drain_once`'s
+    ``handler`` parameter). It is exposed for the health/log-viewer surfaces to
+    report HONESTLY (never understating) how many INFO+ records did not make it
+    to durable storage since startup — the docstring on ``GET /ops/logs/tail``
+    promises exactly that, not merely "dropped for being full". The ring buffer
+    (the live tail) is unaffected by either case — it is a separate,
+    always-appended structure.
 
     ``ring_buffer`` itself is a plain ``deque`` (no lock) because a single
     ``append`` is an atomic C-level op under the GIL — safe from any thread.
@@ -291,7 +299,12 @@ def stop_logging(handler: LogCaptureHandler, *, logger: logging.Logger | None = 
     target.removeHandler(handler)
 
 
-async def drain_once(queue: asyncio.Queue[CapturedLogRecord], repo: LogEventRepository) -> int:
+async def drain_once(
+    queue: asyncio.Queue[CapturedLogRecord],
+    repo: LogEventRepository,
+    *,
+    handler: LogCaptureHandler | None = None,
+) -> int:
     """Drain everything CURRENTLY queued (non-blocking) into one batch insert.
 
     Never awaits for more to arrive — a fixed, non-blocking drain of whatever is
@@ -301,6 +314,16 @@ async def drain_once(queue: asyncio.Queue[CapturedLogRecord], repo: LogEventRepo
     caller, which is expected to catch it, log it, and keep looping — draining
     must never accumulate an unbounded backlog just because one tick's insert
     failed, nor may it crash the process.
+
+    The whole dequeued batch is lost on a failed insert (never re-queued — the
+    items are already off ``queue`` by then, and re-queueing risks an
+    unbounded backlog behind a persistently-broken DB). ``handler``, when
+    given, has its :attr:`LogCaptureHandler.dropped_count` incremented by the
+    LOST batch's size before the exception is re-raised, so that counter stays
+    truthful about EVERY INFO+ record that missed durable storage — not just
+    the queue-full case :meth:`LogCaptureHandler._enqueue` already counts.
+    Optional (defaults to ``None``) so a caller that only cares about the
+    insert itself (e.g. a unit test) is unaffected.
     """
     batch: list[LogEventCreate] = []
     while True:
@@ -319,7 +342,12 @@ async def drain_once(queue: asyncio.Queue[CapturedLogRecord], repo: LogEventRepo
         )
     if not batch:
         return 0
-    await repo.create_many(batch)
+    try:
+        await repo.create_many(batch)
+    except Exception:
+        if handler is not None:
+            handler.dropped_count += len(batch)
+        raise
     return len(batch)
 
 
