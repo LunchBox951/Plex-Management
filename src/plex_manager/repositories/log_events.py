@@ -177,8 +177,17 @@ class SqlLogEventRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return LogEventPage(total=total, results=[_to_record(row) for row in rows])
 
-    async def prune_older_than(self, cutoff: datetime) -> int:
+    async def prune_older_than(
+        self,
+        cutoff: datetime,
+        *,
+        logger_equals: str | None = None,
+        exclude_logger: bool = False,
+    ) -> int:
         stmt = delete(LogEvent).where(LogEvent.created_at < cutoff)
+        if logger_equals is not None:
+            matches = LogEvent.logger == logger_equals
+            stmt = stmt.where(~matches if exclude_logger else matches)
         # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
         # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it).
         # The cast target is referenced at runtime (not a string) so CodeQL does

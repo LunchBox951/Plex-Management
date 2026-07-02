@@ -59,6 +59,8 @@ __all__ = [
     "LOG_PRUNE_INTERVAL_SECONDS",
     "QUEUE_MAXSIZE",
     "RING_BUFFER_MAXLEN",
+    "TELEMETRY_LOGGER_NAME",
+    "TELEMETRY_LOG_RETENTION_DAYS",
     "CapturedLogRecord",
     "LogCaptureHandler",
     "configure_logging",
@@ -87,6 +89,25 @@ LOG_DRAIN_INTERVAL_SECONDS: Final = 2.0
 #: ``DELETE ... WHERE created_at < cutoff`` is a single indexed range delete, so
 #: this need not run anywhere near as often as the drain itself.
 LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
+
+#: The retention-telemetry sweep's own logger name (``services.
+#: retention_telemetry_service`` constructs its module logger from THIS
+#: constant, not ``__name__`` — see that module's docstring), and its
+#: dedicated retention window in days. Beta-week telemetry (ADR-0012 follow-up:
+#: a DELETE-NOTHING periodic observer logging what a pressure sweep WOULD do)
+#: is exactly the dataset the beta needs to survive the WHOLE week, not just
+#: whatever ``log_retention_days`` the operator has set — the general default
+#: is 7 days, which would otherwise prune day-1 telemetry before day 7 even
+#: arrives. Rather than bumping the general retention (which would also retain
+#: ordinary noisy INFO/WARNING/ERROR chatter far longer than needed, growing
+#: ``log_events`` for no benefit), :func:`prune_once` gives rows from THIS one
+#: logger their own, longer cutoff — using the existing ``LogEvent.logger``
+#: column as the marker, no schema change. 30 days is a fixed, generous margin
+#: over one beta week; not (yet) a web-editable setting for week 1 — the
+#: "smallest honest change" the beta blueprint asks for, not a new knob nobody
+#: has asked to tune yet.
+TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.retention_telemetry_service"
+TELEMETRY_LOG_RETENTION_DAYS: Final = 30
 
 #: Third-party HTTP client loggers that MUST be kept quieter than whatever the
 #: operator sets ``config.log_level`` to. ``httpx`` logs ``"HTTP Request: %s %s
@@ -398,12 +419,29 @@ async def drain_once(
 
 
 async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
-    """Delete every ``log_events`` row older than ``retention_days``.
+    """Delete every stale ``log_events`` row -- TWO separate cutoffs, TWO deletes.
 
-    Returns the number of rows removed. ``retention_days <= 0`` is treated as
-    "keep nothing older than now" rather than skipped — an operator who
-    deliberately sets it to 0 gets the honest behaviour, not a silently ignored
-    setting.
+    Every logger EXCEPT :data:`TELEMETRY_LOGGER_NAME` is pruned on the
+    operator-editable ``retention_days`` (the web-editable ``log_retention_days``
+    setting, default 7) exactly as before. Rows FROM that one logger are pruned
+    separately on the fixed, longer :data:`TELEMETRY_LOG_RETENTION_DAYS` instead —
+    so a short ``log_retention_days`` (even the default 7) can never prune the
+    beta-week retention-telemetry dataset before the week is up. See
+    :data:`TELEMETRY_LOGGER_NAME`'s docstring for the full rationale.
+
+    Returns the total rows removed across both deletes. ``retention_days <= 0``
+    is treated as "keep nothing older than now" rather than skipped for the
+    ordinary cutoff — an operator who deliberately sets it to 0 gets the honest
+    behaviour, not a silently ignored setting; the telemetry cutoff is
+    unaffected by that setting either way (see above).
     """
-    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-    return await repo.prune_older_than(cutoff)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=retention_days)
+    pruned = await repo.prune_older_than(
+        cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=True
+    )
+    telemetry_cutoff = now - timedelta(days=TELEMETRY_LOG_RETENTION_DAYS)
+    pruned += await repo.prune_older_than(
+        telemetry_cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=False
+    )
+    return pruned

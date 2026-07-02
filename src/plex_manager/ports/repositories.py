@@ -566,12 +566,30 @@ class LogEventRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def prune_older_than(self, cutoff: datetime) -> int:
+    async def prune_older_than(
+        self,
+        cutoff: datetime,
+        *,
+        logger_equals: str | None = None,
+        exclude_logger: bool = False,
+    ) -> int:
         """Delete every record with ``created_at < cutoff``; return the count removed.
 
         The retention sweep's bounded-growth mechanism (the web-editable
         ``log_retention_days`` setting) -- honesty over silence still applies
         here: this never masks a failure, and the real count lets the sweep log
         what it actually did rather than assuming success.
+
+        ``logger_equals`` optionally scopes the delete to rows whose ``logger``
+        column matches exactly (``None`` = no scoping, every stale row). Combined
+        with ``exclude_logger`` this gives the retention-telemetry sweep
+        (``services.retention_telemetry_service``) its OWN, longer retention
+        window without a schema change: :func:`~plex_manager.services.
+        log_capture_service.prune_once` calls this twice per tick -- once with
+        ``exclude_logger=True`` (the ordinary ``log_retention_days`` cutoff,
+        skipping telemetry rows entirely) and once with ``exclude_logger=False``
+        (telemetry rows only, on their own longer cutoff) -- so a short
+        operator-configured ``log_retention_days`` can never prune telemetry data
+        out from under the beta-week analysis before it is used.
         """
         raise NotImplementedError

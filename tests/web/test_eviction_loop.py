@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.library import LibraryPort, WatchState
+from plex_manager.services import retention_telemetry_service
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import EVICTION_INTERVAL_MINUTES_DEFAULT, SettingsStore
 from tests.web.fakes import FakeLibrary
@@ -132,6 +133,140 @@ async def test_eviction_disabled_setting_is_a_master_kill_switch(
     # Everything else was primed to trigger an eviction -- only the disabled
     # setting stopped it (never a terminal, always a settings toggle).
     assert movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available
+
+
+# --------------------------------------------------------------------------- #
+# Retention telemetry (ADR-0012 follow-up): a DELETE-NOTHING sweep that only
+# runs when the SAME tick's pressure gate does NOT fire -- proving (a) it never
+# changes eviction's own outcome when pressure DOES fire (byte-identical to the
+# tests above) and (b) it DOES run, exactly once, when pressure does not.
+# --------------------------------------------------------------------------- #
+
+
+async def test_telemetry_sweep_runs_when_the_pressure_gate_does_not_fire(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        # Unreachable -- real disk usage can never hit this, so the pressure
+        # gate never fires and the real sweep evicts nothing either way.
+        await store.set("disk_pressure_threshold_percent", "101")
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    calls: list[str] = []
+
+    async def _fake_sweep(**kwargs: object) -> None:
+        calls.append(kwargs["root_path"])  # type: ignore[index]
+
+    monkeypatch.setattr(retention_telemetry_service, "run_retention_telemetry_sweep", _fake_sweep)
+
+    app = _app(sessionmaker_)
+    try:
+        await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert calls == [str(tmp_path)]
+    # Delete-nothing: the pressure gate never fired, so nothing was evicted --
+    # the telemetry sweep never touches the real eviction outcome either way.
+    assert movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available
+
+
+async def test_telemetry_sweep_does_not_run_when_the_pressure_gate_fires(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Byte-identical eviction behaviour when pressure fires: telemetry is
+    strictly additive to the below-threshold case, never invoked (and never
+    interfering) once the real sweep is about to act."""
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    # _seed's default threshold/target are both "0" -- always trips.
+    await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    calls: list[str] = []
+
+    async def _fake_sweep(**kwargs: object) -> None:
+        calls.append(kwargs["root_path"])  # type: ignore[index]
+
+    monkeypatch.setattr(retention_telemetry_service, "run_retention_telemetry_sweep", _fake_sweep)
+
+    app = _app(sessionmaker_)
+    try:
+        await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert calls == []  # never invoked -- pressure fired, the real sweep handled it
+    assert not movie_file.exists()  # the real eviction still ran, unaffected
+
+
+async def test_telemetry_sweep_failure_never_prevents_the_real_eviction(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug in the delete-nothing telemetry sweep must never take down (or
+    skip) the real eviction sweep for the SAME root -- they are wired as two
+    independent steps, the telemetry one wrapped in its own try/except."""
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("disk_pressure_threshold_percent", "101")  # gate never fires
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    async def _boom_sweep(**_kwargs: object) -> None:
+        raise RuntimeError("telemetry sweep exploded")
+
+    monkeypatch.setattr(retention_telemetry_service, "run_retention_telemetry_sweep", _boom_sweep)
+
+    app = _app(sessionmaker_)
+    try:
+        # Must not raise -- the tick itself survives the telemetry failure.
+        await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    # The gate never fired (threshold=101), so the request is still available
+    # regardless -- this test's real point is simply that the RuntimeError
+    # above never escaped _eviction_tick.
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
         assert row is not None

@@ -27,14 +27,16 @@ from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentE
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.config import get_settings
 from plex_manager.db import get_sessionmaker
+from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     eviction_service,
     import_service,
     log_capture_service,
     queue_service,
+    retention_telemetry_service,
 )
-from plex_manager.services.health_service import ReconcileStatus
+from plex_manager.services.health_service import ReconcileStatus, read_disk_usage
 from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     ServiceNotConfiguredError,
@@ -248,7 +250,11 @@ async def _log_drain_loop(app: FastAPI) -> None:
 
 
 async def _eviction_tick(app: FastAPI) -> float:
-    """One disk-pressure eviction pass across every configured root.
+    """One disk-pressure eviction pass across every configured root — plus,
+    for any root whose pressure gate does NOT fire this tick, a DELETE-NOTHING
+    retention-telemetry sweep (:func:`~plex_manager.services.
+    retention_telemetry_service.run_retention_telemetry_sweep`) logging what a
+    sweep WOULD have evicted, on the SAME tick/interval (no new scheduler).
 
     Returns the FRESHLY-read ``eviction_interval_minutes`` (in seconds) for
     :func:`_eviction_loop` to sleep — so a web-edited interval takes effect on
@@ -256,7 +262,10 @@ async def _eviction_tick(app: FastAPI) -> float:
     thresholds, grace, proactive) is likewise re-read every tick for the same
     reason. ``eviction_enabled=False`` short-circuits BOTH the pressure-triggered
     and the proactive sweep — the master, in-app "turn this bot off" switch
-    (north-star #1: a correction is always a settings toggle, never a terminal).
+    (north-star #1: a correction is always a settings toggle, never a terminal)
+    — and, deliberately, the telemetry sweep too: it is part of the SAME
+    eviction subsystem tick, so turning eviction off also stops its extra
+    per-tick Plex watch-state polling.
     """
     sessionmaker = app.state.sessionmaker
     client = app.state.http_client
@@ -286,6 +295,40 @@ async def _eviction_tick(app: FastAPI) -> float:
         for media_type, root in roots:
             if not root:
                 continue
+
+            # Retention telemetry (delete-nothing, ADR-0012 follow-up): only when
+            # THIS root's pressure gate would NOT fire this tick -- the real sweep
+            # below is about to evict nothing anyway (below threshold_pct), so
+            # this is the one case where the operator otherwise learns nothing
+            # about what a cleanup policy would need. A root the sweep itself
+            # cannot read (missing mount) is treated the same as "gate fired" --
+            # never a false "safe to snapshot" signal -- and run_eviction_sweep
+            # below independently logs/skips it exactly as before, unaffected by
+            # this decision. Wrapped in its OWN try/except so a telemetry bug can
+            # never prevent (or be silently masked by) the real eviction sweep
+            # for this same root.
+            try:
+                pressure_would_fire = (
+                    used_percent(await asyncio.to_thread(read_disk_usage, root)) >= threshold_pct
+                )
+            except OSError:
+                pressure_would_fire = True
+            if not pressure_would_fire:
+                try:
+                    await retention_telemetry_service.run_retention_telemetry_sweep(
+                        session=session,
+                        library=library,
+                        media_type=media_type,
+                        root_path=root,
+                        grace_days=grace_days,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "retention telemetry sweep failed for %s root %s; continuing",
+                        media_type,
+                        root,
+                    )
+
             evicted = await eviction_service.run_eviction_sweep(
                 session=session,
                 library=library,
