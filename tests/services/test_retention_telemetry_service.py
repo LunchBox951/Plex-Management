@@ -129,6 +129,7 @@ async def test_sweep_emits_the_expected_aggregate_and_per_candidate_events(
     aggregate_message = records[0].getMessage()
     assert "1 eviction candidate(s)" in aggregate_message
     assert "100 byte(s)" in aggregate_message  # the whole (100b) file -- total_bytes >= size
+    assert "1 available watched title(s)" in aggregate_message
     # _STALE is 40 days idle -- lands in the 30-60d bucket, every other bucket is 0.
     assert "30-60d=1" in aggregate_message
     assert "<7d=0" in aggregate_message
@@ -174,11 +175,22 @@ async def test_sweep_leaves_the_interval_unknown_without_a_completed_at(
     assert "completed_to_first_watch=unknown" in records[1].getMessage()
 
 
-async def test_sweep_reports_zero_candidates_for_a_within_grace_watched_title(
+async def test_within_grace_watched_title_is_tracked_for_time_to_watch_but_not_evictable(
     sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A title watched within grace is NOT a would-evict candidate, but IS still
+    captured in the time-to-watch dataset (idle-age distribution + per-title
+    interval) -- this is the whole point during a sub-30-day beta, where every
+    watched title is by definition within a 30-day grace."""
     library_path = _movie_file(tmp_path, "Recently Watched.mkv")
-    await _movie(sessionmaker_, tmdb_id=2, title="Recently Watched", library_path=library_path)
+    completed_at = _RECENT - timedelta(days=2)
+    await _movie(
+        sessionmaker_,
+        tmdb_id=2,
+        title="Recently Watched",
+        library_path=library_path,
+        completed_at=completed_at,
+    )
     library = FakeLibrary(
         watch_states={(2, "movie", None): WatchState(watched=True, last_viewed_at=_RECENT)}
     )
@@ -195,8 +207,22 @@ async def test_sweep_reports_zero_candidates_for_a_within_grace_watched_title(
             )
 
     records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
-    assert len(records) == 1  # only the (zero-candidate) aggregate event -- no per-title event
-    assert "0 eviction candidate(s)" in records[0].getMessage()
+    # Aggregate + one per-title event: within grace, so NOT an eviction candidate,
+    # but STILL an available watched title tracked for time-to-watch.
+    assert len(records) == 2
+    aggregate_message = records[0].getMessage()
+    assert "0 eviction candidate(s)" in aggregate_message  # within grace -- not evictable
+    assert "0 byte(s)" in aggregate_message  # nothing would free
+    assert "1 available watched title(s)" in aggregate_message
+    # _RECENT is 1 day idle -- lands in the pre-grace <7d bucket (previously
+    # unreachable, now populated -- the primary week-1 signal).
+    assert "<7d=1" in aggregate_message
+    assert "30-60d=0" in aggregate_message
+
+    per_candidate = records[1].getMessage()
+    assert "Recently Watched" in per_candidate
+    assert completed_at.isoformat() in per_candidate
+    assert _RECENT.isoformat() in per_candidate
     assert Path(library_path).exists()  # delete-nothing, even for a non-candidate
 
 
@@ -227,7 +253,13 @@ async def test_sweep_reports_zero_candidates_for_a_keep_forever_pinned_title(
             )
 
     records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
-    assert "0 eviction candidate(s)" in records[0].getMessage()  # pinned -- never a candidate
+    # Pinned (keep_forever) is excluded from BOTH products -- not a would-evict
+    # candidate AND not counted as an available watched title -- so only the
+    # aggregate event fires, with zeros across the board.
+    assert len(records) == 1
+    aggregate_message = records[0].getMessage()
+    assert "0 eviction candidate(s)" in aggregate_message
+    assert "0 available watched title(s)" in aggregate_message
     assert Path(library_path).exists()
 
 

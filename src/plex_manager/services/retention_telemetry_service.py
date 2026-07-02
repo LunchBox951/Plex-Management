@@ -14,18 +14,42 @@ This module answers exactly that, without touching a single byte on disk or a
 single database row's status: on the SAME periodic tick the eviction loop
 already runs (``web/app.py``'s ``_eviction_loop`` — no new scheduler), whenever
 that tick finds a root's disk usage BELOW the pressure threshold (so the real
-eviction sweep would have evicted nothing anyway), it runs the exact same
-candidate ranking eviction would have used — :func:`~plex_manager.services.
-eviction_service.preview_candidates`, which itself calls :func:`~plex_manager.
-domain.eviction.rank_eviction_candidates` (no pressure gate) — and logs what
-that ranking found. Nothing here calls ``fs.delete``, flips a status, or writes
-``download_history``; the candidate list is read-only input to two ``logging``
-calls.
+eviction sweep would have evicted nothing anyway), it assembles the root's
+candidates ONCE and logs two DISTINCT products from that one read.
 
-Because :func:`~plex_manager.services.eviction_service.rank_eviction_candidates`
-already drops any candidate with no recorded Plex view (``last_viewed_at is
-None``), every candidate this sweep sees already has watch state — "where watch
-state exists" from the blueprint is true of the whole list by construction, no
+The two products are deliberately DECOUPLED, because they answer different
+questions and a single grace filter cannot serve both:
+
+* The **would-evict aggregate** (candidate count + estimated would-free bytes)
+  answers "what would a pressure sweep delete *right now*", so it is scoped to
+  the REAL ``grace_days`` (default 30) — the exact set the pressure sweep would
+  pick — via :func:`~plex_manager.domain.eviction.rank_eviction_candidates` at
+  the real grace cutoff.
+* The **time-to-watch dataset** (the idle-age distribution + one
+  completed_at→first-watch interval per available title/season) answers "how
+  long after a title finishes importing does someone actually get around to
+  watching it" — and that must cover EVERY available watched title regardless
+  of idle age, or it captures nothing during the one-week beta this sweep
+  exists to serve (in a seven-day window NO title can have been idle past a
+  30-day grace, so a grace-filtered read would return ``[]`` on every tick and
+  the whole primary dataset — plus the pre-grace <7d/7-14d/14-30d buckets —
+  would be permanent dead weight).
+
+So the single candidate read is done with ``grace_days=0`` (every available,
+watched, unpinned, not-in-flight title/season, regardless of idle age — the
+superset both products need); the would-evict subset is then re-derived from
+that superset with the real grace cutoff, entirely in memory, no second Plex/FS
+pass. A second :func:`~plex_manager.services.eviction_service.preview_candidates`
+call would re-run every title's fresh Plex ``watch_state`` AND a full ``os.walk``
+on every below-pressure tick — exactly the redundant cost ``run_eviction_sweep``'s
+own pressure pre-check goes out of its way to avoid. Nothing here calls
+``fs.delete``, flips a status, or writes ``download_history``; the candidate
+list is read-only input to the ``logging`` calls.
+
+Because :func:`~plex_manager.domain.eviction.rank_eviction_candidates` already
+drops any candidate with no recorded Plex view (``last_viewed_at is None``),
+every candidate this sweep sees already has watch state — "where watch state
+exists" from the blueprint is true of the whole list by construction, no
 separate filter needed.
 
 Logged to a DEDICATED logger (:data:`~plex_manager.services.
@@ -44,9 +68,10 @@ import asyncio
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, Literal
 
+from plex_manager.domain.eviction import rank_eviction_candidates
 from plex_manager.models import MediaRequest, SeasonRequest
 from plex_manager.services import eviction_service
 from plex_manager.services.health_service import read_disk_usage
@@ -65,11 +90,14 @@ __all__ = ["run_retention_telemetry_sweep"]
 # literals that could silently drift apart if either module is ever renamed.
 _logger = logging.getLogger(TELEMETRY_LOGGER_NAME)
 
-# Idle-age (now - last_viewed_at) buckets for the per-root distribution. The
-# last boundary is implicit (anything >= the final explicit boundary falls into
-# the final label) -- see _bucket_label. Chosen to bracket the beta's own
-# default 30-day eviction_grace_days: <7d/7-14d/14-30d cover the pre-grace
-# range, 30-60d/60-90d/90d+ cover how far PAST grace watched content tends to
+# Idle-age (now - last_viewed_at) buckets for the per-root distribution, taken
+# over EVERY available watched title (the grace_days=0 read), not just the
+# would-evict subset -- so the pre-grace buckets actually populate during the
+# beta's own sub-30-day window. The last boundary is implicit (anything >= the
+# final explicit boundary falls into the final label) -- see _bucket_label.
+# Chosen to bracket the beta's own default 30-day eviction_grace_days:
+# <7d/7-14d/14-30d cover the pre-grace range (the primary week-1 time-to-watch
+# signal), 30-60d/60-90d/90d+ cover how far PAST grace watched content tends to
 # sit unevicted absent disk pressure -- exactly the shape needed to judge
 # whether a proactive (non-pressure) sweep is worth turning on.
 _AGE_BUCKET_BOUNDARIES_DAYS: Final[tuple[float, ...]] = (7.0, 14.0, 30.0, 60.0, 90.0)
@@ -194,18 +222,25 @@ async def run_retention_telemetry_sweep(
     redundant: when pressure DID fire, the real sweep's own outcome log already
     tells the operator what happened.
 
-    Two log calls per invocation, both through the dedicated
-    ``TELEMETRY_LOGGER_NAME`` logger:
+    A SINGLE candidate read (``preview_candidates`` with ``grace_days=0`` — every
+    available watched, unpinned, not-in-flight title/season regardless of idle
+    age) feeds two DECOUPLED products (see the module docstring for the full
+    rationale); the would-evict subset is re-derived from that superset in
+    memory with the real grace cutoff, no second Plex/FS pass.
 
-    1. ONE aggregate event: candidate count, the summed estimated would-free
-       bytes (converted from each candidate's ``size_percent`` back to bytes
-       using THIS root's real total capacity — the same estimate basis
-       ``eviction_service`` itself uses before a delete), and the watch-idle
-       age distribution (now - ``last_viewed_at``, bucketed).
-    2. One event PER candidate: its completed_at -> last_viewed_at interval
-       (see :func:`_candidate_context` for what "completed_at" means per media
-       kind), with ``request_id``/``tmdb_id`` passed via ``extra={}`` (never
-       interpolated into the message).
+    Log calls, all through the dedicated ``TELEMETRY_LOGGER_NAME`` logger:
+
+    1. ONE aggregate event: the would-evict candidate count and summed estimated
+       would-free bytes (the real-``grace_days`` subset — what a pressure sweep
+       would pick right now — with bytes converted from each candidate's
+       ``size_percent`` back using THIS root's real total capacity, the same
+       estimate basis ``eviction_service`` itself uses before a delete), the
+       count of available watched titles, and the watch-idle age distribution
+       (now - ``last_viewed_at``, bucketed) over ALL of them.
+    2. One event PER available watched title/season: its completed_at ->
+       last_viewed_at interval (see :func:`_candidate_context` for what
+       "completed_at" means per media kind), with ``request_id``/``tmdb_id``
+       passed via ``extra={}`` (never interpolated into the message).
 
     An unreadable ``root_path`` (missing mount, permission denied) skips the
     whole sweep for this root, logged as a WARNING on this module's own
@@ -229,18 +264,32 @@ async def run_retention_telemetry_sweep(
         )
         return
 
-    candidates = await eviction_service.preview_candidates(
+    moment = now if now is not None else datetime.now(UTC)
+
+    # ONE candidate read for BOTH products: grace_days=0 relaxes ONLY the grace
+    # floor, so this is every available, watched, unpinned, not-in-flight
+    # title/season regardless of idle age -- the superset the time-to-watch
+    # products need (see the module docstring on why a real-grace read captures
+    # nothing during the beta's own sub-30-day window).
+    watched = await eviction_service.preview_candidates(
         session=session,
         library=library,
         media_type=media_type,
         root_path=root_path,
-        grace_days=grace_days,
+        grace_days=0,
     )
 
-    moment = now if now is not None else datetime.now(UTC)
+    # The would-evict subset is that same superset re-filtered by the REAL grace
+    # floor -- grace_days=0 dropped ONLY the grace check, so re-running the
+    # domain's own ranking with the real cutoff reproduces the pressure sweep's
+    # candidate set exactly, without re-deriving grace logic here (the domain
+    # owns "eligible"). Uses ``moment`` (not preview_candidates' internal now)
+    # so an injected test clock drives both products consistently.
+    grace_cutoff = moment - timedelta(days=grace_days)
+    evict_candidates = rank_eviction_candidates(watched, grace_cutoff)
+
     bucket_counts: dict[str, int] = dict.fromkeys(_AGE_BUCKET_LABELS, 0)
-    would_free_bytes = 0
-    for candidate in candidates:
+    for candidate in watched:
         # rank_eviction_candidates (inside preview_candidates) already dropped
         # every candidate with last_viewed_at is None -- see the module
         # docstring -- so this ``continue`` is unreachable in practice; kept as
@@ -252,20 +301,25 @@ async def run_retention_telemetry_sweep(
             continue
         age_days = (moment - last_viewed_at).total_seconds() / 86400.0
         bucket_counts[_bucket_label(age_days)] += 1
-        if disk.total_bytes > 0:
+
+    would_free_bytes = 0
+    if disk.total_bytes > 0:
+        for candidate in evict_candidates:
             would_free_bytes += round(candidate.size_percent / 100.0 * disk.total_bytes)
 
     _logger.info(
         "retention telemetry: %s root %s has %d eviction candidate(s) if pressure "
-        "fired right now (~%d byte(s) estimated would free); idle-age distribution: %s",
+        "fired right now (~%d byte(s) estimated would free); %d available watched "
+        "title(s), idle-age distribution: %s",
         media_type,
         root_path,
-        len(candidates),
+        len(evict_candidates),
         would_free_bytes,
+        len(watched),
         _format_buckets(bucket_counts),
     )
 
-    for candidate in candidates:
+    for candidate in watched:
         last_viewed_at = candidate.last_viewed_at
         if last_viewed_at is None:
             continue  # unreachable per the same invariant noted above
