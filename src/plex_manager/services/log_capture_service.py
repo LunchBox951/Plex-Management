@@ -109,6 +109,13 @@ LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
 TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.retention_telemetry_service"
 TELEMETRY_LOG_RETENTION_DAYS: Final = 30
 
+#: The level the retention-telemetry logger is pinned to (in
+#: :func:`configure_logging`), independent of the operator's ``config.log_level``.
+#: The telemetry sweep logs its beta dataset at INFO; without this pin, a WARNING/
+#: ERROR operator floor would filter those records at the ``_logger.info`` call
+#: BEFORE the durable-log handler ever saw them (see :func:`configure_logging`).
+_TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
+
 #: Third-party HTTP client loggers that MUST be kept quieter than whatever the
 #: operator sets ``config.log_level`` to. ``httpx`` logs ``"HTTP Request: %s %s
 #: ..."`` at INFO — the SECOND ``%s`` is the request's full URL — and every
@@ -345,6 +352,21 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     way; a caller passing a non-root ``logger`` (tests, mainly) still gets the
     same quieting so no test path silently relies on the child not having it.
 
+    Symmetrically, pins the retention-telemetry logger
+    (:data:`TELEMETRY_LOGGER_NAME`) to :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so
+    its INFO records reach the durable ``log_events`` sink at ANY operator
+    ``level``. The handler is attached to the ROOT logger, and the telemetry
+    logger is a NON-propagation-broken descendant of root, so its records flow up
+    to that handler on the normal ``propagate=True`` path — but ONLY if they are
+    created in the first place. Left at the inherited effective level, an operator
+    running at WARNING/ERROR would drop every INFO telemetry record at the
+    ``_logger.info`` call site (``isEnabledFor`` short-circuits before any handler
+    runs), and the beta dataset would silently never persist. Pinning THIS one
+    logger to INFO (not the root, which would un-quiet ALL of the app's INFO
+    chatter and spam the operator's floor) lets exactly the telemetry records
+    through; the LogCaptureHandler itself has no level filter, so once created
+    they reach its DB queue regardless of the root logger's own level.
+
     Returns the handler so the caller (``web/app.py``'s ``lifespan``) can store it
     (e.g. on ``app.state.log_handler``) for the drain task and the future log
     viewer / export endpoints to read from, and detach it again on shutdown via
@@ -357,6 +379,7 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target.setLevel(_resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
+    logging.getLogger(TELEMETRY_LOGGER_NAME).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler
 
 

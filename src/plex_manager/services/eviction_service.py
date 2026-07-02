@@ -65,7 +65,12 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.repositories import RequestRecord
 
-__all__ = ["EvictionOutcome", "preview_candidates", "run_eviction_sweep"]
+__all__ = [
+    "EvictionOutcome",
+    "assemble_candidates",
+    "preview_candidates",
+    "run_eviction_sweep",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -518,6 +523,41 @@ async def _evict_one(
     )
 
 
+async def assemble_candidates(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    media_type: Literal["movie", "tv"],
+    root_path: str,
+    root_total_bytes: int,
+) -> list[EvictionCandidate]:
+    """Assemble every ``available`` movie / TV-season under ``root_path`` into a
+    RAW :class:`~plex_manager.domain.eviction.EvictionCandidate` list -- fresh
+    Plex watch state + a walked on-disk size per row -- with NO grace or
+    eligibility filtering applied. The caller decides what to filter.
+
+    This is the raw superset behind BOTH :func:`preview_candidates` (which simply
+    ranks it) and the retention-telemetry sweep (which needs the ranked /
+    would-evict subsets AND every row with any recorded view -- including a
+    started-but-unfinished season the eligibility filter drops -- from one read).
+    Read-only: never deletes, never flips a status, never writes history.
+
+    ``root_total_bytes`` is threaded in (rather than read here) so each
+    candidate's ``size_percent`` is measured against the right root capacity from
+    the SAME :func:`~plex_manager.services.health_service.read_disk_usage` the
+    caller already performed for its own pressure/skip decision -- one disk-usage
+    syscall per sweep, not two. A caller that has not read it can pass any
+    consistent total; ``0`` yields ``size_percent=0.0`` for every candidate (an
+    honest "unknown share", never a fabricated guess).
+    """
+    pairs = (
+        await _movie_candidates(session, library, root_total_bytes, root_path)
+        if media_type == "movie"
+        else await _season_candidates(session, library, root_total_bytes, root_path)
+    )
+    return [candidate for candidate, _pending in pairs]
+
+
 async def preview_candidates(
     *,
     session: AsyncSession,
@@ -551,12 +591,13 @@ async def preview_candidates(
         )
         return []
 
-    pairs = (
-        await _movie_candidates(session, library, disk.total_bytes, root_path)
-        if media_type == "movie"
-        else await _season_candidates(session, library, disk.total_bytes, root_path)
+    candidates = await assemble_candidates(
+        session=session,
+        library=library,
+        media_type=media_type,
+        root_path=root_path,
+        root_total_bytes=disk.total_bytes,
     )
-    candidates = [candidate for candidate, _pending in pairs]
     grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
     return rank_eviction_candidates(candidates, grace_cutoff)
 

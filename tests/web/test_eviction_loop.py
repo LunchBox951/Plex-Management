@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
@@ -271,6 +272,66 @@ async def test_telemetry_sweep_failure_never_prevents_the_real_eviction(
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status is RequestStatus.available
+
+
+async def test_telemetry_failure_rolls_back_so_the_real_eviction_still_writes(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A telemetry sweep that raises a SQLAlchemy error leaves the SHARED tick
+    session in a poisoned (aborted) transaction. Without a rollback in the tick's
+    telemetry except path, the real eviction sweep's own reads/writes on that same
+    session would then raise too -- a telemetry bug silently BLOCKING eviction,
+    the exact "telemetry can never block eviction" guarantee this subsystem
+    promises. The tick must roll the session back so the real eviction still
+    commits in the same tick.
+
+    Threshold is set unreachable (101) so the pressure gate never fires: the
+    telemetry sweep runs (and poisons the session) while the pressure sweep evicts
+    nothing. Proactive eviction -- which ignores pressure and evicts past-grace
+    watched content -- is what actually WRITES here, proving the real eviction
+    succeeds after the rollback.
+    """
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("disk_pressure_threshold_percent", "101")  # gate never fires
+        await store.set("eviction_proactive_enabled", "true")
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    async def _poisoning_sweep(**kwargs: object) -> None:
+        session = kwargs["session"]
+        # A statement that fails, aborting the shared transaction the real
+        # eviction sweep is about to reuse (mirrors a mid-telemetry DB error).
+        await session.execute(text("SELECT * FROM a_table_that_does_not_exist"))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        retention_telemetry_service, "run_retention_telemetry_sweep", _poisoning_sweep
+    )
+
+    app = _app(sessionmaker_)
+    try:
+        # Must not raise: the tick survives the poisoned telemetry AND still evicts.
+        await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    # The proactive eviction ran and committed on the rolled-back session.
+    assert not movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.evicted
 
 
 class _StopLoop(Exception):

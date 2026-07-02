@@ -321,6 +321,8 @@ async def _eviction_tick(app: FastAPI) -> float:
                         media_type=media_type,
                         root_path=root,
                         grace_days=grace_days,
+                        threshold_pct=threshold_pct,
+                        target_pct=target_pct,
                     )
                 except Exception:
                     _logger.exception(
@@ -328,6 +330,26 @@ async def _eviction_tick(app: FastAPI) -> float:
                         media_type,
                         root,
                     )
+                    # The telemetry sweep shares THIS tick's session with the real
+                    # eviction sweep just below. A SQLAlchemy failure mid-telemetry
+                    # leaves that session in a poisoned (aborted) transaction, so
+                    # run_eviction_sweep's own reads/writes would then raise too --
+                    # a telemetry bug silently blocking the REAL eviction, which is
+                    # exactly the "telemetry can never block eviction" guarantee
+                    # this subsystem promises. Roll the session back to a clean
+                    # state before the eviction sweep runs. The rollback is itself
+                    # guarded: if it also fails, log and continue -- run_eviction_sweep
+                    # will surface any genuinely broken session honestly rather than
+                    # being masked here.
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        _logger.exception(
+                            "rollback after a failed retention telemetry sweep for "
+                            "%s root %s also failed; continuing",
+                            media_type,
+                            root,
+                        )
 
             evicted = await eviction_service.run_eviction_sweep(
                 session=session,
