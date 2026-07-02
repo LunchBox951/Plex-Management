@@ -31,6 +31,7 @@ from plex_manager.domain.state_machine import (
     DownloadState,
     is_legal_transition,
 )
+from plex_manager.logsafe import safe_int
 from plex_manager.models import (
     BlocklistReason,
     Download,
@@ -311,7 +312,7 @@ async def mark_failed(
             qbt,
             row.torrent_hash,
             context="an operator mark-failed",
-            extra={"torrent_hash": row.torrent_hash, "download_id": download_id},
+            extra={"torrent_hash": row.torrent_hash, "download_id": safe_int(download_id)},
         )
 
     failed = await download_repo.get_by_hash(row.torrent_hash)
