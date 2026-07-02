@@ -265,13 +265,24 @@ class SqlRequestRepository:
         season completing re-enters here but the ``None`` guard leaves the first
         stamp intact, so ``completed_at`` honestly records the show's FIRST
         completion, never the latest.
+        The stamp is a single conditional UPDATE (``WHERE completed_at IS
+        NULL``), not read-check-write: two seasons of the same show importing
+        concurrently each hold only their own per-download lock, so an
+        identity-map read here can be stale -- the guarded statement lets
+        exactly one writer win and the first stamp stand.
         """
-        row = await self._session.get(MediaRequest, request_id)
-        if row is None:
-            raise LookupError(f"media request {request_id} does not exist")
-        if row.completed_at is None:
-            row.completed_at = datetime.now(UTC)
-            await self._session.flush()
+        result = await self._session.execute(
+            update(MediaRequest)
+            .where(MediaRequest.id == request_id, MediaRequest.completed_at.is_(None))
+            .values(completed_at=datetime.now(UTC))
+            .execution_options(synchronize_session="fetch")
+        )
+        if isinstance(result, CursorResult) and result.rowcount == 0:
+            row = await self._session.get(MediaRequest, request_id)
+            if row is None:
+                raise LookupError(f"media request {request_id} does not exist")
+            # Already stamped (possibly by a concurrent sibling-season import):
+            # the FIRST stamp stands, nothing to do.
 
     async def set_library_path(self, request_id: int, library_path: str) -> None:
         """Store the final placed path this request's import wrote into (ADR-0012)."""
