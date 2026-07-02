@@ -205,7 +205,7 @@ async def _recompute_parent(
             "parent rollup write skipped: a newer active "
             "request already occupies the active-dedup slot for this show; the "
             "season's own status/history are unaffected",
-            extra={"request_id": media_request_id},
+            extra={"request_id": safe_int(media_request_id)},
         )
 
 

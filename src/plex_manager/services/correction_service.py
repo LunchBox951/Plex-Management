@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from plex_manager.domain.state_machine import DownloadState
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
     DownloadHistory,
@@ -292,7 +293,7 @@ async def report_issue(
     is_tv = target.season is not None
     media_type = "tv" if is_tv else "movie"
     season_note = f" season {target.season}" if target.season is not None else ""
-    log_extra: dict[str, object] = {"request_id": request_id, "tmdb_id": request.tmdb_id}
+    log_extra: dict[str, object] = {"request_id": safe_int(request_id), "tmdb_id": request.tmdb_id}
 
     # Resolve the culprit release from the imported download for (request, season).
     download_repo = SqlDownloadRepository(session)
@@ -331,14 +332,14 @@ async def report_issue(
             _logger.warning(
                 "report-issue purge of %r refused by the filesystem guard (%s); "
                 "re-searching anyway (a stale/misconfigured breadcrumb)",
-                request.title,
+                safe_text(request.title),
                 purge.detail,
                 extra=log_extra,
             )
         elif purge.outcome is PurgeOutcome.error:
             _logger.warning(
                 "report-issue purge of %r failed (%s); re-searching anyway",
-                request.title,
+                safe_text(request.title),
                 purge.detail,
                 extra=log_extra,
             )
@@ -348,7 +349,7 @@ async def report_issue(
         # never a guessed path, and the re-search below still runs.
         _logger.warning(
             "report-issue: no stored library_path for %r; nothing to purge",
-            request.title,
+            safe_text(request.title),
             extra=log_extra,
         )
 
@@ -421,7 +422,7 @@ async def report_issue(
             _logger.warning(
                 "report-issue re-grab for %r failed (%s); parking as "
                 "no_acceptable_release (retryable)",
-                request.title,
+                safe_text(request.title),
                 type(exc).__name__,
                 extra=log_extra,
             )
@@ -498,7 +499,7 @@ async def cancel_request(
             qbt,
             row.torrent_hash,
             context="a cancel",
-            extra={"torrent_hash": row.torrent_hash, "request_id": request_id},
+            extra={"torrent_hash": row.torrent_hash, "request_id": safe_int(request_id)},
         )
         # Move the download row out of the active set so the reconciler stops
         # tracking it and the queue drops it. Reuse the existing terminal ``Failed``
