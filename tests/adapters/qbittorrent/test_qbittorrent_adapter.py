@@ -13,6 +13,7 @@ import base64
 import hashlib
 import os
 import socket
+import ssl
 from typing import Any
 
 import httpcore
@@ -538,6 +539,62 @@ class _RecordingBackend(httpcore.AsyncNetworkBackend):
         _ = seconds
 
 
+class _DummyNetworkStream(httpcore.AsyncNetworkStream):
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        _ = max_bytes, timeout
+        return b""
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        _ = buffer, timeout
+
+    async def aclose(self) -> None:
+        return None
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = ssl_context, server_hostname, timeout
+        return self
+
+    def get_extra_info(self, info: str) -> Any:
+        _ = info
+        return None
+
+
+class _FailFirstBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        if len(self.hosts) == 1:
+            raise httpcore.ConnectError("first address failed")
+        return _DummyNetworkStream()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
 async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -557,6 +614,24 @@ async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
 
     assert delegate.hosts == ["93.184.216.34"]
     assert calls == 1
+
+
+async def test_safe_fetch_backend_tries_next_vetted_dns_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80)),
+        ]
+
+    delegate = _FailFirstBackend()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    stream = await SafeFetchNetworkBackend(delegate).connect_tcp("indexer.example", 80)
+
+    assert isinstance(stream, _DummyNetworkStream)
+    assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
 
 
 async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:

@@ -364,16 +364,24 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
         try:
-            address = _safe_fetch_addresses(host, port)[0]
+            addresses = _safe_fetch_addresses(host, port)
         except QbittorrentError as exc:
             raise httpcore.ConnectError("unsafe torrent source URL") from exc
-        return await self._delegate.connect_tcp(
-            address,
-            port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
+        last_error: httpcore.ConnectError | None = None
+        for address in addresses:
+            try:
+                return await self._delegate.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except httpcore.ConnectError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise httpcore.ConnectError("unsafe torrent source URL")
 
     async def connect_unix_socket(
         self,
