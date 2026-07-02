@@ -82,6 +82,19 @@ _TERMINAL_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     )
 )
 
+# Season statuses at which a season's content is imported and on disk -- watchable
+# now (``available``, Plex-confirmed) or awaiting Plex confirmation (``completed``,
+# "Finalizing"). These are exactly the moments a MOVIE stamps its parent's
+# ``completed_at`` (``SqlRequestRepository.mark_completed``/``.mark_available``);
+# ``_recompute_parent`` stamps the TV parent's ``completed_at`` the first time ANY
+# tracked season reaches one of them (see there). ``evicted`` is deliberately
+# EXCLUDED: its file is gone, so an eviction-time rollup must never be mistaken for
+# a fresh completion -- and the eviction path never stamps anyway (it runs with
+# ``tolerate_active_conflict=True``, which skips the stamp; see _recompute_parent).
+_REAL_DONE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value for s in (RequestStatus.completed, RequestStatus.available)
+)
+
 
 async def _recompute_parent(
     session: AsyncSession, media_request_id: int, *, tolerate_active_conflict: bool = False
@@ -94,6 +107,14 @@ async def _recompute_parent(
     tracked seasons yet (should not happen once ``ensure_seasons`` has run at
     least once) is a no-op rather than a crash -- ``rollup_status`` itself raises
     on an empty sequence, so guard before calling it.
+
+    Besides the rollup ``status``, this also stamps the parent's ``completed_at``
+    the first time any tracked season is imported/on disk
+    (``completed``/``available``) -- the TV analogue of the movie-level stamp in
+    ``mark_completed``/``mark_available`` (which a computed TV rollup never runs),
+    so ``MediaRequest.completed_at`` is no longer permanently ``None`` for a TV
+    request. See the inline comment on that stamp for the season-level (not
+    rollup-level) check and why it is confined to the strict, non-eviction branch.
 
     ``tolerate_active_conflict`` (default ``False`` -- unchanged for every normal
     season transition, which must keep recomputing the rollup STRICTLY so dedup
@@ -121,12 +142,29 @@ async def _recompute_parent(
     if not seasons:
         return
     status = rollup_status([season.status for season in seasons])
+    request_repo = SqlRequestRepository(session)
     if not tolerate_active_conflict:
-        await SqlRequestRepository(session).set_status(media_request_id, status)
+        await request_repo.set_status(media_request_id, status)
+        # Stamp the parent's FIRST-completion timestamp the first time any tracked
+        # season is imported/on disk (``completed``/``available``). A TV
+        # ``MediaRequest.status`` is a pure fold of its seasons and never goes
+        # through the movie-level ``mark_completed``/``mark_available`` that stamp
+        # ``completed_at`` directly, so without this the parent's ``completed_at``
+        # stays ``None`` forever and every TV time-to-watch interval reads
+        # "unknown" (retention_telemetry_service). Checked at the SEASON level, not
+        # off ``status``: rollup precedence (``downloading`` etc.) can mask a
+        # just-completed season while a sibling is still in flight, but the show's
+        # first completion has still happened. Idempotent via the ``is None`` guard
+        # in the repo -- a later season completing never moves the first stamp. Only
+        # in this strict (forward-transition) branch: the ``tolerate_active_conflict``
+        # path below is eviction's alone, and an eviction (file gone) is never a
+        # completion -- see ``_REAL_DONE_SEASON_STATUS_VALUES``.
+        if any(season.status in _REAL_DONE_SEASON_STATUS_VALUES for season in seasons):
+            await request_repo.stamp_completed_at_if_unset(media_request_id)
         return
     try:
         async with session.begin_nested():
-            await SqlRequestRepository(session).set_status(media_request_id, status)
+            await request_repo.set_status(media_request_id, status)
     except IntegrityError:
         # A NEWER active request for the same (tmdb_id, media_type) already holds
         # ``uq_media_requests_active``'s slot -- the parent rollup write collided,

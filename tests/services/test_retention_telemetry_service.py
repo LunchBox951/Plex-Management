@@ -1024,3 +1024,80 @@ async def test_telemetry_records_reach_the_db_sink_at_a_warning_operator_floor(
     assert page.total >= 2
     assert all(r.logger == _TELEMETRY_LOGGER for r in page.results)
     assert any("retention telemetry" in r.message for r in page.results)
+
+
+async def test_per_title_emission_budget_defers_overflow_and_loses_nothing(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-4 finding #1: a per-title burst larger than a sweep's emission budget
+    must NOT be cached-as-emitted then silently dropped when the ``LogCaptureHandler``
+    queue overruns (the logging API can't report a per-record enqueue failure). Each
+    sweep emits at most the budget, reports the honest ``deferred_rows``, leaves the
+    overflow UN-cached, and the next tick emits exactly the remainder -- every row
+    eventually emitted, none lost, none duplicated."""
+    # A tiny budget keeps the test fast: 5 watched titles, budget of 3 -> a 2-row
+    # overflow the first sweep must defer rather than drop.
+    monkeypatch.setattr(retention_telemetry_service, "_PER_SWEEP_EMISSION_BUDGET", 3)
+    tmdb_ids = list(range(101, 106))
+    for i, tmdb in enumerate(tmdb_ids):
+        await _movie(
+            sessionmaker_,
+            tmdb_id=tmdb,
+            title=f"Burst Movie {i}",
+            library_path=_movie_file(tmp_path, f"Burst {i}.mkv"),
+            completed_at=_STALE - timedelta(days=2),  # positive, post-import interval
+        )
+    library = FakeLibrary(
+        watch_states={
+            (tmdb, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+            for tmdb in tmdb_ids
+        }
+    )
+
+    async def _sweep() -> None:
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    def _telemetry_records() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+
+    def _per_title(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+        return [r for r in records if "completed_to_last_watch=" in r.getMessage()]
+
+    def _aggregates(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+        return [r for r in records if "eligible eviction candidate(s)" in r.getMessage()]
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        await _sweep()  # sweep 1: emits budget=3, defers 2
+        first = _telemetry_records()
+        assert len(_per_title(first)) == 3  # exactly the budget, not all five
+        assert "deferred_rows=2" in _aggregates(first)[-1].getMessage()
+        await _sweep()  # sweep 2: emits the deferred 2 (the first 3 are now deduped)
+
+    records = _telemetry_records()
+    per_title = _per_title(records)
+    # Nothing lost, nothing duplicated: all five titles emitted exactly once across
+    # the two sweeps (the deferred tail was un-cached, so the second sweep picked it
+    # up -- and the already-emitted three were deduped, never re-sent).
+    assert len(per_title) == 5
+    emitted_tmdb: list[int] = []
+    for r in per_title:
+        value = getattr(r, "tmdb_id", None)  # set via extra={}, so not a static attr
+        assert isinstance(value, int)
+        emitted_tmdb.append(value)
+    assert sorted(emitted_tmdb) == tmdb_ids
+    # The second sweep drained the remainder with an honest deferred_rows=0.
+    assert "deferred_rows=0" in _aggregates(records)[-1].getMessage()

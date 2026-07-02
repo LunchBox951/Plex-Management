@@ -190,6 +190,24 @@ _logger = logging.getLogger(TELEMETRY_LOGGER_NAME)
 _last_emitted_watch: dict[tuple[int | None, str, int | None], datetime] = {}
 
 
+#: Max per-title ``completed_to_last_watch`` rows a SINGLE sweep will EMIT. Chosen
+#: to stay WELL under ``log_capture_service.QUEUE_MAXSIZE`` (2000) -- it MUST, and
+#: this is why: the ``LogCaptureHandler``'s durable-sink queue is bounded and, when
+#: a burst overruns it between drain ticks, silently drops the NEWEST record
+#: (``_enqueue`` -> ``QueueFull`` -> ``dropped_count += 1``). The ``logging`` API
+#: gives the caller here NO signal that a record failed to enqueue, so a per-title
+#: burst larger than the queue's remaining headroom would be recorded in
+#: ``_last_emitted_watch`` as "emitted" yet never reach ``log_events`` -- the row
+#: is then silently lost until that title's ``last_viewed_at`` next advances. This
+#: budget bounds each sweep's burst so it cannot by itself overrun the queue, and
+#: -- crucially -- the emission loop caches ONLY the rows it actually emits this
+#: sweep, leaving any overflow past the budget UN-cached so the next tick (default
+#: 30m) re-attempts it. Self-pacing, no logging-API surgery: nothing is lost, only
+#: paced. When a sweep truncates, the aggregate reports the honest ``deferred_rows``
+#: count so the pacing is visible, never swallowed.
+_PER_SWEEP_EMISSION_BUDGET: Final = 200
+
+
 async def _reclaimable_bytes(fs: FileSystemPort, candidate: EvictionCandidate) -> int:
     """Best-effort hardlink-aware reclaimable footprint of ``candidate`` in bytes.
 
@@ -320,14 +338,19 @@ async def _candidate_context(
     TV: ``candidate.request_id`` is the ``SeasonRequest`` id. ``SeasonRequest``
     carries no completion timestamp of its own (ADR-0012 never added one, and a
     delete-nothing telemetry sweep is not the place to add a migration for it —
-    see the module docstring's "no schema change" constraint), so
-    ``completed_at`` here is the PARENT SHOW's ``MediaRequest.completed_at``:
-    exact for a single-season show, an honest APPROXIMATION for a later season
-    of a multi-season show (it reflects whenever the show's FIRST tracked
-    season completed, not necessarily this one). This is a documented, known
-    limitation, not a silently assumed precision -- if week-1 telemetry shows
-    this caveat matters for the analysis, a follow-up can add a per-season
-    ``completed_at`` column with its own migration.
+    see the module docstring's "no schema change" constraint), so ``completed_at``
+    here is the PARENT SHOW's ``MediaRequest.completed_at`` -- stamped by
+    ``season_request_service._recompute_parent`` the first time any tracked season
+    reaches ``completed``/``available`` (the per-season analogue of the movie
+    ``mark_completed`` stamp; before that fix a TV parent's ``completed_at`` was
+    NEVER stamped and every TV interval read "unknown"). Exact for a single-season
+    show, an honest APPROXIMATION for a later season of a multi-season show (it
+    reflects whenever the show's FIRST tracked season completed, not necessarily
+    this one). This is a documented, known limitation, not a silently assumed
+    precision -- if week-1 telemetry shows this caveat matters for the analysis, a
+    follow-up can add a per-season ``completed_at`` column with its own migration.
+    A parent still carrying ``None`` (a row imported before the stamp existed)
+    resolves to ``completed_at=None`` and the caller logs "unknown" -- see below.
 
     A missing row (deleted out from under a slow-running sweep) resolves to
     ``completed_at=None`` and ``tmdb_id=None`` -- the caller logs "unknown"
@@ -589,12 +612,46 @@ async def run_retention_telemetry_sweep(
         if context.completed_at is not None and last_viewed < context.completed_at
     )
 
+    # Decide which per-title rows this sweep will EMIT, in order, BEFORE the
+    # aggregate logs -- so the aggregate can honestly report how many the emission
+    # budget defers to the next tick (``deferred_rows``). A row is emittable when:
+    #   * its watch has ADVANCED since the last row emitted for it (the dedupe that
+    #     stops a steady watch state re-logging every 30m tick -- see
+    #     ``_last_emitted_watch``); and
+    #   * its view is NOT pre-import (a negative interval, already tallied in
+    #     ``preexisting_watch_count`` and never emitted -- and never cached, so a
+    #     genuine later post-import play still emits).
+    # Intra-sweep duplicates of a key collapse to the first occurrence (``queued_keys``),
+    # mirroring what the cache would do across the emission loop below. Nothing is
+    # cached HERE (this is a read-only decision pass); the cache is written only as
+    # each row is actually emitted, so the deferred tail stays un-cached and retries.
+    to_emit: list[tuple[EvictionCandidate, datetime, _CandidateContext]] = []
+    queued_keys: set[tuple[int | None, str, int | None]] = set()
+    for candidate, last_viewed, context in watch_rows:
+        dedupe_key = (context.tmdb_id, candidate.media_type, candidate.season)
+        if _last_emitted_watch.get(dedupe_key) == last_viewed:
+            continue
+        if dedupe_key in queued_keys:
+            continue
+        if context.completed_at is not None and last_viewed < context.completed_at:
+            continue
+        queued_keys.add(dedupe_key)
+        to_emit.append((candidate, last_viewed, context))
+
+    # Per-sweep emission budget (see ``_PER_SWEEP_EMISSION_BUDGET``): a burst larger
+    # than the log queue's headroom could otherwise be cached as emitted yet silently
+    # dropped by the handler. Emit at most the budget this tick; the overflow is
+    # deferred (un-cached) to the next tick and surfaced here as ``deferred_rows``.
+    deferred_rows = max(0, len(to_emit) - _PER_SWEEP_EMISSION_BUDGET)
+
     _logger.info(
         "retention telemetry: %s root %s -- %d eligible eviction candidate(s) "
         "(~%d byte(s)); of those, %d would_evict now to relieve %.1f%%->%.1f%% "
         "pressure (~%d byte(s) reclaimable, hardlink-aware); %d title(s) with "
         "recorded watch activity, idle-age distribution: %s; excluded (kept "
-        "honest, never deleted): no_path=%d, guard_refused=%d, preexisting_watch=%d",
+        "honest, never deleted): no_path=%d, guard_refused=%d, preexisting_watch=%d; "
+        "deferred_rows=%d (per-title rows beyond this sweep's emission budget, "
+        "retried next tick)",
         media_type,
         root_path,
         len(eligible),
@@ -608,26 +665,18 @@ async def run_retention_telemetry_sweep(
         no_path_count,
         guard_refused_count,
         preexisting_watch_count,
+        deferred_rows,
     )
 
-    for candidate, last_viewed, context in watch_rows:
-        # In-process dedupe: skip a per-title row whose last_viewed_at has not
-        # advanced since the last one emitted for this title/season, so a steady
-        # watch state does not re-emit an identical row on every below-pressure
-        # tick (see ``_last_emitted_watch``). The per-ROOT aggregate above still
-        # emits every sweep.
+    # Emit at most the budget's worth this sweep; the deferred tail
+    # (``to_emit[_PER_SWEEP_EMISSION_BUDGET:]``) is intentionally left UN-cached so
+    # the next tick re-attempts it. The dedupe/pre-import filtering already happened
+    # in the decision pass above, so this loop only formats + emits + caches.
+    for candidate, last_viewed, context in to_emit[:_PER_SWEEP_EMISSION_BUDGET]:
+        # Cache ONLY now, as this row is actually emitted (never in the decision
+        # pass): the whole point of the budget is that a row recorded as emitted
+        # here has been handed to the logging call below, not deferred.
         dedupe_key = (context.tmdb_id, candidate.media_type, candidate.season)
-        if _last_emitted_watch.get(dedupe_key) == last_viewed:
-            continue
-        # A view that PREDATES completion (re-imported / previously-watched title)
-        # has no post-import interval to report -- skip the row (already tallied in
-        # the aggregate's ``preexisting_watch_count`` above) rather than emit a
-        # negative completed_to_last_watch that corrupts the dataset. Not cached in
-        # ``_last_emitted_watch`` (nothing was emitted for it), so if a genuine
-        # post-import play later advances ``last_viewed_at`` past completion, that
-        # real interval still emits.
-        if context.completed_at is not None and last_viewed < context.completed_at:
-            continue
         _last_emitted_watch[dedupe_key] = last_viewed
         if context.completed_at is not None:
             interval_repr = f"{(last_viewed - context.completed_at).total_seconds():.0f}s"
