@@ -334,23 +334,48 @@ async def run_grab_cycle(
                 )
                 grabbed += 1
             except (
-                NoGrabSourceError,
                 AlreadyDownloadingError,
-                DownloadScopeConflictError,
                 RequestNotActiveError,
                 SeasonRequiredError,
-                GrabError,
             ) as exc:
-                # Honest, expected edge/concurrency cases (e.g. a manual grab raced
-                # us to the request's single active slot). Discard any partial
-                # write and leave the scope as-is for the next cycle -- never a
-                # crash of the whole cycle, never a secret in the log.
+                # Concurrency/shape cases where the scope will NOT be re-selected
+                # next cycle, so leaving its schedule untouched cannot loop:
+                # ``AlreadyDownloadingError`` -> the scope now has an active
+                # download and is skipped BEFORE it costs a search; the two others
+                # -> the scope is terminal / mis-shaped and out of
+                # ``DUE_SEARCH_STATUSES`` (or rejected up front). Discard any
+                # partial write and leave the scope as-is -- never a crash of the
+                # whole cycle, never a secret in the log.
                 await session.rollback()
                 _logger.warning(
                     "auto-grab: grab refused (%s); leaving scope for a later cycle",
                     type(exc).__name__,
                     extra={"request_id": scope.request_id},
                 )
+            except (
+                NoGrabSourceError,
+                GrabError,
+                DownloadScopeConflictError,
+            ) as exc:
+                # A release WAS accepted but cannot be grabbed right now: no usable
+                # source (``NoGrabSourceError``), no derivable info-hash to track by
+                # (``GrabError``), or the same physical torrent is already active for
+                # a different scope (``DownloadScopeConflictError`` -- a multi-season
+                # pack). Unlike the busy/terminal cases above, these scopes stay
+                # selectable AND immediately due, and the offending release keeps
+                # sorting first -- left untouched the worker would re-search Prowlarr
+                # and re-attempt every cycle FOREVER, defeating the single-Prowlarr
+                # load guard the backoff ladder exists for. Discard the partial write
+                # and park on the SAME escalating backoff as a nothing-acceptable
+                # search so the scope is not immediately due again.
+                await session.rollback()
+                _logger.warning(
+                    "auto-grab: grab unusable (%s); parking on backoff",
+                    type(exc).__name__,
+                    extra={"request_id": scope.request_id},
+                )
+                await _park(session, request_repo, season_repo, scope, now)
+                no_acceptable += 1
         else:
             await _park(session, request_repo, season_repo, scope, now)
             no_acceptable += 1

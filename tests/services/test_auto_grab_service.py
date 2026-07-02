@@ -316,6 +316,59 @@ async def test_movie_grab_success_moves_to_downloading(sessionmaker_: SessionMak
 
 
 # --------------------------------------------------------------------------- #
+# Grab refusal — accepted-but-ungrabbable must back off, not loop forever
+# --------------------------------------------------------------------------- #
+async def test_ungrabbable_top_release_parks_on_backoff(sessionmaker_: SessionMaker) -> None:
+    # A release the decision engine ACCEPTS (good 1080p WEB-DL) but which cannot be
+    # grabbed: no magnet + a download_url with no derivable info-hash, and no
+    # indexer-supplied info_hash -> grab_service raises GrabError. Left untouched the
+    # scope would stay immediately due and re-search Prowlarr every cycle forever, so
+    # it must be pushed out on the escalating backoff like a nothing-acceptable search.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", magnet=False)])
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 1
+    assert result.grabbed == 0
+    assert result.no_acceptable == 1
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        # Parked on the honest, retryable state + first backoff rung -- NOT left
+        # pending/NULL (immediately due) to loop next cycle.
+        assert row.status == RequestStatus.no_acceptable_release
+        assert row.search_attempts == 1
+        assert row.next_search_at is not None
+        assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
+        # No untracked download row was left behind by the refused grab.
+        downloads = (
+            (await session.execute(select(Download).where(Download.media_request_id == request_id)))
+            .scalars()
+            .all()
+        )
+        assert downloads == []
+
+
+async def test_ungrabbable_scope_is_not_re_searched_next_cycle(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # End-to-end guard against the tight loop: after the refusal parks the scope,
+    # a SECOND cycle at the same instant finds nothing due (backoff not yet elapsed)
+    # and pays for NO Prowlarr hit.
+    await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", magnet=False)])
+
+    first = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+    assert first.searched == 1
+
+    second = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+    assert second.searched == 0
+    assert len(prowlarr.searched) == 1  # only the first cycle ever hit Prowlarr
+
+
+# --------------------------------------------------------------------------- #
 # TV — per-season park and grab
 # --------------------------------------------------------------------------- #
 async def test_tv_season_no_acceptable_parks_the_season(sessionmaker_: SessionMaker) -> None:
