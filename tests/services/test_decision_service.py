@@ -272,6 +272,47 @@ async def test_preview_rejects_multi_season_pack_for_single_season_request(
     )
 
 
+async def test_preview_episode_scoped_multi_season_pack_surfaces_multi_season_not_wrong_media(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Codex PR #33 finding (honesty over silence): an EPISODE-scoped preview
+    # (specific episodes named) against an S01-S03 pack that covers the requested
+    # S02 must surface RejectionReason.MULTI_SEASON_PACK -- the accurate reason
+    # from the decision-engine gate -- NOT WRONG_MEDIA. The episode-overlap check
+    # (covers_requested_episodes) runs INSIDE the media-identity gate, which fires
+    # BEFORE the multi-season gate; the helper must PASS the pack so the true
+    # reason wins instead of the pack mis-surfacing as WRONG_MEDIA. (The whole-
+    # season variant above never hits the helper -- episodes is empty there -- so
+    # this episode-scoped case is the one the finding is about.) The rejection
+    # itself must remain airtight: the pack is still never accepted.
+    multi = candidate(
+        "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP",
+        info_hash="e" * 40,
+        seeders=900,
+    )
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([multi]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+            episodes=[4],
+        )
+
+    assert result.accepted == []
+    assert result.no_acceptable_release is True
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert (
+        rejected["The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"]
+        is RejectionReason.MULTI_SEASON_PACK
+    )
+
+
 async def test_preview_rejects_wrong_episode_even_at_top_quality(
     sessionmaker_: SessionMaker,
 ) -> None:
