@@ -33,6 +33,7 @@ imports a port or adapter, so it stays trivially testable and I/O-free.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -227,27 +228,38 @@ def _is_video(name: str) -> bool:
     return _extension(name) in VIDEO_EXTENSIONS
 
 
-def _normalized_words(text: str) -> set[str]:
-    """Lower-case word set, split on the same separators ``_SAMPLE_EXTRAS`` tolerates."""
-    return {word for word in re.split(r"[\s._\-]+", text.lower()) if word}
+def _marker_key(marker_match: str) -> str:
+    """Canonicalise a ``_SAMPLE_EXTRAS`` match to a separator-agnostic key.
+
+    A match carries its leading boundary char (``.trailer``) or none at the start
+    of the string (``trailer``); internal separators vary too (``behind.the.scenes``
+    vs ``behind the scenes``). Collapsing every run of separators to a single space
+    and stripping yields one canonical key per marker, so the same marker keys
+    identically wherever it appears — letting the title/filename occurrence COUNTS
+    line up in :func:`_looks_like_sample_name`.
+    """
+    return re.sub(r"[\s._\-]+", " ", marker_match.lower()).strip()
 
 
 def _looks_like_sample_name(name: str, expected_title: str) -> bool:
     """Return ``True`` when ``name`` carries a sample/extra marker NOT explained by the title.
 
     ``_SAMPLE_EXTRAS`` matches ambiguous tokens (``proof``, ``trailer``, ``sample``,
-    ...) that are also valid movie/show titles. Mirroring :func:`_is_multi_part`'s
-    title carve-out, a match only counts as a genuine sample/extra marker when its
-    word(s) are NOT a subset of the expected (canonical TMDB) title's words — a
-    movie literally titled ``Proof`` is spared, while a real trailer/sample file
-    riding alongside it (or a same-named file for a DIFFERENT title) still rejects.
+    ...) that are also valid movie/show titles. The carve-out is COUNT-based, not a
+    set-subset test: a marker is a genuine sample/extra only when the FILE NAME
+    carries it MORE times than the expected (canonical TMDB) title legitimately
+    does. A movie titled ``Proof`` explains one ``proof`` in the filename, and a
+    show titled ``Trailer Park Boys: The Movie`` explains one ``trailer`` — but a
+    SECOND ``trailer`` in ``Trailer.Park.Boys.The.Movie.Trailer.2006`` is a real
+    extra marker and rejects. A subset test would instead excuse EVERY occurrence
+    once the word appeared anywhere in the title, letting that trailing ``Trailer``
+    ride along as the feature.
     """
-    title_words = _normalized_words(expected_title)
-    for match in _SAMPLE_EXTRAS.finditer(name):
-        match_words = _normalized_words(match.group(0))
-        if not match_words <= title_words:
-            return True
-    return False
+    title_markers = Counter(
+        _marker_key(match.group(0)) for match in _SAMPLE_EXTRAS.finditer(expected_title)
+    )
+    name_markers = Counter(_marker_key(match.group(0)) for match in _SAMPLE_EXTRAS.finditer(name))
+    return any(count > title_markers[key] for key, count in name_markers.items())
 
 
 def _is_multi_part(relative_path: str, expected_title: str) -> bool:

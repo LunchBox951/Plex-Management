@@ -85,6 +85,16 @@ _FIELDS: dict[str, dict[str, object]] = {
         "source": "Blu-ray",
         "screen_size": "1080p",
     },
+    # A movie whose title itself contains a marker word ("Trailer" in "Trailer
+    # Park Boys: The Movie"). The title legitimately accounts for exactly ONE
+    # "trailer" occurrence, so the count-based carve-out must keep this genuine
+    # feature — the filename carries no MORE "trailer"s than the title does.
+    "Trailer.Park.Boys.The.Movie.2006.1080p.BluRay-GRP.mkv": {
+        "title": "Trailer Park Boys: The Movie",
+        "year": "2006",
+        "source": "Blu-ray",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -271,6 +281,46 @@ def test_title_marked_feature_kept_while_adjacent_marker_extra_dropped() -> None
     assert result.accepted is True
     assert result.video is not None
     assert result.video.relative_path == "Proof.2005.1080p.BluRay-GRP.mkv"
+
+
+def test_extra_marker_beyond_title_count_flagged() -> None:
+    # Round-2 regression: the expected title "Trailer Park Boys: The Movie"
+    # legitimately contains ONE "trailer". A file that carries "Trailer" a SECOND
+    # time (".../The.Movie.Trailer.2006.mkv") is a real extra marker and must be
+    # dropped. A set-subset carve-out would excuse EVERY "trailer" once the word
+    # appeared in the title, letting this trailing extra ride along as the feature;
+    # the count-based rule catches the occurrence beyond the title's own count. As
+    # the only candidate the drop leaves nothing importable -> NO_VIDEO_FILE.
+    result = validate_import(
+        [VideoFile("Trailer.Park.Boys.The.Movie.Trailer.2006.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Trailer Park Boys: The Movie",
+        expected_year=2006,
+        expected_tmdb_id=13006,
+    )
+    assert result.accepted is False
+    assert result.video is None
+    assert [r.reason for r in result.rejections] == [ImportRejectionReason.NO_VIDEO_FILE]
+
+
+def test_title_marker_word_within_count_stays_feature() -> None:
+    # The counterpart to the above: the SAME title, but the filename carries
+    # "Trailer" only the once the title itself accounts for
+    # ("Trailer.Park.Boys.The.Movie.2006...mkv"). The count-based carve-out must
+    # NOT flag it — this is the genuine feature and imports cleanly.
+    result = validate_import(
+        [VideoFile("Trailer.Park.Boys.The.Movie.2006.1080p.BluRay-GRP.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Trailer Park Boys: The Movie",
+        expected_year=2006,
+        expected_tmdb_id=13006,
+    )
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.video is not None
+    assert result.video.relative_path == "Trailer.Park.Boys.The.Movie.2006.1080p.BluRay-GRP.mkv"
 
 
 def test_multi_part_rejects() -> None:
