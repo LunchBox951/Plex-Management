@@ -77,6 +77,14 @@ _FIELDS: dict[str, dict[str, object]] = {
         "source": "Blu-ray",
         "screen_size": "1080p",
     },
+    # A real movie literally titled "Proof": the _SAMPLE_EXTRAS marker word
+    # "proof" is explained by the expected title, so it must not be dropped.
+    "Proof.2005.1080p.BluRay-GRP.mkv": {
+        "title": "Proof",
+        "year": "2005",
+        "source": "Blu-ray",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -203,6 +211,23 @@ def test_named_sample_not_chosen_over_real_feature() -> None:
     assert result.accepted is True
     assert result.video is not None
     assert result.video.relative_path == "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_title_matching_sample_marker_word_accepts() -> None:
+    # Issue #11 repro: a movie genuinely titled "Proof" must not be dropped by
+    # the sample/extra filter just because "proof" is one of its marker words.
+    result = validate_import(
+        [VideoFile("Proof.2005.1080p.BluRay-GRP.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=9800,
+    )
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.video is not None
+    assert result.video.relative_path == "Proof.2005.1080p.BluRay-GRP.mkv"
 
 
 def test_multi_part_rejects() -> None:
@@ -370,6 +395,34 @@ _TV_FIELDS: dict[str, dict[str, object]] = {
     },
 }
 
+# basename -> recorded guessit-style field mapping for a show whose OWN title
+# contains a _SAMPLE_EXTRAS marker word ("trailer"): none of these files should
+# be silently dropped by the sample/extra filter.
+_TPB_FIELDS: dict[str, dict[str, object]] = {
+    "Trailer.Park.Boys.S02E01.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Trailer Park Boys",
+        "season": 2,
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Trailer.Park.Boys.S02E02.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Trailer Park Boys",
+        "season": 2,
+        "episode": 2,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+}
+
+
+class FakeTpbParser:
+    """A ParserPort for a show whose title itself carries a sample-marker word."""
+
+    def parse(self, release_name: str) -> ParsedRelease:
+        fields = _TPB_FIELDS.get(release_name, {})
+        return to_parsed_release(fields, release_name)
+
 
 class FakeTvParser:
     """A ParserPort that maps known basenames through the real source_mapping."""
@@ -475,6 +528,28 @@ def test_sample_and_nfo_are_silently_dropped() -> None:
     assert len(result.accepted) == 1
     assert result.rejected == ()
     assert result.skipped_not_requested == ()
+
+
+def test_title_matching_sample_marker_word_not_dropped_in_season_pack() -> None:
+    # A show whose OWN title contains a sample/extra marker word ("trailer")
+    # must not have every episode file silently dropped before per-file
+    # rejection reasons are ever recorded.
+    result = validate_season_import(
+        [
+            VideoFile("Trailer.Park.Boys.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+            VideoFile("Trailer.Park.Boys.S02E02.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        ],
+        parser=FakeTpbParser(),
+        profile=default_profile(),
+        expected_title="Trailer Park Boys",
+        expected_tmdb_id=12345,
+        expected_season=2,
+    )
+    assert result.rejected == ()
+    assert {frozenset(r.episodes) for r in result.accepted} == {
+        frozenset({1}),
+        frozenset({2}),
+    }
 
 
 def test_requested_episodes_skip_not_requested_ones() -> None:

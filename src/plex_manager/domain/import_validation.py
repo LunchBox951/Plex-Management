@@ -66,7 +66,10 @@ __all__ = [
 
 # Files whose *name* marks them as a sample/extra rather than the feature. These
 # are dropped from consideration up front so a 40 MB "sample.mkv" can never be
-# chosen as the largest-file feature when the real movie is also present.
+# chosen as the largest-file feature when the real movie is also present. A match
+# is title-aware (see :func:`_looks_like_sample_name`): a movie/show genuinely
+# titled "Proof" or "Trailer Park Boys" is not dropped just because its own name
+# matches one of these ambiguous marker words.
 _SAMPLE_EXTRAS = re.compile(
     r"(?:^|[\s._\-])(?:sample|trailer|extras?|featurette|behind[\s._\-]?the[\s._\-]?scenes|"
     r"deleted[\s._\-]?scene|proof|rarbg\.com)(?:$|[\s._\-])",
@@ -215,8 +218,27 @@ def _is_video(name: str) -> bool:
     return _extension(name) in VIDEO_EXTENSIONS
 
 
-def _looks_like_sample_name(name: str) -> bool:
-    return _SAMPLE_EXTRAS.search(name) is not None
+def _normalized_words(text: str) -> set[str]:
+    """Lower-case word set, split on the same separators ``_SAMPLE_EXTRAS`` tolerates."""
+    return {word for word in re.split(r"[\s._\-]+", text.lower()) if word}
+
+
+def _looks_like_sample_name(name: str, expected_title: str) -> bool:
+    """Return ``True`` when ``name`` carries a sample/extra marker NOT explained by the title.
+
+    ``_SAMPLE_EXTRAS`` matches ambiguous tokens (``proof``, ``trailer``, ``sample``,
+    ...) that are also valid movie/show titles. Mirroring :func:`_is_multi_part`'s
+    title carve-out, a match only counts as a genuine sample/extra marker when its
+    word(s) are NOT a subset of the expected (canonical TMDB) title's words — a
+    movie literally titled ``Proof`` is spared, while a real trailer/sample file
+    riding alongside it (or a same-named file for a DIFFERENT title) still rejects.
+    """
+    title_words = _normalized_words(expected_title)
+    for match in _SAMPLE_EXTRAS.finditer(name):
+        match_words = _normalized_words(match.group(0))
+        if not match_words <= title_words:
+            return True
+    return False
 
 
 def _is_multi_part(relative_path: str, expected_title: str) -> bool:
@@ -251,8 +273,11 @@ def validate_import(
 
     Steps (movies-first):
 
-    1. Keep only video-extension files and drop names that mark a sample/extra; if
-       nothing survives, reject :attr:`~ImportRejectionReason.NO_VIDEO_FILE`.
+    1. Keep only video-extension files and drop names that mark a sample/extra —
+       UNLESS the marker word(s) are explained by ``expected_title`` (a movie
+       genuinely titled ``Proof`` is not dropped just because ``Proof`` also
+       matches the sample/extra marker regex); if nothing survives, reject
+       :attr:`~ImportRejectionReason.NO_VIDEO_FILE`.
     2. Choose the largest survivor by ``size_bytes`` as the feature.
     3. Parse its basename and run the SAME identity gate the grab path uses
        (:func:`matches_media`, title+year fallback because a file carries no
@@ -274,7 +299,7 @@ def validate_import(
         video
         for video in files
         if _is_video(_basename(video.relative_path))
-        and not _looks_like_sample_name(_basename(video.relative_path))
+        and not _looks_like_sample_name(_basename(video.relative_path), expected_title)
     ]
     if not videos:
         return ImportValidation(
@@ -394,7 +419,9 @@ def validate_season_import(
 
     1. Non-video-extension names and sample/extra-named files
        (:func:`_looks_like_sample_name`) are dropped up front, silently — same as
-       :func:`validate_import`; they were never episode candidates.
+       :func:`validate_import`, including the same title carve-out (a show whose
+       title contains an ambiguous marker word, e.g. ``Trailer Park Boys``, is not
+       silently emptied of every episode file); they were never episode candidates.
     2. Parse the FULL folder-qualified relative path — a season-pack folder
        routinely carries the season/quality tokens an individual episode filename
        omits (mirrors :func:`validate_import`'s folder-qualified parse).
@@ -437,7 +464,7 @@ def validate_season_import(
 
     for video in files:
         name = _basename(video.relative_path)
-        if not _is_video(name) or _looks_like_sample_name(name):
+        if not _is_video(name) or _looks_like_sample_name(name, expected_title):
             continue
 
         # Parse the FULL relative path (folder included) — see step 2 above.
