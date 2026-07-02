@@ -463,6 +463,117 @@ async def test_cancel_already_gone_torrent_is_a_no_op_success(
     assert (_CULPRIT, True) in qbt.removed
 
 
+async def test_cancel_tv_refuses_when_a_season_is_already_available(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # season_rollup precedence makes the parent read `downloading` even though
+    # season 1 is already `available` (imported, file on disk, torrent seeding). A
+    # naive cancel would settle season 1 `cancelled` -- orphaning its seeding
+    # torrent (excluded from the active sweep) and its file (eviction ignores
+    # `cancelled`). Cancel must REFUSE and touch nothing.
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1400,
+            media_type=MediaType.tv,
+            title="Mixed Show",
+            status=RequestStatus.downloading,  # rollup of {available, downloading}
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=show.id, season_number=1, status=RequestStatus.available)
+        )
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id, season_number=2, status=RequestStatus.downloading
+            )
+        )
+        # Season 1's imported (terminal) download -- torrent still seeding.
+        session.add(
+            Download(
+                torrent_hash=_ALT,
+                status="imported",
+                media_request_id=show.id,
+                tmdb_id=1400,
+                season=1,
+            )
+        )
+        # Season 2's in-flight download.
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=show.id,
+                tmdb_id=1400,
+                season=2,
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.NotCancellableError):
+        async with sessionmaker_() as session:
+            await correction_service.cancel_request(session, qbt, request_id=request_id)
+
+    # Nothing removed, no season settled cancelled: the done season is untouched.
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert {s.status for s in seasons} == {RequestStatus.available, RequestStatus.downloading}
+
+
+async def test_cancel_tv_refuses_when_a_season_is_evicted_but_still_seeding(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # An `evicted` season's status does not read done, but it can still own an
+    # imported download whose torrent seeds (eviction deletes only the library
+    # file). The parent rolls up to `downloading` via precedence, so the rollup
+    # guard passes -- the per-season imported-download probe must still refuse.
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1401,
+            media_type=MediaType.tv,
+            title="Evicted Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=show.id, season_number=1, status=RequestStatus.evicted)
+        )
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id, season_number=2, status=RequestStatus.downloading
+            )
+        )
+        session.add(
+            Download(
+                torrent_hash=_ALT,
+                status="imported",
+                media_request_id=show.id,
+                tmdb_id=1401,
+                season=1,
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.NotCancellableError):
+        async with sessionmaker_() as session:
+            await correction_service.cancel_request(session, qbt, request_id=request_id)
+    assert qbt.removed == []
+
+
 async def test_cancel_tv_settles_every_season_and_rolls_up_cancelled(
     sessionmaker_: SessionMaker,
 ) -> None:

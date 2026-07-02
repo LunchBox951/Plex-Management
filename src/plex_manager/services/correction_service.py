@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.indexer import IndexerPort
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.parser import ParserPort
-    from plex_manager.ports.repositories import RequestRecord
+    from plex_manager.ports.repositories import RequestRecord, SeasonRequestRecord
 
 __all__ = [
     "CANCELLABLE_REQUEST_STATUS_VALUES",
@@ -104,15 +104,37 @@ REPORTABLE_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 
 # The not-yet-imported states a cancel may act on. A request past these (imported/
 # available/settled) is NOT cancellable -- report-issue (redo) or keep-forever/
-# eviction own that stage. For TV this is the parent rollup: when it is one of
-# these, NO season is available/completed yet (those would roll up to available/
-# partially_available/completed), so cancelling every season is coherent.
+# eviction own that stage.
+#
+# For TV this parent-rollup guard is NECESSARY but NOT sufficient: ``season_rollup``
+# precedence lets an in-flight season (downloading/searching/no_acceptable_release)
+# outrank an already-DONE sibling, so the parent can read one of these cancellable
+# statuses while a season is actually ``available``/``completed`` (or ``evicted``).
+# ``cancel_request`` therefore gates TV cancellability PER-SEASON on top of this --
+# see ``_UNCANCELLABLE_SEASON_STATUS_VALUES``.
 CANCELLABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     {
         RequestStatus.pending.value,
         RequestStatus.searching.value,
         RequestStatus.no_acceptable_release.value,
         RequestStatus.downloading.value,
+    }
+)
+
+# Per-season states that make a TV request UN-cancellable regardless of what the
+# parent rollup reads. An ``available``/``completed`` season is already DONE
+# (imported, file on disk, imported download row whose torrent is still seeding).
+# Cancel excludes terminal (imported) download rows from its active-torrent sweep
+# (``list_active_for_request``) and eviction ignores ``cancelled``, so settling such
+# a season ``cancelled`` would BOTH lie (content still in Plex/on disk) and orphan
+# the seeding torrent + leave the file unreclaimable except from a terminal. Refuse
+# instead. (An ``evicted`` season is caught separately by the imported-download
+# probe in ``cancel_request`` -- its file is gone but its imported torrent may still
+# seed, the same orphan risk.)
+_UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {
+        RequestStatus.available.value,
+        RequestStatus.completed.value,
     }
 )
 
@@ -445,6 +467,30 @@ async def cancel_request(
         raise NotCancellableError(request_id, request.status)
 
     download_repo = SqlDownloadRepository(session)
+
+    seasons: list[SeasonRequestRecord] = []
+    if request.media_type == "tv":
+        # The parent-rollup guard above is necessary but NOT sufficient for TV:
+        # season_rollup precedence lets an in-flight season outrank an already-DONE
+        # sibling, so the parent can read a cancellable status while a season is
+        # actually done. Gate per-season BEFORE mutating anything -- refusing here
+        # leaves the done season's file/torrent untouched rather than orphaning them
+        # (see _UNCANCELLABLE_SEASON_STATUS_VALUES). No partial cancel is performed:
+        # the whole request is refused so no in-flight sibling is half-cancelled.
+        seasons = await SqlSeasonRequestRepository(session).list_for_request(request_id)
+        for srec in seasons:
+            if srec.status in _UNCANCELLABLE_SEASON_STATUS_VALUES:
+                raise NotCancellableError(request_id, request.status)
+            # Belt-and-suspenders: a season whose status does not read done (e.g.
+            # ``evicted``) but that still owns a non-active imported download has a
+            # torrent that may still be seeding -- the same orphan risk. The newest
+            # row for the season is the settled one; if it is imported, refuse.
+            latest = await download_repo.find_latest_for_request(
+                request_id, season=srec.season_number
+            )
+            if latest is not None and latest.status == DownloadState.Imported.value:
+                raise NotCancellableError(request_id, request.status)
+
     active = await download_repo.list_active_for_request(request_id)
     for row in active:
         # Best-effort remove torrent + data; an already-gone hash is a no-op.
@@ -468,9 +514,10 @@ async def cancel_request(
     if request.media_type == "tv":
         # Settle every tracked season to cancelled; the parent rollup then folds to
         # cancelled (season_rollup handles all-cancelled). Unconditional (a failed
-        # season is cancelled too) -- the cancellable guard already ensured no season
-        # is available/completed.
-        seasons = await SqlSeasonRequestRepository(session).list_for_request(request_id)
+        # season is cancelled too) -- the per-season guard above already refused if
+        # any season was available/completed or still owned an imported torrent, so
+        # nothing done is being dishonestly settled or orphaned here. Reuses the
+        # ``seasons`` fetched by that guard.
         for srec in seasons:
             await season_request_service.set_status(
                 session,
