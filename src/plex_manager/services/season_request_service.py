@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.season_rollup import rollup_status
+from plex_manager.logsafe import safe_int
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -163,7 +164,7 @@ async def _present_seasons(library: LibraryPort, tmdb_id: int) -> frozenset[int]
         _logger.warning(
             "plex season-availability crawl failed (%s); proceeding with a request",
             type(exc).__name__,
-            extra={"tmdb_id": tmdb_id},
+            extra={"tmdb_id": safe_int(tmdb_id)},
         )
         return frozenset()
 

@@ -64,18 +64,24 @@ adapter directly. See [docs/design/overview.md](docs/design/overview.md).
 - **Schema changes:** every model change ships with an Alembic migration.
 - **Significant decisions:** add an ADR under `docs/adr/` (copy the format of an
   existing one). ADRs are immutable; supersede rather than edit.
-- **Logging request-derived ids:** never interpolate a request-derived id
-  (`tmdb_id`, `request_id`/`media_request_id`, `download_id`, …) into a log
-  message string. Pass it via `extra={...}` instead, e.g.
-  `_logger.warning("availability check failed", extra={"tmdb_id": tmdb_id})`.
-  This keeps the id out of the free-text message and into a structured field
-  that `LOG_EVENT_CORRELATION_KEYS` (see ADR-0012) picks up for the
-  cross-request correlation trail surfaced by `GET /ops/logs/export` — and it
-  keeps CodeQL's `py/log-injection` query from re-flagging the call site (see
-  issue #23 / alert #238). Interpolating the id into the message text is a
-  false positive here (Pydantic already rejects a non-`int` body with a 422,
-  so no CRLF payload can reach the sink) but the `extra=` form sidesteps the
-  whack-a-mole of dismissing the same alert shape over and over.
+- **Logging request-derived values:** never log a request-derived value
+  (`tmdb_id`, `request_id`/`media_request_id`, `download_id`, …) raw. Pass it
+  through a `plex_manager.logsafe` barrier — `safe_int` for ids/counts,
+  `safe_text` for strings — whether the value goes in the message args OR in
+  `extra={...}`, e.g.
+  `_logger.warning("availability check failed", extra={"tmdb_id": safe_int(tmdb_id)})`.
+  CodeQL's `py/log-injection` taints values inside `extra=` exactly as it taints
+  message args, so merely moving an id into `extra=` does **not** clear the alert
+  (that was the lesson of issue #23 / alert #238); the barrier belongs at the log
+  site regardless of where the value lands. The barriers are honest, not
+  cosmetic: `safe_int` re-coerces with `int()` (a no-op for a real int, a hard
+  type enforcement + analyzer taint barrier otherwise) and `safe_text` collapses
+  CR/LF so a string cannot forge a second log record. `extra=` remains the home
+  for correlation ids: `LOG_EVENT_CORRELATION_KEYS` (see ADR-0012) picks those
+  structured fields up for the cross-request trail surfaced by
+  `GET /ops/logs/export`. Only values that trace from an HTTP request need the
+  barrier; a value read straight off a SQLAlchemy row (a DB-generated id, a
+  stored column) is already trusted and does not.
 
 ## Release flow
 

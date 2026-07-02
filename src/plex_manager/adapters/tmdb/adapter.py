@@ -24,6 +24,7 @@ from typing import Final, cast
 
 import httpx
 
+from plex_manager.logsafe import safe_int
 from plex_manager.ports.metadata import (
     MediaKind,
     MediaPage,
@@ -279,7 +280,9 @@ class TmdbMetadata:
             backdrop_url=_backdrop_url(detail),
             is_anime=_contains_anime_keyword(detail),
         )
-        _logger.debug("resolved tmdb movie (anime=%s)", movie.is_anime, extra={"tmdb_id": tmdb_id})
+        _logger.debug(
+            "resolved tmdb movie (anime=%s)", movie.is_anime, extra={"tmdb_id": safe_int(tmdb_id)}
+        )
         self._movie_cache.set(cache_key, movie)
         return movie
 
@@ -306,7 +309,9 @@ class TmdbMetadata:
             season_count=_get_int(detail, "number_of_seasons") or 0,
             is_anime=_contains_anime_keyword(detail),
         )
-        _logger.debug("resolved tmdb tv (anime=%s)", show.is_anime, extra={"tmdb_id": tmdb_id})
+        _logger.debug(
+            "resolved tmdb tv (anime=%s)", show.is_anime, extra={"tmdb_id": safe_int(tmdb_id)}
+        )
         self._tv_cache.set(cache_key, show)
         return show
 
