@@ -16,7 +16,13 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.models import DownloadHistory, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import (
+    DownloadHistory,
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.ports.library import WatchState
 from plex_manager.services import log_capture_service, retention_telemetry_service
 from tests.web.fakes import FakeLibrary
@@ -59,6 +65,47 @@ async def _movie(
         session.add(row)
         await session.commit()
         return row.id
+
+
+def _tv_file(tmp_path: Path, name: str, size: int = 1024) -> str:
+    path = tmp_path / "tv" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"0" * size)
+    return str(path)
+
+
+async def _show_with_season(
+    sm: SessionMaker,
+    *,
+    tmdb_id: int,
+    title: str,
+    season_number: int,
+    library_path: str | None,
+    completed_at: datetime | None = None,
+) -> int:
+    """Insert a tv show ``MediaRequest`` plus one available ``SeasonRequest``;
+    return the PARENT show's ``MediaRequest`` id (the id the TV branch of
+    ``_candidate_context`` walks to from the season's ``request_id``)."""
+    async with sm() as session:
+        show = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType.tv,
+            title=title,
+            status=RequestStatus.available,
+            completed_at=completed_at,
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=season_number,
+                status=RequestStatus.available,
+                library_path=library_path,
+            )
+        )
+        await session.commit()
+        return show.id
 
 
 async def test_sweep_never_deletes_the_file_or_touches_status_or_history(
@@ -261,6 +308,103 @@ async def test_sweep_reports_zero_candidates_for_a_keep_forever_pinned_title(
     assert "0 eviction candidate(s)" in aggregate_message
     assert "0 available watched title(s)" in aggregate_message
     assert Path(library_path).exists()
+
+
+async def test_sweep_resolves_a_tv_season_context_from_the_parent_show(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The TV branch of ``_candidate_context`` (movie-only tests never touch it):
+    ``candidate.request_id`` is a ``SeasonRequest`` id, resolved to the PARENT
+    ``MediaRequest`` for ``request_id``/``tmdb_id`` and its ``completed_at`` as
+    the (documented-approximation) time-to-watch reference for the season. The
+    per-candidate event must carry ``season N`` and compute the parent
+    completed_at -> last_viewed_at interval."""
+    library_path = _tv_file(tmp_path, "Some Show S05.mkv", size=100)
+    completed_at = _STALE - timedelta(days=3)  # exact 3d -> 259200s interval to _STALE
+    show_id = await _show_with_season(
+        sessionmaker_,
+        tmdb_id=55,
+        title="Some Show",
+        season_number=5,
+        library_path=library_path,
+        completed_at=completed_at,
+    )
+    library = FakeLibrary(
+        available_tv_seasons={55: frozenset({5})},
+        watch_states={(55, "tv", 5): WatchState(watched=True, last_viewed_at=_STALE)},
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                media_type="tv",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    assert len(records) == 2  # one aggregate event, one per-candidate event
+
+    aggregate_message = records[0].getMessage()
+    assert "tv root" in aggregate_message
+    assert "1 eviction candidate(s)" in aggregate_message  # _STALE is past grace
+    assert "1 available watched title(s)" in aggregate_message
+
+    per_candidate = records[1]
+    message = per_candidate.getMessage()
+    assert "season 5" in message
+    assert completed_at.isoformat() in message  # the PARENT show's completed_at
+    assert _STALE.isoformat() in message
+    assert "completed_to_first_watch=259200s" in message  # last_viewed - parent completed
+    # ids resolved by walking season -> parent, passed via extra={}, never in text.
+    assert getattr(per_candidate, "request_id", None) == show_id
+    assert getattr(per_candidate, "tmdb_id", None) == 55
+
+
+async def test_sweep_leaves_the_tv_interval_unknown_when_the_parent_has_no_completed_at(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The TV 'unknown' fallback: a season whose PARENT show carries no
+    ``completed_at`` (a row predating the stamp) still resolves its parent
+    ids, but the completed_at -> first-watch interval is honestly 'unknown'
+    rather than guessed."""
+    library_path = _tv_file(tmp_path, "No Completed Show S02.mkv")
+    show_id = await _show_with_season(
+        sessionmaker_,
+        tmdb_id=56,
+        title="No Completed Show",
+        season_number=2,
+        library_path=library_path,
+        completed_at=None,  # parent never stamped a completion time
+    )
+    library = FakeLibrary(
+        available_tv_seasons={56: frozenset({2})},
+        watch_states={(56, "tv", 2): WatchState(watched=True, last_viewed_at=_STALE)},
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                media_type="tv",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    per_candidate = records[1]
+    message = per_candidate.getMessage()
+    assert "season 2" in message
+    assert "completed_at=unknown" in message
+    assert "completed_to_first_watch=unknown" in message
+    # Parent ids are still resolved even when the timestamp is missing.
+    assert getattr(per_candidate, "request_id", None) == show_id
+    assert getattr(per_candidate, "tmdb_id", None) == 56
 
 
 async def test_unreadable_root_is_skipped_without_crashing(
