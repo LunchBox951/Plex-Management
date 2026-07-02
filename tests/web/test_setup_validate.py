@@ -112,6 +112,12 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
         "http://",  # empty host
         "not a url at all",
         "ftp://prowlarr.local",
+        # Malformed bracketed hosts: urlsplit() ITSELF raises ValueError on these
+        # (an unterminated IPv6 literal / an invalid IPvFuture form), so before the
+        # try/except in _require_http_url the endpoint 500'd instead of returning
+        # this documented ok=False rejection (Codex PR #35 P2).
+        "http://[::1",  # unterminated IPv6 literal
+        "http://[vG.x]",  # invalid IPvFuture (non-hex version)
     ],
 )
 async def test_validate_prowlarr_rejects_non_http_url(
@@ -346,7 +352,14 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
 
 @pytest.mark.parametrize(
     "bad_url",
-    ["file:///etc/passwd", "qb.local", "http://", "not a url at all"],
+    [
+        "file:///etc/passwd",
+        "qb.local",
+        "http://",
+        "not a url at all",
+        "http://[::1",
+        "http://[vG.x]",
+    ],
 )
 async def test_validate_qbittorrent_rejects_non_http_url(
     client: httpx.AsyncClient, app: FastAPI, bad_url: str
@@ -366,7 +379,14 @@ async def test_validate_qbittorrent_rejects_non_http_url(
 
 @pytest.mark.parametrize(
     "bad_url",
-    ["file:///etc/passwd", "plex.local", "http://", "not a url at all"],
+    [
+        "file:///etc/passwd",
+        "plex.local",
+        "http://",
+        "not a url at all",
+        "http://[::1",
+        "http://[vG.x]",
+    ],
 )
 async def test_validate_plex_rejects_non_http_url(
     client: httpx.AsyncClient, app: FastAPI, bad_url: str

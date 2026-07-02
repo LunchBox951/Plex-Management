@@ -67,9 +67,20 @@ def _require_http_url(url: str) -> ServiceValidateResponse | None:
     obviously-broken input (``file://...``, a scheme-less string, an empty host)
     into a clear, retryable rejection instead of an opaque ``httpx`` transport
     error. Returns ``None`` when ``url`` is acceptable to try.
+
+    ``urlsplit`` (and reading ``.hostname``) itself RAISES ``ValueError`` on a
+    malformed bracketed host -- an unterminated IPv6 literal (``http://[::1``) or
+    an invalid IPvFuture form (``http://[v7.x]``) -- so both are guarded: a parse
+    failure is exactly the "obviously-broken input" this rejects, surfaced as the
+    same retryable ``ok=False`` rather than crashing the validate endpoint with a
+    500.
     """
-    parts = urlsplit(url)
-    if parts.scheme not in {"http", "https"} or not parts.hostname:
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+    except ValueError:
+        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
+    if parts.scheme not in {"http", "https"} or not hostname:
         return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
     return None
 
