@@ -313,7 +313,12 @@ async def _eviction_tick(app: FastAPI) -> float:
                 )
             except OSError:
                 pressure_would_fire = True
-            if not pressure_would_fire:
+            # With proactive eviction ON, the "about to evict nothing" premise is
+            # false (the proactive pass below acts on the same candidates this
+            # tick) and the observer would double the Plex/FS walk right before
+            # it -- the delete-nothing observer exists to DESIGN a retention
+            # policy, so it stands down once one is actually enabled.
+            if not pressure_would_fire and not proactive_enabled:
                 try:
                     await retention_telemetry_service.run_retention_telemetry_sweep(
                         session=session,

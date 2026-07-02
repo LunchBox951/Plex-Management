@@ -198,6 +198,50 @@ async def test_telemetry_sweep_runs_when_the_pressure_gate_does_not_fire(
         assert row.status is RequestStatus.available
 
 
+async def test_telemetry_sweep_stands_down_when_proactive_eviction_is_enabled(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With proactive eviction ON, the 'about to evict nothing' premise is
+    false (the proactive pass acts on the same candidates this tick), so the
+    delete-nothing observer stands down instead of doubling the Plex/FS walk
+    right before a real cleanup."""
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        # Pressure unreachable, but the proactive pass below is live.
+        await store.set("disk_pressure_threshold_percent", "101")
+        await store.set("eviction_proactive_enabled", "true")
+        await store.set("eviction_grace_days", "0")
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    calls: list[str] = []
+
+    async def _fake_sweep(**kwargs: object) -> None:
+        calls.append(kwargs["root_path"])  # type: ignore[index]
+
+    monkeypatch.setattr(retention_telemetry_service, "run_retention_telemetry_sweep", _fake_sweep)
+
+    app = _app(sessionmaker_)
+    try:
+        await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert calls == []  # observer stood down: a real retention behaviour is on
+    assert not movie_file.exists()  # the proactive pass actually cleaned up
+
+
 async def test_telemetry_sweep_does_not_run_when_the_pressure_gate_fires(
     sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
