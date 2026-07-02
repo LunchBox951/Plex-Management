@@ -9,6 +9,7 @@ itself carries no ``tmdb_id`` column.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
@@ -25,6 +26,17 @@ if TYPE_CHECKING:
 __all__ = ["SqlSeasonRequestRepository"]
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Coerce a stored timestamp to tz-aware UTC (SQLite returns naive values).
+
+    Mirrors ``repositories.downloads._as_utc``; the auto-grab worker does
+    aware-datetime arithmetic on ``next_search_at``.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
     """Map a ``SeasonRequest`` ORM row (+ its parent's ``tmdb_id``) to the DTO."""
     return SeasonRequestRecord(
@@ -34,6 +46,8 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         status=row.status.value,
         tmdb_id=tmdb_id,
         library_path=row.library_path,
+        search_attempts=row.search_attempts,
+        next_search_at=_as_utc(row.next_search_at),
     )
 
 
@@ -126,6 +140,36 @@ class SqlSeasonRequestRepository:
                 tmdb_ids[row.media_request_id] = await self._tmdb_id_for(row.media_request_id)
             records.append(_to_record(row, tmdb_ids[row.media_request_id]))
         return records
+
+    async def list_due_for_search(
+        self, statuses: frozenset[str], now: datetime
+    ) -> list[SeasonRequestRecord]:
+        # JOIN to the parent's tmdb_id in ONE query (no per-row follow-up), same
+        # as ``list_for_requests``. NULL ("due now") first via an EXPLICIT
+        # ``nulls_first()`` -- see ``SqlRequestRepository.list_due_for_search`` on
+        # why the default NULL ordering is backend-dependent (Postgres is a swap).
+        stmt = (
+            select(SeasonRequest, MediaRequest.tmdb_id)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(
+                SeasonRequest.status.in_([RequestStatus(s) for s in statuses]),
+                (SeasonRequest.next_search_at.is_(None)) | (SeasonRequest.next_search_at <= now),
+            )
+            .order_by(SeasonRequest.next_search_at.asc().nulls_first(), SeasonRequest.id)
+        )
+        return [
+            _to_record(row, tmdb_id) for row, tmdb_id in (await self._session.execute(stmt)).all()
+        ]
+
+    async def schedule_search(
+        self, season_request_id: int, *, search_attempts: int, next_search_at: datetime | None
+    ) -> None:
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.search_attempts = search_attempts
+        row.next_search_at = next_search_at
+        await self._session.flush()
 
     async def ensure(
         self, media_request_id: int, season_number: int, *, status: str

@@ -31,6 +31,17 @@ _SETTLED_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
 )
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Coerce a stored timestamp to tz-aware UTC (SQLite returns naive values).
+
+    Mirrors ``repositories.downloads._as_utc``: the app always stores UTC, and the
+    auto-grab worker does aware-datetime arithmetic on ``next_search_at``.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 def _to_record(row: MediaRequest) -> RequestRecord:
     """Map a ``MediaRequest`` ORM row to its frozen read-model DTO."""
     return RequestRecord(
@@ -46,6 +57,8 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         backdrop_url=row.backdrop_url,
         library_path=row.library_path,
         keep_forever=bool(row.keep_forever),
+        search_attempts=row.search_attempts,
+        next_search_at=_as_utc(row.next_search_at),
     )
 
 
@@ -86,6 +99,38 @@ class SqlRequestRepository:
         stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
+
+    async def list_due_for_search(
+        self, statuses: frozenset[str], now: datetime
+    ) -> list[RequestRecord]:
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.media_type == MediaType.movie,
+                MediaRequest.status.in_([RequestStatus(s) for s in statuses]),
+                # NULL next_search_at is "due now" -- a freshly created request has
+                # never been scheduled, so it is picked up on the next tick.
+                (MediaRequest.next_search_at.is_(None)) | (MediaRequest.next_search_at <= now),
+            )
+            # NULL ("due now") first, then oldest-scheduled, then ``id`` as the
+            # deterministic tiebreak. ``nulls_first()`` is EXPLICIT because the
+            # default NULL ordering differs by backend (SQLite sorts NULLs first,
+            # PostgreSQL last) and Postgres is a config swap -- a never-searched
+            # request (search-on-approve) must outrank a scheduled-but-overdue one.
+            .order_by(MediaRequest.next_search_at.asc().nulls_first(), MediaRequest.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def schedule_search(
+        self, request_id: int, *, search_attempts: int, next_search_at: datetime | None
+    ) -> None:
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.search_attempts = search_attempts
+        row.next_search_at = next_search_at
+        await self._session.flush()
 
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         stmt = (
