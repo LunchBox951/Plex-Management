@@ -395,6 +395,36 @@ def test_delete_rejects_symlink_escaping_the_configured_root(tmp_path: Path) -> 
     assert secret.exists()  # the real target outside the root is untouched
 
 
+def test_delete_guard_refuses_agrees_with_delete_on_a_symlink_escaping_the_root(
+    tmp_path: Path,
+) -> None:
+    """The extracted refusal predicate ``delete`` shares with the retention-telemetry
+    would-evict simulation: it must refuse EXACTLY what ``delete`` raises on -- a
+    breadcrumb lexically under the root that realpaths (via a symlinked component)
+    outside it -- and allow a genuinely in-root path, all WITHOUT deleting anything."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.mkv").write_bytes(b"x" * 10)
+    # A symlinked COMPONENT: root/escaped -> outside, so root/escaped/secret.mkv is
+    # lexically under root but resolves outside it.
+    os.symlink(outside, root / "escaped")
+    escaping = os.fspath(root / "escaped" / "secret.mkv")
+    in_root = os.fspath(root / "Some Movie" / "movie.mkv")
+
+    fs = LocalFileSystem([os.fspath(root)])
+    assert fs.delete_guard_refuses(escaping) is True
+    assert fs.delete_guard_refuses(in_root) is False
+    assert fs.delete_guard_refuses("") is True  # empty path fails closed
+    # No configured root -> everything is refused (fails closed), same as delete.
+    assert LocalFileSystem().delete_guard_refuses(in_root) is True
+    # Agreement with delete(): the refused path raises, the allowed path does not.
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        fs.delete(escaping)
+    assert (outside / "secret.mkv").exists()  # never deleted
+
+
 def test_delete_removes_a_symlink_breadcrumb_without_touching_its_target(
     tmp_path: Path,
 ) -> None:

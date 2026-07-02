@@ -82,6 +82,11 @@ class _MappedReclaimFileSystem:
     def delete(self, path: str) -> None:
         raise NotImplementedError
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        # These controlled would-evict tests drive the reclaimable-aware extension,
+        # not the delete guard: never refuse, so every mapped candidate is counted.
+        return False
+
     def reclaimable_bytes(self, path: str) -> int:
         self.reclaimable_calls.append(path)
         return self._reclaimable.get(path, 0)
@@ -728,6 +733,185 @@ async def test_would_evict_extends_past_the_select_prefix_when_reclaimable_falls
     # Extended past the 2-candidate nominal prefix because m1 reclaimed nothing.
     assert "3 would_evict now" in aggregate_message
     assert "400 byte(s) reclaimable" in aggregate_message  # 0 + 200 + 200
+
+
+async def test_no_path_row_is_excluded_from_metrics_and_counted(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-3 finding #1: a row with NO library_path breadcrumb (a movie found
+    already in Plex, short-circuited straight to 'available' -- completed_at stamped
+    at Plex-verification time, but no file of ours ever placed) can never be evicted
+    and its completed_at is not an import time. It must be excluded from the
+    eligible/would-evict metrics AND the time-to-watch dataset, and surfaced as
+    no_path on the aggregate -- never silently counted, never silently dropped. A
+    normal on-disk row alongside it proves the split is honest, not blanket."""
+    on_disk = _movie_file(tmp_path, "On Disk.mkv", size=100)
+    await _movie(
+        sessionmaker_,
+        tmdb_id=1,
+        title="On Disk",
+        library_path=on_disk,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    await _movie(
+        sessionmaker_,
+        tmdb_id=2,
+        title="Already In Plex",
+        library_path=None,  # in-Plex short-circuit: no breadcrumb, nothing of ours on disk
+        completed_at=_STALE - timedelta(days=2),
+    )
+    library = FakeLibrary(
+        watch_states={
+            (1, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (2, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate = records[0].getMessage()
+    # Only the on-disk row is an eligible/would-evict candidate; the no-path row is
+    # set aside and counted, not folded into the eviction metrics.
+    assert "1 eligible eviction candidate(s)" in aggregate
+    assert "no_path=1" in aggregate
+    # ...and excluded from the time-to-watch dataset too (its completed_at is not an
+    # import time), so only the on-disk row is watch activity.
+    assert "1 title(s) with recorded watch activity" in aggregate
+    per_title = [r for r in records if "completed_to_last_watch=" in r.getMessage()]
+    assert len(per_title) == 1
+    assert "On Disk" in per_title[0].getMessage()
+    assert "Already In Plex" not in per_title[0].getMessage()
+
+
+async def test_guard_refused_breadcrumb_is_excluded_from_would_evict_and_counted(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-3 finding #2: a breadcrumb LEXICALLY under root_path that resolves, via
+    a symlinked path component, OUTSIDE every configured root. The real
+    LocalFileSystem.delete refuses it (its realpath guard) and frees nothing, so the
+    would-evict simulation must run each candidate through fs's OWN delete guard and
+    exclude a refused row's bytes/count -- reporting it as guard_refused -- rather
+    than counting bytes a real sweep could never free. Delete-nothing throughout."""
+    root = tmp_path / "library"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_file = outside / "escapee.mkv"
+    real_file.write_bytes(b"0" * 100)
+    # A symlinked COMPONENT (not a symlink final entry): root/escaped -> outside, so
+    # root/escaped/escapee.mkv is lexically under root but realpaths to outside.
+    (root / "escaped").symlink_to(outside)
+    breadcrumb = str(root / "escaped" / "escapee.mkv")
+    await _movie(
+        sessionmaker_,
+        tmdb_id=1,
+        title="Escapee",
+        library_path=breadcrumb,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    library = FakeLibrary(
+        watch_states={(1, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(root)])
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(root),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate = records[0].getMessage()
+    # Eligible by policy (watched, past grace, unpinned), but the delete guard would
+    # refuse it, so it is NOT in would_evict and frees nothing.
+    assert "1 eligible eviction candidate(s)" in aggregate
+    assert "0 would_evict now" in aggregate
+    assert "0 byte(s) reclaimable" in aggregate
+    assert "guard_refused=1" in aggregate
+    # Delete-nothing: the escaping target file is untouched.
+    assert real_file.exists()
+
+
+async def test_preexisting_watch_interval_is_dropped_and_counted(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-3 finding #3: a re-imported / previously-watched title keeps Plex's OLD
+    last_viewed_at from BEFORE this import, so last_viewed_at < completed_at -- a
+    negative completed_to_last_watch. The interval measures POST-import
+    time-to-watch, which a pre-import view does not have: drop that per-title row and
+    count it as preexisting_watch. A normal post-import view still emits its positive
+    interval -- both dropped+counted and normal+emitted are proven here."""
+    positive_path = _movie_file(tmp_path, "Watched After Import.mkv")
+    await _movie(
+        sessionmaker_,
+        tmdb_id=1,
+        title="Watched After Import",
+        library_path=positive_path,
+        completed_at=_NOW - timedelta(days=20),  # imported...
+    )
+    negative_path = _movie_file(tmp_path, "Rewatch Reimport.mkv")
+    await _movie(
+        sessionmaker_,
+        tmdb_id=2,
+        title="Rewatch Reimport",
+        library_path=negative_path,
+        completed_at=_NOW - timedelta(days=5),  # re-imported recently...
+    )
+    library = FakeLibrary(
+        watch_states={
+            # ...then watched 5 days ago: a positive, post-import interval.
+            (1, "movie", None): WatchState(watched=True, last_viewed_at=_NOW - timedelta(days=5)),
+            # ...but Plex's view is 20 days old, from BEFORE the re-import: negative.
+            (2, "movie", None): WatchState(watched=True, last_viewed_at=_NOW - timedelta(days=20)),
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate = records[0].getMessage()
+    assert "2 title(s) with recorded watch activity" in aggregate  # both have views
+    assert "preexisting_watch=1" in aggregate
+    per_title = [r for r in records if "completed_to_last_watch=" in r.getMessage()]
+    # Only the positive (post-import) interval is emitted; the negative one dropped.
+    assert len(per_title) == 1
+    message = per_title[0].getMessage()
+    assert "Watched After Import" in message
+    assert "Rewatch Reimport" not in message
+    assert "completed_to_last_watch=-" not in message  # never a negative interval
 
 
 async def test_per_title_row_is_deduped_until_last_viewed_advances(

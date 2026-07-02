@@ -92,6 +92,22 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        """Whether :meth:`delete` would REFUSE ``path`` -- the pure containment
+        predicate, WITHOUT attempting the delete.
+
+        :meth:`delete` MUST refuse (raise) a path that does not resolve within a
+        configured library root; this exposes that exact same refusal decision as
+        a read-only query so a would-evict SIMULATION (the retention-telemetry
+        sweep) can pre-filter the very paths a real sweep's delete would refuse
+        -- never counting, as freeable, bytes a real delete would decline to touch
+        -- and can never drift from ``delete``'s own guard. Implementations that
+        fence ``delete`` to configured roots MUST resolve symlinked components the
+        same way ``delete`` does and fail closed (no roots / empty path -> refuse);
+        an implementation whose ``delete`` is unfenced returns ``False``.
+        """
+        raise NotImplementedError
+
     def reclaimable_bytes(self, path: str) -> int:
         """Return how many bytes deleting ``path`` would ACTUALLY reclaim right now.
 

@@ -245,6 +245,23 @@ class LocalFileSystem:
         """
         return list(_iter_video_files(root))
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        """Whether :meth:`delete` would REFUSE ``path`` as outside every configured
+        library root -- the pure containment predicate, no delete attempted.
+
+        The exact refusal check :meth:`delete` raises on, factored out so a
+        read-only caller (the retention-telemetry would-evict SIMULATION) can
+        pre-filter the same paths a real sweep's ``delete`` would refuse WITHOUT
+        deleting anything and WITHOUT reimplementing the check -- so its
+        would-evict count/bytes can never count space a real sweep would refuse to
+        free, and can never drift from ``delete``'s own guard. Mirrors ``delete``:
+        ``path`` is resolved to its realpath first (dereferencing a symlinked
+        COMPONENT that would escape the root, not just a symlink final entry), and
+        it fails CLOSED -- an empty path, or no configured roots, refuses.
+        """
+        real = os.path.realpath(path) if path else ""
+        return not real or not any(_is_within(root, real) for root in self._library_roots)
+
     def delete(self, path: str) -> None:
         """Delete ``path`` (a file, a symlink, or a whole directory tree) from local disk.
 
@@ -277,11 +294,14 @@ class LocalFileSystem:
         success, or a breadcrumb pointing at something already removed
         out-of-band) sees a clean, idempotent success.
         """
-        real = os.path.realpath(path) if path else ""
-        if not real or not any(_is_within(root, real) for root in self._library_roots):
+        if self.delete_guard_refuses(path):
             raise LocalFileSystemError(
                 f"refusing to delete {path!r}: outside every configured library root"
             )
+        # The guard resolved this same realpath to affirm containment; recompute it
+        # for the real-file/tree removal below (the guard passing guarantees a
+        # non-empty ``path`` that resolves within a configured root).
+        real = os.path.realpath(path)
         if not os.path.lexists(path):
             return  # already gone -- idempotent no-op, not an error
         if os.path.islink(path):
