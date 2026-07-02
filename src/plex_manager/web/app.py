@@ -30,17 +30,23 @@ from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
+    auto_grab_service,
     eviction_service,
     import_service,
     log_capture_service,
     queue_service,
     retention_telemetry_service,
 )
-from plex_manager.services.health_service import ReconcileStatus, read_disk_usage
+from plex_manager.services.health_service import (
+    AutograbStatus,
+    ReconcileStatus,
+    read_disk_usage,
+)
 from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     ServiceNotConfiguredError,
     ensure_system_settings,
+    get_auto_grab_enabled,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_eviction_enabled,
@@ -53,6 +59,7 @@ from plex_manager.web.deps import (
     get_log_retention_days,
     get_movies_root_optional,
     get_parser,
+    get_prowlarr,
     get_qbittorrent,
     get_quality_profile,
     get_tv_root_optional,
@@ -78,6 +85,14 @@ _logger = logging.getLogger(__name__)
 # dedicated worker are noted follow-ups).
 _RECONCILE_INTERVAL_SECONDS = 15.0
 
+# How often the auto-grab worker scans for due requests/seasons and searches
+# Prowlarr (ADR-0013). Slower than the 15s reconcile tick on purpose: the tick
+# itself is cheap (a due-scope query bounded by a per-scope backoff ladder), but a
+# tick that DOES find work runs real Prowlarr searches, so a 60s base cadence plus
+# the per-cycle search cap keeps the single Prowlarr from being hammered. A
+# constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
+_AUTOGRAB_INTERVAL_SECONDS = 60.0
+
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
     """Return ``app.state.reconcile_status``, lazily creating it if absent.
@@ -92,6 +107,21 @@ def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
     if not isinstance(status, ReconcileStatus):
         status = ReconcileStatus()
         app.state.reconcile_status = status
+    return status
+
+
+def _get_autograb_status(app: FastAPI) -> AutograbStatus:
+    """Return ``app.state.autograb_status``, lazily creating it if absent.
+
+    The exact mirror of :func:`_get_reconcile_status`: ``lifespan`` creates this
+    once up front, but ``_autograb_once`` is also called directly against a bare
+    ``FastAPI()`` in tests (bypassing ``lifespan`` -- see
+    ``tests/web/test_autograb_loop.py``), so this stays defensive.
+    """
+    status = getattr(app.state, "autograb_status", None)
+    if not isinstance(status, AutograbStatus):
+        status = AutograbStatus()
+        app.state.autograb_status = status
     return status
 
 
@@ -188,6 +218,73 @@ async def _reconcile_loop(app: FastAPI) -> None:
             _get_reconcile_status(app).mark_error(exc)
             _logger.exception("reconcile loop iteration failed; continuing")
         await asyncio.sleep(_RECONCILE_INTERVAL_SECONDS)
+
+
+async def _autograb_once(app: FastAPI) -> None:
+    """One auto-grab pass with a fresh session (ADR-0013), the beta automation spine.
+
+    Best-effort and honest:
+
+    * The ``auto_grab_enabled`` master switch is re-read EVERY tick (like the
+      eviction settings), so a web toggle takes effect on the very next cycle with
+      no restart -- north-star #1's "turn this bot off with a button". A disabled
+      or not-yet-configured (Prowlarr/qBittorrent absent) worker is a CLEAN no-op
+      (``mark_ok``), never an error: nothing is wrong, there is just nothing to do.
+    * Otherwise it delegates to :func:`auto_grab_service.run_grab_cycle`, which
+      reuses the SAME ``decision_service.preview`` + ``grab_service.grab`` brains
+      as the manual Grab button.
+
+    Stamps ``app.state.autograb_status`` (ADR-0013's health signal): ``mark_ok``
+    only if the whole body completes without raising. A search that RAISES
+    (Prowlarr down / rate-limited) propagates out of ``run_grab_cycle`` and is
+    recorded by ``_autograb_loop``'s ``except`` -- the operator sees a failing
+    auto-grab loop (WHY nothing is being grabbed), not requests silently stuck at
+    ``pending``.
+    """
+    status = _get_autograb_status(app)
+    status.mark_run_started()
+    sessionmaker = app.state.sessionmaker
+    client = app.state.http_client
+    async with sessionmaker() as session:
+        if not await get_auto_grab_enabled(session):
+            status.mark_ok()
+            return
+        # Prowlarr + qBittorrent are both required to search and grab; if either is
+        # unconfigured the worker is a clean no-op until setup completes (honest,
+        # not an error -- exactly the reconcile loop's posture for a missing qBt).
+        try:
+            prowlarr = await get_prowlarr(session, client)
+            qbt = await get_qbittorrent(session, client)
+        except ServiceNotConfiguredError:
+            status.mark_ok()
+            return
+        await auto_grab_service.run_grab_cycle(
+            session,
+            prowlarr=prowlarr,
+            parser=get_parser(),
+            profile=get_quality_profile(),
+            qbt=qbt,
+        )
+    status.mark_ok()
+
+
+async def _autograb_loop(app: FastAPI) -> None:
+    """Run :func:`_autograb_once` forever; one bad cycle never kills the loop.
+
+    A raised indexer error (Prowlarr down / rate-limited) is recorded on the
+    ``AutograbStatus`` health signal and the loop simply sleeps its base interval
+    before retrying -- ``run_grab_cycle`` already ABORTS the rest of the cycle on
+    the first raise (rather than hammering a down Prowlarr with every due scope),
+    so a 60s base cadence is itself the global cycle backoff. Mirrors
+    ``_reconcile_loop``'s "one bad cycle never kills the loop".
+    """
+    while True:
+        try:
+            await _autograb_once(app)
+        except Exception as exc:
+            _get_autograb_status(app).mark_error(exc)
+            _logger.exception("auto-grab loop iteration failed; continuing")
+        await asyncio.sleep(_AUTOGRAB_INTERVAL_SECONDS)
 
 
 async def _log_drain_loop(app: FastAPI) -> None:
@@ -508,17 +605,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     app.state.reconcile_status = ReconcileStatus()
+    app.state.autograb_status = AutograbStatus()
 
     log_handler = log_capture_service.configure_logging(get_settings().log_level)
     app.state.log_handler = log_handler
 
     # The background reconciler closes the request -> grab -> import -> available
-    # loop without a GET /queue poll having to do the heavy work. The log-drain
-    # and eviction tasks are its SIBLINGS (own intervals, same lifecycle).
+    # loop without a GET /queue poll having to do the heavy work. The auto-grab
+    # worker (ADR-0013) is what turns a fresh request INTO a grab in the first
+    # place; the log-drain and eviction tasks round out the set. All four are
+    # SIBLINGS (own intervals, same lifecycle) -- never the same schedule.
     reconcile_task = asyncio.create_task(_reconcile_loop(app))
+    autograb_task = asyncio.create_task(_autograb_loop(app))
     log_drain_task = asyncio.create_task(_log_drain_loop(app))
     eviction_task = asyncio.create_task(_eviction_loop(app))
-    background_tasks = (reconcile_task, log_drain_task, eviction_task)
+    background_tasks = (reconcile_task, autograb_task, log_drain_task, eviction_task)
     try:
         yield
     finally:

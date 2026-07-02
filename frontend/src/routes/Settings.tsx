@@ -30,6 +30,8 @@ const EVICTION_ENABLED_DEFAULT = true
 const EVICTION_PROACTIVE_ENABLED_DEFAULT = false
 const EVICTION_INTERVAL_MINUTES_DEFAULT = 30
 const LOG_RETENTION_DAYS_DEFAULT = 7
+// Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
+const AUTO_GRAB_ENABLED_DEFAULT = true
 
 interface FormState {
   plex_url: string
@@ -52,6 +54,8 @@ interface FormState {
   eviction_proactive_enabled: boolean
   eviction_interval_minutes: string
   log_retention_days: string
+  // Auto-grab worker (ADR-0013) — the master on/off switch.
+  auto_grab_enabled: boolean
 }
 
 /** Plaintext fields prefill from current values; secret inputs always start empty. */
@@ -81,6 +85,7 @@ function initialForm(data: SettingsResponse): FormState {
       data.eviction_interval_minutes ?? EVICTION_INTERVAL_MINUTES_DEFAULT,
     ),
     log_retention_days: String(data.log_retention_days ?? LOG_RETENTION_DAYS_DEFAULT),
+    auto_grab_enabled: data.auto_grab_enabled ?? AUTO_GRAB_ENABLED_DEFAULT,
   }
 }
 
@@ -98,7 +103,7 @@ type NumberKey =
   | 'eviction_grace_days'
   | 'eviction_interval_minutes'
   | 'log_retention_days'
-type BoolKey = 'eviction_enabled' | 'eviction_proactive_enabled'
+type BoolKey = 'eviction_enabled' | 'eviction_proactive_enabled' | 'auto_grab_enabled'
 
 // Operator-facing label per numeric operability knob — reused by the Save
 // validation below so an invalid field's toast names it the same way the form
@@ -406,6 +411,7 @@ export function Settings() {
       eviction_proactive_enabled: form.eviction_proactive_enabled,
       eviction_interval_minutes: Number(form.eviction_interval_minutes),
       log_retention_days: Number(form.log_retention_days),
+      auto_grab_enabled: form.auto_grab_enabled,
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -578,6 +584,24 @@ export function Settings() {
                   </button>
                 ) : null}
               </>
+            )}
+          </div>
+        </section>
+
+        {/* ADR-0013 — the auto-grab worker's master switch. North star #1: turn
+            the background request→search→grab loop off with a button, never a
+            terminal. The manual Grab button still works when this is off. */}
+        <section className="rounded-xl border border-hairline bg-surface p-5">
+          <h2 className="font-display text-sm font-semibold text-ink">Automation</h2>
+          <p className="mt-1 text-xs text-faint">
+            Controls the background worker that searches and grabs approved requests.
+          </p>
+          <div className="mt-4 flex flex-col gap-3">
+            {checkboxField(
+              'auto_grab_enabled',
+              'Enable auto-grab',
+              'Automatically search and grab pending requests. Turn off to grab ' +
+                'only via the manual button on each title.',
             )}
           </div>
         </section>

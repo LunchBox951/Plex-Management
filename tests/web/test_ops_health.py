@@ -57,6 +57,14 @@ async def test_every_subsystem_is_honestly_not_configured_by_default(
         "last_error_at": None,
         "consecutive_failures": 0,
     }
+    # The auto-grab loop (ADR-0013) surfaces the same fresh-process shape.
+    assert body["autograb"] == {
+        "last_run_at": None,
+        "last_ok_at": None,
+        "last_error_type": None,
+        "last_error_at": None,
+        "consecutive_failures": 0,
+    }
 
 
 async def test_prowlarr_reports_ok_then_down_once_configured(
