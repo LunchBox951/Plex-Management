@@ -33,6 +33,9 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   // error (it is deliberate, honest space management), so this gets the neutral
   // intent rather than red.
   evicted: { label: 'Evicted', intent: 'neutral' },
+  // ADR-0014: the operator cancelled a not-yet-imported request. Settled/
+  // re-requestable; deliberate, not a failure, so neutral rather than red.
+  cancelled: { label: 'Cancelled', intent: 'neutral' },
 }
 
 const DOWNLOAD_STATUS: Record<string, StatusPresentation> = {

@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  useCancelRequest,
   useCreateRequest,
   useGrab,
   useImportDownload,
   useMarkFailed,
   useQueue,
+  useReportIssue,
   useRequests,
   useSearchPreview,
   useSetKeepForever,
+  type ReportReason,
 } from '../api/hooks'
 import type {
   AcceptedRelease,
@@ -60,6 +63,9 @@ type DerivedState =
   // season's) file. Settled, same as available/failed — "Request again" makes
   // a fresh, grabbable request.
   | { kind: 'evicted' }
+  // ADR-0014: the operator cancelled a not-yet-imported request. Settled, same as
+  // available/failed/evicted — "Request again" makes a fresh, grabbable request.
+  | { kind: 'cancelled' }
   | { kind: 'unknown'; status: string }
 
 /**
@@ -123,10 +129,20 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
       return { kind: 'failed' }
     case 'evicted':
       return { kind: 'evicted' }
+    case 'cancelled':
+      return { kind: 'cancelled' }
     default:
       return { kind: 'unknown', status }
   }
 }
+
+/**
+ * The not-yet-imported request statuses a cancel may act on (ADR-0014). Mirrors
+ * the backend `CANCELLABLE_REQUEST_STATUS_VALUES`; gates the "Cancel request"
+ * action against the PARENT request status (for tv the rollup), never the
+ * per-season zone — a `partially_available` show is not cancellable wholesale.
+ */
+const CANCELLABLE_STATUSES = new Set(['pending', 'searching', 'no_acceptable_release', 'downloading'])
 
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
@@ -183,6 +199,8 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const markFailed = useMarkFailed()
   const importDownload = useImportDownload()
   const setKeepForever = useSetKeepForever()
+  const reportIssue = useReportIssue()
+  const cancelRequest = useCancelRequest()
 
   // Live correlation sources — poll while a title is open so the action zone
   // tracks the backend through search -> download -> import without a refresh.
@@ -208,6 +226,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
   // The confirm dialog for "report a problem"; carries the download to re-arm.
   const [reportFor, setReportFor] = useState<{ downloadId: number } | null>(null)
+  // The confirm dialog for reporting an IMPORTED/available title (ADR-0014): the
+  // new report-issue endpoint (blocklist + purge torrent/file + inline re-search),
+  // distinct from `reportFor`'s queue mark-failed. Carries the request + season.
+  const [reportIssueFor, setReportIssueFor] = useState<{
+    requestId: number
+    season: number | null
+  } | null>(null)
+  const [reportReason, setReportReason] = useState<ReportReason>('bad_quality')
+  // The confirm dialog for cancelling a not-yet-imported request (ADR-0014).
+  const [cancelFor, setCancelFor] = useState<{ requestId: number } | null>(null)
 
   // Reset the per-title flow whenever a different title is opened. Keyed on
   // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
@@ -226,6 +254,9 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     setPreview(null)
     setGrabbingGuid(null)
     setReportFor(null)
+    setReportIssueFor(null)
+    setReportReason('bad_quality')
+    setCancelFor(null)
   }, [titleKey])
 
   // The live request for this exact title (media_type + tmdb_id), if any. /requests
@@ -466,6 +497,41 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     }
   }, [reportFor, markFailed, toast])
 
+  // Report an IMPORTED/available title (ADR-0014): blocklist the release, purge its
+  // torrent + library file, and re-search inline. Distinct from `runReport` above
+  // (which marks an in-flight queue download failed) — there is no queue row here.
+  const runReportIssue = useCallback(async () => {
+    if (!reportIssueFor) return
+    try {
+      await reportIssue.mutateAsync({
+        requestId: reportIssueFor.requestId,
+        reason: reportReason,
+        season: reportIssueFor.season,
+      })
+      toast({
+        title: 'Reported',
+        description: 'Blocklisted that release, removed the file, and re-searching.',
+        intent: 'success',
+      })
+      setReportIssueFor(null)
+    } catch (error) {
+      toast({ title: 'Report failed', description: asApiError(error).message, intent: 'error' })
+    }
+  }, [reportIssueFor, reportReason, reportIssue, toast])
+
+  // Cancel a not-yet-imported request (ADR-0014): drop any active torrent(s) and
+  // settle it to `cancelled`. The honest opposite of report-issue.
+  const runCancel = useCallback(async () => {
+    if (!cancelFor) return
+    try {
+      await cancelRequest.mutateAsync(cancelFor.requestId)
+      toast({ title: 'Request cancelled', intent: 'success' })
+      setCancelFor(null)
+    } catch (error) {
+      toast({ title: 'Cancel failed', description: asApiError(error).message, intent: 'error' })
+    }
+  }, [cancelFor, cancelRequest, toast])
+
   // Retry a blocked import (operator fixed the infra, or it was a transient Plex
   // hiccup). The reconcile loop re-runs validate -> place -> scan; an idempotent
   // re-import skips the copy if the file is already in place.
@@ -590,6 +656,31 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     </Button>
   ) : null
 
+  // Report an IMPORTED/available title (ADR-0014). Distinct from `reportButton`
+  // (queue mark-failed): there is no active download here, so it acts on the
+  // request + selected season via the report-issue endpoint. Needs a known request.
+  const reportIssueButton =
+    effectiveRequestId !== null ? (
+      <Button
+        variant="danger"
+        onClick={() =>
+          setReportIssueFor({ requestId: effectiveRequestId, season: currentSeason })
+        }
+      >
+        Report a problem
+      </Button>
+    ) : null
+
+  // Cancel the whole request (ADR-0014) — only while it is genuinely not-yet-imported.
+  // Gated on the PARENT request status (for tv the rollup), so a partially_available
+  // show never offers a wholesale cancel that the backend would 409.
+  const canCancel = liveRequest != null && CANCELLABLE_STATUSES.has(liveRequest.status)
+  const cancelButton = canCancel ? (
+    <Button variant="secondary" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
+      Cancel request
+    </Button>
+  ) : null
+
   const reSearchButton = (
     <Button
       variant="secondary"
@@ -637,6 +728,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             Searching
           </span>
           {reSearchButton}
+          {cancelButton}
         </div>
       )
       break
@@ -652,7 +744,12 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
               </span>
             </div>
           </div>
-          {reportButton ? <div className="flex flex-wrap gap-2">{reportButton}</div> : null}
+          {reportButton || cancelButton ? (
+            <div className="flex flex-wrap gap-2">
+              {reportButton}
+              {cancelButton}
+            </div>
+          ) : null}
         </div>
       )
       break
@@ -664,6 +761,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             Nothing was grabbed. Re-search to try again later.
           </span>
           {reSearchButton}
+          {cancelButton}
         </div>
       )
       break
@@ -688,21 +786,32 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       break
     case 'completed':
       actionZone = (
-        <div className="flex flex-wrap items-center gap-3">
-          <StatusBadge status={FINALIZING} />
-          <span className="text-sm text-muted">Imported — awaiting Plex confirmation.</span>
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={FINALIZING} />
+            <span className="text-sm text-muted">Imported — awaiting Plex confirmation.</span>
+          </div>
+          {/* Imported (finalizing): report-issue can already redo it (ADR-0014). */}
+          {reportIssueButton ? (
+            <div className="flex flex-wrap gap-2">{reportIssueButton}</div>
+          ) : null}
         </div>
       )
       break
     case 'available':
       // In the library. The download is terminal (gone from the active queue), so
-      // there is no mark-failed target here; report-issue-with-purge (blocklist +
-      // delete from Plex/disk + re-search) is a deferred next-beta capability.
+      // there is no mark-failed target — instead report-issue-with-purge (ADR-0014)
+      // blocklists the release, deletes it from Plex/disk, and re-searches inline.
       actionZone = (
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="inline-flex items-center gap-1.5 rounded-lg bg-available/15 px-3 py-1 text-sm font-semibold text-available ring-1 ring-available/30">
-            ✓ In your library
-          </span>
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="inline-flex items-center gap-1.5 rounded-lg bg-available/15 px-3 py-1 text-sm font-semibold text-available ring-1 ring-available/30">
+              ✓ In your library
+            </span>
+          </div>
+          {reportIssueButton ? (
+            <div className="flex flex-wrap gap-2">{reportIssueButton}</div>
+          ) : null}
         </div>
       )
       break
@@ -735,6 +844,20 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             <span className="text-sm text-muted">
               Freed to relieve disk pressure. Request it again to re-grab it.
             </span>
+          </div>
+          <div className="flex flex-wrap gap-2">{requestAgainButton}</div>
+        </div>
+      )
+      break
+    case 'cancelled':
+      // ADR-0014: the operator cancelled this (not-yet-imported) request. Settled,
+      // same as evicted/available/failed — "Request again" makes a fresh, grabbable
+      // request (the old id is settled).
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={requestStatus('cancelled')} />
+            <span className="text-sm text-muted">Cancelled. Request it again to restart.</span>
           </div>
           <div className="flex flex-wrap gap-2">{requestAgainButton}</div>
         </div>
@@ -814,6 +937,73 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             </Button>
             <Button variant="danger" loading={markFailed.isPending} onClick={() => void runReport()}>
               Blocklist &amp; re-search
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
+
+      {reportIssueFor ? (
+        <Dialog
+          open
+          onOpenChange={(next) => {
+            if (!next) setReportIssueFor(null)
+          }}
+          title="Report a problem with this title?"
+          description="Blocklist this release, delete the file, and search again for a different one. This can't be undone, but re-searching brings the content back."
+        >
+          <div className="flex flex-col gap-4">
+            <label className="flex flex-col gap-1.5 text-sm text-muted">
+              What's wrong?
+              <select
+                aria-label="Reason"
+                className="h-9 rounded-lg bg-bg px-2 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                value={reportReason}
+                onChange={(e) => setReportReason(e.target.value as ReportReason)}
+              >
+                <option value="bad_quality">Bad quality</option>
+                <option value="wrong_media">Wrong movie/episode</option>
+                <option value="user_reported">Something else</option>
+              </select>
+            </label>
+            <div className="flex justify-end gap-3">
+              <Button
+                variant="secondary"
+                onClick={() => setReportIssueFor(null)}
+                disabled={reportIssue.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                loading={reportIssue.isPending}
+                onClick={() => void runReportIssue()}
+              >
+                Blocklist &amp; redo
+              </Button>
+            </div>
+          </div>
+        </Dialog>
+      ) : null}
+
+      {cancelFor ? (
+        <Dialog
+          open
+          onOpenChange={(next) => {
+            if (!next) setCancelFor(null)
+          }}
+          title="Cancel this request?"
+          description="Stops any active download and removes it. You can request it again later."
+        >
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setCancelFor(null)}
+              disabled={cancelRequest.isPending}
+            >
+              Keep it
+            </Button>
+            <Button variant="danger" loading={cancelRequest.isPending} onClick={() => void runCancel()}>
+              Cancel request
             </Button>
           </div>
         </Dialog>
