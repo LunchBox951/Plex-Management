@@ -11,6 +11,8 @@ const h = vi.hoisted(() => ({
   settingsData: null as SettingsResponse | null,
   libraries: [] as PlexLibraryOption[],
   toast: vi.fn(),
+  revealMutateAsync: vi.fn(),
+  rotateMutateAsync: vi.fn(),
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -23,6 +25,12 @@ vi.mock('../api/hooks', () => ({
   }),
   useUpdateSettings: () => ({ mutateAsync: h.mutateAsync, isPending: false }),
   usePlexLibraries: () => ({ data: h.libraries }),
+  useRevealAppKey: () => ({ mutateAsync: h.revealMutateAsync, isPending: false }),
+  useRotateAppKey: () => ({
+    mutateAsync: h.rotateMutateAsync,
+    isPending: false,
+    isSuccess: false,
+  }),
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -341,5 +349,74 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(h.toast).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Settings saved', intent: 'success' }),
     )
+  })
+})
+
+describe('Settings — app key reveal/rotate (issue #28)', () => {
+  beforeEach(() => {
+    h.revealMutateAsync.mockReset()
+    h.rotateMutateAsync.mockReset()
+    h.settingsData = {
+      plex_url: 'http://plex:32400',
+      plex_token: '***',
+      prowlarr_url: 'http://prowlarr:9696',
+      prowlarr_api_key: '***',
+      qbittorrent_url: 'http://qb:8080',
+      qbittorrent_username: 'admin',
+      qbittorrent_password: '***',
+      tmdb_api_key: '***',
+      movies_root: '/plex/movies',
+    }
+    h.libraries = []
+  })
+
+  it('reveals the current key on click', async () => {
+    h.revealMutateAsync.mockResolvedValue({ app_api_key: 'current-key-abc' })
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /^reveal$/i }))
+
+    await waitFor(() => expect(screen.getByLabelText(/current app key/i)).toBeInTheDocument())
+    expect(screen.getByLabelText(/current app key/i)).toHaveValue('current-key-abc')
+    expect(h.revealMutateAsync).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a confirm dialog before rotating, and does not rotate until confirmed', () => {
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
+
+    expect(screen.getByText(/rotate the app key\?/i)).toBeInTheDocument()
+    // The dialog warns that every OTHER device is signed out, but this one is not.
+    expect(screen.getByText(/signed out/i)).toBeInTheDocument()
+    expect(h.rotateMutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('rotates and displays the new key once confirmed', async () => {
+    h.rotateMutateAsync.mockResolvedValue({ app_api_key: 'brand-new-key-xyz' })
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: /rotate key/i }))
+
+    await waitFor(() => expect(h.rotateMutateAsync).toHaveBeenCalledTimes(1))
+    // useRotateAppKey itself is responsible for persisting the key via
+    // setApiKey (issue #28: the current session must survive its own
+    // rotation) -- this component only needs to display what came back.
+    await waitFor(() => expect(screen.getByLabelText(/new app key/i)).toHaveValue(
+      'brand-new-key-xyz',
+    ))
+  })
+
+  it('cancelling the confirm dialog rotates nothing', () => {
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: /^cancel$/i }))
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(h.rotateMutateAsync).not.toHaveBeenCalled()
   })
 })

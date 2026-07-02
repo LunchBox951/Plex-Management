@@ -329,3 +329,53 @@ async def test_put_single_field_threshold_above_stored_target_still_succeeds(
     async with sessionmaker_() as session:
         assert await get_disk_pressure_threshold_percent(session) == 90.0
         assert await get_disk_pressure_target_percent(session) == 80.0  # untouched
+
+
+# --------------------------------------------------------------------------- #
+# App-key reveal / rotate (issue #28's OAuth-deferral hardening)
+# --------------------------------------------------------------------------- #
+async def test_reveal_app_key_returns_the_current_key(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json() == {"app_api_key": _API_KEY}
+
+
+async def test_reveal_app_key_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key")
+    assert response.status_code == 401
+
+
+async def test_rotate_app_key_mints_a_new_key_and_invalidates_the_old_one(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    rotate = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key != _API_KEY
+    assert len(new_key) > 20  # matches setup.complete()'s token_urlsafe(32) shape
+
+    # The OLD key (still in this request's headers) is immediately invalid --
+    # rotation replaces the single live key, so every other device holding the
+    # old value is locked out at once.
+    old_key_check = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert old_key_check.status_code == 401
+
+    # The NEW key works.
+    new_key_check = await client.get("/api/v1/settings", headers={"X-Api-Key": new_key})
+    assert new_key_check.status_code == 200
+
+
+async def test_rotate_app_key_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.post("/api/v1/settings/app-key/rotate")
+    assert response.status_code == 401

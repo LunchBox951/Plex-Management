@@ -67,6 +67,20 @@
         "title": "AcceptedRelease",
         "type": "object"
       },
+      "AppApiKeyResponse": {
+        "description": "The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.\n\nAuthenticated-only (both endpoints require a currently-valid ``X-Api-Key``):\nreveal is the belt-and-braces recovery path for a lost/forgotten key on a\ndevice that still has it saved, and rotate mints and returns a brand-new key\nONCE \u2014 the plaintext is never retrievable again after this response, only the\nFernet-encrypted column at rest (matching the one-time disclosure setup's\n``/complete`` already gives the initial key).",
+        "properties": {
+          "app_api_key": {
+            "title": "App Api Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "app_api_key"
+        ],
+        "title": "AppApiKeyResponse",
+        "type": "object"
+      },
       "BlocklistEntry": {
         "description": "A blocklist entry as returned to the client.",
         "properties": {
@@ -3286,6 +3300,60 @@
           }
         ],
         "summary": "Put Settings Endpoint",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/v1/settings/app-key": {
+      "get": {
+        "description": "Return the current app ``X-Api-Key`` in plaintext.\n\nAuthenticated: the caller already proved they hold a currently-valid key\n(``require_api_key`` on the whole router), so this is not a privilege\nescalation -- it is the break-glass recovery path for a NEW device/browser\nthat needs to be paired without re-running setup, and the belt-and-braces\nanswer to \"I'm about to lose my only saved copy\" (issue #28's OAuth-deferral\nanalysis: total key loss is the one genuine gap in keeping a static key for\nthe beta).",
+        "operationId": "reveal_app_key_endpoint_api_v1_settings_app_key_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppApiKeyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Reveal App Key Endpoint",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/v1/settings/app-key/rotate": {
+      "post": {
+        "description": "Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.\n\nEvery OTHER device/browser with the OLD key saved (localStorage) is\nimmediately locked out -- there is exactly one live key at a time, matching\n``require_api_key``'s single-key comparison. The frontend caller of this\nendpoint MUST persist the returned key immediately so the session that just\nrotated it survives (the new key is never shown again after this response).",
+        "operationId": "rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppApiKeyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Rotate App Key Endpoint",
         "tags": [
           "settings"
         ]

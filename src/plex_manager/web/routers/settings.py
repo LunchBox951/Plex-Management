@@ -3,27 +3,42 @@
 ``GET`` returns a redacted view (secrets masked to ``"***"``). ``PUT`` upserts
 the provided config, encrypting secret values at rest. Only fields present in the
 request body are written; absent fields are left unchanged.
+
+``GET /app-key`` and ``POST /app-key/rotate`` reveal / rotate the app's own
+``X-Api-Key`` (``SystemSettings.app_api_key``) -- the belt-and-braces recovery
+path for a lost key on a new device, or a full rotate if the key was ever
+exposed (issue #28's OAuth-deferral analysis).
 """
 
 from __future__ import annotations
 
+import secrets
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.db import get_session
+from plex_manager.models import SystemSettings
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web.deps import (
     SECRET_MASK,
     SECRET_SETTING_KEYS,
     SettingsStore,
+    ensure_system_settings,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_library,
+    load_system_settings,
     require_api_key,
 )
-from plex_manager.web.schemas import PlexLibraryOption, SettingsResponse, SettingsUpdate
+from plex_manager.web.schemas import (
+    AppApiKeyResponse,
+    PlexLibraryOption,
+    SettingsResponse,
+    SettingsUpdate,
+)
 from plex_manager.web.setup_validation import library_options
 
 __all__ = ["router"]
@@ -33,6 +48,11 @@ router = APIRouter(
     tags=["settings"],
     dependencies=[Depends(require_api_key)],
 )
+
+# Same byte length setup.complete() mints the initial key with
+# (secrets.token_urlsafe(32) — a 43-char URL-safe token), so a rotated key is
+# indistinguishable in shape/strength from the one setup issued.
+_API_KEY_BYTES = 32
 
 
 async def _redacted(store: SettingsStore) -> SettingsResponse:
@@ -87,6 +107,47 @@ async def plex_libraries_endpoint(
     # reason. The warmed fast paths (is_available/scan/watch_state) are
     # untouched and stay on the cached default.
     return library_options(await library.list_sections(use_cache=False), probe_writable=True)
+
+
+@router.get("/app-key")
+async def reveal_app_key_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AppApiKeyResponse:
+    """Return the current app ``X-Api-Key`` in plaintext.
+
+    Authenticated: the caller already proved they hold a currently-valid key
+    (``require_api_key`` on the whole router), so this is not a privilege
+    escalation -- it is the break-glass recovery path for a NEW device/browser
+    that needs to be paired without re-running setup, and the belt-and-braces
+    answer to "I'm about to lose my only saved copy" (issue #28's OAuth-deferral
+    analysis: total key loss is the one genuine gap in keeping a static key for
+    the beta).
+    """
+    system = await load_system_settings(session)
+    if system is None or system.app_api_key is None:
+        raise HTTPException(status_code=409, detail="not_initialized")
+    return AppApiKeyResponse(app_api_key=system.app_api_key)
+
+
+@router.post("/app-key/rotate")
+async def rotate_app_key_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AppApiKeyResponse:
+    """Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
+
+    Every OTHER device/browser with the OLD key saved (localStorage) is
+    immediately locked out -- there is exactly one live key at a time, matching
+    ``require_api_key``'s single-key comparison. The frontend caller of this
+    endpoint MUST persist the returned key immediately so the session that just
+    rotated it survives (the new key is never shown again after this response).
+    """
+    system = await ensure_system_settings(session)
+    new_key = secrets.token_urlsafe(_API_KEY_BYTES)
+    await session.execute(
+        update(SystemSettings).where(SystemSettings.id == system.id).values(app_api_key=new_key)
+    )
+    await session.commit()
+    return AppApiKeyResponse(app_api_key=new_key)
 
 
 @router.put("")
