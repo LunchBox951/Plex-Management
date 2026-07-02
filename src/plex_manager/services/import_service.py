@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import weakref
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final
 
@@ -244,11 +245,19 @@ def _remove_quietly_many(paths: list[Path]) -> None:
 # store), so without this two import attempts of the SAME download could both claim
 # ``Importing`` and race on placement/finalize — risking deletion of the file the
 # other attempt placed. One lock per download id; different downloads never block.
-# The registry grows by one small lock per imported download and is never evicted:
-# bounded by the lifetime download count (negligible for a self-hosted server).
-# Correct per-key eviction needs a ref-counted manager (a bare pop races a waiter),
-# so it is deferred rather than done unsafely.
-_import_locks: dict[int, asyncio.Lock] = {}
+#
+# A ``WeakValueDictionary`` keeps this self-bounded WITHOUT a naive pop-after-
+# release, which would race an incoming waiter that already captured a reference
+# to the old Lock object (two Lock instances for one download_id loses mutual
+# exclusion — the hazard a bare pop() would reintroduce). As long as a coroutine
+# is inside or awaiting ``async with _import_lock(download_id):``, the ``async
+# with`` statement's own temporary holds a strong reference to that Lock object
+# for the whole block, including while suspended on ``.acquire()`` — CPython's
+# immediate refcounting only drops the weak-value entry once the TRUE last
+# strong reference (no coroutine still holding/awaiting it) disappears, never
+# mid-wait. Relies on CPython's deterministic refcounting (not portable to
+# PyPy); acceptable for this project's single-runtime deployment target.
+_import_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 def _import_lock(download_id: int) -> asyncio.Lock:
