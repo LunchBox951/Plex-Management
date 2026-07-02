@@ -104,6 +104,35 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
     assert response.json()["ok"] is False
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "file:///etc/passwd",
+        "prowlarr.local",  # no scheme
+        "http://",  # empty host
+        "not a url at all",
+        "ftp://prowlarr.local",
+    ],
+)
+async def test_validate_prowlarr_rejects_non_http_url(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # A defense-in-depth check (alert #247): a malformed/non-http(s) url never
+    # reaches httpx -- it gets a clear, retryable rejection instead of an opaque
+    # transport error. Prove no outbound request is even attempted.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Enter a valid http(s) URL."
+
+
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(
     client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
 ) -> None:
@@ -313,6 +342,62 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
     body = response.json()
     assert body["ok"] is False
     assert "bad" not in response.text
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    ["file:///etc/passwd", "qb.local", "http://", "not a url at all"],
+)
+async def test_validate_qbittorrent_rejects_non_http_url(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/qbittorrent",
+        json={"url": bad_url, "username": "admin", "password": "pw"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Enter a valid http(s) URL."
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    ["file:///etc/passwd", "plex.local", "http://", "not a url at all"],
+)
+async def test_validate_plex_rejects_non_http_url(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": bad_url, "token": "tok"},
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Enter a valid http(s) URL."
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+async def test_validate_prowlarr_accepts_valid_http_and_https(
+    client: httpx.AsyncClient, app: FastAPI, scheme: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/system/status"
+        return httpx.Response(200, json={"version": "1.0"})
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": f"{scheme}://prowlarr.local", "api_key": "pk"},
+    )
+    assert response.json()["ok"] is True
 
 
 async def test_validate_requires_api_key_after_init(
