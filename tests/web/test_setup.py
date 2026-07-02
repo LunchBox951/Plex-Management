@@ -255,6 +255,25 @@ def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
     )
 
 
+def test_complete_contract_documents_library_root_invariant(app: FastAPI) -> None:
+    schema = app.openapi()["components"]["schemas"]["SetupCompleteRequest"]
+
+    assert schema["allOf"] == [
+        {
+            "anyOf": [
+                {
+                    "required": ["movies_root"],
+                    "properties": {"movies_root": {"type": "string", "pattern": "\\S"}},
+                },
+                {
+                    "required": ["tv_root"],
+                    "properties": {"tv_root": {"type": "string", "pattern": "\\S"}},
+                },
+            ]
+        }
+    ]
+
+
 async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(
     client: httpx.AsyncClient,
 ) -> None:

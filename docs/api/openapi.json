@@ -1997,6 +1997,34 @@
         "type": "object"
       },
       "SetupCompleteRequest": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "properties": {
+                  "movies_root": {
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "movies_root"
+                ]
+              },
+              {
+                "properties": {
+                  "tv_root": {
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tv_root"
+                ]
+              }
+            ]
+          }
+        ],
         "description": "The validated credential set written on ``POST /setup/complete``.",
         "properties": {
           "movies_root": {

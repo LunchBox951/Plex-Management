@@ -160,7 +160,25 @@ class ServiceValidateResponse(BaseModel):
 class SetupCompleteRequest(BaseModel):
     """The validated credential set written on ``POST /setup/complete``."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        json_schema_extra={
+            "allOf": [
+                {
+                    "anyOf": [
+                        {
+                            "required": ["movies_root"],
+                            "properties": {"movies_root": {"type": "string", "pattern": "\\S"}},
+                        },
+                        {
+                            "required": ["tv_root"],
+                            "properties": {"tv_root": {"type": "string", "pattern": "\\S"}},
+                        },
+                    ]
+                }
+            ]
+        },
+    )
 
     plex_url: str
     plex_token: str

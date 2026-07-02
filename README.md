@@ -12,8 +12,7 @@ single app — with two differences that define the project:
 > **Status:** alpha. The request, search, grab, reconcile, import, Plex scan,
 > Plex availability dedupe, disk-pressure eviction, log/status, settings, and web
 > UI workflows are built and tested. Plex OAuth and the bundled host updater are
-> still deferred. See
-> [docs/design/alpha-plan.md](docs/design/alpha-plan.md).
+> still deferred.
 
 ## What works now (alpha)
 
@@ -127,7 +126,7 @@ See [ADR-0002](docs/adr/0002-python-typed-stack.md) and
 ## Documentation
 
 - [Design overview](docs/design/overview.md)
-- [Backend alpha scope & plan](docs/design/alpha-plan.md)
+- [Historical backend-alpha plan](docs/design/alpha-plan.md)
 - [REST API contract (OpenAPI)](docs/api/openapi.json)
 - [Architecture Decision Records](docs/adr/)
 - [Security policy](SECURITY.md)

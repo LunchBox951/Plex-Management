@@ -30,16 +30,17 @@ there is no bug-bounty program.
 - First-run setup is guarded by `PLEX_MANAGER_SETUP_TOKEN` in the stock Docker
   Compose deployment, and the default published host bind is loopback-only. Keep
   that token out of issue reports, logs, screenshots, and public compose examples.
-- Secrets **must never be written to logs** — enforced in review today, and to be
-  backed by a logging redaction filter and a test once the secrets code lands (a
-  regression carried over from a prototype lesson).
+- Secrets **must never be written to logs**. The log capture pipeline stores
+  already-formatted messages and context rather than redacting after capture, so
+  the control is call-site hygiene plus tests and quieter `httpx`/`httpcore`
+  logger levels for secret-prone third-party request logs.
 
 ## Automated security checks (CI)
 
 | Check | Tool |
 |---|---|
 | Static analysis (SAST) | CodeQL |
-| Dependency vulnerabilities | `pip-audit` (runtime deps) + Dependabot alerts (incl. dev) |
+| Dependency vulnerabilities | `pip-audit` (runtime deps) + `npm audit --audit-level=high` (frontend shipped deps) + Dependabot alerts (incl. dev) |
 | Python security lints | `ruff` (bandit `S` rules) |
 | Secret scanning | gitleaks (CI) + GitHub secret scanning (repo setting) |
 | Container image CVEs | Trivy — scans the built image on every PR and on push to `main`; report-only, all severities (the Security tab is the honest tally) |

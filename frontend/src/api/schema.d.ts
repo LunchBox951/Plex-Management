@@ -1502,7 +1502,11 @@ export interface components {
             tmdb_api_key: string;
             /** Tv Root */
             tv_root?: string | null;
-        };
+        } & ({
+            movies_root: string;
+        } | {
+            tv_root: string;
+        });
         /**
          * SetupStatusResponse
          * @description Install state. ``app_api_key`` is populated only once initialized.

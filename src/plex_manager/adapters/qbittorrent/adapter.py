@@ -37,10 +37,12 @@ import json
 import logging
 import os
 import socket
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from typing import Final, cast
 from urllib.parse import parse_qs, urljoin, urlparse
 
+import httpcore
 import httpx
 
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
@@ -59,6 +61,13 @@ _PROPERTIES_TTL_SECONDS: Final = 30.0
 _MAX_TORRENT_BYTES: Final = 1_000_000
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
+_HTTP_CORE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpcore.TimeoutException,
+    httpcore.NetworkError,
+    httpcore.ProtocolError,
+    httpcore.ProxyError,
+    httpcore.UnsupportedProtocol,
+)
 
 
 class QbittorrentError(RuntimeError):
@@ -279,19 +288,137 @@ def _is_blocked_address(address: str) -> bool:
     return not ip.is_global or ip.is_multicast
 
 
+def _safe_fetch_addresses(host: str, port: int | None) -> list[str]:
+    if _is_blocked_address(host):
+        raise QbittorrentError("unsafe torrent source URL")
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise QbittorrentError("unsafe torrent source URL") from exc
+
+    addresses = [info[4][0] for info in infos if isinstance(info[4][0], str)]
+    if not addresses or any(_is_blocked_address(address) for address in addresses):
+        raise QbittorrentError("unsafe torrent source URL")
+    return addresses
+
+
 def _assert_safe_fetch_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise QbittorrentError("unsupported torrent source URL")
-    host = parsed.hostname
-    if _is_blocked_address(host):
-        raise QbittorrentError("unsafe torrent source URL")
-    try:
-        infos = socket.getaddrinfo(host, parsed.port, type=socket.SOCK_STREAM)
-    except OSError:
-        raise QbittorrentError("unsafe torrent source URL") from None
-    if any(isinstance(info[4][0], str) and _is_blocked_address(info[4][0]) for info in infos):
-        raise QbittorrentError("unsafe torrent source URL")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    _safe_fetch_addresses(parsed.hostname, port)
+
+
+class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Pin HTTP-source fetches to a vetted global address.
+
+    httpx/httpcore normally resolve the request hostname inside ``connect_tcp``.
+    The adapter also validates torrent-source URLs before fetching, but that
+    validation and the actual connection would otherwise be two DNS lookups. This
+    backend makes the connection-time lookup the authority: it resolves once,
+    rejects any non-global answer, then asks the real backend to connect to the
+    vetted IP while httpcore keeps the original origin for Host and TLS SNI.
+    """
+
+    def __init__(self, delegate: httpcore.AsyncNetworkBackend | None = None) -> None:
+        self._delegate: httpcore.AsyncNetworkBackend = (
+            delegate
+            if delegate is not None
+            else cast(httpcore.AsyncNetworkBackend, httpcore.AnyIOBackend())
+        )
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            address = _safe_fetch_addresses(host, port)[0]
+        except QbittorrentError as exc:
+            raise httpcore.ConnectError("unsafe torrent source URL") from exc
+        return await self._delegate.connect_tcp(
+            address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise httpcore.UnsupportedProtocol("torrent source fetches do not use unix sockets")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
+class _SafeFetchResponseStream(httpx.AsyncByteStream):
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for part in self._stream:
+                yield part
+        except _HTTP_CORE_EXCEPTIONS as exc:
+            raise httpx.TransportError("torrent source request failed") from exc
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._stream, "aclose", None)
+        if aclose is not None:
+            await cast("Callable[[], Awaitable[None]]", aclose)()
+
+
+class _SafeFetchTransport(httpx.AsyncBaseTransport):
+    """Async HTTP transport for untrusted indexer/Prowlarr torrent URLs."""
+
+    def __init__(self) -> None:
+        self._pool = httpcore.AsyncConnectionPool(
+            network_backend=SafeFetchNetworkBackend(),
+            http1=True,
+            http2=False,
+            retries=0,
+            max_keepalive_connections=0,
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not isinstance(request.stream, httpx.AsyncByteStream):
+            raise httpx.TransportError("async torrent source request expected", request=request)
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        try:
+            resp = await self._pool.handle_async_request(req)
+        except _HTTP_CORE_EXCEPTIONS as exc:
+            raise httpx.TransportError("torrent source request failed", request=request) from exc
+
+        stream = cast(AsyncIterable[bytes], resp.stream)
+        return httpx.Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=_SafeFetchResponseStream(stream),
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
 
 
 def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
@@ -334,11 +461,13 @@ class QbittorrentClient:
         base_url: str,
         username: str,
         password: str,
+        source_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._username = username
         self._password = password
+        self._source_client = source_client
         self._logged_in = False
         # info_hash -> (fetched_at, properties json) — bounds /properties calls.
         self._properties_cache: dict[str, tuple[datetime, dict[str, object]]] = {}
@@ -428,7 +557,9 @@ class QbittorrentClient:
         return response
 
     # ---- add ------------------------------------------------------------ #
-    async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
+    async def _resolve_http_source_with_client(
+        self, client: httpx.AsyncClient, url: str
+    ) -> tuple[str | None, bytes | None]:
         """Walk an HTTP(S) source to a magnet URI or ``.torrent`` body.
 
         Returns ``(magnet_uri, None)`` if a redirect leads to a magnet, or
@@ -439,7 +570,7 @@ class QbittorrentClient:
         for _ in range(_REDIRECT_MAX_DEPTH):
             _assert_safe_fetch_url(current)
             try:
-                async with self._client.stream("GET", current, follow_redirects=False) as response:
+                async with client.stream("GET", current, follow_redirects=False) as response:
                     if response.is_redirect:
                         location = response.headers.get("Location", "")
                         if not location:
@@ -473,6 +604,16 @@ class QbittorrentClient:
                 # escape as an opaque 500 on the grab path. No url/secret in the message.
                 raise QbittorrentError("qBittorrent request failed") from exc
         return None, None
+
+    async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
+        if self._source_client is not None:
+            return await self._resolve_http_source_with_client(self._source_client, url)
+        async with httpx.AsyncClient(
+            transport=_SafeFetchTransport(),
+            timeout=30.0,
+            trust_env=False,
+        ) as client:
+            return await self._resolve_http_source_with_client(client, url)
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
         """Add a torrent; return its lowercased info-hash.

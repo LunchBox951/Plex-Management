@@ -15,6 +15,7 @@ import os
 import socket
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 
@@ -23,6 +24,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentClient,
     QbittorrentError,
 )
+from plex_manager.adapters.qbittorrent.adapter import SafeFetchNetworkBackend
 
 BASE_URL = "http://qbit.local:8080"
 USERNAME = "admin"
@@ -109,7 +111,7 @@ def _router(*, add_status: int = 200, webapi_version: str = "2.11.0") -> Any:
 def _client(handler: Any | None = None) -> QbittorrentClient:
     transport = httpx.MockTransport(handler or _router())
     http = httpx.AsyncClient(transport=transport)
-    return QbittorrentClient(http, BASE_URL, USERNAME, PASSWORD)
+    return QbittorrentClient(http, BASE_URL, USERNAME, PASSWORD, source_client=http)
 
 
 async def test_add_magnet_returns_derived_hash() -> None:
@@ -467,6 +469,56 @@ async def test_add_unresolvable_http_host_is_rejected_before_fetch(
         await _client(handler).add(url, "/downloads", "plex-manager")
 
     assert seen == []
+
+
+class _RecordingBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        raise httpcore.ConnectError("stop after target selection")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        address = "93.184.216.34" if calls == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 80))]
+
+    delegate = _RecordingBackend()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(httpcore.ConnectError):
+        await SafeFetchNetworkBackend(delegate).connect_tcp("indexer.example", 80)
+
+    assert delegate.hosts == ["93.184.216.34"]
+    assert calls == 1
 
 
 def _control_handler(seen: list[str], *, webapi_version: str) -> Any:
