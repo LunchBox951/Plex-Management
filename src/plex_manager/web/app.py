@@ -125,6 +125,26 @@ def _get_autograb_status(app: FastAPI) -> AutograbStatus:
     return status
 
 
+def _get_autograb_cooldowns(app: FastAPI) -> auto_grab_service.CooldownRegistry:
+    """Return ``app.state.autograb_cooldowns``, lazily creating it if absent.
+
+    The in-process grab-pipeline cooldown registry (ADR-0013 round-3 #2): scopes
+    whose grab keeps raising ``GrabError``, mapped to their escalating
+    retry-not-before. Owned HERE, not in the service, so it survives across ticks; a
+    process restart clears it, exactly like ``AutograbStatus``. ``lifespan`` creates
+    it once, but ``_autograb_once`` is also driven against a bare ``FastAPI()`` in
+    tests (bypassing ``lifespan``), so this stays defensive like
+    :func:`_get_autograb_status`.
+    """
+    cooldowns: auto_grab_service.CooldownRegistry | None = getattr(
+        app.state, "autograb_cooldowns", None
+    )
+    if cooldowns is None:
+        cooldowns = {}
+        app.state.autograb_cooldowns = cooldowns
+    return cooldowns
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe used by the container healthcheck and monitoring."""
@@ -267,7 +287,14 @@ async def _autograb_once(app: FastAPI) -> None:
             parser=get_parser(),
             profile=get_quality_profile(),
             qbt=qbt,
+            cooldowns=_get_autograb_cooldowns(app),
         )
+    # Surface how many scopes are CURRENTLY in a grab-pipeline cooldown (ADR-0013
+    # round-3 #2), independent of the ok/error verdict below: a non-zero count is the
+    # operator's honest signal that the grab pipeline (not the search) is failing --
+    # eager scopes that keep hitting ``GrabError`` are being cooled so they don't
+    # starve the search budget, rather than silently never reaching ``downloading``.
+    status.cooled_down_scopes = result.cooled_down
     # An operational GRAB failure (``GrabError`` -- qBittorrent accepted the torrent
     # but no info-hash could be derived, leaving a live untracked torrent) does NOT
     # propagate the way a raised search does: ``run_grab_cycle`` catches it, leaves
@@ -619,6 +646,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
+    # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
+    # it survives across auto-grab ticks; a restart clears it, like the health record.
+    autograb_cooldowns: auto_grab_service.CooldownRegistry = {}
+    app.state.autograb_cooldowns = autograb_cooldowns
 
     log_handler = log_capture_service.configure_logging(get_settings().log_level)
     app.state.log_handler = log_handler

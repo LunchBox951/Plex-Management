@@ -119,6 +119,18 @@ function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
         >
           {autograb.consecutive_failures}
         </dd>
+        {/* Scopes whose grab keeps failing (GrabError) are cooled down so they don't
+            starve the search budget — a non-zero count means the grab pipeline, not
+            the search, is what's broken. */}
+        <dt>Cooling scopes</dt>
+        <dd
+          className={cn(
+            'text-right',
+            autograb.cooled_down_scopes > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {autograb.cooled_down_scopes}
+        </dd>
         {autograb.last_error_type ? (
           <>
             <dt>Last error</dt>

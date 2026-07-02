@@ -107,6 +107,34 @@ scheduled-command bus) that a single-machine, single-Prowlarr beta does not need
    pushes `next_search_at` into the future, so a later failure-rearm to `searching`
    is immediately due rather than stuck behind a stale backoff.
 
+8. **A repeatedly-`GrabError`ing scope is cooled, never parked (round-3).** A scope
+   whose grab keeps raising `GrabError` (qBittorrent accepted the torrent but no
+   info-hash could be derived) must *not* be parked `no_acceptable_release` — that
+   would lie (releases exist; the grab *pipeline* is what's broken) — yet, being
+   eager `pending`/`searching`, it ignores the DB backoff (decision 3) and would
+   otherwise consume the whole per-cycle search budget every tick, starving every
+   other scope. The guard is an **in-process, per-scope cooldown** fed *only* by
+   `GrabError`: a registry `{(request_id, season): (failures, not_before)}`,
+   escalating `[5m, 15m, 60m]` then 60m forever per consecutive `GrabError`, cleared
+   the moment the scope resolves any other way (a grab, a park, or a scope-level
+   settle). While cooling, the scope is skipped **before** it costs a search and,
+   once its window expires, it sorts *after* healthy scopes so it can't re-monopolise
+   the budget. The registry is owned by `app.state` (like the health record) and is
+   **not persisted** — a process restart clears it, the same honesty as
+   `AutograbStatus` — and the count of currently-cooling scopes is surfaced on
+   `AutograbStatus` (`cooled_down_scopes`, in `GET /ops/health`) so the operator
+   *sees* the grab pipeline failing rather than eager requests silently never
+   reaching `downloading`. Per-scope DB backoff can't serve here precisely because
+   decision 3 makes eager scopes ignore `next_search_at`.
+
+9. **Park scheduling reads the clock fresh at the park moment (round-3).** The
+   nothing-acceptable backoff is scheduled from a fresh clock read *inside* the park,
+   not from a single `now` captured at cycle start. A slow cycle (up to 5 searches ×
+   ~120s each) would otherwise schedule a late park from a ~10-minute-old base and
+   make it due again on the very next tick instead of honouring the first rung.
+   Cycle-start `now` remains the single, cycle-consistent basis for *due selection*
+   only.
+
 ## Consequences
 
 - The request→watchable loop is now closed unattended: a `POST /requests` returns

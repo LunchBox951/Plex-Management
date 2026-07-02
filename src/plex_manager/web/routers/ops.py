@@ -175,6 +175,7 @@ async def health_endpoint(
             last_error_type=snapshot.autograb.last_error_type,
             last_error_at=snapshot.autograb.last_error_at,
             consecutive_failures=snapshot.autograb.consecutive_failures,
+            cooled_down_scopes=snapshot.autograb.cooled_down_scopes,
         ),
     )
 

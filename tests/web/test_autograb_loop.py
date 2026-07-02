@@ -196,3 +196,6 @@ async def test_autograb_records_grab_error_on_health(
     assert status.last_error_type == "GrabError"
     assert status.consecutive_failures == 1
     assert status.last_ok_at is None
+    # The scope entered a grab-pipeline cooldown, surfaced on the health record so the
+    # operator SEES the pipeline failing (ADR-0013 round-3 #2), not just a stuck request.
+    assert status.cooled_down_scopes == 1

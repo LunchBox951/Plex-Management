@@ -638,7 +638,12 @@ class AutograbStatusItem(BaseModel):
     ``services.health_service.AutograbStatusSnapshot``. The exact shape of
     ``ReconcileStatusItem`` above, for the separate ``_autograb_loop`` -- a
     Prowlarr outage surfaces here as a failing loop so the operator sees WHY
-    nothing is being grabbed, not just that requests sit at ``pending``."""
+    nothing is being grabbed, not just that requests sit at ``pending``.
+
+    ``cooled_down_scopes`` is how many scopes are CURRENTLY in a grab-pipeline
+    cooldown (ADR-0013): scopes whose grab keeps failing, skipped so they don't
+    starve the search budget -- a non-zero count is the operator's signal that the
+    grab pipeline (not the search) is what's broken."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -647,6 +652,7 @@ class AutograbStatusItem(BaseModel):
     last_error_type: str | None = None
     last_error_at: datetime | None = None
     consecutive_failures: int = 0
+    cooled_down_scopes: int = 0
 
 
 class HealthResponse(BaseModel):

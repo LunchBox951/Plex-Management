@@ -39,6 +39,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       last_error_type: null,
       last_error_at: null,
       consecutive_failures: 0,
+      cooled_down_scopes: 0,
     },
     ...overrides,
   }
@@ -211,6 +212,7 @@ describe('Status', () => {
       last_error_type: null,
       last_error_at: null,
       consecutive_failures: 0,
+      cooled_down_scopes: 0,
     }
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       // Both background loops are fresh (never run), so neither panel may read
@@ -230,6 +232,31 @@ describe('Status', () => {
     expect(screen.getAllByText('starting up')).toHaveLength(2)
     // Both "Last run" and "Last success" render the same honest placeholder.
     expect(screen.getAllByText('never').length).toBeGreaterThan(0)
+  })
+
+  it('surfaces how many scopes are in a grab-pipeline cooldown', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        autograb: {
+          last_run_at: '2026-01-01T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          consecutive_failures: 0,
+          cooled_down_scopes: 3,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />)
+
+    // The operator SEES the grab pipeline failing: a labelled, non-zero count.
+    expect(screen.getByText('Cooling scopes')).toBeInTheDocument()
+    expect(screen.getByText('3')).toBeInTheDocument()
   })
 
   it('notes that a candidate preview is not currently under pressure', () => {

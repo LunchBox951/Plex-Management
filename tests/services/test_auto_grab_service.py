@@ -11,6 +11,7 @@ scope behind backoff).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -33,7 +34,10 @@ from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import auto_grab_service
 from plex_manager.services.auto_grab_service import (
     BACKOFF_SCHEDULE,
+    COOLDOWN_SCHEDULE,
     MAX_GRAB_ATTEMPTS_PER_SCOPE,
+    ScopeCooldown,
+    cooldown_delay,
     next_search_at,
 )
 from plex_manager.services.grab_service import (
@@ -214,6 +218,8 @@ async def _run(
     *,
     max_searches: int = auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE,
     now: datetime = _NOW,
+    clock: Callable[[], datetime] | None = None,
+    cooldowns: auto_grab_service.CooldownRegistry | None = None,
 ) -> auto_grab_service.AutograbCycleResult:
     async with sessionmaker_() as session:
         return await auto_grab_service.run_grab_cycle(
@@ -224,6 +230,11 @@ async def _run(
             qbt=qbt,
             max_searches=max_searches,
             now=now,
+            # Default the fresh-park clock to the fixed cycle ``now`` so the existing
+            # exact-timestamp park assertions stay deterministic; the round-3 fresh-
+            # clock test injects an advancing clock instead.
+            clock=clock or (lambda: now),
+            cooldowns=cooldowns,
         )
 
 
@@ -733,3 +744,234 @@ async def test_tv_season_grab_success(sessionmaker_: SessionMaker) -> None:
             await session.execute(select(Download).where(Download.media_request_id == request_id))
         ).scalar_one()
         assert download.season == 1
+
+
+# --------------------------------------------------------------------------- #
+# Park race — a download appearing before the park write must not false-park
+# (Codex PR #31 round-3 #1)
+# --------------------------------------------------------------------------- #
+async def test_active_download_before_park_skips_the_park(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A nothing-acceptable search would park the scope -- but a racing manual grab
+    # lands an active download in the window BETWEEN the pre-search active check and
+    # the park write. Parking would overwrite a live ``downloading`` scope with the
+    # honest-but-now-wrong ``no_acceptable_release`` dead-end. Drive
+    # ``find_active_for_request`` to return None the FIRST time (pre-search: nothing
+    # yet) and a live download the SECOND (the round-3 park re-check), exactly the
+    # race the manual /queue/grab endpoint guards.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(prerelease_only_candidates())  # nothing acceptable -> would park
+
+    calls = {"n": 0}
+    racing = DownloadRecord(
+        id=1, torrent_hash="deadbeef01", status="downloading", media_request_id=request_id
+    )
+
+    async def _find_active(
+        _self: object, _media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        return None if calls["n"] == 1 else racing
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository, "find_active_for_request", _find_active
+    )
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert result.searched == 1  # the search DID run (the pre-check saw nothing)
+    assert result.no_acceptable == 0  # but the park was SKIPPED -- a download appeared
+    assert calls["n"] == 2  # pre-search active check + the round-3 park re-check
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        # No false park: state untouched, no backoff written.
+        assert row.status == RequestStatus.pending
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+
+
+# --------------------------------------------------------------------------- #
+# Fresh park clock — each park schedules from its OWN moment (round-3 #3)
+# --------------------------------------------------------------------------- #
+class _AdvancingClock:
+    """A fake clock returning ``start`` then advancing by ``step`` on each call -- so a
+    test can prove every PARK reads the clock FRESH (round-3 #3) instead of reusing a
+    single cycle-start ``now``."""
+
+    def __init__(self, start: datetime, step: timedelta) -> None:
+        self._now = start
+        self._step = step
+
+    def __call__(self) -> datetime:
+        current = self._now
+        self._now += self._step
+        return current
+
+
+async def test_each_park_schedules_from_its_own_fresh_clock_read(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Two due movies both find nothing acceptable, so both park in one cycle. A slow
+    # cycle advances the clock BETWEEN the two parks; each ``next_search_at`` must be
+    # one backoff rung from ITS OWN park moment, not from a single cycle-start ``now``
+    # (which would schedule the later park in the past -> due again next tick).
+    id_a = await _seed_movie(sessionmaker_, tmdb_id=1001)
+    id_b = await _seed_movie(sessionmaker_, tmdb_id=1002)
+    prowlarr = FakeProwlarr(prerelease_only_candidates())
+    step = timedelta(minutes=10)
+    clock = _AdvancingClock(_NOW, step)
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent(), now=_NOW, clock=clock)
+
+    assert result.no_acceptable == 2
+    async with sessionmaker_() as session:
+        row_a = await session.get(MediaRequest, id_a)
+        row_b = await session.get(MediaRequest, id_b)
+        assert row_a is not None
+        assert row_b is not None
+        assert row_a.next_search_at is not None
+        assert row_b.next_search_at is not None
+        parks = {
+            row_a.next_search_at.replace(tzinfo=UTC),
+            row_b.next_search_at.replace(tzinfo=UTC),
+        }
+    # Two DISTINCT park bases -- the first at _NOW, the second ``step`` later. A single
+    # cycle-start timestamp would collapse both to ``_NOW + rung`` (one element).
+    assert parks == {
+        _NOW + BACKOFF_SCHEDULE[0],
+        _NOW + step + BACKOFF_SCHEDULE[0],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# GrabError cooldown — cool (never park) a scope whose grab keeps failing, so it
+# can't starve the per-cycle search budget (round-3 #2)
+# --------------------------------------------------------------------------- #
+def _grab_error_candidate() -> list[CandidateRelease]:
+    """One accepted release qBittorrent takes but yields no info-hash for -> GrabError."""
+    return [candidate("Some.Movie.2020.1080p.WEB-DL.x264-BAD", magnet=False)]
+
+
+def test_cooldown_delay_ladder() -> None:
+    assert len(COOLDOWN_SCHEDULE) == 3
+    assert COOLDOWN_SCHEDULE[0] == timedelta(minutes=5)
+    assert COOLDOWN_SCHEDULE[1] == timedelta(minutes=15)
+    assert COOLDOWN_SCHEDULE[2] == timedelta(minutes=60)
+    for prior in range(len(COOLDOWN_SCHEDULE)):
+        assert cooldown_delay(prior) == COOLDOWN_SCHEDULE[prior]
+    # An exhausted ladder repeats the last rung (60m) forever.
+    assert cooldown_delay(len(COOLDOWN_SCHEDULE)) == COOLDOWN_SCHEDULE[-1]
+    assert cooldown_delay(999) == COOLDOWN_SCHEDULE[-1]
+
+
+async def test_grab_error_cools_scope_then_skips_it_then_escalates(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # A scope whose grab keeps raising GrabError must be COOLED (never parked -- that
+    # would lie: releases exist) and, while cooling, SKIPPED before it costs a search,
+    # so it can't consume the budget every tick. Consecutive GrabErrors escalate.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(_grab_error_candidate())
+    cooldowns: auto_grab_service.CooldownRegistry = {}
+    qbt = FakeQbittorrent()
+
+    # Cycle 1: GrabError -> first cooldown rung (5m); scope left UNCHANGED (not parked).
+    r1 = await _run(sessionmaker_, prowlarr, qbt, now=_NOW, cooldowns=cooldowns)
+    assert r1.grab_errors == 1
+    assert r1.no_acceptable == 0
+    assert r1.cooled_down == 1
+    assert len(prowlarr.searched) == 1
+    # The registry keys by (request_id, season) -- the DB id + season, the same
+    # granularity as the active-download guard (NOT the tmdb id).
+    scope_key = (request_id, None)
+    entry = cooldowns[scope_key]
+    assert entry.failures == 1
+    assert entry.not_before == _NOW + COOLDOWN_SCHEDULE[0]
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.pending  # cooled, NOT parked
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+
+    # Cycle 2, still inside the 5m window: the scope is SKIPPED -- no new search, no
+    # budget spent, the cooldown untouched (no escalation while cooling).
+    r2 = await _run(
+        sessionmaker_, prowlarr, qbt, now=_NOW + timedelta(minutes=2), cooldowns=cooldowns
+    )
+    assert r2.searched == 0
+    assert len(prowlarr.searched) == 1  # unchanged -- no second Prowlarr hit
+    assert r2.cooled_down == 1
+    assert cooldowns[scope_key].failures == 1
+
+    # Cycle 3, past the window: retried, GrabErrors again -> escalates to the 2nd rung.
+    later = _NOW + timedelta(minutes=6)
+    r3 = await _run(sessionmaker_, prowlarr, qbt, now=later, cooldowns=cooldowns)
+    assert r3.searched == 1
+    assert r3.grab_errors == 1
+    assert len(prowlarr.searched) == 2
+    entry3 = cooldowns[scope_key]
+    assert entry3.failures == 2
+    assert entry3.not_before == later + COOLDOWN_SCHEDULE[1]
+
+
+async def test_cooled_scope_yields_search_budget_to_healthy_scope(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # A cooled scope must not consume the per-cycle budget: with room for ONE search
+    # and a cooled scope + a healthy scope both due, the search goes to the HEALTHY
+    # one (the cooled scope sorts last and never costs a search), which grabs.
+    cooled_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    healthy_id = await _seed_movie(sessionmaker_, tmdb_id=604)
+    prowlarr = _PerTmdbProwlarr(
+        {
+            603: _grab_error_candidate(),  # would GrabError if ever searched
+            604: good_and_cam_candidates(),  # grabs cleanly
+        }
+    )
+    cooldowns: auto_grab_service.CooldownRegistry = {
+        (cooled_id, None): ScopeCooldown(failures=1, not_before=_NOW + timedelta(minutes=5)),
+    }
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt, now=_NOW, max_searches=1, cooldowns=cooldowns)
+
+    assert result.searched == 1
+    searched_tmdbs = [req.tmdb_id for req in prowlarr.searched]
+    assert 603 not in searched_tmdbs  # the cooled scope was NOT searched
+    assert searched_tmdbs == [604]  # the single search went to the healthy scope
+    assert result.grabbed == 1
+    async with sessionmaker_() as session:
+        cooled = await session.get(MediaRequest, cooled_id)
+        healthy = await session.get(MediaRequest, healthy_id)
+        assert cooled is not None
+        assert healthy is not None
+        assert cooled.status == RequestStatus.pending  # untouched
+        assert healthy.status == RequestStatus.downloading  # got the budget
+
+
+async def test_grab_success_clears_the_cooldown(sessionmaker_: SessionMaker) -> None:
+    # A scope that recovers (a later grab succeeds) must have its cooldown CLEARED --
+    # GrabError is the cooldown's only feeder, so a clean grab starts it fresh.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    cooldowns: auto_grab_service.CooldownRegistry = {}
+
+    # Cycle 1: GrabError -> cooled.
+    bad = FakeProwlarr(_grab_error_candidate())
+    r1 = await _run(sessionmaker_, bad, FakeQbittorrent(), now=_NOW, cooldowns=cooldowns)
+    assert r1.grab_errors == 1
+    assert (request_id, None) in cooldowns
+
+    # Cycle 2 past the window: a grabbable release now exists -> grab -> cooldown cleared.
+    good = FakeProwlarr(good_and_cam_candidates())
+    later = _NOW + timedelta(minutes=6)
+    r2 = await _run(sessionmaker_, good, FakeQbittorrent(), now=later, cooldowns=cooldowns)
+    assert r2.grabbed == 1
+    assert r2.cooled_down == 0
+    assert (request_id, None) not in cooldowns
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.downloading

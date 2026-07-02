@@ -34,6 +34,20 @@ Design decisions (see ADR-0013):
   actual searches run per cycle, processed sequentially; a scope that already has
   an active download is skipped BEFORE it costs a search (and never races
   ``grab_service``'s one-active guard).
+* **Cool a scope whose GRAB keeps failing (never park it).** A scope that keeps
+  raising ``GrabError`` (releases exist; the grab pipeline is what's broken) must
+  not be parked ``no_acceptable_release`` -- that would LIE -- yet, being eager
+  ``pending``/``searching``, it ignores the DB backoff and would consume the whole
+  per-cycle budget every tick, starving other scopes. An IN-PROCESS per-scope
+  cooldown (:data:`COOLDOWN_SCHEDULE`, fed ONLY by ``GrabError``, cleared on any
+  other resolution) skips such a scope for the window so the budget flows to
+  healthy scopes; the count of cooling scopes is surfaced on ``AutograbStatus``
+  (honesty over silence). It is not persisted -- a restart clears it, exactly like
+  the ``AutograbStatus`` health record.
+* **Park from a fresh clock read.** The backoff for a nothing-acceptable park is
+  scheduled from the ACTUAL park moment (a fresh clock read inside :func:`_park`),
+  never a ``now`` captured at cycle start -- a slow cycle would otherwise schedule
+  a late park from a stale base and make it due again on the very next tick.
 """
 
 from __future__ import annotations
@@ -63,6 +77,8 @@ from plex_manager.services.grab_service import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.domain.quality_profile import QualityProfile
@@ -73,9 +89,14 @@ if TYPE_CHECKING:
 __all__ = [
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE",
     "BACKOFF_SCHEDULE",
+    "COOLDOWN_SCHEDULE",
     "DUE_SEARCH_STATUSES",
     "MAX_GRAB_ATTEMPTS_PER_SCOPE",
     "AutograbCycleResult",
+    "CooldownRegistry",
+    "ScopeCooldown",
+    "ScopeKey",
+    "cooldown_delay",
     "next_search_at",
     "run_grab_cycle",
 ]
@@ -124,6 +145,61 @@ AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
 # accepted releases are tried.
 MAX_GRAB_ATTEMPTS_PER_SCOPE: int = 3
 
+# --------------------------------------------------------------------------- #
+# In-process grab-pipeline cooldown (Codex PR #31 round-3 #2)
+# --------------------------------------------------------------------------- #
+# A scope whose GRAB keeps raising ``GrabError`` (qBittorrent accepted the torrent
+# but no info-hash could be derived) must NOT be parked ``no_acceptable_release`` --
+# that would LIE (releases exist; the grab PIPELINE is what's broken) -- and it
+# cannot lean on the per-scope DB backoff either, because ``pending``/``searching``
+# are deliberately EAGER (they ignore ``next_search_at``; ADR-0013 §3). Left alone,
+# such a scope stays due-now every tick and, because a ``GrabError`` still costs a
+# search, consumes the whole per-cycle search budget forever, starving every other
+# scope. The guard is an IN-PROCESS, per-scope cooldown: a registry mapping each
+# failing scope to its consecutive-failure count + the instant it may be retried.
+# The window escalates per consecutive ``GrabError`` (below, then its last rung
+# forever) and is CLEARED the moment the scope resolves any OTHER way (a grab, a
+# park, or a scope-level settle) -- ``GrabError`` is its only feeder, so it only ever
+# holds actively-failing scopes and is bounded by process lifetime. Deliberately NOT
+# persisted: a restart clears it, the same honesty as the ``AutograbStatus`` health
+# record. See :func:`run_grab_cycle`.
+COOLDOWN_SCHEDULE: tuple[timedelta, ...] = (
+    timedelta(minutes=5),
+    timedelta(minutes=15),
+    timedelta(minutes=60),
+)
+
+# A scope's identity for the cooldown registry (and, incidentally, the active-download
+# guard): ``(request_id, season)`` -- ``season`` is ``None`` for a movie and the
+# season number for a TV season.
+ScopeKey = tuple[int, int | None]
+
+
+@dataclass(frozen=True)
+class ScopeCooldown:
+    """One scope's live grab-pipeline cooldown: how many consecutive ``GrabError``s
+    it has hit and the earliest instant it may be searched again."""
+
+    failures: int
+    not_before: datetime
+
+
+# The in-process registry the worker threads through each tick, OWNED by the caller
+# (``app.state`` in production, a fresh dict in tests). A missing key = a healthy
+# scope; :func:`run_grab_cycle` falls back to a throwaway dict when the caller wires
+# none, so a one-shot call needs no cooldown plumbing.
+CooldownRegistry = dict[ScopeKey, ScopeCooldown]
+
+
+def cooldown_delay(prior_failures: int) -> timedelta:
+    """The cooldown window after the (``prior_failures`` + 1)-th consecutive GrabError.
+
+    ``prior_failures`` is the scope's failure count BEFORE this one, so the first
+    failure (``0``) waits the first rung and an exhausted ladder repeats its last
+    rung (60m) forever -- the same shape as :func:`next_search_at`."""
+    return COOLDOWN_SCHEDULE[min(prior_failures, len(COOLDOWN_SCHEDULE) - 1)]
+
+
 # NULL ``next_search_at`` ("due now") sorts ahead of any real timestamp; this
 # tz-aware minimum is its sort stand-in so a never-scheduled scope outranks a
 # scheduled-but-overdue one when the per-cycle cap has to choose.
@@ -170,6 +246,12 @@ class AutograbCycleResult:
     (TYPE name only) and refuse to mark the cycle clean -- the mirror of a raised
     indexer search, except a single bad grab continues the cycle rather than
     aborting it (the torrent reached a reachable qBittorrent; Prowlarr is fine).
+
+    ``cooled_down`` is how many scopes are CURRENTLY inside a grab-pipeline cooldown
+    at cycle end (:data:`COOLDOWN_SCHEDULE`) -- the count the caller surfaces on the
+    ``AutograbStatus`` health record so the operator can SEE the grab pipeline
+    failing (honesty over silence), rather than wondering why eager scopes never
+    reach ``downloading``.
     """
 
     searched: int = 0
@@ -178,6 +260,7 @@ class AutograbCycleResult:
     skipped_active: int = 0
     grab_errors: int = 0
     last_grab_error: GrabError | None = None
+    cooled_down: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,10 +299,16 @@ def next_search_at(now: datetime, prior_attempts: int) -> datetime:
     return now + BACKOFF_SCHEDULE[index]
 
 
+def _scope_key(scope: _PendingScope) -> ScopeKey:
+    """The scope's cooldown-registry / active-download identity: ``(request_id, season)``."""
+    return (scope.request_id, scope.season)
+
+
 async def _collect_due_scopes(
     request_repo: SqlRequestRepository,
     season_repo: SqlSeasonRequestRepository,
     now: datetime,
+    cooldowns: CooldownRegistry,
 ) -> list[_PendingScope]:
     """Gather every due movie request + TV season, ordered most-overdue-first.
 
@@ -229,6 +318,11 @@ async def _collect_due_scopes(
     re-armed scope is never starved behind parked ones by a stale ``next_search_at``
     (see :func:`_due_sort_key`; the same rule the repositories' ``list_due_for_search``
     apply in SQL).
+
+    A scope carrying a grab-pipeline cooldown entry (:data:`COOLDOWN_SCHEDULE`) sorts
+    AFTER every healthy scope regardless of its due-time, so that when its window
+    expires it is retried without leaping ahead of scopes that never failed -- it
+    must not re-monopolise the budget the moment it becomes eligible again.
     """
     movies = await request_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
     seasons = await season_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
@@ -260,7 +354,9 @@ async def _collect_due_scopes(
         )
         for s in seasons
     )
-    scopes.sort(key=lambda sc: _due_sort_key(sc.status, sc.next_search_at))
+    scopes.sort(
+        key=lambda sc: (_scope_key(sc) in cooldowns, _due_sort_key(sc.status, sc.next_search_at))
+    )
     return scopes
 
 
@@ -268,23 +364,49 @@ async def _park(
     session: AsyncSession,
     request_repo: SqlRequestRepository,
     season_repo: SqlSeasonRequestRepository,
+    download_repo: SqlDownloadRepository,
     scope: _PendingScope,
-    now: datetime,
-) -> None:
+    clock: Callable[[], datetime],
+) -> bool:
     """Record a nothing-acceptable result: schedule the backoff + mark the honest
-    ``no_acceptable_release`` park state, then commit.
+    ``no_acceptable_release`` park state, then commit. Returns ``True`` if it parked,
+    ``False`` if a racing active download made parking wrong (see below).
 
     The SAME honest dead-end the manual ``/queue/grab`` endpoint uses
     (``request_service`` / ``season_request_service.mark_no_acceptable_release``,
     both of which keep the never-un-terminate guard), plus the backoff bookkeeping
     the manual path has no need of. ``search_attempts`` is bumped so the ladder
     escalates; ``next_search_at`` gates the next search.
+
+    Codex round-3 #1 -- park race: a manual grab (or a lower-ranked auto grab) can
+    create an active download between this cycle's pre-search active check and this
+    park write; parking then would overwrite a LIVE ``downloading`` scope with the
+    honest-but-now-wrong ``no_acceptable_release`` dead-end -- a momentary lie the
+    reconciler would have to undo. The manual endpoint guards this exact race the
+    same way, so mirror it: re-check ``find_active_for_request`` immediately before
+    the write and, if a download appeared, skip the park entirely (no status write,
+    no backoff bump) and report it un-parked.
+
+    Codex round-3 #3 -- stale park base: the backoff is scheduled from a FRESH clock
+    read at the actual park moment, never a ``now`` captured at cycle start. A slow
+    cycle (several searches x up to ~120s each) would otherwise schedule a late park
+    from a ~10-minute-old base and make it due again on the very next tick instead of
+    honouring the first rung.
     """
+    active = await download_repo.find_active_for_request(scope.request_id, season=scope.season)
+    if active is not None:
+        _logger.info(
+            "auto-grab: active download appeared before park; leaving scope as-is",
+            extra={"request_id": scope.request_id, "season": scope.season},
+        )
+        return False
+
+    now = clock()
     scheduled_attempts = scope.search_attempts + 1
     scheduled_at = next_search_at(now, scope.search_attempts)
     if scope.season is not None:  # TV season
         if scope.season_request_id is None:  # pragma: no cover - a tv scope always has one
-            return
+            return False
         await season_repo.schedule_search(
             scope.season_request_id,
             search_attempts=scheduled_attempts,
@@ -303,6 +425,7 @@ async def _park(
         # Commits internally (movie path); the extra commit below is then a no-op.
         await request_service.mark_no_acceptable_release(session, scope.request_id)
     await session.commit()
+    return True
 
 
 async def run_grab_cycle(
@@ -314,12 +437,17 @@ async def run_grab_cycle(
     qbt: DownloadClientPort,
     max_searches: int = AUTO_GRAB_MAX_SEARCHES_PER_CYCLE,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
+    cooldowns: CooldownRegistry | None = None,
 ) -> AutograbCycleResult:
     """Run one auto-grab pass: search the due scopes and grab / park each.
 
     For each due scope (most-overdue first), up to ``max_searches`` ACTUAL
     searches:
 
+    * skip it (no search, no budget) if it is inside a grab-pipeline cooldown --
+      it keeps raising ``GrabError`` and would otherwise consume the whole budget
+      every tick (see below);
     * skip it (no search) if it already has an active download -- avoids a wasted
       Prowlarr hit and never races ``grab_service``'s one-active guard;
     * else search + decide via :func:`decision_service.preview`; if any release is
@@ -344,17 +472,34 @@ async def run_grab_cycle(
     error is returned on :class:`AutograbCycleResult` (``grab_errors`` /
     ``last_grab_error``) so the caller records it on ``AutograbStatus`` and refuses
     to mark the cycle clean. Unlike a raised search it does NOT abort the cycle --
-    the remaining due scopes are still processed.
+    the remaining due scopes are still processed. The failing scope ALSO enters an
+    in-process cooldown (:data:`COOLDOWN_SCHEDULE`, escalating per consecutive
+    ``GrabError``, cleared on any other resolution): while cooling it is skipped
+    before it costs a search, so it can never monopolise the per-cycle budget and
+    starve every other scope (Codex round-3 #2). ``cooldowns`` is that registry,
+    OWNED by the caller so it survives across ticks (``app.state`` in production);
+    it defaults to a throwaway dict for a one-shot call.
 
-    ``now`` is injectable for deterministic tests; it defaults to
-    ``datetime.now(UTC)``.
+    ``now`` is the cycle-start instant used for DUE SELECTION only (cycle-consistent);
+    it defaults to ``datetime.now(UTC)``. ``clock`` is read FRESH at each park /
+    cooldown event so a slow cycle schedules from the real event time, not a stale
+    cycle-start base (Codex round-3 #3); it defaults to the wall clock. Both are
+    injectable for deterministic tests.
     """
     now = now or datetime.now(UTC)
+    # Park + cooldown scheduling read the clock FRESH at each event (round-3 #3); the
+    # cycle-start ``now`` above stays the single, cycle-consistent basis for DUE
+    # selection only. Default: the wall clock; tests inject a controllable clock.
+    park_clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+    # In-process grab cooldown registry (round-3 #2); a throwaway dict when the caller
+    # wires none, so a one-shot call keeps working with no cooldown state.
+    if cooldowns is None:
+        cooldowns = {}
     request_repo = SqlRequestRepository(session)
     season_repo = SqlSeasonRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
 
-    scopes = await _collect_due_scopes(request_repo, season_repo, now)
+    scopes = await _collect_due_scopes(request_repo, season_repo, now, cooldowns)
 
     searched = grabbed = no_acceptable = skipped_active = grab_errors = 0
     last_grab_error: GrabError | None = None
@@ -362,9 +507,20 @@ async def run_grab_cycle(
         if searched >= max_searches:
             break
 
+        scope_key = _scope_key(scope)
+        cooling = cooldowns.get(scope_key)
+        if cooling is not None and cooling.not_before > now:
+            # Inside its grab-pipeline cooldown window: skip WITHOUT searching and
+            # WITHOUT charging the budget, so the budget flows to healthy scopes
+            # instead of a scope whose grab keeps failing (round-3 #2).
+            continue
+
         active = await download_repo.find_active_for_request(scope.request_id, season=scope.season)
         if active is not None:
             skipped_active += 1
+            # Resolved elsewhere (a manual/other grab is downloading it): drop any
+            # stale cooldown so a later failure-rearm starts fresh, not escalated.
+            cooldowns.pop(scope_key, None)
             continue
 
         # Resolve the search descriptor. A TV season's own record carries only the
@@ -424,6 +580,7 @@ async def run_grab_cycle(
                 )
                 grabbed += 1
                 park_scope = False
+                cooldowns.pop(scope_key, None)  # grabbed: the pipeline recovered -- clear cooldown
                 break
             except (
                 AlreadyDownloadingError,
@@ -441,6 +598,9 @@ async def run_grab_cycle(
                 # cycle, never a secret in the log.
                 await session.rollback()
                 park_scope = False
+                # Resolved some other way (now downloading, terminal, or mis-shaped):
+                # GrabError is the cooldown's only feeder, so clear any stale entry.
+                cooldowns.pop(scope_key, None)
                 _logger.warning(
                     "auto-grab: grab refused (%s); leaving scope for a later cycle",
                     type(exc).__name__,
@@ -472,13 +632,29 @@ async def run_grab_cycle(
                 # follow-up (grab_service would need to remove-by-name/best-effort) and
                 # is deliberately OUT OF SCOPE here; this handler only stops the false
                 # park + false-clean cycle.
+                #
+                # Round-3 #2: a scope whose grab keeps failing must not be re-searched
+                # every tick (it would consume the whole per-cycle budget and starve
+                # other scopes) yet must not be parked (a LIE -- releases exist). Enter
+                # an escalating in-process cooldown fed ONLY by GrabError; while it
+                # cools, the scope is skipped BEFORE it costs a search. The window is
+                # scheduled from a FRESH clock read (round-3 #3), like a park.
                 await session.rollback()
                 park_scope = False
+                prior_failures = cooling.failures if cooling is not None else 0
+                delay = cooldown_delay(prior_failures)
+                cooldowns[scope_key] = ScopeCooldown(
+                    failures=prior_failures + 1,
+                    not_before=park_clock() + delay,
+                )
                 _logger.warning(
-                    "auto-grab: grab operational failure (%s); recording on health, "
+                    "auto-grab: grab operational failure (%s); cooling scope "
+                    "(consecutive failure #%d, %s window), recording on health, "
                     "leaving scope unchanged",
                     type(exc).__name__,
-                    extra={"request_id": scope.request_id},
+                    prior_failures + 1,
+                    delay,
+                    extra={"request_id": scope.request_id, "season": scope.season},
                 )
                 grab_errors += 1
                 last_grab_error = exc
@@ -513,16 +689,24 @@ async def run_grab_cycle(
                     extra={"request_id": scope.request_id},
                 )
         if park_scope:
-            await _park(session, request_repo, season_repo, scope, now)
-            no_acceptable += 1
+            # Parking resolves the scope one way or the other, so clear any stale
+            # cooldown (GrabError is its only feeder). ``_park`` re-checks for a
+            # racing active download and, if one appeared, skips the park entirely
+            # (round-3 #1): only a real park counts toward ``no_acceptable``.
+            cooldowns.pop(scope_key, None)
+            if await _park(session, request_repo, season_repo, download_repo, scope, park_clock):
+                no_acceptable += 1
 
+    cooled_down = sum(1 for cd in cooldowns.values() if cd.not_before > now)
     _logger.info(
-        "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d grab_errors=%d",
+        "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d "
+        "grab_errors=%d cooled_down=%d",
         searched,
         grabbed,
         no_acceptable,
         skipped_active,
         grab_errors,
+        cooled_down,
     )
     return AutograbCycleResult(
         searched=searched,
@@ -531,4 +715,5 @@ async def run_grab_cycle(
         skipped_active=skipped_active,
         grab_errors=grab_errors,
         last_grab_error=last_grab_error,
+        cooled_down=cooled_down,
     )

@@ -244,6 +244,13 @@ class AutograbStatus:
     last_error_type: str | None = field(default=None)
     last_error_at: datetime | None = field(default=None)
     consecutive_failures: int = field(default=0)
+    # How many scopes are CURRENTLY inside a grab-pipeline cooldown (ADR-0013):
+    # scopes whose grab keeps raising ``GrabError`` and are being skipped so they
+    # don't starve the per-cycle search budget. Surfaced so the operator SEES the
+    # grab pipeline failing (honesty over silence), not just eager requests that
+    # never reach ``downloading``. Set from each cycle's ``AutograbCycleResult``;
+    # orthogonal to the error streak, so ``mark_ok``/``mark_error`` leave it alone.
+    cooled_down_scopes: int = field(default=0)
 
     def mark_run_started(self) -> None:
         """Stamp the top of a new cycle -- called unconditionally, success or not."""
@@ -273,6 +280,7 @@ class AutograbStatusSnapshot:
     last_error_type: str | None
     last_error_at: datetime | None
     consecutive_failures: int
+    cooled_down_scopes: int
 
 
 def snapshot_autograb(status: AutograbStatus) -> AutograbStatusSnapshot:
@@ -283,6 +291,7 @@ def snapshot_autograb(status: AutograbStatus) -> AutograbStatusSnapshot:
         last_error_type=status.last_error_type,
         last_error_at=status.last_error_at,
         consecutive_failures=status.consecutive_failures,
+        cooled_down_scopes=status.cooled_down_scopes,
     )
 
 
