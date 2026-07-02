@@ -101,9 +101,15 @@ LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
 #: arrives. Rather than bumping the general retention (which would also retain
 #: ordinary noisy INFO/WARNING/ERROR chatter far longer than needed, growing
 #: ``log_events`` for no benefit), :func:`prune_once` gives rows from THIS one
-#: logger their own, longer cutoff — using the existing ``LogEvent.logger``
-#: column as the marker, no schema change. 30 days is a fixed, generous margin
-#: over one beta week; not (yet) a web-editable setting for week 1 — the
+#: logger their own cutoff — using the existing ``LogEvent.logger`` column as the
+#: marker, no schema change. This constant is a FLOOR, not a fixed window:
+#: :func:`prune_once` retains telemetry for ``max(TELEMETRY_LOG_RETENTION_DAYS,
+#: log_retention_days)`` days, so it is never pruned earlier than 30 days AND
+#: never earlier than the operator's own general retention (an operator who sets
+#: ``log_retention_days`` to 60/90 keeps telemetry that long too — a fixed 30-day
+#: cutoff would otherwise prune telemetry BEFORE their own ordinary logs, which
+#: is never what raising retention means). 30 days is a generous margin over one
+#: beta week; not (yet) a web-editable setting of its own for week 1 — the
 #: "smallest honest change" the beta blueprint asks for, not a new knob nobody
 #: has asked to tune yet.
 TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.retention_telemetry_service"
@@ -446,24 +452,33 @@ async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
 
     Every logger EXCEPT :data:`TELEMETRY_LOGGER_NAME` is pruned on the
     operator-editable ``retention_days`` (the web-editable ``log_retention_days``
-    setting, default 7) exactly as before. Rows FROM that one logger are pruned
-    separately on the fixed, longer :data:`TELEMETRY_LOG_RETENTION_DAYS` instead —
-    so a short ``log_retention_days`` (even the default 7) can never prune the
-    beta-week retention-telemetry dataset before the week is up. See
-    :data:`TELEMETRY_LOGGER_NAME`'s docstring for the full rationale.
+    setting, default 7) exactly as before. Rows FROM that one logger are pruned on
+    their OWN, never-shorter cutoff: ``max(TELEMETRY_LOG_RETENTION_DAYS,
+    retention_days)`` days. That ``max`` is the whole point of the carve-out —
+
+    * an operator on the default (or any ``retention_days`` below 30) still keeps
+      the beta-week telemetry a full 30 days, so a short general retention can
+      never prune the dataset before the week is up; and
+    * an operator who deliberately RAISES ``log_retention_days`` to 60/90 keeps
+      telemetry AT LEAST as long as everything else — the carve-out is a floor,
+      never a ceiling, so telemetry is never pruned EARLIER than the operator's
+      own window (the bug a fixed 30-day cutoff would introduce above 30).
+
+    See :data:`TELEMETRY_LOGGER_NAME`'s docstring for the full rationale.
 
     Returns the total rows removed across both deletes. ``retention_days <= 0``
     is treated as "keep nothing older than now" rather than skipped for the
     ordinary cutoff — an operator who deliberately sets it to 0 gets the honest
-    behaviour, not a silently ignored setting; the telemetry cutoff is
-    unaffected by that setting either way (see above).
+    behaviour, not a silently ignored setting; the telemetry cutoff still holds
+    its 30-day floor either way (``max(30, 0) == 30``).
     """
     now = datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
     pruned = await repo.prune_older_than(
         cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=True
     )
-    telemetry_cutoff = now - timedelta(days=TELEMETRY_LOG_RETENTION_DAYS)
+    telemetry_retention_days = max(TELEMETRY_LOG_RETENTION_DAYS, retention_days)
+    telemetry_cutoff = now - timedelta(days=telemetry_retention_days)
     pruned += await repo.prune_older_than(
         telemetry_cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=False
     )

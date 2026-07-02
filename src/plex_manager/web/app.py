@@ -318,6 +318,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                     await retention_telemetry_service.run_retention_telemetry_sweep(
                         session=session,
                         library=library,
+                        fs=fs,
                         media_type=media_type,
                         root_path=root,
                         grace_days=grace_days,

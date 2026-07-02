@@ -48,6 +48,7 @@ from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.domain.eviction import (
     EvictionCandidate,
+    pressure_relieved,
     rank_eviction_candidates,
     select_evictions,
 )
@@ -734,8 +735,7 @@ async def run_eviction_sweep(
     # very first check below already finds `projected <= target_pct`.
     if extra_pool and disk.total_bytes > 0:
         for candidate in extra_pool:
-            freed_pct = (freed_bytes_total / disk.total_bytes) * 100.0
-            if disk_used_pct - freed_pct <= target_pct:
+            if pressure_relieved(disk_used_pct, freed_bytes_total, disk.total_bytes, target_pct):
                 break
             await _attempt(candidate)
 

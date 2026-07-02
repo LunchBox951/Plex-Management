@@ -490,3 +490,42 @@ async def test_prune_once_eventually_prunes_telemetry_rows_past_their_own_retent
 
         remaining = await repo.list_events(limit=10)
     assert remaining.results == []
+
+
+async def test_prune_once_telemetry_retention_never_shorter_than_the_operator_window(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The other direction of the ``max`` floor: an operator who RAISES
+    ``log_retention_days`` above the 30-day telemetry default must keep telemetry
+    AT LEAST as long as everything else -- never pruned EARLIER than their own
+    window. With ``retention_days=90``, a 45-day-old telemetry row (past the fixed
+    30-day default, but well within the operator's 90) must SURVIVE (a fixed
+    30-day cutoff would have wrongly pruned it), while a 100-day-old one is past
+    even the 90-day window and is pruned. Regression for the fixed-30-below-
+    operator-window finding."""
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        # 45 days old: past the 30-day telemetry default but within the operator's
+        # raised 90-day window -- must survive (the bug pruned it at a fixed 30).
+        await repo.create(
+            level="INFO",
+            logger=TELEMETRY_LOGGER_NAME,
+            message="telemetry, 45 days old",
+            created_at=now - timedelta(days=45),
+        )
+        # 100 days old: past even the raised 90-day window -- still pruned.
+        await repo.create(
+            level="INFO",
+            logger=TELEMETRY_LOGGER_NAME,
+            message="telemetry, 100 days old",
+            created_at=now - timedelta(days=100),
+        )
+        await session.commit()
+
+        removed = await prune_once(repo, retention_days=90)
+        await session.commit()
+        assert removed == 1  # only the 100-day row, not the 45-day one
+
+        remaining = await repo.list_events(limit=10)
+    assert [r.message for r in remaining.results] == ["telemetry, 45 days old"]

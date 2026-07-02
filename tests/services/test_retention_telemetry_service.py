@@ -17,6 +17,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.domain.eviction import EvictionCandidate
 from plex_manager.models import (
     DownloadHistory,
@@ -32,6 +34,59 @@ from tests.web.fakes import FakeLibrary
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
+
+@pytest.fixture(autouse=True)
+def reset_watch_dedupe_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test a fresh copy of the sweep's per-title dedupe cache
+    (``retention_telemetry_service._last_emitted_watch``, a PROCESS-lifetime dict),
+    restored on teardown, so one test's emitted titles can never suppress a
+    per-title row another test expects. The dedupe-across-sweeps behaviour is
+    exercised WITHIN a single test, which does not reset between its own sweeps."""
+    monkeypatch.setattr(retention_telemetry_service, "_last_emitted_watch", {})
+
+
+def _local_fs(tmp_path: Path) -> LocalFileSystem:
+    """The real ``LocalFileSystem`` scoped to ``tmp_path`` -- the sweep only calls
+    its read-only ``reclaimable_bytes`` (never ``delete``), which for the plain,
+    single-link files these tests create returns each file's real size."""
+    return LocalFileSystem(library_roots=[str(tmp_path)])
+
+
+class _MappedReclaimFileSystem:
+    """Minimal :class:`~plex_manager.ports.filesystem.FileSystemPort` for the
+    would-evict simulation: only ``reclaimable_bytes`` is used (delete-nothing),
+    returning a per-path fixed value (default ``0``). Lets a test drive the exact
+    hardlink shortfall -- a candidate whose reclaimable bytes fall below its
+    nominal size -- without laying down real hardlinks. Every other method is
+    unused by the telemetry sweep and raises."""
+
+    def __init__(self, reclaimable: dict[str, int]) -> None:
+        self._reclaimable = reclaimable
+        self.reclaimable_calls: list[str] = []
+
+    def available_bytes(self, path: Path) -> int:
+        raise NotImplementedError
+
+    def move(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+        raise NotImplementedError
+
+    def largest_video_file(self, root: str) -> str | None:
+        raise NotImplementedError
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        raise NotImplementedError
+
+    def reclaimable_bytes(self, path: str) -> int:
+        self.reclaimable_calls.append(path)
+        return self._reclaimable.get(path, 0)
+
+
 _NOW = datetime.now(UTC)
 _GRACE_DAYS = 30
 _STALE = _NOW - timedelta(days=_GRACE_DAYS + 10)  # 40 days idle -- past grace, a candidate
@@ -44,8 +99,10 @@ _TELEMETRY_LOGGER = log_capture_service.TELEMETRY_LOGGER_NAME
 # reaches the target by shedding them and picks EVERY eligible candidate. That is
 # the intended below-pressure shape: with a roomy disk, "what a sweep would pick"
 # equals the full eligible set. The strict would_evict SUBSET behaviour (a prefix
-# that stops at the target) is proven separately, with controlled size_percent,
-# in test_would_evict_reports_the_select_prefix_not_the_full_eligible_set.
+# that stops at the target, plus the reclaimable-aware extension past it) is
+# proven separately, with controlled size_percent and reclaimable bytes, in
+# test_would_evict_reports_the_select_prefix_when_reclaimable_matches_nominal and
+# test_would_evict_extends_past_the_select_prefix_when_reclaimable_falls_short.
 _THRESHOLD = 80.0
 _TARGET = 50.0
 
@@ -141,6 +198,7 @@ async def test_sweep_never_deletes_the_file_or_touches_status_or_history(
         await retention_telemetry_service.run_retention_telemetry_sweep(
             session=session,
             library=library,
+            fs=_local_fs(tmp_path),
             media_type="movie",
             root_path=str(tmp_path),
             grace_days=_GRACE_DAYS,
@@ -180,6 +238,7 @@ async def test_sweep_emits_the_expected_aggregate_and_per_candidate_events(
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="movie",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -234,6 +293,7 @@ async def test_sweep_leaves_the_interval_unknown_without_a_completed_at(
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="movie",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -271,6 +331,7 @@ async def test_within_grace_watched_title_is_tracked_for_time_to_watch_but_not_e
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="movie",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -325,6 +386,7 @@ async def test_sweep_excludes_a_pinned_title_from_eviction_but_tracks_its_watch_
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="movie",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -373,6 +435,7 @@ async def test_sweep_resolves_a_tv_season_context_from_the_parent_show(
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="tv",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -426,6 +489,7 @@ async def test_sweep_leaves_the_tv_interval_unknown_when_the_parent_has_no_compl
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="tv",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -456,6 +520,7 @@ async def test_unreadable_root_is_skipped_without_crashing(
         await retention_telemetry_service.run_retention_telemetry_sweep(
             session=session,
             library=library,
+            fs=_local_fs(tmp_path),
             media_type="movie",
             root_path=missing_root,
             grace_days=_GRACE_DAYS,
@@ -497,6 +562,7 @@ async def test_partial_watch_is_captured_for_time_to_watch_but_never_evictable(
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="tv",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -525,17 +591,10 @@ async def test_partial_watch_is_captured_for_time_to_watch_but_never_evictable(
     assert Path(library_path).exists()  # delete-nothing
 
 
-async def test_would_evict_reports_the_select_prefix_not_the_full_eligible_set(
-    sessionmaker_: SessionMaker,
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``would_evict`` must be the :func:`select_evictions` prefix (what a
-    pressure sweep would ACTUALLY delete to reach the target), never the full
-    eligible ranking. With controlled sizes the two diverge: three eligible
-    candidates each ~20% of the root, and a 90%->50% relief needs only the two
-    stalest (90->70->50). Regression for the overstated would-free finding."""
+def _controlled_candidates(tmp_path: Path) -> list[EvictionCandidate]:
+    """Three eligible movie candidates, each nominally 20% of a controlled 1000-byte
+    root, stalest (90d) first -- the shared fixture behind the two would-evict
+    selection tests below."""
 
     def _mk(request_id: int, last_viewed: datetime) -> EvictionCandidate:
         return EvictionCandidate(
@@ -552,22 +611,50 @@ async def test_would_evict_reports_the_select_prefix_not_the_full_eligible_set(
             size_percent=20.0,
         )
 
-    candidates = [
+    return [
         _mk(1, _NOW - timedelta(days=90)),  # stalest -> selected first
         _mk(2, _NOW - timedelta(days=80)),
-        _mk(3, _NOW - timedelta(days=70)),  # eligible, but the target is met before it
+        _mk(3, _NOW - timedelta(days=70)),  # last in rank order
     ]
+
+
+def _fake_1000_byte_disk(_path: str) -> DiskUsage:
+    """Monkeypatch stand-in for ``read_disk_usage``: a controlled 1000-byte root so
+    each candidate's 20% ``size_percent`` maps to a meaningful 200 bytes."""
+    return DiskUsage(root=_path, total_bytes=1000, available_bytes=100)
+
+
+async def test_would_evict_reports_the_select_prefix_when_reclaimable_matches_nominal(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every candidate reclaims its full nominal size (no hardlinks),
+    ``would_evict`` is exactly the :func:`select_evictions` prefix -- never the
+    full eligible ranking. Three candidates each 20% of a 1000-byte root; a
+    90%->50% relief is met by the two stalest (90->70->50), so the third is
+    eligible but NOT in would_evict. Regression for the overstated would-free
+    finding."""
+    candidates = _controlled_candidates(tmp_path)
 
     async def _fake_assemble(**_kwargs: object) -> list[EvictionCandidate]:
         return candidates
 
     monkeypatch.setattr(eviction_service, "assemble_candidates", _fake_assemble)
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", _fake_1000_byte_disk)
+    # Each of the two selected candidates reclaims its full 20% (200 bytes) -- no
+    # hardlink shortfall, so the extension never fires.
+    fs = _MappedReclaimFileSystem(
+        {candidates[0].library_path or "": 200, candidates[1].library_path or "": 200}
+    )
 
     with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
         async with sessionmaker_() as session:
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=FakeLibrary(),
+                fs=fs,
                 media_type="movie",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,
@@ -581,6 +668,116 @@ async def test_would_evict_reports_the_select_prefix_not_the_full_eligible_set(
     assert "3 eligible eviction candidate(s)" in aggregate_message
     assert "2 would_evict now" in aggregate_message  # the select prefix, not all 3
     assert "90.0%->50.0%" in aggregate_message
+    assert "400 byte(s) reclaimable" in aggregate_message  # 200 + 200, the two selected
+    # The third (unselected) candidate's reclaimable bytes are never even measured.
+    assert candidates[2].library_path not in fs.reclaimable_calls
+
+
+async def test_would_evict_extends_past_the_select_prefix_when_reclaimable_falls_short(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The finding-#3 regression: a real pressure sweep extends PAST the
+    ``select_evictions`` prefix when the measured reclaimable bytes fall short of
+    the nominal estimate (a hardlinked import frees ~nothing). The telemetry
+    would-evict simulation MUST do the same, reusing ``run_eviction_sweep``'s
+    reclaimable-aware extension (the shared ``pressure_relieved`` predicate), or it
+    understates what a real sweep would delete.
+
+    Same three 20%-of-1000-byte candidates as the prefix test, but the STALEST
+    (selected first) is hardlinked and reclaims 0 bytes. The nominal prefix is
+    still [m1, m2], but after evicting them only 200 bytes are freed (m1 gave
+    nothing) -- not enough to reach the target -- so the sweep draws m3 too."""
+    candidates = _controlled_candidates(tmp_path)
+
+    async def _fake_assemble(**_kwargs: object) -> list[EvictionCandidate]:
+        return candidates
+
+    monkeypatch.setattr(eviction_service, "assemble_candidates", _fake_assemble)
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", _fake_1000_byte_disk)
+    # m1 (stalest, selected first) is hardlinked -> reclaims 0; m2, m3 reclaim
+    # their full 200 each. 0 + 200 = 200 leaves used at 90-20=70 > 50 target, so
+    # the extension pulls m3 (the +200 that finally closes the gap).
+    fs = _MappedReclaimFileSystem(
+        {
+            candidates[0].library_path or "": 0,
+            candidates[1].library_path or "": 200,
+            candidates[2].library_path or "": 200,
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=FakeLibrary(),
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=90.0,
+                target_pct=50.0,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate_message = records[0].getMessage()
+    assert "3 eligible eviction candidate(s)" in aggregate_message
+    # Extended past the 2-candidate nominal prefix because m1 reclaimed nothing.
+    assert "3 would_evict now" in aggregate_message
+    assert "400 byte(s) reclaimable" in aggregate_message  # 0 + 200 + 200
+
+
+async def test_per_title_row_is_deduped_until_last_viewed_advances(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The finding-#2 regression: per-title ``completed_to_last_watch`` rows must
+    NOT re-emit on every below-pressure tick. A title's row is logged once, then
+    suppressed while its ``last_viewed_at`` is unchanged, and logged again only
+    when it advances (a fresh play). The per-root aggregate always emits (it is
+    the time-series)."""
+    library_path = _movie_file(tmp_path, "Rewatched.mkv")
+    await _movie(
+        sessionmaker_,
+        tmdb_id=9,
+        title="Rewatched",
+        library_path=library_path,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    library = FakeLibrary(
+        watch_states={(9, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _sweep() -> None:
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        await _sweep()  # sweep 1: aggregate + per-title
+        await _sweep()  # sweep 2: aggregate only -- unchanged watch state is deduped
+        # A fresh play advances last_viewed_at -> the per-title row emits again.
+        library.watch_states[(9, "movie", None)] = WatchState(
+            watched=True, last_viewed_at=_STALE + timedelta(days=1)
+        )
+        await _sweep()  # sweep 3: aggregate + per-title
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate = [r for r in records if "eligible eviction candidate(s)" in r.getMessage()]
+    per_title = [r for r in records if "completed_to_last_watch=" in r.getMessage()]
+    assert len(aggregate) == 3  # the aggregate time-series emits every sweep
+    assert len(per_title) == 2  # emitted on sweep 1 and 3, deduped on sweep 2
 
 
 async def test_telemetry_records_reach_the_db_sink_at_a_warning_operator_floor(
@@ -616,6 +813,7 @@ async def test_telemetry_records_reach_the_db_sink_at_a_warning_operator_floor(
             await retention_telemetry_service.run_retention_telemetry_sweep(
                 session=session,
                 library=library,
+                fs=_local_fs(tmp_path),
                 media_type="movie",
                 root_path=str(tmp_path),
                 grace_days=_GRACE_DAYS,

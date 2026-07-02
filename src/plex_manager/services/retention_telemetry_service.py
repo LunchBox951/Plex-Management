@@ -31,14 +31,24 @@ questions and no single filter serves both:
     watched, past-grace, unpinned, not-in-flight title/season, regardless of
     how much space a sweep would actually need to free.
   - ``would_evict_count`` / ``would_evict_bytes`` — the SUBSET a pressure sweep
-    would actually delete to relieve pressure, i.e. the
-    :func:`~plex_manager.domain.eviction.select_evictions` prefix taken
-    stalest-first down from the configured ``threshold_pct`` to the configured
-    ``target_pct``. It is simulated AT the threshold (the moment pressure first
-    fires), NOT at the current below-threshold usage — the sweep only runs while
-    usage is below threshold, where ``select_evictions`` correctly selects
-    nothing, so a current-usage simulation would always report zero and tell the
-    operator nothing. This is always a prefix of the eligible set, so
+    would actually delete to relieve pressure, and how much it would ACTUALLY
+    free. This REUSES ``run_eviction_sweep``'s own two-phase selection rather than
+    reimplementing it: the stalest-first
+    :func:`~plex_manager.domain.eviction.select_evictions` prefix down from the
+    configured ``threshold_pct`` toward ``target_pct``, THEN the reclaimable-aware
+    extension (R4-6) that keeps drawing further stalest-first candidates while the
+    MEASURED reclaimable bytes fall short of the target. Both the sweep and this
+    simulation gate that extension on the SAME
+    :func:`~plex_manager.domain.eviction.pressure_relieved` predicate, so the two
+    can never drift. Without the extension the count/bytes would understate a real
+    sweep whenever content is hardlinked: a same-filesystem import frees far less
+    than its nominal size, so a nominal-size ``select_evictions`` prefix stops too
+    early and the real sweep goes further. It is simulated AT the threshold (the
+    moment pressure first fires), NOT at the current below-threshold usage — the
+    sweep only runs while usage is below threshold, where ``select_evictions``
+    correctly selects nothing, so a current-usage simulation would always report
+    zero and tell the operator nothing. Still always a prefix of the eligible set
+    (the extension only draws consecutive stalest-first candidates from it), so
     ``would_evict_count <= eligible_count`` by construction.
 
 * The **time-to-watch dataset** (the idle-age distribution + one
@@ -56,15 +66,25 @@ questions and no single filter serves both:
   <7d/7-14d/14-30d buckets — would be permanent dead weight).
 
 The single raw read feeds all of this: ``rank_eviction_candidates`` /
-``select_evictions`` re-derive the two would-evict subsets in memory (no second
-Plex/FS pass), and the time-to-watch set is a plain ``last_viewed_at is not
-None`` filter over the same rows. A second
-:func:`~plex_manager.services.eviction_service.preview_candidates` call would
-re-run every title's fresh Plex ``watch_state`` AND a full ``os.walk`` on every
-below-pressure tick — exactly the redundant cost ``run_eviction_sweep``'s own
-pressure pre-check goes out of its way to avoid. Nothing here calls
-``fs.delete``, flips a status, or writes ``download_history``; the candidate
-list is read-only input to the ``logging`` calls.
+``select_evictions`` re-derive the would-evict subset in memory over the same
+rows (no second Plex pass and no second full-library ``os.walk``), and the
+time-to-watch set is a plain ``last_viewed_at is not None`` filter over them. The
+ONE extra disk touch is a read-only, hardlink-aware
+:meth:`~plex_manager.ports.filesystem.FileSystemPort.reclaimable_bytes` stat over
+ONLY the would-evict subset (never every candidate) — the price of an honest,
+hardlink-aware ``would_evict`` that matches the real sweep; it never deletes. A
+second :func:`~plex_manager.services.eviction_service.preview_candidates` call, by
+contrast, would re-run every title's fresh Plex ``watch_state`` AND a full
+``os.walk`` on every below-pressure tick — exactly the redundant cost
+``run_eviction_sweep``'s own pressure pre-check goes out of its way to avoid.
+Nothing here calls ``fs.delete``, flips a status, or writes ``download_history``;
+the candidate list is read-only input to the ``logging`` calls.
+
+The per-title ``completed_to_last_watch`` rows are de-duplicated in-process (see
+:data:`_last_emitted_watch`): a title's row is emitted only when its
+``last_viewed_at`` advances (or the process has not seen it yet), so a steady
+watch state does not re-log an identical row every 30-minute tick. The per-root
+aggregate is the time-series and always emits.
 
 The interval is labelled ``completed_to_last_watch`` (not "first watch"):
 ``last_viewed_at`` is Plex's MOST-RECENT play, not the first, so for a rewatched
@@ -91,7 +111,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, Literal
 
-from plex_manager.domain.eviction import rank_eviction_candidates, select_evictions
+from plex_manager.domain.eviction import (
+    pressure_relieved,
+    rank_eviction_candidates,
+    select_evictions,
+)
 from plex_manager.models import MediaRequest, SeasonRequest
 from plex_manager.services import eviction_service
 from plex_manager.services.health_service import read_disk_usage
@@ -101,6 +125,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.domain.eviction import EvictionCandidate
+    from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
 
 __all__ = ["run_retention_telemetry_sweep"]
@@ -119,6 +144,50 @@ __all__ = ["run_retention_telemetry_sweep"]
 # to the durable ``log_events`` sink at any operator floor without also
 # un-quieting the rest of the app's INFO chatter.
 _logger = logging.getLogger(TELEMETRY_LOGGER_NAME)
+
+
+#: In-process dedupe for the per-title ``completed_to_last_watch`` rows, keyed by
+#: ``(tmdb_id, media_type, season)`` -> the ``last_viewed_at`` last emitted for
+#: that title/season. Without it, a below-pressure install re-emits an IDENTICAL
+#: per-title row on EVERY eviction tick (the default 30-minute interval ~= 48
+#: duplicate rows/day/title), flooding ``log_events`` and skewing any analysis of
+#: the dataset. A per-title row is emitted only when its ``last_viewed_at`` has
+#: actually ADVANCED since the last emission (someone watched it again) or the
+#: key has not been seen since this process started -- so a steady watch state
+#: contributes exactly one row, and a new play contributes exactly one more.
+#:
+#: Deliberately process-lifetime, not durable: a restart re-emits each watched
+#: title's current row ONCE (the cache starts empty). That is an accepted,
+#: honest cost -- one duplicate per title per restart is negligible next to one
+#: per title per 30 minutes, and persisting a dedupe watermark would need a
+#: schema change this delete-nothing observer explicitly avoids. The per-ROOT
+#: aggregate row is NOT deduped here: it is the time-series this sweep exists to
+#: produce and must emit every sweep. Bounded by the count of distinct
+#: ever-watched titles/seasons -- a beta library's worth, never unbounded.
+_last_emitted_watch: dict[tuple[int | None, str, int | None], datetime] = {}
+
+
+async def _reclaimable_bytes(fs: FileSystemPort, candidate: EvictionCandidate) -> int:
+    """Best-effort hardlink-aware reclaimable footprint of ``candidate`` in bytes.
+
+    Delegates to :meth:`~plex_manager.ports.filesystem.FileSystemPort.
+    reclaimable_bytes` (read-only -- it never deletes, only stats link counts) so
+    the would-evict simulation projects against the bytes a real sweep would
+    ACTUALLY free, not the nominal on-disk size (a same-filesystem hardlinked
+    import frees far less -- often nothing). Offloaded like every other blocking
+    FS primitive this subsystem calls from an async function. A candidate with no
+    stored ``library_path`` breadcrumb, or any FS error, contributes ``0`` --
+    mirroring ``_evict_one``'s own "nothing reclaimed" fallback for the same cases
+    (so a no-breadcrumb candidate the real sweep would attempt-and-skip is counted
+    as freeing nothing here too, never guessed at).
+    """
+    library_path = candidate.library_path
+    if library_path is None:
+        return 0
+    try:
+        return await asyncio.to_thread(fs.reclaimable_bytes, library_path)
+    except OSError:
+        return 0
 
 
 def _sum_estimated_bytes(candidates: Sequence[EvictionCandidate], total_bytes: int) -> int:
@@ -252,6 +321,7 @@ async def run_retention_telemetry_sweep(
     *,
     session: AsyncSession,
     library: LibraryPort,
+    fs: FileSystemPort,
     media_type: Literal["movie", "tv"],
     root_path: str,
     grace_days: int,
@@ -273,24 +343,31 @@ async def run_retention_telemetry_sweep(
     A SINGLE raw candidate read (:func:`~plex_manager.services.eviction_service.
     assemble_candidates` — every available title/season with fresh watch state +
     walked size, NO grace or eligibility filter) feeds two DECOUPLED products
-    (see the module docstring for the full rationale); both would-evict subsets
-    are re-derived from that superset in memory, no second Plex/FS pass.
+    (see the module docstring for the full rationale); the would-evict subset is
+    re-derived from that superset in memory with no second Plex pass and no second
+    full-library walk. ``fs`` is used ONLY for a read-only, hardlink-aware
+    :meth:`~plex_manager.ports.filesystem.FileSystemPort.reclaimable_bytes` stat
+    over the would-evict subset (so the would-evict numbers match a real sweep's
+    hardlink accounting), never to delete.
 
     Log calls, all through the dedicated ``TELEMETRY_LOGGER_NAME`` logger:
 
     1. ONE aggregate event reporting, honestly split:
        * ``eligible_count`` / ``eligible_bytes`` — every ever-evictable candidate
          at the real ``grace_days`` cutoff (:func:`~plex_manager.domain.eviction.
-         rank_eviction_candidates`).
-       * ``would_evict_count`` / ``would_evict_bytes`` — the
-         :func:`~plex_manager.domain.eviction.select_evictions` prefix a pressure
+         rank_eviction_candidates`); bytes from each candidate's ``size_percent``
+         and THIS root's real total capacity (the nominal on-disk footprint).
+       * ``would_evict_count`` / ``would_evict_bytes`` — the subset a pressure
          sweep would actually delete to relieve ``threshold_pct``->``target_pct``,
-         simulated AT the threshold (a strict subset of the eligible set).
+         and how much it would ACTUALLY free. Reuses ``run_eviction_sweep``'s
+         two-phase selection (the :func:`~plex_manager.domain.eviction.
+         select_evictions` prefix plus the reclaimable-aware R4-6 extension, gated
+         on the shared :func:`~plex_manager.domain.eviction.pressure_relieved`
+         predicate), simulated AT the threshold; ``would_evict_bytes`` is the
+         MEASURED hardlink-aware reclaimable total, not the nominal size. Still a
+         prefix of the eligible set.
        * the count of titles with ANY recorded view and the watch-idle age
          distribution (now - ``last_viewed_at``, bucketed) over them.
-       Bytes are converted from each candidate's ``size_percent`` back with THIS
-       root's real total capacity (the same estimate basis ``eviction_service``
-       uses before a delete).
     2. One event PER title/season with any recorded view — INCLUDING a
        started-but-unfinished one (``watched=False`` but a view timestamp
        exists): its completed_at -> last_viewed_at interval (labelled
@@ -298,7 +375,10 @@ async def run_retention_telemetry_sweep(
        play, so this is a watch-recency, not a true time-to-first-watch; see
        :func:`_candidate_context` for what "completed_at" means per media kind),
        with ``request_id``/``tmdb_id`` passed via ``extra={}`` (never
-       interpolated into the message).
+       interpolated into the message). De-duplicated in-process: emitted only when
+       a title's ``last_viewed_at`` advances since the last emission (see
+       :data:`_last_emitted_watch`), so a steady watch state does not re-log the
+       same row every tick. The aggregate above always emits.
 
     An unreadable ``root_path`` (missing mount, permission denied) skips the
     whole sweep for this root, logged as a WARNING on the dedicated telemetry
@@ -347,15 +427,44 @@ async def run_retention_telemetry_sweep(
 
     # Product 1b -- the SUBSET a pressure sweep would ACTUALLY delete to relieve
     # pressure from the configured threshold down to the configured target,
-    # stalest-first (a prefix of ``eligible``). Simulated with used_pct set to
-    # ``threshold_pct`` (the moment pressure first fires), NOT the current
-    # below-threshold usage: the telemetry sweep only runs BELOW threshold, where
-    # select_evictions correctly picks nothing, so simulating at the real usage
-    # would always report zero and answer the wrong question. See the module
-    # docstring.
-    would_evict = select_evictions(
-        candidates, threshold_pct, threshold_pct, target_pct, grace_cutoff
-    )
+    # stalest-first. This REUSES ``run_eviction_sweep``'s two-phase selection
+    # (its ``select_evictions`` prefix + the reclaimable-aware extension) so the
+    # numbers match what a real sweep does, hardlinks and all -- see the module
+    # docstring's "why a reclaimable-aware simulation, not select_evictions
+    # alone".
+    #
+    # Simulated with used_pct set to ``threshold_pct`` (the moment pressure first
+    # fires), NOT the current below-threshold usage: the telemetry sweep only runs
+    # BELOW threshold, where select_evictions correctly picks nothing, so
+    # simulating at the real usage would always report zero and answer the wrong
+    # question.
+    #
+    # Phase 1: the estimate-based prefix, ranked stalest-first by NOMINAL size --
+    # identical to ``run_eviction_sweep``'s ``selected``. It is a prefix of
+    # ``eligible`` (both come from the same stable ``rank_eviction_candidates``
+    # ordering), so ``eligible[len(selected):]`` is exactly the same extension
+    # pool the real sweep draws from.
+    selected = select_evictions(candidates, threshold_pct, threshold_pct, target_pct, grace_cutoff)
+    extra_pool = eligible[len(selected) :]
+
+    # Phase 2: extend past that prefix while the MEASURED reclaimable bytes fall
+    # short of the target -- the exact R4-6 behaviour ``run_eviction_sweep`` runs
+    # (a hardlinked candidate frees less than its nominal size, so more must be
+    # drawn). Both loops share ``domain.eviction.pressure_relieved`` as the single
+    # stop condition, so this can never drift from the real sweep. Unlike the real
+    # sweep (which measures reclaimable bytes LAZILY as it deletes), a
+    # delete-nothing observer must measure them up front -- a read-only,
+    # hardlink-aware stat pass over ONLY the would-evict subset (never the full
+    # candidate set), never a delete.
+    would_evict = list(selected)
+    would_free_bytes = 0
+    for candidate in selected:
+        would_free_bytes += await _reclaimable_bytes(fs, candidate)
+    for candidate in extra_pool:
+        if pressure_relieved(threshold_pct, would_free_bytes, disk.total_bytes, target_pct):
+            break
+        would_evict.append(candidate)
+        would_free_bytes += await _reclaimable_bytes(fs, candidate)
 
     # Product 2's population: EVERY row with any recorded Plex view -- watched OR
     # started-but-unfinished (``watched=False`` with a view timestamp). The
@@ -376,8 +485,8 @@ async def run_retention_telemetry_sweep(
     _logger.info(
         "retention telemetry: %s root %s -- %d eligible eviction candidate(s) "
         "(~%d byte(s)); of those, %d would_evict now to relieve %.1f%%->%.1f%% "
-        "pressure (~%d byte(s) estimated would free); %d title(s) with recorded "
-        "watch activity, idle-age distribution: %s",
+        "pressure (~%d byte(s) reclaimable, hardlink-aware); %d title(s) with "
+        "recorded watch activity, idle-age distribution: %s",
         media_type,
         root_path,
         len(eligible),
@@ -385,13 +494,23 @@ async def run_retention_telemetry_sweep(
         len(would_evict),
         threshold_pct,
         target_pct,
-        _sum_estimated_bytes(would_evict, disk.total_bytes),
+        would_free_bytes,
         len(watch_activity),
         _format_buckets(bucket_counts),
     )
 
     for candidate, last_viewed in watch_activity:
         context = await _candidate_context(session, candidate)
+        # In-process dedupe: skip a per-title row whose last_viewed_at has not
+        # advanced since the last one emitted for this title/season, so a steady
+        # watch state does not re-emit an identical row on every below-pressure
+        # tick (see ``_last_emitted_watch``). The per-ROOT aggregate above still
+        # emits every sweep. The context is still resolved first (the id lookup
+        # is cheap and doubles as the dedupe key's ``tmdb_id``).
+        dedupe_key = (context.tmdb_id, candidate.media_type, candidate.season)
+        if _last_emitted_watch.get(dedupe_key) == last_viewed:
+            continue
+        _last_emitted_watch[dedupe_key] = last_viewed
         if context.completed_at is not None:
             interval_repr = f"{(last_viewed - context.completed_at).total_seconds():.0f}s"
             completed_repr = context.completed_at.isoformat()
