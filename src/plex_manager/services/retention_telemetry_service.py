@@ -54,11 +54,16 @@ questions and no single filter serves both:
 * The **time-to-watch dataset** (the idle-age distribution + one
   completed_at→last-watch interval per title/season) answers "how long after a
   title finishes importing does someone actually get around to watching it".
-  It is built from EVERY row with ANY recorded Plex view
+  It is built from EVERY path-bearing row with a POST-IMPORT recorded Plex view
   (``last_viewed_at is not None``) — which deliberately INCLUDES a
   started-but-unfinished season (``watched=False`` but a view timestamp exists):
   that "began watching" signal is exactly what this dataset exists to capture,
-  and the eligibility filter behind the would-evict numbers would drop it. It
+  and the eligibility filter behind the would-evict numbers would drop it. The
+  ONE recorded view it excludes is a PRE-IMPORT one (``last_viewed_at`` before the
+  title's ``completed_at`` — a re-import keeping Plex's older timestamp), which has
+  no post-import interval to measure and would skew the whole dataset; it is
+  reported as ``preexisting_watch_count`` instead (see the partition contract
+  below). It
   must also cover titles of any idle age, or it captures nothing during the
   one-week beta this sweep exists to serve (in a seven-day window NO title can
   have been idle past a 30-day grace, so a grace-filtered read would return
@@ -68,7 +73,8 @@ questions and no single filter serves both:
 The single raw read feeds all of this: ``rank_eviction_candidates`` /
 ``select_evictions`` re-derive the would-evict subset in memory over the same
 rows (no second Plex pass and no second full-library ``os.walk``), and the
-time-to-watch set is a plain ``last_viewed_at is not None`` filter over them. The
+time-to-watch set is those rows with a POST-import recorded view (``last_viewed_at
+is not None`` and not pre-import — see the partition contract below). The
 ONE extra disk touch is a read-only, hardlink-aware
 :meth:`~plex_manager.ports.filesystem.FileSystemPort.reclaimable_bytes` stat over
 ONLY the would-evict subset (never every candidate) — the price of an honest,
@@ -80,28 +86,64 @@ contrast, would re-run every title's fresh Plex ``watch_state`` AND a full
 Nothing here calls ``fs.delete``, flips a status, or writes ``download_history``;
 the candidate list is read-only input to the ``logging`` calls.
 
-Three classes of row are EXCLUDED from the metrics they would otherwise corrupt
-and instead reported as labelled counts on the per-root aggregate -- honest
-"these exist, here is why we set them aside", never a silent drop:
+The partition contract
+======================
+Every raw candidate is classified EXACTLY ONCE, up front, at a single point
+(:func:`_classify_candidates` -> :class:`_Partition`); every metric this sweep
+emits then reads a partition field and NONE re-derives its own filter -- so the
+watch-activity count, the idle-age buckets and the per-title intervals can never
+again disagree about which rows are in the time-to-watch dataset. Three exclusion
+rules govern the partition -- each an honest "these rows exist, here is why we set
+them aside", reported as a labelled count on the per-root aggregate, never a silent
+drop. They act on TWO ORTHOGONAL axes, because a row set aside from one metric
+family may still legitimately feed the other:
 
-* ``no_path_count`` -- a row with NO ``library_path`` breadcrumb (e.g. a movie
-  found already in Plex, short-circuited straight to ``available`` by
-  ``request_service.create_request``: ``mark_available`` stamps a ``completed_at``
-  that is the Plex-verification moment, not an import time, and no file of ours
-  was ever placed). Eviction can never touch it, so it is dropped from the
-  eligible/would-evict metrics AND the time-to-watch dataset.
-* ``guard_refused_count`` -- a would-evict candidate whose breadcrumb is lexically
-  under ``root_path`` but resolves, via a symlinked component, OUTSIDE every
-  configured root. The real ``LocalFileSystem.delete`` refuses it and frees
-  nothing, so the simulation runs each would-evict candidate through ``fs``'s OWN
-  delete guard (:meth:`~plex_manager.ports.filesystem.FileSystemPort.
-  delete_guard_refuses`, the very predicate ``delete`` raises on) and excludes a
-  refused row from the would-evict count/bytes.
-* ``preexisting_watch_count`` -- a row whose recorded view PREDATES its completion
-  (a re-imported / previously-watched title keeps Plex's older ``last_viewed_at``),
-  which would yield a negative ``completed_to_last_watch``. The per-title interval
-  measures POST-import time-to-watch, and a pre-import view has no such interval,
-  so that per-title row is skipped.
+* The **disk-space axis** -- ``eligible`` / ``would_evict`` and their byte sums,
+  answering "what would a pressure sweep delete". Its exclusions:
+
+  - ``no_path_count`` (rule 1) -- a row with NO ``library_path`` breadcrumb (e.g. a
+    movie found already in Plex, short-circuited straight to ``available`` by
+    ``request_service.create_request``: ``mark_available`` stamps a ``completed_at``
+    that is the Plex-verification moment, not an import time, and no file of ours
+    was ever placed). Eviction can never touch it, so it is excluded from EVERY
+    metric on BOTH axes.
+  - ``guard_refused_count`` (rule 3) -- a would-evict candidate whose breadcrumb is
+    lexically under ``root_path`` but resolves, via a symlinked component, OUTSIDE
+    every configured root. The real ``LocalFileSystem.delete`` refuses it and frees
+    nothing, so each would-evict candidate is run through ``fs``'s OWN delete guard
+    (:meth:`~plex_manager.ports.filesystem.FileSystemPort.delete_guard_refuses`, the
+    very predicate ``delete`` raises on) and a refused row is excluded from the
+    ``would_evict`` count/bytes ONLY -- it is still a policy-eligible title (it
+    counts in ``eligible``) and, if it has a post-import view, still a valid
+    time-to-watch data point.
+
+* The **time-to-watch axis** -- the watch-activity count, the idle-age distribution
+  AND the per-title ``completed_to_last_watch`` intervals (one dataset, so they MUST
+  agree), answering "how long after import does someone watch". Its exclusions:
+
+  - ``no_path_count`` (rule 1) -- as above; its ``completed_at`` is not an import
+    time, so it feeds no interval and is excluded here too.
+  - ``preexisting_watch_count`` (rule 2) -- a path-bearing row whose recorded view
+    PREDATES its completion (a re-imported / previously-watched title keeps Plex's
+    older ``last_viewed_at``), which would yield a negative
+    ``completed_to_last_watch``. The interval measures POST-import time-to-watch, and
+    a pre-import view has no such interval, so it is excluded from ALL time/idle
+    metrics -- the per-title interval, the idle-age buckets AND the watch-activity
+    count alike -- and reported only as ``preexisting_watch_count``. It is NOT
+    excluded from the disk-space axis: a previously-watched title is still watched,
+    past grace, and evictable, so it still counts in ``eligible``/``would_evict``. A
+    row whose ``completed_at`` is UNKNOWN is NOT pre-import (its idle age is still
+    well defined), so it stays in the watch dataset and its interval logs an honest
+    "unknown" rather than being dropped or guessed at.
+
+Why two axes and not one global bucket-per-row: a single mutually-exclusive
+membership would be WRONG here. A ``preexisting`` view is still an evictable title
+(it must stay in ``eligible``); a ``guard_refused`` title may still have a valid
+post-import watch (it must stay in the watch dataset). So the partition is disjoint
+WITHIN each axis -- every path-bearing viewed row is exactly one of
+{watch-metric-eligible, preexisting}; every would-evict-selected row is exactly one
+of {would_evict, guard_refused}; ``no_path`` is disjoint from all path-bearing rows
+-- while a single path-bearing row may be a member on BOTH axes at once.
 
 The per-title ``completed_to_last_watch`` rows are de-duplicated in-process (see
 :data:`_last_emitted_watch`): a title's row is emitted only when its
@@ -406,6 +448,138 @@ async def _candidate_context(
     )
 
 
+@dataclass(frozen=True)
+class _Partition:
+    """One root's raw candidates classified ONCE (see :func:`_classify_candidates`),
+    so every metric reads a field here and none re-derives its own filter.
+
+    The full rationale is the module docstring's "partition contract"; in brief, the
+    three exclusion rules act on TWO ORTHOGONAL axes:
+
+    * disk-space axis -- ``eligible`` (the full policy-evictable set, which KEEPS
+      pre-import views: a previously-watched title is still evictable) and
+      ``would_evict`` (the subset a pressure sweep would actually delete, with its
+      measured hardlink-aware ``would_free_bytes``). ``no_path_count`` (rule 1) and
+      ``guard_refused_count`` (rule 3) are its exclusions; a guard-refused row is
+      dropped from ``would_evict`` ONLY, never from ``eligible``.
+    * time-to-watch axis -- ``watch_metric_eligible`` (each ``(candidate,
+      last_viewed_at, context)`` resolved once) feeds the watch-activity count, the
+      idle-age buckets AND the per-title intervals, so those three always agree.
+      ``no_path_count`` (rule 1) and ``preexisting_watch_count`` (rule 2, a
+      pre-import view) are its exclusions.
+
+    Disjoint WITHIN each axis (every path-bearing viewed row is exactly one of
+    {``watch_metric_eligible``, preexisting}; every would-evict-selected row is
+    exactly one of {``would_evict``, guard_refused}; ``no_path`` rows are disjoint
+    from all path-bearing rows), while a single path-bearing row may be a member on
+    BOTH axes at once -- which is why this is not a single global bucket-per-row.
+    """
+
+    no_path_count: int
+    eligible: list[EvictionCandidate]
+    would_evict: list[EvictionCandidate]
+    would_free_bytes: int
+    guard_refused_count: int
+    watch_metric_eligible: list[tuple[EvictionCandidate, datetime, _CandidateContext]]
+    preexisting_watch_count: int
+
+
+async def _classify_candidates(
+    *,
+    session: AsyncSession,
+    fs: FileSystemPort,
+    candidates: Sequence[EvictionCandidate],
+    grace_cutoff: datetime,
+    threshold_pct: float,
+    target_pct: float,
+    total_bytes: int,
+) -> _Partition:
+    """Partition one root's RAW candidates ONCE into the metric-eligible sets and
+    the labelled exclusion counts every emitted field consumes.
+
+    This is the SINGLE classification point (see :class:`_Partition` and the module
+    docstring's partition contract). The three exclusion rules are applied HERE and
+    NOWHERE else, so no downstream metric re-derives its own filter and the
+    watch-activity count, idle-age buckets and per-title intervals can never again
+    disagree about which rows belong to the time-to-watch dataset.
+    """
+    # Rule 1 -- no-path total exclusion, applied first. A None breadcrumb means
+    # nothing of ours is on disk (eviction can never touch it) and ``completed_at``
+    # is not an import time (no post-import interval), so the row feeds NEITHER axis
+    # and is only counted. The two axes are then classified independently over the
+    # surviving path-bearing rows (orthogonal, not one global bucket -- see the
+    # dataclass docstring).
+    path_bearing = [candidate for candidate in candidates if candidate.library_path is not None]
+    no_path_count = len(candidates) - len(path_bearing)
+
+    # Disk-space axis. ``eligible`` is the FULL policy-evictable set at the real
+    # grace cutoff (pre-import views INCLUDED: a previously-watched title is still
+    # watched + past grace + evictable). ``would_evict`` reuses ``run_eviction_sweep``'s
+    # two-phase selection -- the estimate-based ``select_evictions`` prefix plus the
+    # reclaimable-aware extension, both gated on the shared ``pressure_relieved``
+    # predicate so this can never drift from a real sweep -- simulated AT the
+    # threshold (the moment pressure first fires; the telemetry sweep only runs BELOW
+    # threshold, where ``select_evictions`` correctly picks nothing). Rule 3 runs each
+    # selected candidate through ``fs``'s OWN delete guard and drops a refused row
+    # from ``would_evict`` (count/bytes) while LEAVING it in ``eligible``. Phase 1
+    # attempts every ``selected`` candidate with no early stop, exactly like the real
+    # sweep; phase 2 re-checks pressure at the top of each iteration, so a refused
+    # candidate simply frees nothing and the loop keeps drawing.
+    eligible = rank_eviction_candidates(path_bearing, grace_cutoff)
+    selected = select_evictions(
+        path_bearing, threshold_pct, threshold_pct, target_pct, grace_cutoff
+    )
+    extra_pool = eligible[len(selected) :]
+    would_evict: list[EvictionCandidate] = []
+    would_free_bytes = 0
+    guard_refused_count = 0
+    for candidate in selected:
+        if await _guard_refuses(fs, candidate):
+            guard_refused_count += 1
+            continue
+        would_evict.append(candidate)
+        would_free_bytes += await _reclaimable_bytes(fs, candidate)
+    for candidate in extra_pool:
+        if pressure_relieved(threshold_pct, would_free_bytes, total_bytes, target_pct):
+            break
+        if await _guard_refuses(fs, candidate):
+            guard_refused_count += 1
+            continue
+        would_evict.append(candidate)
+        would_free_bytes += await _reclaimable_bytes(fs, candidate)
+
+    # Time-to-watch axis. Over EVERY path-bearing row with a recorded view (watched
+    # OR started-but-unfinished -- the "began watching" signal), rule 2 splits out
+    # PRE-import views: a recorded view older than the title's completion has no
+    # post-import interval and would skew the whole dataset, so it is excluded from
+    # ALL time/idle metrics (interval, buckets AND count alike) and counted only as
+    # ``preexisting_watch``. A row whose ``completed_at`` is UNKNOWN is NOT pre-import
+    # (its idle age is still well defined), so it stays metric-eligible and logs an
+    # honest "unknown" interval. Each context is resolved ONCE here (the id lookup is
+    # not paid twice) and reused by the buckets/emission downstream.
+    watch_metric_eligible: list[tuple[EvictionCandidate, datetime, _CandidateContext]] = []
+    preexisting_watch_count = 0
+    for candidate in path_bearing:
+        last_viewed = candidate.last_viewed_at
+        if last_viewed is None:
+            continue
+        context = await _candidate_context(session, candidate)
+        if context.completed_at is not None and last_viewed < context.completed_at:
+            preexisting_watch_count += 1
+            continue
+        watch_metric_eligible.append((candidate, last_viewed, context))
+
+    return _Partition(
+        no_path_count=no_path_count,
+        eligible=eligible,
+        would_evict=would_evict,
+        would_free_bytes=would_free_bytes,
+        guard_refused_count=guard_refused_count,
+        watch_metric_eligible=watch_metric_eligible,
+        preexisting_watch_count=preexisting_watch_count,
+    )
+
+
 async def run_retention_telemetry_sweep(
     *,
     session: AsyncSession,
@@ -459,12 +633,15 @@ async def run_retention_telemetry_sweep(
          predicate), simulated AT the threshold; ``would_evict_bytes`` is the
          MEASURED hardlink-aware reclaimable total, not the nominal size. Still a
          prefix of the eligible set.
-       * the count of titles with ANY recorded view and the watch-idle age
-         distribution (now - ``last_viewed_at``, bucketed) over them.
+       * the count of titles with a POST-IMPORT recorded view and the watch-idle
+         age distribution (now - ``last_viewed_at``, bucketed) over the SAME set --
+         pre-import views (``preexisting_watch_count``) are excluded from BOTH, so
+         the count, the buckets and the per-title intervals are one consistent
+         dataset (see the module docstring's partition contract).
        * ``no_path_count`` / ``guard_refused_count`` / ``preexisting_watch_count``
          -- rows set aside from the metrics above (no breadcrumb, delete-guard
          refusal, a view predating completion), reported so the dataset shows they
-         exist without either metric being overstated (see the module docstring).
+         exist without any metric being overstated (see the module docstring).
     2. One event PER title/season with any recorded view — INCLUDING a
        started-but-unfinished one (``watched=False`` but a view timestamp
        exists): its completed_at -> last_viewed_at interval (labelled
@@ -532,147 +709,56 @@ async def run_retention_telemetry_sweep(
         root_total_bytes=disk.total_bytes,
     )
 
-    # A row with NO ``library_path`` breadcrumb has nothing of OURS on disk (e.g. a
-    # movie found already in Plex, short-circuited straight to ``available`` by
-    # ``request_service.create_request`` -- ``mark_available`` stamps a
-    # ``completed_at`` that is the Plex-verification moment, NOT an import time, and
-    # no file was ever placed): eviction can NEVER touch it (``_evict_one`` skips a
-    # None breadcrumb), so counting it as eligible/would-evict would overstate what
-    # a sweep frees, and its ``completed_at`` is not a real import->watch reference.
-    # Excluded from BOTH products below, reported honestly as ``no_path_count`` on
-    # the aggregate so the dataset shows these rows EXIST without polluting either
-    # metric -- never silently dropped.
-    path_bearing = [candidate for candidate in candidates if candidate.library_path is not None]
-    no_path_count = len(candidates) - len(path_bearing)
-
     grace_cutoff = moment - timedelta(days=grace_days)
 
-    # Product 1a -- the FULL ever-evictable set at the real grace cutoff (what a
-    # sweep COULD pick, regardless of how much space it would need to free).
-    eligible = rank_eviction_candidates(path_bearing, grace_cutoff)
-
-    # Product 1b -- the SUBSET a pressure sweep would ACTUALLY delete to relieve
-    # pressure from the configured threshold down to the configured target,
-    # stalest-first. This REUSES ``run_eviction_sweep``'s two-phase selection
-    # (its ``select_evictions`` prefix + the reclaimable-aware extension) so the
-    # numbers match what a real sweep does, hardlinks and all -- see the module
-    # docstring's "why a reclaimable-aware simulation, not select_evictions
-    # alone".
-    #
-    # Simulated with used_pct set to ``threshold_pct`` (the moment pressure first
-    # fires), NOT the current below-threshold usage: the telemetry sweep only runs
-    # BELOW threshold, where select_evictions correctly picks nothing, so
-    # simulating at the real usage would always report zero and answer the wrong
-    # question.
-    #
-    # Phase 1: the estimate-based prefix, ranked stalest-first by NOMINAL size --
-    # identical to ``run_eviction_sweep``'s ``selected``. It is a prefix of
-    # ``eligible`` (both come from the same stable ``rank_eviction_candidates``
-    # ordering), so ``eligible[len(selected):]`` is exactly the same extension
-    # pool the real sweep draws from.
-    selected = select_evictions(
-        path_bearing, threshold_pct, threshold_pct, target_pct, grace_cutoff
+    # SINGLE classification pass: partition the raw candidates ONCE into the
+    # metric-eligible sets and the labelled exclusion counts (no_path / guard_refused
+    # / preexisting) -- see ``_classify_candidates`` / ``_Partition`` and the module
+    # docstring's partition contract. Every metric below reads a partition field;
+    # none re-derives a filter, so the watch-activity count, the idle-age buckets and
+    # the per-title intervals can never disagree about which rows are in the
+    # time-to-watch dataset.
+    partition = await _classify_candidates(
+        session=session,
+        fs=fs,
+        candidates=candidates,
+        grace_cutoff=grace_cutoff,
+        threshold_pct=threshold_pct,
+        target_pct=target_pct,
+        total_bytes=disk.total_bytes,
     )
-    extra_pool = eligible[len(selected) :]
 
-    # Phase 2: extend past that prefix while the MEASURED reclaimable bytes fall
-    # short of the target -- the exact R4-6 behaviour ``run_eviction_sweep`` runs
-    # (a hardlinked candidate frees less than its nominal size, so more must be
-    # drawn). Both loops share ``domain.eviction.pressure_relieved`` as the single
-    # stop condition, so this can never drift from the real sweep. Unlike the real
-    # sweep (which measures reclaimable bytes LAZILY as it deletes), a
-    # delete-nothing observer must measure them up front -- a read-only,
-    # hardlink-aware stat pass over ONLY the would-evict subset (never the full
-    # candidate set), never a delete.
-    #
-    # Each candidate is first run through ``fs``'s OWN delete guard
-    # (:func:`_guard_refuses`): a breadcrumb lexically under ``root_path`` can still
-    # resolve, via a symlinked component, OUTSIDE every configured root, where the
-    # real ``LocalFileSystem.delete`` refuses it and frees nothing. Such a row is
-    # excluded from ``would_evict`` count/bytes (mirroring the real sweep, whose
-    # delete raises and yields no freed bytes for it) and tallied as
-    # ``guard_refused_count`` -- so the would-evict figures never overstate what a
-    # real sweep could touch. Phase 1 attempts every ``selected`` candidate with no
-    # early stop, exactly like the real sweep; phase 2 re-checks pressure at the top
-    # of each iteration, so a refused candidate simply frees nothing and the loop
-    # keeps drawing -- byte-for-byte the real sweep's behaviour.
-    would_evict: list[EvictionCandidate] = []
-    would_free_bytes = 0
-    guard_refused_count = 0
-    for candidate in selected:
-        if await _guard_refuses(fs, candidate):
-            guard_refused_count += 1
-            continue
-        would_evict.append(candidate)
-        would_free_bytes += await _reclaimable_bytes(fs, candidate)
-    for candidate in extra_pool:
-        if pressure_relieved(threshold_pct, would_free_bytes, disk.total_bytes, target_pct):
-            break
-        if await _guard_refuses(fs, candidate):
-            guard_refused_count += 1
-            continue
-        would_evict.append(candidate)
-        would_free_bytes += await _reclaimable_bytes(fs, candidate)
-
-    # Product 2's population: EVERY path-bearing row with any recorded Plex view --
-    # watched OR started-but-unfinished (``watched=False`` with a view timestamp).
-    # The walrus narrows ``last_viewed_at`` to non-None for the rest of the sweep,
-    # so the loops below never re-check it (a partial watch is exactly the "began
-    # watching" signal the eligibility filter above would drop). No-path rows are
-    # already excluded (``path_bearing``): their ``completed_at`` is not an import
-    # time, so a completed_at->watch interval over them would be meaningless.
-    watch_activity: list[tuple[EvictionCandidate, datetime]] = [
-        (candidate, last_viewed)
-        for candidate in path_bearing
-        if (last_viewed := candidate.last_viewed_at) is not None
-    ]
-
+    # Idle-age (now - last_viewed_at) distribution over the time-to-watch dataset --
+    # the SAME ``watch_metric_eligible`` rows the count and per-title intervals use,
+    # so a pre-import view excluded from one is excluded from all three (the round-7
+    # fix: this pass no longer runs before the pre-import filter).
     bucket_counts: dict[str, int] = dict.fromkeys(_AGE_BUCKET_LABELS, 0)
-    for _candidate, last_viewed in watch_activity:
+    for _candidate, last_viewed, _context in partition.watch_metric_eligible:
         age_days = (moment - last_viewed).total_seconds() / 86400.0
         bucket_counts[_bucket_label(age_days)] += 1
 
-    # Resolve each watched candidate's completion reference ONCE, up front: the
-    # aggregate (logged first, and always) must report ``preexisting_watch_count``
-    # -- rows whose recorded view PREDATES their completion (a re-imported /
-    # previously-watched title: Plex kept the old ``last_viewed_at`` from before
-    # this import). Those yield a NEGATIVE completed_to_last_watch that would
-    # corrupt the time-to-watch dataset, so the per-title interval row is skipped
-    # for them below; the interval measures POST-import time-to-watch, and a
-    # pre-import view has no such interval. The resolved contexts are reused by the
-    # per-title loop (the id lookup is not paid twice).
-    watch_rows: list[tuple[EvictionCandidate, datetime, _CandidateContext]] = []
-    for candidate, last_viewed in watch_activity:
-        context = await _candidate_context(session, candidate)
-        watch_rows.append((candidate, last_viewed, context))
-    preexisting_watch_count = sum(
-        1
-        for _candidate, last_viewed, context in watch_rows
-        if context.completed_at is not None and last_viewed < context.completed_at
-    )
-
     # Decide which per-title rows this sweep will EMIT, in order, BEFORE the
     # aggregate logs -- so the aggregate can honestly report how many the emission
-    # budget defers to the next tick (``deferred_rows``). A row is emittable when:
-    #   * its watch has ADVANCED since the last row emitted for it (the dedupe that
-    #     stops a steady watch state re-logging every 30m tick -- see
-    #     ``_last_emitted_watch``); and
-    #   * its view is NOT pre-import (a negative interval, already tallied in
-    #     ``preexisting_watch_count`` and never emitted -- and never cached, so a
-    #     genuine later post-import play still emits).
-    # Intra-sweep duplicates of a key collapse to the first occurrence (``queued_keys``),
-    # mirroring what the cache would do across the emission loop below. Nothing is
-    # cached HERE (this is a read-only decision pass); the cache is written only as
-    # each row is actually emitted, so the deferred tail stays un-cached and retries.
+    # budget defers to the next tick (``deferred_rows``). The rows are already the
+    # partition's ``watch_metric_eligible`` set (pre-import views were excluded THERE,
+    # rule 2, not re-filtered here -- a pre-import view is never cached, so a genuine
+    # later post-import play still emits). This pass applies only the cross-sweep
+    # dedupe and collapses intra-sweep duplicate keys:
+    #   * a row whose watch has NOT ADVANCED since the last row emitted for it is
+    #     skipped (the dedupe that stops a steady watch state re-logging every 30m
+    #     tick -- see ``_last_emitted_watch``);
+    #   * intra-sweep duplicates of a key collapse to the first occurrence
+    #     (``queued_keys``), mirroring what the cache would do across the loop below.
+    # Nothing is cached HERE (this is a read-only decision pass); the cache is written
+    # only as each row is actually emitted, so the deferred tail stays un-cached and
+    # retries.
     to_emit: list[tuple[EvictionCandidate, datetime, _CandidateContext]] = []
     queued_keys: set[tuple[int | None, str, int | None]] = set()
-    for candidate, last_viewed, context in watch_rows:
+    for candidate, last_viewed, context in partition.watch_metric_eligible:
         dedupe_key = (context.tmdb_id, candidate.media_type, candidate.season)
         if _last_emitted_watch.get(dedupe_key) == last_viewed:
             continue
         if dedupe_key in queued_keys:
-            continue
-        if context.completed_at is not None and last_viewed < context.completed_at:
             continue
         queued_keys.add(dedupe_key)
         to_emit.append((candidate, last_viewed, context))
@@ -704,17 +790,17 @@ async def run_retention_telemetry_sweep(
         "retried next tick)",
         media_type,
         root_path,
-        len(eligible),
-        _sum_estimated_bytes(eligible, disk.total_bytes),
-        len(would_evict),
+        len(partition.eligible),
+        _sum_estimated_bytes(partition.eligible, disk.total_bytes),
+        len(partition.would_evict),
         threshold_pct,
         target_pct,
-        would_free_bytes,
-        len(watch_activity),
+        partition.would_free_bytes,
+        len(partition.watch_metric_eligible),
         _format_buckets(bucket_counts),
-        no_path_count,
-        guard_refused_count,
-        preexisting_watch_count,
+        partition.no_path_count,
+        partition.guard_refused_count,
+        partition.preexisting_watch_count,
         deferred_rows,
     )
 

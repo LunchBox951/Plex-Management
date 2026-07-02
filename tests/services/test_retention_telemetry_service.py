@@ -31,6 +31,9 @@ from plex_manager.models import (
 from plex_manager.ports.library import WatchState
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service, log_capture_service, retention_telemetry_service
+from plex_manager.services.retention_telemetry_service import (
+    _classify_candidates,  # pyright: ignore[reportPrivateUsage]
+)
 from tests.web.fakes import FakeLibrary
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -61,8 +64,11 @@ class _MappedReclaimFileSystem:
     nominal size -- without laying down real hardlinks. Every other method is
     unused by the telemetry sweep and raises."""
 
-    def __init__(self, reclaimable: dict[str, int]) -> None:
+    def __init__(
+        self, reclaimable: dict[str, int], *, refused: frozenset[str] = frozenset()
+    ) -> None:
         self._reclaimable = reclaimable
+        self._refused = refused
         self.reclaimable_calls: list[str] = []
 
     def available_bytes(self, path: Path) -> int:
@@ -84,9 +90,11 @@ class _MappedReclaimFileSystem:
         raise NotImplementedError
 
     def delete_guard_refuses(self, path: str) -> bool:
-        # These controlled would-evict tests drive the reclaimable-aware extension,
-        # not the delete guard: never refuse, so every mapped candidate is counted.
-        return False
+        # Refuse only the explicitly-listed breadcrumbs (a symlink-escaping
+        # candidate). The would-evict extension tests pass none (the default empty
+        # set), so every mapped candidate is counted; the partition test lists the
+        # one guard-refused breadcrumb.
+        return path in self._refused
 
     def reclaimable_bytes(self, path: str) -> int:
         self.reclaimable_calls.append(path)
@@ -904,7 +912,11 @@ async def test_preexisting_watch_interval_is_dropped_and_counted(
 
     records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
     aggregate = records[0].getMessage()
-    assert "2 title(s) with recorded watch activity" in aggregate  # both have views
+    # Post-fix (round-7): the pre-import view is excluded from the watch-activity
+    # COUNT too, not just the per-title interval -- the count, the buckets and the
+    # intervals are one dataset. Only the post-import title is counted; the pre-import
+    # one shows up solely as preexisting_watch. (Pre-fix this asserted "2".)
+    assert "1 title(s) with recorded watch activity" in aggregate
     assert "preexisting_watch=1" in aggregate
     per_title = [r for r in records if "completed_to_last_watch=" in r.getMessage()]
     # Only the positive (post-import) interval is emitted; the negative one dropped.
@@ -913,6 +925,223 @@ async def test_preexisting_watch_interval_is_dropped_and_counted(
     assert "Watched After Import" in message
     assert "Rewatch Reimport" not in message
     assert "completed_to_last_watch=-" not in message  # never a negative interval
+
+
+async def test_preexisting_view_is_absent_from_idle_age_buckets_and_count(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-7 finding: the idle-age BUCKET pass used to run BEFORE the pre-import
+    filter, so a re-imported title's old Plex view (last_viewed_at < completed_at) --
+    though correctly dropped from the per-title interval -- still incremented the
+    aggregate watch-activity count AND one idle-age bucket, mixing pre-import history
+    into the time-to-watch distribution. The bucket now sources the SAME
+    watch_metric_eligible set as the count and the intervals, so a pre-import view is
+    absent from ALL THREE and shows up ONLY as preexisting_watch."""
+    # A post-import title, idle 40 days -> the 30-60d bucket.
+    post_import = _movie_file(tmp_path, "Post Import.mkv")
+    await _movie(
+        sessionmaker_,
+        tmdb_id=1,
+        title="Post Import",
+        library_path=post_import,
+        completed_at=_STALE - timedelta(days=2),  # before its view -> post-import
+    )
+    # A re-imported title whose old Plex view (idle 1 day -> WOULD be the <7d bucket)
+    # PREDATES its recent completion: a pre-import view, excluded from the dataset.
+    pre_import = _movie_file(tmp_path, "Reimport.mkv")
+    await _movie(
+        sessionmaker_,
+        tmdb_id=2,
+        title="Reimport",
+        library_path=pre_import,
+        completed_at=_NOW,  # after its 1-day-old view -> pre-import
+    )
+    library = FakeLibrary(
+        watch_states={
+            (1, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (2, "movie", None): WatchState(watched=True, last_viewed_at=_RECENT),
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate = records[0].getMessage()
+    # The pre-import view is gone from the count, the <7d bucket it WOULD have hit,
+    # and the intervals -- present only as preexisting_watch.
+    assert "1 title(s) with recorded watch activity" in aggregate
+    assert "<7d=0" in aggregate  # the pre-import view did NOT leak into its bucket
+    assert "30-60d=1" in aggregate  # only the post-import title is distributed
+    assert "preexisting_watch=1" in aggregate
+    per_title = [r for r in records if "completed_to_last_watch=" in r.getMessage()]
+    assert len(per_title) == 1
+    assert "Post Import" in per_title[0].getMessage()
+    assert "Reimport" not in per_title[0].getMessage()
+
+
+def _partition_candidate(
+    *, request_id: int, name: str, library_path: str | None
+) -> EvictionCandidate:
+    """A stale (40d), watched movie candidate 0% of the disk (so select_evictions
+    picks the whole eligible set), used to drive ``_classify_candidates`` directly."""
+    return EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title=name,
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=0.0,
+    )
+
+
+async def test_classify_partitions_every_candidate_into_exactly_one_bucket_set(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The class-closing partition contract: ``_classify_candidates`` is the SINGLE
+    classification point, and every emitted metric consumes its partition. This
+    exercises all four categories at once -- no_path, preexisting, guard_refused, and
+    metric-eligible -- and asserts (a) each candidate lands in exactly one bucket-set
+    PER AXIS, (b) the two axes are orthogonal (a preexisting row is still evictable; a
+    guard-refused row is still a watch data point), and (c) the aggregate log's every
+    number is sourced from the corresponding partition field."""
+    # id_post: on disk, watched, stale, view AFTER completion -> eligible + would_evict
+    #          + watch_metric_eligible (a normal, post-import, evictable, watched row).
+    id_post = await _movie(
+        sessionmaker_,
+        tmdb_id=610,
+        title="Post",
+        library_path=_movie_file(tmp_path, "post.mkv"),
+        completed_at=_STALE - timedelta(days=2),
+    )
+    # id_pre: on disk, watched, stale, view BEFORE completion -> eligible + would_evict
+    #         (still evictable!) but preexisting on the watch axis (NOT watch-eligible).
+    id_pre = await _movie(
+        sessionmaker_,
+        tmdb_id=611,
+        title="Pre",
+        library_path=_movie_file(tmp_path, "pre.mkv"),
+        completed_at=_NOW,  # after the stale view -> pre-import
+    )
+    # id_guard: on disk, watched, stale, post-import view, but a symlink-escaping
+    #           breadcrumb the delete guard refuses -> eligible + guard_refused (NOT
+    #           would_evict) but STILL watch_metric_eligible (a valid post-import view).
+    guard_path = str(tmp_path / "escaped" / "guard.mkv")
+    id_guard = await _movie(
+        sessionmaker_,
+        tmdb_id=612,
+        title="Guard",
+        library_path=guard_path,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    # id_np: no breadcrumb -> no_path, excluded from BOTH axes.
+    id_np = await _movie(
+        sessionmaker_,
+        tmdb_id=613,
+        title="NoPath",
+        library_path=None,
+        completed_at=_STALE - timedelta(days=2),
+    )
+
+    candidates = [
+        _partition_candidate(
+            request_id=id_post, name="Post", library_path=_movie_file(tmp_path, "post.mkv")
+        ),
+        _partition_candidate(
+            request_id=id_pre, name="Pre", library_path=_movie_file(tmp_path, "pre.mkv")
+        ),
+        _partition_candidate(request_id=id_guard, name="Guard", library_path=guard_path),
+        _partition_candidate(request_id=id_np, name="NoPath", library_path=None),
+    ]
+    fs = _MappedReclaimFileSystem({}, refused=frozenset({guard_path}))
+    grace_cutoff = _NOW - timedelta(days=_GRACE_DAYS)
+
+    async with sessionmaker_() as session:
+        partition = await _classify_candidates(
+            session=session,
+            fs=fs,
+            candidates=candidates,
+            grace_cutoff=grace_cutoff,
+            threshold_pct=_THRESHOLD,
+            target_pct=_TARGET,
+            total_bytes=1000,
+        )
+
+    eligible_ids = {c.request_id for c in partition.eligible}
+    would_evict_ids = {c.request_id for c in partition.would_evict}
+    watch_ids = {c.request_id for c, _lv, _ctx in partition.watch_metric_eligible}
+
+    # --- Category membership (each row where the contract says it goes) ---
+    assert partition.no_path_count == 1  # id_np only
+    assert eligible_ids == {id_post, id_pre, id_guard}  # all three path-bearing stale rows
+    assert would_evict_ids == {id_post, id_pre}  # guard-refused id_guard dropped from would_evict
+    assert partition.guard_refused_count == 1  # id_guard
+    assert watch_ids == {id_post, id_guard}  # pre-import id_pre dropped from the watch dataset
+    assert partition.preexisting_watch_count == 1  # id_pre
+
+    # --- Disjoint + exhaustive PER AXIS (each row in exactly one bucket-set) ---
+    # Watch axis: every path-bearing viewed row is exactly one of {watch-eligible, preexisting}.
+    assert len(partition.watch_metric_eligible) + partition.preexisting_watch_count == 3
+    # Disk axis: every selected candidate is exactly one of {would_evict, guard_refused}
+    # (here every eligible row is selected because each is 0% of the disk).
+    assert len(partition.would_evict) + partition.guard_refused_count == len(partition.eligible)
+    # no_path is disjoint from all path-bearing rows.
+    assert partition.no_path_count == len(candidates) - len(partition.eligible)
+
+    # --- Orthogonality: a preexisting row is still evictable; a guard-refused row is
+    # still a watch data point (this is why it is NOT one global bucket-per-row). ---
+    assert id_pre in eligible_ids and id_pre in would_evict_ids and id_pre not in watch_ids
+    assert id_guard in eligible_ids and id_guard not in would_evict_ids and id_guard in watch_ids
+
+    # --- Every emitted aggregate metric is sourced from the partition ---
+    async def _fake_assemble(**_kwargs: object) -> list[EvictionCandidate]:
+        return candidates
+
+    monkeypatch.setattr(eviction_service, "assemble_candidates", _fake_assemble)
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", _fake_1000_byte_disk)
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=FakeLibrary(),
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    aggregate = next(r for r in caplog.records if r.name == _TELEMETRY_LOGGER).getMessage()
+    assert f"{len(partition.eligible)} eligible eviction candidate(s)" in aggregate
+    assert f"{len(partition.would_evict)} would_evict now" in aggregate
+    assert (
+        f"{len(partition.watch_metric_eligible)} title(s) with recorded watch activity" in aggregate
+    )
+    assert f"no_path={partition.no_path_count}" in aggregate
+    assert f"guard_refused={partition.guard_refused_count}" in aggregate
+    assert f"preexisting_watch={partition.preexisting_watch_count}" in aggregate
 
 
 async def test_per_title_row_is_deduped_until_last_viewed_advances(
