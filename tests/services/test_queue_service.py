@@ -71,8 +71,9 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
     )
 
     # The client reports nothing — the torrent is gone beyond the grace window.
+    qbt = FakeQbittorrent(statuses=[])
     async with sessionmaker_() as session:
-        queue = await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+        queue = await queue_service.reconcile_and_list(qbt, session)
 
     # The blocklist + re-search fired, so the download completed FailedPending ->
     # Failed and drops out of the active queue (no zombie row left behind).
@@ -94,6 +95,9 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
     assert request.status is RequestStatus.searching
     # The row reached the terminal Failed state (not stranded at failed_pending).
     assert failed.status == "failed"
+    # ADR-0014 seeding-leak fix: the reconcile-driven failure removed the torrent
+    # WITH its data (mirrors the operator mark-failed path in test_queue.py).
+    assert qbt.removed == [(_HASH, True)]
 
 
 async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate(
