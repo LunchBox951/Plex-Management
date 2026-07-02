@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   useRevealAppKey,
   useRotateAppKey,
@@ -141,10 +141,22 @@ function AppKeySection() {
   // mutation hook's own isSuccess flag staying true across re-renders/tests.
   const [justRotated, setJustRotated] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
+  // Monotonic ticket shared by reveal AND rotate. Each click takes the next
+  // ticket BEFORE it awaits, and a resolving handler paints the displayed key
+  // only while its ticket is still the latest. Without it a Reveal (which
+  // authenticated with the OLD key) that resolves AFTER a Rotate would clobber
+  // the freshly rotated key on screen — the operator would then pair a new
+  // device with an already-dead key. A ref (not state): bumping it must not
+  // trigger a re-render, and every in-flight closure must see the newest value.
+  const latestActionTicket = useRef(0)
 
   const handleReveal = async () => {
+    const ticket = (latestActionTicket.current += 1)
     try {
       const result = await reveal.mutateAsync()
+      // A newer reveal/rotate superseded this one while it was in flight — drop
+      // this now-stale key rather than overwrite what the newer action showed.
+      if (ticket !== latestActionTicket.current) return
       setRevealedKey(result.app_api_key)
       setJustRotated(false)
     } catch (err) {
@@ -154,13 +166,19 @@ function AppKeySection() {
   }
 
   const handleRotate = async () => {
+    const ticket = (latestActionTicket.current += 1)
     try {
       // useRotateAppKey's onSuccess persists the new key into THIS browser's
       // own store first (setApiKey), so the current session survives the
       // rotation before we ever touch component state.
       const result = await rotate.mutateAsync()
-      setRevealedKey(result.app_api_key)
-      setJustRotated(true)
+      // Paint the new key only if no later action has since superseded this
+      // rotation; the rotation itself succeeded (the key was already persisted
+      // above) regardless, so the dialog still closes and the toast still fires.
+      if (ticket === latestActionTicket.current) {
+        setRevealedKey(result.app_api_key)
+        setJustRotated(true)
+      }
       setConfirmOpen(false)
       toast({
         title: 'App key rotated',
@@ -191,7 +209,14 @@ function AppKeySection() {
           />
         ) : null}
         <div className="flex flex-wrap gap-3">
-          <Button variant="secondary" loading={reveal.isPending} onClick={() => void handleReveal()}>
+          <Button
+            variant="secondary"
+            loading={reveal.isPending}
+            // A rotation in flight will replace the key; block starting a reveal
+            // (which would authenticate with the about-to-die key) until it lands.
+            disabled={rotate.isPending}
+            onClick={() => void handleReveal()}
+          >
             Reveal
           </Button>
           <Button variant="secondary" onClick={() => setConfirmOpen(true)}>

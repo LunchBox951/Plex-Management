@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -13,6 +13,9 @@ const h = vi.hoisted(() => ({
   toast: vi.fn(),
   revealMutateAsync: vi.fn(),
   rotateMutateAsync: vi.fn(),
+  // Drives useRotateAppKey().isPending so a test can assert the Reveal button is
+  // disabled while a rotation is in flight.
+  rotatePending: false,
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -28,7 +31,7 @@ vi.mock('../api/hooks', () => ({
   useRevealAppKey: () => ({ mutateAsync: h.revealMutateAsync, isPending: false }),
   useRotateAppKey: () => ({
     mutateAsync: h.rotateMutateAsync,
-    isPending: false,
+    isPending: h.rotatePending,
     isSuccess: false,
   }),
 }))
@@ -357,6 +360,7 @@ describe('Settings — app key reveal/rotate (issue #28)', () => {
     h.revealMutateAsync.mockReset()
     h.rotateMutateAsync.mockReset()
     h.toast.mockReset()
+    h.rotatePending = false
     h.settingsData = {
       plex_url: 'http://plex:32400',
       plex_token: '***',
@@ -445,5 +449,52 @@ describe('Settings — app key reveal/rotate (issue #28)', () => {
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(h.rotateMutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('Round-2: a reveal resolving AFTER a rotate does not clobber the rotated key', async () => {
+    // The reveal starts FIRST (so it authenticates with the OLD key) but is made
+    // to resolve LAST -- the exact stale-response race. A monotonic ticket must
+    // drop the late reveal so it never overwrites the freshly rotated key (which
+    // would otherwise have the operator pair a new device with a dead key).
+    let resolveReveal!: (value: { app_api_key: string }) => void
+    h.revealMutateAsync.mockReturnValue(
+      new Promise<{ app_api_key: string }>((resolve) => {
+        resolveReveal = resolve
+      }),
+    )
+    h.rotateMutateAsync.mockResolvedValue({ app_api_key: 'rotated-key-new' })
+
+    render(<Settings />, { wrapper: Wrapper })
+
+    // 1. Reveal in flight (authenticated with the old key), not yet resolved.
+    fireEvent.click(screen.getByRole('button', { name: /^reveal$/i }))
+    // 2. Rotate to completion -- it paints the new key.
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /rotate key/i }),
+    )
+    await waitFor(() =>
+      expect(screen.getByLabelText(/new app key/i)).toHaveValue('rotated-key-new'),
+    )
+
+    // 3. NOW the stale reveal finally resolves, carrying the now-dead old key.
+    await act(async () => {
+      resolveReveal({ app_api_key: 'stale-dead-key' })
+    })
+
+    // The rotated key survives; the stale reveal neither overwrites the value nor
+    // flips the label back to "Current app key".
+    expect(screen.getByLabelText(/new app key/i)).toHaveValue('rotated-key-new')
+    expect(screen.queryByLabelText(/current app key/i)).not.toBeInTheDocument()
+    expect(screen.queryByDisplayValue('stale-dead-key')).not.toBeInTheDocument()
+  })
+
+  it('Round-2: disables the Reveal button while a rotation is in flight', () => {
+    // A reveal started mid-rotation would authenticate with the about-to-die key;
+    // block it at the source while rotate.isPending.
+    h.rotatePending = true
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('button', { name: /^reveal$/i })).toBeDisabled()
   })
 })
