@@ -578,14 +578,16 @@ export interface paths {
          *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
          *     value) before either commits. Without a guard the write that commits second
          *     would silently overwrite the first's freshly minted key, so the client that
-         *     fired the first request would be left displaying an already-dead key. Inside
-         *     THIS request's own transaction we re-read the stored key and require it to
-         *     still equal the key the request authenticated with; if it has already changed,
-         *     the race happened and we answer 409 (``app_key_changed``) rather than clobber
-         *     the winner. SQLite serializes the two writes, so the loser's re-read observes
-         *     the winner's committed key and honestly bails out. The check is skipped under
-         *     ``dev_auth_bypass`` (there is no authenticated key to compare against), exactly
-         *     like ``require_api_key`` itself.
+         *     fired the first request would be left displaying an already-dead key. The
+         *     re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
+         *     is a true atomic read-modify-write rather than check-then-act: the compare and
+         *     the write cannot interleave with another rotation, so the loser's re-read runs
+         *     only AFTER the winner has committed. Inside THIS request's own transaction we
+         *     re-read the stored key and require it to still equal the key the request
+         *     authenticated with; if it has already changed, the race happened and we answer
+         *     409 (``app_key_changed``) rather than clobber the winner. The check is skipped
+         *     under ``dev_auth_bypass`` (there is no authenticated key to compare against),
+         *     exactly like ``require_api_key`` itself.
          */
         post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
         delete?: never;
