@@ -68,8 +68,13 @@ def test_covers_requested_episodes_whole_season_pack_never_rejected() -> None:
     assert covers_requested_episodes(_parsed(season=2, episode=None), requested=[4]) is True
 
 
-def test_covers_requested_episodes_multi_season_pack_never_rejected() -> None:
-    assert covers_requested_episodes(_parsed(season=[1, 2, 3], episode=None), requested=[4]) is True
+def test_covers_requested_episodes_multi_season_pack_rejected() -> None:
+    # Issue #24 beta posture: a multi-season pack is never grab-eligible (the
+    # decision engine permanently rejects it), so this gate must not wave one
+    # through either -- the two gates must agree.
+    assert (
+        covers_requested_episodes(_parsed(season=[1, 2, 3], episode=None), requested=[4]) is False
+    )
 
 
 def test_covers_requested_episodes_multi_episode_file_partial_overlap_kept() -> None:

@@ -233,6 +233,45 @@ async def test_preview_rejects_wrong_season_pack(sessionmaker_: SessionMaker) ->
     assert rejected["The.Mandalorian.S01.1080p.WEB-DL.x264-GROUP"] is RejectionReason.WRONG_MEDIA
 
 
+async def test_preview_rejects_multi_season_pack_for_single_season_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Issue #24 beta posture: an S01-S03 pack that plausibly covers the requested
+    # S02 (correct title/tmdb id, season identity gate passes) is still a
+    # PERMANENT rejection -- never grabbed, never preferred -- because this app's
+    # one-download-one-season model can't satisfy several seasons from one grab.
+    # Only the exact single-season pack survives.
+    multi = candidate(
+        "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP",
+        info_hash="e" * 40,
+        seeders=900,
+    )
+    single_season_pack = candidate(
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="f" * 40, seeders=10
+    )
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([multi, single_season_pack]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+        )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP"
+    ]
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert (
+        rejected["The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"]
+        is RejectionReason.MULTI_SEASON_PACK
+    )
+
+
 async def test_preview_rejects_wrong_episode_even_at_top_quality(
     sessionmaker_: SessionMaker,
 ) -> None:

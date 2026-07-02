@@ -89,10 +89,15 @@ def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -
 
     Decision, via :func:`classify_release_scope`:
 
-    - ``"season_pack"`` / ``"multi_season_pack"`` -> ``True``. A pack covering
-      the requested season inherently contains the requested episode(s); packs
-      are never rejected here (the season gate in
-      :mod:`plex_manager.domain.media_match` already confirms season identity).
+    - ``"season_pack"`` -> ``True``. A single-season pack covering the requested
+      season inherently contains the requested episode(s); it is never rejected
+      here (the season gate in :mod:`plex_manager.domain.media_match` already
+      confirms season identity).
+    - ``"multi_season_pack"`` -> ``False``. A pack spanning more than one season
+      is permanently rejected by :func:`plex_manager.domain.decision_engine.decide`
+      (issue #24 beta posture, mirroring Sonarr's ``MultiSeasonSpecification``),
+      so it must never be waved through here either -- this keeps the two gates
+      from disagreeing about whether a multi-season pack is grab-eligible.
     - ``"single_episode"`` -> ``True`` iff the file's own episode number(s)
       (normalized via :func:`episode_numbers`) overlap ``requested`` at all — a
       multi-episode file with even partial overlap is kept, mirroring
@@ -104,7 +109,7 @@ def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -
       proof that it covers the wanted episode.
     """
     scope = classify_release_scope(parsed)
-    if scope in ("season_pack", "multi_season_pack"):
+    if scope == "season_pack":
         return True
     if scope == "single_episode":
         requested_set = set(requested)
