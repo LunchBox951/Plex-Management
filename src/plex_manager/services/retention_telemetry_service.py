@@ -129,7 +129,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, Literal
@@ -206,6 +206,28 @@ _last_emitted_watch: dict[tuple[int | None, str, int | None], datetime] = {}
 #: paced. When a sweep truncates, the aggregate reports the honest ``deferred_rows``
 #: count so the pacing is visible, never swallowed.
 _PER_SWEEP_EMISSION_BUDGET: Final = 200
+
+
+#: Slack held back from the log queue's LIVE free-slot count before this sweep
+#: spends any of it on per-title rows (see ``free_slots`` param on
+#: :func:`run_retention_telemetry_sweep`). The static ``_PER_SWEEP_EMISSION_BUDGET``
+#: above bounds a sweep's burst against an EMPTY queue, but the queue is rarely
+#: empty: ordinary INFO chatter and a not-yet-run drain tick leave an ambient
+#: backlog occupying it. Sizing each sweep's emission against
+#: ``max(0, free_slots() - _QUEUE_SAFETY_MARGIN)`` keeps the burst under the LIVE
+#: headroom, so a full-budget burst on top of that backlog no longer silently
+#: overruns ``LogCaptureHandler``'s bounded queue while the dedupe cache records
+#: the newest rows as "emitted". The margin is deliberately GENEROUS (2.5x the
+#: full budget): the read is inherently racy -- concurrent loggers and the drain
+#: task mutate the queue between :meth:`LogCaptureHandler.free_slots` and this
+#: sweep's actual ``_logger.info`` calls -- and the margin absorbs that race.
+#: Beyond it, any residual loss is NOT swallowed: the handler's existing
+#: ``LogCaptureHandler.dropped_count`` (incremented in
+#: ``LogCaptureHandler._enqueue`` on ``QueueFull``, and in ``drain_once`` on a
+#: failed insert) makes every INFO+ record that missed durable storage VISIBLE on
+#: the health/log surfaces. This budget is best-effort-with-visible-drops, never
+#: transactional.
+_QUEUE_SAFETY_MARGIN: Final = 500
 
 
 async def _reclaimable_bytes(fs: FileSystemPort, candidate: EvictionCandidate) -> int:
@@ -395,6 +417,7 @@ async def run_retention_telemetry_sweep(
     threshold_pct: float,
     target_pct: float,
     now: datetime | None = None,
+    free_slots: Callable[[], int] | None = None,
 ) -> None:
     """Log what an eviction sweep of ``root_path`` WOULD do — never deletes,
     never flips a status, never writes ``download_history``.
@@ -464,6 +487,22 @@ async def run_retention_telemetry_sweep(
     step with a web-edited setting). ``now`` defaults to ``datetime.now(UTC)``;
     overridable for a deterministic idle-age distribution in tests (a fake
     clock), never used in production.
+
+    ``free_slots``, when given, reports the durable log queue's LIVE free-slot
+    count (wired by ``web/app.py`` to ``app.state.log_handler.free_slots``,
+    which is ``QUEUE_MAXSIZE - qsize()``). It DYNAMICALLY shrinks this sweep's
+    per-title emission budget to ``min(_PER_SWEEP_EMISSION_BUDGET, max(0,
+    free_slots() - _QUEUE_SAFETY_MARGIN))`` so a burst cannot be recorded as
+    emitted (in :data:`_last_emitted_watch`) yet silently dropped by a queue an
+    ambient INFO backlog has already partly filled — the exact gap the static
+    budget alone left open. Rows past the effective budget are deferred UN-cached
+    and surfaced as ``deferred_rows``, identical to the static-budget path.
+    ``None`` (a one-shot / test call with no live handler) falls back to the
+    static :data:`_PER_SWEEP_EMISSION_BUDGET`. This is a best-effort guarantee
+    WITH VISIBLE DROPS, not a transactional one: the read is racy and the margin
+    only absorbs so much, so any record that still loses the race is counted in
+    ``LogCaptureHandler.dropped_count`` (never silently lost) — see
+    :data:`_QUEUE_SAFETY_MARGIN`.
     """
     try:
         # Offloaded like every other blocking FS primitive this subsystem calls
@@ -640,9 +679,20 @@ async def run_retention_telemetry_sweep(
 
     # Per-sweep emission budget (see ``_PER_SWEEP_EMISSION_BUDGET``): a burst larger
     # than the log queue's headroom could otherwise be cached as emitted yet silently
-    # dropped by the handler. Emit at most the budget this tick; the overflow is
-    # deferred (un-cached) to the next tick and surfaced here as ``deferred_rows``.
-    deferred_rows = max(0, len(to_emit) - _PER_SWEEP_EMISSION_BUDGET)
+    # dropped by the handler. The static budget bounds the burst against an EMPTY
+    # queue; ``free_slots`` (when wired) shrinks it to the queue's LIVE headroom
+    # minus a safety margin, so an ambient INFO backlog already occupying the queue
+    # cannot turn a full-budget burst into silent drops (see ``_QUEUE_SAFETY_MARGIN``
+    # and this function's docstring). ``None`` -> the static budget (one-shot/test
+    # calls with no live handler). Emit at most the effective budget this tick; the
+    # overflow is deferred (un-cached) to the next tick and surfaced here as
+    # ``deferred_rows``, identical to the static-budget path.
+    effective_budget = _PER_SWEEP_EMISSION_BUDGET
+    if free_slots is not None:
+        effective_budget = min(
+            _PER_SWEEP_EMISSION_BUDGET, max(0, free_slots() - _QUEUE_SAFETY_MARGIN)
+        )
+    deferred_rows = max(0, len(to_emit) - effective_budget)
 
     _logger.info(
         "retention telemetry: %s root %s -- %d eligible eviction candidate(s) "
@@ -668,11 +718,11 @@ async def run_retention_telemetry_sweep(
         deferred_rows,
     )
 
-    # Emit at most the budget's worth this sweep; the deferred tail
-    # (``to_emit[_PER_SWEEP_EMISSION_BUDGET:]``) is intentionally left UN-cached so
-    # the next tick re-attempts it. The dedupe/pre-import filtering already happened
-    # in the decision pass above, so this loop only formats + emits + caches.
-    for candidate, last_viewed, context in to_emit[:_PER_SWEEP_EMISSION_BUDGET]:
+    # Emit at most the effective budget's worth this sweep; the deferred tail
+    # (``to_emit[effective_budget:]``) is intentionally left UN-cached so the next
+    # tick re-attempts it. The dedupe/pre-import filtering already happened in the
+    # decision pass above, so this loop only formats + emits + caches.
+    for candidate, last_viewed, context in to_emit[:effective_budget]:
         # Cache ONLY now, as this row is actually emitted (never in the decision
         # pass): the whole point of the budget is that a row recorded as emitted
         # here has been handed to the logging call below, not deferred.

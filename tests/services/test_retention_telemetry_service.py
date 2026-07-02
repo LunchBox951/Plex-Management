@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1101,3 +1102,157 @@ async def test_per_title_emission_budget_defers_overflow_and_loses_nothing(
     assert sorted(emitted_tmdb) == tmdb_ids
     # The second sweep drained the remainder with an honest deferred_rows=0.
     assert "deferred_rows=0" in _aggregates(records)[-1].getMessage()
+
+
+async def _burst_setup(
+    sm: SessionMaker, tmp_path: Path, *, base_tmdb: int, count: int = 5
+) -> tuple[FakeLibrary, list[int]]:
+    """Insert ``count`` stale, watched, POST-import movies and a matching
+    ``FakeLibrary`` -- the per-title burst the emission-budget tests pace. Each
+    has a positive completed_at -> last_viewed interval (a real, emittable row).
+    Returns the library and the sorted tmdb ids."""
+    tmdb_ids = list(range(base_tmdb, base_tmdb + count))
+    for i, tmdb in enumerate(tmdb_ids):
+        await _movie(
+            sm,
+            tmdb_id=tmdb,
+            title=f"Budget Movie {i}",
+            library_path=_movie_file(tmp_path, f"Budget {base_tmdb}-{i}.mkv"),
+            completed_at=_STALE - timedelta(days=2),
+        )
+    library = FakeLibrary(
+        watch_states={
+            (tmdb, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+            for tmdb in tmdb_ids
+        }
+    )
+    return library, tmdb_ids
+
+
+def _telemetry_only(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [r for r in records if r.name == _TELEMETRY_LOGGER]
+
+
+def _per_title_rows(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [r for r in records if "completed_to_last_watch=" in r.getMessage()]
+
+
+def _aggregate_rows(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [r for r in records if "eligible eviction candidate(s)" in r.getMessage()]
+
+
+async def _run_budget_sweep(
+    sm: SessionMaker,
+    tmp_path: Path,
+    library: FakeLibrary,
+    *,
+    free_slots: Callable[[], int] | None,
+) -> None:
+    # free_slots=None is identical to omitting the argument (the sweep's default),
+    # so this drives the None-accessor fallback path directly.
+    async with sm() as session:
+        await retention_telemetry_service.run_retention_telemetry_sweep(
+            session=session,
+            library=library,
+            fs=_local_fs(tmp_path),
+            media_type="movie",
+            root_path=str(tmp_path),
+            grace_days=_GRACE_DAYS,
+            threshold_pct=_THRESHOLD,
+            target_pct=_TARGET,
+            now=_NOW,
+            free_slots=free_slots,
+        )
+
+
+async def test_occupied_queue_shrinks_the_emission_budget_and_defers_overflow(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-6 finding: the static per-sweep budget bounds a burst against an
+    EMPTY queue, but an ambient backlog already occupying the ``LogCaptureHandler``
+    queue leaves less live headroom -- a full-budget burst then overruns it and is
+    dropped silently while the dedupe cache marks the newest rows emitted. A live
+    ``free_slots`` accessor shrinks the effective budget to the queue's REAL
+    headroom minus the safety margin: overflow is deferred UN-cached (retried next
+    tick) and nothing is cached that was not actually emitted."""
+    # Static budget large enough to emit all five; the LIVE headroom is what must
+    # shrink it. margin 2, free_slots()==5 -> effective = max(0, 5-2) = 3.
+    monkeypatch.setattr(retention_telemetry_service, "_PER_SWEEP_EMISSION_BUDGET", 10)
+    monkeypatch.setattr(retention_telemetry_service, "_QUEUE_SAFETY_MARGIN", 2)
+    library, tmdb_ids = await _burst_setup(sessionmaker_, tmp_path, base_tmdb=201)
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        # Occupied queue: only 5 slots free -> effective budget 3, below the static 10.
+        await _run_budget_sweep(sessionmaker_, tmp_path, library, free_slots=lambda: 5)
+        first = _telemetry_only(caplog.records)
+        assert len(_per_title_rows(first)) == 3  # shrunk by live headroom, not the static 10
+        assert "deferred_rows=2" in _aggregate_rows(first)[-1].getMessage()
+        # Next tick, queue drained (generous headroom): the deferred remainder emits,
+        # the already-cached three stay deduped -> nothing cached that wasn't emitted.
+        await _run_budget_sweep(sessionmaker_, tmp_path, library, free_slots=lambda: 10_000)
+
+    per_title = _per_title_rows(_telemetry_only(caplog.records))
+    # All five emitted exactly once across the two sweeps: the deferred tail was
+    # UN-cached (so sweep 2 picked it up) and the emitted three were cached (so
+    # sweep 2 never re-sent them). No loss, no duplication.
+    assert len(per_title) == 5
+    emitted: list[int] = []
+    for r in per_title:
+        value = getattr(r, "tmdb_id", None)  # set via extra={}, not a static attr
+        assert isinstance(value, int)
+        emitted.append(value)
+    assert sorted(emitted) == tmdb_ids
+    assert "deferred_rows=0" in _aggregate_rows(_telemetry_only(caplog.records))[-1].getMessage()
+
+
+async def test_empty_queue_leaves_the_static_budget_in_force(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty (or nearly-empty) queue must not shrink the budget below the static
+    ``_PER_SWEEP_EMISSION_BUDGET``: with generous free_slots the effective budget is
+    exactly the static budget (the ``min`` clamps the ample headroom back down)."""
+    monkeypatch.setattr(retention_telemetry_service, "_PER_SWEEP_EMISSION_BUDGET", 3)
+    library, _tmdb_ids = await _burst_setup(sessionmaker_, tmp_path, base_tmdb=301)
+    # An empty handler queue reports QUEUE_MAXSIZE free; with the default 500 margin
+    # that is 1500 headroom, far above the static budget of 3.
+    empty_queue_free = log_capture_service.QUEUE_MAXSIZE
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        await _run_budget_sweep(
+            sessionmaker_, tmp_path, library, free_slots=lambda: empty_queue_free
+        )
+
+    first = _telemetry_only(caplog.records)
+    assert len(_per_title_rows(first)) == 3  # the static budget, not the 1500 headroom
+    assert "deferred_rows=2" in _aggregate_rows(first)[-1].getMessage()
+
+
+async def test_none_free_slots_accessor_falls_back_to_the_static_budget(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-shot / test call with no live handler (``free_slots=None``) uses the
+    static ``_PER_SWEEP_EMISSION_BUDGET`` unchanged: the live-headroom shrink is
+    opt-in via the accessor, never required. A deliberately huge safety margin --
+    which WOULD force the effective budget to 0 if free_slots were consulted --
+    proves the None path never touches the free-slot math at all."""
+    monkeypatch.setattr(retention_telemetry_service, "_PER_SWEEP_EMISSION_BUDGET", 3)
+    monkeypatch.setattr(retention_telemetry_service, "_QUEUE_SAFETY_MARGIN", 10_000)
+    library, _tmdb_ids = await _burst_setup(sessionmaker_, tmp_path, base_tmdb=401)
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        await _run_budget_sweep(sessionmaker_, tmp_path, library, free_slots=None)
+
+    first = _telemetry_only(caplog.records)
+    # Static budget 3 applies despite the huge margin, because free_slots is None
+    # and never consulted (any consulted value minus 10_000 would floor to 0).
+    assert len(_per_title_rows(first)) == 3
+    assert "deferred_rows=2" in _aggregate_rows(first)[-1].getMessage()

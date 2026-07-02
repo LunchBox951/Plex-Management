@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.library import LibraryPort, WatchState
-from plex_manager.services import retention_telemetry_service
+from plex_manager.services import log_capture_service, retention_telemetry_service
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import EVICTION_INTERVAL_MINUTES_DEFAULT, SettingsStore
 from tests.web.fakes import FakeLibrary
@@ -71,6 +71,11 @@ def _app(sessionmaker_: SessionMaker) -> FastAPI:
     app.state.http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: httpx.Response(200, text="ok"))
     )
+    # Mirror production: lifespan always sets ``log_handler`` before the eviction
+    # loop starts, and ``_eviction_tick`` reads its ``free_slots`` to pace the
+    # telemetry sweep's emission budget against the live log-queue headroom.
+    # Constructed here inside the test's running loop (the handler captures it).
+    app.state.log_handler = log_capture_service.LogCaptureHandler()
     return app
 
 

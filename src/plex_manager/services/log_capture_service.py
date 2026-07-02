@@ -296,6 +296,26 @@ class LogCaptureHandler(logging.Handler):
         with self._lock:
             return list(self.ring_buffer)[-limit:]
 
+    def free_slots(self) -> int:
+        """Best-effort count of currently-unused durable-queue slots
+        (``queue.maxsize - queue.qsize()``, floored at 0).
+
+        A CHEAP, non-blocking read (``asyncio.Queue.qsize`` is a plain ``len``
+        under the GIL — no ``await``, no I/O) for a producer that wants to pace
+        its own burst under the queue's LIVE headroom rather than a static
+        assumption of an empty queue: e.g. the retention-telemetry sweep sizes
+        its per-tick emission budget from this so it cannot, by itself, overrun
+        the queue ON TOP OF the ambient INFO backlog already sitting in it
+        (ordinary chatter plus a drain tick that has not run yet). INHERENTLY
+        racy — the drain task and other threads' loggers mutate the queue
+        between this read and the producer's later :meth:`emit` calls — so the
+        result is an UPPER BOUND to keep a margin under, never an exact
+        reservation. Any record that still loses that race is counted in
+        :attr:`dropped_count` (see :meth:`_enqueue`), so residual loss stays
+        VISIBLE, never silent.
+        """
+        return max(0, self.queue.maxsize - self.queue.qsize())
+
     def _enqueue(self, captured: CapturedLogRecord) -> None:
         """Runs ON THE LOOP THREAD (via ``call_soon_threadsafe``) — safe to touch
         the queue directly here."""

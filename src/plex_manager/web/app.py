@@ -324,6 +324,12 @@ async def _eviction_tick(app: FastAPI) -> float:
                         grace_days=grace_days,
                         threshold_pct=threshold_pct,
                         target_pct=target_pct,
+                        # Live queue headroom, so a per-tick emission burst is
+                        # paced under the durable log queue's ACTUAL free slots
+                        # (not an empty-queue assumption) -- set on app.state in
+                        # lifespan before this loop starts. See the sweep's
+                        # ``free_slots`` param.
+                        free_slots=app.state.log_handler.free_slots,
                     )
                 except Exception:
                     _logger.exception(
