@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -435,6 +436,64 @@ async def test_rotate_app_key_cas_rejects_racing_rotation_with_stale_key(
         system = await load_system_settings(session)
         assert system is not None
         assert system.app_api_key == winner_key
+
+
+async def test_rotate_app_key_lock_serializes_two_concurrent_rotations(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two genuinely concurrent rotations with the SAME old key: exactly one wins.
+
+    This exercises the window the previous CAS test could not: BOTH requests are
+    forced into the handler and past authentication (against the old key) BEFORE
+    EITHER commits, so a bare check-then-act would let both re-read the old key,
+    both pass the compare, and both 200 -- the second silently clobbering the
+    first's freshly minted key. The rendezvous is a barrier planted in
+    ``ensure_system_settings`` (which runs BEFORE ``_rotate_lock`` is acquired):
+    neither request can proceed to the locked read-modify-write until both have
+    entered the handler, guaranteeing the both-in-flight-before-any-commit
+    interleaving. ``_rotate_lock`` must then serialize them into one 200 + one 409;
+    without the lock this assertion fails with two 200s.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    # Barrier(2): the first request to reach it blocks until the second arrives,
+    # so BOTH are inside the handler (authenticated, nothing committed yet) before
+    # either advances to acquire _rotate_lock.
+    both_in_handler = asyncio.Barrier(2)
+
+    async def rendezvous_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        # Timeout so a regression that never lets both sides in (or a broken lock)
+        # fails loudly instead of hanging the suite.
+        await asyncio.wait_for(both_in_handler.wait(), timeout=5.0)
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", rendezvous_ensure)
+
+    first, second = await asyncio.gather(
+        client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
+        client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
+    )
+
+    # Exactly one 200 (the winner) and one 409 (the loser) -- never two 200s.
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    winner, loser = (first, second) if first.status_code == 200 else (second, first)
+    assert loser.json()["detail"] == "app_key_changed"
+
+    # The stored key is the winner's minted key, and the OLD key is dead -- the
+    # loser did not clobber the winner with a second, unreturned key.
+    new_key = winner.json()["app_api_key"]
+    assert new_key != _API_KEY
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == new_key
 
 
 async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(

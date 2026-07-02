@@ -12,6 +12,7 @@ exposed (issue #28's OAuth-deferral analysis).
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from typing import Annotated
 
@@ -54,6 +55,24 @@ router = APIRouter(
 # (secrets.token_urlsafe(32) — a 43-char URL-safe token), so a rotated key is
 # indistinguishable in shape/strength from the one setup issued.
 _API_KEY_BYTES = 32
+
+# Serialises app-key rotation so the compare-and-swap in ``rotate_app_key_endpoint``
+# is a genuine atomic read-modify-write, not check-then-act. Two rotations racing
+# with the SAME old key would otherwise both re-read the old value and both pass
+# the compare BEFORE either commits, so the second write silently clobbers the
+# first's freshly minted key (leaving the first client showing a dead key). Under
+# this lock the loser's re-read happens only AFTER the winner has committed, so it
+# observes the new key and honestly 409s.
+#
+# Correctness relies on this being a SINGLE-PROCESS deployment: uvicorn runs one
+# worker and the in-app reconcile / eviction / log-drain lifespan loops (web/app.py)
+# already assume the same single process, so an in-process ``asyncio.Lock`` — not a
+# DB row lock or advisory lock — is the right, matching tool. A multi-worker
+# deployment would need a DB-level guard instead (a conditional UPDATE is not an
+# option here: the key column is EncryptedStr/Fernet, whose ciphertext is
+# non-deterministic, so a ``WHERE app_api_key = <ciphertext>`` predicate can never
+# match).
+_rotate_lock = asyncio.Lock()
 
 
 async def _redacted(store: SettingsStore) -> SettingsResponse:
@@ -147,31 +166,36 @@ async def rotate_app_key_endpoint(
     the SAME old key can both clear ``require_api_key`` (each reads the old stored
     value) before either commits. Without a guard the write that commits second
     would silently overwrite the first's freshly minted key, so the client that
-    fired the first request would be left displaying an already-dead key. Inside
-    THIS request's own transaction we re-read the stored key and require it to
-    still equal the key the request authenticated with; if it has already changed,
-    the race happened and we answer 409 (``app_key_changed``) rather than clobber
-    the winner. SQLite serializes the two writes, so the loser's re-read observes
-    the winner's committed key and honestly bails out. The check is skipped under
-    ``dev_auth_bypass`` (there is no authenticated key to compare against), exactly
-    like ``require_api_key`` itself.
+    fired the first request would be left displaying an already-dead key. The
+    re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
+    is a true atomic read-modify-write rather than check-then-act: the compare and
+    the write cannot interleave with another rotation, so the loser's re-read runs
+    only AFTER the winner has committed. Inside THIS request's own transaction we
+    re-read the stored key and require it to still equal the key the request
+    authenticated with; if it has already changed, the race happened and we answer
+    409 (``app_key_changed``) rather than clobber the winner. The check is skipped
+    under ``dev_auth_bypass`` (there is no authenticated key to compare against),
+    exactly like ``require_api_key`` itself.
     """
     system = await ensure_system_settings(session)
-    if not get_settings().dev_auth_bypass:
-        # ``require_api_key`` already loaded this row into the shared request
-        # session, so its cached instance still shows the auth-time value; force a
-        # fresh read here (in the same transaction as the write below) so the CAS
-        # reflects any rotation that committed while this request was in flight.
-        await session.refresh(system)
-        presented = request.headers.get(API_KEY_HEADER_NAME)
-        if not api_key_matches(presented, system.app_api_key):
-            raise HTTPException(
-                status_code=409,
-                detail="app_key_changed",
-            )
-    new_key = secrets.token_urlsafe(_API_KEY_BYTES)
-    system.app_api_key = new_key
-    await session.commit()
+    async with _rotate_lock:
+        if not get_settings().dev_auth_bypass:
+            # ``require_api_key`` already loaded this row into the shared request
+            # session, so its cached instance still shows the auth-time value; force
+            # a fresh read here (in the same transaction as the write below, and
+            # under _rotate_lock so no other rotation can commit between this read
+            # and our own commit) so the CAS reflects any rotation that committed
+            # while this request was in flight.
+            await session.refresh(system)
+            presented = request.headers.get(API_KEY_HEADER_NAME)
+            if not api_key_matches(presented, system.app_api_key):
+                raise HTTPException(
+                    status_code=409,
+                    detail="app_key_changed",
+                )
+        new_key = secrets.token_urlsafe(_API_KEY_BYTES)
+        system.app_api_key = new_key
+        await session.commit()
     return AppApiKeyResponse(app_api_key=new_key)
 
 
