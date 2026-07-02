@@ -77,7 +77,16 @@ async def plex_libraries_endpoint(
     # probe_writable=True (the default): authenticated, and the Plex creds are the
     # operator's own stored config — so the real writability signal is legitimate
     # here (unlike the pre-init validate/plex step, which must NOT probe).
-    return library_options(await library.list_sections(), probe_writable=True)
+    #
+    # use_cache=False: this is an infrequent, human-driven read (once per
+    # Settings page load, no polling) so it must reflect Plex as it is RIGHT
+    # NOW, not a snapshot cached for up to 300s -- otherwise a movie library the
+    # operator just added in Plex stays invisible in the movies_root picker for
+    # up to 5 minutes (issue #15). Same use_cache=False treatment already given
+    # to validate_plex (setup wizard + health dashboard) for the identical
+    # reason. The warmed fast paths (is_available/scan/watch_state) are
+    # untouched and stay on the cached default.
+    return library_options(await library.list_sections(use_cache=False), probe_writable=True)
 
 
 @router.put("")
