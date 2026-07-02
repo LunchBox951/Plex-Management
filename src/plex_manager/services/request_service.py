@@ -180,9 +180,9 @@ async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
         return await library.is_available(tmdb_id, "movie", use_cache=False)
     except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
         _logger.warning(
-            "plex availability check failed for tmdb %s (%s); proceeding with a request",
-            tmdb_id,
+            "plex availability check failed (%s); proceeding with a request",
             type(exc).__name__,
+            extra={"tmdb_id": tmdb_id},
         )
         return False
 
@@ -225,9 +225,9 @@ async def _present_seasons_or_empty(library: LibraryPort, tmdb_id: int) -> froze
         return await library.present_seasons(tmdb_id)
     except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
         _logger.warning(
-            "plex season-presence check failed for tmdb %s (%s); proceeding with a request",
-            tmdb_id,
+            "plex season-presence check failed (%s); proceeding with a request",
             type(exc).__name__,
+            extra={"tmdb_id": tmdb_id},
         )
         return frozenset()
 

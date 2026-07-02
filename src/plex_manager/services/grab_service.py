@@ -426,10 +426,10 @@ async def grab(
                     except Exception:
                         _logger.warning(
                             "failed to remove orphaned torrent %s after losing a "
-                            "parallel grab for request %s",
+                            "parallel grab for this request",
                             torrent_hash,
-                            request_id,
                             exc_info=True,
+                            extra={"request_id": request_id},
                         )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)

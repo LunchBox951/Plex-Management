@@ -279,7 +279,7 @@ class TmdbMetadata:
             backdrop_url=_backdrop_url(detail),
             is_anime=_contains_anime_keyword(detail),
         )
-        _logger.debug("resolved tmdb movie %s (anime=%s)", tmdb_id, movie.is_anime)
+        _logger.debug("resolved tmdb movie (anime=%s)", movie.is_anime, extra={"tmdb_id": tmdb_id})
         self._movie_cache.set(cache_key, movie)
         return movie
 
@@ -306,7 +306,7 @@ class TmdbMetadata:
             season_count=_get_int(detail, "number_of_seasons") or 0,
             is_anime=_contains_anime_keyword(detail),
         )
-        _logger.debug("resolved tmdb tv %s (anime=%s)", tmdb_id, show.is_anime)
+        _logger.debug("resolved tmdb tv (anime=%s)", show.is_anime, extra={"tmdb_id": tmdb_id})
         self._tv_cache.set(cache_key, show)
         return show
 
