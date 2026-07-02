@@ -40,7 +40,7 @@ import socket
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from typing import Final, cast
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
 
 import httpcore
 import httpx
@@ -59,6 +59,7 @@ _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
 _MAX_TORRENT_BYTES: Final = 1_000_000
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
 _HTTP_CORE_EXCEPTIONS: tuple[type[Exception], ...] = (
@@ -154,7 +155,7 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
             if key == b"info":
                 return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()  # noqa: S324
             idx = value_end
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
 
@@ -280,12 +281,38 @@ def _parse_webapi_version(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if not ip.is_global or ip.is_multicast:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded_v4: list[ipaddress.IPv4Address] = []
+        if ip.ipv4_mapped is not None:
+            embedded_v4.append(ip.ipv4_mapped)
+        if ip.sixtofour is not None:
+            embedded_v4.append(ip.sixtofour)
+        if ip.teredo is not None:
+            embedded_v4.extend(ip.teredo)
+        if ip in _NAT64_WELL_KNOWN_PREFIX:
+            embedded_v4.append(ipaddress.IPv4Address(int(ip) & 0xFFFF_FFFF))
+        if any(_is_blocked_ip(embedded) for embedded in embedded_v4):
+            return True
+    return False
+
+
 def _is_blocked_address(address: str) -> bool:
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return False
-    return not ip.is_global or ip.is_multicast
+    return _is_blocked_ip(ip)
+
+
+def _safe_fetch_port(parsed: ParseResult, scheme: str) -> int:
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise QbittorrentError("unsupported torrent source URL") from exc
+    return port or (443 if scheme == "https" else 80)
 
 
 def _safe_fetch_addresses(host: str, port: int | None) -> list[str]:
@@ -306,7 +333,7 @@ def _assert_safe_fetch_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise QbittorrentError("unsupported torrent source URL")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    port = _safe_fetch_port(parsed, parsed.scheme)
     _safe_fetch_addresses(parsed.hostname, port)
 
 
@@ -634,8 +661,10 @@ class QbittorrentClient:
                 urls_value = magnet
                 info_hash = _info_hash_from_magnet(magnet)
             elif body is not None:
-                torrent_bytes = body
                 info_hash = _info_hash_from_torrent(body)
+                if info_hash is None:
+                    raise QbittorrentError("could not determine torrent hash for HTTP source")
+                torrent_bytes = body
             else:
                 # Could not resolve to a magnet or locally hashable .torrent. Do
                 # not ask qBittorrent to add an untrackable opaque URL.

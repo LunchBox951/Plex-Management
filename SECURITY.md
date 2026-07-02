@@ -40,10 +40,10 @@ there is no bug-bounty program.
 | Check | Tool |
 |---|---|
 | Static analysis (SAST) | CodeQL |
-| Dependency vulnerabilities | `pip-audit` (runtime deps) + `npm audit --audit-level=high` (frontend shipped deps) + Dependabot alerts (incl. dev) |
+| Dependency vulnerabilities | `pip-audit` (runtime deps) + `npm audit --audit-level=high` (frontend deps, including dev tooling) + Dependabot alerts (incl. dev) |
 | Python security lints | `ruff` (bandit `S` rules) |
 | Secret scanning | gitleaks (CI) + GitHub secret scanning (repo setting) |
-| Container image CVEs | Trivy — scans the built image on every PR and on push to `main`; report-only, all severities (the Security tab is the honest tally) |
+| Container image CVEs | Trivy — PR scans are report-only in the job log; push/rescan SARIF in the Security tab covers fixed OS-package CVEs only. Python/frontend library CVEs are owned by the dependency-audit and Dependabot checks above. |
 | Dependency / Action / base-image updates | Dependabot |
 
 GitHub Actions are version-pinned and kept current by Dependabot. Pinning Actions

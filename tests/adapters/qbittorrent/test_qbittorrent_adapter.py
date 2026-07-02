@@ -444,6 +444,44 @@ async def test_add_cgnat_http_url_is_rejected_before_fetch() -> None:
     assert seen == []
 
 
+async def test_add_nat64_loopback_http_url_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(
+            "http://[64:ff9b::7f00:1]/file.torrent", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_add_http_url_with_invalid_port_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(
+            "http://93.184.216.34:99999/file.torrent", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
 async def test_add_unresolvable_http_host_is_rejected_before_fetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -519,6 +557,25 @@ async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
 
     assert delegate.hosts == ["93.184.216.34"]
     assert calls == 1
+
+
+async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=b"d3:foo3:bare")
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
 
 
 def _control_handler(seen: list[str], *, webapi_version: str) -> Any:
