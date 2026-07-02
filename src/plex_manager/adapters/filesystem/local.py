@@ -148,9 +148,33 @@ class LocalFileSystem:
         return shutil.disk_usage(probe).free
 
     def move(self, src: Path, dst: Path) -> None:
-        """Move ``src`` to ``dst`` (atomic rename when on the same device)."""
+        """Move ``src`` to ``dst`` (atomic rename when on the same device).
+
+        ``shutil.move`` tries ``os.rename`` first and only falls back to a
+        content copy + unlink-source on a genuine cross-device failure
+        (``EXDEV``). If that copy fallback raises partway through (disk full,
+        killed process, I/O error), the exception propagates with a partially
+        written ``dst`` left on disk and ``src`` still intact — the same
+        partial-file hazard :meth:`hardlink_or_copy`'s copy fallback already
+        guards against. Mirror that fix here: on failure, if ``dst`` did NOT
+        pre-exist (so any partial file left behind is ours to remove), best-
+        effort clean it up — a file or a partially populated directory tree,
+        since ``shutil.move``'s copy fallback for a directory is a full
+        ``copytree`` that can be interrupted mid-walk — then re-raise the
+        ORIGINAL, unmasked error (north-star #3: honesty).
+        """
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(os.fspath(src), os.fspath(dst))
+        dst_preexisted = os.path.lexists(dst)
+        try:
+            shutil.move(os.fspath(src), os.fspath(dst))
+        except OSError:
+            if not dst_preexisted:
+                with contextlib.suppress(OSError):
+                    if os.path.isdir(dst) and not os.path.islink(dst):
+                        shutil.rmtree(dst)
+                    else:
+                        os.unlink(dst)
+            raise
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
