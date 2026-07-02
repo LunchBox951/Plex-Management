@@ -289,10 +289,7 @@ def _assert_safe_fetch_url(url: str) -> None:
     try:
         infos = socket.getaddrinfo(host, parsed.port, type=socket.SOCK_STREAM)
     except OSError:
-        # The request itself will surface an honest reachability error. This keeps
-        # mocked/unresolvable test hostnames usable while still rejecting resolvable
-        # private targets.
-        return
+        raise QbittorrentError("unsafe torrent source URL") from None
     if any(isinstance(info[4][0], str) and _is_blocked_address(info[4][0]) for info in infos):
         raise QbittorrentError("unsafe torrent source URL")
 

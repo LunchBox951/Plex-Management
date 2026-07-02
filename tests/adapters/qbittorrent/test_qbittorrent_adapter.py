@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import socket
 from typing import Any
 
 import httpx
@@ -285,8 +286,8 @@ _TORRENT_HASH = hashlib.sha1(_INFO_DICT).hexdigest()  # noqa: S324
 _FAKE_INFO_DICT = b"d6:lengthi1e4:name8:fake.txte"
 _NESTED_INFO_TORRENT_BYTES = b"d3:food4:info" + _FAKE_INFO_DICT + b"e4:info" + _INFO_DICT + b"e"
 
-DOWNLOAD_URL = "http://indexer.local/file.torrent"
-REDIRECT_URL = "http://indexer.local/redirect"
+DOWNLOAD_URL = "http://93.184.216.34/file.torrent"
+REDIRECT_URL = "http://93.184.216.34/redirect"
 REDIRECT_MAGNET = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98&dn=Redirected"
 REDIRECT_HASH = "fedcba9876543210fedcba9876543210fedcba98"
 
@@ -362,7 +363,7 @@ async def test_add_uppercase_http_url_uses_resolver_before_client_add() -> None:
     """URI schemes are case-insensitive. Uppercase HTTP(S) must not bypass the
     local resolver/safety checks and get handed to qBittorrent as an opaque URL."""
     seen: list[str] = []
-    upper_url = "HTTP://indexer.local/file.torrent"
+    upper_url = "HTTP://93.184.216.34/file.torrent"
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(str(request.url))
@@ -437,6 +438,33 @@ async def test_add_cgnat_http_url_is_rejected_before_fetch() -> None:
 
     with pytest.raises(QbittorrentError):
         await _client(handler).add("http://100.64.0.1/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_add_unresolvable_http_host_is_rejected_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    url = "http://unresolvable.invalid/file.torrent"
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        raise socket.gaierror("no address")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == url:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).add(url, "/downloads", "plex-manager")
 
     assert seen == []
 

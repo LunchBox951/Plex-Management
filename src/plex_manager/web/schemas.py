@@ -9,7 +9,7 @@ Prowlarr / TMDB api keys, qBittorrent password) are represented by a masked
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -176,6 +176,30 @@ class SetupCompleteRequest(BaseModel):
     # non-empty (setup.complete).
     movies_root: str | None = None
     tv_root: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_at_least_one_library_root(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        raw = cast("dict[str, object]", data)
+        movies_root = raw.get("movies_root")
+        tv_root = raw.get("tv_root")
+        if any(root is not None and not isinstance(root, str) for root in (movies_root, tv_root)):
+            return raw
+
+        normalized: dict[str, object] = dict(raw)
+        if isinstance(movies_root, str) and not movies_root.strip():
+            normalized["movies_root"] = None
+            movies_root = None
+        if isinstance(tv_root, str) and not tv_root.strip():
+            normalized["tv_root"] = None
+            tv_root = None
+
+        if not any(isinstance(root, str) and root.strip() for root in (movies_root, tv_root)):
+            raise ValueError("at_least_one_library_root_required")
+        return normalized
 
 
 class SetupStatusResponse(BaseModel):

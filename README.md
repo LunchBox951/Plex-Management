@@ -9,18 +9,20 @@ single app — with two differences that define the project:
    CAM/TS/telecast junk is *rejected outright* instead of slipping into your
    library.
 
-> **Status:** backend alpha (the **request → search → grab** slice). The pure
-> decision engine, persistence, the live Prowlarr/qBittorrent/TMDB adapters, the
-> reconciler, and the REST API are built and tested; file import, Plex dedupe,
-> retention, and the front-end are deferred. See
+> **Status:** alpha. The request, search, grab, reconcile, import, Plex scan,
+> Plex availability dedupe, disk-pressure eviction, log/status, settings, and web
+> UI workflows are built and tested. Plex OAuth and the bundled host updater are
+> still deferred. See
 > [docs/design/alpha-plan.md](docs/design/alpha-plan.md).
 
-## What works now (backend alpha)
+## What works now (alpha)
 
 - **First-run setup wizard** (`/api/v1/setup/*`): validate and store
   Plex/Prowlarr/qBittorrent/TMDB credentials — encrypted at rest, never logged.
 - **API-key auth** (`X-Api-Key`) on every protected route; a setup guard blocks
   the API until the install is initialized.
+- **Web UI** for setup, discovery, requests, queue management, status, logs,
+  settings, blocklist, and quality-profile inspection.
 - **TMDB discovery** → **request** a movie/show (anime auto-tagged).
 - **`/api/v1/search-preview`** — the headline: searches Prowlarr, parses each
   release with `guessit`, runs the Radarr-style **ordered quality profile with a
@@ -31,13 +33,18 @@ single app — with two differences that define the project:
 - **Grab** the chosen release into qBittorrent and **reconcile** its status; a
   single missed poll never falses a download, failures are blocklisted and
   re-searched, and the blocklist is operator-manageable.
+- **Import and Plex reconciliation**: validate completed downloads, place movie
+  files and TV episodes under the configured library root, scan Plex, detect
+  existing Plex availability, and surface import-blocked cases for correction.
+- **Operability tools**: health checks, live logs, disk usage, retention
+  settings, and manual or scheduled disk-pressure eviction.
 
 The typed contract for all of this is published at
 [`docs/api/openapi.json`](docs/api/openapi.json) (regenerate with `make openapi`).
 
-**Deferred** (ports defined, adapters stubbed): file import (validate → rename →
-route → Plex scan), Plex availability dedupe, disk-pressure eviction, retention,
-Plex OAuth, and the front-end.
+**Deferred**: Plex OAuth and a bundled host auto-updater. The release workflow can
+promote an already-built image to `:stable`, but the host-side pull/restart
+mechanism is still operator-managed.
 
 ## Why
 
@@ -101,6 +108,11 @@ make check     # backend + frontend lint, typecheck, tests, and build
 make run       # http://localhost:8000  (/health to verify, /docs for the API)
 make openapi   # regenerate docs/api/openapi.json from the live app
 ```
+
+Before `make run`, create `.env` and set `PLEX_MANAGER_SETUP_TOKEN`; the local
+server refuses first-run startup without it. For short-lived local API/docs work
+only, `PLEX_MANAGER_DEV_AUTH_BYPASS=true make run` skips both setup-token and
+API-key checks.
 
 Project layout and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 

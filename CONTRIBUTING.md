@@ -32,6 +32,19 @@ make check    # backend + frontend gates — run this before pushing
 make run      # run the app locally (http://localhost:8000)
 ```
 
+`make run` starts the real first-run-capable server, so it requires a bootstrap
+token unless you explicitly enable the development bypass:
+
+```bash
+python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+# or, for local API/docs probing only:
+PLEX_MANAGER_DEV_AUTH_BYPASS=true make run
+```
+
+After completing setup, the `/api/v1/setup/complete` response reveals the
+`app_api_key` once. Use it as `X-Api-Key` for protected API calls; `/docs` shows
+the same security scheme.
+
 CI runs the same gates (`make check`), so green locally ≈ green in CI. The `ruff`
 and `pyright` versions are pinned exactly in `pyproject.toml` and mirrored in
 `.pre-commit-config.yaml`, so the hook, local, and CI agree. Dependabot does not

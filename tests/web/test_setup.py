@@ -233,6 +233,20 @@ async def test_complete_with_only_tv_root_leaves_movies_root_unset(
     assert settings.json()["tv_root"] == "/library/tv"
 
 
+async def test_complete_rejects_missing_library_roots(client: httpx.AsyncClient) -> None:
+    body = {key: value for key, value in _COMPLETE_BODY.items() if key != "movies_root"}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
+async def test_complete_rejects_blank_library_roots(client: httpx.AsyncClient) -> None:
+    body = {**_COMPLETE_BODY, "movies_root": "   ", "tv_root": ""}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
 def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
     responses = app.openapi()["paths"]["/api/v1/setup/complete"]["post"]["responses"]
 
