@@ -1332,6 +1332,56 @@ async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
     assert request.status is RequestStatus.completed  # "Finalizing", not yet available
 
 
+async def test_import_tv_defers_when_live_client_status_is_not_settled(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(
+        sessionmaker_,
+        season=2,
+        request_status=RequestStatus.import_blocked,
+        season_status=RequestStatus.import_blocked.value,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.failed_reason = "stale tv import block"
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=release_dir.name,
+                raw_state="moving",
+                progress=0.5,
+                ratio=0.25,
+                save_path=str(release_dir.parent),
+                content_path=str(release_dir),
+            )
+        ]
+    )
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, qbt, library)
+
+    assert record is not None
+    assert record.status == DownloadState.Downloading.value
+    assert record.failed_reason is None
+    assert record.progress == 0.5
+    assert record.seed_ratio == 0.25
+    assert library.scan_calls == []
+    assert not any(tv_root.iterdir())
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == RequestStatus.downloading.value
+    assert request is not None and request.status is RequestStatus.downloading
+
+
 async def test_import_tv_persists_season_library_path_and_a_later_sweep_reclaims_it(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

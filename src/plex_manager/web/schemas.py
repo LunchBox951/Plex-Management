@@ -170,11 +170,11 @@ class SetupCompleteRequest(BaseModel):
     qbittorrent_username: str
     qbittorrent_password: str
     tmdb_api_key: str
-    movies_root: str
-    # Optional (mirrors ``movies_root``'s TV sibling): an install may complete
-    # setup with only a Movies library, only a TV library, or both -- see
-    # ``setup_validation.validate_plex``'s "movie-only or tv-only is legit" gate.
-    # Written to the ``tv_root`` setting ONLY when non-empty (setup.complete).
+    # Optional library roots: an install may complete setup with only a Movies
+    # library, only a TV library, or both -- see ``setup_validation.validate_plex``'s
+    # "movie-only or tv-only is legit" gate. Each setting is written only when
+    # non-empty (setup.complete).
+    movies_root: str | None = None
     tv_root: str | None = None
 
 

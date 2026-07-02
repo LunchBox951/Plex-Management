@@ -441,7 +441,17 @@ export function Settings() {
             Where imported tv seasons are placed. Leave unset if you don't request tv shows.
           </p>
           <div className="mt-4 flex flex-col gap-2">
-            {!manualTvPath && tvLibraries.length > 0 ? (
+            {plexConnectionChanged ? (
+              <select
+                aria-label="TV library folder"
+                className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                value=""
+                disabled
+                onChange={() => undefined}
+              >
+                <option value="">No tv library folder…</option>
+              </select>
+            ) : !manualTvPath && tvLibraries.length > 0 ? (
               <>
                 <select
                   aria-label="TV library folder"

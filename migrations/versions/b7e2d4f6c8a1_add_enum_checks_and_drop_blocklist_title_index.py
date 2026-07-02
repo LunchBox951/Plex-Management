@@ -21,7 +21,12 @@ depends_on: str | Sequence[str] | None = None
 _ENUM_CHECKS = (
     ("blocklist", "media_type", ("movie", "tv"), True),
     ("blocklist", "reason", ("failed", "bad_quality", "wrong_media", "user_reported"), False),
-    ("download_history", "event_type", ("grabbed", "import_started", "imported", "failed"), False),
+    (
+        "download_history",
+        "event_type",
+        ("grabbed", "import_started", "imported", "failed", "evicted"),
+        False,
+    ),
     ("media_requests", "media_type", ("movie", "tv"), False),
     (
         "media_requests",

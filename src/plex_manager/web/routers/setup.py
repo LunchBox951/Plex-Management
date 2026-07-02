@@ -1,14 +1,13 @@
 """First-run setup wizard endpoints.
 
-``status`` and ``complete`` are reachable pre-init (no app key exists yet) and are
-exempt from the setup guard. ``status`` reports only the install-state flag — it
-NEVER re-serves the app api key (the key is revealed exactly once, in the
-``/complete`` response). ``complete`` is one-shot: once initialized it is rejected
-(409) so an anonymous caller can't overwrite creds or re-mint the key; post-init
-configuration changes go through the authenticated ``PUT /api/v1/settings``. The
-``validate/*`` probes do a real lightweight connection check to a caller-supplied
-URL; they are open pre-init but require the api key once initialized (so they
-can't become an anonymous SSRF / reachability oracle).
+``status`` is reachable before setup so the SPA can discover whether a bootstrap
+token is required. ``complete`` and ``validate/*`` require ``X-Setup-Token`` before
+init (no app key exists yet) and the API key after init. ``status`` reports only
+the install-state flag — it NEVER re-serves the app api key (the key is revealed
+exactly once, in the ``/complete`` response). ``complete`` is one-shot: once
+initialized it is rejected (409) so an anonymous caller can't overwrite creds or
+re-mint the key; post-init configuration changes go through the authenticated
+``PUT /api/v1/settings``.
 """
 
 from __future__ import annotations
@@ -206,7 +205,6 @@ async def complete(
         "qbittorrent_username": body.qbittorrent_username,
         "qbittorrent_password": body.qbittorrent_password,
         "tmdb_api_key": body.tmdb_api_key,
-        "movies_root": body.movies_root,
     }
     # Iterates ``values`` (exactly the fields the setup wizard collects), NOT
     # ``KNOWN_SETTING_KEYS`` — that tuple also carries the operability-beta
@@ -216,10 +214,12 @@ async def complete(
     # KeyError on a field this request body never had.
     for key, value in values.items():
         await store.set(key, value)
-    # ``tv_root`` is optional (unlike every field in ``values``): an install may
-    # complete setup with only a Movies library configured. Write it only when
-    # the operator actually supplied one, mirroring how an unset ``tv_root``
-    # reads back as None from GET /settings rather than an empty string.
+    # Library roots are independently optional: movie-only, TV-only, and mixed
+    # installs are all valid. Write a root only when the operator actually supplied
+    # one, so an unset root reads back as None from GET /settings rather than an
+    # empty string.
+    if body.movies_root:
+        await store.set("movies_root", body.movies_root)
     if body.tv_root:
         await store.set("tv_root", body.tv_root)
 

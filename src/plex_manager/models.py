@@ -121,10 +121,9 @@ class DownloadHistoryEvent(StrEnum):
     # The disk-pressure eviction sweep reclaimed this title's/season's file
     # (ADR-0012). Unlike every other member, it is not tied to a torrent —
     # ``DownloadHistory.torrent_hash`` is left ``None`` for an eviction row.
-    # ``download_history.event_type`` is a plain VARCHAR (``native_enum=False``,
-    # no CHECK constraint — see ``41d427bd38e6`` / ``RequestStatus.evicted``'s
-    # docstring for the identical precedent), so adding this member needs NO
-    # migration of its own.
+    # ``download_history.event_type`` is a portable non-native enum. The
+    # hardening migration's CHECK explicitly includes this value for migrated
+    # databases, and ``Base.metadata.create_all`` does the same for fresh ones.
     evicted = "evicted"
 
 

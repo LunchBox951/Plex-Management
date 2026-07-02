@@ -25,6 +25,8 @@ SeedFn = Callable[..., Awaitable[None]]
 
 _API_KEY = "setup-validate-key"
 _HEADERS = {"X-Api-Key": _API_KEY}
+_SETUP_TOKEN = "boot-token"  # noqa: S105 - fixed test bootstrap token
+_SETUP_HEADERS = {"X-Setup-Token": _SETUP_TOKEN}
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +35,12 @@ def reset_plex_caches() -> Iterator[None]:
     reset_caches()
     yield
     reset_caches()
+
+
+@pytest.fixture(autouse=True)
+def configured_setup_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", _SETUP_TOKEN)
+    get_settings.cache_clear()
 
 
 def test_library_options_includes_both_kinds_tagged_by_type(tmp_path: Path) -> None:
@@ -69,14 +77,18 @@ async def test_validate_tmdb_ok(client: httpx.AsyncClient, app: FastAPI) -> None
         return httpx.Response(200, json={"results": []})
 
     await _use_transport(app, handler)
-    response = await client.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+    response = await client.post(
+        "/api/v1/setup/validate/tmdb", json={"api_key": "k"}, headers=_SETUP_HEADERS
+    )
     assert response.status_code == 200
     assert response.json()["ok"] is True
 
 
 async def test_validate_tmdb_bad_key(client: httpx.AsyncClient, app: FastAPI) -> None:
     await _use_transport(app, lambda _r: httpx.Response(401, json={"status_message": "no"}))
-    response = await client.post("/api/v1/setup/validate/tmdb", json={"api_key": "bad"})
+    response = await client.post(
+        "/api/v1/setup/validate/tmdb", json={"api_key": "bad"}, headers=_SETUP_HEADERS
+    )
     body = response.json()
     assert body["ok"] is False
     assert "bad" not in response.text  # the rejected key never echoes back
@@ -87,7 +99,7 @@ async def test_validate_requires_configured_setup_token_pre_init(
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", _SETUP_TOKEN)
     get_settings.cache_clear()
     outbound: list[str] = []
 
@@ -105,7 +117,7 @@ async def test_validate_requires_configured_setup_token_pre_init(
     ok = await client.post(
         "/api/v1/setup/validate/tmdb",
         json={"api_key": "k"},
-        headers={"X-Setup-Token": "boot-token"},
+        headers=_SETUP_HEADERS,
     )
     assert ok.status_code == 200
     assert ok.json()["ok"] is True
@@ -123,6 +135,25 @@ async def test_validate_requires_setup_token_from_remote_pre_init(app: FastAPI) 
     transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
         response = await remote.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert outbound == []
+
+
+async def test_validate_requires_setup_token_from_loopback_pre_init(
+    app: FastAPI,
+) -> None:
+    outbound: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outbound.append(request.url.path)
+        return httpx.Response(200, json={"results": []})
+
+    await _use_transport(app, handler)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as local:
+        response = await local.post("/api/v1/setup/validate/tmdb", json={"api_key": "k"})
 
     assert response.status_code == 401
     assert response.json()["detail"] == "invalid_setup_token"
@@ -189,6 +220,7 @@ async def test_validate_prowlarr_ok(client: httpx.AsyncClient, app: FastAPI) -> 
     response = await client.post(
         "/api/v1/setup/validate/prowlarr",
         json={"url": "http://prowlarr.local", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
     )
     assert response.json()["ok"] is True
 
@@ -198,6 +230,7 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
     response = await client.post(
         "/api/v1/setup/validate/prowlarr",
         json={"url": "http://prowlarr.local", "api_key": "bad"},
+        headers=_SETUP_HEADERS,
     )
     assert response.json()["ok"] is False
 
@@ -209,6 +242,7 @@ async def test_validate_prowlarr_rejects_non_json_status_200(
     response = await client.post(
         "/api/v1/setup/validate/prowlarr",
         json={"url": "http://prowlarr.local", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -222,6 +256,7 @@ async def test_validate_prowlarr_rejects_status_200_without_version(
     response = await client.post(
         "/api/v1/setup/validate/prowlarr",
         json={"url": "http://prowlarr.local", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -260,6 +295,7 @@ async def test_validate_plex_ok_returns_movie_and_tv_libraries(
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is True
@@ -298,6 +334,7 @@ async def test_validate_plex_movie_only_is_legit(client: httpx.AsyncClient, app:
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is True
@@ -328,6 +365,7 @@ async def test_validate_plex_tv_only_is_legit(client: httpx.AsyncClient, app: Fa
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is True
@@ -349,6 +387,7 @@ async def test_validate_plex_no_library_at_all_blocks_setup(
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -387,6 +426,7 @@ async def test_validate_plex_bypasses_the_sections_cache_on_a_later_outage(
     first = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     assert first.json()["ok"] is True  # warms the 300s module-level sections cache
 
@@ -397,6 +437,7 @@ async def test_validate_plex_bypasses_the_sections_cache_on_a_later_outage(
     second = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = second.json()
     assert body["ok"] is False  # NOT a stale "ok" served from the 300s cache
@@ -407,6 +448,7 @@ async def test_validate_plex_bad_token(client: httpx.AsyncClient, app: FastAPI) 
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://plex.local:32400", "token": "nope-secret"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -424,6 +466,7 @@ async def test_validate_qbittorrent_ok(client: httpx.AsyncClient, app: FastAPI) 
     response = await client.post(
         "/api/v1/setup/validate/qbittorrent",
         json={"url": "http://qb.local", "username": "admin", "password": "pw"},
+        headers=_SETUP_HEADERS,
     )
     assert response.json()["ok"] is True
 
@@ -433,6 +476,7 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
     response = await client.post(
         "/api/v1/setup/validate/qbittorrent",
         json={"url": "http://qb.local", "username": "admin", "password": "bad"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -442,8 +486,8 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
 async def test_validate_requires_api_key_after_init(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
 ) -> None:
-    # Pre-init the probes are open (no key exists yet); once initialized they must
-    # require the api key so they can't be an anonymous SSRF / reachability oracle.
+    # Pre-init the probes require the setup token; once initialized they require
+    # the api key so they can't be an anonymous SSRF / reachability oracle.
     await seed(initialized=True, app_api_key="setup-key")
     await _use_transport(app, lambda _r: httpx.Response(200, json={"results": []}))
 
@@ -462,10 +506,10 @@ async def test_validate_requires_api_key_after_init(
 async def test_validate_plex_does_not_probe_filesystem(
     client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The pre-init validate/plex endpoint is reachable UNAUTHENTICATED against a
-    # caller-supplied Plex server. It must NEVER stat / os.access the locations that
-    # server reports, or it becomes a pre-auth local-filesystem existence/writability
-    # oracle. Prove _is_writable is never called and writability is reported UNKNOWN.
+    # The pre-init validate/plex endpoint checks a caller-supplied Plex server. It
+    # must NEVER stat / os.access the locations that server reports, or it becomes a
+    # local-filesystem existence/writability oracle. Prove _is_writable is never
+    # called and writability is reported UNKNOWN.
     probed: list[str] = []
 
     def spy(path: str) -> bool:
@@ -497,6 +541,7 @@ async def test_validate_plex_does_not_probe_filesystem(
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": "http://attacker.plex:32400", "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is True

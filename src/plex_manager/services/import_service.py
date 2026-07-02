@@ -769,6 +769,26 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
+    if status is not None and not _is_settled_for_import(status):
+        deferred = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Downloading.value,
+            _RESUMABLE,
+            clear_failed_reason=True,
+            progress=status.progress,
+            seed_ratio=status.ratio,
+        )
+        if not deferred:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        await season_request_service.set_status(
+            session,
+            media_request_id=request.id,
+            season_number=season,
+            status=RequestStatus.downloading.value,
+        )
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
     try:
         content = _resolve_content(status, download_path)
     except _UnsafeContentPathError as exc:

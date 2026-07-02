@@ -2000,8 +2000,15 @@
         "description": "The validated credential set written on ``POST /setup/complete``.",
         "properties": {
           "movies_root": {
-            "title": "Movies Root",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Movies Root"
           },
           "plex_token": {
             "title": "Plex Token",
@@ -2055,8 +2062,7 @@
           "qbittorrent_url",
           "qbittorrent_username",
           "qbittorrent_password",
-          "tmdb_api_key",
-          "movies_root"
+          "tmdb_api_key"
         ],
         "title": "SetupCompleteRequest",
         "type": "object"

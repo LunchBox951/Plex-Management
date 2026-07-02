@@ -244,7 +244,7 @@ export function SetupWizard() {
   // backend normalizes an empty root to None and surfaces a per-type ImportBlocked
   // only for the missing kind). Forcing movies_root would lock a tv-only operator
   // out of setup entirely — they have no movie library to point at.
-  const hasLibraryRoot = form.movies_root.trim() !== '' || (form.tv_root ?? '').trim() !== ''
+  const hasLibraryRoot = (form.movies_root ?? '').trim() !== '' || (form.tv_root ?? '').trim() !== ''
   const allVerified = servicesVerified && setupTokenReady && hasLibraryRoot
 
   const onComplete = async () => {
@@ -383,7 +383,7 @@ export function SetupWizard() {
             <select
               aria-label="Movies library folder"
               className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
-              value={form.movies_root}
+              value={form.movies_root ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, movies_root: e.target.value }))}
             >
               <option value="">Choose a movie library folder…</option>
@@ -412,7 +412,7 @@ export function SetupWizard() {
               label="Movies library folder"
               type="text"
               placeholder="/library/movies"
-              value={form.movies_root}
+              value={form.movies_root ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, movies_root: e.target.value }))}
             />
             {movieLibraries && movieLibraries.length > 0 ? (

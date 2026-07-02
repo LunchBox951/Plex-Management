@@ -22,10 +22,8 @@ Wiring rules:
 from __future__ import annotations
 
 import hmac
-import ipaddress
 import logging
 from typing import Annotated, cast
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
@@ -381,51 +379,14 @@ def _configured_setup_token() -> str | None:
     return value or None
 
 
-def _is_loopback_client(request: Request) -> bool:
-    """True when the request comes from the local host."""
-    host = request.client.host if request.client is not None else None
-    return _is_loopback_hostname(host)
-
-
-def _is_loopback_hostname(host: str | None) -> bool:
-    if host is None:
-        return False
-    normalized = host.strip().strip("[]").rstrip(".").lower()
-    if normalized == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        return False
-
-
-def _origin_matches_request(request: Request, origin: str) -> bool:
-    parsed = urlsplit(origin)
-    return (
-        parsed.scheme == request.url.scheme
-        and parsed.hostname == request.url.hostname
-        and parsed.port == request.url.port
-    )
-
-
-def _is_trusted_local_setup_request(request: Request) -> bool:
-    if not _is_loopback_client(request) or not _is_loopback_hostname(request.url.hostname):
-        return False
-    origin = request.headers.get("Origin")
-    return origin is None or _origin_matches_request(request, origin)
-
-
 def is_setup_token_required(request: Request | None = None) -> bool:
     """Whether this request requires ``X-Setup-Token`` before initialization."""
-    if _configured_setup_token() is not None:
-        return True
-    return request is not None and not _is_trusted_local_setup_request(request)
+    _ = request
+    return not get_settings().dev_auth_bypass
 
 
 def _pre_init_setup_token_valid(request: Request) -> bool:
     expected_setup_token = _configured_setup_token()
-    if expected_setup_token is None and _is_trusted_local_setup_request(request):
-        return True
     provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
     return _api_key_matches(provided_setup_token, expected_setup_token)
 
@@ -454,13 +415,13 @@ async def require_pre_init_or_api_key(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Open before first-run init; require ``X-Api-Key`` once initialized.
+    """Require bootstrap token before first-run init; require ``X-Api-Key`` after.
 
-    The setup ``validate/*`` probes must be callable pre-init (no app key exists
-    yet), but each drives a server-side request to a caller-supplied URL. Leaving
-    them anonymous post-init would turn them into an SSRF / reachability oracle,
-    so once ``initialized`` is set they fall under the same api-key gate as the
-    rest of the API (still skippable via ``dev_auth_bypass``).
+    The setup ``validate/*`` probes must be callable before an app key exists, but
+    each drives a server-side request to a caller-supplied URL. They therefore
+    require ``X-Setup-Token`` pre-init and fall under the same api-key gate as the
+    rest of the API once ``initialized`` is set (still skippable via
+    ``dev_auth_bypass``).
 
     Unlike :func:`require_api_key`, the header is read imperatively from the
     request (not via :class:`APIKeyHeader`): these setup routes are intentionally

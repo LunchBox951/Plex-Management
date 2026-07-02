@@ -151,6 +151,16 @@ def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
                     )
                 )
             conn.rollback()
+
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO download_history (event_type)
+                    VALUES ('evicted')
+                    """
+                )
+            )
+            conn.rollback()
     finally:
         engine.dispose()
 

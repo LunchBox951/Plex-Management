@@ -13,6 +13,11 @@ def test_default_host_is_loopback() -> None:
     assert Settings().host == "127.0.0.1"
 
 
+def test_loopback_bind_without_setup_token_is_rejected() -> None:
+    with pytest.raises(SystemExit, match="PLEX_MANAGER_SETUP_TOKEN"):
+        validate_startup_exposure(Settings())
+
+
 def test_public_bind_without_setup_token_is_rejected() -> None:
     settings = Settings(host="0.0.0.0")  # noqa: S104 - deliberate unsafe bind under test
 
@@ -27,3 +32,7 @@ def test_public_bind_with_setup_token_is_allowed() -> None:
     )
 
     validate_startup_exposure(settings)
+
+
+def test_dev_auth_bypass_without_setup_token_is_allowed() -> None:
+    validate_startup_exposure(Settings(dev_auth_bypass=True))

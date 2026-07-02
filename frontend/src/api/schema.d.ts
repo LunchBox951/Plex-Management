@@ -1483,7 +1483,7 @@ export interface components {
          */
         SetupCompleteRequest: {
             /** Movies Root */
-            movies_root: string;
+            movies_root?: string | null;
             /** Plex Token */
             plex_token: string;
             /** Plex Url */

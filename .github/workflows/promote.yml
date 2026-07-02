@@ -47,21 +47,28 @@ jobs:
         run: |
           # Promote only immutable edge-<sha> handles so :stable is exactly the
           # canary-proven image, never whatever the floating :edge points at now.
-          if ! printf '%s' "$SOURCE_TAG" | grep -Eq '^edge-[A-Za-z0-9._-]+$'; then
+          if [[ "$SOURCE_TAG" == *[$'\r\n\t']* ]]; then
+            echo "::error::Invalid source_tag: contains control characters"
+            exit 1
+          fi
+          if [[ ! "$SOURCE_TAG" =~ ^edge-[A-Za-z0-9._-]+$ ]]; then
             echo "::error::Invalid source_tag (expected immutable edge-<sha>): '$SOURCE_TAG'"
             exit 1
           fi
 
-          tags="--tag ${IMAGE}:stable"
+          tags=(--tag "${IMAGE}:stable")
           if [ -n "$VERSION" ]; then
-            if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            if [[ "$VERSION" == *[$'\r\n\t']* ]]; then
+              echo "::error::Invalid version: contains control characters"
+              exit 1
+            fi
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Invalid version (expected x.y.z): '$VERSION'"
               exit 1
             fi
             major_minor="${VERSION%.*}"
-            tags="$tags --tag ${IMAGE}:${VERSION} --tag ${IMAGE}:${major_minor}"
+            tags+=(--tag "${IMAGE}:${VERSION}" --tag "${IMAGE}:${major_minor}")
           fi
 
-          echo "Promoting ${IMAGE}:${SOURCE_TAG} -> ${tags} (re-tag by reference, no rebuild)"
-          # shellcheck disable=SC2086 -- intentional word-splitting of the --tag list
-          docker buildx imagetools create $tags "${IMAGE}:${SOURCE_TAG}"
+          echo "Promoting ${IMAGE}:${SOURCE_TAG} -> ${tags[*]} (re-tag by reference, no rebuild)"
+          docker buildx imagetools create "${tags[@]}" "${IMAGE}:${SOURCE_TAG}"

@@ -182,6 +182,22 @@ describe('Settings — tv_root library picker (optional)', () => {
     expect(lastBody().tv_root).toBe('')
   })
 
+  it('does not save a stale tv library re-selection after a Plex change', async () => {
+    h.libraries = [
+      { path: '/old-plex/tv', section_key: '2', section_type: 'tv', title: 'Old TV', writable: true },
+      { path: '/new-plex/tv', section_key: '3', section_type: 'tv', title: 'New TV', writable: true },
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+
+    expect(screen.getByLabelText('TV library folder')).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().tv_root).toBe('')
+  })
+
   it('keeps tv_root when the Plex connection is untouched', async () => {
     h.settingsData = { ...h.settingsData!, tv_root: '/plex/tv' }
     render(<Settings />, { wrapper: Wrapper })
