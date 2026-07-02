@@ -46,6 +46,7 @@ __all__ = [
     "QueueResponse",
     "ReconcileStatusItem",
     "RejectedRelease",
+    "ReportIssueBody",
     "RequestListResponse",
     "RequestResponse",
     "SearchPreviewRequest",
@@ -379,6 +380,22 @@ class CreateRequestBody(BaseModel):
     # ``_season_numbers``. A repeat POST with a NEW season list GROWS the tracked
     # set rather than being dropped by the request-level dedup.
     seasons: list[int] | None = None
+
+
+class ReportIssueBody(BaseModel):
+    """``POST /requests/{id}/report-issue`` -- report a bad imported file (ADR-0014).
+
+    ``reason`` is one of the operator-choosable :class:`BlocklistReason` values
+    (``failed`` is auto-only and deliberately excluded). ``season`` is REQUIRED for
+    a tv request (report-issue is per-season, mirroring grab) and ignored for a
+    movie. The verb blocklists the culprit release, purges the torrent + library
+    file, and synchronously re-searches (see ``correction_service.report_issue``).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reason: Literal["bad_quality", "wrong_media", "user_reported"]
+    season: int | None = None
 
 
 class SeasonStatus(BaseModel):

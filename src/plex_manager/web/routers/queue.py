@@ -289,12 +289,23 @@ async def import_endpoint(
 async def mark_failed_endpoint(
     download_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     blocklist: Annotated[bool, Query()] = False,
+    remove_torrent: Annotated[bool, Query()] = True,
 ) -> QueueItem:
-    """Operator move: mark a download failed (optionally blocklisting the release)."""
+    """Operator move: mark a download failed (optionally blocklisting the release).
+
+    ``remove_torrent`` (default true): also remove the torrent + its data from the
+    client, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup
+    never blocks the fail/blocklist/re-arm.
+    """
     try:
         record = await queue_service.mark_failed(
-            session, download_id=download_id, blocklist=blocklist
+            session,
+            qbt,
+            download_id=download_id,
+            blocklist=blocklist,
+            remove_torrent=remove_torrent,
         )
     except LookupError as exc:
         raise HTTPException(

@@ -460,7 +460,9 @@ async def test_mark_failed_recovers_a_blocked_import(sessionmaker_: SessionMaker
     )
 
     async with sessionmaker_() as session:
-        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=True)
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=True
+        )
     assert record.status == DownloadState.Failed.value
 
     async with sessionmaker_() as session:
@@ -703,7 +705,7 @@ class _MarkFailedMidImportQbt(FakeQbittorrent):
             self._fired = True
             async with self._sessionmaker() as session:
                 await queue_service.mark_failed(
-                    session, download_id=self._download_id, blocklist=True
+                    session, FakeQbittorrent(), download_id=self._download_id, blocklist=True
                 )
         return await super().get_status(info_hash)
 
@@ -858,7 +860,9 @@ async def test_blocked_import_blocklists_grabbed_release_title_not_file_basename
     assert all("movie.mkv" in (e.message or "") for e in started)
 
     async with sessionmaker_() as session:
-        await queue_service.mark_failed(session, download_id=download_id, blocklist=True)
+        await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=True
+        )
 
     async with sessionmaker_() as session:
         entry = (await session.execute(select(Blocklist))).scalar_one()

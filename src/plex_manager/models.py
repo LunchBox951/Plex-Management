@@ -97,6 +97,17 @@ class RequestStatus(StrEnum):
     # now-off-disk row must never block a fresh active request for the same
     # media, so a re-request creates a new row rather than resurrecting this one.
     evicted = "evicted"
+    # The operator cancelled a not-yet-imported request (ADR-0014's cancel verb):
+    # "I don't want this anymore", distinct from report-issue's "redo it". SETTLED
+    # (terminal) and, exactly like ``available``/``failed``/``evicted``, deliberately
+    # OUTSIDE ``uq_media_requests_active``'s predicate so a later fresh request for
+    # the same media is allowed (the cancelled row is kept only for history). The
+    # ``status`` column is a plain VARCHAR (``native_enum=False`` => no CHECK
+    # constraint, see ``41d427bd38e6``) and ``cancelled`` (9 chars) fits the existing
+    # length, so adding this member needs NO column migration; and because the active
+    # partial index is an INCLUSION list that never named ``cancelled``, it is
+    # excluded by omission -- no index migration either (mirrors ``evicted``).
+    cancelled = "cancelled"
 
 
 class BlocklistReason(StrEnum):
@@ -123,6 +134,12 @@ class DownloadHistoryEvent(StrEnum):
     # docstring for the identical precedent), so adding this member needs NO
     # migration of its own.
     evicted = "evicted"
+    # ADR-0014 correction verbs: the audit row a report-issue / cancel writes. Like
+    # ``evicted`` these are not tied to a live torrent (``torrent_hash`` may be the
+    # culprit's, or ``None`` when no download ever existed). Same plain-VARCHAR
+    # ``event_type`` column, so neither member needs a migration of its own.
+    reported = "reported"
+    cancelled = "cancelled"
 
 
 def _enum(enum_cls: type[StrEnum]) -> sa.Enum:

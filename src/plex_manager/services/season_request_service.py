@@ -49,6 +49,7 @@ __all__ = [
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
+    "reset_for_research",
     "set_library_path",
     "set_status",
     "set_status_if_in",
@@ -80,6 +81,9 @@ _TERMINAL_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.available,
         RequestStatus.failed,
         RequestStatus.evicted,
+        # ADR-0014: a cancelled season is terminal for the same reason as
+        # evicted -- a stale later signal must never drag it back to searching.
+        RequestStatus.cancelled,
     )
 )
 
@@ -447,6 +451,28 @@ async def mark_available(
     )
     await season_repo.mark_available(row.id)
     await _recompute_parent(session, media_request_id, stamp_completion=True)
+
+
+async def reset_for_research(
+    session: AsyncSession, *, media_request_id: int, season_number: int
+) -> None:
+    """Re-arm ONE reported season for a fresh search (ADR-0014's report-issue verb).
+
+    The season-level analogue of ``SqlRequestRepository.reset_for_research``: sets
+    the season back to the non-terminal ``searching`` and clears its
+    ``library_path`` purge breadcrumb (the file was just deleted), then recomputes
+    the parent rollup so the show reflects the re-armed season. Unlike
+    :func:`set_status` this is UNCONDITIONAL (no ``skip_if_terminal``): report-issue
+    deliberately re-opens an already-``available``/``completed`` season -- that is
+    the whole point of "this imported file is bad, redo it".
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.set_status(row.id, RequestStatus.searching.value)
+    await season_repo.clear_library_path(row.id)
+    await _recompute_parent(session, media_request_id)
 
 
 async def mark_no_acceptable_release(

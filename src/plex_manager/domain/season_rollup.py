@@ -76,8 +76,9 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
 
     Pure and total over the season-status vocabulary: every combination of
     ``pending``/``searching``/``no_acceptable_release``/``downloading``/
-    ``completed``/``available``/``failed``/``import_blocked``/``evicted`` resolves
-    to exactly one branch above. Raises :class:`ValueError` on an empty sequence —
+    ``completed``/``available``/``failed``/``import_blocked``/``evicted``/
+    ``cancelled`` resolves to exactly one branch above. Raises :class:`ValueError`
+    on an empty sequence —
     a TV request always has at least one season once ``ensure_seasons`` has run, so
     an empty rollup input is a caller bug, never a state to silently guess at.
     """
@@ -95,27 +96,41 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         # sweep -- honest, non-terminal, re-requestable at the show level too.
         return "evicted"
 
-    # Only pending/available/completed/failed/evicted remain among the season
-    # statuses. ``evicted`` folds alongside available/completed as "done" for the
-    # purposes of this branch, EXCEPT it must never let the whole show read as
-    # cleanly "available" (its file is gone) -- see the docstring above.
+    if statuses == {"cancelled"}:
+        # The operator cancelled every tracked season (ADR-0014's cancel verb):
+        # the whole show rolls up to the SETTLED ``cancelled`` too. Mirrors the
+        # all-``evicted`` case just above -- a fresh request re-tracks the show.
+        return "cancelled"
+
+    # Only pending/available/completed/failed/evicted/cancelled remain among the
+    # season statuses. ``evicted`` and ``cancelled`` fold alongside available/
+    # completed as "gone/settled" for the purposes of this branch, EXCEPT neither
+    # may ever let the whole show read as cleanly "available" (their file is gone /
+    # was never fetched) -- see the docstring above. They are grouped identically
+    # here: both mean "nothing on disk for this season right now".
     _DONE = {"available", "completed"}
-    _DONE_OR_EVICTED = _DONE | {"evicted"}
-    if statuses <= _DONE_OR_EVICTED:
+    _GONE = {"evicted", "cancelled"}
+    _DONE_OR_GONE = _DONE | _GONE
+    # Every season is done-or-gone AND at least one is REAL-DONE (available/
+    # completed). A ``statuses & _DONE`` guard is REQUIRED: an all-GONE mix with no
+    # done season (e.g. ``{evicted, cancelled}`` -- neither single-type early return
+    # above caught it) has nothing watchable and must NOT read partially_available;
+    # it falls through to the pending/failed tail below instead.
+    if statuses <= _DONE_OR_GONE and statuses & _DONE:
         if statuses == {"available"}:
             return "available"
-        if "evicted" in statuses:
+        if statuses & _GONE:
             return "partially_available"
-        # Every season is done (available/completed, no evicted) but at least one
+        # Every season is done (available/completed, none gone) but at least one
         # is still awaiting Plex confirmation -> the (terminal) "completed".
         return "completed"
     if statuses & _DONE:
         # At least one REAL-DONE season (available/completed) is mixed with a
-        # pending/failed/evicted one: honestly partial -- something is actually
-        # watchable right now, and never a terminal status that would mask the
-        # unfinished season or block its grab. Deliberately checked against
-        # ``_DONE`` (not ``_DONE_OR_EVICTED``): an ``evicted`` season must never
-        # by itself earn "partially_available" -- see the docstring.
+        # pending/failed/evicted/cancelled one: honestly partial -- something is
+        # actually watchable right now, and never a terminal status that would mask
+        # the unfinished season or block its grab. Deliberately checked against
+        # ``_DONE`` (not ``_DONE_OR_GONE``): an ``evicted``/``cancelled`` season
+        # must never by itself earn "partially_available" -- see the docstring.
         return "partially_available"
     if "pending" in statuses:
         return "pending"

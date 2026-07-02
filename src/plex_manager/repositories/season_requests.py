@@ -271,3 +271,18 @@ class SqlSeasonRequestRepository:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = library_path
         await self._session.flush()
+
+    async def clear_library_path(self, season_request_id: int) -> None:
+        """Drop the eviction/purge breadcrumb (ADR-0014's report-issue verb).
+
+        The season-level mirror of ``SqlRequestRepository.reset_for_research``'s
+        ``library_path`` clear: after report-issue purges the season's placed file
+        the breadcrumb must not keep pointing at a path that no longer exists (a
+        later sweep would only skip+log it, but leaving a stale breadcrumb is
+        dishonest). No-op-safe if the row vanished.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.library_path = None
+        await self._session.flush()

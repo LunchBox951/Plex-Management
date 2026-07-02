@@ -173,6 +173,8 @@ async def test_mark_failed_blocklists(
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     download_id = await _insert_download(sessionmaker_, torrent_hash="c" * 40, status="downloading")
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
 
     response = await client.post(
         f"/api/v1/queue/{download_id}/mark-failed",
@@ -186,6 +188,9 @@ async def test_mark_failed_blocklists(
     entries = blocklist.json()["entries"]
     assert len(entries) == 1
     assert entries[0]["torrent_hash"] == "c" * 40
+
+    # ADR-0014 seeding-leak fix: mark-failed removed the torrent WITH its data.
+    assert qbt.removed == [("c" * 40, True)]
 
 
 async def test_grab_refuses_cam_only_release_and_adds_nothing(

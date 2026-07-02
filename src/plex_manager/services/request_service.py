@@ -67,6 +67,10 @@ TERMINAL_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.available,
         RequestStatus.failed,
         RequestStatus.evicted,
+        # ADR-0014: a cancelled request is terminal for grab purposes -- a stale
+        # cancelled id handed to /queue/grab must be rejected up front (nothing
+        # left to resume), exactly like available/failed/evicted above.
+        RequestStatus.cancelled,
     )
 )
 

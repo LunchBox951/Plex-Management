@@ -27,7 +27,15 @@ __all__ = ["SqlRequestRepository"]
 # ADR-0012), which excludes ``evicted`` from the DB backstop for the identical
 # reason — see ``RequestStatus.evicted``'s docstring there.
 _SETTLED_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
-    {RequestStatus.available, RequestStatus.failed, RequestStatus.evicted}
+    {
+        RequestStatus.available,
+        RequestStatus.failed,
+        RequestStatus.evicted,
+        # ADR-0014: a cancelled request is settled -- it must never dedup-block a
+        # fresh request for the same media (a re-request creates a new row), for
+        # the SAME reason as available/failed/evicted above.
+        RequestStatus.cancelled,
+    }
 )
 
 
@@ -352,6 +360,27 @@ class SqlRequestRepository:
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.library_path = library_path
+        await self._session.flush()
+
+    async def reset_for_research(self, request_id: int) -> None:
+        """Re-arm a reported movie for a fresh search (ADR-0014's report-issue verb).
+
+        Sets ``status`` back to the non-terminal ``searching`` and clears every
+        breadcrumb that asserted the (now-purged) file is present:
+        ``library_path`` (the eviction/purge target -- the file is gone),
+        ``completed_at`` and ``library_verified_at`` (the honest-availability
+        anchors). The subsequent inline re-grab drives the row on to
+        ``downloading``; if nothing acceptable is found it lands on the honest
+        ``no_acceptable_release`` dead-end -- either way the row never lingers
+        claiming an in-library file it no longer has.
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.status = RequestStatus.searching
+        row.library_path = None
+        row.completed_at = None
+        row.library_verified_at = None
         await self._session.flush()
 
     async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:

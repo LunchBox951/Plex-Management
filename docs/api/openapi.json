@@ -1377,6 +1377,36 @@
         "title": "RejectedRelease",
         "type": "object"
       },
+      "ReportIssueBody": {
+        "description": "``POST /requests/{id}/report-issue`` -- report a bad imported file (ADR-0014).\n\n``reason`` is one of the operator-choosable :class:`BlocklistReason` values\n(``failed`` is auto-only and deliberately excluded). ``season`` is REQUIRED for\na tv request (report-issue is per-season, mirroring grab) and ignored for a\nmovie. The verb blocklists the culprit release, purges the torrent + library\nfile, and synchronously re-searches (see ``correction_service.report_issue``).",
+        "properties": {
+          "reason": {
+            "enum": [
+              "bad_quality",
+              "wrong_media",
+              "user_reported"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ReportIssueBody",
+        "type": "object"
+      },
       "RequestListResponse": {
         "description": "A list of media requests.",
         "properties": {
@@ -3042,7 +3072,7 @@
     },
     "/api/v1/queue/{download_id}/mark-failed": {
       "post": {
-        "description": "Operator move: mark a download failed (optionally blocklisting the release).",
+        "description": "Operator move: mark a download failed (optionally blocklisting the release).\n\n``remove_torrent`` (default true): also remove the torrent + its data from the\nclient, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup\nnever blocks the fail/blocklist/re-arm.",
         "operationId": "mark_failed_endpoint_api_v1_queue__download_id__mark_failed_post",
         "parameters": [
           {
@@ -3061,6 +3091,16 @@
             "schema": {
               "default": false,
               "title": "Blocklist",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "remove_torrent",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Remove Torrent",
               "type": "boolean"
             }
           }
@@ -3218,6 +3258,54 @@
         ]
       }
     },
+    "/api/v1/requests/{request_id}/cancel": {
+      "post": {
+        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.",
+        "operationId": "cancel_request_endpoint_api_v1_requests__request_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Cancel Request Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
     "/api/v1/requests/{request_id}/keep-forever": {
       "post": {
         "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op.",
@@ -3271,6 +3359,64 @@
           }
         ],
         "summary": "Keep Forever Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/{request_id}/report-issue": {
+      "post": {
+        "description": "Report a bad imported/available movie or TV season (ADR-0014).\n\nBlocklists the culprit release, removes its torrent + the library file, and\nsynchronously re-searches for a DIFFERENT release (the honest\n``no_acceptable_release`` park if nothing is acceptable). Requires Plex +\nqBittorrent + Prowlarr configured (their deps 409 ``service_not_configured``\notherwise). The correction-without-a-terminal button for \"this file is bad\".",
+        "operationId": "report_issue_endpoint_api_v1_requests__request_id__report_issue_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportIssueBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Report Issue Endpoint",
         "tags": [
           "requests"
         ]
