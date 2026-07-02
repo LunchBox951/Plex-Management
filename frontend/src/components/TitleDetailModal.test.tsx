@@ -128,7 +128,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
   })
 })
 
-describe('TitleDetailModal deferred media types', () => {
+describe('TitleDetailModal TV request actions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
@@ -136,11 +136,12 @@ describe('TitleDetailModal deferred media types', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(idle())
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
   })
 
-  it('does not offer request or preview actions for TV titles while TV import is deferred', () => {
+  it('offers request and preview actions for TV titles', () => {
     render(
       <TitleDetailModal
         title={{ ...TITLE, media_type: 'tv', title: 'Test Show' }}
@@ -149,9 +150,9 @@ describe('TitleDetailModal deferred media types', () => {
       />,
     )
 
-    expect(screen.getByText(/TV requests are deferred/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
+    expect(screen.queryByText(/TV requests are deferred/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /preview releases/i })).toBeInTheDocument()
   })
 })
 
@@ -286,7 +287,10 @@ describe('TitleDetailModal — tv season selector', () => {
     year: 2022,
   }
 
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+  })
 
   it('threads the chosen season into CreateRequestBody.seasons and SearchPreviewRequest.season', async () => {
     const created: RequestResponse = {

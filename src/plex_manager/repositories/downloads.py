@@ -220,6 +220,7 @@ class SqlDownloadRepository:
         tmdb_id: int | None = None,
         year: int | None = None,
         season: int | None = None,
+        episodes: list[int] | None = None,
         media_type: str | None = None,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -263,6 +264,7 @@ class SqlDownloadRepository:
             values["tmdb_id"] = tmdb_id
             values["year"] = year
             values["season"] = season
+            values["episodes_json"] = episodes
             values["media_type"] = MediaType(media_type) if media_type is not None else None
         if clear_first_seen_at:
             values["first_seen_at"] = None

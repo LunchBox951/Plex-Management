@@ -12,7 +12,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-
 # revision identifiers, used by Alembic.
 revision: str = "b7e2d4f6c8a1"
 down_revision: str | None = "88bcf173ab91"
@@ -34,13 +33,31 @@ _ENUM_CHECKS = (
             "downloading",
             "completed",
             "available",
+            "partially_available",
             "failed",
             "import_blocked",
+            "evicted",
         ),
         False,
     ),
     ("request_dedup_locks", "media_type", ("movie", "tv"), False),
-    ("season_requests", "status", ("pending", "searching", "no_acceptable_release", "downloading", "completed", "available", "failed", "import_blocked"), False),
+    (
+        "season_requests",
+        "status",
+        (
+            "pending",
+            "searching",
+            "no_acceptable_release",
+            "downloading",
+            "completed",
+            "available",
+            "partially_available",
+            "failed",
+            "import_blocked",
+            "evicted",
+        ),
+        False,
+    ),
     ("downloads", "media_type", ("movie", "tv"), True),
 )
 
@@ -65,7 +82,9 @@ def _raise_on_invalid_enum_values() -> None:
     for table, column, values, _nullable in _ENUM_CHECKS:
         rows = (
             bind.execute(
-                sa.text(
+                # Table/column names and values come only from the local
+                # _ENUM_CHECKS constants above, not operator input.
+                sa.text(  # noqa: S608
                     f"""
                     SELECT {column} AS value, COUNT(*) AS invalid_count
                     FROM {table}

@@ -523,7 +523,6 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
-  const tvDeferred = title.media_type === 'tv'
 
   // tv only: before any request exists, let the operator name a single season (and
   // whether to track just it or the whole series); once seasons are tracked,
@@ -621,27 +620,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
-  const showReleases = !tvDeferred && (
+  const showReleases =
     state.kind === 'none' ||
     state.kind === 'pending' ||
     state.kind === 'searching' ||
     state.kind === 'no_acceptable_release' ||
     state.kind === 'failed' ||
     state.kind === 'unknown'
-  )
 
   let actionZone: ReactNode
-  if (tvDeferred) {
-    actionZone = (
-      <div className="flex flex-wrap items-center gap-3">
-        <StatusBadge status={{ label: 'Deferred', intent: 'neutral' }} />
-        <span className="text-sm text-muted">
-          TV requests are deferred until TV import is available.
-        </span>
-      </div>
-    )
-  } else {
-    switch (state.kind) {
+  switch (state.kind) {
     case 'none':
       actionZone = (
         <div className="flex flex-wrap gap-2">
@@ -778,7 +766,6 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         </div>
       )
       break
-    }
   }
 
   return (

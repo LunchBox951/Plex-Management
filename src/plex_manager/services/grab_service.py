@@ -499,7 +499,9 @@ async def grab(
                 raise
             if winner.status not in _TERMINAL_STATUS_VALUES:
                 if request_id is not None and winner.media_request_id != request_id:
-                    raise TorrentAlreadyTrackedError(torrent_hash, winner.media_request_id) from None
+                    raise TorrentAlreadyTrackedError(
+                        torrent_hash, winner.media_request_id
+                    ) from None
                 # Same scope-conflict guard as the non-race precheck: two grabs for
                 # the same hash but a DIFFERENT tv scope can race past the prechecks,
                 # the loser hitting UNIQUE(torrent_hash) here. Returning the winner's

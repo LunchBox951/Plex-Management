@@ -27,7 +27,6 @@ from plex_manager.db import get_session
 from plex_manager.models import SystemSettings
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
-    KNOWN_SETTING_KEYS,
     SETUP_TOKEN_HEADER_NAME,
     SettingsStore,
     ensure_system_settings,

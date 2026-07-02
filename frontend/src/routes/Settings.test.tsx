@@ -146,6 +146,8 @@ describe('Settings — tv_root library picker (optional)', () => {
       { path: '/plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
       { path: '/plex/tv', section_key: '2', section_type: 'tv', title: 'TV Shows', writable: true },
     ]
+    h.librariesError = null
+    h.librariesRefetch.mockReset()
   })
 
   it('filters the movie picker to section_type "movie" and the tv picker to "tv"', () => {

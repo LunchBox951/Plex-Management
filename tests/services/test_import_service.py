@@ -9,8 +9,8 @@ real bytes.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -1537,7 +1537,8 @@ async def test_import_tv_single_file_symlink_escaping_parent_is_blocked_not_copi
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
-    assert record.failed_reason == "no video file found in the download"
+    assert record.failed_reason is not None
+    assert "outside download save path" in record.failed_reason
     assert not any(tv_root.iterdir())  # nothing was imported into the library
     async with sessionmaker_() as session:
         season_row = await session.get(SeasonRequest, season_id)

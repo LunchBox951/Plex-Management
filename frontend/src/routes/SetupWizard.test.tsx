@@ -180,7 +180,7 @@ describe('SetupWizard', () => {
 
     expect(screen.queryByText('Plex ok')).not.toBeInTheDocument()
     expect(screen.getByText('0/4 verified')).toBeInTheDocument()
-    expect(screen.getByText(/Verify Plex above/i)).toBeInTheDocument()
+    expect(screen.getAllByText(/Verify Plex above/i)).toHaveLength(2)
   })
 
   it('stores and reveals the one-time setup key before navigating away', async () => {

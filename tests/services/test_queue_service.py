@@ -213,7 +213,7 @@ async def test_mark_failed_routes_import_pending_through_failed_pending(
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
     assert len(blocklist) == 1
     assert blocklist[0].torrent_hash == _HASH
-    assert blocklist[0].media_type is None
+    assert blocklist[0].media_type is MediaType.movie
 
 
 async def test_mark_failed_does_not_overwrite_importing_claim_from_stale_session(

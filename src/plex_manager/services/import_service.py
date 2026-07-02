@@ -769,7 +769,13 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
-    content = _resolve_content(status, download_path)
+    try:
+        content = _resolve_content(status, download_path)
+    except _UnsafeContentPathError as exc:
+        await _block(
+            session, download_repo, download_id, str(exc), request_id=request.id, season=season
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     if content is None:
         await _block(
             session,
