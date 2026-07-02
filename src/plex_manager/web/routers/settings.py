@@ -15,17 +15,18 @@ from __future__ import annotations
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import update
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.config import get_settings
 from plex_manager.db import get_session
-from plex_manager.models import SystemSettings
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web.deps import (
+    API_KEY_HEADER_NAME,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
     SettingsStore,
+    api_key_matches,
     ensure_system_settings,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
@@ -131,6 +132,7 @@ async def reveal_app_key_endpoint(
 
 @router.post("/app-key/rotate")
 async def rotate_app_key_endpoint(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AppApiKeyResponse:
     """Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
@@ -140,12 +142,35 @@ async def rotate_app_key_endpoint(
     ``require_api_key``'s single-key comparison. The frontend caller of this
     endpoint MUST persist the returned key immediately so the session that just
     rotated it survives (the new key is never shown again after this response).
+
+    Compare-and-swap against concurrent rotations: two rotate requests carrying
+    the SAME old key can both clear ``require_api_key`` (each reads the old stored
+    value) before either commits. Without a guard the write that commits second
+    would silently overwrite the first's freshly minted key, so the client that
+    fired the first request would be left displaying an already-dead key. Inside
+    THIS request's own transaction we re-read the stored key and require it to
+    still equal the key the request authenticated with; if it has already changed,
+    the race happened and we answer 409 (``app_key_changed``) rather than clobber
+    the winner. SQLite serializes the two writes, so the loser's re-read observes
+    the winner's committed key and honestly bails out. The check is skipped under
+    ``dev_auth_bypass`` (there is no authenticated key to compare against), exactly
+    like ``require_api_key`` itself.
     """
     system = await ensure_system_settings(session)
+    if not get_settings().dev_auth_bypass:
+        # ``require_api_key`` already loaded this row into the shared request
+        # session, so its cached instance still shows the auth-time value; force a
+        # fresh read here (in the same transaction as the write below) so the CAS
+        # reflects any rotation that committed while this request was in flight.
+        await session.refresh(system)
+        presented = request.headers.get(API_KEY_HEADER_NAME)
+        if not api_key_matches(presented, system.app_api_key):
+            raise HTTPException(
+                status_code=409,
+                detail="app_key_changed",
+            )
     new_key = secrets.token_urlsafe(_API_KEY_BYTES)
-    await session.execute(
-        update(SystemSettings).where(SystemSettings.id == system.id).values(app_api_key=new_key)
-    )
+    system.app_api_key = new_key
     await session.commit()
     return AppApiKeyResponse(app_api_key=new_key)
 

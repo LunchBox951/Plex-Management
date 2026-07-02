@@ -15,6 +15,13 @@ describe('toApiError', () => {
     expect(err.message).toBe('Some unmapped code')
   })
 
+  it('maps the app-key rotation 409 to an honest refresh-and-retry message', () => {
+    const err = toApiError({ detail: 'app_key_changed' }, 409)
+    expect(err.code).toBe('app_key_changed')
+    expect(err.status).toBe(409)
+    expect(err.message).toMatch(/changed while this request was in flight/i)
+  })
+
   it('reads the first message from a FastAPI validation error list', () => {
     const err = toApiError({ detail: [{ msg: 'field required', loc: ['body', 'x'] }] }, 422)
     expect(err.message).toBe('field required')

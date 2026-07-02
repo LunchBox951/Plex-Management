@@ -356,6 +356,7 @@ describe('Settings — app key reveal/rotate (issue #28)', () => {
   beforeEach(() => {
     h.revealMutateAsync.mockReset()
     h.rotateMutateAsync.mockReset()
+    h.toast.mockReset()
     h.settingsData = {
       plex_url: 'http://plex:32400',
       plex_token: '***',
@@ -407,6 +408,32 @@ describe('Settings — app key reveal/rotate (issue #28)', () => {
     await waitFor(() => expect(screen.getByLabelText(/new app key/i)).toHaveValue(
       'brand-new-key-xyz',
     ))
+  })
+
+  it('surfaces the 409 (key changed mid-flight) honestly and keeps the dialog open to retry', async () => {
+    h.rotateMutateAsync.mockRejectedValueOnce({
+      code: 'app_key_changed',
+      message: 'The app key changed while this request was in flight — refresh and retry.',
+      status: 409,
+    })
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: /rotate key/i }))
+
+    await waitFor(() => expect(h.rotateMutateAsync).toHaveBeenCalledTimes(1))
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Rotate failed',
+        description: expect.stringContaining('changed while this request was in flight'),
+        intent: 'error',
+      }),
+    )
+    // The confirm dialog stays open so the operator can refresh and try again;
+    // no dead key is displayed as if the rotation had succeeded.
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(screen.queryByLabelText(/new app key/i)).not.toBeInTheDocument()
   })
 
   it('cancelling the confirm dialog rotates nothing', () => {

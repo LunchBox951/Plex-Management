@@ -573,6 +573,19 @@ export interface paths {
          *     ``require_api_key``'s single-key comparison. The frontend caller of this
          *     endpoint MUST persist the returned key immediately so the session that just
          *     rotated it survives (the new key is never shown again after this response).
+         *
+         *     Compare-and-swap against concurrent rotations: two rotate requests carrying
+         *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
+         *     value) before either commits. Without a guard the write that commits second
+         *     would silently overwrite the first's freshly minted key, so the client that
+         *     fired the first request would be left displaying an already-dead key. Inside
+         *     THIS request's own transaction we re-read the stored key and require it to
+         *     still equal the key the request authenticated with; if it has already changed,
+         *     the race happened and we answer 409 (``app_key_changed``) rather than clobber
+         *     the winner. SQLite serializes the two writes, so the loser's re-read observes
+         *     the winner's committed key and honestly bails out. The check is skipped under
+         *     ``dev_auth_bypass`` (there is no authenticated key to compare against), exactly
+         *     like ``require_api_key`` itself.
          */
         post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
         delete?: never;
