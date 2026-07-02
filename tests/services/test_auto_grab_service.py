@@ -3,8 +3,10 @@
 Covers the honest behaviours the beta depends on: escalating backoff on a
 nothing-acceptable search, the strict park-vs-error distinction (a raised Prowlarr
 error must NEVER be mistaken for "nothing acceptable"), the per-cycle search cap
-that protects the single Prowlarr, the active-download skip, and both the movie and
-TV (per-season) grab/park paths.
+that protects the single Prowlarr, the active-download skip, both the movie and TV
+(per-season) grab/park paths, and the bounded try-the-next-accepted-release fall
+through (a per-release grab failure on the top pick must not park a still-grabbable
+scope behind backoff).
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.prowlarr import IndexerError
 from plex_manager.domain.quality_profile import default_profile
-from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest, ScoredRelease
 from plex_manager.models import (
     Download,
     MediaRequest,
@@ -26,9 +28,19 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.ports.download_client import DownloadClientPort
+from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import auto_grab_service
-from plex_manager.services.auto_grab_service import BACKOFF_SCHEDULE, next_search_at
-from plex_manager.services.grab_service import GrabError
+from plex_manager.services.auto_grab_service import (
+    BACKOFF_SCHEDULE,
+    MAX_GRAB_ATTEMPTS_PER_SCOPE,
+    next_search_at,
+)
+from plex_manager.services.grab_service import (
+    AlreadyDownloadingError,
+    GrabError,
+    NoGrabSourceError,
+)
 from tests.web.fakes import (
     FakeProwlarr,
     FakeQbittorrent,
@@ -69,23 +81,72 @@ class _PerTmdbProwlarr:
         return list(self.by_tmdb.get(request.tmdb_id or 0, []))
 
 
-def _sourceless_candidate() -> CandidateRelease:
+def _sourceless_candidate(
+    title: str = "Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+    *,
+    seeders: int = 10,
+) -> CandidateRelease:
     """A good-quality release the engine ACCEPTS but with NO magnet and NO download
     url -> ``grab_service`` raises :class:`NoGrabSourceError` before anything is ever
-    handed to the client (nothing is left live to track)."""
+    handed to the client (nothing is left live to track). ``title``/``seeders`` are
+    parametrised so a test can build several distinct sourceless candidates and
+    control their rank order (seeders descending)."""
     return CandidateRelease(
-        guid="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
-        title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        guid=title,
+        title=title,
         size_bytes=1_000_000_000,
         magnet_url=None,
         download_url=None,
         info_hash=None,
-        seeders=10,
+        seeders=seeders,
         leechers=1,
         indexer_id=1,
         indexer_name="FakeIndexer",
         publish_date=datetime(2020, 1, 1, tzinfo=UTC),
     )
+
+
+def _two_good_candidates() -> list[CandidateRelease]:
+    """Two acceptable, distinct 1080p WEB-DL movie releases, highest-seeded first."""
+    return [
+        candidate("Some.Movie.2020.1080p.WEB-DL.x264-A", info_hash="a" * 40, seeders=100),
+        candidate("Some.Movie.2020.1080p.WEB-DL.x264-B", info_hash="b" * 40, seeders=10),
+    ]
+
+
+def _many_good_candidates(count: int) -> list[CandidateRelease]:
+    """``count`` distinct acceptable 1080p WEB-DL movie releases, highest-seeded first."""
+    return [
+        candidate(f"Some.Movie.2020.1080p.WEB-DL.x264-G{i}", seeders=100 - i) for i in range(count)
+    ]
+
+
+class _ScriptedGrab:
+    """Stand-in for ``grab_service.grab`` with a scripted per-call exception sequence.
+
+    Each call records the :class:`ScoredRelease` it was handed -- so a test can assert
+    WHICH accepted releases were attempted, and that a settling outcome stopped
+    further attempts -- then raises the next scripted exception. Every scripted
+    outcome is an exception: a test that needs a SUCCESSFUL grab exercises the real
+    ``grab_service.grab`` end-to-end instead. Lets the per-exception loop behaviour
+    (clean-skip vs cap-and-park) be driven deterministically, decoupled from how
+    ``grab_service`` internally raises each error.
+    """
+
+    def __init__(self, *outcomes: Exception) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[ScoredRelease] = []
+
+    async def __call__(
+        self,
+        qbt: DownloadClientPort,
+        session: AsyncSession,
+        *,
+        scored: ScoredRelease,
+        **_kwargs: object,
+    ) -> DownloadRecord:
+        self.calls.append(scored)
+        raise self._outcomes.pop(0)
 
 
 def _tv_season_pack() -> list[CandidateRelease]:
@@ -440,6 +501,186 @@ async def test_no_grab_source_still_parks_on_backoff(sessionmaker_: SessionMaker
     assert result.no_acceptable == 1
     assert result.grab_errors == 0
     assert qbt.added == []  # nothing was ever handed to the client
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.no_acceptable_release
+        assert row.search_attempts == 1
+        assert row.next_search_at is not None
+        assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
+
+
+# --------------------------------------------------------------------------- #
+# Alternate accepted releases — try the next before parking (PR #31)
+# --------------------------------------------------------------------------- #
+async def test_scope_conflict_on_top_pick_grabs_lower_ranked_release(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # The top-ranked accepted release is a multi-season pack whose hash is ALREADY
+    # active tracking a DIFFERENT season (season 2), so the season-1 grab raises
+    # DownloadScopeConflictError. A lower-ranked, season-1-only pack is still
+    # grabbable -- the worker must fall through to it and GRAB, never park a
+    # still-grabbable season behind backoff.
+    request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=1399, season_number=1)
+    async with sessionmaker_() as session:
+        # The shared pack (hash "aaaa...") is already downloading season 2.
+        session.add(
+            Download(
+                torrent_hash="a" * 40,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=1399,
+                season=2,
+            )
+        )
+        await session.commit()
+    prowlarr = FakeProwlarr(
+        [
+            candidate("Some.Show.S01.1080p.WEB-DL.x264-PACK", info_hash="a" * 40, seeders=100),
+            candidate("Some.Show.S01.1080p.WEB-DL.x264-OTHER", info_hash="b" * 40, seeders=10),
+        ]
+    )
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 1
+    assert result.grabbed == 1
+    assert result.no_acceptable == 0  # NOT parked -- a grabbable alternate existed
+    assert len(qbt.added) == 1  # only the fallback pack reached the client
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.downloading
+        assert season.search_attempts == 0  # no backoff scheduled
+        assert season.next_search_at is None
+        # The grabbed season-1 download tracks the FALLBACK hash, not the conflict.
+        grabbed_row = (
+            await session.execute(
+                select(Download).where(
+                    Download.media_request_id == request_id, Download.season == 1
+                )
+            )
+        ).scalar_one()
+        assert grabbed_row.torrent_hash == "b" * 40
+        assert grabbed_row.status == "downloading"
+
+
+async def test_all_accepted_ungrabbable_parks_on_backoff(sessionmaker_: SessionMaker) -> None:
+    # Every accepted release is sourceless (NoGrabSourceError) -> the list is
+    # exhausted with no successful grab, so the scope parks on the escalating backoff
+    # exactly as a nothing-acceptable search would (both mean "no grabbable release").
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(
+        [
+            _sourceless_candidate("Some.Movie.2020.1080p.WEB-DL.x264-A", seeders=100),
+            _sourceless_candidate("Some.Movie.2020.1080p.WEB-DL.x264-B", seeders=10),
+        ]
+    )
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 1
+    assert result.grabbed == 0
+    assert result.no_acceptable == 1
+    assert result.grab_errors == 0
+    assert qbt.added == []  # nothing sourceless ever reached the client
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.no_acceptable_release
+        assert row.search_attempts == 1
+        assert row.next_search_at is not None
+        assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
+
+
+async def test_grab_error_on_top_pick_stops_further_attempts(sessionmaker_: SessionMaker) -> None:
+    # A GrabError leaves a LIVE, untracked torrent, so the worker must NOT try a
+    # second candidate (a live orphan plus another grab would double-download) and
+    # must NOT park. The top pick raises GrabError; the grabbable runner-up is left
+    # untouched -- proving the operational abort halts the fall-through.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(
+        [
+            # magnet=False + a download_url the fake client returns "" for -> GrabError.
+            candidate("Some.Movie.2020.1080p.WEB-DL.x264-BAD", magnet=False, seeders=100),
+            # Would grab cleanly IF it were attempted -- it must not be.
+            candidate("Some.Movie.2020.1080p.WEB-DL.x264-GOOD", info_hash="c" * 40, seeders=10),
+        ]
+    )
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.grabbed == 0
+    assert result.grab_errors == 1
+    assert result.no_acceptable == 0  # never parked
+    assert isinstance(result.last_grab_error, GrabError)
+    assert len(qbt.added) == 1  # only the bad top pick reached the client
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.pending  # left exactly as it was
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+        # The runner-up ("cccc...") was never grabbed -> no download row exists.
+        downloads = (
+            (await session.execute(select(Download).where(Download.media_request_id == request_id)))
+            .scalars()
+            .all()
+        )
+        assert downloads == []
+
+
+async def test_already_downloading_is_a_clean_skip(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AlreadyDownloadingError means a download now exists for the scope (a racing
+    # manual grab): skip the scope ENTIRELY -- no park, no further candidates, no
+    # error -- and leave its state untouched. Two releases are accepted; only the
+    # first is attempted, proving the fall-through stops.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(_two_good_candidates())
+    scripted = _ScriptedGrab(AlreadyDownloadingError(request_id))
+    monkeypatch.setattr(auto_grab_service.grab_service, "grab", scripted)
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert result.searched == 1
+    assert len(scripted.calls) == 1  # no second candidate attempted
+    assert result.grabbed == 0
+    assert result.no_acceptable == 0  # NOT parked
+    assert result.grab_errors == 0  # NOT an operational error
+    assert result.last_grab_error is None
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.pending  # untouched
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+
+
+async def test_grab_attempts_capped_then_parks(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # More accepted releases than the cap, EVERY one a per-release failure: the
+    # worker attempts exactly MAX_GRAB_ATTEMPTS_PER_SCOPE of them (never the whole
+    # list) and then parks on the backoff. Proves the cap bounds grab attempts.
+    assert MAX_GRAB_ATTEMPTS_PER_SCOPE == 3
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(_many_good_candidates(MAX_GRAB_ATTEMPTS_PER_SCOPE + 2))
+    # Script more failures than the cap so a broken cap surfaces as a call-count
+    # mismatch (assertion) rather than an IndexError.
+    scripted = _ScriptedGrab(*(NoGrabSourceError(f"guid-{i}") for i in range(5)))
+    monkeypatch.setattr(auto_grab_service.grab_service, "grab", scripted)
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert len(scripted.calls) == MAX_GRAB_ATTEMPTS_PER_SCOPE  # capped, not all 5
+    assert result.grabbed == 0
+    assert result.no_acceptable == 1  # parked after the cap
+    assert result.grab_errors == 0
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
         assert row is not None

@@ -74,6 +74,7 @@ __all__ = [
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE",
     "BACKOFF_SCHEDULE",
     "DUE_SEARCH_STATUSES",
+    "MAX_GRAB_ATTEMPTS_PER_SCOPE",
     "AutograbCycleResult",
     "next_search_at",
     "run_grab_cycle",
@@ -111,6 +112,17 @@ BACKOFF_SCHEDULE: tuple[timedelta, ...] = (
 # search happened). A module constant for the beta (a web-config knob is a noted
 # follow-up), mirroring ``web/app.py``'s interval constants.
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
+
+# At most this many GRAB attempts per scope in one cycle. When the top-ranked
+# accepted release can't be grabbed for a PER-RELEASE reason (no usable source, or
+# its hash is already active for a different scope), the worker falls through to the
+# next-ranked accepted release rather than parking a still-grabbable scope behind
+# backoff. Bounded so a scope whose every candidate is ungrabbable can't monopolise
+# the grab loop (or hammer qBittorrent's add). This caps GRAB attempts ONLY -- the
+# per-cycle Prowlarr SEARCH cap (:data:`AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`) is
+# unaffected: one scope still costs exactly one search no matter how many of its
+# accepted releases are tried.
+MAX_GRAB_ATTEMPTS_PER_SCOPE: int = 3
 
 # NULL ``next_search_at`` ("due now") sorts ahead of any real timestamp; this
 # tz-aware minimum is its sort stand-in so a never-scheduled scope outranks a
@@ -310,10 +322,14 @@ async def run_grab_cycle(
 
     * skip it (no search) if it already has an active download -- avoids a wasted
       Prowlarr hit and never races ``grab_service``'s one-active guard;
-    * else search + decide via :func:`decision_service.preview`; if a release is
+    * else search + decide via :func:`decision_service.preview`; if any release is
       accepted, grab the top pick via :func:`grab_service.grab` (which drives the
-      scope to ``downloading`` and commits); if nothing is acceptable, park it at
-      ``no_acceptable_release`` and schedule the escalating backoff.
+      scope to ``downloading`` and commits), falling through to the next-ranked
+      accepted release -- bounded by :data:`MAX_GRAB_ATTEMPTS_PER_SCOPE` -- when the
+      top pick hits a PER-RELEASE grab failure ({``NoGrabSourceError``,
+      ``DownloadScopeConflictError``}); if nothing is acceptable, or every accepted
+      release is ungrabbable, park it at ``no_acceptable_release`` and schedule the
+      escalating backoff.
 
     A search that RAISES (Prowlarr unreachable / rate-limited -- the ``IndexerPort``
     contract raises rather than returning ``[]``) is NOT caught here: it propagates
@@ -377,12 +393,29 @@ async def run_grab_cycle(
             episodes=None,
         )
 
-        if result.accepted:
+        # Try the accepted releases in rank order until one grabs. Only the two
+        # PER-RELEASE failures {NoGrabSourceError, DownloadScopeConflictError} --
+        # neither of which leaves anything live to track -- fall through to the
+        # next-ranked candidate; every OTHER outcome settles the scope on the spot
+        # (a grab, an operational GrabError, or a concurrency/shape refusal), so a
+        # single top-pick hiccup never hides a grabbable lower-ranked release behind
+        # backoff. ``park_scope`` starts True and is cleared by any settling outcome;
+        # if it SURVIVES the loop -- because every attempted candidate hit a
+        # per-release failure (list exhausted or the attempt cap reached), or because
+        # ``accepted`` was empty (nothing found) -- the scope parks on the escalating
+        # backoff exactly as a nothing-acceptable search does. Bounded by
+        # ``MAX_GRAB_ATTEMPTS_PER_SCOPE`` so a scope whose every candidate is
+        # ungrabbable can't monopolise the grab loop; this caps GRAB attempts only --
+        # the per-cycle Prowlarr SEARCH cap already spent its one search above,
+        # regardless of how many candidates are tried here.
+        candidates = result.accepted[:MAX_GRAB_ATTEMPTS_PER_SCOPE]
+        park_scope = True
+        for attempt, scored in enumerate(candidates, start=1):
             try:
                 await grab_service.grab(
                     qbt,
                     session,
-                    scored=result.accepted[0],
+                    scored=scored,
                     request_id=scope.request_id,
                     tmdb_id=scope.tmdb_id,
                     year=year,
@@ -390,45 +423,49 @@ async def run_grab_cycle(
                     episodes=None,
                 )
                 grabbed += 1
+                park_scope = False
+                break
             except (
                 AlreadyDownloadingError,
                 RequestNotActiveError,
                 SeasonRequiredError,
             ) as exc:
-                # Concurrency/shape cases where the scope will NOT be re-selected
-                # next cycle, so leaving its schedule untouched cannot loop:
-                # ``AlreadyDownloadingError`` -> the scope now has an active
-                # download and is skipped BEFORE it costs a search; the two others
-                # -> the scope is terminal / mis-shaped and out of
-                # ``DUE_SEARCH_STATUSES`` (or rejected up front). Discard any
-                # partial write and leave the scope as-is -- never a crash of the
-                # whole cycle, never a secret in the log.
+                # Concurrency/shape cases that apply to the SCOPE, not this one
+                # release, so trying another candidate cannot help and the scope will
+                # NOT be re-selected next cycle: ``AlreadyDownloadingError`` -> the
+                # scope now has an active download and is skipped BEFORE it costs a
+                # search; the two others -> the scope is terminal / mis-shaped and out
+                # of ``DUE_SEARCH_STATUSES`` (or rejected up front). Discard any
+                # partial write, settle the scope (no park, no further candidates,
+                # no error), and leave its state as-is -- never a crash of the whole
+                # cycle, never a secret in the log.
                 await session.rollback()
+                park_scope = False
                 _logger.warning(
                     "auto-grab: grab refused (%s); leaving scope for a later cycle",
                     type(exc).__name__,
                     extra={"request_id": scope.request_id},
                 )
+                break
             except GrabError as exc:
                 # OPERATIONAL failure, NOT "nothing acceptable found": qBittorrent
                 # ACCEPTED the torrent but no info-hash could be derived (opaque URL,
                 # and the indexer supplied none either), so there is now a LIVE,
-                # untracked torrent and NO ``Download`` row. Parking this as
-                # ``no_acceptable_release`` (the prior behaviour) would both LIE about
-                # the state and mark the cycle clean while an orphan torrent silently
-                # consumes disk. Treat it exactly like a raised search instead: discard
-                # the partial write, leave the scope's request/season state COMPLETELY
-                # untouched (never write ``no_acceptable_release``), and hand the error
-                # up on the result so the caller records it on the ``AutograbStatus``
-                # health signal (TYPE only) and refuses to mark the cycle clean. Unlike
-                # a raised indexer search this does NOT abort the cycle -- the torrent
+                # untracked torrent and NO ``Download`` row. Settle the scope WITHOUT
+                # parking -- parking would both LIE about the state and mark the cycle
+                # clean while an orphan torrent silently consumes disk -- and WITHOUT
+                # trying another candidate: a live orphan PLUS a second grab would
+                # double-download. Discard the partial write, leave the scope's
+                # request/season state COMPLETELY untouched, and hand the error up on
+                # the result so the caller records it on the ``AutograbStatus`` health
+                # signal (TYPE only) and refuses to mark the cycle clean. Unlike a
+                # raised indexer search this does NOT abort the cycle -- the torrent
                 # reached a reachable qBittorrent (Prowlarr is fine), so a single bad
-                # grab must not starve every other due scope; continue to the next one.
-                # The scope stays due, so it IS re-attempted next tick -- the same retry
-                # cadence a raised search has (bounded by the per-cycle cap + ~60s tick),
-                # which is the honest cost of not lying about state; it is NOT the tight
-                # every-cycle loop the backoff ladder guards a nothing-acceptable scope
-                # against.
+                # grab must not starve every other due SCOPE; continue to the next
+                # scope. The scope stays due, so it IS re-attempted next tick -- the
+                # same retry cadence a raised search has, which is the honest cost of
+                # not lying about state; it is NOT the tight every-cycle loop the
+                # backoff ladder guards a nothing-acceptable scope against.
                 #
                 # NOTE: grab-side orphan cleanup -- removing the untracked torrent from
                 # qBittorrent when its info-hash cannot be derived -- is a deeper
@@ -436,6 +473,7 @@ async def run_grab_cycle(
                 # is deliberately OUT OF SCOPE here; this handler only stops the false
                 # park + false-clean cycle.
                 await session.rollback()
+                park_scope = False
                 _logger.warning(
                     "auto-grab: grab operational failure (%s); recording on health, "
                     "leaving scope unchanged",
@@ -444,6 +482,7 @@ async def run_grab_cycle(
                 )
                 grab_errors += 1
                 last_grab_error = exc
+                break
             except (
                 NoGrabSourceError,
                 DownloadScopeConflictError,
@@ -451,24 +490,29 @@ async def run_grab_cycle(
                 # A release WAS accepted but cannot be grabbed right now, and NOTHING
                 # is left live to track: no usable source (``NoGrabSourceError`` --
                 # raised BEFORE anything is handed to the client) or the same physical
-                # torrent is already active for a different scope
+                # torrent is already active for a DIFFERENT scope
                 # (``DownloadScopeConflictError`` -- a multi-season pack; the re-add is
-                # a qBittorrent no-op, so nothing is orphaned). Unlike the busy/terminal
-                # cases above, these scopes stay selectable AND immediately due, and the
-                # offending release keeps sorting first -- left untouched the worker
-                # would re-search Prowlarr and re-attempt every cycle FOREVER, defeating
-                # the single-Prowlarr load guard the backoff ladder exists for. Discard
-                # the partial write and park on the SAME escalating backoff as a
-                # nothing-acceptable search so the scope is not immediately due again.
+                # a qBittorrent no-op, so nothing is orphaned). Unlike the settling
+                # cases above, a LOWER-ranked accepted release may still be grabbable,
+                # so discard the partial write and fall through to the next candidate
+                # (do NOT ``break``). ``park_scope`` stays True, so an EXHAUSTED list
+                # (or the attempt cap) parks the scope on the SAME escalating backoff
+                # a nothing-acceptable search uses -- left un-parked with no grabbable
+                # alternative the worker would re-search Prowlarr and re-attempt every
+                # cycle FOREVER, defeating the single-Prowlarr load guard the backoff
+                # ladder exists for. Release titles are external Prowlarr text; the log
+                # deliberately carries only the exception TYPE + attempt counter (never
+                # the title), matching this module's other grab handlers.
                 await session.rollback()
                 _logger.warning(
-                    "auto-grab: grab unusable (%s); parking on backoff",
+                    "auto-grab: accepted release unusable (%s), attempt %d/%d; "
+                    "trying next accepted release",
                     type(exc).__name__,
+                    attempt,
+                    len(candidates),
                     extra={"request_id": scope.request_id},
                 )
-                await _park(session, request_repo, season_repo, scope, now)
-                no_acceptable += 1
-        else:
+        if park_scope:
             await _park(session, request_repo, season_repo, scope, now)
             no_acceptable += 1
 
