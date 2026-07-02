@@ -9,9 +9,9 @@ Prowlarr / TMDB api keys, qBittorrent password) are represented by a masked
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "AcceptedRelease",
@@ -23,7 +23,19 @@ __all__ = [
     "DiscoverListResponse",
     "DiscoverResult",
     "DiscoverSearchResponse",
+    "DiskResponse",
+    "DiskRootItem",
+    "EvictErrorItem",
+    "EvictResponse",
+    "EvictionCandidateItem",
+    "EvictionOutcomeItem",
     "GrabRequest",
+    "HealthResponse",
+    "KeepForeverBody",
+    "LiveLogRecordItem",
+    "LogEventItem",
+    "LogsResponse",
+    "LogsTailResponse",
     "PlexLibraryOption",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
@@ -32,6 +44,7 @@ __all__ = [
     "QualityProfileResponse",
     "QueueItem",
     "QueueResponse",
+    "ReconcileStatusItem",
     "RejectedRelease",
     "RequestListResponse",
     "RequestResponse",
@@ -43,6 +56,7 @@ __all__ = [
     "SettingsUpdate",
     "SetupCompleteRequest",
     "SetupStatusResponse",
+    "SubsystemHealthItem",
     "TmdbValidateRequest",
 ]
 
@@ -187,6 +201,20 @@ class SettingsResponse(BaseModel):
     tmdb_api_key: str | None = None
     movies_root: str | None = None
     tv_root: str | None = None
+    # Operability beta (ADR-0012) — the eviction/log-retention knobs from
+    # ``web.deps.KNOWN_SETTING_KEYS``. ``None`` means "unset" (the typed getters
+    # in ``web.deps`` — e.g. ``get_eviction_grace_days`` — fall back to their own
+    # safe default in that case; this response mirrors what is actually STORED,
+    # not the effective fallback, matching ``movies_root``/``tv_root`` above).
+    # Stored as plain-text ``settings.value`` strings; pydantic coerces the
+    # stored string into the typed field below on the way out.
+    disk_pressure_threshold_percent: float | None = None
+    disk_pressure_target_percent: float | None = None
+    eviction_grace_days: int | None = None
+    eviction_enabled: bool | None = None
+    eviction_proactive_enabled: bool | None = None
+    eviction_interval_minutes: float | None = None
+    log_retention_days: int | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -208,6 +236,47 @@ class SettingsUpdate(BaseModel):
     tmdb_api_key: str | None = Field(default=None)
     movies_root: str | None = Field(default=None)
     tv_root: str | None = Field(default=None)
+    # Operability beta (ADR-0012) — see ``SettingsResponse`` above for the wire
+    # semantics; bounded with ``ge``/``le`` so a malformed operator input is a
+    # visible 422, not a value that silently sails past ``web.deps``'s own
+    # unset/unparsable fallback (that fallback only guards a CORRUPT stored
+    # value, not a bad NEW value coming in over this endpoint).
+    disk_pressure_threshold_percent: float | None = Field(default=None, ge=0, le=100)
+    disk_pressure_target_percent: float | None = Field(default=None, ge=0, le=100)
+    eviction_grace_days: int | None = Field(default=None, ge=0)
+    eviction_enabled: bool | None = Field(default=None)
+    eviction_proactive_enabled: bool | None = Field(default=None)
+    eviction_interval_minutes: float | None = Field(default=None, gt=0)
+    log_retention_days: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _target_at_or_below_threshold(self) -> SettingsUpdate:
+        """Reject a target ABOVE the trigger threshold when both are set together.
+
+        ``select_evictions`` starts ``projected = used_pct`` and stops the moment
+        ``used_pct <= target_pct``. So a target above the threshold makes every root
+        in the ``[threshold, target]`` band read "under pressure" yet select NOTHING
+        — a valid-looking settings update that silently disables pressure relief. A
+        422 here makes that misconfiguration visible instead of a silent dead band.
+        (Enforced when both fields are present in the same request — which the
+        Settings form always sends together. A direct-API split update that changes
+        only ONE side against a stored other side is a SEPARATE, narrower window
+        this fast-path validator cannot see — it has no access to what is currently
+        persisted. That case is cross-checked against the STORED counterpart in
+        ``web.routers.settings._validate_disk_pressure_pair``, which the ``PUT``
+        endpoint runs before writing anything; this validator stays as the cheap,
+        no-DB-access fast path for the common both-sent case.)
+        """
+        threshold = self.disk_pressure_threshold_percent
+        target = self.disk_pressure_target_percent
+        if threshold is not None and target is not None and target > threshold:
+            msg = (
+                "disk_pressure_target_percent must be <= disk_pressure_threshold_percent "
+                "(a target above the trigger leaves the whole threshold-to-target band "
+                "under 'pressure' with nothing to evict)"
+            )
+            raise ValueError(msg)
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +384,10 @@ class RequestResponse(BaseModel):
     # for a movie (movies have no ``SeasonRequest`` rows). ``status`` above is the
     # COMPUTED fold of these (``domain.season_rollup.rollup_status``).
     seasons: list[SeasonStatus] | None = None
+    # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` will never
+    # select this title (or, for a show, any of its seasons) regardless of watch
+    # state or disk pressure. Toggled via ``POST /requests/{id}/keep-forever``.
+    keep_forever: bool = False
 
 
 class RequestListResponse(BaseModel):
@@ -491,3 +564,213 @@ class QualityProfileResponse(BaseModel):
     cutoff_name: str
     upgrade_allowed: bool
     items: list[QualityProfileItemResponse]
+
+
+# --------------------------------------------------------------------------- #
+# Ops — health / status dashboard (ADR-0012, Component 1)
+# --------------------------------------------------------------------------- #
+class SubsystemHealthItem(BaseModel):
+    """One upstream's reachability, as ``services.health_service.SubsystemHealth``
+    reports it. ``not_configured`` is honest -- never confused with ``down``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    status: Literal["ok", "degraded", "down", "not_configured"]
+    detail: str | None = None
+    checked_at: datetime
+
+
+class DiskGaugeItem(BaseModel):
+    """One configured library root's usage snapshot (health dashboard gauge)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    root: str
+    path: str
+    total_bytes: int
+    available_bytes: int
+    used_percent: float
+    error: str | None = None
+
+
+class ReconcileStatusItem(BaseModel):
+    """The background reconcile loop's own health, mirrored from
+    ``services.health_service.ReconcileStatusSnapshot``. Deliberately separate
+    from the subsystem cards above -- a cycle can complete OK even while one
+    upstream inside it degraded (see that class's docstring)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    last_run_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error_type: str | None = None
+    last_error_at: datetime | None = None
+    consecutive_failures: int = 0
+
+
+class HealthResponse(BaseModel):
+    """``GET /api/v1/ops/health`` -- one read answering "is every subsystem
+    healthy, is the reconcile loop running, how full is the disk"."""
+
+    model_config = ConfigDict(frozen=True)
+
+    subsystems: list[SubsystemHealthItem]
+    disks: list[DiskGaugeItem]
+    reconcile: ReconcileStatusItem
+
+
+# --------------------------------------------------------------------------- #
+# Ops — log / console viewer (ADR-0012, Component 2)
+# --------------------------------------------------------------------------- #
+class LogEventItem(BaseModel):
+    """One durably-stored ``log_events`` row, as the log viewer / export reads it.
+
+    ``context`` carries correlation ids (``request_id``/``download_id``/
+    ``tmdb_id``) set at the log call site -- never a secret-bearing field (see
+    ``models.LogEvent``)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    created_at: datetime
+    level: str
+    logger: str
+    message: str
+    context: dict[str, Any] | None = None
+
+
+class LogsResponse(BaseModel):
+    """A filtered, paginated page of ``GET /api/v1/ops/logs``.
+
+    ``total`` is the count of rows matching the filter (not the whole table),
+    so the client can tell whether more pages exist beyond ``events``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total: int
+    events: list[LogEventItem]
+
+
+class LiveLogRecordItem(BaseModel):
+    """One entry from the in-memory, all-levels live tail ring buffer.
+
+    Unlike :class:`LogEventItem`, this has no durable row id -- the ring buffer
+    is lost on restart and never persisted (only INFO-and-above reaches
+    ``log_events``; this endpoint shows EVERY level, including DEBUG)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    created_at: datetime
+    level: str
+    logger: str
+    message: str
+    context: dict[str, Any] | None = None
+
+
+class LogsTailResponse(BaseModel):
+    """``GET /api/v1/ops/logs/tail`` -- the live ring buffer, newest first.
+
+    ``dropped_count`` is the capture handler's own honest signal: how many
+    INFO+ records could not be enqueued for durable storage since startup
+    because the drain queue was full (the ring buffer itself is unaffected --
+    see ``LogCaptureHandler``'s docstring)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    events: list[LiveLogRecordItem]
+    dropped_count: int
+
+
+# --------------------------------------------------------------------------- #
+# Ops — disk-pressure eviction (ADR-0012, Component 3)
+# --------------------------------------------------------------------------- #
+class EvictionCandidateItem(BaseModel):
+    """One title/season a pressure sweep WOULD evict (the ``GET /ops/disk``
+    preview), or one it DID evict (a ``POST /ops/evict`` outcome shares this
+    shape's fields, see :class:`EvictionOutcomeItem`)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: int
+    media_type: MediaTypeField
+    title: str
+    season: int | None = None
+    status: str
+    last_viewed_at: datetime | None = None
+    size_percent: float
+    library_path: str | None = None
+
+
+class DiskRootItem(BaseModel):
+    """One configured library root's usage + its ranked eviction preview."""
+
+    model_config = ConfigDict(frozen=True)
+
+    root: str
+    path: str
+    total_bytes: int
+    available_bytes: int
+    used_percent: float
+    error: str | None = None
+    candidates: list[EvictionCandidateItem]
+
+
+class DiskResponse(BaseModel):
+    """``GET /api/v1/ops/disk`` -- usage + a ranked eviction-candidate preview
+    per configured root."""
+
+    model_config = ConfigDict(frozen=True)
+
+    roots: list[DiskRootItem]
+
+
+class EvictionOutcomeItem(BaseModel):
+    """One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted."""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: int
+    media_type: MediaTypeField
+    title: str
+    season: int | None = None
+    library_path: str
+    freed_bytes: int | None = None
+
+
+class EvictErrorItem(BaseModel):
+    """One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --
+    a LATER root raising (e.g. a transient Plex error resolving TV watch
+    state) must never hide an EARLIER root's evictions that already deleted
+    files and committed (honesty over silence: partial progress is surfaced,
+    not swallowed behind a 500)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    root: Literal["movies_root", "tv_root"]
+    detail: str
+
+
+class EvictResponse(BaseModel):
+    """The result of a manual disk-pressure sweep (north-star #1: a button that
+    frees space on demand). Empty ``evicted`` is a normal, honest outcome (no
+    root was under pressure, or nothing was eligible). ``errors`` is populated
+    per-root when THAT root's own sweep raised -- every other root's outcome
+    in ``evicted`` still stands; the sweep never aborts one root's already
+    committed work just because a sibling root failed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    evicted: list[EvictionOutcomeItem]
+    errors: list[EvictErrorItem] = Field(default_factory=list[EvictErrorItem])
+
+
+# --------------------------------------------------------------------------- #
+# Requests — keep-forever pin (ADR-0012)
+# --------------------------------------------------------------------------- #
+class KeepForeverBody(BaseModel):
+    """``POST /api/v1/requests/{id}/keep-forever`` -- set or clear the pin."""
+
+    model_config = ConfigDict(frozen=True)
+
+    keep_forever: bool

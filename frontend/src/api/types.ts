@@ -45,5 +45,27 @@ export type ProwlarrValidateRequest = Schemas['ProwlarrValidateRequest']
 export type QbittorrentValidateRequest = Schemas['QbittorrentValidateRequest']
 export type TmdbValidateRequest = Schemas['TmdbValidateRequest']
 
+export type KeepForeverBody = Schemas['KeepForeverBody']
+
+/* ------------------------------------------------------------------- ops -- */
+// ADR-0012 — health/status dashboard, log viewer, disk-pressure eviction.
+
+export type HealthResponse = Schemas['HealthResponse']
+export type SubsystemHealthItem = Schemas['SubsystemHealthItem']
+export type DiskGaugeItem = Schemas['DiskGaugeItem']
+export type ReconcileStatusItem = Schemas['ReconcileStatusItem']
+
+export type LogEventItem = Schemas['LogEventItem']
+export type LogsResponse = Schemas['LogsResponse']
+export type LiveLogRecordItem = Schemas['LiveLogRecordItem']
+export type LogsTailResponse = Schemas['LogsTailResponse']
+
+export type EvictionCandidateItem = Schemas['EvictionCandidateItem']
+export type DiskRootItem = Schemas['DiskRootItem']
+export type DiskResponse = Schemas['DiskResponse']
+export type EvictionOutcomeItem = Schemas['EvictionOutcomeItem']
+export type EvictErrorItem = Schemas['EvictErrorItem']
+export type EvictResponse = Schemas['EvictResponse']
+
 /** `media_type` is a free string in the contract; the UI only ever sets these. */
 export type MediaType = 'movie' | 'tv'

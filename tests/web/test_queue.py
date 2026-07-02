@@ -636,6 +636,38 @@ async def test_grab_terminal_request_returns_409_and_adds_nothing(
     assert rows == []
 
 
+async def test_grab_evicted_request_returns_409_and_adds_nothing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """C2 regression: an ``evicted`` request id (ADR-0012's disk-pressure sweep
+    already deleted the file) is refused exactly like any other terminal
+    status -- an honest 409 request_not_active, nothing handed to the client."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        request.status = RequestStatus.evicted
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "request_not_active"
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert rows == []
+
+
 async def test_grab_terminal_request_with_empty_preview_stays_terminal(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:

@@ -210,3 +210,22 @@ async def test_mark_completed_and_mark_available(session: AsyncSession) -> None:
     fetched = await repo.get(created.id)
     assert fetched is not None
     assert fetched.status == "available"
+
+
+async def test_library_path_defaults_none_and_round_trips(session: AsyncSession) -> None:
+    """Mirrors ``RequestRepository``'s breadcrumb (ADR-0012), one season at a time."""
+    show = await _make_show(session)
+    repo = SqlSeasonRequestRepository(session)
+    created = await repo.ensure(show.id, 1, status="downloading")
+    assert created.library_path is None
+
+    await repo.set_library_path(created.id, "/data/library/tv/Show/Season 01")
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.library_path == "/data/library/tv/Show/Season 01"
+
+
+async def test_set_library_path_missing_row_raises(session: AsyncSession) -> None:
+    repo = SqlSeasonRequestRepository(session)
+    with pytest.raises(LookupError):
+        await repo.set_library_path(999, "/data/library/tv/Ghost/Season 01")

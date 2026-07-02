@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.db import get_session
@@ -18,6 +18,8 @@ from plex_manager.web.deps import (
     SECRET_MASK,
     SECRET_SETTING_KEYS,
     SettingsStore,
+    get_disk_pressure_target_percent,
+    get_disk_pressure_threshold_percent,
     get_library,
     require_api_key,
 )
@@ -35,6 +37,23 @@ router = APIRouter(
 
 async def _redacted(store: SettingsStore) -> SettingsResponse:
     return SettingsResponse.model_validate(await store.redacted())
+
+
+def _to_stored_string(value: object) -> str:
+    """Render an incoming ``SettingsUpdate`` field value as the plain-text string
+    :meth:`SettingsStore.set` persists (``settings.value`` has no typed columns).
+
+    Booleans render lowercase (``"true"``/``"false"``) to match this codebase's
+    own convention for the setting (see ``web.deps._TRUE_STRINGS`` and the
+    eviction tests that seed ``store.set("eviction_enabled", "true")`` directly)
+    rather than Python's capitalized ``str(True)`` -- both round-trip correctly
+    through ``web.deps``'s case-insensitive parse, but the lowercase form is
+    the one actually written elsewhere, so a raw DB read stays consistent
+    regardless of which path wrote the value.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value if isinstance(value, str) else str(value)
 
 
 @router.get("")
@@ -73,7 +92,18 @@ async def put_settings_endpoint(
     the whole object back (e.g. after editing only ``plex_url``) must not clobber
     the real credential with the mask — a silent secret-wipe that would only
     surface later as an auth failure to the downstream service.
+
+    The disk-pressure pair is cross-checked against the EFFECTIVE (post-update)
+    values, not just what this one request happens to carry: ``SettingsUpdate``'s
+    own ``model_validator`` only catches a target above the threshold when BOTH
+    are submitted together, but ``PUT`` is a PARTIAL update — sending just one
+    side against an already-stored (and now-inverted) other side would otherwise
+    silently leave the whole threshold-to-target band unable to relieve pressure
+    (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
+    Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
     """
+    await _validate_disk_pressure_pair(body, session)
+
     store = SettingsStore(session)
     for field in body.model_fields_set:
         value = getattr(body, field)
@@ -81,6 +111,46 @@ async def put_settings_endpoint(
             continue
         if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
             continue
-        await store.set(field, value)
+        await store.set(field, _to_stored_string(value))
     await session.commit()
     return await _redacted(store)
+
+
+async def _validate_disk_pressure_pair(body: SettingsUpdate, session: AsyncSession) -> None:
+    """422 when the EFFECTIVE (threshold, target) pair would be inverted.
+
+    "Effective" means: this request's submitted value for a side, when it
+    actually supplies one (present in ``model_fields_set`` AND non-``null`` —
+    mirroring ``put_settings_endpoint``'s own persist loop, which treats a
+    ``null`` field as "leave unchanged", never as "clear to null"); otherwise
+    whatever is CURRENTLY STORED for that side (via the same typed getters the
+    eviction sweep itself reads, so this check reasons about the identical
+    effective values the sweep would see after this PUT commits). Catches the
+    single-field split-update ``SettingsUpdate._target_at_or_below_threshold``
+    documents as its known residual: e.g. a stored target of 80 plus a PUT
+    naming only ``disk_pressure_threshold_percent=70`` would otherwise leave
+    ``target(80) > threshold(70)`` in effect, with nothing else ever
+    cross-checking it.
+    """
+    fields = body.model_fields_set
+    threshold = (
+        body.disk_pressure_threshold_percent
+        if "disk_pressure_threshold_percent" in fields
+        and body.disk_pressure_threshold_percent is not None
+        else await get_disk_pressure_threshold_percent(session)
+    )
+    target = (
+        body.disk_pressure_target_percent
+        if "disk_pressure_target_percent" in fields
+        and body.disk_pressure_target_percent is not None
+        else await get_disk_pressure_target_percent(session)
+    )
+    if target > threshold:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "disk_pressure_target_percent must be <= disk_pressure_threshold_percent "
+                "(a target above the trigger leaves the whole threshold-to-target band "
+                "under 'pressure' with nothing to evict)"
+            ),
+        )

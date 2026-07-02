@@ -6,22 +6,30 @@ P2 SQLAlchemy implementations map ORM rows to and from them. Status fields are
 plain ``str`` to avoid coupling to the (separately owned) state-machine enum.
 
 Method sets are intentionally minimal — sufficient for the alpha pipeline
-(create request -> grab -> reconcile -> blocklist) and nothing more.
+(create request -> grab -> reconcile -> blocklist) and nothing more; the
+operability beta (ADR-0012) adds exactly what its three features need: the
+``library_path``/``keep_forever`` breadcrumb + pin on the request/season repos,
+and the ``LogEvent`` repository backing the durable, LLM-diagnosable log store.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "LOG_EVENT_CORRELATION_KEYS",
     "BlocklistRecord",
     "BlocklistRepository",
     "DownloadRecord",
     "DownloadRepository",
+    "LogEventCreate",
+    "LogEventPage",
+    "LogEventRecord",
+    "LogEventRepository",
     "RequestRecord",
     "RequestRepository",
     "SeasonRequestRecord",
@@ -44,6 +52,13 @@ class RequestRecord(BaseModel):
     user_id: int | None = None
     poster_url: str | None = None
     backdrop_url: str | None = None
+    # The final placed path the importer wrote this movie into (ADR-0012) --
+    # ``None`` until import/availability time sets it (or for a tv rollup row,
+    # where the breadcrumb lives per-season on ``SeasonRequestRecord`` instead).
+    library_path: str | None = None
+    # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` must never
+    # select this title, regardless of watch state or disk pressure.
+    keep_forever: bool = False
 
 
 class DownloadRecord(BaseModel):
@@ -86,6 +101,9 @@ class SeasonRequestRecord(BaseModel):
     season_number: int
     status: str
     tmdb_id: int
+    # The per-season mirror of ``RequestRecord.library_path`` (ADR-0012): the
+    # final placed path this season's import wrote into, ``None`` until set.
+    library_path: str | None = None
 
 
 class BlocklistRecord(BaseModel):
@@ -102,6 +120,58 @@ class BlocklistRecord(BaseModel):
     protocol: str | None = None
     media_type: str | None = None
     added_at: datetime | None = None
+
+
+class LogEventRecord(BaseModel):
+    """A captured log record as the log viewer / export reads it (ADR-0012).
+
+    ``context`` carries correlation ids (e.g. ``request_id`` / ``download_id`` /
+    ``tmdb_id``) set at the log call site -- see ``models.LogEvent`` for the full
+    rationale. Never a secret-bearing field: the capture pipeline and every call
+    site logging into it are responsible for that, this DTO just carries it
+    through unexamined.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    created_at: datetime
+    level: str
+    logger: str
+    message: str
+    context: dict[str, Any] | None = None
+
+
+class LogEventCreate(BaseModel):
+    """One record to persist -- the unit :meth:`LogEventRepository.create_many`
+    batch-inserts.
+
+    ``created_at`` is the ORIGINAL time the underlying ``logging.LogRecord`` was
+    emitted (``record.created``), not the time the drain task happens to flush
+    it -- a batch can hold several records emitted seconds apart, and losing that
+    distinction would misorder an export's reconstructed trail.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    created_at: datetime
+    level: str
+    logger: str
+    message: str
+    context: dict[str, Any] | None = None
+
+
+class LogEventPage(BaseModel):
+    """One page of :meth:`LogEventRepository.list_events` results.
+
+    ``total`` is the count of rows matching the filter (not the whole table), so
+    a caller can tell whether more pages exist beyond ``results``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    total: int
+    results: list[LogEventRecord]
 
 
 @runtime_checkable
@@ -145,6 +215,18 @@ class RequestRepository(Protocol):
     async def set_status(self, request_id: int, status: str) -> None:
         """Update a request's status."""
 
+    async def set_status_if_in(
+        self, request_id: int, status: str, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+
+        Returns whether the row was actually updated -- ``False`` means a
+        genuinely concurrent writer already moved it elsewhere. The eviction
+        sweep's authoritative double-count guard (ADR-0012, C6): see
+        ``SqlRequestRepository.set_status_if_in``'s docstring.
+        """
+        raise NotImplementedError
+
     async def mark_completed(self, request_id: int) -> None:
         """Mark a request ``completed`` (imported, scan triggered) + stamp the time.
 
@@ -158,6 +240,44 @@ class RequestRepository(Protocol):
 
         Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
         the title — never asserts watchable before Plex actually has it.
+        """
+        raise NotImplementedError
+
+    async def set_library_path(self, request_id: int, library_path: str) -> None:
+        """Store the final placed path this request's import wrote into (ADR-0012).
+
+        Set once at import/availability time and never reconstructed later — the
+        disk-pressure eviction sweep ``fs.delete()``s exactly this path, so a
+        wrong or stale value here would misdirect (or silently skip) an eviction.
+        """
+        raise NotImplementedError
+
+    async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:
+        """Set the operator's "keep forever" pin (ADR-0012).
+
+        ``True`` means ``domain/eviction.py`` must never select this title,
+        regardless of watch state or disk pressure; the toggle endpoint passes
+        the desired value directly rather than this method inferring a flip, so a
+        double-submit (e.g. a retried request) is idempotent.
+        """
+        raise NotImplementedError
+
+    async def set_keep_forever_for_title(
+        self, tmdb_id: int, media_type: str, keep_forever: bool
+    ) -> None:
+        """Set the pin on EVERY ``MediaRequest`` row for this ``(tmdb_id,
+        media_type)``, not just one (ADR-0012).
+
+        ``uq_media_requests_active`` only constrains ACTIVE rows, so a title
+        commonly has several rows over its lifetime -- e.g. an older SETTLED
+        ``available`` request covering seasons 1-2 and a newer ACTIVE request
+        for season 3. ``domain/eviction.py``'s ``_season_candidates`` reads
+        ``keep_forever`` off EACH season's OWN parent row, so pinning only the
+        one row the UI resolved to (the active one) would leave the settled
+        sibling's seasons unpinned and still evictable after the operator
+        believes they pinned the whole show. Keep-forever is a per-TITLE
+        intent, so this updates every row sharing the key, symmetric for both
+        pin and unpin.
         """
         raise NotImplementedError
 
@@ -296,6 +416,16 @@ class SeasonRequestRepository(Protocol):
         """Update a season request's status."""
         raise NotImplementedError
 
+    async def set_status_if_in(
+        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+
+        The season-granularity mirror of ``RequestRepository.set_status_if_in``;
+        see ``SqlSeasonRequestRepository.set_status_if_in``'s docstring.
+        """
+        raise NotImplementedError
+
     async def mark_completed(self, season_request_id: int) -> None:
         """Mark a season ``completed`` (imported, scan triggered).
 
@@ -312,6 +442,14 @@ class SeasonRequestRepository(Protocol):
         Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
         the season (``leafCount>0``) -- never asserts watchable before Plex
         actually has it.
+        """
+        raise NotImplementedError
+
+    async def set_library_path(self, season_request_id: int, library_path: str) -> None:
+        """Store the final placed path this season's import wrote into (ADR-0012).
+
+        The per-season mirror of :meth:`RequestRepository.set_library_path` --
+        same "set once, never reconstruct" rule, same eviction target.
         """
         raise NotImplementedError
 
@@ -357,3 +495,83 @@ class BlocklistRepository(Protocol):
 
     async def delete(self, blocklist_id: int) -> None:
         """Remove a blocklist entry (operator un-blocklist)."""
+
+
+# Correlation keys a log record's ``context_json`` may carry (ADR-0012). Shared
+# between the repository implementation's WHERE clause and any caller building a
+# ``context`` dict, so "what counts as a correlation id" has exactly one
+# definition.
+LOG_EVENT_CORRELATION_KEYS: tuple[str, ...] = ("request_id", "download_id", "tmdb_id")
+
+
+@runtime_checkable
+class LogEventRepository(Protocol):
+    """Persistence for captured log records (ADR-0012's LLM-diagnosable log store).
+
+    Populated by the capture pipeline's background drain task ONLY -- never
+    written to from the synchronous logging handler itself (that would block or
+    re-enter the event loop). See ``models.LogEvent`` for the full rationale.
+    """
+
+    async def create(
+        self,
+        *,
+        level: str,
+        logger: str,
+        message: str,
+        created_at: datetime | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> LogEventRecord:
+        """Insert one log record and return the persisted row.
+
+        ``created_at`` defaults to ``None``, letting the database stamp
+        ``now()`` (``LogEvent.created_at``'s ``server_default``) -- pass it
+        explicitly to preserve an already-elapsed record's original emission
+        time (as :meth:`create_many` always does for the drain task's batch).
+        """
+        raise NotImplementedError
+
+    async def create_many(self, events: Sequence[LogEventCreate]) -> None:
+        """Batch-insert every record in ``events`` in one round trip.
+
+        The drain task's write path: a burst of INFO+ records queued between
+        drain ticks costs one INSERT, not one per record. A no-op for an empty
+        sequence -- the drain task calls this unconditionally on every tick
+        whether or not anything queued, so this must never fail on "nothing to
+        insert".
+        """
+        raise NotImplementedError
+
+    async def list_events(
+        self,
+        *,
+        level: str | None = None,
+        since: datetime | None = None,
+        logger: str | None = None,
+        correlation_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> LogEventPage:
+        """Return a page of log records, newest first, optionally filtered.
+
+        ``level`` matches the exact stored level name (e.g. ``"ERROR"``) --
+        mirrors the plain-string status filters elsewhere in this module, no
+        severity ordering is baked in here. ``since`` is an inclusive lower bound
+        on ``created_at``. ``logger`` matches the exact stored logger name.
+        ``correlation_id`` matches a record whose ``context_json`` carries this
+        value (compared as a string) under ANY of :data:`LOG_EVENT_CORRELATION_KEYS`
+        -- the same identifiers ``GET /ops/logs/export`` assembles one trail for.
+        ``limit``/``offset`` page the (already filtered) result set; ``total`` on
+        the returned page is the filtered count, not the whole table's.
+        """
+        raise NotImplementedError
+
+    async def prune_older_than(self, cutoff: datetime) -> int:
+        """Delete every record with ``created_at < cutoff``; return the count removed.
+
+        The retention sweep's bounded-growth mechanism (the web-editable
+        ``log_retention_days`` setting) -- honesty over silence still applies
+        here: this never masks a failure, and the real count lets the sweep log
+        what it actually did rather than assuming success.
+        """
+        raise NotImplementedError

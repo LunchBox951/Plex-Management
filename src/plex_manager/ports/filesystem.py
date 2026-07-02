@@ -75,3 +75,40 @@ class FileSystemPort(Protocol):
         directory (a season pack or a whole-show download).
         """
         raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        """Delete ``path`` (a file or a whole directory tree) from local disk.
+
+        The disk-pressure eviction sweep's ONLY write operation (ADR-0012): it is
+        the sole caller, always with a title's/season's stored ``library_path``
+        breadcrumb, never a reconstructed-from-naming guess. Implementations MUST
+        refuse (raise, never silently ignore) a ``path`` that does not resolve
+        within one of the app's configured library roots -- eviction must never
+        be able to delete an arbitrary filesystem path, mirroring the symlink-
+        escape containment ``LocalFileSystem`` already applies to imports. A
+        ``path`` that does not exist is a no-op, not an error: an eviction retried
+        after a previous partial success (or a breadcrumb pointing at something
+        already removed out-of-band) must not fail honestly-idempotent cleanup.
+        """
+        raise NotImplementedError
+
+    def reclaimable_bytes(self, path: str) -> int:
+        """Return how many bytes deleting ``path`` would ACTUALLY reclaim right now.
+
+        Hardlink-aware (ADR-0012's eviction freed-bytes accounting): for a
+        same-filesystem import, ``hardlink_or_copy`` prefers a hardlink over a
+        copy, and the import finalizes WITHOUT removing the download-client's
+        seed source -- so the placed library file often has ``st_nlink > 1``.
+        Deleting only the library copy in that case frees NOTHING (the inode's
+        bytes stay allocated via the other link), so such a file MUST report
+        ``0``, never its full size. A file with no other link (``st_nlink <= 1``)
+        reports its real size. For a directory (a TV season), this walks it and
+        sums only the files whose OWN link count is ``<= 1`` -- a season can mix
+        hardlinked and not-yet-shared files. A missing ``path``, or any
+        underlying stat error, contributes ``0`` (best-effort honesty, mirroring
+        the eviction service's own "unknown size" fallback) rather than raising.
+        Read-only: never deletes anything itself, and (unlike :meth:`delete`) is
+        not fenced to a configured library root -- callers only ever pass an
+        already-trusted, stored breadcrumb.
+        """
+        raise NotImplementedError

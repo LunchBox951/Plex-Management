@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from plex_manager.adapters.filesystem import LocalFileSystem
+from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
 
 
 def test_available_bytes_is_positive(tmp_path: Path) -> None:
@@ -300,3 +300,231 @@ def test_list_video_files_allows_symlinked_downloads_parent(tmp_path: Path) -> N
     assert Path(abs_path) == (release / "Show.S01E01.mkv").resolve()
     assert size == 1000
     assert rel == os.path.join("Season 01", "Show.S01E01.mkv")
+
+
+# --------------------------------------------------------------------------- #
+# delete — root-guarded eviction removal (ADR-0012)
+# --------------------------------------------------------------------------- #
+def test_delete_removes_file_within_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    target = root / "Some Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(target))
+
+    assert not target.exists()
+
+
+def test_delete_removes_directory_tree_within_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "tv"
+    root.mkdir()
+    season_dir = root / "Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+    (season_dir / "Show.S01E02.mkv").write_bytes(b"x" * 200)
+
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(season_dir))
+
+    assert not season_dir.exists()
+    assert (root / "Show").exists()  # only the season dir is removed, not its parent
+
+
+def test_delete_missing_path_is_a_noop(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    already_gone = root / "Removed Movie" / "movie.mkv"
+
+    # Must not raise: a retried eviction (or a breadcrumb pointing at something
+    # already removed out-of-band) is idempotent, not a failure.
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(already_gone))
+
+
+def test_delete_raises_when_no_root_is_configured(tmp_path: Path) -> None:
+    target = tmp_path / "movie.mkv"
+    target.write_bytes(b"x" * 10)
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem().delete(os.fspath(target))
+
+    assert target.exists()  # refused, never deleted
+
+
+def test_delete_raises_for_path_outside_every_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside = tmp_path / "outside" / "movie.mkv"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x" * 10)
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem([os.fspath(root)]).delete(os.fspath(outside))
+
+    assert outside.exists()  # refused, never deleted
+
+
+def test_delete_raises_for_missing_path_outside_every_configured_root(tmp_path: Path) -> None:
+    # A path outside every root is refused REGARDLESS of whether it exists -- a
+    # caller bug (wrong/misconfigured breadcrumb) must be surfaced loudly, never
+    # swallowed as a harmless no-op just because there happens to be nothing there.
+    root = tmp_path / "movies"
+    root.mkdir()
+    missing_outside = tmp_path / "outside" / "movie.mkv"
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem([os.fspath(root)]).delete(os.fspath(missing_outside))
+
+
+def test_delete_rejects_symlink_escaping_the_configured_root(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.mkv"
+    secret.write_bytes(b"x" * 10)
+    # A symlink INSIDE the configured root that points OUTSIDE it -- the realpath
+    # containment check must catch this even though the nominal path is textually
+    # under the root, mirroring the symlink-escape guard the import scan uses.
+    escaping_link = root / "escape.mkv"
+    os.symlink(secret, escaping_link)
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        LocalFileSystem([os.fspath(root)]).delete(os.fspath(escaping_link))
+
+    assert secret.exists()  # the real target outside the root is untouched
+
+
+def test_delete_removes_a_symlink_breadcrumb_without_touching_its_target(
+    tmp_path: Path,
+) -> None:
+    """R4-4: a stored ``library_path`` that turns out to be a SYMLINK (rather
+    than the real placed file) -- pointing at ANOTHER title's real content,
+    also inside the configured root -- must have only the symlink entry
+    removed. Before the fix, ``delete`` resolved the symlink to its realpath
+    and deleted THAT (the other title's actual file), leaving the symlink
+    breadcrumb itself dangling and destroying unrelated library data."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    real_target = root / "Other Movie (2020)" / "movie.mkv"
+    real_target.parent.mkdir(parents=True)
+    real_target.write_bytes(b"x" * 100)
+    # A breadcrumb that is a symlink INSIDE the root, pointing at a DIFFERENT
+    # (also in-root) title's real file -- both sides pass containment.
+    breadcrumb = root / "Some Movie (2020)" / "movie.mkv"
+    breadcrumb.parent.mkdir(parents=True)
+    os.symlink(real_target, breadcrumb)
+
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(breadcrumb))
+
+    assert not os.path.lexists(breadcrumb)  # the symlink entry itself is gone
+    assert real_target.exists()  # the OTHER title's real content is untouched
+    assert real_target.read_bytes() == b"x" * 100
+
+
+def test_delete_works_across_multiple_configured_roots(tmp_path: Path) -> None:
+    movies_root = tmp_path / "movies"
+    tv_root = tmp_path / "tv"
+    movies_root.mkdir()
+    tv_root.mkdir()
+    movie = movies_root / "movie.mkv"
+    movie.write_bytes(b"x" * 10)
+    episode = tv_root / "Show" / "episode.mkv"
+    episode.parent.mkdir(parents=True)
+    episode.write_bytes(b"x" * 10)
+
+    fs = LocalFileSystem([os.fspath(movies_root), os.fspath(tv_root)])
+    fs.delete(os.fspath(movie))
+    fs.delete(os.fspath(episode.parent))
+
+    assert not movie.exists()
+    assert not episode.parent.exists()
+
+
+def test_adapter_delete_conforms_to_filesystem_port() -> None:
+    from plex_manager.ports.filesystem import FileSystemPort
+
+    assert isinstance(LocalFileSystem(), FileSystemPort)
+
+
+# --------------------------------------------------------------------------- #
+# reclaimable_bytes — hardlink-aware freed-bytes accounting (R4-6, ADR-0012)
+# --------------------------------------------------------------------------- #
+def test_reclaimable_bytes_reports_full_size_for_a_single_link_file(tmp_path: Path) -> None:
+    target = tmp_path / "movie.mkv"
+    target.write_bytes(b"x" * 500)
+
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(target)) == 500
+
+
+def test_reclaimable_bytes_reports_zero_for_a_file_with_another_hard_link(tmp_path: Path) -> None:
+    # A same-filesystem import (hardlink_or_copy) can leave the placed library
+    # file with another hard link still present -- e.g. the download client's
+    # own seed copy, never removed at import finalize. Deleting only THIS path
+    # would free nothing: the inode's bytes stay allocated via the other link.
+    target = tmp_path / "movie.mkv"
+    target.write_bytes(b"x" * 500)
+    other_link = tmp_path / "seed" / "movie.mkv"
+    other_link.parent.mkdir()
+    os.link(target, other_link)
+
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(target)) == 0
+
+
+def test_reclaimable_bytes_for_a_directory_sums_only_single_link_files(tmp_path: Path) -> None:
+    season_dir = tmp_path / "Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    single_link = season_dir / "Show.S01E01.mkv"
+    single_link.write_bytes(b"x" * 300)
+    hardlinked = season_dir / "Show.S01E02.mkv"
+    hardlinked.write_bytes(b"x" * 700)
+    seed_copy = tmp_path / "seed" / "Show.S01E02.mkv"
+    seed_copy.parent.mkdir()
+    os.link(hardlinked, seed_copy)
+
+    # Only E01 (single-link, 300 bytes) is actually reclaimable; E02's bytes
+    # stay allocated via its other hard link.
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(season_dir)) == 300
+
+
+def test_reclaimable_bytes_is_zero_for_a_missing_path(tmp_path: Path) -> None:
+    missing = tmp_path / "already-gone.mkv"
+
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(missing)) == 0
+
+
+def test_reclaimable_bytes_is_zero_for_a_symlink_to_a_real_file(tmp_path: Path) -> None:
+    # R5-2: a stored library_path can be a symlink to a single-linked file.
+    # delete() only ever unlinks the symlink entry itself (never dereferences
+    # it), so accounting must match: reclaiming a symlink frees ~nothing, NOT
+    # the target's size (os.path.isfile/os.stat both follow symlinks, which is
+    # exactly the bug -- they must never be trusted directly on `path`).
+    real_target = tmp_path / "real" / "movie.mkv"
+    real_target.parent.mkdir()
+    real_target.write_bytes(b"x" * 900)
+    link_path = tmp_path / "library" / "movie.mkv"
+    link_path.parent.mkdir()
+    os.symlink(real_target, link_path)
+
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(link_path)) == 0
+
+
+def test_reclaimable_bytes_for_a_directory_skips_a_symlinked_file(tmp_path: Path) -> None:
+    # A season dir can contain a symlinked episode alongside real files (e.g. a
+    # breadcrumb pointing at content actually stored elsewhere). Only the real,
+    # single-linked files are reclaimable; the symlinked entry contributes 0
+    # bytes, matching that shutil.rmtree unlinks the link rather than freeing
+    # whatever it points at.
+    season_dir = tmp_path / "Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    single_link = season_dir / "Show.S01E01.mkv"
+    single_link.write_bytes(b"x" * 300)
+    real_target = tmp_path / "elsewhere" / "Show.S01E02.mkv"
+    real_target.parent.mkdir()
+    real_target.write_bytes(b"x" * 900)
+    symlinked_episode = season_dir / "Show.S01E02.mkv"
+    os.symlink(real_target, symlinked_episode)
+
+    # Only E01 (300 bytes, real single-linked file) counts; the symlinked E02
+    # must NOT contribute its target's 900 bytes.
+    assert LocalFileSystem().reclaimable_bytes(os.fspath(season_dir)) == 300

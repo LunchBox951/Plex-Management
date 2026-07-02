@@ -9,6 +9,7 @@ real bytes.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -31,8 +32,9 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.library import WatchState
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import queue_service
+from plex_manager.services import eviction_service, queue_service
 from plex_manager.services.import_service import (
     import_download,
     run_availability_cycle,
@@ -142,6 +144,72 @@ async def test_import_happy_path_places_file_scans_and_marks_completed(
         assert request.completed_at is not None
 
 
+async def test_import_persists_library_path_and_a_later_sweep_reclaims_it(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """C1 regression: import finalize must persist ``MediaRequest.library_path``
+    (the movie's own placed folder) -- proven end-to-end by running a REAL
+    eviction sweep straight after import and confirming it actually finds and
+    deletes the placed directory. Before the fix, ``library_path`` stayed
+    ``None`` forever, so ``eviction_service._movie_candidates`` had no deletion
+    target and disk-pressure eviction reclaimed nothing regardless of watch
+    state (see ``eviction_service._evict_one``'s "no stored library_path
+    breadcrumb" skip)."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
+    assert record is not None and record.status == DownloadState.Imported.value
+
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        # The breadcrumb is the movie's own folder (what fs.delete() removes on
+        # eviction), not the file itself.
+        assert request.library_path == str(dst.parent)
+
+    # Confirm availability (Plex-side "Finalizing" -> "available"), then run a
+    # real eviction sweep against a watched, past-grace copy -- proving the
+    # persisted breadcrumb is exactly what the eviction candidate builder reads.
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=FakeLibrary(available={_TMDB_ID}), session=session)
+
+    stale_library = FakeLibrary(
+        watch_states={
+            (_TMDB_ID, "movie", None): WatchState(
+                watched=True, last_viewed_at=datetime.now(UTC) - timedelta(days=999)
+            )
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(movies_root)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=stale_library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(movies_root),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=30,
+        )
+
+    assert [o.title for o in outcomes] == ["The Matrix"]
+    assert not dst.parent.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.evicted
+
+
 async def test_import_generic_file_under_release_folder_succeeds(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -179,6 +247,7 @@ class _LosingRaceFs(LocalFileSystem):
     on EEXIST when another import won the race."""
 
     def __init__(self, winner_size: int) -> None:
+        super().__init__()
         self._winner_size = winner_size
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
@@ -976,6 +1045,67 @@ async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
     assert request.status is RequestStatus.completed  # "Finalizing", not yet available
 
 
+async def test_import_tv_persists_season_library_path_and_a_later_sweep_reclaims_it(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """C1 regression, tv side: import finalize must persist
+    ``SeasonRequest.library_path`` (the season's own directory) -- proven
+    end-to-end by running a REAL eviction sweep straight after import and
+    confirming it actually finds and deletes the season directory. Before the
+    fix, ``library_path`` stayed ``None`` forever, so
+    ``eviction_service._season_candidates`` had no deletion target for this
+    season."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+    assert record is not None and record.status == DownloadState.Imported.value
+
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        assert season_row is not None
+        assert season_row.library_path == str(season_dir)
+
+    # Confirm availability, then run a real eviction sweep against a watched,
+    # past-grace season -- proving the persisted breadcrumb is exactly what
+    # eviction_service._season_candidates reads.
+    async with sessionmaker_() as session:
+        await run_availability_cycle(
+            library=FakeLibrary(available_tv_seasons={_TMDB_ID: frozenset({2})}), session=session
+        )
+
+    stale_library = FakeLibrary(
+        watch_states={
+            (_TMDB_ID, "tv", 2): WatchState(
+                watched=True, last_viewed_at=datetime.now(UTC) - timedelta(days=999)
+            )
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(tv_root)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=stale_library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tv_root),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=30,
+        )
+
+    assert [(o.title, o.season) for o in outcomes] == [("Some Show", 2)]
+    assert not season_dir.exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        assert season_row is not None
+        assert season_row.status.value == "evicted"
+
+
 async def test_import_tv_partial_accept_places_only_the_good_episode(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -1213,6 +1343,7 @@ class _FailsOnSecondCallFs(LocalFileSystem):
     file already placed successfully."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._calls = 0
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]

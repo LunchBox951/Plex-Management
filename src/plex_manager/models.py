@@ -1,10 +1,12 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Ten tables back the alpha pipeline: ``users``, ``settings``, ``system_settings``,
-``audit_log``, ``media_requests``, ``season_requests``, ``downloads``,
-``download_history``, ``blocklist``, ``tmdb_cache``. Column shapes, indexes, and
-``ON DELETE`` behaviour follow the persistence design (see the analysis extract's
-"Persistence + Schema Migrations" section and ADR-0007).
+Eleven tables back the alpha + beta pipeline: ``users``, ``settings``,
+``system_settings``, ``audit_log``, ``media_requests``, ``season_requests``,
+``downloads``, ``download_history``, ``blocklist``, ``tmdb_cache``,
+``log_events``. Column shapes, indexes, and ``ON DELETE`` behaviour follow the
+persistence design (see the analysis extract's "Persistence + Schema Migrations"
+section, ADR-0007, and — for ``log_events``/``library_path``/``keep_forever``/the
+``evicted`` status — ADR-0012).
 
 Conventions:
 
@@ -39,6 +41,7 @@ __all__ = [
     "Download",
     "DownloadHistory",
     "DownloadHistoryEvent",
+    "LogEvent",
     "MediaRequest",
     "MediaType",
     "RequestStatus",
@@ -84,6 +87,16 @@ class RequestStatus(StrEnum):
     # never a dishonest "downloading". The operator retries the import or rejects
     # the release (blocklist + re-search). Non-terminal, so it keeps dedup-blocking.
     import_blocked = "import_blocked"
+    # The disk-pressure eviction sweep (ADR-0012) deleted this title's (movie) or
+    # season's placed file to relieve disk pressure — always AFTER it was fully
+    # watched, past its grace period, and never pinned (``keep_forever``). It is
+    # NON-terminal (the title is honestly re-requestable — a re-request re-grabs
+    # it) but, UNLIKE ``partially_available``/``completed``/``import_blocked``
+    # above, it is deliberately excluded from ``uq_media_requests_active``'s
+    # predicate (like the SETTLED ``available``/``failed`` statuses): the old,
+    # now-off-disk row must never block a fresh active request for the same
+    # media, so a re-request creates a new row rather than resurrecting this one.
+    evicted = "evicted"
 
 
 class BlocklistReason(StrEnum):
@@ -102,6 +115,14 @@ class DownloadHistoryEvent(StrEnum):
     import_started = "import_started"
     imported = "imported"
     failed = "failed"
+    # The disk-pressure eviction sweep reclaimed this title's/season's file
+    # (ADR-0012). Unlike every other member, it is not tied to a torrent —
+    # ``DownloadHistory.torrent_hash`` is left ``None`` for an eviction row.
+    # ``download_history.event_type`` is a plain VARCHAR (``native_enum=False``,
+    # no CHECK constraint — see ``41d427bd38e6`` / ``RequestStatus.evicted``'s
+    # docstring for the identical precedent), so adding this member needs NO
+    # migration of its own.
+    evicted = "evicted"
 
 
 def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
@@ -216,16 +237,21 @@ class MediaRequest(Base):
         # Serialize active-request dedup at the database level: two concurrent
         # POST /requests for the same (tmdb_id, media_type) can both pass the
         # application-level find_active() check, then both INSERT. A PARTIAL UNIQUE
-        # index scoped to the ACTIVE statuses (pending / searching /
-        # no_acceptable_release / downloading) makes the second insert raise
-        # IntegrityError, which create_request catches and resolves to the existing
-        # active request. Terminal rows (completed / available / failed) are
-        # excluded, so a fresh request after one finishes is still allowed.
-        # The predicate must be supplied per-dialect: ``sqlite_where`` alone is
-        # ignored by PostgreSQL, which would then build an UNCONDITIONAL unique
-        # index and reject a valid re-request after a prior one reached a terminal
-        # status. ``postgresql_where`` carries the SAME predicate so the partial
-        # index is honoured on both backends (Postgres is a config swap).
+        # index scoped to the statuses that must keep blocking a duplicate request
+        # (pending / searching / no_acceptable_release / downloading /
+        # import_blocked / completed / partially_available) makes the second
+        # insert raise IntegrityError, which create_request catches and resolves to
+        # the existing active request. SETTLED statuses are deliberately OUTSIDE the
+        # predicate, so a fresh request after one finishes is still allowed:
+        # ``available`` / ``failed`` (a normal finished/dead request), and — as of
+        # ADR-0012 — ``evicted`` (the file was deleted by the disk-pressure sweep;
+        # the old row must never block a fresh re-request that actually re-grabs
+        # the content; see ``RequestStatus.evicted``'s docstring). The predicate
+        # must be supplied per-dialect: ``sqlite_where`` alone is ignored by
+        # PostgreSQL, which would then build an UNCONDITIONAL unique index and
+        # reject a valid re-request after a prior one reached a settled status.
+        # ``postgresql_where`` carries the SAME predicate so the partial index is
+        # honoured on both backends (Postgres is a config swap).
         Index(
             "uq_media_requests_active",
             "tmdb_id",
@@ -260,6 +286,19 @@ class MediaRequest(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The final placed path the importer wrote this movie into (ADR-0012),
+    # captured at import/availability time and STORED — never reconstructed from
+    # naming at eviction time, which would be fragile. The disk-pressure eviction
+    # sweep ``fs.delete()``s exactly this path. ``None`` for rows that predate this
+    # breadcrumb (or a tv rollup row, where the breadcrumb lives per-season on
+    # ``SeasonRequest`` instead) — eviction skips + logs rather than guessing one.
+    library_path: Mapped[str | None] = mapped_column(String)
+    # Operator pin (ADR-0012): a pinned title is NEVER selected by
+    # ``domain/eviction.py``, regardless of watch state or disk pressure. Movie or
+    # (whole) show granularity — TV eviction is scoped per season on
+    # ``SeasonRequest``, but the pin itself lives on the parent show, so pinning a
+    # series protects every one of its seasons.
+    keep_forever: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
 
 
 class SeasonRequest(Base):
@@ -287,6 +326,11 @@ class SeasonRequest(Base):
     )
     season_number: Mapped[int] = mapped_column()
     status: Mapped[RequestStatus] = mapped_column(_enum(RequestStatus), index=True)
+    # The final placed path this season's import wrote into — the per-season
+    # mirror of ``MediaRequest.library_path`` (ADR-0012): same "store, never
+    # reconstruct" rule, same eviction target. ``None`` for seasons imported
+    # before this breadcrumb existed.
+    library_path: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -403,3 +447,37 @@ class TmdbCache(Base):
     data_json: Mapped[dict[str, Any]] = mapped_column(sa.JSON)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LogEvent(Base):
+    """A captured application log record — the durable, LLM-diagnosable trail
+    (ADR-0012).
+
+    Populated ONLY by the capture pipeline's background drain task, never
+    written to directly by the (synchronous) logging handler: the handler pushes
+    onto an in-process ``asyncio.Queue``, and this async drain task is what
+    batch-inserts rows here, so a DB write never happens on the handler's call
+    stack (no event-loop blocking, no reentrancy). Only INFO-and-above records
+    reach this table; DEBUG and below live only in the in-memory ring buffer (the
+    live all-levels tail), never persisted. Rows are pruned by a periodic
+    retention sweep (the web-editable ``log_retention_days`` setting), so growth
+    is bounded.
+
+    ``context_json`` carries correlation ids (e.g. ``request_id`` / ``download_id``
+    / ``tmdb_id``) set at key decision points (reconcile failure, adapter outage,
+    import block, grab failure) so ``GET /ops/logs/export`` can assemble one
+    coherent trail for a single failure, or for a time window, to paste into an
+    LLM. Never a secret-bearing column: log call sites are responsible for never
+    logging a credential (honesty over silence never trades away that rule).
+    """
+
+    __tablename__ = "log_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    level: Mapped[str] = mapped_column(String)
+    logger: Mapped[str] = mapped_column(String)
+    message: Mapped[str] = mapped_column(Text)
+    context_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)

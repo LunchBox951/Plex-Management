@@ -110,3 +110,49 @@ def test_all_failed_is_failed() -> None:
 def test_empty_input_raises() -> None:
     with pytest.raises(ValueError, match="at least one season status"):
         rollup_status([])
+
+
+# -- evicted seasons (ADR-0012 disk-pressure sweep) -----------------------------
+
+
+@pytest.mark.parametrize("winner", _PRECEDENCE)
+def test_precedence_status_wins_outright_over_evicted(winner: str) -> None:
+    assert rollup_status([winner, "evicted"]) == winner
+
+
+def test_all_evicted_is_evicted() -> None:
+    assert rollup_status(["evicted"]) == "evicted"
+    assert rollup_status(["evicted", "evicted"]) == "evicted"
+
+
+def test_evicted_mixed_with_available_is_partially_available() -> None:
+    # Never "available": one season's file is actually gone, so reporting the
+    # whole show as cleanly available would be dishonest.
+    assert rollup_status(["available", "evicted"]) == "partially_available"
+
+
+def test_evicted_mixed_with_completed_is_partially_available() -> None:
+    assert rollup_status(["completed", "evicted"]) == "partially_available"
+
+
+def test_evicted_mixed_with_available_and_pending_is_partially_available() -> None:
+    assert rollup_status(["available", "evicted", "pending"]) == "partially_available"
+
+
+# -- evicted with NO real-done (available/completed) season: never dishonestly
+# "partially_available" -- nothing is actually watchable, so this folds evicted
+# alongside failed and applies the ordinary pending/failed rule instead. -------
+
+
+def test_evicted_mixed_with_pending_and_no_done_season_is_pending() -> None:
+    # S1 evicted (file gone), S2 still pending: nothing is currently watchable,
+    # but S2 might still complete -- "pending" is honest, "partially_available"
+    # would not be (it implies something is available right now).
+    assert rollup_status(["evicted", "pending"]) == "pending"
+
+
+def test_evicted_mixed_with_failed_and_no_done_season_is_failed() -> None:
+    # The regression this guards: S1 watched then evicted, S2 failed outright --
+    # NOTHING is available, so this must never read "partially_available" (which
+    # would render the show as watchable when it is not).
+    assert rollup_status(["evicted", "failed"]) == "failed"
