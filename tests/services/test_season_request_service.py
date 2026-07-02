@@ -429,6 +429,46 @@ async def test_mark_completed_stamps_parent_completed_at_on_first_season_only(
         assert show.completed_at == first_stamp  # NOT re-stamped by the later season
 
 
+async def test_mixed_tv_request_stamps_completed_at_only_when_a_season_is_imported(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """R5 P2: a TV request that MIXES an already-in-Plex season (created ``available``
+    with no ``library_path`` by ``ensure_seasons`` -- no import ever ran) with a
+    missing season must NOT stamp the parent ``completed_at`` at REQUEST time. The
+    stamp is confined to genuine import/availability transitions
+    (``mark_completed``/``mark_available``), so ``ensure_seasons``'s already-present
+    creation never fires it; otherwise the later-imported season's telemetry interval
+    would start at request/Plex-verification time instead of its own import."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=723)
+    library = FakeLibrary(available_tv_seasons={723: frozenset({1})})
+
+    # Creation: season 1 already in Plex (-> available, no import), season 2 missing.
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, library, media_request_id=show_id, tmdb_id=723, seasons=[1, 2]
+        )
+        await session.commit()
+    assert {r.season_number: r.status for r in records} == {1: "available", 2: "pending"}
+
+    # No import has happened yet -> completed_at must still be unset, even though one
+    # season is already ``available`` off the Plex-presence short-circuit.
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None
+
+    # The missing season is imported (a real transition path) -> NOW the stamp fires.
+    async with sessionmaker_() as session:
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None
+
+
 async def test_completed_at_is_stamped_at_season_level_even_when_rollup_is_masked(
     sessionmaker_: SessionMaker,
 ) -> None:
