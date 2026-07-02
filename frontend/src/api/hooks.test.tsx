@@ -41,6 +41,24 @@ describe('useUpdateSettings', () => {
     // The PUT body is written straight into the settings cache (no extra GET).
     expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
   })
+
+  it('invalidates Discover so it refetches after a TMDB api-key change (issue #14)', async () => {
+    const saved: SettingsResponse = { tmdb_api_key: '***' }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({ tmdb_api_key: 'sk-new-key' })
+
+    // A prefix match on ['discover'] covers both queryKeys.discoverHome and
+    // every queryKeys.discover(query, year) variant. Fails before the fix
+    // (Discover data stays keyed to the old TMDB credentials).
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] }))
+  })
 })
 
 describe('useEvict', () => {

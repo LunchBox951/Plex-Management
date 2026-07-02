@@ -118,6 +118,12 @@ export function useUpdateSettings() {
       // against the newly-saved connection — and clear any prior unconfigured/auth
       // error, which retry:false otherwise leaves stuck until the page remounts.
       void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+      // The TMDB api key may have changed; Discover's home + search results are
+      // keyed on the old credentials, so drop them too. TanStack Query v5's
+      // default exact:false prefix match covers both queryKeys.discoverHome
+      // (['discover','home']) and every queryKeys.discover(query, year) variant
+      // (['discover', query, year]) with this one call (issue #14).
+      void qc.invalidateQueries({ queryKey: ['discover'] })
     },
   })
 }
