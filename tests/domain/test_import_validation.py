@@ -230,6 +230,49 @@ def test_title_matching_sample_marker_word_accepts() -> None:
     assert result.video.relative_path == "Proof.2005.1080p.BluRay-GRP.mkv"
 
 
+def test_title_marker_followed_by_real_marker_still_flagged_extra() -> None:
+    # Regression: the expected title "Proof" itself matches a sample/extra marker
+    # word, and a REAL marker ("Trailer") follows it immediately. The
+    # title-explained "Proof" match must NOT consume the separator before
+    # "Trailer" -- otherwise finditer never sees the second marker, the file is
+    # not recognised as an extra, and (being large) it would be chosen as the
+    # feature. With the non-consuming boundary both markers are examined, so the
+    # file is dropped; here it is the only candidate, leaving nothing importable.
+    result = validate_import(
+        [VideoFile("Proof.Trailer.2005.1080p.BluRay-GRP.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=9800,
+    )
+    assert result.accepted is False
+    assert result.video is None
+    assert [r.reason for r in result.rejections] == [ImportRejectionReason.NO_VIDEO_FILE]
+
+
+def test_title_marked_feature_kept_while_adjacent_marker_extra_dropped() -> None:
+    # The stronger form of the regression: a genuine "Proof" feature ships next to
+    # a LARGER "Proof.Trailer" extra. Without the non-consuming boundary the
+    # trailing "Trailer" marker is hidden by the title-explained "Proof" prefix,
+    # the extra survives, and (being the largest) it would be imported as the
+    # movie. The fix drops the extra and the real feature is chosen instead.
+    result = validate_import(
+        [
+            VideoFile("Proof.Trailer.2005.1080p.BluRay-GRP.mkv", 5 * _GIB),
+            VideoFile("Proof.2005.1080p.BluRay-GRP.mkv", 4 * _GIB),
+        ],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=9800,
+    )
+    assert result.accepted is True
+    assert result.video is not None
+    assert result.video.relative_path == "Proof.2005.1080p.BluRay-GRP.mkv"
+
+
 def test_multi_part_rejects() -> None:
     result = _validate(
         VideoFile("The.Matrix.1999.1080p.BluRay.x264-CD1.mkv", 4 * _GIB),

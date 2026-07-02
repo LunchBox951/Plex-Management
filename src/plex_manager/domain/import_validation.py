@@ -70,9 +70,18 @@ __all__ = [
 # is title-aware (see :func:`_looks_like_sample_name`): a movie/show genuinely
 # titled "Proof" or "Trailer Park Boys" is not dropped just because its own name
 # matches one of these ambiguous marker words.
+#
+# The trailing boundary is a NON-consuming lookahead (``(?=...)``), not a matched
+# separator. A consuming trailing separator would be eaten by one match and then
+# be unavailable as the *leading* boundary of the very next token, so two adjacent
+# markers (``Proof.Trailer``) would hide the second from ``finditer``: the
+# title-explained ``Proof`` match would swallow the ``.`` and ``Trailer`` — a real
+# extra marker — would never be examined, letting the extra survive as a feature
+# candidate. The lookahead leaves that separator in place so consecutive markers
+# are each seen (see :func:`_looks_like_sample_name`).
 _SAMPLE_EXTRAS = re.compile(
     r"(?:^|[\s._\-])(?:sample|trailer|extras?|featurette|behind[\s._\-]?the[\s._\-]?scenes|"
-    r"deleted[\s._\-]?scene|proof|rarbg\.com)(?:$|[\s._\-])",
+    r"deleted[\s._\-]?scene|proof|rarbg\.com)(?=$|[\s._\-])",
     re.IGNORECASE,
 )
 
