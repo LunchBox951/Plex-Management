@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.repositories import SqlRequestRepository
+
+# The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
+# ONLY to the parked ``no_acceptable_release``.
+_DUE_STATUSES = frozenset({"pending", "no_acceptable_release", "searching"})
+_NOW = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 
 
 async def test_create_then_get_returns_persisted_record(session: AsyncSession) -> None:
@@ -214,3 +221,63 @@ async def test_set_keep_forever_missing_row_raises(session: AsyncSession) -> Non
     repo = SqlRequestRepository(session)
     with pytest.raises(LookupError):
         await repo.set_keep_forever(999, True)
+
+
+# --------------------------------------------------------------------------- #
+# list_due_for_search — the backoff gate applies ONLY to parked scopes (ADR-0013)
+# --------------------------------------------------------------------------- #
+async def test_list_due_returns_searching_scope_with_stale_future_backoff(
+    session: AsyncSession,
+) -> None:
+    """A scope re-armed to ``searching`` (a failed download) may still carry a stale
+    ``next_search_at`` from a PRIOR ``no_acceptable_release`` backoff -- re-arming
+    does not clear it. ``searching`` is EAGER: it must be due IMMEDIATELY, never
+    suppressed until that stale future timestamp expires."""
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=800, media_type="movie", title="Rearmed", status="searching"
+    )
+    await repo.schedule_search(
+        created.id, search_attempts=3, next_search_at=_NOW + timedelta(hours=24)
+    )
+
+    due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
+    assert [r.id for r in due] == [created.id]
+
+
+async def test_list_due_suppresses_parked_scope_until_backoff_elapses(
+    session: AsyncSession,
+) -> None:
+    """A parked ``no_acceptable_release`` scope earned its backoff: a FUTURE
+    ``next_search_at`` means NOT due yet (existing behavior, pinned)."""
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=801, media_type="movie", title="Parked", status="no_acceptable_release"
+    )
+    await repo.schedule_search(
+        created.id, search_attempts=1, next_search_at=_NOW + timedelta(hours=1)
+    )
+
+    due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
+    assert due == []
+
+
+async def test_list_due_orders_eager_scope_ahead_of_overdue_parked(
+    session: AsyncSession,
+) -> None:
+    """An eager ``searching`` scope (stale future backoff) sorts due-now AHEAD of a
+    parked scope whose backoff has elapsed -- never behind it by its stale timestamp."""
+    repo = SqlRequestRepository(session)
+    parked = await repo.create(
+        tmdb_id=810, media_type="movie", title="Parked", status="no_acceptable_release"
+    )
+    await repo.schedule_search(
+        parked.id, search_attempts=1, next_search_at=_NOW - timedelta(hours=1)
+    )
+    eager = await repo.create(tmdb_id=811, media_type="movie", title="Eager", status="searching")
+    await repo.schedule_search(
+        eager.id, search_attempts=2, next_search_at=_NOW + timedelta(hours=12)
+    )
+
+    due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
+    assert [r.id for r in due] == [eager.id, parked.id]

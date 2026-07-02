@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
@@ -144,18 +144,32 @@ class SqlSeasonRequestRepository:
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[SeasonRequestRecord]:
-        # JOIN to the parent's tmdb_id in ONE query (no per-row follow-up), same
-        # as ``list_for_requests``. NULL ("due now") first via an EXPLICIT
-        # ``nulls_first()`` -- see ``SqlRequestRepository.list_due_for_search`` on
-        # why the default NULL ordering is backend-dependent (Postgres is a swap).
+        # JOIN to the parent's tmdb_id in ONE query (no per-row follow-up), same as
+        # ``list_for_requests``. The ``next_search_at`` backoff gate applies ONLY to a
+        # PARKED (``no_acceptable_release``) season; ``pending``/``searching`` are
+        # EAGER (always due immediately) so a season re-armed to ``searching`` (a
+        # failed download) during a stale backoff window is picked up on the very next
+        # tick, never suppressed until that stale timestamp expires -- the season-level
+        # mirror of ``SqlRequestRepository.list_due_for_search`` (see its docstring,
+        # ADR-0013 §3). NULL ("due now") first via an EXPLICIT ``nulls_first()`` --
+        # the default NULL ordering is backend-dependent (Postgres is a swap).
+        parked = SeasonRequest.status == RequestStatus.no_acceptable_release
+        due = or_(
+            ~parked,  # eager (pending/searching): always due
+            SeasonRequest.next_search_at.is_(None),  # never scheduled: due now
+            SeasonRequest.next_search_at <= now,  # parked + backoff elapsed
+        )
+        # A parked season sorts by its scheduled backoff; an eager season collapses
+        # to NULL so it sorts due-now, never behind a parked one by a stale timestamp.
+        effective_due = case((parked, SeasonRequest.next_search_at))
         stmt = (
             select(SeasonRequest, MediaRequest.tmdb_id)
             .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
             .where(
                 SeasonRequest.status.in_([RequestStatus(s) for s in statuses]),
-                (SeasonRequest.next_search_at.is_(None)) | (SeasonRequest.next_search_at <= now),
+                due,
             )
-            .order_by(SeasonRequest.next_search_at.asc().nulls_first(), SeasonRequest.id)
+            .order_by(effective_due.asc().nulls_first(), SeasonRequest.id)
         )
         return [
             _to_record(row, tmdb_id) for row, tmdb_id in (await self._session.execute(stmt)).all()

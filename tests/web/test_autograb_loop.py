@@ -23,6 +23,7 @@ from plex_manager.web import app as app_module
 from tests.web.fakes import (
     FakeProwlarr,
     FakeQbittorrent,
+    candidate,
     good_and_cam_candidates,
 )
 
@@ -163,3 +164,35 @@ async def test_autograb_records_prowlarr_outage_on_health(
     status = app.state.autograb_status
     assert status.last_error_type == "IndexerError"
     assert status.consecutive_failures == 1
+
+
+async def test_autograb_records_grab_error_on_health(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A GrabError (qBittorrent accepted the torrent but no info-hash could be
+    # derived -> a live, untracked torrent) is an OPERATIONAL failure. Unlike a
+    # raised search it does NOT propagate/abort: run_grab_cycle surfaces it on the
+    # result and _autograb_once records it on the health signal (TYPE only) WITHOUT
+    # marking the cycle clean -- so the operator sees a failing loop, never a request
+    # silently parked while an orphan torrent lingers.
+    request_id = await _seed_pending_movie(sessionmaker_)
+    prowlarr = FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", magnet=False)])
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=FakeQbittorrent(), enabled=True)
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    # The scope was left UNCHANGED (never falsely parked).
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.pending
+        assert request.next_search_at is None
+    # The operational failure is recorded (TYPE only) and the cycle is NOT clean.
+    status = app.state.autograb_status
+    assert status.last_error_type == "GrabError"
+    assert status.consecutive_failures == 1
+    assert status.last_ok_at is None

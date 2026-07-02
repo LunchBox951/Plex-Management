@@ -22,10 +22,14 @@ Design decisions (see ADR-0013):
   release may appear at any time, so the worker keeps trying indefinitely rather
   than dead-ending like the prototype's 5-nights-then-stuck cron.
 * **Honesty over silence.** "searched OK, nothing acceptable" (park +
-  backoff) is kept strictly distinct from "the search RAISED" (Prowlarr down /
-  rate-limited): the latter leaves the scope's state untouched and propagates so
-  the loop records it on the ``AutograbStatus`` health signal -- a scope is never
-  falsely marked ``no_acceptable_release`` just because Prowlarr was unreachable.
+  backoff) is kept strictly distinct from operational failures. A RAISED search
+  (Prowlarr down / rate-limited) leaves the scope untouched and propagates so the
+  loop records it on the ``AutograbStatus`` health signal and backs the whole
+  cycle off. A ``GrabError`` (qBittorrent accepted the torrent but no info-hash
+  could be derived, leaving a live untracked torrent) is likewise operational:
+  the scope is left untouched and the error surfaced on ``AutograbStatus`` -- but
+  the cycle CONTINUES (one bad grab is not a Prowlarr outage). A scope is never
+  falsely marked ``no_acceptable_release`` just because a grab or search failed.
 * **Protect the single Prowlarr.** At most :data:`AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`
   actual searches run per cycle, processed sequentially; a scope that already has
   an active download is skipped BEFORE it costs a search (and never races
@@ -113,6 +117,28 @@ AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
 # scheduled-but-overdue one when the per-cycle cap has to choose.
 _NULL_DUE_SORT_KEY = datetime.min.replace(tzinfo=UTC)
 
+# The ONLY status whose ``next_search_at`` backoff gate actually applies. A parked
+# scope earned its escalating backoff and must wait it out; ``pending`` and
+# ``searching`` are EAGER -- always due immediately -- so a scope deliberately
+# re-armed to ``searching`` (a failed download; ``queue_service._handle_failed``)
+# during a stale 24h backoff window is picked up on the very next tick instead of
+# staying suppressed until that stale timestamp expires (ADR-0013 §3). The
+# raised-search global cycle abort still protects the single Prowlarr from a burst.
+_BACKOFF_GATED_STATUS = "no_acceptable_release"
+
+
+def _due_sort_key(status: str, next_search_at: datetime | None) -> datetime:
+    """Effective due-time for ordering (most-overdue first, then oldest-scheduled).
+
+    A parked (:data:`_BACKOFF_GATED_STATUS`) scope sorts by its scheduled backoff;
+    an eager ``pending``/``searching`` scope always sorts due-now
+    (:data:`_NULL_DUE_SORT_KEY`) so it is never starved behind parked scopes by a
+    stale ``next_search_at`` left over from a prior backoff.
+    """
+    if status == _BACKOFF_GATED_STATUS and next_search_at is not None:
+        return next_search_at
+    return _NULL_DUE_SORT_KEY
+
 
 @dataclass(frozen=True)
 class AutograbCycleResult:
@@ -121,12 +147,25 @@ class AutograbCycleResult:
     ``searched`` counts ACTUAL Prowlarr searches (never more than
     ``max_searches``); ``skipped_active`` counts due scopes passed over because
     they already had an active download (those cost no search).
+
+    ``grab_errors`` counts scopes whose grab hit an OPERATIONAL failure --
+    :class:`~plex_manager.services.grab_service.GrabError`: qBittorrent ACCEPTED
+    the torrent but no info-hash could be derived, so a LIVE, untracked torrent
+    is left with no ``Download`` row. That is NOT "nothing acceptable found", so
+    it is counted here (never in ``no_acceptable``) and the scope's state is left
+    UNCHANGED (never parked). ``last_grab_error`` carries the representative
+    exception so the caller can record it on the ``AutograbStatus`` health signal
+    (TYPE name only) and refuse to mark the cycle clean -- the mirror of a raised
+    indexer search, except a single bad grab continues the cycle rather than
+    aborting it (the torrent reached a reachable qBittorrent; Prowlarr is fine).
     """
 
     searched: int = 0
     grabbed: int = 0
     no_acceptable: int = 0
     skipped_active: int = 0
+    grab_errors: int = 0
+    last_grab_error: GrabError | None = None
 
 
 @dataclass(frozen=True)
@@ -136,7 +175,10 @@ class _PendingScope:
     ``season``/``season_request_id`` are ``None`` for a movie and set for a TV
     season. ``title``/``year`` are resolved up front for a movie (off its own
     record) and lazily from the parent ``MediaRequest`` for a TV season (whose
-    record carries only ``tmdb_id``).
+    record carries only ``tmdb_id``). ``status`` drives the effective-due sort
+    (see :func:`_due_sort_key`): only a parked (``no_acceptable_release``) scope
+    sorts by its scheduled backoff; an eager ``pending``/``searching`` scope
+    always sorts due-now regardless of any stale ``next_search_at``.
     """
 
     request_id: int
@@ -145,6 +187,7 @@ class _PendingScope:
     season_request_id: int | None
     title: str | None
     year: int | None
+    status: str
     search_attempts: int
     next_search_at: datetime | None
 
@@ -168,9 +211,12 @@ async def _collect_due_scopes(
 ) -> list[_PendingScope]:
     """Gather every due movie request + TV season, ordered most-overdue-first.
 
-    NULL ``next_search_at`` (due now) sorts ahead of any scheduled timestamp, then
-    oldest-scheduled first -- so the per-cycle cap always spends its budget on the
-    most-overdue scopes.
+    An eager (``pending``/``searching``) scope sorts due-now ahead of any parked
+    scope's scheduled timestamp, then oldest-scheduled first -- so the per-cycle
+    cap always spends its budget on the most-overdue scopes AND a deliberately
+    re-armed scope is never starved behind parked ones by a stale ``next_search_at``
+    (see :func:`_due_sort_key`; the same rule the repositories' ``list_due_for_search``
+    apply in SQL).
     """
     movies = await request_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
     seasons = await season_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
@@ -182,6 +228,7 @@ async def _collect_due_scopes(
             season_request_id=None,
             title=r.title,
             year=r.year,
+            status=r.status,
             search_attempts=r.search_attempts,
             next_search_at=r.next_search_at,
         )
@@ -195,12 +242,13 @@ async def _collect_due_scopes(
             season_request_id=s.id,
             title=None,
             year=None,
+            status=s.status,
             search_attempts=s.search_attempts,
             next_search_at=s.next_search_at,
         )
         for s in seasons
     )
-    scopes.sort(key=lambda sc: sc.next_search_at or _NULL_DUE_SORT_KEY)
+    scopes.sort(key=lambda sc: _due_sort_key(sc.status, sc.next_search_at))
     return scopes
 
 
@@ -274,6 +322,14 @@ async def run_grab_cycle(
     scope's state is left untouched (never falsely parked), and any scope already
     processed this cycle keeps its committed result.
 
+    An operational GRAB failure (:class:`~plex_manager.services.grab_service.
+    GrabError` -- qBittorrent accepted the torrent but no info-hash could be
+    derived) is caught but NOT parked: the scope's state is left untouched and the
+    error is returned on :class:`AutograbCycleResult` (``grab_errors`` /
+    ``last_grab_error``) so the caller records it on ``AutograbStatus`` and refuses
+    to mark the cycle clean. Unlike a raised search it does NOT abort the cycle --
+    the remaining due scopes are still processed.
+
     ``now`` is injectable for deterministic tests; it defaults to
     ``datetime.now(UTC)``.
     """
@@ -284,7 +340,8 @@ async def run_grab_cycle(
 
     scopes = await _collect_due_scopes(request_repo, season_repo, now)
 
-    searched = grabbed = no_acceptable = skipped_active = 0
+    searched = grabbed = no_acceptable = skipped_active = grab_errors = 0
+    last_grab_error: GrabError | None = None
     for scope in scopes:
         if searched >= max_searches:
             break
@@ -352,22 +409,57 @@ async def run_grab_cycle(
                     type(exc).__name__,
                     extra={"request_id": scope.request_id},
                 )
+            except GrabError as exc:
+                # OPERATIONAL failure, NOT "nothing acceptable found": qBittorrent
+                # ACCEPTED the torrent but no info-hash could be derived (opaque URL,
+                # and the indexer supplied none either), so there is now a LIVE,
+                # untracked torrent and NO ``Download`` row. Parking this as
+                # ``no_acceptable_release`` (the prior behaviour) would both LIE about
+                # the state and mark the cycle clean while an orphan torrent silently
+                # consumes disk. Treat it exactly like a raised search instead: discard
+                # the partial write, leave the scope's request/season state COMPLETELY
+                # untouched (never write ``no_acceptable_release``), and hand the error
+                # up on the result so the caller records it on the ``AutograbStatus``
+                # health signal (TYPE only) and refuses to mark the cycle clean. Unlike
+                # a raised indexer search this does NOT abort the cycle -- the torrent
+                # reached a reachable qBittorrent (Prowlarr is fine), so a single bad
+                # grab must not starve every other due scope; continue to the next one.
+                # The scope stays due, so it IS re-attempted next tick -- the same retry
+                # cadence a raised search has (bounded by the per-cycle cap + ~60s tick),
+                # which is the honest cost of not lying about state; it is NOT the tight
+                # every-cycle loop the backoff ladder guards a nothing-acceptable scope
+                # against.
+                #
+                # NOTE: grab-side orphan cleanup -- removing the untracked torrent from
+                # qBittorrent when its info-hash cannot be derived -- is a deeper
+                # follow-up (grab_service would need to remove-by-name/best-effort) and
+                # is deliberately OUT OF SCOPE here; this handler only stops the false
+                # park + false-clean cycle.
+                await session.rollback()
+                _logger.warning(
+                    "auto-grab: grab operational failure (%s); recording on health, "
+                    "leaving scope unchanged",
+                    type(exc).__name__,
+                    extra={"request_id": scope.request_id},
+                )
+                grab_errors += 1
+                last_grab_error = exc
             except (
                 NoGrabSourceError,
-                GrabError,
                 DownloadScopeConflictError,
             ) as exc:
-                # A release WAS accepted but cannot be grabbed right now: no usable
-                # source (``NoGrabSourceError``), no derivable info-hash to track by
-                # (``GrabError``), or the same physical torrent is already active for
-                # a different scope (``DownloadScopeConflictError`` -- a multi-season
-                # pack). Unlike the busy/terminal cases above, these scopes stay
-                # selectable AND immediately due, and the offending release keeps
-                # sorting first -- left untouched the worker would re-search Prowlarr
-                # and re-attempt every cycle FOREVER, defeating the single-Prowlarr
-                # load guard the backoff ladder exists for. Discard the partial write
-                # and park on the SAME escalating backoff as a nothing-acceptable
-                # search so the scope is not immediately due again.
+                # A release WAS accepted but cannot be grabbed right now, and NOTHING
+                # is left live to track: no usable source (``NoGrabSourceError`` --
+                # raised BEFORE anything is handed to the client) or the same physical
+                # torrent is already active for a different scope
+                # (``DownloadScopeConflictError`` -- a multi-season pack; the re-add is
+                # a qBittorrent no-op, so nothing is orphaned). Unlike the busy/terminal
+                # cases above, these scopes stay selectable AND immediately due, and the
+                # offending release keeps sorting first -- left untouched the worker
+                # would re-search Prowlarr and re-attempt every cycle FOREVER, defeating
+                # the single-Prowlarr load guard the backoff ladder exists for. Discard
+                # the partial write and park on the SAME escalating backoff as a
+                # nothing-acceptable search so the scope is not immediately due again.
                 await session.rollback()
                 _logger.warning(
                     "auto-grab: grab unusable (%s); parking on backoff",
@@ -381,15 +473,18 @@ async def run_grab_cycle(
             no_acceptable += 1
 
     _logger.info(
-        "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d",
+        "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d grab_errors=%d",
         searched,
         grabbed,
         no_acceptable,
         skipped_active,
+        grab_errors,
     )
     return AutograbCycleResult(
         searched=searched,
         grabbed=grabbed,
         no_acceptable=no_acceptable,
         skipped_active=skipped_active,
+        grab_errors=grab_errors,
+        last_grab_error=last_grab_error,
     )

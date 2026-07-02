@@ -28,6 +28,7 @@ from plex_manager.models import (
 )
 from plex_manager.services import auto_grab_service
 from plex_manager.services.auto_grab_service import BACKOFF_SCHEDULE, next_search_at
+from plex_manager.services.grab_service import GrabError
 from tests.web.fakes import (
     FakeProwlarr,
     FakeQbittorrent,
@@ -50,6 +51,41 @@ class _RaisingProwlarr:
     async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
         self.searched.append(request)
         raise IndexerError("prowlarr unreachable")
+
+
+class _PerTmdbProwlarr:
+    """An :class:`IndexerPort` returning a DIFFERENT candidate set per tmdb id.
+
+    Lets a single cycle drive one scope to a GrabError while another grabs cleanly,
+    proving one bad grab does not abort the rest of the cycle.
+    """
+
+    def __init__(self, by_tmdb: dict[int, list[CandidateRelease]]) -> None:
+        self.by_tmdb = by_tmdb
+        self.searched: list[IndexerSearchRequest] = []
+
+    async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+        self.searched.append(request)
+        return list(self.by_tmdb.get(request.tmdb_id or 0, []))
+
+
+def _sourceless_candidate() -> CandidateRelease:
+    """A good-quality release the engine ACCEPTS but with NO magnet and NO download
+    url -> ``grab_service`` raises :class:`NoGrabSourceError` before anything is ever
+    handed to the client (nothing is left live to track)."""
+    return CandidateRelease(
+        guid="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        size_bytes=1_000_000_000,
+        magnet_url=None,
+        download_url=None,
+        info_hash=None,
+        seeders=10,
+        leechers=1,
+        indexer_id=1,
+        indexer_name="FakeIndexer",
+        publish_date=datetime(2020, 1, 1, tzinfo=UTC),
+    )
 
 
 def _tv_season_pack() -> list[CandidateRelease]:
@@ -316,14 +352,19 @@ async def test_movie_grab_success_moves_to_downloading(sessionmaker_: SessionMak
 
 
 # --------------------------------------------------------------------------- #
-# Grab refusal — accepted-but-ungrabbable must back off, not loop forever
+# GrabError — operational failure: leave scope unchanged, surface on health,
+# NEVER park (a live untracked torrent must not be hidden behind a false park)
 # --------------------------------------------------------------------------- #
-async def test_ungrabbable_top_release_parks_on_backoff(sessionmaker_: SessionMaker) -> None:
-    # A release the decision engine ACCEPTS (good 1080p WEB-DL) but which cannot be
-    # grabbed: no magnet + a download_url with no derivable info-hash, and no
-    # indexer-supplied info_hash -> grab_service raises GrabError. Left untouched the
-    # scope would stay immediately due and re-search Prowlarr every cycle forever, so
-    # it must be pushed out on the escalating backoff like a nothing-acceptable search.
+async def test_grab_error_leaves_scope_unchanged_and_surfaces_on_result(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # A release the decision engine ACCEPTS (good 1080p WEB-DL) that qBittorrent
+    # ACCEPTS but for which no info-hash can be derived (no magnet + a download_url
+    # the client returns "" for, no indexer info_hash) -> grab_service raises
+    # GrabError: a LIVE, untracked torrent with no Download row. This is OPERATIONAL,
+    # not "nothing acceptable" -- the scope's state is left COMPLETELY unchanged
+    # (never parked) and the error is surfaced on the result for the caller to record
+    # on the AutograbStatus health signal.
     request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
     prowlarr = FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", magnet=False)])
     qbt = FakeQbittorrent()
@@ -332,17 +373,18 @@ async def test_ungrabbable_top_release_parks_on_backoff(sessionmaker_: SessionMa
 
     assert result.searched == 1
     assert result.grabbed == 0
-    assert result.no_acceptable == 1
+    assert result.no_acceptable == 0  # NOT parked as nothing-acceptable
+    assert result.grab_errors == 1
+    assert isinstance(result.last_grab_error, GrabError)
+    assert len(qbt.added) == 1  # the torrent WAS handed to (accepted by) the client
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
         assert row is not None
-        # Parked on the honest, retryable state + first backoff rung -- NOT left
-        # pending/NULL (immediately due) to loop next cycle.
-        assert row.status == RequestStatus.no_acceptable_release
-        assert row.search_attempts == 1
-        assert row.next_search_at is not None
-        assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
-        # No untracked download row was left behind by the refused grab.
+        # Left exactly as it was -- never falsely parked, no backoff scheduled.
+        assert row.status == RequestStatus.pending
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+        # No untracked Download row was created for the ungrabbable release.
         downloads = (
             (await session.execute(select(Download).where(Download.media_request_id == request_id)))
             .scalars()
@@ -351,21 +393,60 @@ async def test_ungrabbable_top_release_parks_on_backoff(sessionmaker_: SessionMa
         assert downloads == []
 
 
-async def test_ungrabbable_scope_is_not_re_searched_next_cycle(
+async def test_grab_error_does_not_abort_cycle_other_scopes_processed(
     sessionmaker_: SessionMaker,
 ) -> None:
-    # End-to-end guard against the tight loop: after the refusal parks the scope,
-    # a SECOND cycle at the same instant finds nothing due (backoff not yet elapsed)
-    # and pays for NO Prowlarr hit.
-    await _seed_movie(sessionmaker_, tmdb_id=603)
-    prowlarr = FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", magnet=False)])
+    # Unlike a raised indexer search (which aborts the whole cycle), a GrabError on
+    # one scope must NOT abort the cycle: the torrent reached a reachable qBittorrent,
+    # so every remaining due scope is still searched + grabbed. The lower-id scope is
+    # processed first, so the GrabError precedes the clean grab.
+    bad_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    good_id = await _seed_movie(sessionmaker_, tmdb_id=604)
+    prowlarr = _PerTmdbProwlarr(
+        {
+            603: [candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", magnet=False)],
+            604: good_and_cam_candidates(),
+        }
+    )
+    qbt = FakeQbittorrent()
 
-    first = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
-    assert first.searched == 1
+    result = await _run(sessionmaker_, prowlarr, qbt)
 
-    second = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
-    assert second.searched == 0
-    assert len(prowlarr.searched) == 1  # only the first cycle ever hit Prowlarr
+    assert result.grab_errors == 1
+    assert result.grabbed == 1  # the second scope still grabbed after the bad one
+    assert result.searched == 2
+    async with sessionmaker_() as session:
+        bad = await session.get(MediaRequest, bad_id)
+        good = await session.get(MediaRequest, good_id)
+        assert bad is not None
+        assert good is not None
+        assert bad.status == RequestStatus.pending  # untouched
+        assert good.status == RequestStatus.downloading  # processed
+
+
+async def test_no_grab_source_still_parks_on_backoff(sessionmaker_: SessionMaker) -> None:
+    # The OTHER accepted-but-ungrabbable cases (here NoGrabSourceError: nothing was
+    # ever handed to the client, so nothing is left live to track) still PARK on the
+    # escalating backoff -- unlike GrabError they leave no orphan, and left untouched
+    # they would re-search Prowlarr every cycle forever.
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr([_sourceless_candidate()])
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 1
+    assert result.grabbed == 0
+    assert result.no_acceptable == 1
+    assert result.grab_errors == 0
+    assert qbt.added == []  # nothing was ever handed to the client
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.no_acceptable_release
+        assert row.search_attempts == 1
+        assert row.next_search_at is not None
+        assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
 
 
 # --------------------------------------------------------------------------- #

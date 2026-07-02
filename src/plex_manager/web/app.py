@@ -235,11 +235,14 @@ async def _autograb_once(app: FastAPI) -> None:
       as the manual Grab button.
 
     Stamps ``app.state.autograb_status`` (ADR-0013's health signal): ``mark_ok``
-    only if the whole body completes without raising. A search that RAISES
-    (Prowlarr down / rate-limited) propagates out of ``run_grab_cycle`` and is
-    recorded by ``_autograb_loop``'s ``except`` -- the operator sees a failing
-    auto-grab loop (WHY nothing is being grabbed), not requests silently stuck at
-    ``pending``.
+    only if the whole body completes cleanly. A search that RAISES (Prowlarr down /
+    rate-limited) propagates out of ``run_grab_cycle`` and is recorded by
+    ``_autograb_loop``'s ``except`` -- the operator sees a failing auto-grab loop
+    (WHY nothing is being grabbed), not requests silently stuck at ``pending``. An
+    operational GRAB failure (``GrabError``) does not propagate -- ``run_grab_cycle``
+    surfaces it on the result; it is recorded here via ``mark_error`` (TYPE only)
+    and the cycle is NOT marked clean, so a live untracked torrent is never hidden
+    behind a falsely-parked scope.
     """
     status = _get_autograb_status(app)
     status.mark_run_started()
@@ -258,13 +261,23 @@ async def _autograb_once(app: FastAPI) -> None:
         except ServiceNotConfiguredError:
             status.mark_ok()
             return
-        await auto_grab_service.run_grab_cycle(
+        result = await auto_grab_service.run_grab_cycle(
             session,
             prowlarr=prowlarr,
             parser=get_parser(),
             profile=get_quality_profile(),
             qbt=qbt,
         )
+    # An operational GRAB failure (``GrabError`` -- qBittorrent accepted the torrent
+    # but no info-hash could be derived, leaving a live untracked torrent) does NOT
+    # propagate the way a raised search does: ``run_grab_cycle`` catches it, leaves
+    # the scope untouched, continues the rest of the cycle, and surfaces it on the
+    # result. Record it on the health signal (TYPE only) exactly like a raised
+    # search, and do NOT mark the cycle clean -- the operator sees a failing loop,
+    # not a request silently parked while an orphan torrent consumes disk.
+    if result.last_grab_error is not None:
+        status.mark_error(result.last_grab_error)
+        return
     status.mark_ok()
 
 

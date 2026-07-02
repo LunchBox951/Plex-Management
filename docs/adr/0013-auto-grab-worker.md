@@ -52,11 +52,26 @@ scheduled-command bus) that a single-machine, single-Prowlarr beta does not need
    are added to **both** `media_requests` and `season_requests` (a TV grab is
    per-season): `search_attempts INT NOT NULL DEFAULT 0` and a nullable
    `next_search_at`. The worker scans requests/seasons in
-   `{pending, no_acceptable_release, searching}` whose `next_search_at <= now`
-   (`NULL` = due now, so a freshly created request is searched on the next tick —
-   Radarr's "search on add" / Overseerr's `searchNow`). A search that finds nothing
+   `{pending, no_acceptable_release, searching}`. A search that finds nothing
    acceptable bumps `search_attempts` and schedules the next search on the ladder
    **`[10m, 30m, 1h, 3h, 6h, 12h, 24h]`, then 24h forever**.
+
+   **The `next_search_at` backoff gate applies ONLY to the parked
+   `no_acceptable_release` status.** `pending` and `searching` are *eager*: always
+   due immediately, regardless of any `next_search_at` value (`NULL` = due now, so a
+   freshly created request is searched on the next tick — Radarr's "search on add" /
+   Overseerr's `searchNow`). This matters because `search_attempts`/`next_search_at`
+   are only ever bumped when a scope is *parked*, and re-arming a scope to
+   `searching` (a failed download, `queue_service._handle_failed`) does **not** clear
+   them: a scope parked with a 24h backoff, then manually grabbed and failed back to
+   `searching`, would otherwise stay suppressed behind its now-stale timestamp for up
+   to 24h. Semantics: **parked scopes back off; deliberately re-armed scopes are
+   eager.** For ordering (the per-cycle search cap), an eager scope's effective
+   due-time collapses to *due-now* so it is never starved behind parked scopes by a
+   stale timestamp. The single global protection against hammering the one Prowlarr
+   is still the raised-search cycle abort (decision 5) plus the ~60s base tick — not
+   this per-scope gate. Both `list_due_for_search` queries and the in-service merge
+   ordering encode this rule.
 
 4. **Never give up.** A nothing-acceptable search parks the scope at the honest,
    retryable `no_acceptable_release` state (the SAME `mark_no_acceptable_release`
