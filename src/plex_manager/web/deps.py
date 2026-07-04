@@ -94,6 +94,7 @@ __all__ = [
     "get_parser",
     "get_prowlarr",
     "get_qbittorrent",
+    "get_qbittorrent_optional",
     "get_quality_profile",
     "get_reconcile_status",
     "get_session",
@@ -486,6 +487,26 @@ async def get_qbittorrent(
     if not url or not username or password is None:
         raise ServiceNotConfiguredError("qbittorrent")
     return QbittorrentClient(client, url, username, password)
+
+
+async def get_qbittorrent_optional(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> DownloadClientPort | None:
+    """Like :func:`get_qbittorrent`, but ``None`` when qBittorrent is unconfigured.
+
+    For an endpoint that only CONDITIONALLY needs the client -- the mark-failed move
+    with ``remove_torrent=false`` runs a pure DB fail/blocklist/re-arm and never
+    touches qBittorrent, so requiring the (eager, dependency-resolved)
+    :func:`get_qbittorrent` there would 409 ``service_not_configured`` on an install
+    without qBittorrent even though the caller opted out of removal. The endpoint
+    re-imposes the honest 409 itself when removal IS requested but the client is
+    unconfigured (never a silent skip).
+    """
+    try:
+        return await get_qbittorrent(session, client)
+    except ServiceNotConfiguredError:
+        return None
 
 
 def get_filesystem() -> FileSystemPort:

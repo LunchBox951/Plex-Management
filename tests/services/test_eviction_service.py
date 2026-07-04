@@ -1104,7 +1104,11 @@ class _SlowDeleteFileSystem:
         raise NotImplementedError
 
     def delete_guard_refuses(self, path: str) -> bool:
-        raise NotImplementedError
+        # These fakes only ever model in-root deletion targets (real tmp_path files
+        # the test intends to delete), so purge_library_path's pre-measure containment
+        # gate must pass -- return False (delete would NOT refuse) so it proceeds to
+        # measure + delete as before.
+        return False
 
     def reclaimable_bytes(self, path: str) -> int:
         try:
@@ -1479,7 +1483,11 @@ class _PinsSecondCandidateOnFirstDeleteFs:
         raise NotImplementedError
 
     def delete_guard_refuses(self, path: str) -> bool:
-        raise NotImplementedError
+        # These fakes only ever model in-root deletion targets (real tmp_path files
+        # the test intends to delete), so purge_library_path's pre-measure containment
+        # gate must pass -- return False (delete would NOT refuse) so it proceeds to
+        # measure + delete as before.
+        return False
 
     def reclaimable_bytes(self, path: str) -> int:
         try:
@@ -1614,7 +1622,11 @@ class _ConcurrentSecondEvictFs:
         raise NotImplementedError
 
     def delete_guard_refuses(self, path: str) -> bool:
-        raise NotImplementedError
+        # These fakes only ever model in-root deletion targets (real tmp_path files
+        # the test intends to delete), so purge_library_path's pre-measure containment
+        # gate must pass -- return False (delete would NOT refuse) so it proceeds to
+        # measure + delete as before.
+        return False
 
     def reclaimable_bytes(self, path: str) -> int:
         try:

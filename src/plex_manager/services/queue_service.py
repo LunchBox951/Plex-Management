@@ -21,8 +21,6 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
-
 from plex_manager.domain.reconciler import (
     failed_download_events,
     reconcile,
@@ -33,16 +31,16 @@ from plex_manager.domain.state_machine import (
     DownloadState,
     is_legal_transition,
 )
+from plex_manager.logsafe import safe_int
 from plex_manager.models import (
     BlocklistReason,
     Download,
-    DownloadHistory,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
-from plex_manager.services import season_request_service
+from plex_manager.services import blocklist_service, purge_service, season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,42 +69,21 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-async def _source_title_for(session: AsyncSession, torrent_hash: str) -> str | None:
-    """Best-effort original release title from the download history (for blocklist)."""
-    stmt = (
-        select(DownloadHistory.source_title)
-        .where(DownloadHistory.torrent_hash == torrent_hash)
-        .where(DownloadHistory.source_title.is_not(None))
-        .order_by(DownloadHistory.id.desc())
-        .limit(1)
-    )
-    return (await session.execute(stmt)).scalars().first()
-
-
-async def _indexer_for(session: AsyncSession, torrent_hash: str) -> str | None:
-    """Best-effort originating indexer from the download history (for blocklist).
-
-    Recorded at grab time (``grab_service`` writes ``DownloadHistory.indexer``).
-    Without it a blocklist row has ``indexer=None``, so the pure two-tier identity
-    check can never fall back to title+indexer for a candidate that exposes no
-    info_hash — defeating blocklist-then-research for hashless feeds.
-    """
-    stmt = (
-        select(DownloadHistory.indexer)
-        .where(DownloadHistory.torrent_hash == torrent_hash)
-        .where(DownloadHistory.indexer.is_not(None))
-        .order_by(DownloadHistory.id.desc())
-        .limit(1)
-    )
-    return (await session.execute(stmt)).scalars().first()
-
-
 async def _handle_failed(
     session: AsyncSession,
     event: DownloadFailed,
     rows: list[DownloadRecord],
 ) -> None:
-    """Blocklist a failed release and re-arm its request for a fresh search."""
+    """Blocklist a failed release and re-arm its request (DB writes only).
+
+    Does NOT remove the torrent: that ``qbt.remove(delete_files=True)`` is external
+    client I/O and must not run inside the reconcile write transaction -- holding
+    SQLite's write lock across a network round-trip, and (worse) a later write failure
+    in the same transaction would roll the DB back AFTER the torrent was already
+    deleted. :func:`reconcile_and_list` instead collects the failed hashes and removes
+    them best-effort AFTER its final commit (mirroring :func:`mark_failed`'s own
+    after-commit removal); an already-gone hash is a no-op success there.
+    """
     blocklist_repo = SqlBlocklistRepository(session)
     request_repo = SqlRequestRepository(session)
 
@@ -114,8 +91,10 @@ async def _handle_failed(
         (r for r in rows if r.torrent_hash.lower() == event.torrent_hash.lower()),
         None,
     )
-    source_title = await _source_title_for(session, event.torrent_hash) or event.source_title
-    indexer = await _indexer_for(session, event.torrent_hash)
+    source_title = (
+        await blocklist_service.source_title_for(session, event.torrent_hash) or event.source_title
+    )
+    indexer = await blocklist_service.indexer_for(session, event.torrent_hash)
     await blocklist_repo.create(
         source_title=source_title,
         reason=BlocklistReason.failed.value,
@@ -230,20 +209,58 @@ async def reconcile_and_list(
                 row.id, progress=live.progress, seed_ratio=live.ratio
             )
 
-    for event in failed_download_events(transitions, rows, occurred_at=now):
+    # Collect the failed events during the transaction (blocklist + re-arm are DB
+    # writes), then remove their torrents AFTER the commit below -- qbt.remove is
+    # external client I/O and must not run while the reconcile write transaction holds
+    # SQLite's write lock (nor before a later write that could roll the DB back after
+    # the torrent was already deleted).
+    failed_events = list(failed_download_events(transitions, rows, occurred_at=now))
+    for event in failed_events:
         await _handle_failed(session, event, rows)
 
     await session.commit()
+
+    # Close the seeding leak (ADR-0014) AFTER the commit, mirroring mark_failed's
+    # after-commit removal: a client hiccup here never undoes the committed
+    # blocklist/re-arm, and an already-gone hash (the common case -- the row usually
+    # failed BECAUSE it went ClientMissing) is a no-op success. Best-effort per hash,
+    # preserving the per-hash log extra.
+    for event in failed_events:
+        await purge_service.remove_torrent(
+            qbt,
+            event.torrent_hash,
+            context="a reconcile-driven download failure",
+            extra={"torrent_hash": event.torrent_hash, "tmdb_id": event.tmdb_id},
+        )
+
     return await download_repo.list_active()
 
 
 async def mark_failed(
     session: AsyncSession,
+    qbt: DownloadClientPort | None,
     *,
     download_id: int,
     blocklist: bool,
+    remove_torrent: bool = True,
 ) -> DownloadRecord:
-    """Operator move: fail a download (and optionally blocklist its release)."""
+    """Operator move: fail a download (and optionally blocklist its release).
+
+    ``remove_torrent`` (default ``True``): also remove the torrent + its data from
+    the client (ADR-0014's seeding-leak fix). Before this, a mark-failed left the
+    bad torrent seeding forever; now it is removed best-effort (a failure is
+    logged, never raised -- the DB fail/blocklist/re-arm stands regardless, and an
+    already-gone hash is a no-op success).
+
+    ``qbt`` may be ``None`` ONLY when ``remove_torrent`` is ``False`` (the DB-only
+    path): the caller (the mark-failed endpoint) resolves qBittorrent optionally so a
+    fail/blocklist/re-arm still works on an install without the client configured. A
+    ``None`` client with ``remove_torrent=True`` is a caller bug -- the endpoint has
+    already 409'd that combination up front -- so it is refused loudly here rather than
+    silently skipping the removal (honesty over silence).
+    """
+    if remove_torrent and qbt is None:
+        raise ValueError("mark_failed(remove_torrent=True) requires a qBittorrent client")
     download_repo = SqlDownloadRepository(session)
     row = await session.get(Download, download_id)
     if row is None:
@@ -267,8 +284,10 @@ async def mark_failed(
     )
 
     if blocklist:
-        source_title = await _source_title_for(session, row.torrent_hash) or row.torrent_hash
-        indexer = await _indexer_for(session, row.torrent_hash)
+        source_title = (
+            await blocklist_service.source_title_for(session, row.torrent_hash) or row.torrent_hash
+        )
+        indexer = await blocklist_service.indexer_for(session, row.torrent_hash)
         await SqlBlocklistRepository(session).create(
             source_title=source_title,
             reason=BlocklistReason.user_reported.value,
@@ -303,6 +322,21 @@ async def mark_failed(
             )
 
     await session.commit()
+
+    # Close the seeding leak (ADR-0014): remove the torrent + its data AFTER the
+    # DB fail/blocklist/re-arm has committed, so a client hiccup never undoes that
+    # committed state. Best-effort + already-gone-is-a-no-op (see
+    # ``purge_service.remove_torrent``). ``qbt is not None`` is guaranteed by the
+    # top-of-function guard whenever ``remove_torrent`` is True; the explicit check
+    # narrows the optional type for the type checker.
+    if remove_torrent and qbt is not None:
+        await purge_service.remove_torrent(
+            qbt,
+            row.torrent_hash,
+            context="an operator mark-failed",
+            extra={"torrent_hash": row.torrent_hash, "download_id": safe_int(download_id)},
+        )
+
     failed = await download_repo.get_by_hash(row.torrent_hash)
     if failed is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download {download_id} vanished mid-update")

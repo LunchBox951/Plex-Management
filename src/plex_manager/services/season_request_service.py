@@ -45,10 +45,12 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import SeasonRequestRecord
 
 __all__ = [
+    "clear_library_path",
     "ensure_seasons",
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
+    "reset_for_research",
     "set_library_path",
     "set_status",
     "set_status_if_in",
@@ -80,6 +82,9 @@ _TERMINAL_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.available,
         RequestStatus.failed,
         RequestStatus.evicted,
+        # ADR-0014: a cancelled season is terminal for the same reason as
+        # evicted -- a stale later signal must never drag it back to searching.
+        RequestStatus.cancelled,
     )
 )
 
@@ -201,7 +206,7 @@ async def _recompute_parent(
             "parent rollup write skipped: a newer active "
             "request already occupies the active-dedup slot for this show; the "
             "season's own status/history are unaffected",
-            extra={"request_id": media_request_id},
+            extra={"request_id": safe_int(media_request_id)},
         )
 
 
@@ -419,6 +424,31 @@ async def set_library_path(
     await season_repo.set_library_path(row.id, library_path)
 
 
+async def clear_library_path(
+    session: AsyncSession, *, media_request_id: int, season_number: int
+) -> None:
+    """Drop one season's eviction/purge breadcrumb (ADR-0014's report-issue verb).
+
+    The season-level analogue of ``SqlRequestRepository.clear_library_path`` and the
+    counterpart of :func:`set_library_path`: report-issue re-arms the season (claiming
+    the parent's active-dedup slot via :func:`reset_for_research` with
+    ``clear_library_path=False``) BEFORE it knows whether the purge will succeed, then
+    clears the breadcrumb HERE only once the file was actually removed. A failed/refused
+    purge leaves the breadcrumb intact so the orphan stays reclaimable (honesty over
+    silence).
+
+    Resolves the row via ``ensure()`` (idempotent get-or-create) rather than requiring a
+    pre-known ``SeasonRequest`` id. Does NOT recompute the parent rollup -- clearing
+    ``library_path`` is not a status transition, so it never re-touches the parent's
+    ``uq_media_requests_active`` slot.
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.clear_library_path(row.id)
+
+
 async def mark_completed(
     session: AsyncSession, *, media_request_id: int, season_number: int
 ) -> None:
@@ -447,6 +477,41 @@ async def mark_available(
     )
     await season_repo.mark_available(row.id)
     await _recompute_parent(session, media_request_id, stamp_completion=True)
+
+
+async def reset_for_research(
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    clear_library_path: bool = True,
+) -> None:
+    """Re-arm ONE reported season for a fresh search (ADR-0014's report-issue verb).
+
+    The season-level analogue of ``SqlRequestRepository.reset_for_research``: sets
+    the season back to the non-terminal ``searching`` then recomputes the parent
+    rollup so the show reflects the re-armed season. Unlike :func:`set_status` this is
+    UNCONDITIONAL (no ``skip_if_terminal``): report-issue deliberately re-opens an
+    already-``available``/``completed`` season -- that is the whole point of "this
+    imported file is bad, redo it".
+
+    ``clear_library_path`` (default ``True``) also clears the season's ``library_path``
+    purge breadcrumb -- correct when the file was actually deleted. report-issue passes
+    ``False`` when the purge failed/was refused (the season directory may still be on
+    disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
+    reclaim the orphan, never stranded with no handle (honesty over silence).
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.set_status(row.id, RequestStatus.searching.value)
+    # Fresh search, fresh backoff ladder (ADR-0013): the culprit's accrued
+    # search_attempts must not throttle the operator's explicit redo.
+    await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
+    if clear_library_path:
+        await season_repo.clear_library_path(row.id)
+    await _recompute_parent(session, media_request_id)
 
 
 async def mark_no_acceptable_release(

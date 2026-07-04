@@ -384,6 +384,16 @@ export interface paths {
         /**
          * Mark Failed Endpoint
          * @description Operator move: mark a download failed (optionally blocklisting the release).
+         *
+         *     ``remove_torrent`` (default true): also remove the torrent + its data from the
+         *     client, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup
+         *     never blocks the fail/blocklist/re-arm.
+         *
+         *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): the DB-only
+         *     fail/blocklist/re-arm path never touches it, so ``remove_torrent=false`` still
+         *     works on an install with qBittorrent unconfigured. When removal IS requested but
+         *     the client is unconfigured, this re-imposes the honest 409 ``service_not_configured``
+         *     up front (before any state change) rather than silently skipping the removal.
          */
         post: operations["mark_failed_endpoint_api_v1_queue__download_id__mark_failed_post"];
         delete?: never;
@@ -443,6 +453,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/requests/{request_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Request Endpoint
+         * @description Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.
+         *
+         *     Removes any active torrent(s) WITH data (best-effort) and flips the request
+         *     (and every tracked season, for tv) to the settled ``cancelled`` status; the
+         *     row is kept for history and nothing is re-grabbed. A request past the
+         *     not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
+         *     to redo an imported title instead.
+         *
+         *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
+         *     ``pending``/``searching``/``no_acceptable_release`` request with NO active download
+         *     rows is a pure DB settle that never touches the client, so it still works on an
+         *     install with qBittorrent unconfigured. When there ARE active torrents to remove but
+         *     the client is unconfigured, the service refuses up front (409
+         *     ``service_not_configured``) rather than silently leaking a seeding torrent.
+         */
+        post: operations["cancel_request_endpoint_api_v1_requests__request_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/requests/{request_id}/keep-forever": {
         parameters: {
             query?: never;
@@ -463,6 +506,32 @@ export interface paths {
          *     a silent no-op.
          */
         post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/requests/{request_id}/report-issue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report Issue Endpoint
+         * @description Report a bad imported/available movie or TV season (ADR-0014).
+         *
+         *     Blocklists the culprit release, removes its torrent + the library file, and
+         *     synchronously re-searches for a DIFFERENT release (the honest
+         *     ``no_acceptable_release`` park if nothing is acceptable). Requires Plex +
+         *     qBittorrent + Prowlarr configured (their deps 409 ``service_not_configured``
+         *     otherwise). The correction-without-a-terminal button for "this file is bad".
+         */
+        post: operations["report_issue_endpoint_api_v1_requests__request_id__report_issue_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1394,6 +1463,25 @@ export interface components {
             title: string;
         };
         /**
+         * ReportIssueBody
+         * @description ``POST /requests/{id}/report-issue`` -- report a bad imported file (ADR-0014).
+         *
+         *     ``reason`` is one of the operator-choosable :class:`BlocklistReason` values
+         *     (``failed`` is auto-only and deliberately excluded). ``season`` is REQUIRED for
+         *     a tv request (report-issue is per-season, mirroring grab) and ignored for a
+         *     movie. The verb blocklists the culprit release, purges the torrent + library
+         *     file, and synchronously re-searches (see ``correction_service.report_issue``).
+         */
+        ReportIssueBody: {
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "bad_quality" | "wrong_media" | "user_reported";
+            /** Season */
+            season?: number | null;
+        };
+        /**
          * RequestListResponse
          * @description A list of media requests.
          */
@@ -2093,6 +2181,7 @@ export interface operations {
         parameters: {
             query?: {
                 blocklist?: boolean;
+                remove_torrent?: boolean;
             };
             header?: never;
             path: {
@@ -2206,6 +2295,37 @@ export interface operations {
             };
         };
     };
+    cancel_request_endpoint_api_v1_requests__request_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post: {
         parameters: {
             query?: never;
@@ -2218,6 +2338,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["KeepForeverBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_issue_endpoint_api_v1_requests__request_id__report_issue_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReportIssueBody"];
             };
         };
         responses: {

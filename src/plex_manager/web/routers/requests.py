@@ -7,21 +7,46 @@ from typing import TYPE_CHECKING, Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.domain.quality_profile import QualityProfile
+from plex_manager.ports.download_client import DownloadClientPort
+from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
+from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import request_service
+from plex_manager.services import correction_service, request_service
+from plex_manager.services.correction_service import (
+    ActiveDuplicateError,
+    DownloadClientRequiredError,
+    ImportInProgressError,
+    MediaRootUnavailableError,
+    NotCancellableError,
+    NotReportableError,
+    ReportSeasonRequiredError,
+    SeasonNotFoundError,
+)
 from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
+    ServiceNotConfiguredError,
+    get_eviction_filesystem,
+    get_library,
     get_library_optional,
+    get_movies_root_optional,
+    get_parser,
+    get_prowlarr,
+    get_qbittorrent,
+    get_qbittorrent_optional,
+    get_quality_profile,
     get_session,
     get_tmdb,
+    get_tv_root_optional,
     require_api_key,
 )
 from plex_manager.web.schemas import (
     CreateRequestBody,
     KeepForeverBody,
+    ReportIssueBody,
     RequestListResponse,
     RequestResponse,
     SeasonStatus,
@@ -169,3 +194,119 @@ async def keep_forever_endpoint(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
     return await _to_response(session, record)
+
+
+@router.post("/{request_id}/report-issue")
+async def report_issue_endpoint(
+    request_id: int,
+    body: ReportIssueBody,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
+    library: Annotated[LibraryPort, Depends(get_library)],
+    prowlarr: Annotated[IndexerPort, Depends(get_prowlarr)],
+    parser: Annotated[ParserPort, Depends(get_parser)],
+    profile: Annotated[QualityProfile, Depends(get_quality_profile)],
+    movies_root: Annotated[str | None, Depends(get_movies_root_optional)],
+    tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
+) -> RequestResponse:
+    """Report a bad imported/available movie or TV season (ADR-0014).
+
+    Blocklists the culprit release, removes its torrent + the library file, and
+    synchronously re-searches for a DIFFERENT release (the honest
+    ``no_acceptable_release`` park if nothing is acceptable). Requires Plex +
+    qBittorrent + Prowlarr configured (their deps 409 ``service_not_configured``
+    otherwise). The correction-without-a-terminal button for "this file is bad".
+    """
+    record = await request_service.get_request(session, request_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+    # The purge target's root: an unmounted/empty root is refused inside the service
+    # (MediaRootUnavailableError -> 409). Build the root-scoped filesystem the same
+    # way the eviction trigger does -- the ONLY FileSystemPort whose delete() guard
+    # has real roots to check against (see get_eviction_filesystem).
+    root_path = movies_root if record.media_type == "movie" else tv_root
+    fs = get_eviction_filesystem(movies_root, tv_root)
+    try:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            fs,
+            library,
+            prowlarr,
+            parser,
+            profile,
+            request_id=request_id,
+            reason=body.reason,
+            season=body.season,
+            root_path=root_path,
+        )
+    except correction_service.RequestNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
+        ) from exc
+    except ReportSeasonRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="report_requires_season"
+        ) from exc
+    except SeasonNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="season_not_found"
+        ) from exc
+    except NotReportableError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_reportable") from exc
+    except ActiveDuplicateError as exc:
+        # A newer active request already owns this media's dedup slot -- re-arming the
+        # reported (settled) row would collide. Refused before any blocklist/purge, so
+        # nothing was touched; the operator acts on the live active request instead.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="active_duplicate"
+        ) from exc
+    except MediaRootUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="media_root_unavailable"
+        ) from exc
+    return await _to_response(session, updated)
+
+
+@router.post("/{request_id}/cancel")
+async def cancel_request_endpoint(
+    request_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
+) -> RequestResponse:
+    """Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.
+
+    Removes any active torrent(s) WITH data (best-effort) and flips the request
+    (and every tracked season, for tv) to the settled ``cancelled`` status; the
+    row is kept for history and nothing is re-grabbed. A request past the
+    not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
+    to redo an imported title instead.
+
+    qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
+    ``pending``/``searching``/``no_acceptable_release`` request with NO active download
+    rows is a pure DB settle that never touches the client, so it still works on an
+    install with qBittorrent unconfigured. When there ARE active torrents to remove but
+    the client is unconfigured, the service refuses up front (409
+    ``service_not_configured``) rather than silently leaking a seeding torrent.
+    """
+    try:
+        updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+    except correction_service.RequestNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
+        ) from exc
+    except NotCancellableError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_cancellable") from exc
+    except ImportInProgressError as exc:
+        # A download is finalizing its import: cancelling now would race the importer
+        # and could strand a placed file under a cancelled request. Honest, retryable
+        # 409 -- the operator retries once the import lands (report-issue takes over).
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="import_in_progress"
+        ) from exc
+    except DownloadClientRequiredError as exc:
+        # Active torrent(s) to remove, but qBittorrent is unconfigured. Surface the same
+        # honest 409 ``service_not_configured`` the mark-failed endpoint uses -- refused
+        # before any state change, so nothing was settled or removed.
+        raise ServiceNotConfiguredError("qbittorrent") from exc
+    return await _to_response(session, updated)

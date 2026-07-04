@@ -156,3 +156,42 @@ def test_evicted_mixed_with_failed_and_no_done_season_is_failed() -> None:
     # NOTHING is available, so this must never read "partially_available" (which
     # would render the show as watchable when it is not).
     assert rollup_status(["evicted", "failed"]) == "failed"
+
+
+# -- cancelled seasons (ADR-0014 cancel verb) -----------------------------------
+# ``cancelled`` folds identically to ``evicted`` for rollup purposes (both mean
+# "nothing on disk for this season now"), EXCEPT all-cancelled rolls up to the
+# settled ``cancelled`` (mirroring all-evicted -> evicted).
+
+
+@pytest.mark.parametrize("winner", _PRECEDENCE)
+def test_precedence_status_wins_outright_over_cancelled(winner: str) -> None:
+    assert rollup_status([winner, "cancelled"]) == winner
+
+
+def test_all_cancelled_is_cancelled() -> None:
+    assert rollup_status(["cancelled"]) == "cancelled"
+    assert rollup_status(["cancelled", "cancelled"]) == "cancelled"
+
+
+def test_cancelled_mixed_with_available_is_partially_available() -> None:
+    # Never "available": a cancelled season was never fetched, so reporting the
+    # whole show as cleanly available would be dishonest.
+    assert rollup_status(["available", "cancelled"]) == "partially_available"
+
+
+def test_cancelled_mixed_with_completed_is_partially_available() -> None:
+    assert rollup_status(["completed", "cancelled"]) == "partially_available"
+
+
+def test_cancelled_mixed_with_pending_and_no_done_season_is_pending() -> None:
+    assert rollup_status(["cancelled", "pending"]) == "pending"
+
+
+def test_cancelled_mixed_with_failed_and_no_done_season_is_failed() -> None:
+    assert rollup_status(["cancelled", "failed"]) == "failed"
+
+
+def test_cancelled_and_evicted_mixed_with_no_done_season_is_failed() -> None:
+    # Both "gone" statuses together, nothing watchable and nothing pending -> failed.
+    assert rollup_status(["cancelled", "evicted"]) == "failed"

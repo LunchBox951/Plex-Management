@@ -27,7 +27,15 @@ __all__ = ["SqlRequestRepository"]
 # ADR-0012), which excludes ``evicted`` from the DB backstop for the identical
 # reason — see ``RequestStatus.evicted``'s docstring there.
 _SETTLED_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
-    {RequestStatus.available, RequestStatus.failed, RequestStatus.evicted}
+    {
+        RequestStatus.available,
+        RequestStatus.failed,
+        RequestStatus.evicted,
+        # ADR-0014: a cancelled request is settled -- it must never dedup-block a
+        # fresh request for the same media (a re-request creates a new row), for
+        # the SAME reason as available/failed/evicted above.
+        RequestStatus.cancelled,
+    }
 )
 
 
@@ -352,6 +360,57 @@ class SqlRequestRepository:
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.library_path = library_path
+        await self._session.flush()
+
+    async def reset_for_research(self, request_id: int, *, clear_library_path: bool = True) -> None:
+        """Re-arm a reported movie for a fresh search (ADR-0014's report-issue verb).
+
+        Sets ``status`` back to the non-terminal ``searching`` and clears the
+        honest-availability anchors (``completed_at`` / ``library_verified_at``) that
+        asserted the title was in the library. The subsequent inline re-grab drives the
+        row on to ``downloading``; if nothing acceptable is found it lands on the honest
+        ``no_acceptable_release`` dead-end -- either way the row never lingers claiming
+        an in-library file it no longer has.
+
+        ``clear_library_path`` (default ``True``) also nulls the ``library_path`` purge
+        breadcrumb -- correct when the file was actually deleted. The report-issue verb
+        passes ``False`` when the purge failed/was refused (the file may still be on
+        disk): the breadcrumb is then PRESERVED as the only handle a later retry /
+        eviction has to reclaim the orphan (honesty over silence -- never strand a bad
+        file with no way to purge it).
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.status = RequestStatus.searching
+        if clear_library_path:
+            row.library_path = None
+        row.completed_at = None
+        row.library_verified_at = None
+        # A report-issue is the operator saying "look again NOW": the auto-grab
+        # worker's accrued backoff (ADR-0013) belongs to the culprit's history,
+        # not the fresh search, so a later re-park starts the ladder over.
+        row.search_attempts = 0
+        row.next_search_at = None
+        await self._session.flush()
+
+    async def clear_library_path(self, request_id: int) -> None:
+        """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).
+
+        The movie-level mirror of ``SqlSeasonRequestRepository.clear_library_path``:
+        report-issue re-arms the request (claiming the active slot) BEFORE it knows
+        whether the purge will succeed, so it keeps the ``library_path`` breadcrumb
+        through the claim and clears it HERE only once the file was actually removed --
+        never as part of the re-arm. Clearing ``library_path`` is not a status change,
+        so this never re-touches ``uq_media_requests_active`` (unlike
+        :meth:`reset_for_research`, whose status flush is the slot claim). No-op-safe if
+        the row vanished is not needed here (the caller just re-armed it), but a missing
+        row is still an honest error rather than a silent skip.
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.library_path = None
         await self._session.flush()
 
     async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:

@@ -255,6 +255,60 @@ export function useSetKeepForever() {
   })
 }
 
+/** The operator-choosable report-issue reasons (ADR-0014) — the `BlocklistReason`
+ * values minus the auto-only `failed`. Mirrors the backend `ReportIssueBody`. */
+export type ReportReason = 'bad_quality' | 'wrong_media' | 'user_reported'
+
+/**
+ * Report a bad imported/available movie or TV season (ADR-0014): blocklist the
+ * culprit release, purge its torrent + library file, and synchronously re-search
+ * for a different release. Returns the updated request (re-grabbing, or parked at
+ * no_acceptable_release). Invalidates requests + queue + blocklist so every
+ * surface reflects the correction at once.
+ */
+export function useReportIssue() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (args: {
+      requestId: number
+      reason: ReportReason
+      season?: number | null
+    }): Promise<RequestResponse> =>
+      unwrap(
+        await client.POST('/api/v1/requests/{request_id}/report-issue', {
+          params: { path: { request_id: args.requestId } },
+          body: { reason: args.reason, season: args.season ?? null },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: ['blocklist'] })
+    },
+  })
+}
+
+/**
+ * Cancel a not-yet-imported request (ADR-0014): drop any active torrent(s) and
+ * settle the request to `cancelled`. The honest opposite of report-issue —
+ * nothing is re-grabbed. Invalidates requests + queue.
+ */
+export function useCancelRequest() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (requestId: number): Promise<RequestResponse> =>
+      unwrap(
+        await client.POST('/api/v1/requests/{request_id}/cancel', {
+          params: { path: { request_id: requestId } },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+    },
+  })
+}
+
 /* --------------------------------------------------------- search-preview -- */
 
 export function useSearchPreview() {
