@@ -180,6 +180,73 @@ def test_hardlink_or_copy_falls_back_when_all_hardlinks_are_unsupported(
     assert src.stat().st_ino != dst.stat().st_ino
 
 
+def test_hardlinkless_publish_renames_temp_without_second_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a fully hardlinkless filesystem (SMB/FAT: EVERY os.link refuses) the
+    completed temp copy must be RENAMED into the final name, not content-copied a
+    second time — the old fallback wrote the title's bytes twice, transiently
+    needing ~2x its size and hitting spurious ENOSPC on a barely-fitting disk."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "movie" / "copied.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    real_copy2 = shutil.copy2
+    copies: list[tuple[str, str]] = []
+
+    def _counting_copy2(copy_src: str, copy_dst: str) -> None:
+        copies.append((copy_src, copy_dst))
+        real_copy2(copy_src, copy_dst)
+
+    real_rename = os.rename
+    renames: list[tuple[str, str]] = []
+
+    def _recording_rename(rename_src: str, rename_dst: str) -> None:
+        renames.append((os.fspath(rename_src), os.fspath(rename_dst)))
+        real_rename(rename_src, rename_dst)
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    monkeypatch.setattr(shutil, "copy2", _counting_copy2)
+    monkeypatch.setattr(os, "rename", _recording_rename)
+
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "payload"
+    # The content was written exactly ONCE (src -> temp); the publish is a rename.
+    assert len(copies) == 1
+    assert copies[0][0] == os.fspath(src)
+    assert [rename_dst for _s, rename_dst in renames] == [os.fspath(dst)]
+    # The rename consumed the temp: nothing left over next to the final file.
+    leftovers = [p for p in dst.parent.iterdir() if p != dst]
+    assert leftovers == []
+
+
+def test_hardlinkless_publish_still_refuses_existing_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename publish keeps the no-overwrite contract: an existing final file
+    is refused under the publish lock (FileExistsError) and never replaced."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    dst.write_text("existing library file")
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "existing library file"
+    # The temp copy was cleaned up; only src and dst remain in the directory.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["copied.mkv", "src.mkv"]
+
+
 def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

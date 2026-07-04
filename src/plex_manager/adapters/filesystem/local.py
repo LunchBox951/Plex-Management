@@ -129,7 +129,22 @@ def _publish_lock(dst: Path):
 
 
 def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
-    """Publish a complete temp copy under a per-destination lock."""
+    """Publish a complete temp copy under a per-destination lock.
+
+    The hardlink is the preferred publish (an atomic exclusive create — it fails
+    ``EEXIST`` on its own, catching even a non-cooperating writer). On a
+    filesystem that refuses hardlinks outright (SMB / FAT — ``EPERM`` /
+    ``EOPNOTSUPP``, the same refusal that routed the caller here in the first
+    place) the temp file is RENAMED into place instead: it already holds the
+    fully verified bytes and already lives in ``dst.parent``, so the rename is a
+    same-directory atomic move that costs no second content copy — previously
+    this fell back to re-copying the temp's bytes into the final path, needing
+    ~2x the title's size transiently and failing with a spurious ENOSPC on a
+    barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
+    PUBLISHER is preserved by the per-destination ``_publish_lock`` plus the
+    ``dst.exists()`` check made under it — every publisher in this module takes
+    that same lock before touching ``dst``.
+    """
     with _publish_lock(dst):
         if dst.exists():
             raise FileExistsError(os.fspath(dst))
@@ -138,32 +153,11 @@ def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
         except OSError as exc:
             if exc.errno not in _COPY_FALLBACK_ERRNOS:
                 raise
-            _copy_temp_no_overwrite(tmp_path, dst)
+            # The rename consumes the temp — nothing left to unlink.
+            os.rename(tmp_path, os.fspath(dst))
+            return
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
-
-
-def _copy_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
-    """Publish a temp file with exclusive create when final hardlinking is unsupported."""
-    dst_fd: int | None = None
-    created_dst = False
-    try:
-        mode = Path(tmp_path).stat().st_mode & 0o777
-        dst_fd = os.open(os.fspath(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
-        created_dst = True
-        with os.fdopen(dst_fd, "wb") as dst_file:
-            dst_fd = None
-            with open(tmp_path, "rb") as tmp_file:
-                shutil.copyfileobj(tmp_file, dst_file)
-        if dst.stat().st_size != Path(tmp_path).stat().st_size:
-            raise OSError(f"publish of {dst.name} is incomplete; partial destination removed")
-    except OSError:
-        if dst_fd is not None:
-            os.close(dst_fd)
-        if created_dst:
-            with contextlib.suppress(OSError):
-                os.unlink(dst)
-        raise
 
 
 def _publish_link_no_overwrite(src: Path, dst: Path) -> None:
