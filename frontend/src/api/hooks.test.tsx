@@ -3,14 +3,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi, type Mock } from 'vitest'
-import { useEvict, useUpdateSettings } from './hooks'
+import { useEvict, useRotateAppKey, useUpdateSettings } from './hooks'
 import { client } from './client'
 import { queryKeys } from '../lib/queryClient'
-import type { EvictResponse, SettingsResponse } from './types'
+import * as apiKeyLib from '../lib/apiKey'
+import type { AppApiKeyResponse, EvictResponse, SettingsResponse } from './types'
 
-// No network: the typed client is replaced with controllable PUT/POST mocks.
+// No network: the typed client is replaced with controllable GET/PUT/POST mocks.
 vi.mock('./client', () => ({
-  client: { PUT: vi.fn(), POST: vi.fn() },
+  client: { GET: vi.fn(), PUT: vi.fn(), POST: vi.fn() },
 }))
 
 function createWrapper(qc: QueryClient) {
@@ -40,6 +41,24 @@ describe('useUpdateSettings', () => {
     )
     // The PUT body is written straight into the settings cache (no extra GET).
     expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
+  })
+
+  it('invalidates Discover so it refetches after a TMDB api-key change (issue #14)', async () => {
+    const saved: SettingsResponse = { tmdb_api_key: '***' }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({ tmdb_api_key: 'sk-new-key' })
+
+    // A prefix match on ['discover'] covers both queryKeys.discoverHome and
+    // every queryKeys.discover(query, year) variant. Fails before the fix
+    // (Discover data stays keyed to the old TMDB credentials).
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] }))
   })
 })
 
@@ -75,5 +94,27 @@ describe('useEvict', () => {
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsDisk }))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests })
+  })
+})
+
+describe('useRotateAppKey', () => {
+  it('persists the rotated key immediately so the current session survives (issue #28)', async () => {
+    const rotated: AppApiKeyResponse = { app_api_key: 'brand-new-key' }
+    ;(client.POST as unknown as Mock).mockResolvedValue({
+      data: rotated,
+      response: { status: 200 },
+    })
+    const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const { result } = renderHook(() => useRotateAppKey(), { wrapper: createWrapper(qc) })
+    const outcome = await result.current.mutateAsync()
+
+    expect(outcome.app_api_key).toBe('brand-new-key')
+    // Fails before the fix: a rotated key never written into THIS browser's
+    // own store would 401 the very next request from the device that just
+    // rotated it -- every other device is correctly locked out, but this one
+    // must not be.
+    expect(setApiKeySpy).toHaveBeenCalledWith('brand-new-key')
   })
 })

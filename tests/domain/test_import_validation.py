@@ -77,6 +77,24 @@ _FIELDS: dict[str, dict[str, object]] = {
         "source": "Blu-ray",
         "screen_size": "1080p",
     },
+    # A real movie literally titled "Proof": the _SAMPLE_EXTRAS marker word
+    # "proof" is explained by the expected title, so it must not be dropped.
+    "Proof.2005.1080p.BluRay-GRP.mkv": {
+        "title": "Proof",
+        "year": "2005",
+        "source": "Blu-ray",
+        "screen_size": "1080p",
+    },
+    # A movie whose title itself contains a marker word ("Trailer" in "Trailer
+    # Park Boys: The Movie"). The title legitimately accounts for exactly ONE
+    # "trailer" occurrence, so the count-based carve-out must keep this genuine
+    # feature — the filename carries no MORE "trailer"s than the title does.
+    "Trailer.Park.Boys.The.Movie.2006.1080p.BluRay-GRP.mkv": {
+        "title": "Trailer Park Boys: The Movie",
+        "year": "2006",
+        "source": "Blu-ray",
+        "screen_size": "1080p",
+    },
 }
 
 
@@ -203,6 +221,106 @@ def test_named_sample_not_chosen_over_real_feature() -> None:
     assert result.accepted is True
     assert result.video is not None
     assert result.video.relative_path == "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+
+
+def test_title_matching_sample_marker_word_accepts() -> None:
+    # Issue #11 repro: a movie genuinely titled "Proof" must not be dropped by
+    # the sample/extra filter just because "proof" is one of its marker words.
+    result = validate_import(
+        [VideoFile("Proof.2005.1080p.BluRay-GRP.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=9800,
+    )
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.video is not None
+    assert result.video.relative_path == "Proof.2005.1080p.BluRay-GRP.mkv"
+
+
+def test_title_marker_followed_by_real_marker_still_flagged_extra() -> None:
+    # Regression: the expected title "Proof" itself matches a sample/extra marker
+    # word, and a REAL marker ("Trailer") follows it immediately. The
+    # title-explained "Proof" match must NOT consume the separator before
+    # "Trailer" -- otherwise finditer never sees the second marker, the file is
+    # not recognised as an extra, and (being large) it would be chosen as the
+    # feature. With the non-consuming boundary both markers are examined, so the
+    # file is dropped; here it is the only candidate, leaving nothing importable.
+    result = validate_import(
+        [VideoFile("Proof.Trailer.2005.1080p.BluRay-GRP.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=9800,
+    )
+    assert result.accepted is False
+    assert result.video is None
+    assert [r.reason for r in result.rejections] == [ImportRejectionReason.NO_VIDEO_FILE]
+
+
+def test_title_marked_feature_kept_while_adjacent_marker_extra_dropped() -> None:
+    # The stronger form of the regression: a genuine "Proof" feature ships next to
+    # a LARGER "Proof.Trailer" extra. Without the non-consuming boundary the
+    # trailing "Trailer" marker is hidden by the title-explained "Proof" prefix,
+    # the extra survives, and (being the largest) it would be imported as the
+    # movie. The fix drops the extra and the real feature is chosen instead.
+    result = validate_import(
+        [
+            VideoFile("Proof.Trailer.2005.1080p.BluRay-GRP.mkv", 5 * _GIB),
+            VideoFile("Proof.2005.1080p.BluRay-GRP.mkv", 4 * _GIB),
+        ],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Proof",
+        expected_year=2005,
+        expected_tmdb_id=9800,
+    )
+    assert result.accepted is True
+    assert result.video is not None
+    assert result.video.relative_path == "Proof.2005.1080p.BluRay-GRP.mkv"
+
+
+def test_extra_marker_beyond_title_count_flagged() -> None:
+    # Round-2 regression: the expected title "Trailer Park Boys: The Movie"
+    # legitimately contains ONE "trailer". A file that carries "Trailer" a SECOND
+    # time (".../The.Movie.Trailer.2006.mkv") is a real extra marker and must be
+    # dropped. A set-subset carve-out would excuse EVERY "trailer" once the word
+    # appeared in the title, letting this trailing extra ride along as the feature;
+    # the count-based rule catches the occurrence beyond the title's own count. As
+    # the only candidate the drop leaves nothing importable -> NO_VIDEO_FILE.
+    result = validate_import(
+        [VideoFile("Trailer.Park.Boys.The.Movie.Trailer.2006.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Trailer Park Boys: The Movie",
+        expected_year=2006,
+        expected_tmdb_id=13006,
+    )
+    assert result.accepted is False
+    assert result.video is None
+    assert [r.reason for r in result.rejections] == [ImportRejectionReason.NO_VIDEO_FILE]
+
+
+def test_title_marker_word_within_count_stays_feature() -> None:
+    # The counterpart to the above: the SAME title, but the filename carries
+    # "Trailer" only the once the title itself accounts for
+    # ("Trailer.Park.Boys.The.Movie.2006...mkv"). The count-based carve-out must
+    # NOT flag it — this is the genuine feature and imports cleanly.
+    result = validate_import(
+        [VideoFile("Trailer.Park.Boys.The.Movie.2006.1080p.BluRay-GRP.mkv", 4 * _GIB)],
+        parser=FakeParser(),
+        profile=default_profile(),
+        expected_title="Trailer Park Boys: The Movie",
+        expected_year=2006,
+        expected_tmdb_id=13006,
+    )
+    assert result.accepted is True
+    assert result.rejections == ()
+    assert result.video is not None
+    assert result.video.relative_path == "Trailer.Park.Boys.The.Movie.2006.1080p.BluRay-GRP.mkv"
 
 
 def test_multi_part_rejects() -> None:
@@ -370,6 +488,34 @@ _TV_FIELDS: dict[str, dict[str, object]] = {
     },
 }
 
+# basename -> recorded guessit-style field mapping for a show whose OWN title
+# contains a _SAMPLE_EXTRAS marker word ("trailer"): none of these files should
+# be silently dropped by the sample/extra filter.
+_TPB_FIELDS: dict[str, dict[str, object]] = {
+    "Trailer.Park.Boys.S02E01.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Trailer Park Boys",
+        "season": 2,
+        "episode": 1,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+    "Trailer.Park.Boys.S02E02.1080p.WEB-DL.x264-GRP.mkv": {
+        "title": "Trailer Park Boys",
+        "season": 2,
+        "episode": 2,
+        "source": "Web",
+        "screen_size": "1080p",
+    },
+}
+
+
+class FakeTpbParser:
+    """A ParserPort for a show whose title itself carries a sample-marker word."""
+
+    def parse(self, release_name: str) -> ParsedRelease:
+        fields = _TPB_FIELDS.get(release_name, {})
+        return to_parsed_release(fields, release_name)
+
 
 class FakeTvParser:
     """A ParserPort that maps known basenames through the real source_mapping."""
@@ -475,6 +621,28 @@ def test_sample_and_nfo_are_silently_dropped() -> None:
     assert len(result.accepted) == 1
     assert result.rejected == ()
     assert result.skipped_not_requested == ()
+
+
+def test_title_matching_sample_marker_word_not_dropped_in_season_pack() -> None:
+    # A show whose OWN title contains a sample/extra marker word ("trailer")
+    # must not have every episode file silently dropped before per-file
+    # rejection reasons are ever recorded.
+    result = validate_season_import(
+        [
+            VideoFile("Trailer.Park.Boys.S02E01.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+            VideoFile("Trailer.Park.Boys.S02E02.1080p.WEB-DL.x264-GRP.mkv", 2 * _GIB),
+        ],
+        parser=FakeTpbParser(),
+        profile=default_profile(),
+        expected_title="Trailer Park Boys",
+        expected_tmdb_id=12345,
+        expected_season=2,
+    )
+    assert result.rejected == ()
+    assert {frozenset(r.episodes) for r in result.accepted} == {
+        frozenset({1}),
+        frozenset({2}),
+    }
 
 
 def test_requested_episodes_skip_not_requested_ones() -> None:

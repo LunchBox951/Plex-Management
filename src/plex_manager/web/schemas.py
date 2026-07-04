@@ -217,6 +217,22 @@ class SettingsResponse(BaseModel):
     log_retention_days: int | None = None
 
 
+class AppApiKeyResponse(BaseModel):
+    """The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+
+    Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
+    reveal is the belt-and-braces recovery path for a lost/forgotten key on a
+    device that still has it saved, and rotate mints and returns a brand-new key
+    ONCE — the plaintext is never retrievable again after this response, only the
+    Fernet-encrypted column at rest (matching the one-time disclosure setup's
+    ``/complete`` already gives the initial key).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    app_api_key: str
+
+
 class SettingsUpdate(BaseModel):
     """Partial upsert of service config (``PUT /settings``).
 

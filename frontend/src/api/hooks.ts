@@ -6,7 +6,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
+import { setApiKey } from '../lib/apiKey'
 import type {
+  AppApiKeyResponse,
   BlocklistResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
@@ -118,6 +120,42 @@ export function useUpdateSettings() {
       // against the newly-saved connection — and clear any prior unconfigured/auth
       // error, which retry:false otherwise leaves stuck until the page remounts.
       void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+      // The TMDB api key may have changed; Discover's home + search results are
+      // keyed on the old credentials, so drop them too. TanStack Query v5's
+      // default exact:false prefix match covers both queryKeys.discoverHome
+      // (['discover','home']) and every queryKeys.discover(query, year) variant
+      // (['discover', query, year]) with this one call (issue #14).
+      void qc.invalidateQueries({ queryKey: ['discover'] })
+    },
+  })
+}
+
+/**
+ * Reveal the CURRENT app X-Api-Key in plaintext — the break-glass recovery
+ * path for a new device/browser, without re-running setup. On-demand
+ * (mutation, not a query) so the key is only ever fetched on an explicit
+ * "Reveal" click, never pre-fetched/cached.
+ */
+export function useRevealAppKey() {
+  return useMutation({
+    mutationFn: async (): Promise<AppApiKeyResponse> =>
+      unwrap(await client.GET('/api/v1/settings/app-key')),
+  })
+}
+
+/**
+ * Mint a brand-new app X-Api-Key, invalidating the old one everywhere. The
+ * CALLER'S own stored key must be updated immediately (via setApiKey) or the
+ * current session's very next request would 401 with no saved key to fall
+ * back to — every OTHER device/browser holding the old key is, correctly,
+ * locked out until it's re-paired with the new one.
+ */
+export function useRotateAppKey() {
+  return useMutation({
+    mutationFn: async (): Promise<AppApiKeyResponse> =>
+      unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
+    onSuccess: (data) => {
+      setApiKey(data.app_api_key)
     },
   })
 }

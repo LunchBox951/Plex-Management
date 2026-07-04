@@ -34,6 +34,7 @@ class RejectionReason(StrEnum):
     NO_QUALITY_DETECTED = "no_quality_detected"
     BLOCKLISTED = "blocklisted"
     WRONG_MEDIA = "wrong_media"
+    MULTI_SEASON_PACK = "multi_season_pack"
 
 
 @dataclass(frozen=True)

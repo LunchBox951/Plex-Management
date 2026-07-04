@@ -81,12 +81,12 @@ class _OutageProwlarr(FakeProwlarr):
 
 
 class _AuthFailLibrary(FakeLibrary):
-    async def list_sections(self) -> list[LibrarySection]:
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
         raise PlexAuthError("Plex rejected the request (HTTP 401)")
 
 
 class _OutageLibrary(FakeLibrary):
-    async def list_sections(self) -> list[LibrarySection]:
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
         raise PlexLibraryError("Plex request to /library/sections failed")
 
 

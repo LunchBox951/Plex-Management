@@ -1,10 +1,17 @@
-import { useEffect, useState } from 'react'
-import { usePlexLibraries, useSettings, useUpdateSettings } from '../api/hooks'
+import { useEffect, useRef, useState } from 'react'
+import {
+  useRevealAppKey,
+  useRotateAppKey,
+  usePlexLibraries,
+  useSettings,
+  useUpdateSettings,
+} from '../api/hooks'
 import type { SettingsResponse, SettingsUpdate } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { Button } from '../components/ui/Button'
 import { LinkButton } from '../components/ui/LinkButton'
 import { Field } from '../components/ui/Field'
+import { Dialog } from '../components/ui/Dialog'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { useToast } from '../components/ui/toast'
 
@@ -117,6 +124,126 @@ function isValidNumberInput(value: string): boolean {
 }
 
 const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
+
+/**
+ * Reveal / rotate the app's own X-Api-Key (issue #28's OAuth-deferral
+ * hardening): the belt-and-braces recovery path for a lost key on a new
+ * device, and a full rotate if the key was ever exposed. Both actions require
+ * the caller to already hold a currently-valid key (this whole router is
+ * authenticated), so this is not a privilege escalation.
+ */
+function AppKeySection() {
+  const reveal = useRevealAppKey()
+  const rotate = useRotateAppKey()
+  const { toast } = useToast()
+  const [revealedKey, setRevealedKey] = useState<string | null>(null)
+  // Distinguishes the label ("Current" vs "New") without depending on the
+  // mutation hook's own isSuccess flag staying true across re-renders/tests.
+  const [justRotated, setJustRotated] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  // Monotonic ticket shared by reveal AND rotate. Each click takes the next
+  // ticket BEFORE it awaits, and a resolving handler paints the displayed key
+  // only while its ticket is still the latest. Without it a Reveal (which
+  // authenticated with the OLD key) that resolves AFTER a Rotate would clobber
+  // the freshly rotated key on screen — the operator would then pair a new
+  // device with an already-dead key. A ref (not state): bumping it must not
+  // trigger a re-render, and every in-flight closure must see the newest value.
+  const latestActionTicket = useRef(0)
+
+  const handleReveal = async () => {
+    const ticket = (latestActionTicket.current += 1)
+    try {
+      const result = await reveal.mutateAsync()
+      // A newer reveal/rotate superseded this one while it was in flight — drop
+      // this now-stale key rather than overwrite what the newer action showed.
+      if (ticket !== latestActionTicket.current) return
+      setRevealedKey(result.app_api_key)
+      setJustRotated(false)
+    } catch (err) {
+      const apiError = err as ApiError
+      toast({ title: "Couldn't reveal the app key", description: apiError.message, intent: 'error' })
+    }
+  }
+
+  const handleRotate = async () => {
+    const ticket = (latestActionTicket.current += 1)
+    try {
+      // useRotateAppKey's onSuccess persists the new key into THIS browser's
+      // own store first (setApiKey), so the current session survives the
+      // rotation before we ever touch component state.
+      const result = await rotate.mutateAsync()
+      // Paint the new key only if no later action has since superseded this
+      // rotation; the rotation itself succeeded (the key was already persisted
+      // above) regardless, so the dialog still closes and the toast still fires.
+      if (ticket === latestActionTicket.current) {
+        setRevealedKey(result.app_api_key)
+        setJustRotated(true)
+      }
+      setConfirmOpen(false)
+      toast({
+        title: 'App key rotated',
+        description: 'This device is already updated. Every other device needs the new key.',
+        intent: 'success',
+      })
+    } catch (err) {
+      const apiError = err as ApiError
+      toast({ title: 'Rotate failed', description: apiError.message, intent: 'error' })
+    }
+  }
+
+  return (
+    <section className="rounded-xl border border-hairline bg-surface p-5">
+      <h2 className="font-display text-sm font-semibold text-ink">App key</h2>
+      <p className="mt-1 text-xs text-faint">
+        The <code>X-Api-Key</code> every device uses to talk to this app. Reveal it to pair a
+        new device without re-running setup, or rotate it if it's ever been exposed.
+      </p>
+      <div className="mt-4 flex flex-col gap-3">
+        {revealedKey ? (
+          <Field
+            label={justRotated ? 'New app key' : 'Current app key'}
+            value={revealedKey}
+            readOnly
+            onFocus={(e) => e.currentTarget.select()}
+            hint="Copy this into any other device's key entry screen."
+          />
+        ) : null}
+        <div className="flex flex-wrap gap-3">
+          <Button
+            variant="secondary"
+            loading={reveal.isPending}
+            // A rotation in flight will replace the key; block starting a reveal
+            // (which would authenticate with the about-to-die key) until it lands.
+            disabled={rotate.isPending}
+            onClick={() => void handleReveal()}
+          >
+            Reveal
+          </Button>
+          <Button variant="secondary" onClick={() => setConfirmOpen(true)}>
+            Rotate
+          </Button>
+        </div>
+      </div>
+
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen} title="Rotate the app key?">
+        <p className="text-sm text-muted">
+          This mints a brand-new key and immediately invalidates the current one. Every{' '}
+          <strong className="text-ink">other</strong> device or browser with the old key saved
+          will be signed out and need the new key pasted in before it can talk to this app
+          again — this device updates itself automatically and stays signed in.
+        </p>
+        <div className="mt-6 flex justify-end gap-3">
+          <Button variant="secondary" onClick={() => setConfirmOpen(false)}>
+            Cancel
+          </Button>
+          <Button variant="danger" loading={rotate.isPending} onClick={() => void handleRotate()}>
+            Rotate key
+          </Button>
+        </div>
+      </Dialog>
+    </section>
+  )
+}
 
 export function Settings() {
   const { data, isLoading, isError, error, refetch } = useSettings()
@@ -510,6 +637,8 @@ export function Settings() {
           Save changes
         </Button>
       </div>
+
+      <AppKeySection />
 
       <section className="rounded-xl border border-hairline bg-surface p-5">
         <h2 className="font-display text-sm font-semibold text-ink">More</h2>

@@ -65,6 +65,7 @@ __all__ = [
     "SECRET_SETTING_KEYS",
     "ServiceNotConfiguredError",
     "SettingsStore",
+    "api_key_matches",
     "ensure_system_settings",
     "get_disk_pressure_target_percent",
     "get_disk_pressure_threshold_percent",
@@ -349,7 +350,7 @@ def get_reconcile_status(request: Request) -> ReconcileStatus:
 # --------------------------------------------------------------------------- #
 # Authentication
 # --------------------------------------------------------------------------- #
-def _api_key_matches(provided: str | None, expected: str | None) -> bool:
+def api_key_matches(provided: str | None, expected: str | None) -> bool:
     """Constant-time check of the incoming header against the stored key.
 
     ``expected`` is the decrypted ``SystemSettings.app_api_key`` (the column is
@@ -383,7 +384,7 @@ async def require_api_key(
         return
     system = await load_system_settings(session)
     expected = system.app_api_key if system is not None else None
-    if not _api_key_matches(provided, expected):
+    if not api_key_matches(provided, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 
@@ -409,7 +410,7 @@ async def require_pre_init_or_api_key(
     if get_settings().dev_auth_bypass:
         return
     provided = request.headers.get(API_KEY_HEADER_NAME)
-    if not _api_key_matches(provided, system.app_api_key):
+    if not api_key_matches(provided, system.app_api_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 

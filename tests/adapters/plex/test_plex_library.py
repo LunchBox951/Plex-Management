@@ -652,6 +652,37 @@ async def test_list_sections_invalidates_a_stale_movie_cache_when_the_library_is
     assert all(s.type != "movie" for s in third)
 
 
+async def test_list_sections_use_cache_false_sees_a_newly_added_second_movie_section() -> None:
+    # Issue #15: warm the cache with 1 movie section (an already-cached
+    # movie-bearing snapshot), then the operator adds a 2nd movie library in
+    # Plex. A default (use_cache=True) call would still serve the OLD,
+    # shorter, cached list for up to the remaining TTL -- but a caller that
+    # needs the picker to be current RIGHT NOW (settings.plex_libraries_endpoint)
+    # passes use_cache=False and must see both sections immediately.
+    calls = {"n": 0}
+    state = {"two_movie": False}
+
+    def switching(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        if request.url.path == "/library/sections":
+            calls["n"] += 1
+            return httpx.Response(200, json=SECTIONS_TWO_MOVIE if state["two_movie"] else SECTIONS)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(switching, base_url="http://second-movie-lib-plex:32400")
+    # Warm the cache with 1 movie section.
+    first = await adapter.list_sections()
+    assert len([s for s in first if s.type == "movie"]) == 1
+    assert calls["n"] == 1
+
+    # Operator adds a 2nd movie library in Plex.
+    state["two_movie"] = True
+    second = await adapter.list_sections(use_cache=False)
+    assert calls["n"] == 2  # bypassed the stale 1-movie-section cache
+    assert len([s for s in second if s.type == "movie"]) == 2
+
+
 async def test_is_available_no_cache_repages_despite_cached_presence() -> None:
     """G7: use_cache=False bypasses the cached-PRESENT fast path so a removal is seen
     immediately. The default (cached) lookup still trusts a cached present answer; the

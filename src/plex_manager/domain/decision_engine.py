@@ -8,11 +8,17 @@ Mirrors Radarr's decision-engine specification pipeline, in a fixed order:
    *permanent* rejection and is never scored; this guards the north star "do NOT
    grab the wrong media" and runs BEFORE quality so a high-quality wrong release
    can never out-rank a correct one;
-3. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
+3. **multi-season-pack gate** (:func:`~plex_manager.domain.season_pack.classify_release_scope`)
+   — a release spanning more than one season (``S01-S03``) is a *permanent*
+   rejection, mirroring Sonarr's ``MultiSeasonSpecification``: this app's one
+   download == one season data model can't satisfy several seasons from a single
+   grab without stranding sibling ``SeasonRequest``s, so the beta posture is to
+   never grab one, not to prefer it (see ADR/issue #24);
+4. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
    a *permanent* rejection and is never scored (north-star hard cutoff);
-4. **blocklist filter** — a previously failed/reported release is an
+5. **blocklist filter** — a previously failed/reported release is an
    unconditional skip;
-5. **score / sort** the survivors, best-first.
+6. **score / sort** the survivors, best-first.
 
 There is deliberately **no relaxed-fallback retry**: if nothing survives, the
 result carries ``no_acceptable_release=True`` as an observable state. The engine
@@ -44,12 +50,19 @@ from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
 # Release scopes that satisfy a WHOLE-season grab and so earn the season-pack
-# preference: an exact single-season pack AND a multi-season pack (``S01-S03``) that
-# covers the requested season (the media-identity season gate already confirmed it
-# does). Both must rank ahead of a single-episode release for a whole-season request,
-# or a higher-seeded single episode could out-rank a release that actually contains
-# the whole requested season.
-_PACK_SCOPES: frozenset[str] = frozenset({"season_pack", "multi_season_pack"})
+# preference: an exact single-season pack. It must rank ahead of a single-episode
+# release for a whole-season request, or a higher-seeded single episode could
+# out-rank a release that actually contains the whole requested season.
+#
+# A multi-season pack (``S01-S03``) is DELIBERATELY excluded: it is permanently
+# rejected below (the ``_MULTI_SEASON_SCOPE`` gate) rather than preferred, so it
+# never reaches scoring in the first place. See issue #24.
+_PACK_SCOPES: frozenset[str] = frozenset({"season_pack"})
+
+# The release scope :func:`classify_release_scope` reports for a pack that spans
+# more than one season (``S01-S03``). Kept as a named constant so the gate and its
+# tests can't drift from the classifier's string literal.
+_MULTI_SEASON_SCOPE = "multi_season_pack"
 
 __all__ = ["BlocklistCheck", "DecisionResult", "MediaMatchCheck", "decide"]
 
@@ -129,6 +142,15 @@ def decide(
         # scored, so a high-quality wrong release can't out-rank a correct one.
         if not media_match(candidate, parsed):
             rejected.append((candidate, RejectionReason.WRONG_MEDIA))
+            continue
+
+        # Multi-season-pack gate: mirrors Sonarr's MultiSeasonSpecification. This
+        # app's one-download-one-season model can't satisfy several seasons from a
+        # single grab (import would strand every sibling season's SeasonRequest),
+        # so a multi-season pack is a permanent rejection, never scored -- the
+        # beta posture is "borrow proven brains" (issue #24), not "prefer it".
+        if classify_release_scope(parsed) == _MULTI_SEASON_SCOPE:
+            rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
             continue
 
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)

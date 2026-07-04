@@ -68,7 +68,13 @@ def test_covers_requested_episodes_whole_season_pack_never_rejected() -> None:
     assert covers_requested_episodes(_parsed(season=2, episode=None), requested=[4]) is True
 
 
-def test_covers_requested_episodes_multi_season_pack_never_rejected() -> None:
+def test_covers_requested_episodes_multi_season_pack_passes_here_engine_rejects() -> None:
+    # Division of authority (issue #24): this episode-overlap helper backs the
+    # media-identity gate, which runs FIRST, so it must PASS a multi-season pack.
+    # The pack is still refused for the beta, but that rejection is owned solely
+    # by the decision-engine multi-season gate (see the test_multi_season_pack_*
+    # cases in tests/domain/test_decision_engine.py), which surfaces the accurate
+    # RejectionReason.MULTI_SEASON_PACK instead of a misleading WRONG_MEDIA.
     assert covers_requested_episodes(_parsed(season=[1, 2, 3], episode=None), requested=[4]) is True
 
 

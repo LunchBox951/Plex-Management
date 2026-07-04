@@ -32,6 +32,73 @@ def test_move_relocates_file_and_creates_parent(tmp_path: Path) -> None:
     assert dst.read_text() == "payload"
 
 
+def test_move_rolls_back_partial_copy_on_cross_device_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force shutil.move's internal os.rename attempt to fail cross-device so it
+    # takes its copy2-then-unlink-source fallback branch, then make that copy
+    # fail partway through (e.g. ENOSPC mid-write) after it has already
+    # created/truncated dst.
+    src = tmp_path / "src.mkv"
+    src.write_text("the full expected payload")
+    dst = tmp_path / "library" / "movie" / "dst.mkv"
+
+    def _refuse_rename(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device rename")
+
+    def _failing_copyfile(_src: str, dst_arg: str, **_kwargs: object) -> None:
+        Path(dst_arg).write_text("short")  # partial write
+        raise OSError(errno.ENOSPC, "simulated disk full mid-copy")
+
+    monkeypatch.setattr(os, "rename", _refuse_rename)
+    # shutil.move's copy fallback defaults to shutil.copy2, whose *default
+    # arg* binding captures the original copy2 object at shutil.move's own
+    # definition time -- patching shutil.copy2 directly would not affect that
+    # already-bound default. copy2 itself calls copyfile(...) as a bare
+    # module-global name, resolved dynamically at call time, so patching
+    # shutil.copyfile IS observed.
+    monkeypatch.setattr(shutil, "copyfile", _failing_copyfile)
+
+    with pytest.raises(OSError, match="disk full"):
+        LocalFileSystem().move(src, dst)
+
+    assert not dst.exists()  # partial destination cleaned up
+    assert src.exists()  # source untouched -- copy failed before unlink
+    assert src.read_text() == "the full expected payload"
+
+
+def test_move_rolls_back_partial_directory_tree_on_cross_device_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Directory case: shutil.move's cross-device fallback for a directory is a
+    # full copytree, which can be interrupted mid-walk leaving a partially
+    # populated destination tree.
+    src = tmp_path / "src_season"
+    src.mkdir()
+    (src / "e01.mkv").write_text("episode one")
+    (src / "e02.mkv").write_text("episode two")
+    dst = tmp_path / "library" / "show" / "season_01"
+
+    def _refuse_rename(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device rename")
+
+    def _failing_copytree(*_args: object, **_kwargs: object) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
+        (dst / "e01.mkv").write_text("episode one")  # partial tree
+        raise OSError(errno.ENOSPC, "simulated disk full mid-copytree")
+
+    monkeypatch.setattr(os, "rename", _refuse_rename)
+    monkeypatch.setattr(shutil, "copytree", _failing_copytree)
+
+    with pytest.raises(OSError, match="disk full"):
+        LocalFileSystem().move(src, dst)
+
+    assert not dst.exists()  # partial destination tree cleaned up
+    assert src.exists()  # source untouched
+    assert (src / "e01.mkv").exists()
+    assert (src / "e02.mkv").exists()
+
+
 def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     src = tmp_path / "src.mkv"
     src.write_text("payload")
