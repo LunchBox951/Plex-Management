@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -27,6 +28,7 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
+from plex_manager.web.deps import SettingsStore
 from tests.web.fakes import (
     FakeLibrary,
     FakeProwlarr,
@@ -943,6 +945,76 @@ async def test_import_endpoint_tv_root_unset_is_an_honest_block_not_a_409(
     assert body["status"] == "import_blocked"
     assert body["failed_reason"] == "tv library root is not configured"
     assert body["season"] == 1
+
+
+async def test_import_endpoint_anime_movie_routes_to_configured_anime_root(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # The manual import/retry button (POST /queue/{id}/import) must thread the anime
+    # roots exactly as the background reconcile cycle does. An is_anime download whose
+    # anime_movie_root is configured lands under the ANIME library, never the normal
+    # movies_root -- otherwise the destination library would depend on whether the
+    # import ran via the background cycle or this operator button, silently misrouting
+    # anime through a first-class correction path.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_movie_root = tmp_path / "anime"
+    anime_movie_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    with video.open("wb") as handle:  # sparse >50 MiB feature (above the sample floor)
+        handle.seek(60 * 1024 * 1024 - 1)
+        handle.write(b"\0")
+    torrent_hash = "c" * 40
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("movies_root", str(movies_root))
+        await store.set("anime_movie_root", str(anime_movie_root))
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            year=1999,
+            status=RequestStatus.downloading,
+            is_anime=True,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash=torrent_hash,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=603,
+            year=1999,
+        )
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=torrent_hash,
+                name=video.name,
+                raw_state="stalledUP",
+                content_path=str(video),
+            )
+        ]
+    )
+    override_adapters(app, qbt=qbt, library=FakeLibrary())
+
+    response = await client.post(f"/api/v1/queue/{download_id}/import", headers=_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "imported"
+    dst = anime_movie_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    # The normal movies_root must stay untouched -- a REROUTE, not a copy to both.
+    assert not any(movies_root.iterdir())
 
 
 async def test_grab_threads_season_and_episodes_into_search_and_queue_item(

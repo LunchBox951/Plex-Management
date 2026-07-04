@@ -164,6 +164,13 @@ async def complete(
     # reads back as None from GET /settings rather than an empty string.
     if body.tv_root:
         await store.set("tv_root", body.tv_root)
+    # Anime library routing (ADR-0015) — optional exactly like ``tv_root``:
+    # write only when the operator actually supplied one, so an unset anime
+    # root reads back as None (unset), not an empty string.
+    if body.anime_movie_root:
+        await store.set("anime_movie_root", body.anime_movie_root)
+    if body.anime_tv_root:
+        await store.set("anime_tv_root", body.anime_tv_root)
 
     await session.commit()
     return SetupStatusResponse(initialized=True, app_api_key=app_api_key)

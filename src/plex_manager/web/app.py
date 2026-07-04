@@ -46,6 +46,8 @@ from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     ServiceNotConfiguredError,
     ensure_system_settings,
+    get_anime_movie_root_optional,
+    get_anime_tv_root_optional,
     get_auto_grab_enabled,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
@@ -202,6 +204,8 @@ async def _reconcile_once(app: FastAPI) -> None:
                 if library is not None:
                     movies_root = await get_movies_root_optional(session)
                     tv_root = await get_tv_root_optional(session)
+                    anime_movie_root = await get_anime_movie_root_optional(session)
+                    anime_tv_root = await get_anime_tv_root_optional(session)
                     await import_service.run_import_cycle(
                         fs=get_filesystem(),
                         library=library,
@@ -211,6 +215,8 @@ async def _reconcile_once(app: FastAPI) -> None:
                         session=session,
                         movies_root=movies_root,
                         tv_root=tv_root,
+                        anime_movie_root=anime_movie_root,
+                        anime_tv_root=anime_tv_root,
                     )
             except QbittorrentError as exc:
                 await session.rollback()
@@ -423,12 +429,27 @@ async def _eviction_tick(app: FastAPI) -> float:
         proactive_enabled = await get_eviction_proactive_enabled(session)
         movies_root = await get_movies_root_optional(session)
         tv_root = await get_tv_root_optional(session)
-        fs = get_eviction_filesystem(movies_root, tv_root)
+        anime_movie_root = await get_anime_movie_root_optional(session)
+        anime_tv_root = await get_anime_tv_root_optional(session)
+        fs = get_eviction_filesystem(movies_root, tv_root, anime_movie_root, anime_tv_root)
 
+        # ADR-0015: the anime roots get their own entries so both the pressure
+        # sweep and the delete-nothing telemetry sweep below can actually reach
+        # anime content -- eviction_service._owned_by_root assigns each
+        # breadcrumb to its DEEPEST containing configured root, so an anime
+        # library_path is never a candidate unless its root is listed here.
         roots: tuple[tuple[Literal["movie", "tv"], str | None], ...] = (
             ("movie", movies_root),
             ("tv", tv_root),
+            ("movie", anime_movie_root),
+            ("tv", anime_tv_root),
         )
+        # Every configured root, threaded into each per-root sweep as the
+        # ownership scope: with NESTED roots (an anime root inside movies_root),
+        # a breadcrumb belongs ONLY to its most specific root's sweep -- the
+        # parent's disk pressure must never evict (or telemetry-count) the child
+        # mount's content (see eviction_service._owned_by_root).
+        all_roots: list[str] = [r for _mt, r in roots if r]
         for media_type, root in roots:
             if not root:
                 continue
@@ -463,6 +484,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                         fs=fs,
                         media_type=media_type,
                         root_path=root,
+                        all_roots=all_roots,
                         grace_days=grace_days,
                         threshold_pct=threshold_pct,
                         target_pct=target_pct,
@@ -506,6 +528,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                 fs=fs,
                 media_type=media_type,
                 root_path=root,
+                all_roots=all_roots,
                 threshold_pct=threshold_pct,
                 target_pct=target_pct,
                 grace_days=grace_days,
@@ -528,6 +551,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                     fs=fs,
                     media_type=media_type,
                     root_path=root,
+                    all_roots=all_roots,
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,

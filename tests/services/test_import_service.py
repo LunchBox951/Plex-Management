@@ -57,7 +57,11 @@ def _make_video(path: Path, size_bytes: int = 60 * 1024 * 1024) -> None:
 
 
 async def _seed(
-    sessionmaker_: SessionMaker, *, request_status: RequestStatus, download_status: str
+    sessionmaker_: SessionMaker,
+    *,
+    request_status: RequestStatus,
+    download_status: str,
+    is_anime: bool = False,
 ) -> tuple[int, int]:
     """Insert a movie request + a tracked download; return ``(download_id, request_id)``."""
     async with sessionmaker_() as session:
@@ -67,6 +71,7 @@ async def _seed(
             title="The Matrix",
             year=1999,
             status=request_status,
+            is_anime=is_anime,
         )
         session.add(request)
         await session.flush()
@@ -101,6 +106,8 @@ async def _import(
     movies_root: Path,
     qbt: FakeQbittorrent,
     library: FakeLibrary,
+    *,
+    anime_movie_root: Path | None = None,
 ) -> DownloadRecord | None:
     async with sessionmaker_() as session:
         return await import_download(
@@ -112,6 +119,7 @@ async def _import(
             profile=default_profile(),
             session=session,
             movies_root=str(movies_root),
+            anime_movie_root=str(anime_movie_root) if anime_movie_root is not None else None,
         )
 
 
@@ -965,6 +973,7 @@ async def _seed_tv(
     season_status: str = "downloading",
     download_status: str = DownloadState.ImportPending.value,
     episodes: list[int] | None = None,
+    is_anime: bool = False,
 ) -> tuple[int, int, int]:
     """Insert a tv request + one tracked season + a download for that season.
 
@@ -977,6 +986,7 @@ async def _seed_tv(
             title="Some Show",
             year=2020,
             status=request_status,
+            is_anime=is_anime,
         )
         session.add(request)
         await session.flush()
@@ -1005,6 +1015,8 @@ async def _import_tv(
     tv_root: Path,
     qbt: FakeQbittorrent,
     library: FakeLibrary,
+    *,
+    anime_tv_root: Path | None = None,
 ) -> DownloadRecord | None:
     async with sessionmaker_() as session:
         return await import_download(
@@ -1017,6 +1029,7 @@ async def _import_tv(
             session=session,
             movies_root="/unused",  # required by the port, never touched by the tv branch
             tv_root=str(tv_root),
+            anime_tv_root=str(anime_tv_root) if anime_tv_root is not None else None,
         )
 
 
@@ -1486,3 +1499,243 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
         request = await session.get(MediaRequest, request_id)
     assert season_row is not None and season_row.status.value == "completed"
     assert request is not None and request.status is RequestStatus.completed  # stays "Finalizing"
+
+
+# --------------------------------------------------------------------------- #
+# Anime library routing (ADR-0015)
+# --------------------------------------------------------------------------- #
+
+
+async def test_import_anime_movie_routes_to_anime_movie_root_when_configured(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    anime_movie_root = tmp_path / "anime-library"
+    anime_movie_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+        is_anime=True,
+    )
+    library = FakeLibrary()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        anime_movie_root=anime_movie_root,
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = anime_movie_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    # The normal movies_root tree must stay untouched -- this is a REROUTE, not
+    # a copy to both.
+    assert not any(movies_root.iterdir())
+
+
+async def test_import_anime_tv_routes_to_anime_tv_root_when_configured(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    anime_tv_root = tmp_path / "anime-tv"
+    anime_tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, season_id = await _seed_tv(sessionmaker_, season=2, is_anime=True)
+    library = FakeLibrary()
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(release_dir),
+        library,
+        anime_tv_root=anime_tv_root,
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    season_dir = anime_tv_root / "Some Show (2020)" / "Season 02"
+    assert (season_dir / "Some Show - S02E01.mkv").exists()
+    assert not any(tv_root.iterdir())
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None
+    # The breadcrumb records the ANIME path -- what purge/eviction target.
+    assert season_row.library_path == str(season_dir)
+
+
+async def test_import_anime_movie_falls_back_to_movies_root_when_anime_root_unset(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """``is_anime=True`` with no ``anime_movie_root`` configured must behave
+    IDENTICALLY to before this feature existed -- routed to ``movies_root``."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+        is_anime=True,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+
+
+async def test_import_non_anime_movie_ignores_a_configured_anime_root(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """An anime root must never capture non-anime content, even when set."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    anime_movie_root = tmp_path / "anime-library"
+    anime_movie_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+        is_anime=False,
+    )
+    library = FakeLibrary()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        anime_movie_root=anime_movie_root,
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    assert not any(anime_movie_root.iterdir())
+
+
+async def test_import_anime_movie_blocked_honestly_when_no_root_at_all_is_configured(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``is_anime=True``, both ``anime_movie_root`` AND ``movies_root`` unset ->
+    the SAME honest, retryable ``ImportBlocked`` as the non-anime case (never a
+    crash from ``Path(None)``), firing only on the truly-unset EFFECTIVE root."""
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+        is_anime=True,
+    )
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=FakeQbittorrent(),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=None,
+            tv_root="/unused",
+            anime_movie_root=None,
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "movies library root is not configured"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_anime_only_install_imports_with_movies_root_unset(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """An anime-only install (only ``anime_movie_root`` configured, no plain
+    ``movies_root``) must still import an anime movie -- the effective-root
+    guard, not the raw ``movies_root``, gates the block."""
+    anime_movie_root = tmp_path / "anime-library"
+    anime_movie_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+        is_anime=True,
+    )
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        record = await import_download(
+            download_id=download_id,
+            fs=LocalFileSystem(),
+            library=library,
+            qbt=_qbt(video),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=None,
+            anime_movie_root=str(anime_movie_root),
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = anime_movie_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+
+
+async def test_import_anime_movie_persists_anime_library_path_for_eviction(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """The breadcrumb (``MediaRequest.library_path``) records the ANIME path, so
+    a later eviction/report-issue purge targets the right (anime) location."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    anime_movie_root = tmp_path / "anime-library"
+    anime_movie_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+        is_anime=True,
+    )
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        FakeLibrary(),
+        anime_movie_root=anime_movie_root,
+    )
+    assert record is not None and record.status == DownloadState.Imported.value
+
+    dst = anime_movie_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.library_path == str(dst.parent)

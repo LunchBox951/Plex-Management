@@ -243,6 +243,118 @@ async def test_candidate_outside_the_swept_root_is_not_evicted(
         assert row is not None and row.status is RequestStatus.available
 
 
+async def test_parent_root_sweep_never_claims_a_nested_child_roots_content(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # Codex P2 (nested roots): anime_movie_root is configured INSIDE movies_root
+    # (its own mount, its own disk pressure, its own sweep iteration). The PARENT
+    # root's sweep must not claim breadcrumbs the nested child root owns -- plain
+    # lexical containment would evict the child mount's content under the parent's
+    # pressure. Deepest-match assignment (``all_roots``) gives each breadcrumb
+    # exactly one owning sweep: the parent evicts only its own direct content, and
+    # the child's own sweep evicts the nested title.
+    movies_root = tmp_path / "movies"
+    anime_root = movies_root / "anime"
+    anime_root.mkdir(parents=True)
+    normal_file = movies_root / "Old Movie.mkv"
+    normal_file.write_bytes(b"0" * 1024)
+    anime_file = anime_root / "Old Anime.mkv"
+    anime_file.write_bytes(b"0" * 1024)
+    normal_id = await _movie(
+        sessionmaker_, tmdb_id=501, title="Old Movie", library_path=str(normal_file)
+    )
+    anime_id = await _movie(
+        sessionmaker_, tmdb_id=502, title="Old Anime", library_path=str(anime_file)
+    )
+    # Both watched + past grace: only the ownership scope decides who sweeps what.
+    library = FakeLibrary(
+        watch_states={
+            (501, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (502, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(movies_root), str(anime_root)])
+    all_roots = [str(movies_root), str(anime_root)]
+
+    # The PARENT sweep: evicts its own direct movie, never the nested anime title.
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(movies_root),
+            all_roots=all_roots,
+            threshold_pct=0.0,  # always-evict pressure: only ownership can stop it
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+    assert [o.title for o in outcomes] == ["Old Movie"]
+    assert not normal_file.exists()
+    assert anime_file.exists()  # the child mount's content is untouched
+    async with sessionmaker_() as session:
+        normal_row = await session.get(MediaRequest, normal_id)
+        anime_row = await session.get(MediaRequest, anime_id)
+    assert normal_row is not None and normal_row.status is RequestStatus.evicted
+    assert anime_row is not None and anime_row.status is RequestStatus.available
+
+    # The CHILD root's own sweep is the one that owns (and evicts) the anime title.
+    async with sessionmaker_() as session:
+        child_outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(anime_root),
+            all_roots=all_roots,
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+    assert [o.title for o in child_outcomes] == ["Old Anime"]
+    assert not anime_file.exists()
+
+
+async def test_assemble_candidates_assigns_nested_root_content_to_the_child_only(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # The same nested-root ownership through ``assemble_candidates`` -- the shared
+    # raw read behind BOTH the ops /disk preview (via preview_candidates) and the
+    # retention-telemetry sweep, so neither double-counts a nested child root's
+    # content under its parent's row/metrics.
+    movies_root = tmp_path / "movies"
+    anime_root = movies_root / "anime"
+    anime_root.mkdir(parents=True)
+    normal_file = movies_root / "Plain.mkv"
+    normal_file.write_bytes(b"0" * 512)
+    anime_file = anime_root / "Nested.mkv"
+    anime_file.write_bytes(b"0" * 512)
+    await _movie(sessionmaker_, tmdb_id=511, title="Plain", library_path=str(normal_file))
+    await _movie(sessionmaker_, tmdb_id=512, title="Nested", library_path=str(anime_file))
+    library = FakeLibrary()
+    all_roots = [str(movies_root), str(anime_root)]
+
+    async with sessionmaker_() as session:
+        parent = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="movie",
+            root_path=str(movies_root),
+            root_total_bytes=0,
+            all_roots=all_roots,
+        )
+        child = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="movie",
+            root_path=str(anime_root),
+            root_total_bytes=0,
+            all_roots=all_roots,
+        )
+    assert [c.title for c in parent] == ["Plain"]
+    assert [c.title for c in child] == ["Nested"]
+
+
 async def test_never_evicts_an_unwatched_movie(sessionmaker_: SessionMaker, tmp_path: Path) -> None:
     library_path = _movie_file(tmp_path, "Unwatched.mkv")
     await _movie(sessionmaker_, tmdb_id=2, title="Unwatched", library_path=library_path)

@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
     SettingsStore,
+    get_anime_movie_root_optional,
+    get_anime_tv_root_optional,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_eviction_enabled,
@@ -196,6 +198,82 @@ async def test_empty_string_root_reads_back_as_unset(
         assert await SettingsStore(session).get("tv_root") == ""
         assert await get_movies_root_optional(session) is None
         assert await get_tv_root_optional(session) is None
+
+
+# --------------------------------------------------------------------------- #
+# Anime library routing (ADR-0015): anime_movie_root / anime_tv_root
+# --------------------------------------------------------------------------- #
+async def test_get_starts_with_anime_roots_unset(client: httpx.AsyncClient, seed: SeedFn) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    body = response.json()
+    assert body["anime_movie_root"] is None
+    assert body["anime_tv_root"] is None
+
+
+async def test_put_anime_roots_round_trip_independently_of_movies_and_tv_root(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"anime_movie_root": "/library/anime-movies", "anime_tv_root": "/library/anime-tv"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    body = put.json()
+    assert body["anime_movie_root"] == "/library/anime-movies"
+    assert body["anime_tv_root"] == "/library/anime-tv"
+    # Untouched by the anime-only PUT.
+    assert body["movies_root"] is None
+    assert body["tv_root"] is None
+
+    got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
+    assert got["anime_movie_root"] == "/library/anime-movies"
+    assert got["anime_tv_root"] == "/library/anime-tv"
+
+
+async def test_put_partial_anime_root_only_leaves_the_other_and_normal_roots_untouched(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "/library/movies", "anime_movie_root": "/library/anime-movies"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    put = await client.put(
+        "/api/v1/settings",
+        json={"anime_tv_root": "/library/anime-tv"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    body = put.json()
+    assert body["anime_tv_root"] == "/library/anime-tv"
+    assert body["anime_movie_root"] == "/library/anime-movies"  # untouched by this partial PUT
+    assert body["movies_root"] == "/library/movies"  # untouched by this partial PUT
+
+
+async def test_empty_string_anime_root_reads_back_as_unset(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Mirrors ``test_empty_string_root_reads_back_as_unset``: an empty-string
+    anime root (a frontend clear-on-Plex-reconnect) reads back as unset, never
+    a falsy-but-truthy path that would sail past the importer's ``is None``
+    guard."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"anime_movie_root": "", "anime_tv_root": ""},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("anime_movie_root") == ""
+        assert await SettingsStore(session).get("anime_tv_root") == ""
+        assert await get_anime_movie_root_optional(session) is None
+        assert await get_anime_tv_root_optional(session) is None
 
 
 # --------------------------------------------------------------------------- #
