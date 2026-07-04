@@ -81,6 +81,70 @@
         "title": "AppApiKeyResponse",
         "type": "object"
       },
+      "AutograbStatusItem": {
+        "description": "The background auto-grab loop's own health (ADR-0013), mirrored from\n``services.health_service.AutograbStatusSnapshot``. The exact shape of\n``ReconcileStatusItem`` above, for the separate ``_autograb_loop`` -- a\nProwlarr outage surfaces here as a failing loop so the operator sees WHY\nnothing is being grabbed, not just that requests sit at ``pending``.\n\n``cooled_down_scopes`` is how many scopes are CURRENTLY in a grab-pipeline\ncooldown (ADR-0013): scopes whose grab keeps failing, skipped so they don't\nstarve the search budget -- a non-zero count is the operator's signal that the\ngrab pipeline (not the search) is what's broken.",
+        "properties": {
+          "consecutive_failures": {
+            "default": 0,
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "cooled_down_scopes": {
+            "default": 0,
+            "title": "Cooled Down Scopes",
+            "type": "integer"
+          },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
+          "last_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Type"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Ok At"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          }
+        },
+        "title": "AutograbStatusItem",
+        "type": "object"
+      },
       "BlocklistEntry": {
         "description": "A blocklist entry as returned to the client.",
         "properties": {
@@ -767,6 +831,9 @@
       "HealthResponse": {
         "description": "``GET /api/v1/ops/health`` -- one read answering \"is every subsystem\nhealthy, is the reconcile loop running, how full is the disk\".",
         "properties": {
+          "autograb": {
+            "$ref": "#/components/schemas/AutograbStatusItem"
+          },
           "disks": {
             "items": {
               "$ref": "#/components/schemas/DiskGaugeItem"
@@ -788,7 +855,8 @@
         "required": [
           "subsystems",
           "disks",
-          "reconcile"
+          "reconcile",
+          "autograb"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -1604,6 +1672,17 @@
       "SettingsResponse": {
         "description": "Redacted view of stored service config.\n\nPlaintext (non-secret) values are returned as-is; secret values are shown as\n``\"***\"`` when configured and ``None`` when unset \u2014 the plaintext secret is\nNEVER serialized.",
         "properties": {
+          "auto_grab_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Enabled"
+          },
           "disk_pressure_target_percent": {
             "anyOf": [
               {
@@ -1798,6 +1877,17 @@
       "SettingsUpdate": {
         "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
         "properties": {
+          "auto_grab_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Enabled"
+          },
           "disk_pressure_target_percent": {
             "anyOf": [
               {
@@ -2507,7 +2597,7 @@
     },
     "/api/v1/ops/health": {
       "get": {
-        "description": "One read: per-subsystem reachability, disk gauges, and the reconcile\nloop's own health. Each upstream probe is TTL-cached (~15s) so polling this\nevery few seconds never hammers an upstream or burns the TMDB rate limit.",
+        "description": "One read: per-subsystem reachability, disk gauges, and the reconcile +\nauto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so\npolling this every few seconds never hammers an upstream or burns the TMDB\nrate limit.",
         "operationId": "health_endpoint_api_v1_ops_health_get",
         "responses": {
           "200": {
