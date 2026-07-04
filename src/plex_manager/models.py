@@ -38,6 +38,7 @@ from plex_manager.db import Base
 
 __all__ = [
     "AuditLog",
+    "AuthSession",
     "Blocklist",
     "BlocklistReason",
     "Download",
@@ -46,6 +47,7 @@ __all__ = [
     "LogEvent",
     "MediaRequest",
     "MediaType",
+    "PlexLoginState",
     "RequestDedupLock",
     "RequestStatus",
     "SeasonRequest",
@@ -163,7 +165,7 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String)
     avatar_url: Mapped[str | None] = mapped_column(String)
     encrypted_plex_token: Mapped[str | None] = mapped_column(EncryptedStr)
-    permissions: Mapped[int] = mapped_column(default=1, server_default=sa.text("1"))
+    permissions: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -226,6 +228,46 @@ class SystemSettings(Base):
     app_api_key: Mapped[str | None] = mapped_column(EncryptedStr)
     setup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     setup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PlexLoginState(Base):
+    """Pending plex.tv PIN login challenge.
+
+    The state value is the local CSRF-style nonce the SPA sends back to
+    ``/auth/plex/complete``. It is single-use and short-lived; the row contains no
+    Plex user token.
+    """
+
+    __tablename__ = "plex_login_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    state: Mapped[str] = mapped_column(String, unique=True, index=True)
+    pin_id: Mapped[int] = mapped_column(index=True)
+    code: Mapped[str] = mapped_column(String)
+    client_identifier: Mapped[str] = mapped_column(String)
+    browser_token_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuthSession(Base):
+    """HTTP-only browser session for a Plex-authenticated user.
+
+    Only the SHA-256 digest of the random cookie token is stored. Revocation sets
+    ``revoked_at`` rather than deleting so logout/session behavior remains
+    auditable without retaining a usable bearer token.
+    """
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditLog(Base):

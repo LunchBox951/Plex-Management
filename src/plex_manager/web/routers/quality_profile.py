@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 
 from plex_manager.domain.quality import QUALITY_BY_ID, Resolution
 from plex_manager.domain.quality_profile import QualityProfile
-from plex_manager.web.deps import get_quality_profile, require_api_key
+from plex_manager.web.deps import get_quality_profile, require_admin
 from plex_manager.web.schemas import (
     QualityProfileItemResponse,
     QualityProfileResponse,
@@ -19,7 +19,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/quality-profile",
     tags=["quality-profile"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 

@@ -28,6 +28,7 @@ export const queryClient = new QueryClient({
 
 /** Stable query-key roots so mutations can invalidate precisely. */
 export const queryKeys = {
+  authMe: ['auth', 'me'] as const,
   setupStatus: ['setup', 'status'] as const,
   settings: ['settings'] as const,
   plexLibraries: ['settings', 'plex-libraries'] as const,

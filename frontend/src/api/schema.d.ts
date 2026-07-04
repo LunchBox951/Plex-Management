@@ -4,6 +4,86 @@
  */
 
 export interface paths {
+    "/api/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout Endpoint
+         * @description Revoke the current Plex browser session and clear auth cookies.
+         */
+        post: operations["logout_endpoint_api_v1_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Me Endpoint
+         * @description Return current auth state without requiring auth.
+         */
+        get: operations["me_endpoint_api_v1_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/plex/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Plex Complete Endpoint
+         * @description Complete a Plex PIN challenge, verify owner access, and issue cookies.
+         */
+        post: operations["plex_complete_endpoint_api_v1_auth_plex_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/plex/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Plex Start Endpoint
+         * @description Create a plex.tv PIN challenge and return the hosted auth URL.
+         */
+        post: operations["plex_start_endpoint_api_v1_auth_plex_start_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/blocklist": {
         parameters: {
             query?: never;
@@ -608,13 +688,10 @@ export interface paths {
          * Reveal App Key Endpoint
          * @description Return the current app ``X-Api-Key`` in plaintext.
          *
-         *     Authenticated: the caller already proved they hold a currently-valid key
-         *     (``require_api_key`` on the whole router), so this is not a privilege
-         *     escalation -- it is the break-glass recovery path for a NEW device/browser
-         *     that needs to be paired without re-running setup, and the belt-and-braces
-         *     answer to "I'm about to lose my only saved copy" (issue #28's OAuth-deferral
-         *     analysis: total key loss is the one genuine gap in keeping a static key for
-         *     the beta).
+         *     Authenticated: the caller already proved they have a valid Plex session or
+         *     app key, so this is not an anonymous disclosure -- it is the break-glass
+         *     recovery path for a NEW device/browser that needs to be paired without
+         *     re-running setup.
          */
         get: operations["reveal_app_key_endpoint_api_v1_settings_app_key_get"];
         put?: never;
@@ -640,9 +717,9 @@ export interface paths {
          *
          *     Every OTHER device/browser with the OLD key saved (localStorage) is
          *     immediately locked out -- there is exactly one live key at a time, matching
-         *     ``require_api_key``'s single-key comparison. The frontend caller of this
-         *     endpoint MUST persist the returned key immediately so the session that just
-         *     rotated it survives (the new key is never shown again after this response).
+         *     ``require_api_key``'s single-key comparison. The frontend persists the
+         *     returned key immediately for future access-key recovery, but normal browser
+         *     auth continues to use the Plex session cookie.
          *
          *     Compare-and-swap against concurrent rotations: two rotate requests carrying
          *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
@@ -878,16 +955,53 @@ export interface components {
          * AppApiKeyResponse
          * @description The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
          *
-         *     Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
-         *     reveal is the belt-and-braces recovery path for a lost/forgotten key on a
-         *     device that still has it saved, and rotate mints and returns a brand-new key
-         *     ONCE — the plaintext is never retrievable again after this response, only the
+         *     Authenticated-only (Plex session or currently-valid ``X-Api-Key``): reveal is
+         *     the belt-and-braces recovery path for a lost/forgotten key on a device that
+         *     still has it saved, and rotate mints and returns a brand-new key ONCE — the
+         *     plaintext is never retrievable again after this response, only the
          *     Fernet-encrypted column at rest (matching the one-time disclosure setup's
          *     ``/complete`` already gives the initial key).
          */
         AppApiKeyResponse: {
             /** App Api Key */
             app_api_key: string;
+        };
+        /**
+         * AuthMeResponse
+         * @description Current app authentication state.
+         */
+        AuthMeResponse: {
+            /** Auth Method */
+            auth_method?: ("api_key" | "plex_session" | "dev_bypass") | null;
+            /** Authenticated */
+            authenticated: boolean;
+            /**
+             * Is Admin
+             * @default false
+             */
+            is_admin: boolean;
+            user?: components["schemas"]["AuthUser"] | null;
+        };
+        /**
+         * AuthUser
+         * @description Current signed-in Plex user.
+         */
+        AuthUser: {
+            /** Avatar Url */
+            avatar_url?: string | null;
+            /** Email */
+            email?: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Is Admin
+             * @default false
+             */
+            is_admin: boolean;
+            /** Plex Id */
+            plex_id: number | null;
+            /** Username */
+            username: string;
         };
         /**
          * AutograbStatusItem
@@ -1337,6 +1451,29 @@ export interface components {
             title: string;
             /** Writable */
             writable?: boolean | null;
+        };
+        /**
+         * PlexLoginCompleteRequest
+         * @description Complete a pending Plex PIN login challenge.
+         */
+        PlexLoginCompleteRequest: {
+            /** State */
+            state: string;
+        };
+        /**
+         * PlexLoginStartResponse
+         * @description A pending Plex PIN login challenge.
+         */
+        PlexLoginStartResponse: {
+            /** Auth Url */
+            auth_url: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** State */
+            state: string;
         };
         /**
          * PlexValidateRequest
@@ -1806,6 +1943,97 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    logout_endpoint_api_v1_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    me_endpoint_api_v1_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+        };
+    };
+    plex_complete_endpoint_api_v1_auth_plex_complete_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexLoginCompleteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    plex_start_endpoint_api_v1_auth_plex_start_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLoginStartResponse"];
+                };
+            };
+        };
+    };
     list_blocklist_api_v1_blocklist_get: {
         parameters: {
             query?: {

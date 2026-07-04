@@ -29,6 +29,7 @@ from plex_manager.services.correction_service import (
 from plex_manager.services.library_roots import LibraryRoots
 from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
+    AuthContext,
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
@@ -44,6 +45,7 @@ from plex_manager.web.deps import (
     get_session,
     get_tmdb,
     get_tv_root_optional,
+    require_admin,
     require_api_key,
 )
 from plex_manager.web.schemas import (
@@ -64,7 +66,6 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/requests",
     tags=["requests"],
-    dependencies=[Depends(require_api_key)],
 )
 
 # NB: no 409 "media type deferred" here -- ``CreateRequestBody.media_type`` is
@@ -127,6 +128,7 @@ async def _to_response(
 async def create_request_endpoint(
     body: CreateRequestBody,
     response: Response,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
@@ -148,6 +150,7 @@ async def create_request_endpoint(
             media_type=body.media_type,
             library=library,
             seasons=body.seasons,
+            user_id=auth.user_id,
         )
     except MediaNotFoundError as exc:
         raise HTTPException(
@@ -169,10 +172,13 @@ async def create_request_endpoint(
 
 @router.get("")
 async def list_requests_endpoint(
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestListResponse:
     """List all media requests."""
     records = await request_service.list_requests(session)
+    if not auth.is_admin:
+        records = [record for record in records if record.user_id == auth.user_id]
     # Batch every tv row's season rows in ONE query (avoids an N+1 query per tv
     # request that calling ``_to_response`` per-row without this would cause).
     tv_ids = [r.id for r in records if r.media_type == "tv"]
@@ -188,11 +194,12 @@ async def list_requests_endpoint(
 )
 async def get_request_endpoint(
     request_id: int,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestResponse:
     """Return a single media request, or 404."""
     record = await request_service.get_request(session, request_id)
-    if record is None:
+    if record is None or (not auth.is_admin and record.user_id != auth.user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
     return await _to_response(session, record)
 
@@ -201,6 +208,7 @@ async def get_request_endpoint(
 async def keep_forever_endpoint(
     request_id: int,
     body: KeepForeverBody,
+    _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestResponse:
     """Set or clear the operator's "keep forever" pin (ADR-0012).
@@ -223,6 +231,7 @@ async def keep_forever_endpoint(
 async def report_issue_endpoint(
     request_id: int,
     body: ReportIssueBody,
+    _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     library: Annotated[LibraryPort, Depends(get_library)],
@@ -315,6 +324,7 @@ async def report_issue_endpoint(
 @router.post("/{request_id}/cancel")
 async def cancel_request_endpoint(
     request_id: int,
+    _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
 ) -> RequestResponse:

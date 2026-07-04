@@ -71,6 +71,7 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
 )
 from plex_manager.web.middleware import SetupGuardMiddleware
+from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
 from plex_manager.web.routers import ops as ops_router
@@ -728,6 +729,7 @@ def create_app() -> FastAPI:
         app.add_exception_handler(adapter_error, _adapter_error_handler)
     app.include_router(router)
     app.include_router(setup_router.router)
+    app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
     app.include_router(requests_router.router)

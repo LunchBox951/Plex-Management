@@ -21,8 +21,12 @@ Wiring rules:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Annotated, cast
 
 import httpx
@@ -41,7 +45,7 @@ from plex_manager.adapters.tmdb.adapter import TmdbMetadata
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.domain.quality_profile import QualityProfile, default_profile
-from plex_manager.models import Setting, SystemSettings
+from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
@@ -59,6 +63,8 @@ from plex_manager.services.health_service import (
 __all__ = [
     "API_KEY_HEADER_NAME",
     "AUTO_GRAB_ENABLED_DEFAULT",
+    "CSRF_COOKIE_NAME",
+    "CSRF_HEADER_NAME",
     "DISK_PRESSURE_TARGET_PERCENT_DEFAULT",
     "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
     "EVICTION_ENABLED_DEFAULT",
@@ -69,10 +75,14 @@ __all__ = [
     "LOG_RETENTION_DAYS_DEFAULT",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
+    "SESSION_COOKIE_NAME",
     "SETUP_TOKEN_HEADER_NAME",
+    "AuthContext",
+    "AuthMethod",
     "ServiceNotConfiguredError",
     "SettingsStore",
     "api_key_matches",
+    "authenticate_request",
     "ensure_system_settings",
     "get_anime_movie_root_optional",
     "get_anime_tv_root_optional",
@@ -104,8 +114,10 @@ __all__ = [
     "get_tmdb",
     "get_tv_root",
     "get_tv_root_optional",
+    "hash_session_token",
     "is_setup_token_required",
     "load_system_settings",
+    "require_admin",
     "require_api_key",
     "require_pre_init_or_api_key",
     "require_setup_token_pre_init",
@@ -119,9 +131,37 @@ _logger = logging.getLogger(__name__)
 # the key.
 API_KEY_HEADER_NAME = "X-Api-Key"
 SETUP_TOKEN_HEADER_NAME = "X-Setup-Token"  # noqa: S105 — header name, not a token
+SESSION_COOKIE_NAME = "plexmgr.session"
+CSRF_COOKIE_NAME = "plexmgr.csrf"
+CSRF_HEADER_NAME = "X-CSRF-Token"
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+
+
+class AuthMethod(StrEnum):
+    """How the current request authenticated."""
+
+    api_key = "api_key"
+    plex_session = "plex_session"
+    dev_bypass = "dev_bypass"
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    """Authenticated request identity.
+
+    ``user_*`` is populated only for Plex session auth. The legacy app API key has
+    no user identity and remains a recovery/automation credential.
+    """
+
+    method: AuthMethod
+    user_id: int | None = None
+    plex_id: int | None = None
+    username: str | None = None
+    email: str | None = None
+    avatar_url: str | None = None
+    is_admin: bool = False
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -443,24 +483,123 @@ def _pre_init_setup_token_valid(request: Request) -> bool:
     return api_key_matches(provided_setup_token, expected_setup_token)
 
 
+def hash_session_token(token: str) -> str:
+    """Return the stored digest for a random browser-session token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_unsafe_method(method: str) -> bool:
+    return method.upper() not in {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+def _require_csrf_for_session(request: Request) -> None:
+    if not _is_unsafe_method(request.method):
+        return
+    header = request.headers.get(CSRF_HEADER_NAME)
+    cookie = request.cookies.get(CSRF_COOKIE_NAME)
+    if (
+        not header
+        or not cookie
+        or not hmac.compare_digest(header.encode("utf-8"), cookie.encode("utf-8"))
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="csrf_token_required")
+
+
+def _normalize_dt(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+async def _session_auth_context(
+    request: Request,
+    session: AsyncSession,
+    *,
+    enforce_csrf: bool,
+) -> AuthContext | None:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    token_hash = hash_session_token(token)
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(AuthSession, User)
+        .join(User, User.id == AuthSession.user_id)
+        .where(
+            AuthSession.token_hash == token_hash,
+            AuthSession.revoked_at.is_(None),
+        )
+    )
+    row = result.first()
+    if row is None:
+        return None
+    auth_session, user = row
+    if _normalize_dt(auth_session.expires_at) <= now:
+        return None
+    if enforce_csrf:
+        _require_csrf_for_session(request)
+    return AuthContext(
+        method=AuthMethod.plex_session,
+        user_id=user.id,
+        plex_id=user.plex_id,
+        username=user.username,
+        email=user.email,
+        avatar_url=user.avatar_url,
+        is_admin=user.permissions > 0,
+    )
+
+
+async def authenticate_request(
+    request: Request,
+    session: AsyncSession,
+    *,
+    provided_api_key: str | None = None,
+    enforce_csrf: bool = True,
+) -> AuthContext | None:
+    """Return request auth context, accepting API key or Plex session cookie.
+
+    The legacy app API key remains a valid recovery/automation credential. Browser
+    sessions are checked only after the key path fails, so API-key callers are not
+    subject to CSRF enforcement.
+    """
+    if get_settings().dev_auth_bypass:
+        return AuthContext(method=AuthMethod.dev_bypass, is_admin=True)
+    system = await load_system_settings(session)
+    expected = system.app_api_key if system is not None else None
+    if api_key_matches(provided_api_key, expected):
+        return AuthContext(method=AuthMethod.api_key, is_admin=True)
+    return await _session_auth_context(request, session, enforce_csrf=enforce_csrf)
+
+
 async def require_api_key(
     provided: Annotated[str | None, Depends(_api_key_header)],
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> None:
-    """Enforce the ``X-Api-Key`` header against ``SystemSettings.app_api_key``.
+    request: Request,
+) -> AuthContext:
+    """Enforce app authentication.
 
     The header source is :class:`APIKeyHeader`, so the security scheme + per-route
     requirement appear in the exported OpenAPI (generated clients then send the
     key). The stored key is Fernet-encrypted at rest; the incoming value is
     constant-time-compared (``hmac.compare_digest``) against the decrypted value.
+    A valid Plex session cookie is accepted as the normal browser auth path.
     Skipped entirely when ``settings.dev_auth_bypass`` is set (dev only).
     """
-    if get_settings().dev_auth_bypass:
-        return
-    system = await load_system_settings(session)
-    expected = system.app_api_key if system is not None else None
-    if not api_key_matches(provided, expected):
+    context = await authenticate_request(request, session, provided_api_key=provided)
+    if context is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    return context
+
+
+async def require_admin(
+    context: Annotated[AuthContext, Depends(require_api_key)],
+) -> AuthContext:
+    """Require an app administrator.
+
+    API-key and dev-bypass auth are administrator contexts. Plex session auth is
+    administrator-only when the signed-in Plex account owns the configured server.
+    """
+    if not context.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
+    return context
 
 
 async def require_pre_init_or_api_key(
@@ -488,11 +627,15 @@ async def require_pre_init_or_api_key(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token"
             )
         return
-    if get_settings().dev_auth_bypass:
-        return
-    provided = request.headers.get(API_KEY_HEADER_NAME)
-    if not api_key_matches(provided, system.app_api_key):
+    context = await authenticate_request(
+        request,
+        session,
+        provided_api_key=request.headers.get(API_KEY_HEADER_NAME),
+    )
+    if context is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    if not context.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
 
 
 async def require_setup_token_pre_init(

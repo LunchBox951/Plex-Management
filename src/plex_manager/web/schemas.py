@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "AcceptedRelease",
+    "AuthMeResponse",
+    "AuthUser",
     "BlocklistEntry",
     "BlocklistResponse",
     "CreateRequestBody",
@@ -38,6 +40,8 @@ __all__ = [
     "LogsResponse",
     "LogsTailResponse",
     "PlexLibraryOption",
+    "PlexLoginCompleteRequest",
+    "PlexLoginStartResponse",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -161,6 +165,51 @@ class ServiceValidateResponse(BaseModel):
     message: str
     detail: str | None = None
     libraries: list[PlexLibraryOption] | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Browser authentication — Plex hosted sign-in
+# --------------------------------------------------------------------------- #
+class PlexLoginStartResponse(BaseModel):
+    """A pending Plex PIN login challenge."""
+
+    model_config = ConfigDict(frozen=True)
+
+    state: str
+    auth_url: str
+    expires_at: datetime
+
+
+class PlexLoginCompleteRequest(BaseModel):
+    """Complete a pending Plex PIN login challenge."""
+
+    model_config = ConfigDict(frozen=True)
+
+    state: str
+
+
+class AuthUser(BaseModel):
+    """Current signed-in Plex user."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    plex_id: int | None
+    username: str
+    email: str | None = None
+    avatar_url: str | None = None
+    is_admin: bool = False
+
+
+class AuthMeResponse(BaseModel):
+    """Current app authentication state."""
+
+    model_config = ConfigDict(frozen=True)
+
+    authenticated: bool
+    auth_method: Literal["api_key", "plex_session", "dev_bypass"] | None = None
+    is_admin: bool = False
+    user: AuthUser | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -308,10 +357,10 @@ class SettingsResponse(BaseModel):
 class AppApiKeyResponse(BaseModel):
     """The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
 
-    Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
-    reveal is the belt-and-braces recovery path for a lost/forgotten key on a
-    device that still has it saved, and rotate mints and returns a brand-new key
-    ONCE — the plaintext is never retrievable again after this response, only the
+    Authenticated-only (Plex session or currently-valid ``X-Api-Key``): reveal is
+    the belt-and-braces recovery path for a lost/forgotten key on a device that
+    still has it saved, and rotate mints and returns a brand-new key ONCE — the
+    plaintext is never retrievable again after this response, only the
     Fernet-encrypted column at rest (matching the one-time disclosure setup's
     ``/complete`` already gives the initial key).
     """

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { client } from '../api/client'
-import { clearApiKey, setApiKey } from '../lib/apiKey'
+import { clearApiKey, disableApiKeyAuth, enableApiKeyAuth, setApiKey } from '../lib/apiKey'
 import { Button } from './ui/Button'
 import { Field } from './ui/Field'
 
@@ -12,7 +12,13 @@ import { Field } from './ui/Field'
  * way to re-enter a key — i.e. recovery would require a terminal, which the
  * zero-terminal north star (ADR-0005) forbids.
  */
-export function KeyEntry({ onAuthenticated }: { onAuthenticated: () => void }) {
+export function KeyEntry({
+  onAuthenticated,
+  onUsePlex,
+}: {
+  onAuthenticated: () => void
+  onUsePlex?: () => void
+}) {
   const queryClient = useQueryClient()
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | undefined>(undefined)
@@ -24,6 +30,7 @@ export function KeyEntry({ onAuthenticated }: { onAuthenticated: () => void }) {
     setChecking(true)
     setError(undefined)
     setApiKey(key)
+    enableApiKeyAuth()
     // Validate against a cheap protected endpoint before committing to it. The
     // GET can REJECT (not just return an error body) on a network/connection
     // failure — openapi-fetch rethrows when no onError middleware is registered —
@@ -73,6 +80,18 @@ export function KeyEntry({ onAuthenticated }: { onAuthenticated: () => void }) {
           <Button type="submit" loading={checking} disabled={value.trim().length === 0}>
             Continue
           </Button>
+          {onUsePlex ? (
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                disableApiKeyAuth()
+                onUsePlex()
+              }}
+            >
+              Use Plex sign-in
+            </Button>
+          ) : null}
         </form>
       </div>
     </div>

@@ -2,11 +2,12 @@ import { useEffect, useState } from 'react'
 import { Navigate, Outlet, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { AUTH_INVALID_EVENT, SETUP_REQUIRED_EVENT } from '../api/client'
-import { useSetupStatus } from '../api/hooks'
+import { useAuthMe, useSetupStatus } from '../api/hooks'
 import { queryKeys } from '../lib/queryClient'
 import { Button } from './ui/Button'
 import { CenteredSpinner, StateMessage } from './ui/feedback'
 import { KeyEntry } from './KeyEntry'
+import { PlexLogin } from './PlexLogin'
 
 /**
  * Gate for every authenticated screen. Reads install state and routes:
@@ -20,14 +21,15 @@ export function SetupGate() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { data, isLoading, isError, refetch } = useSetupStatus()
-  const [authFailed, setAuthFailed] = useState(false)
+  const auth = useAuthMe(data?.initialized === true)
+  const [authMode, setAuthMode] = useState<'plex' | 'key'>('plex')
 
   useEffect(() => {
     const onSetupRequired = () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.setupStatus })
       navigate('/setup', { replace: true })
     }
-    const onAuthInvalid = () => setAuthFailed(true)
+    const onAuthInvalid = () => setAuthMode('key')
     window.addEventListener(SETUP_REQUIRED_EVENT, onSetupRequired)
     window.addEventListener(AUTH_INVALID_EVENT, onAuthInvalid)
     return () => {
@@ -59,9 +61,23 @@ export function SetupGate() {
     return <Navigate to="/setup" replace />
   }
 
-  if (authFailed) {
-    return <KeyEntry onAuthenticated={() => setAuthFailed(false)} />
+  if (auth.isLoading) return <CenteredSpinner label="Checking sign-in…" />
+
+  if (auth.data?.authenticated) {
+    return <Outlet />
   }
 
-  return <Outlet />
+  if (authMode === 'key') {
+    return (
+      <KeyEntry
+        onAuthenticated={() => {
+          setAuthMode('plex')
+          void auth.refetch()
+        }}
+        onUsePlex={() => setAuthMode('plex')}
+      />
+    )
+  }
+
+  return <PlexLogin onUseAccessKey={() => setAuthMode('key')} />
 }

@@ -35,6 +35,10 @@ export type QualityProfileItemResponse = Schemas['QualityProfileItemResponse']
 
 export type SettingsResponse = Schemas['SettingsResponse']
 export type SettingsUpdate = Schemas['SettingsUpdate']
+export type AuthMeResponse = Schemas['AuthMeResponse']
+export type AuthUser = Schemas['AuthUser']
+export type PlexLoginCompleteRequest = Schemas['PlexLoginCompleteRequest']
+export type PlexLoginStartResponse = Schemas['PlexLoginStartResponse']
 
 export type SetupStatusResponse = Schemas['SetupStatusResponse']
 export type SetupCompleteRequest = Schemas['SetupCompleteRequest']

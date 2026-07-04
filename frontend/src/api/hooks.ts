@@ -6,9 +6,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
-import { setApiKey } from '../lib/apiKey'
+import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
 import type {
   AppApiKeyResponse,
+  AuthMeResponse,
   BlocklistResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
@@ -20,6 +21,8 @@ import type {
   LogsResponse,
   LogsTailResponse,
   PlexLibraryOption,
+  PlexLoginCompleteRequest,
+  PlexLoginStartResponse,
   QualityProfileResponse,
   QueueItem,
   QueueResponse,
@@ -40,6 +43,48 @@ import {
   REQUESTS_POLL_INTERVAL_MS,
   queryKeys,
 } from '../lib/queryClient'
+
+/* ------------------------------------------------------------------- auth -- */
+
+export function useAuthMe(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.authMe,
+    enabled,
+    retry: false,
+    queryFn: async (): Promise<AuthMeResponse> => unwrap(await client.GET('/api/v1/auth/me')),
+  })
+}
+
+export function useStartPlexLogin() {
+  return useMutation({
+    mutationFn: async (): Promise<PlexLoginStartResponse> =>
+      unwrap(await client.POST('/api/v1/auth/plex/start')),
+  })
+}
+
+export function useCompletePlexLogin() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (body: PlexLoginCompleteRequest): Promise<AuthMeResponse> =>
+      unwrap(await client.POST('/api/v1/auth/plex/complete', { body })),
+    onSuccess: (data) => {
+      disableApiKeyAuth()
+      qc.setQueryData(queryKeys.authMe, data)
+      void qc.invalidateQueries()
+    },
+  })
+}
+
+export function useLogout() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<void> => ensureOk(await client.POST('/api/v1/auth/logout')),
+    onSuccess: () => {
+      disableApiKeyAuth()
+      void qc.invalidateQueries()
+    },
+  })
+}
 
 /* ------------------------------------------------------------------ setup -- */
 

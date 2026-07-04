@@ -68,7 +68,7 @@
         "type": "object"
       },
       "AppApiKeyResponse": {
-        "description": "The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.\n\nAuthenticated-only (both endpoints require a currently-valid ``X-Api-Key``):\nreveal is the belt-and-braces recovery path for a lost/forgotten key on a\ndevice that still has it saved, and rotate mints and returns a brand-new key\nONCE \u2014 the plaintext is never retrievable again after this response, only the\nFernet-encrypted column at rest (matching the one-time disclosure setup's\n``/complete`` already gives the initial key).",
+        "description": "The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.\n\nAuthenticated-only (Plex session or currently-valid ``X-Api-Key``): reveal is\nthe belt-and-braces recovery path for a lost/forgotten key on a device that\nstill has it saved, and rotate mints and returns a brand-new key ONCE \u2014 the\nplaintext is never retrievable again after this response, only the\nFernet-encrypted column at rest (matching the one-time disclosure setup's\n``/complete`` already gives the initial key).",
         "properties": {
           "app_api_key": {
             "title": "App Api Key",
@@ -79,6 +79,109 @@
           "app_api_key"
         ],
         "title": "AppApiKeyResponse",
+        "type": "object"
+      },
+      "AuthMeResponse": {
+        "description": "Current app authentication state.",
+        "properties": {
+          "auth_method": {
+            "anyOf": [
+              {
+                "enum": [
+                  "api_key",
+                  "plex_session",
+                  "dev_bypass"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Method"
+          },
+          "authenticated": {
+            "title": "Authenticated",
+            "type": "boolean"
+          },
+          "is_admin": {
+            "default": false,
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuthUser"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "authenticated"
+        ],
+        "title": "AuthMeResponse",
+        "type": "object"
+      },
+      "AuthUser": {
+        "description": "Current signed-in Plex user.",
+        "properties": {
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_admin": {
+            "default": false,
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "plex_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Id"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "plex_id",
+          "username"
+        ],
+        "title": "AuthUser",
         "type": "object"
       },
       "AutograbStatusItem": {
@@ -1078,6 +1181,45 @@
           "section_type"
         ],
         "title": "PlexLibraryOption",
+        "type": "object"
+      },
+      "PlexLoginCompleteRequest": {
+        "description": "Complete a pending Plex PIN login challenge.",
+        "properties": {
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "PlexLoginCompleteRequest",
+        "type": "object"
+      },
+      "PlexLoginStartResponse": {
+        "description": "A pending Plex PIN login challenge.",
+        "properties": {
+          "auth_url": {
+            "title": "Auth Url",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "auth_url",
+          "expires_at"
+        ],
+        "title": "PlexLoginStartResponse",
         "type": "object"
       },
       "PlexValidateRequest": {
@@ -2472,6 +2614,112 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/auth/logout": {
+      "post": {
+        "description": "Revoke the current Plex browser session and clear auth cookies.",
+        "operationId": "logout_endpoint_api_v1_auth_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Logout Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "description": "Return current auth state without requiring auth.",
+        "operationId": "me_endpoint_api_v1_auth_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Me Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/auth/plex/complete": {
+      "post": {
+        "description": "Complete a Plex PIN challenge, verify owner access, and issue cookies.",
+        "operationId": "plex_complete_endpoint_api_v1_auth_plex_complete_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlexLoginCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Plex Complete Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/auth/plex/start": {
+      "post": {
+        "description": "Create a plex.tv PIN challenge and return the hosted auth URL.",
+        "operationId": "plex_start_endpoint_api_v1_auth_plex_start_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlexLoginStartResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Plex Start Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/api/v1/blocklist": {
       "get": {
         "description": "List blocklist entries, optionally scoped to one media item.",
@@ -3839,7 +4087,7 @@
     },
     "/api/v1/settings/app-key": {
       "get": {
-        "description": "Return the current app ``X-Api-Key`` in plaintext.\n\nAuthenticated: the caller already proved they hold a currently-valid key\n(``require_api_key`` on the whole router), so this is not a privilege\nescalation -- it is the break-glass recovery path for a NEW device/browser\nthat needs to be paired without re-running setup, and the belt-and-braces\nanswer to \"I'm about to lose my only saved copy\" (issue #28's OAuth-deferral\nanalysis: total key loss is the one genuine gap in keeping a static key for\nthe beta).",
+        "description": "Return the current app ``X-Api-Key`` in plaintext.\n\nAuthenticated: the caller already proved they have a valid Plex session or\napp key, so this is not an anonymous disclosure -- it is the break-glass\nrecovery path for a NEW device/browser that needs to be paired without\nre-running setup.",
         "operationId": "reveal_app_key_endpoint_api_v1_settings_app_key_get",
         "responses": {
           "200": {
@@ -3866,7 +4114,7 @@
     },
     "/api/v1/settings/app-key/rotate": {
       "post": {
-        "description": "Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.\n\nEvery OTHER device/browser with the OLD key saved (localStorage) is\nimmediately locked out -- there is exactly one live key at a time, matching\n``require_api_key``'s single-key comparison. The frontend caller of this\nendpoint MUST persist the returned key immediately so the session that just\nrotated it survives (the new key is never shown again after this response).\n\nCompare-and-swap against concurrent rotations: two rotate requests carrying\nthe SAME old key can both clear ``require_api_key`` (each reads the old stored\nvalue) before either commits. Without a guard the write that commits second\nwould silently overwrite the first's freshly minted key, so the client that\nfired the first request would be left displaying an already-dead key. The\nre-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it\nis a true atomic read-modify-write rather than check-then-act: the compare and\nthe write cannot interleave with another rotation, so the loser's re-read runs\nonly AFTER the winner has committed. Inside THIS request's own transaction we\nre-read the stored key and require it to still equal the key the request\nauthenticated with; if it has already changed, the race happened and we answer\n409 (``app_key_changed``) rather than clobber the winner. The check is skipped\nunder ``dev_auth_bypass`` (there is no authenticated key to compare against),\nexactly like ``require_api_key`` itself.",
+        "description": "Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.\n\nEvery OTHER device/browser with the OLD key saved (localStorage) is\nimmediately locked out -- there is exactly one live key at a time, matching\n``require_api_key``'s single-key comparison. The frontend persists the\nreturned key immediately for future access-key recovery, but normal browser\nauth continues to use the Plex session cookie.\n\nCompare-and-swap against concurrent rotations: two rotate requests carrying\nthe SAME old key can both clear ``require_api_key`` (each reads the old stored\nvalue) before either commits. Without a guard the write that commits second\nwould silently overwrite the first's freshly minted key, so the client that\nfired the first request would be left displaying an already-dead key. The\nre-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it\nis a true atomic read-modify-write rather than check-then-act: the compare and\nthe write cannot interleave with another rotation, so the loser's re-read runs\nonly AFTER the winner has committed. Inside THIS request's own transaction we\nre-read the stored key and require it to still equal the key the request\nauthenticated with; if it has already changed, the race happened and we answer\n409 (``app_key_changed``) rather than clobber the winner. The check is skipped\nunder ``dev_auth_bypass`` (there is no authenticated key to compare against),\nexactly like ``require_api_key`` itself.",
         "operationId": "rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post",
         "responses": {
           "200": {

@@ -1,4 +1,4 @@
-"""Settings endpoints — AUTHENTICATED (require the ``X-Api-Key`` header).
+"""Settings endpoints — authenticated by Plex session or ``X-Api-Key``.
 
 ``GET`` returns a redacted view (secrets masked to ``"***"``). ``PUT`` upserts
 the provided config, encrypting secret values at rest. Only fields present in the
@@ -26,6 +26,8 @@ from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
+    AuthContext,
+    AuthMethod,
     SettingsStore,
     api_key_matches,
     ensure_system_settings,
@@ -33,7 +35,7 @@ from plex_manager.web.deps import (
     get_disk_pressure_threshold_percent,
     get_library,
     load_system_settings,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.schemas import (
     AppApiKeyResponse,
@@ -48,7 +50,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/settings",
     tags=["settings"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 # Same byte length setup.complete() mints the initial key with
@@ -135,13 +137,10 @@ async def reveal_app_key_endpoint(
 ) -> AppApiKeyResponse:
     """Return the current app ``X-Api-Key`` in plaintext.
 
-    Authenticated: the caller already proved they hold a currently-valid key
-    (``require_api_key`` on the whole router), so this is not a privilege
-    escalation -- it is the break-glass recovery path for a NEW device/browser
-    that needs to be paired without re-running setup, and the belt-and-braces
-    answer to "I'm about to lose my only saved copy" (issue #28's OAuth-deferral
-    analysis: total key loss is the one genuine gap in keeping a static key for
-    the beta).
+    Authenticated: the caller already proved they have a valid Plex session or
+    app key, so this is not an anonymous disclosure -- it is the break-glass
+    recovery path for a NEW device/browser that needs to be paired without
+    re-running setup.
     """
     system = await load_system_settings(session)
     if system is None or system.app_api_key is None:
@@ -153,14 +152,15 @@ async def reveal_app_key_endpoint(
 async def rotate_app_key_endpoint(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
+    auth: Annotated[AuthContext, Depends(require_admin)],
 ) -> AppApiKeyResponse:
     """Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
 
     Every OTHER device/browser with the OLD key saved (localStorage) is
     immediately locked out -- there is exactly one live key at a time, matching
-    ``require_api_key``'s single-key comparison. The frontend caller of this
-    endpoint MUST persist the returned key immediately so the session that just
-    rotated it survives (the new key is never shown again after this response).
+    ``require_api_key``'s single-key comparison. The frontend persists the
+    returned key immediately for future access-key recovery, but normal browser
+    auth continues to use the Plex session cookie.
 
     Compare-and-swap against concurrent rotations: two rotate requests carrying
     the SAME old key can both clear ``require_api_key`` (each reads the old stored
@@ -179,7 +179,7 @@ async def rotate_app_key_endpoint(
     """
     system = await ensure_system_settings(session)
     async with _rotate_lock:
-        if not get_settings().dev_auth_bypass:
+        if not get_settings().dev_auth_bypass and auth.method is AuthMethod.api_key:
             # ``require_api_key`` already loaded this row into the shared request
             # session, so its cached instance still shows the auth-time value; force
             # a fresh read here (in the same transaction as the write below, and

@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     # this so an uninitialized host cannot be claimed over the published port.
     setup_token: SecretStr | None = None
 
+    # Public origin used for Plex hosted-login callbacks. When unset, the request
+    # origin is used, which is fine for direct local deployments.
+    public_base_url: str | None = None
+
+    # Override auth-cookie Secure handling for TLS-terminating reverse proxies.
+    # ``None`` means infer from the request scheme.
+    auth_cookie_secure: bool | None = None
+
     log_level: str = "INFO"
 
 
