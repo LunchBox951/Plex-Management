@@ -415,15 +415,23 @@ def _configured_setup_token() -> str | None:
 
 
 def is_setup_token_required(request: Request | None = None) -> bool:
-    """Whether this request requires ``X-Setup-Token`` before initialization."""
+    """Whether this request requires ``X-Setup-Token`` before initialization.
+
+    True only when a token is BOTH enforced (``dev_auth_bypass`` off) AND actually
+    configured. A server with bypass off but no ``setup_token`` set has nothing to
+    validate a submitted token against, so advertising the requirement would render
+    a setup-token field that can never succeed -- a dead end (north-star #1). This
+    only reports the advisory status; it does not itself gate the setup routes.
+    """
     _ = request
-    return not get_settings().dev_auth_bypass
+    settings = get_settings()
+    return not settings.dev_auth_bypass and _configured_setup_token() is not None
 
 
 def _pre_init_setup_token_valid(request: Request) -> bool:
     expected_setup_token = _configured_setup_token()
     provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
-    return _api_key_matches(provided_setup_token, expected_setup_token)
+    return api_key_matches(provided_setup_token, expected_setup_token)
 
 
 async def require_api_key(

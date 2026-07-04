@@ -26,11 +26,7 @@ from plex_manager.services.correction_service import (
     ReportSeasonRequiredError,
     SeasonNotFoundError,
 )
-from plex_manager.services.request_service import (
-    MediaNotFoundError,
-    MediaTypeDeferredError,
-    NoAiredSeasonsError,
-)
+from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
     ServiceNotConfiguredError,
     get_eviction_filesystem,
@@ -68,10 +64,13 @@ router = APIRouter(
     dependencies=[Depends(require_api_key)],
 )
 
+# NB: no 409 "media type deferred" here -- ``CreateRequestBody.media_type`` is
+# ``Literal["movie", "tv"]``, so any other value is already a 422 at validation;
+# the service-level ``MediaTypeDeferredError`` remains only as a defensive guard
+# for internal (non-HTTP) callers.
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
-    409: {"model": ErrorDetail, "description": "Media type deferred"},
 }
 
 
@@ -159,11 +158,6 @@ async def create_request_endpoint(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no_aired_seasons",
-        ) from exc
-    except MediaTypeDeferredError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="media_type_deferred",
         ) from exc
     if not result.created:
         response.status_code = status.HTTP_200_OK

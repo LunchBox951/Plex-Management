@@ -16,9 +16,10 @@ const DETAIL_MESSAGES: Record<string, string> = {
   tmdb_auth_failed: 'TMDB rejected the API key. Re-check it in Settings.',
   qbittorrent_unavailable: 'qBittorrent is unavailable right now. Try again shortly.',
   qbittorrent_auth_failed: 'qBittorrent rejected the credentials. Re-check them in Settings.',
+  torrent_source_unresolvable:
+    'That release’s download link did not resolve to a usable torrent. Try another release.',
   upstream_error: 'An upstream service failed. Try again shortly.',
   media_not_found: 'That title could not be found on TMDB.',
-  media_type_deferred: 'TV requests are deferred until TV import is available.',
   request_not_found: 'That request no longer exists.',
   request_not_active: 'That request is already finished or was superseded.',
   no_acceptable_release: 'No acceptable release was found. You can re-search later.',

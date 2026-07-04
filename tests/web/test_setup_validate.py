@@ -300,6 +300,7 @@ async def test_validate_prowlarr_rejects_non_http_url(
     response = await client.post(
         "/api/v1/setup/validate/prowlarr",
         json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -553,6 +554,7 @@ async def test_validate_qbittorrent_rejects_non_http_url(
     response = await client.post(
         "/api/v1/setup/validate/qbittorrent",
         json={"url": bad_url, "username": "admin", "password": "pw"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -587,6 +589,7 @@ async def test_validate_plex_rejects_non_http_url(
     response = await client.post(
         "/api/v1/setup/validate/plex",
         json={"url": bad_url, "token": "tok"},
+        headers=_SETUP_HEADERS,
     )
     body = response.json()
     assert body["ok"] is False
@@ -605,6 +608,7 @@ async def test_validate_prowlarr_accepts_valid_http_and_https(
     response = await client.post(
         "/api/v1/setup/validate/prowlarr",
         json={"url": f"{scheme}://prowlarr.local", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
     )
     assert response.json()["ok"] is True
 

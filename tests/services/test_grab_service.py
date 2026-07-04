@@ -750,7 +750,7 @@ async def test_grab_reuse_refreshes_metadata_used_by_blocklist(
         assert row.season is None
         assert row.media_type == MediaType.movie
         assert row.magnet_link == f"magnet:?xt=urn:btih:{_HASH}"
-        await mark_failed(session, download_id=row.id, blocklist=True)
+        await mark_failed(session, FakeQbittorrent(), download_id=row.id, blocklist=True)
 
     async with sessionmaker_() as session:
         entry = (await session.execute(select(Blocklist))).scalar_one()

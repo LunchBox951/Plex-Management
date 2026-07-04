@@ -260,11 +260,11 @@ def _file_digest(path: str | Path) -> bytes:
 
 
 def _same_file_content(src: str, dst: Path) -> bool:
-    try:
+    # samefile is only the cheap same-inode short-circuit; on any OSError (a side
+    # not stat-able) fall through to the honest size + digest comparison below.
+    with contextlib.suppress(OSError):
         if os.path.samefile(src, dst):
             return True
-    except OSError:
-        pass
     if dst.stat().st_size != os.path.getsize(src):
         return False
     return _file_digest(src) == _file_digest(dst)

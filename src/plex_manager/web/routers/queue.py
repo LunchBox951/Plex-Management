@@ -69,6 +69,27 @@ _QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     409: {"model": ErrorDetail, "description": "Queue action conflict"},
 }
 
+# The grab endpoint additionally 422s with an ErrorDetail code (a missing
+# descriptor from run_preview, or a season/media-type mismatch) on top of
+# FastAPI's own body-validation 422 -- document both shapes, mirroring
+# search_preview's anyOf.
+_GRAB_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_QUEUE_ERROR_RESPONSES,
+    422: {
+        "description": "Validation error, missing request descriptor, or season mismatch",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {"$ref": "#/components/schemas/ErrorDetail"},
+                    ]
+                }
+            }
+        },
+    },
+}
+
 
 def _to_item(record: DownloadRecord) -> QueueItem:
     return QueueItem(
@@ -118,7 +139,7 @@ async def get_queue(
     return QueueResponse(queue=[_to_item(r) for r in records])
 
 
-@router.post("/grab", status_code=status.HTTP_201_CREATED, responses=_QUEUE_ERROR_RESPONSES)
+@router.post("/grab", status_code=status.HTTP_201_CREATED, responses=_GRAB_ERROR_RESPONSES)
 async def grab_endpoint(
     body: GrabRequest,
     session: Annotated[AsyncSession, Depends(get_session)],

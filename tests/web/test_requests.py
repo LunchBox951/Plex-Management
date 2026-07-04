@@ -134,9 +134,9 @@ def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
     assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
         "/ErrorDetail"
     )
-    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
-        "/ErrorDetail"
-    )
+    # No 409 documented: media_type is Literal["movie", "tv"], so an unsupported
+    # type is already FastAPI's 422 -- the old media_type_deferred 409 was dead code.
+    assert "409" not in responses
 
 
 def test_get_request_contract_documents_not_found(app: FastAPI) -> None:

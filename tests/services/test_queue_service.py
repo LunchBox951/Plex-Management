@@ -260,7 +260,9 @@ async def test_mark_failed_does_not_overwrite_importing_claim_from_stale_session
             await importer_session.commit()
 
         with pytest.raises(queue_service.InvalidStateTransitionError):
-            await queue_service.mark_failed(stale_session, download_id=download_id, blocklist=True)
+            await queue_service.mark_failed(
+                stale_session, FakeQbittorrent(), download_id=download_id, blocklist=True
+            )
 
     async with sessionmaker_() as session:
         row = await session.get(Download, download_id)
