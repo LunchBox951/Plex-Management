@@ -435,8 +435,8 @@ async def _eviction_tick(app: FastAPI) -> float:
 
         # ADR-0015: the anime roots get their own entries so both the pressure
         # sweep and the delete-nothing telemetry sweep below can actually reach
-        # anime content -- eviction_service._under_root filters candidates to
-        # those lexically under one of these enumerated paths, so an anime
+        # anime content -- eviction_service._owned_by_root assigns each
+        # breadcrumb to its DEEPEST containing configured root, so an anime
         # library_path is never a candidate unless its root is listed here.
         roots: tuple[tuple[Literal["movie", "tv"], str | None], ...] = (
             ("movie", movies_root),
@@ -444,6 +444,12 @@ async def _eviction_tick(app: FastAPI) -> float:
             ("movie", anime_movie_root),
             ("tv", anime_tv_root),
         )
+        # Every configured root, threaded into each per-root sweep as the
+        # ownership scope: with NESTED roots (an anime root inside movies_root),
+        # a breadcrumb belongs ONLY to its most specific root's sweep -- the
+        # parent's disk pressure must never evict (or telemetry-count) the child
+        # mount's content (see eviction_service._owned_by_root).
+        all_roots: list[str] = [r for _mt, r in roots if r]
         for media_type, root in roots:
             if not root:
                 continue
@@ -478,6 +484,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                         fs=fs,
                         media_type=media_type,
                         root_path=root,
+                        all_roots=all_roots,
                         grace_days=grace_days,
                         threshold_pct=threshold_pct,
                         target_pct=target_pct,
@@ -521,6 +528,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                 fs=fs,
                 media_type=media_type,
                 root_path=root,
+                all_roots=all_roots,
                 threshold_pct=threshold_pct,
                 target_pct=target_pct,
                 grace_days=grace_days,
@@ -543,6 +551,7 @@ async def _eviction_tick(app: FastAPI) -> float:
                     fs=fs,
                     media_type=media_type,
                     root_path=root,
+                    all_roots=all_roots,
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,

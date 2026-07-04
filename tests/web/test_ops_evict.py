@@ -216,7 +216,7 @@ async def test_evict_sweeps_a_configured_anime_movie_root(
 ) -> None:
     """ADR-0015: an anime title's ``library_path`` lives under
     ``anime_movie_root``, which must be BOTH enumerated by the pressure sweep
-    (``eviction_service._under_root`` only considers enumerated roots) AND
+    (``eviction_service._owned_by_root`` only considers enumerated roots) AND
     included in the delete-guard's allowlist -- otherwise the anime root is
     silently never a pressure-eviction candidate."""
     await seed(initialized=True, app_api_key=_API_KEY)

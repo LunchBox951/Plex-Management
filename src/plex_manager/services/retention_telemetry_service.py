@@ -592,6 +592,7 @@ async def run_retention_telemetry_sweep(
     target_pct: float,
     now: datetime | None = None,
     free_slots: Callable[[], int] | None = None,
+    all_roots: Sequence[str] | None = None,
 ) -> None:
     """Log what an eviction sweep of ``root_path`` WOULD do — never deletes,
     never flips a status, never writes ``download_history``.
@@ -701,12 +702,17 @@ async def run_retention_telemetry_sweep(
     # eligibility filter -- the superset from which both the would-evict subsets
     # (ranked/selected in memory) and the time-to-watch dataset (any recorded
     # view) are derived. See the module docstring for the full rationale.
+    # ``all_roots`` mirrors ``run_eviction_sweep``'s own nested-root ownership
+    # scope (see ``assemble_candidates``): the telemetry for a parent root must
+    # not count content a nested child root's REAL sweep would own, or the
+    # would-evict numbers double-report the child's bytes under the parent.
     candidates = await eviction_service.assemble_candidates(
         session=session,
         library=library,
         media_type=media_type,
         root_path=root_path,
         root_total_bytes=disk.total_bytes,
+        all_roots=all_roots,
     )
 
     grace_cutoff = moment - timedelta(days=grace_days)
