@@ -1,12 +1,13 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Eleven tables back the alpha + beta pipeline: ``users``, ``settings``,
-``system_settings``, ``audit_log``, ``media_requests``, ``season_requests``,
-``downloads``, ``download_history``, ``blocklist``, ``tmdb_cache``,
-``log_events``. Column shapes, indexes, and ``ON DELETE`` behaviour follow the
-persistence design (see the analysis extract's "Persistence + Schema Migrations"
-section, ADR-0007, and — for ``log_events``/``library_path``/``keep_forever``/the
-``evicted`` status — ADR-0012).
+Twelve tables back the alpha + beta pipeline: ``users``, ``settings``,
+``system_settings``, ``audit_log``, ``media_requests``, ``request_dedup_locks``,
+``season_requests``, ``downloads``, ``download_history``, ``blocklist``,
+``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
+behaviour follow the persistence design (see the analysis extract's
+"Persistence + Schema Migrations" section, ADR-0007, and — for
+``log_events``/``library_path``/``keep_forever``/the ``evicted`` status —
+ADR-0012).
 
 Conventions:
 
@@ -14,10 +15,11 @@ Conventions:
   from whether the ``Mapped`` type includes ``None``.
 * ``created_at``-style columns get ``server_default=func.now()`` so bulk inserts
   are timestamped by the database.
-* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False)`` (a portable
-  VARCHAR + CHECK on SQLite). ``downloads.status`` is a plain indexed ``String``:
-  the canonical ``DownloadState`` StrEnum is owned by the P4 state machine and
-  writes its values here, and the ``DownloadRecord`` DTO reads it as ``str``.
+* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)``
+  (a portable VARCHAR + CHECK on SQLite/PostgreSQL). ``downloads.status`` is a
+  plain indexed ``String``: the canonical ``DownloadState`` StrEnum is owned by
+  the P4 state machine and writes its values here, and the ``DownloadRecord`` DTO
+  reads it as ``str``.
 * Secrets (``users.encrypted_plex_token``) use :class:`EncryptedStr`.
 """
 
@@ -44,6 +46,7 @@ __all__ = [
     "LogEvent",
     "MediaRequest",
     "MediaType",
+    "RequestDedupLock",
     "RequestStatus",
     "SeasonRequest",
     "Setting",
@@ -129,10 +132,9 @@ class DownloadHistoryEvent(StrEnum):
     # The disk-pressure eviction sweep reclaimed this title's/season's file
     # (ADR-0012). Unlike every other member, it is not tied to a torrent —
     # ``DownloadHistory.torrent_hash`` is left ``None`` for an eviction row.
-    # ``download_history.event_type`` is a plain VARCHAR (``native_enum=False``,
-    # no CHECK constraint — see ``41d427bd38e6`` / ``RequestStatus.evicted``'s
-    # docstring for the identical precedent), so adding this member needs NO
-    # migration of its own.
+    # ``download_history.event_type`` is a portable non-native enum. The
+    # hardening migration's CHECK explicitly includes this value for migrated
+    # databases, and ``Base.metadata.create_all`` does the same for fresh ones.
     evicted = "evicted"
     # ADR-0014 correction verbs: the audit row a report-issue / cancel writes. Like
     # ``evicted`` these are not tied to a live torrent (``torrent_hash`` may be the
@@ -144,7 +146,7 @@ class DownloadHistoryEvent(StrEnum):
 
 def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
     """Build a portable, non-native ``Enum`` column type for ``enum_cls``."""
-    return sa.Enum(enum_cls, native_enum=False)
+    return sa.Enum(enum_cls, native_enum=False, create_constraint=True, validate_strings=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -328,6 +330,21 @@ class MediaRequest(Base):
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class RequestDedupLock(Base):
+    """Serializable lock row for per-media request decisions.
+
+    PostgreSQL's MVCC can let two concurrent transactions both miss an uncommitted
+    terminal ``available`` row. The active partial unique index intentionally
+    excludes ``available``, so in-library short-circuits need a separate row to lock
+    before checking/inserting terminal request records.
+    """
+
+    __tablename__ = "request_dedup_locks"
+
+    tmdb_id: Mapped[int] = mapped_column(primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType), primary_key=True)
+
+
 class SeasonRequest(Base):
     """A per-season request belonging to a TV :class:`MediaRequest`."""
 
@@ -459,7 +476,7 @@ class Blocklist(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
-    source_title: Mapped[str] = mapped_column(Text, index=True)
+    source_title: Mapped[str] = mapped_column(Text)
     indexer: Mapped[str | None] = mapped_column(String)
     protocol: Mapped[str | None] = mapped_column(String)
     media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))

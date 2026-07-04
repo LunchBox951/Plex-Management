@@ -23,9 +23,13 @@ from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
-from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
+from plex_manager.adapters.qbittorrent import (
+    QbittorrentAuthError,
+    QbittorrentError,
+    QbittorrentSourceError,
+)
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings
+from plex_manager.config import get_settings, validate_startup_exposure
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -631,6 +635,9 @@ _ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
     TmdbAuthError: (502, "tmdb_auth_failed"),
     TmdbApiError: (502, "tmdb_unavailable"),
     QbittorrentAuthError: (502, "qbittorrent_auth_failed"),
+    # A well-formed grab whose HTTP source resolves to no addable torrent — the
+    # client is healthy, so 422 (unprocessable), never a dishonest 502 outage.
+    QbittorrentSourceError: (422, "torrent_source_unresolvable"),
     QbittorrentError: (502, "qbittorrent_unavailable"),
     PlexAuthError: (502, "plex_auth_failed"),
     PlexLibraryError: (502, "plex_unavailable"),
@@ -665,9 +672,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         system = await ensure_system_settings(session)
         initialized = system.initialized
         await session.commit()
+    # Uniform launch-path guard (Codex PR #21): every launch path — the console
+    # entry point / Docker entrypoint AND anything serving
+    # ``plex_manager.web.app:app`` directly — passes through this lifespan, so
+    # enforcing here (and ONLY here) means advertisement and enforcement cannot
+    # diverge. Tokenless + bypass-off would otherwise deadlock first-run setup
+    # (the pre-init gate 401s every call while /setup/status honestly advertises
+    # no token) — and loosening pre-init auth instead would expose the
+    # validate/* SSRF probes and let anyone who can reach the port claim the
+    # install. Enforced AFTER the ``initialized`` read because only a
+    # FIRST-RUN-CAPABLE server is refused: an initialized install is API-key
+    # gated everywhere and never consults the setup token again, so it must
+    # keep restarting/upgrading tokenless.
+    validate_startup_exposure(get_settings(), initialized=initialized)
     prepare_encryption(initialized=initialized)
 
-    app.state.http_client = httpx.AsyncClient(timeout=30.0)
+    app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
@@ -677,7 +697,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     log_handler = log_capture_service.configure_logging(get_settings().log_level)
     app.state.log_handler = log_handler
-
     # The background reconciler closes the request -> grab -> import -> available
     # loop without a GET /queue poll having to do the heavy work. The auto-grab
     # worker (ADR-0013) is what turns a fresh request INTO a grab in the first
@@ -721,6 +740,11 @@ def create_app() -> FastAPI:
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
     mount_spa(app)
     return app
+
+
+def create_upstream_http_client() -> httpx.AsyncClient:
+    """Create the shared service-to-service client for configured integrations."""
+    return httpx.AsyncClient(timeout=30.0, trust_env=False)
 
 
 app = create_app()

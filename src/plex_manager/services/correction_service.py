@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.prowlarr.adapter import IndexerError
-from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentError, QbittorrentSourceError
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
@@ -80,6 +80,7 @@ from plex_manager.services import (
     request_service,
     season_request_service,
 )
+from plex_manager.services.auto_grab_service import MAX_GRAB_ATTEMPTS_PER_SCOPE
 from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
 
@@ -158,11 +159,29 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     }
 )
 
-# The grab-path exceptions the inline re-grab may raise (all defined in
+# The PER-RELEASE grab failures the inline re-grab falls through on (mirroring
+# ``auto_grab_service``'s per-release set): the ATTEMPTED release is unusable --
+# no source, an unresolvable/vetoed/oversized source (``QbittorrentSourceError``
+# is raised BEFORE anything reaches the client; it subclasses ``QbittorrentError``
+# so it MUST be caught before ``_DOWNLOAD_CLIENT_ERRORS`` or a bad source would be
+# mistreated as a client outage and the scope silently left at ``searching``), or
+# its hash is already active under a different scope/request -- while a LOWER-
+# ranked accepted replacement may still be grabbable. The re-grab tries the next
+# candidate (bounded) and only parks when the list/cap exhausts.
+_PER_RELEASE_GRAB_ERRORS: Final = (
+    grab_service.NoGrabSourceError,
+    grab_service.DownloadScopeConflictError,
+    grab_service.TorrentAlreadyTrackedError,
+    QbittorrentSourceError,
+)
+
+# The remaining grab-path exceptions the inline re-grab may raise (all defined in
 # ``grab_service``). A report-issue that has ALREADY purged + blocklisted must not
 # then 500/409 on a grab hiccup: it lands on the honest, retryable
 # ``no_acceptable_release`` park instead, exactly like the grab endpoint's own
 # empty-preview branch -- the request is left visible and re-searchable.
+# (``NoGrabSourceError``/``DownloadScopeConflictError`` are listed for
+# completeness but are consumed by the per-release fall-through above first.)
 _GRAB_ERRORS: Final = (
     grab_service.NoGrabSourceError,
     grab_service.GrabError,
@@ -425,6 +444,18 @@ async def report_issue(
     state returned normally (a 200, not a 502): the merged auto-grab worker picks up an
     eager ``searching`` scope on its next tick (~60s), so the state self-heals and the
     operator sees "searching" rather than an error page after a successful correction.
+
+    Re-grab PER-RELEASE failure (mirroring auto-grab): a replacement whose grab
+    fails for a reason specific to THAT release (``_PER_RELEASE_GRAB_ERRORS`` --
+    no/unresolvable/vetoed source, or a hash already tracked elsewhere; nothing
+    live to track in any case) falls through to the next-ranked accepted
+    replacement, bounded by the shared :data:`~plex_manager.services.
+    auto_grab_service.MAX_GRAB_ATTEMPTS_PER_SCOPE`; only an exhausted list/cap
+    parks. In particular a bad HTTP torrent source (``QbittorrentSourceError``,
+    a ``QbittorrentError`` subclass) is a RELEASE problem handled here -- never
+    mistaken for the client outage its base class signals, which would strand
+    the promised synchronous re-grab at ``searching`` (worst with auto-grab
+    disabled: nothing would ever retry it).
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -672,17 +703,49 @@ async def report_issue(
         if not result.accepted:
             await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
         else:
+            # Try the accepted replacements in rank order, mirroring auto-grab's
+            # bounded fall-through: a PER-RELEASE failure on the top pick (its
+            # source is unusable/vetoed, or its hash is already tracked
+            # elsewhere) must not sink the whole correction -- a lower-ranked
+            # replacement may still grab. Only when the list (or the shared
+            # attempt cap) exhausts with nothing grabbed does the scope park on
+            # the honest, retryable ``no_acceptable_release``. Any settling
+            # failure (an operational client outage, an application-level grab
+            # refusal) is handled by the outer except clauses exactly as before.
             try:
-                await grab_service.grab(
-                    qbt,
-                    session,
-                    scored=result.accepted[0],
-                    request_id=request_id,
-                    tmdb_id=request.tmdb_id,
-                    year=request.year,
-                    season=target.season,
-                    episodes=None,
-                )
+                grabbed = False
+                for scored in result.accepted[:MAX_GRAB_ATTEMPTS_PER_SCOPE]:
+                    try:
+                        await grab_service.grab(
+                            qbt,
+                            session,
+                            scored=scored,
+                            request_id=request_id,
+                            tmdb_id=request.tmdb_id,
+                            year=request.year,
+                            season=target.season,
+                            episodes=None,
+                        )
+                        grabbed = True
+                        break
+                    except _PER_RELEASE_GRAB_ERRORS as exc:
+                        # This RELEASE is unusable (nothing live to track --
+                        # QbittorrentSourceError in particular is raised BEFORE
+                        # anything reaches the client, and must not be mistaken
+                        # for the client outage its base class signals); discard
+                        # the partial write and try the next-ranked replacement.
+                        await session.rollback()
+                        _logger.warning(
+                            "report-issue re-grab for %r: replacement release "
+                            "unusable (%s); trying next accepted release",
+                            safe_text(request.title),
+                            type(exc).__name__,
+                            extra=log_extra,
+                        )
+                if not grabbed:
+                    # Every attempted replacement was unusable: the SAME honest
+                    # park an empty preview takes -- never a silent 'searching'.
+                    await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
             except _DOWNLOAD_CLIENT_ERRORS as exc:
                 # OPERATIONAL client failure (qBittorrent unreachable/erroring), NOT
                 # "nothing acceptable" -- releases exist; the CLIENT failed. Do NOT park

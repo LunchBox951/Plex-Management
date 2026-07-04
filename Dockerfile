@@ -25,19 +25,27 @@ ENV PATH="/opt/venv/bin:$PATH"
 # (CVE-2026-1703: path traversal when extracting a crafted wheel).
 RUN pip install --upgrade pip
 
-# Copy only what the build backend needs, then install.
+# Copy only what the build backend needs, then install against the committed
+# runtime constraints used by CI/audit.
 COPY pyproject.toml README.md ./
+COPY requirements ./requirements
 COPY src ./src
 # Drop the built SPA in BEFORE the install so hatchling packages it into the
 # wheel (via [tool.hatch.build.targets.wheel].artifacts) and it ships in the image.
 COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
-RUN pip install .
+RUN pip install -c requirements/runtime-constraints.txt ".[postgres]"
 
 # ---- runtime: slim image with just the venv + migration assets ----
 FROM python:3.14-slim AS runtime
+# The app's config default is loopback (safe for bare-metal first runs); inside
+# the container the ONLY way in is the published port, so bind all interfaces
+# here or `docker run -p` would map to a dead socket (the healthcheck, probing
+# 127.0.0.1 from INSIDE, would still pass -- an unreachable-but-green trap).
+# Overridable per-deployment via the environment like any other setting.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    PLEX_MANAGER_HOST=0.0.0.0
 WORKDIR /app
 
 # Patch the base image's own system pip too (same CVE-2026-1703). The app runs

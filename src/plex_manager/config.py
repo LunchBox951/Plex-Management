@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Plex Manager"
-    host: str = "0.0.0.0"  # noqa: S104 — binding all interfaces is intentional inside the container
+    # Local/non-Docker startup defaults to loopback so first-run setup cannot be
+    # claimed from the network. Docker deployments set PLEX_MANAGER_HOST=0.0.0.0
+    # explicitly inside the container and require PLEX_MANAGER_SETUP_TOKEN.
+    host: str = "127.0.0.1"
     port: int = 8000
 
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync
@@ -45,6 +48,10 @@ class Settings(BaseSettings):
     # the :stable deployment leaves this False.
     dev_auth_bypass: bool = False
 
+    # Optional one-time bootstrap token for first-run setup. Docker Compose requires
+    # this so an uninitialized host cannot be claimed over the published port.
+    setup_token: SecretStr | None = None
+
     log_level: str = "INFO"
 
 
@@ -52,3 +59,43 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the cached application settings."""
     return Settings()
+
+
+_UNSAFE_STARTUP_MESSAGE = (
+    "Refusing to start a first-run-capable server without PLEX_MANAGER_SETUP_TOKEN. "
+    "Set PLEX_MANAGER_SETUP_TOKEN or explicitly enable PLEX_MANAGER_DEV_AUTH_BYPASS."
+)
+
+
+def _has_setup_token(settings: Settings) -> bool:
+    token = settings.setup_token
+    return token is not None and bool(token.get_secret_value().strip())
+
+
+def validate_startup_exposure(settings: Settings, *, initialized: bool) -> None:
+    """Refuse startup that would expose tokenless FIRST-RUN setup.
+
+    Only a first-run-capable server (``initialized`` False) is refused. With
+    ``dev_auth_bypass`` off and no (non-blank) ``setup_token``, an uninitialized
+    server would be unclaimable-yet-exposed: the pre-init setup dependencies 401
+    every request (there is no token to match), while ``/setup/status`` honestly
+    advertises that no token is required — a setup deadlock. And the alternative
+    — allowing tokenless pre-init — would let anyone who can reach the port
+    drive the setup ``validate/*`` probes (server-side requests to
+    caller-supplied URLs) and complete first-run setup, claiming the install. So
+    the only honest posture is to refuse to serve until the operator picks one:
+    set a token or explicitly enable the dev bypass.
+
+    An INITIALIZED install is exempt: every post-init route is gated by the app
+    API key and the setup token is never consulted again, so requiring the env
+    var forever would break ordinary restarts/upgrades of a healthy install for
+    no protective gain. ``initialized`` lives in the database, so the guard is
+    enforced from the ASGI ``lifespan`` (the one place every launch path —
+    ``python -m plex_manager``, the Docker entrypoint, a bare
+    ``uvicorn plex_manager.web.app:app`` — passes through once the state is
+    known); ``__main__`` deliberately carries no separate pre-uvicorn check, so
+    the paths cannot diverge.
+    """
+    if initialized or settings.dev_auth_bypass or _has_setup_token(settings):
+        return
+    raise SystemExit(_UNSAFE_STARTUP_MESSAGE)

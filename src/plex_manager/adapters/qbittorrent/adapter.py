@@ -32,17 +32,28 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
+import os
+import socket
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from typing import Final, cast
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
 
+import anyio.to_thread
+import httpcore
 import httpx
 
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 
-__all__ = ["QbittorrentAuthError", "QbittorrentClient", "QbittorrentError"]
+__all__ = [
+    "QbittorrentAuthError",
+    "QbittorrentClient",
+    "QbittorrentError",
+    "QbittorrentSourceError",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -53,8 +64,20 @@ _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
+# A .torrent metafile is normally tens of KB, but a large multi-file pack with a
+# small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
+# real metafile yet still a hard ceiling against a hostile/unbounded source body.
+_MAX_TORRENT_BYTES: Final = 10 * 1024 * 1024
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
+_HTTP_CORE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpcore.TimeoutException,
+    httpcore.NetworkError,
+    httpcore.ProtocolError,
+    httpcore.ProxyError,
+    httpcore.UnsupportedProtocol,
+)
 
 
 class QbittorrentError(RuntimeError):
@@ -77,6 +100,26 @@ class QbittorrentAuthError(QbittorrentError):
     """
 
 
+class QbittorrentSourceError(QbittorrentError):
+    """A torrent SOURCE was vetoed or could not be resolved to a trackable torrent.
+
+    Distinct from a client outage: qBittorrent itself is healthy and (in every
+    case) was never asked to add anything — the SOURCE (an indexer download URL)
+    is the problem. Every pre-client source veto raises this subtype, not the
+    base class: an unsupported/malformed URL, an unsafe (non-global / NAT64 /
+    unresolvable) fetch target, an oversized ``.torrent`` body (declared or
+    streamed past the cap), a source fetch that failed in transport, or a body
+    that is neither a magnet redirect nor a locally-hashable ``.torrent``.
+
+    This taxonomy is load-bearing: the web layer maps it to a 422 (the request
+    is well-formed but unprocessable) instead of the dishonest 502
+    ``qbittorrent_unavailable`` that would blame a healthy client, and the
+    auto-grab worker treats it as a PER-RELEASE failure (try the next accepted
+    release, park on exhaustion) instead of aborting the whole cycle as a
+    client outage.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers (bencode / magnet) — salvaged from the prototype, re-typed.
 # --------------------------------------------------------------------------- #
@@ -91,17 +134,43 @@ def _bencode_skip(data: bytes, idx: int) -> int:
         raise ValueError("unexpected end of bencode data")
     ch = data[idx : idx + 1]
     if ch == b"i":  # integer: i<number>e
-        return data.index(b"e", idx + 1) + 1
+        end = data.index(b"e", idx + 1)
+        digits = data[idx + 1 : end]
+        if digits[:1] == b"-":
+            digits = digits[1:]
+        if not digits.isdigit():
+            # Non-digit garbage between i..e: honoring this docstring's "raises
+            # on malformed input" contract keeps a mangled body from being
+            # hashed as if it were a well-formed .torrent.
+            raise ValueError(f"invalid bencode integer at position {idx}")
+        return end + 1
     if ch in (b"l", b"d"):  # list / dict: container<elements>e
         idx += 1
-        while data[idx : idx + 1] != b"e":
+        while idx < len(data) and data[idx : idx + 1] != b"e":
             idx = _bencode_skip(data, idx)
+        if idx >= len(data):
+            raise ValueError("unterminated bencode container")
         return idx + 1
     if ch.isdigit():  # byte string: <length>:<bytes>
         colon = data.index(b":", idx)
         length = int(data[idx:colon])
-        return colon + 1 + length
+        end = colon + 1 + length
+        if end > len(data):
+            raise ValueError("bencode string extends past end of data")
+        return end
     raise ValueError(f"invalid bencode at position {idx}: {ch!r}")
+
+
+def _bencode_string(data: bytes, idx: int) -> tuple[bytes, int]:
+    if idx >= len(data) or not data[idx : idx + 1].isdigit():
+        raise ValueError(f"expected bencode string at position {idx}")
+    colon = data.index(b":", idx)
+    length = int(data[idx:colon])
+    start = colon + 1
+    end = start + length
+    if end > len(data):
+        raise ValueError("bencode string extends past end of data")
+    return data[start:end], end
 
 
 def _info_hash_from_torrent(data: bytes) -> str | None:
@@ -110,16 +179,31 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
     Returns the lowercased hex digest, or ``None`` if the structure can't be
     located (never raises — the caller treats ``None`` as "couldn't derive").
     """
-    marker = b"4:infod"
-    idx = data.find(marker)
-    if idx == -1:
-        return None
-    info_start = idx + len(marker) - 1  # position of the 'd' opening the dict
     try:
-        info_end = _bencode_skip(data, info_start)
-    except ValueError:
+        if data[:1] != b"d":
+            return None
+        idx = 1
+        while True:
+            if idx >= len(data):
+                return None
+            if data[idx : idx + 1] == b"e":
+                return None
+            key, value_start = _bencode_string(data, idx)
+            value_end = _bencode_skip(data, value_start)
+            if key == b"info":
+                # The info VALUE must itself be a bencoded dict. Hashing an
+                # arbitrary non-dict value (integer/string/list) would fabricate
+                # an "info-hash" for a body that is not a torrent, letting an
+                # invalid source reach /torrents/add — surfacing as a client
+                # failure, or worse being tracked under a hash qBittorrent will
+                # never report. No dict -> no hash derivable -> the caller's
+                # no-hash path raises the per-release SourceError.
+                if data[value_start : value_start + 1] != b"d":
+                    return None
+                return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()  # noqa: S324
+            idx = value_end
+    except (ValueError, RecursionError):
         return None
-    return hashlib.sha1(data[info_start:info_end]).hexdigest().lower()  # noqa: S324
 
 
 def _normalize_btih(value: str) -> str:
@@ -142,8 +226,17 @@ def _normalize_btih(value: str) -> str:
 
 
 def _info_hash_from_magnet(magnet: str) -> str | None:
-    """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter."""
-    parsed = urlparse(magnet)
+    """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter.
+
+    Total: an UNPARSABLE magnet (an attacker-controlled redirect can supply e.g.
+    ``magnet://[::1x/…`` whose bogus netloc makes ``urlparse`` raise ValueError)
+    returns ``None`` — no hash derivable — instead of escaping the source-error
+    taxonomy with a raw ValueError.
+    """
+    try:
+        parsed = urlparse(magnet)
+    except ValueError:
+        return None
     if parsed.scheme != "magnet":
         return None
     for xt in parse_qs(parsed.query).get("xt", []):
@@ -244,6 +337,261 @@ def _parse_webapi_version(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if not ip.is_global or ip.is_multicast:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded_v4: list[ipaddress.IPv4Address] = []
+        if ip.ipv4_mapped is not None:
+            embedded_v4.append(ip.ipv4_mapped)
+        if ip.sixtofour is not None:
+            embedded_v4.append(ip.sixtofour)
+        if ip.teredo is not None:
+            embedded_v4.extend(ip.teredo)
+        if ip in _NAT64_WELL_KNOWN_PREFIX:
+            embedded_v4.append(ipaddress.IPv4Address(int(ip) & 0xFFFF_FFFF))
+        if any(_is_blocked_ip(embedded) for embedded in embedded_v4):
+            return True
+    return False
+
+
+def _is_blocked_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return _is_blocked_ip(ip)
+
+
+def _safe_fetch_port(parsed: ParseResult, scheme: str) -> int:
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        # A source-URL veto (qBittorrent never contacted) -> the SourceError
+        # subtype, so the 422 mapping / per-release auto-grab handling apply.
+        raise QbittorrentSourceError("unsupported torrent source URL") from exc
+    return port or (443 if scheme == "https" else 80)
+
+
+def _safe_fetch_addresses(host: str, port: int | None, allow_blocked: bool = False) -> list[str]:
+    # All three vetoes below are SOURCE problems (an unsafe or unresolvable fetch
+    # target; qBittorrent never contacted) -> the SourceError subtype, never the
+    # base class that would read as a client outage. ``allow_blocked`` skips ONLY
+    # the private/non-global address vetoes (never the resolve-failure one) for the
+    # single operator-configured trusted source origin — the Prowlarr endpoint the
+    # app already talks to for every API call (see ``_source_origin_triple``).
+    if not allow_blocked and _is_blocked_address(host):
+        raise QbittorrentSourceError("unsafe torrent source URL")
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise QbittorrentSourceError("unsafe torrent source URL") from exc
+
+    addresses = [info[4][0] for info in infos if isinstance(info[4][0], str)]
+    if not addresses or (
+        not allow_blocked and any(_is_blocked_address(address) for address in addresses)
+    ):
+        raise QbittorrentSourceError("unsafe torrent source URL")
+    return addresses
+
+
+async def _safe_fetch_addresses_async(
+    host: str, port: int | None, allow_blocked: bool = False
+) -> list[str]:
+    """Resolve + vet ``host`` off the event loop.
+
+    ``_safe_fetch_addresses`` calls the blocking ``socket.getaddrinfo``; run inside
+    an async path (this and ``SafeFetchNetworkBackend.connect_tcp``) it would stall
+    the whole event loop for the resolver's timeout. Offload to a worker thread so a
+    slow or hostile DNS answer never blocks unrelated requests (httpx already pulls
+    in anyio).
+    """
+    return await anyio.to_thread.run_sync(_safe_fetch_addresses, host, port, allow_blocked)
+
+
+def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
+    """Normalize a URL to its ``(scheme, host, port)`` origin, or ``None``.
+
+    The identity used to match a torrent-source hop against the OPERATOR-
+    CONFIGURED Prowlarr endpoint: compared by URL origin (scheme + casefolded
+    host + effective port), deliberately NEVER by resolved addresses — a
+    hostile DNS answer must not be able to claim the trust. ``None`` for a
+    non-http(s), hostless, malformed-port, or entirely UNPARSABLE URL (e.g. a
+    bad IPv6 literal makes ``urlparse``/``parsed.hostname`` raise ValueError):
+    nothing trustable — the caller keeps the SSRF veto fully closed rather
+    than crashing outside the source-error taxonomy.
+    """
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.casefold()
+        if scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    return scheme, parsed.hostname.casefold(), port or (443 if scheme == "https" else 80)
+
+
+async def _assert_safe_fetch_url(url: str) -> None:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        # An UNPARSABLE source URL (e.g. `http://[::1` — urlparse raises on the
+        # bad IPv6 literal) is a release problem like any other malformed source:
+        # SourceError, never a raw ValueError that 500s the manual grab and
+        # aborts the auto-grab cycle.
+        raise QbittorrentSourceError("unsupported torrent source URL") from exc
+    if parsed.scheme not in ("http", "https") or not hostname:
+        # A source-URL veto (e.g. a redirect hop left http(s)) -- SourceError, so
+        # a hostile/broken redirect chain is a 422 release problem, not a "client
+        # down" 502.
+        raise QbittorrentSourceError("unsupported torrent source URL")
+    port = _safe_fetch_port(parsed, parsed.scheme)
+    await _safe_fetch_addresses_async(hostname, port)
+
+
+class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Pin HTTP-source fetches to a vetted global address.
+
+    httpx/httpcore normally resolve the request hostname inside ``connect_tcp``.
+    The adapter also validates torrent-source URLs before fetching, but that
+    validation and the actual connection would otherwise be two DNS lookups. This
+    backend makes the connection-time lookup the authority: it resolves once,
+    rejects any non-global answer, then asks the real backend to connect to the
+    vetted IP while httpcore keeps the original origin for Host and TLS SNI.
+
+    ``trusted_host_port`` is the single OPERATOR-CONFIGURED trusted source
+    endpoint (the Prowlarr host + effective port, derived from the same
+    configured base URL the app already calls for every Prowlarr API request):
+    a connection to exactly that host+port may resolve to a private address
+    (``http://prowlarr:9696`` on a compose network, ``127.0.0.1``, RFC1918 —
+    the normal self-hosted layout). Every other host keeps the full veto, so a
+    redirect OFF the configured endpoint re-enters the normal SSRF guard.
+    """
+
+    def __init__(
+        self,
+        delegate: httpcore.AsyncNetworkBackend | None = None,
+        trusted_host_port: tuple[str, int] | None = None,
+    ) -> None:
+        self._delegate: httpcore.AsyncNetworkBackend = (
+            delegate
+            if delegate is not None
+            else cast(httpcore.AsyncNetworkBackend, httpcore.AnyIOBackend())
+        )
+        self._trusted_host_port = trusted_host_port
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        trusted = self._trusted_host_port is not None and (
+            (host.casefold(), port) == self._trusted_host_port
+        )
+        try:
+            addresses = await _safe_fetch_addresses_async(host, port, allow_blocked=trusted)
+        except QbittorrentError as exc:
+            raise httpcore.ConnectError("unsafe torrent source URL") from exc
+        # ``ConnectTimeout`` is a ``TimeoutException`` subclass, NOT a
+        # ``ConnectError`` -- a broken-IPv6 dual-stack host times out on its AAAA
+        # address, so catching only ``ConnectError`` would abandon the working IPv4
+        # fallback. Catch both so every resolved address is actually tried.
+        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+        for address in addresses:
+            try:
+                return await self._delegate.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise httpcore.ConnectError("unsafe torrent source URL")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise httpcore.UnsupportedProtocol("torrent source fetches do not use unix sockets")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
+
+
+class _SafeFetchResponseStream(httpx.AsyncByteStream):
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for part in self._stream:
+                yield part
+        except _HTTP_CORE_EXCEPTIONS as exc:
+            raise httpx.TransportError("torrent source request failed") from exc
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._stream, "aclose", None)
+        if aclose is not None:
+            # Non-string cast so Callable/Awaitable are runtime-used imports
+            # (a string form trips CodeQL's py/unused-import, alert #259).
+            await cast(Callable[[], Awaitable[None]], aclose)()
+
+
+class _SafeFetchTransport(httpx.AsyncBaseTransport):
+    """Async HTTP transport for untrusted indexer/Prowlarr torrent URLs."""
+
+    def __init__(self, trusted_host_port: tuple[str, int] | None = None) -> None:
+        self._pool = httpcore.AsyncConnectionPool(
+            network_backend=SafeFetchNetworkBackend(trusted_host_port=trusted_host_port),
+            http1=True,
+            http2=False,
+            retries=0,
+            max_keepalive_connections=0,
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not isinstance(request.stream, httpx.AsyncByteStream):
+            raise httpx.TransportError("async torrent source request expected", request=request)
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        try:
+            resp = await self._pool.handle_async_request(req)
+        except _HTTP_CORE_EXCEPTIONS as exc:
+            raise httpx.TransportError("torrent source request failed", request=request) from exc
+
+        stream = cast(AsyncIterable[bytes], resp.stream)
+        return httpx.Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=_SafeFetchResponseStream(stream),
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
+
+
 def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     """Map one ``/torrents/info`` row to the port's ``DownloadStatus`` DTO.
 
@@ -252,7 +600,15 @@ def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     """
     save_path = _s(torrent.get("save_path"))
     content_path = _s(torrent.get("content_path")) or None
-    if content_path is not None and content_path == save_path:
+    if (
+        content_path is not None
+        and save_path
+        # Pure lexical compare: the intent is only to drop content_path when it
+        # echoes save_path modulo a trailing slash. realpath() would do a blocking
+        # per-component lstat against qBittorrent's FOREIGN filesystem namespace on
+        # a reconciler/health hot path -- normpath needs no I/O and is correct here.
+        and os.path.normpath(content_path) == os.path.normpath(save_path)
+    ):
         content_path = None
     eta = _i(torrent.get("eta"))
     return DownloadStatus(
@@ -280,11 +636,40 @@ class QbittorrentClient:
         base_url: str,
         username: str,
         password: str,
+        source_client: httpx.AsyncClient | None = None,
+        trusted_source_origin: str | None = None,
     ) -> None:
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._username = username
         self._password = password
+        self._source_client = source_client
+        # The OPERATOR-CONFIGURED Prowlarr base URL (the endpoint the app already
+        # trusts with an API key for every search call), normalized to its
+        # (scheme, host, port) origin. A torrent-source hop on EXACTLY this origin
+        # skips the private-address SSRF veto — Prowlarr routinely serves magnetless
+        # .torrent downloadUrls pointing at itself, and on the normal self-hosted
+        # layout that host is 127.0.0.1 / RFC1918 / a compose alias, which the veto
+        # would otherwise make ungrabbable. Matching is by URL origin, never DNS
+        # results, and per hop: a redirect OFF this origin re-enters the full veto.
+        self._trusted_source_origin = (
+            _source_origin_triple(trusted_source_origin) if trusted_source_origin else None
+        )
+        if trusted_source_origin and self._trusted_source_origin is None:
+            # The stored Prowlarr URL is not a usable origin (malformed IPv6
+            # literal / bad port / non-http scheme — PUT /settings does not
+            # URL-validate this field, so it need not be a corrupt row). The
+            # CLIENT is healthy, so degrade honestly: keep the SSRF veto fully
+            # closed (no trusted origin) and say so, rather than crash the
+            # constructor (a 500 on every qbt-dependent route, including pure
+            # DB paths) or report qBittorrent itself as unconfigured. Magnetless
+            # Prowlarr-self downloadUrls will surface as per-release source
+            # errors until the setting is fixed. Static message: no URL in logs.
+            _logger.warning(
+                "configured Prowlarr URL is not a usable trusted source origin; "
+                "torrent-source fetches keep the strict SSRF veto (fix the "
+                "Prowlarr URL in Settings)"
+            )
         self._logged_in = False
         # info_hash -> (fetched_at, properties json) — bounds /properties calls.
         self._properties_cache: dict[str, tuple[datetime, dict[str, object]]] = {}
@@ -374,7 +759,9 @@ class QbittorrentClient:
         return response
 
     # ---- add ------------------------------------------------------------ #
-    async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
+    async def _resolve_http_source_with_client(
+        self, client: httpx.AsyncClient, url: str
+    ) -> tuple[str | None, bytes | None]:
         """Walk an HTTP(S) source to a magnet URI or ``.torrent`` body.
 
         Returns ``(magnet_uri, None)`` if a redirect leads to a magnet, or
@@ -383,25 +770,94 @@ class QbittorrentClient:
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
+            # Per-hop trust check, by URL ORIGIN only (never DNS results): a hop on
+            # exactly the operator-configured Prowlarr origin skips the private-
+            # address veto (Prowlarr serves .torrent downloadUrls pointing at itself,
+            # typically a private/compose address); any redirect OFF that origin --
+            # including to another private host -- re-enters the full SSRF veto on
+            # its own next iteration.
+            if not self._is_trusted_source_url(current):
+                await _assert_safe_fetch_url(current)
             try:
-                response = await self._client.get(current, follow_redirects=False)
+                async with client.stream("GET", current, follow_redirects=False) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("Location", "")
+                        if not location:
+                            break
+                        if location.startswith("magnet:"):
+                            return location, None
+                        try:
+                            current = urljoin(current, location)
+                        except ValueError as exc:
+                            # A MALFORMED redirect Location (e.g. `http://[::1` --
+                            # urljoin's urlsplit raises on the bad IPv6 literal) is
+                            # attacker-suppliable indexer output: a release problem,
+                            # never a raw ValueError that 500s the manual grab and
+                            # aborts the whole auto-grab cycle.
+                            raise QbittorrentSourceError("unsupported torrent source URL") from exc
+                        continue
+                    if response.status_code == _HTTP_OK:
+                        content_length = response.headers.get("Content-Length")
+                        if content_length is not None:
+                            try:
+                                declared_size = int(content_length)
+                            except ValueError:
+                                # A malformed Content-Length is only an early-abort
+                                # optimization lost -- the streamed byte cap below
+                                # still enforces _MAX_TORRENT_BYTES authoritatively.
+                                declared_size = None
+                            # Oversized source: a RELEASE problem (no qBittorrent
+                            # request was made) -> the SourceError subtype, so the
+                            # manual grab 422s and auto-grab fails just this
+                            # release, never the 502 / cycle-abort a client outage
+                            # earns. Same for the streamed cap below.
+                            if declared_size is not None and declared_size > _MAX_TORRENT_BYTES:
+                                raise QbittorrentSourceError("torrent file is too large")
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > _MAX_TORRENT_BYTES:
+                                raise QbittorrentSourceError("torrent file is too large")
+                            chunks.append(chunk)
+                        body = b"".join(chunks)
+                        if body[:1] == b"d":
+                            return None, body
+                    break
             except httpx.RequestError as exc:
                 # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):
-                # surface a retryable error rather than letting httpx's transport error
-                # escape as an opaque 500 on the grab path. No url/secret in the message.
-                raise QbittorrentError("qBittorrent request failed") from exc
-            if response.is_redirect:
-                location = response.headers.get("Location", "")
-                if not location:
-                    break
-                if location.startswith("magnet:"):
-                    return location, None
-                current = urljoin(current, location)
-                continue
-            if response.status_code == _HTTP_OK and response.content[:1] == b"d":
-                return None, response.content
-            break
+                # a SOURCE problem -- qBittorrent was never contacted, so the
+                # SourceError subtype (and an honest message; the old base-class
+                # "qBittorrent request failed" blamed a healthy client). Still never
+                # an opaque httpx error -> 500; no url/secret in the message. The
+                # auto-grab park backoff retries a transiently-down source later.
+                raise QbittorrentSourceError("torrent source request failed") from exc
         return None, None
+
+    def _is_trusted_source_url(self, url: str) -> bool:
+        """Whether ``url`` sits on the operator-configured trusted source origin."""
+        if self._trusted_source_origin is None:
+            return False
+        return _source_origin_triple(url) == self._trusted_source_origin
+
+    async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
+        if self._source_client is not None:
+            return await self._resolve_http_source_with_client(self._source_client, url)
+        # The connection-time backend needs the same single allowance the per-hop
+        # URL check grants: the trusted origin's host may legitimately resolve to a
+        # private address. (scheme is enforced at the URL level; host+port is the
+        # connection's identity.)
+        trusted_host_port = (
+            (self._trusted_source_origin[1], self._trusted_source_origin[2])
+            if self._trusted_source_origin is not None
+            else None
+        )
+        async with httpx.AsyncClient(
+            transport=_SafeFetchTransport(trusted_host_port=trusted_host_port),
+            timeout=30.0,
+            trust_env=False,
+        ) as client:
+            return await self._resolve_http_source_with_client(client, url)
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
         """Add a torrent; return its lowercased info-hash.
@@ -412,21 +868,34 @@ class QbittorrentClient:
         torrent_bytes: bytes | None = None
         info_hash: str | None = None
 
-        if magnet_or_url.startswith("magnet:"):
+        try:
+            scheme = urlparse(magnet_or_url).scheme.casefold()
+        except ValueError as exc:
+            # An indexer-supplied source that urlparse itself refuses (bad IPv6
+            # literal) is a release problem -> the SourceError subtype, never a
+            # raw ValueError escaping the taxonomy.
+            raise QbittorrentSourceError("unsupported torrent source URL") from exc
+        if scheme == "magnet":
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
-        elif magnet_or_url.startswith("http"):
+        elif scheme in ("http", "https"):
             magnet, body = await self._resolve_http_source(magnet_or_url)
             if magnet is not None:
                 urls_value = magnet
                 info_hash = _info_hash_from_magnet(magnet)
             elif body is not None:
-                torrent_bytes = body
                 info_hash = _info_hash_from_torrent(body)
+                if info_hash is None:
+                    raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
+                torrent_bytes = body
             else:
-                # Could not resolve; hand the original URL to qBittorrent and let
-                # it try (it can fetch plain .torrent URLs directly).
-                urls_value = magnet_or_url
+                # Could not resolve to a magnet or locally hashable .torrent. Do
+                # not ask qBittorrent to add an untrackable opaque URL.
+                raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
+        elif scheme:
+            # An unsupported scheme (ftp:// etc.) is a source veto -- nothing was
+            # (or will be) handed to qBittorrent -> the SourceError subtype.
+            raise QbittorrentSourceError("unsupported torrent source URL")
         else:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)

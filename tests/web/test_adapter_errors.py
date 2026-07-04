@@ -15,7 +15,11 @@ from fastapi import FastAPI
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
-from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
+from plex_manager.adapters.qbittorrent import (
+    QbittorrentAuthError,
+    QbittorrentError,
+    QbittorrentSourceError,
+)
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.ports.library import LibrarySection
@@ -73,6 +77,11 @@ class _AuthFailQbt(FakeQbittorrent):
 class _OutageQbt(FakeQbittorrent):
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
         raise QbittorrentError("qBittorrent request failed")
+
+
+class _UnresolvableSourceQbt(FakeQbittorrent):
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
 
 
 class _OutageProwlarr(FakeProwlarr):
@@ -160,6 +169,26 @@ async def test_qbittorrent_outage_maps_to_502_unavailable(
     )
     assert response.status_code == 502
     assert response.json() == {"detail": "qbittorrent_unavailable"}
+
+
+async def test_qbittorrent_unresolvable_source_maps_to_422_not_502(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """An HTTP source that resolves to no addable torrent is a source problem, not a
+    client outage: it must map to 422 torrent_source_unresolvable, never the
+    dishonest 502 qbittorrent_unavailable that blames a healthy client."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=_UnresolvableSourceQbt(),
+    )
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "torrent_source_unresolvable"}
 
 
 async def test_indexer_outage_maps_to_503_unavailable(

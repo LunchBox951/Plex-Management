@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
@@ -48,6 +48,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.schemas import (
     CreateRequestBody,
+    ErrorDetail,
     KeepForeverBody,
     ReportIssueBody,
     RequestListResponse,
@@ -65,6 +66,15 @@ router = APIRouter(
     tags=["requests"],
     dependencies=[Depends(require_api_key)],
 )
+
+# NB: no 409 "media type deferred" here -- ``CreateRequestBody.media_type`` is
+# ``Literal["movie", "tv"]``, so any other value is already a 422 at validation;
+# the service-level ``MediaTypeDeferredError`` remains only as a defensive guard
+# for internal (non-HTTP) callers.
+_CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {"model": RequestResponse, "description": "Existing matching request"},
+    404: {"model": ErrorDetail, "description": "Media not found"},
+}
 
 
 async def _to_response(
@@ -109,9 +119,14 @@ async def _to_response(
     )
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    responses=_CREATE_REQUEST_RESPONSES,
+)
 async def create_request_endpoint(
     body: CreateRequestBody,
+    response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
@@ -126,7 +141,7 @@ async def create_request_endpoint(
     with a NEW season list grows the tracked set rather than being dropped.
     """
     try:
-        record = await request_service.create_request(
+        result = await request_service.create_request_result(
             session,
             tmdb,
             tmdb_id=body.tmdb_id,
@@ -147,7 +162,9 @@ async def create_request_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no_aired_seasons",
         ) from exc
-    return await _to_response(session, record)
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return await _to_response(session, result.record)
 
 
 @router.get("")
@@ -165,7 +182,10 @@ async def list_requests_endpoint(
     )
 
 
-@router.get("/{request_id}")
+@router.get(
+    "/{request_id}",
+    responses={404: {"model": ErrorDetail, "description": "Request not found"}},
+)
 async def get_request_endpoint(
     request_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],

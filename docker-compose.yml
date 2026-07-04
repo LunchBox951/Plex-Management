@@ -2,6 +2,10 @@
 # (setup, config, recovery) happens in the browser. See ADR-0003 / ADR-0005.
 #
 #   cp .env.example .env   # then adjust
+#   python - <<'PY' >> .env
+#   import secrets
+#   print(f"PLEX_MANAGER_SETUP_TOKEN={secrets.token_urlsafe(32)}")
+#   PY
 #   docker compose up -d
 #
 # Canary host: set PLEX_MANAGER_IMAGE=ghcr.io/<owner>/plex-manager:edge
@@ -13,16 +17,21 @@ services:
     container_name: plex-manager
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Keep the in-container app and healthcheck on 8000. Use
+      # PLEX_MANAGER_HOST_BIND / PLEX_MANAGER_HOST_PORT below for the host socket.
+      PLEX_MANAGER_PORT: "8000"
+      # Required for first-run setup when a port is published. The setup wizard
+      # asks for this token before accepting service probes or completion.
+      PLEX_MANAGER_SETUP_TOKEN: ${PLEX_MANAGER_SETUP_TOKEN:?set PLEX_MANAGER_SETUP_TOKEN in .env}
     ports:
-      # PLEX_MANAGER_PORT is the app's bind port (config.port) AND the host
-      # port; the container side must match it, not a hardcoded 8000.
-      - "${PLEX_MANAGER_PORT:-8000}:${PLEX_MANAGER_PORT:-8000}"
+      - "${PLEX_MANAGER_HOST_BIND:-127.0.0.1}:${PLEX_MANAGER_HOST_PORT:-8000}:8000"
     volumes:
       # Config + database persist across updates and rollbacks.
       - plex-manager-data:/app/data
-      # In v1, media + download paths are mounted here and selected in the wizard:
-      # - /srv/media:/media
-      # - /srv/downloads:/downloads
+      # Required: paths selected in setup must be visible inside the container.
+      - ${PLEX_MANAGER_MEDIA_ROOT:?set PLEX_MANAGER_MEDIA_ROOT in .env}:/media
+      - ${PLEX_MANAGER_DOWNLOADS_ROOT:?set PLEX_MANAGER_DOWNLOADS_ROOT in .env}:/downloads
 
 volumes:
   plex-manager-data:

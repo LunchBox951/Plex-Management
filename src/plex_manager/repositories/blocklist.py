@@ -71,6 +71,7 @@ class SqlBlocklistRepository:
         torrent_hash: str | None,
         source_title: str,
         indexer: str | None,
+        *,
         media_type: str | None = None,
     ) -> bool:
         # Pre-scope to the same media item (tmdb_id, with NULL matching NULL) AND the
@@ -97,7 +98,7 @@ class SqlBlocklistRepository:
         )
 
     async def list_for_media(
-        self, tmdb_id: int | None = None, media_type: str | None = None
+        self, tmdb_id: int | None = None, *, media_type: str | None = None
     ) -> list[BlocklistRecord]:
         stmt = select(Blocklist)
         if tmdb_id is not None:

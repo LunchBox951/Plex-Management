@@ -35,6 +35,44 @@ _NEW_PREDICATE = (
 _OLD_PREDICATE = "status IN ('pending', 'searching', 'no_acceptable_release', 'downloading')"
 
 
+def _raise_on_duplicate_new_active_rows() -> None:
+    rows = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                """
+                SELECT tmdb_id, media_type, COUNT(*) AS duplicate_count
+                FROM media_requests
+                WHERE status IN (
+                    'pending',
+                    'searching',
+                    'no_acceptable_release',
+                    'downloading',
+                    'import_blocked',
+                    'completed'
+                )
+                GROUP BY tmdb_id, media_type
+                HAVING COUNT(*) > 1
+                ORDER BY duplicate_count DESC, tmdb_id, media_type
+                LIMIT 5
+                """
+            )
+        )
+        .mappings()
+        .all()
+    )
+    if rows:
+        examples = ", ".join(
+            f"tmdb_id={row['tmdb_id']} media_type={row['media_type']} "
+            f"count={row['duplicate_count']}"
+            for row in rows
+        )
+        raise RuntimeError(
+            "Cannot expand uq_media_requests_active; duplicate media_requests would violate "
+            f"the new predicate: {examples}"
+        )
+
+
 def _recreate_active_index(predicate: str) -> None:
     op.drop_index(_INDEX, table_name="media_requests")
     op.create_index(
@@ -48,6 +86,7 @@ def _recreate_active_index(predicate: str) -> None:
 
 
 def upgrade() -> None:
+    _raise_on_duplicate_new_active_rows()
     _recreate_active_index(_NEW_PREDICATE)
 
 

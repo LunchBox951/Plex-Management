@@ -577,6 +577,69 @@ async def test_scope_conflict_on_top_pick_grabs_lower_ranked_release(
         assert grabbed_row.status == "downloading"
 
 
+async def test_torrent_tracked_by_other_request_grabs_next_release_cycle_survives(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Request A's top-ranked accepted release carries a hash ALREADY actively
+    # tracked by a DIFFERENT request entirely -> grab_service raises
+    # TorrentAlreadyTrackedError at the known-hash precheck (nothing handed to the
+    # client; the other request's download owns the physical torrent). That is a
+    # PER-RELEASE failure for A: the worker must fall through and GRAB A's
+    # lower-ranked release, and the cycle must survive to process request B --
+    # pre-fix the error escaped run_grab_cycle and aborted the whole pass.
+    other_id = await _seed_movie(
+        sessionmaker_, tmdb_id=999, status=RequestStatus.downloading, title="Other Movie"
+    )
+    a_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    b_id = await _seed_movie(sessionmaker_, tmdb_id=604)
+    async with sessionmaker_() as session:
+        # The shared hash ("aaaa...") is actively downloading for the OTHER request.
+        session.add(
+            Download(
+                torrent_hash="a" * 40,
+                status="downloading",
+                media_request_id=other_id,
+                tmdb_id=999,
+            )
+        )
+        await session.commit()
+    prowlarr = _PerTmdbProwlarr(
+        {
+            603: [
+                candidate("Some.Movie.2020.1080p.WEB-DL.x264-DUPE", info_hash="a" * 40, seeders=99),
+                candidate("Some.Movie.2020.1080p.WEB-DL.x264-ALT", info_hash="b" * 40, seeders=10),
+            ],
+            604: good_and_cam_candidates(),
+        }
+    )
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 2  # the cycle survived A's duplicate-hash top pick
+    assert result.grabbed == 2  # A's fallback release AND B both grabbed
+    assert result.no_acceptable == 0
+    assert result.grab_errors == 0  # per-release, never an operational error
+    assert result.last_grab_error is None
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, a_id)
+        b = await session.get(MediaRequest, b_id)
+        assert a is not None and b is not None
+        assert a.status == RequestStatus.downloading
+        assert b.status == RequestStatus.downloading
+        # A's download tracks the FALLBACK hash, never the other request's torrent.
+        a_row = (
+            await session.execute(select(Download).where(Download.media_request_id == a_id))
+        ).scalar_one()
+        assert a_row.torrent_hash == "b" * 40
+        # The other request's download is untouched.
+        other_row = (
+            await session.execute(select(Download).where(Download.media_request_id == other_id))
+        ).scalar_one()
+        assert other_row.torrent_hash == "a" * 40
+        assert other_row.status == "downloading"
+
+
 async def test_all_accepted_ungrabbable_parks_on_backoff(sessionmaker_: SessionMaker) -> None:
     # Every accepted release is sourceless (NoGrabSourceError) -> the list is
     # exhausted with no successful grab, so the scope parks on the escalating backoff
@@ -604,6 +667,74 @@ async def test_all_accepted_ungrabbable_parks_on_backoff(sessionmaker_: SessionM
         assert row.search_attempts == 1
         assert row.next_search_at is not None
         assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
+
+
+async def test_source_error_parks_scope_on_backoff(sessionmaker_: SessionMaker) -> None:
+    # An accepted release whose HTTP source resolves to neither a magnet nor a
+    # hashable .torrent -> ``qbt.add`` raises QbittorrentSourceError. qBittorrent is
+    # HEALTHY (the SOURCE is unusable) and the raise happens BEFORE the add POST, so
+    # NOTHING is left live to track -- a PER-RELEASE failure exactly like
+    # NoGrabSourceError, NOT an operational GrabError and NOT a client outage. The
+    # sole candidate is unusable, so the list exhausts and the scope PARKS on the
+    # escalating backoff (never falsely surfaced as a grab_error / client outage).
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr([candidate(title, magnet=False)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 1
+    assert result.grabbed == 0
+    assert result.no_acceptable == 1
+    assert result.grab_errors == 0  # NOT an operational GrabError
+    assert result.last_grab_error is None
+    assert qbt.added == []  # the raise precedes the add POST -- nothing handed over
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.no_acceptable_release
+        assert row.search_attempts == 1
+        assert row.next_search_at is not None
+        assert row.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
+
+
+async def test_source_error_does_not_abort_cycle_other_scope_grabs(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # THE regression: pre-fix, a QbittorrentSourceError on scope A's top candidate was
+    # caught by NO handler in run_grab_cycle, so it propagated out and aborted the
+    # WHOLE pass -- scope B (lower id, but processed after A here) never got searched.
+    # A source-unresolvable release is a RELEASE problem, not a client outage: A must
+    # park on its own backoff while B is still searched + grabbed cleanly.
+    bad_title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    bad_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    good_id = await _seed_movie(sessionmaker_, tmdb_id=604)
+    prowlarr = _PerTmdbProwlarr(
+        {
+            603: [candidate(bad_title, magnet=False)],
+            604: good_and_cam_candidates(),
+        }
+    )
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{bad_title}"})
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 2  # the cycle survived A and went on to search B
+    assert result.grabbed == 1  # B still grabbed after A's unusable source
+    assert result.no_acceptable == 1  # A parked on backoff
+    assert result.grab_errors == 0  # a per-release failure, never a client outage
+    assert result.last_grab_error is None
+    async with sessionmaker_() as session:
+        bad = await session.get(MediaRequest, bad_id)
+        good = await session.get(MediaRequest, good_id)
+        assert bad is not None
+        assert good is not None
+        assert bad.status == RequestStatus.no_acceptable_release  # parked, not aborted
+        assert bad.search_attempts == 1
+        assert bad.next_search_at is not None
+        assert bad.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
+        assert good.status == RequestStatus.downloading  # processed despite A's failure
 
 
 async def test_grab_error_on_top_pick_stops_further_attempts(sessionmaker_: SessionMaker) -> None:

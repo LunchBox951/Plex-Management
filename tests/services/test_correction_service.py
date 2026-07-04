@@ -191,6 +191,102 @@ async def test_report_issue_movie_blocklists_purges_removes_and_regrabs(
     assert len(history) == 1
 
 
+async def test_report_issue_source_error_on_top_replacement_grabs_next(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # The top-ranked REPLACEMENT's HTTP torrent source is unresolvable ->
+    # ``qbt.add`` raises QbittorrentSourceError (a QbittorrentError subclass,
+    # raised BEFORE anything reaches the client). Pre-fix the
+    # _DOWNLOAD_CLIENT_ERRORS catch treated it as a client OUTAGE and left the
+    # scope at 'searching' -- the promised synchronous re-grab silently never
+    # happened. It is a RELEASE problem: the re-grab must fall through to the
+    # next-ranked accepted replacement and grab it (mirroring auto-grab).
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    bad_title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{bad_title}"})
+    prowlarr = FakeProwlarr(
+        [
+            # The culprit is blocklisted by the verb itself before the re-search.
+            candidate("Some.Movie.2020.1080p.BluRay.x264-GROUP", info_hash=_CULPRIT),
+            # Top-ranked replacement: accepted, but its only source is an HTTP
+            # url the client's source resolution vetoes.
+            candidate(bad_title, magnet=False, seeders=100),
+            # Lower-ranked replacement: grabs cleanly.
+            candidate("Some.Movie.2020.1080p.WEB-DL.x264-ALT", info_hash=_ALT, seeders=10),
+        ]
+    )
+
+    async with sessionmaker_() as session:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            prowlarr,
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    # Never left at 'searching' with no action: the fallback replacement is in flight.
+    assert updated.status == RequestStatus.downloading.value
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+    active_hashes = {d.torrent_hash for d in downloads if d.status != "imported"}
+    assert active_hashes == {_ALT}
+
+
+async def test_report_issue_source_error_exhaustion_parks_honestly(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # EVERY accepted replacement has an unresolvable source: the bounded
+    # fall-through exhausts and the scope parks on the honest, retryable
+    # no_acceptable_release -- never the pre-fix silent 'searching' limbo
+    # (worst with auto-grab disabled: nothing would ever retry it).
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    bad_title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{bad_title}"})
+    prowlarr = FakeProwlarr(
+        [
+            candidate("Some.Movie.2020.1080p.BluRay.x264-GROUP", info_hash=_CULPRIT),
+            candidate(bad_title, magnet=False, seeders=100),
+        ]
+    )
+
+    async with sessionmaker_() as session:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            prowlarr,
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    assert updated.status == RequestStatus.no_acceptable_release.value
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+    assert {d.torrent_hash for d in downloads if d.status != "imported"} == set()
+
+
 async def test_report_issue_movie_reset_clears_library_path(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:

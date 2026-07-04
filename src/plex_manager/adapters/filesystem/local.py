@@ -16,6 +16,8 @@ import contextlib
 import errno
 import os
 import shutil
+import tempfile
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -50,6 +52,118 @@ class LocalFileSystemError(RuntimeError):
     guard, which is to make it structurally impossible for eviction to delete
     anything outside a configured library root.
     """
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+# How long an EMPTY / unparseable publish lock must sit untouched before it is
+# presumed poisoned (a crash between creating the lock and writing its pid) rather
+# than a concurrent creator still mid-write. Small enough that recovery is prompt,
+# large enough to never race a healthy publisher that has the fd open.
+_EMPTY_LOCK_STALE_SECONDS = 60.0
+
+
+def _lock_is_expired(lock_path: Path) -> bool:
+    """Whether an empty/unparseable lock is old enough (by mtime) to reclaim."""
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    return age > _EMPTY_LOCK_STALE_SECONDS
+
+
+def _lock_is_stale(lock_path: Path) -> bool:
+    """Whether a publish lock can be reclaimed.
+
+    A parseable pid is authoritative: the lock is stale iff that process is gone.
+    An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
+    creates the lock file and writes its pid in two separate steps, so a crash in
+    between leaves a zero-byte lock ``int('')`` can never parse. Rather than block
+    the destination FOREVER (a terminal-only dead end -- violates north-star #1),
+    reclaim such a lock once it is older than a short threshold; a younger empty
+    lock is presumed to be a concurrent creator mid-write and is left untouched.
+    """
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not raw:
+        return _lock_is_expired(lock_path)
+    try:
+        pid = int(raw)
+    except ValueError:
+        return _lock_is_expired(lock_path)
+    return not _pid_is_running(pid)
+
+
+@contextlib.contextmanager
+def _publish_lock(dst: Path):
+    lock_path = dst.parent / f".{dst.name}.publish.lock"
+    while True:
+        try:
+            lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if dst.exists():
+                raise FileExistsError(os.fspath(dst)) from None
+            if _lock_is_stale(lock_path):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(lock_path)
+                continue
+            raise
+        break
+    try:
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            os.unlink(lock_path)
+
+
+def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
+    """Publish a complete temp copy under a per-destination lock.
+
+    The hardlink is the preferred publish (an atomic exclusive create — it fails
+    ``EEXIST`` on its own, catching even a non-cooperating writer). On a
+    filesystem that refuses hardlinks outright (SMB / FAT — ``EPERM`` /
+    ``EOPNOTSUPP``, the same refusal that routed the caller here in the first
+    place) the temp file is RENAMED into place instead: it already holds the
+    fully verified bytes and already lives in ``dst.parent``, so the rename is a
+    same-directory atomic move that costs no second content copy — previously
+    this fell back to re-copying the temp's bytes into the final path, needing
+    ~2x the title's size transiently and failing with a spurious ENOSPC on a
+    barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
+    PUBLISHER is preserved by the per-destination ``_publish_lock`` plus the
+    ``dst.exists()`` check made under it — every publisher in this module takes
+    that same lock before touching ``dst``.
+    """
+    with _publish_lock(dst):
+        if dst.exists():
+            raise FileExistsError(os.fspath(dst))
+        try:
+            os.link(tmp_path, os.fspath(dst))
+        except OSError as exc:
+            if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                raise
+            # The rename consumes the temp — nothing left to unlink.
+            os.rename(tmp_path, os.fspath(dst))
+            return
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
+def _publish_link_no_overwrite(src: Path, dst: Path) -> None:
+    """Publish ``src`` at ``dst`` via an exclusive hardlink under the destination lock."""
+    with _publish_lock(dst):
+        os.link(os.fspath(src), os.fspath(dst))
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -148,33 +262,15 @@ class LocalFileSystem:
         return shutil.disk_usage(probe).free
 
     def move(self, src: Path, dst: Path) -> None:
-        """Move ``src`` to ``dst`` (atomic rename when on the same device).
-
-        ``shutil.move`` tries ``os.rename`` first and only falls back to a
-        content copy + unlink-source on a genuine cross-device failure
-        (``EXDEV``). If that copy fallback raises partway through (disk full,
-        killed process, I/O error), the exception propagates with a partially
-        written ``dst`` left on disk and ``src`` still intact — the same
-        partial-file hazard :meth:`hardlink_or_copy`'s copy fallback already
-        guards against. Mirror that fix here: on failure, if ``dst`` did NOT
-        pre-exist (so any partial file left behind is ours to remove), best-
-        effort clean it up — a file or a partially populated directory tree,
-        since ``shutil.move``'s copy fallback for a directory is a full
-        ``copytree`` that can be interrupted mid-walk — then re-raise the
-        ORIGINAL, unmasked error (north-star #3: honesty).
-        """
+        """Move ``src`` to ``dst`` without replacing an existing destination file."""
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst_preexisted = os.path.lexists(dst)
         try:
-            shutil.move(os.fspath(src), os.fspath(dst))
-        except OSError:
-            if not dst_preexisted:
-                with contextlib.suppress(OSError):
-                    if os.path.isdir(dst) and not os.path.islink(dst):
-                        shutil.rmtree(dst)
-                    else:
-                        os.unlink(dst)
-            raise
+            _publish_link_no_overwrite(src, dst)
+        except OSError as exc:
+            if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                raise
+            self._copy_no_overwrite(src, dst)
+        src.unlink()
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
@@ -185,7 +281,7 @@ class LocalFileSystem:
         """
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(os.fspath(src), os.fspath(dst))
+            _publish_link_no_overwrite(src, dst)
         except OSError as exc:
             # Only a genuine cross-device / hardlink-unsupported failure warrants a
             # copy. EEXIST (the destination already exists — e.g. a concurrent import
@@ -196,35 +292,48 @@ class LocalFileSystem:
             # Cross-device (or hardlink-refusing) filesystem: copy instead. A
             # copy actually consumes space, so preflight that the destination
             # filesystem can hold the source before writing a partial file.
-            src_size = src.stat().st_size
-            free = self.available_bytes(dst.parent)
-            if free < src_size:
-                raise OSError(
-                    f"insufficient space to copy {src.name}: need {src_size} bytes, "
-                    f"{free} available on destination filesystem"
-                ) from None
-            try:
-                shutil.copy2(os.fspath(src), os.fspath(dst))
-            except OSError:
-                # copy2 can raise AFTER it created/truncated dst (e.g. ENOSPC
-                # mid-write when another writer consumed the preflighted space).
-                # dst did not pre-exist here — EEXIST is not a copy-fallback errno —
-                # so any partial file is OURS to remove. Clean it up best-effort so a
-                # retry sees a clean slate, not a differently-sized file that
-                # _place_file would surface as a PERSISTENT FileExistsError conflict.
-                # Re-raise the ORIGINAL error, unmasked (north-star #3: honesty).
-                with contextlib.suppress(OSError):
-                    os.unlink(os.fspath(dst))
-                raise
-            # Verify the copy is complete; a short write means a truncated /
-            # corrupt import, so roll back the partial file and surface it.
-            copied_size = dst.stat().st_size
+            self._copy_no_overwrite(src, dst)
+
+    def _copy_no_overwrite(self, src: Path, dst: Path) -> None:
+        src_size = src.stat().st_size
+        free = self.available_bytes(dst.parent)
+        if free < src_size:
+            raise OSError(
+                f"insufficient space to copy {src.name}: need {src_size} bytes, "
+                f"{free} available on destination filesystem"
+            ) from None
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{dst.name}.",
+                suffix=".tmp",
+                dir=dst.parent,
+                delete=False,
+            ) as tmp:
+                tmp_path = tmp.name
+            shutil.copy2(os.fspath(src), tmp_path)
+            # Verify the copy is complete before exposing it at the final path.
+            copied_size = Path(tmp_path).stat().st_size
             if copied_size != src_size:
-                os.unlink(os.fspath(dst))
                 raise OSError(
                     f"copy of {src.name} is incomplete: expected {src_size} bytes, "
                     f"wrote {copied_size}; partial destination removed"
-                ) from None
+                )
+            _publish_temp_no_overwrite(tmp_path, dst)
+            tmp_path = None
+        except OSError:
+            # The copy target is a temp file in dst.parent, never the final path,
+            # so a process crash cannot leave a partial library file that blocks
+            # every retry. Clean the temp best-effort and re-raise the original
+            # error, unmasked (north-star #3: honesty).
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+            raise
+        else:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.

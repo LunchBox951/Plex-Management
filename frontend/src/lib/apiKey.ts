@@ -11,8 +11,10 @@
  * unauthenticated with no way to recover.
  */
 const STORAGE_KEY = 'plexmgr.apiKey'
+const SETUP_STORAGE_KEY = 'plexmgr.setupToken'
 
 let memoryKey: string | null = null
+let memorySetupToken: string | null = null
 
 export function getApiKey(): string | null {
   try {
@@ -30,6 +32,34 @@ export function setApiKey(key: string): void {
     localStorage.setItem(STORAGE_KEY, key)
   } catch {
     /* private-mode / storage-disabled: the in-memory copy carries the session */
+  }
+}
+
+export function getSetupToken(): string | null {
+  try {
+    const stored = sessionStorage.getItem(SETUP_STORAGE_KEY)
+    if (stored !== null) return stored
+  } catch {
+    /* storage unreadable — fall through to the in-memory copy */
+  }
+  return memorySetupToken
+}
+
+export function setSetupToken(token: string): void {
+  memorySetupToken = token
+  try {
+    sessionStorage.setItem(SETUP_STORAGE_KEY, token)
+  } catch {
+    /* private-mode / storage-disabled: the in-memory copy carries the session */
+  }
+}
+
+export function clearSetupToken(): void {
+  memorySetupToken = null
+  try {
+    sessionStorage.removeItem(SETUP_STORAGE_KEY)
+  } catch {
+    /* ignore */
   }
 }
 

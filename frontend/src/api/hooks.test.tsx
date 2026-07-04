@@ -1,13 +1,19 @@
-/** Regression test for F2: saving Settings must refetch the Plex library picker. */
+/** Regression tests for mutation cache invalidation behavior. */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { describe, expect, it, vi, type Mock } from 'vitest'
-import { useEvict, useRotateAppKey, useUpdateSettings } from './hooks'
+import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { useEvict, useMarkFailed, useRotateAppKey, useUpdateSettings } from './hooks'
 import { client } from './client'
 import { queryKeys } from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
-import type { AppApiKeyResponse, EvictResponse, SettingsResponse } from './types'
+import type {
+  AppApiKeyResponse,
+  EvictResponse,
+  PlexLibraryOption,
+  QueueItem,
+  SettingsResponse,
+} from './types'
 
 // No network: the typed client is replaced with controllable GET/PUT/POST mocks.
 vi.mock('./client', () => ({
@@ -20,26 +26,59 @@ function createWrapper(qc: QueryClient) {
   }
 }
 
+beforeEach(() => {
+  vi.mocked(client.POST).mockReset()
+  vi.mocked(client.PUT).mockReset()
+})
+
 describe('useUpdateSettings', () => {
-  it('invalidates the Plex library picker so it refetches against the just-saved connection', async () => {
+  it('removes stale Plex library picker data when the Plex connection changes', async () => {
     const saved: SettingsResponse = { plex_url: 'http://new-plex:32400' }
     ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
-    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    const oldLibraries: PlexLibraryOption[] = [
+      {
+        path: '/old-plex/movies',
+        section_key: '1',
+        section_type: 'movie',
+        title: 'Movies',
+        writable: true,
+      },
+    ]
+    qc.setQueryData(queryKeys.settings, { plex_url: 'http://old-plex:32400' })
+    qc.setQueryData(queryKeys.plexLibraries, oldLibraries)
+    const remove = vi.spyOn(qc, 'removeQueries')
 
     const { result } = renderHook(() => useUpdateSettings(), {
       wrapper: createWrapper(qc),
     })
     await result.current.mutateAsync({ plex_url: 'http://new-plex:32400' })
 
-    // The movies_root picker (queryKeys.plexLibraries) is refetched so a stale
-    // pick-list — or a prior 409/401 frozen by retry:false — cannot survive a
-    // connection change. Fails before the fix (key never invalidated); passes after.
+    await waitFor(() => expect(remove).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries }))
+    expect(qc.getQueryData(queryKeys.plexLibraries)).toBeUndefined()
+    expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
+  })
+
+  it('invalidates the Plex library picker when the Plex connection is unchanged', async () => {
+    const saved: SettingsResponse = { plex_url: 'http://plex:32400', qbittorrent_username: 'next' }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    qc.setQueryData(queryKeys.settings, { plex_url: 'http://plex:32400' })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({
+      plex_url: 'http://plex:32400',
+      qbittorrent_username: 'next',
+    })
+
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries }),
     )
-    // The PUT body is written straight into the settings cache (no extra GET).
     expect(qc.getQueryData(queryKeys.settings)).toEqual(saved)
   })
 
@@ -64,11 +103,6 @@ describe('useUpdateSettings', () => {
 
 describe('useEvict', () => {
   it('invalidates disk/health/requests even when the sweep reports per-root errors', async () => {
-    // R6-C: a partial sweep (one root evicted, a LATER root raised) is still a
-    // 200 -- a genuinely successful mutation, never a thrown error -- so the
-    // disk/health/requests views must refresh to reflect whatever the sweep
-    // actually accomplished, not be left stale just because `errors` is
-    // non-empty.
     const partial: EvictResponse = {
       evicted: [
         {
@@ -94,6 +128,32 @@ describe('useEvict', () => {
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsDisk }))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests })
+  })
+})
+
+describe('useMarkFailed', () => {
+  it('invalidates requests after rejecting a queued release', async () => {
+    const item: QueueItem = {
+      id: 7,
+      media_request_id: 4,
+      progress: 0,
+      seed_ratio: 0,
+      status: 'failed',
+      tmdb_id: 603,
+      torrent_hash: 'deadbeef',
+    }
+    ;(client.POST as unknown as Mock).mockResolvedValue({ data: item, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useMarkFailed(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({ downloadId: 7, blocklist: true })
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests }))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue })
   })
 })
 

@@ -9,18 +9,19 @@ single app — with two differences that define the project:
    CAM/TS/telecast junk is *rejected outright* instead of slipping into your
    library.
 
-> **Status:** backend alpha (the **request → search → grab** slice). The pure
-> decision engine, persistence, the live Prowlarr/qBittorrent/TMDB adapters, the
-> reconciler, and the REST API are built and tested; file import, Plex dedupe,
-> retention, and the front-end are deferred. See
-> [docs/design/alpha-plan.md](docs/design/alpha-plan.md).
+> **Status:** alpha. The request, search, grab, reconcile, import, Plex scan,
+> Plex availability dedupe, disk-pressure eviction, log/status, settings, and web
+> UI workflows are built and tested. Plex OAuth and the bundled host updater are
+> still deferred.
 
-## What works now (backend alpha)
+## What works now (alpha)
 
 - **First-run setup wizard** (`/api/v1/setup/*`): validate and store
   Plex/Prowlarr/qBittorrent/TMDB credentials — encrypted at rest, never logged.
 - **API-key auth** (`X-Api-Key`) on every protected route; a setup guard blocks
   the API until the install is initialized.
+- **Web UI** for setup, discovery, requests, queue management, status, logs,
+  settings, blocklist, and quality-profile inspection.
 - **TMDB discovery** → **request** a movie/show (anime auto-tagged).
 - **`/api/v1/search-preview`** — the headline: searches Prowlarr, parses each
   release with `guessit`, runs the Radarr-style **ordered quality profile with a
@@ -31,13 +32,18 @@ single app — with two differences that define the project:
 - **Grab** the chosen release into qBittorrent and **reconcile** its status; a
   single missed poll never falses a download, failures are blocklisted and
   re-searched, and the blocklist is operator-manageable.
+- **Import and Plex reconciliation**: validate completed downloads, place movie
+  files and TV episodes under the configured library root, scan Plex, detect
+  existing Plex availability, and surface import-blocked cases for correction.
+- **Operability tools**: health checks, live logs, disk usage, retention
+  settings, and manual or scheduled disk-pressure eviction.
 
 The typed contract for all of this is published at
 [`docs/api/openapi.json`](docs/api/openapi.json) (regenerate with `make openapi`).
 
-**Deferred** (ports defined, adapters stubbed): file import (validate → rename →
-route → Plex scan), Plex availability dedupe, disk-pressure eviction, retention,
-Plex OAuth, and the front-end.
+**Deferred**: Plex OAuth and a bundled host auto-updater. The release workflow can
+promote an already-built image to `:stable`, but the host-side pull/restart
+mechanism is still operator-managed.
 
 ## Why
 
@@ -66,10 +72,21 @@ recovery, troubleshooting — happens in the browser** (see
 [ADR-0005](docs/adr/0005-zero-terminal-web-operability.md)).
 
 ```bash
-cp .env.example .env      # adjust bootstrap settings (port, image, database URL)
-docker compose up -d      # pulls the image and starts the service
-# then open http://<host>:8000 and complete the setup wizard
+cp .env.example .env
+python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+# adjust image, bind mounts, database URL, and host bind/port as needed
+docker compose up -d
+# then open http://127.0.0.1:8000 and enter the setup token from .env
 ```
+
+Before starting the container, set `PLEX_MANAGER_MEDIA_ROOT` and
+`PLEX_MANAGER_DOWNLOADS_ROOT` in `.env` to host directories that contain the Plex
+libraries and qBittorrent downloads. They are mounted as `/media` and `/downloads`
+inside the container; the setup wizard paths must use those in-container paths.
+The stock compose file publishes only on `127.0.0.1` and requires
+`PLEX_MANAGER_SETUP_TOKEN` so a fresh uninitialized install cannot be claimed
+remotely. Use an SSH tunnel or reverse proxy for first setup; only set
+`PLEX_MANAGER_HOST_BIND=0.0.0.0` when the host is intentionally exposed.
 
 Each host is *designed* to auto-pull its release channel (the updater mechanism —
 Watchtower vs. a systemd timer — is an open decision and is not bundled in the
@@ -80,29 +97,36 @@ untouched by updates. See
 
 ## Developing
 
-Requires Python 3.12+.
+Requires Python 3.12+ and Node.js 22+ with npm.
 
 ```bash
 make install   # editable install + dev tools + pre-commit
+make ui-install # install frontend dependencies
 make migrate   # apply Alembic migrations (creates ./data and the schema)
-make check     # ruff (lint+format), pyright --strict, pytest
+make check     # backend + frontend lint, typecheck, tests, and build
 make run       # http://localhost:8000  (/health to verify, /docs for the API)
 make openapi   # regenerate docs/api/openapi.json from the live app
 ```
+
+Before `make run`, create `.env` and set `PLEX_MANAGER_SETUP_TOKEN`; the local
+server refuses first-run startup without it. For short-lived local API/docs work
+only, `PLEX_MANAGER_DEV_AUTH_BYPASS=true make run` skips both setup-token and
+API-key checks.
 
 Project layout and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Tech stack
 
 Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) + Alembic · `httpx` ·
-`guessit` (release parsing) · pyright (strict) · ruff · pytest · Docker / GHCR.
+`guessit` (release parsing) · React · TanStack Query · Vite · pyright (strict) ·
+ruff · pytest · Docker / GHCR.
 See [ADR-0002](docs/adr/0002-python-typed-stack.md) and
 [ADR-0008](docs/adr/0008-release-parser-guessit.md).
 
 ## Documentation
 
 - [Design overview](docs/design/overview.md)
-- [Backend alpha scope & plan](docs/design/alpha-plan.md)
+- [Historical backend-alpha plan](docs/design/alpha-plan.md)
 - [REST API contract (OpenAPI)](docs/api/openapi.json)
 - [Architecture Decision Records](docs/adr/)
 - [Security policy](SECURITY.md)

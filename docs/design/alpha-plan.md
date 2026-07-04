@@ -1,4 +1,8 @@
-# Backend Alpha — scope & plan
+# Backend Alpha — historical first-slice plan
+
+> Historical note: this document records the first backend-alpha planning slice.
+> It is not the current shipped-scope statement; use the README, changelog, ADRs,
+> and exported OpenAPI contract for current behavior.
 
 - **Status:** In progress (first backend-alpha session)
 - **Goal:** the smallest slice that proves the v2 architecture and the prototype's

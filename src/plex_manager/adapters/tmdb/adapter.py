@@ -223,6 +223,8 @@ class TmdbMetadata:
             for row in _as_sequence(payload.get("results")):
                 parsed = self._parse_search_row(_as_mapping(row))
                 if parsed is not None:
+                    if year is not None and parsed.year != year:
+                        continue
                     results.append(parsed)
         self._search_cache.set(cache_key, results)
         return results

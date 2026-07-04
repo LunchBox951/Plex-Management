@@ -11,6 +11,8 @@ const h = vi.hoisted(() => ({
   settingsData: null as SettingsResponse | null,
   libraries: [] as PlexLibraryOption[],
   toast: vi.fn(),
+  librariesError: null as Error | null,
+  librariesRefetch: vi.fn(),
   revealMutateAsync: vi.fn(),
   rotateMutateAsync: vi.fn(),
   // Drives useRotateAppKey().isPending so a test can assert the Reveal button is
@@ -27,7 +29,12 @@ vi.mock('../api/hooks', () => ({
     refetch: vi.fn(),
   }),
   useUpdateSettings: () => ({ mutateAsync: h.mutateAsync, isPending: false }),
-  usePlexLibraries: () => ({ data: h.libraries }),
+  usePlexLibraries: () => ({
+    data: h.libraries,
+    isError: h.librariesError !== null,
+    error: h.librariesError,
+    refetch: h.librariesRefetch,
+  }),
   useRevealAppKey: () => ({ mutateAsync: h.revealMutateAsync, isPending: false }),
   useRotateAppKey: () => ({
     mutateAsync: h.rotateMutateAsync,
@@ -64,6 +71,9 @@ describe('Settings — movies_root save payload (G2)', () => {
     h.libraries = [
       { path: '/old-plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
     ]
+    h.librariesError = null
+    h.librariesRefetch.mockReset()
+    h.toast.mockReset()
   })
 
   it('clears movies_root when the Plex URL changes and no folder is re-picked', async () => {
@@ -97,7 +107,7 @@ describe('Settings — movies_root save payload (G2)', () => {
     expect(lastBody().movies_root).toBe('/old-plex/movies')
   })
 
-  it('honors an explicit folder re-selection made alongside a Plex change', async () => {
+  it('does not save a stale library re-selection after a Plex change', async () => {
     h.libraries = [
       { path: '/old-plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
       { path: '/new-plex/movies', section_key: '2', section_type: 'movie', title: 'Films', writable: true },
@@ -106,12 +116,24 @@ describe('Settings — movies_root save payload (G2)', () => {
     fireEvent.change(screen.getByDisplayValue('http://old-plex:32400'), {
       target: { value: 'http://new-plex:32400' },
     })
-    fireEvent.change(screen.getByLabelText('Movies library folder'), {
-      target: { value: '/new-plex/movies' },
-    })
+    expect(screen.getByLabelText('Movies library folder')).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
-    expect(lastBody().movies_root).toBe('/new-plex/movies')
+    expect(lastBody().movies_root).toBe('')
+  })
+
+  it('shows Plex library picker failures instead of silently falling back to a manual path', () => {
+    h.libraries = []
+    h.librariesError = new Error('Plex unavailable')
+
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByText("Couldn't load Plex libraries")).toBeInTheDocument()
+    expect(screen.getByText('Plex unavailable')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('/old-plex/movies')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    expect(h.librariesRefetch).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -135,6 +157,8 @@ describe('Settings — tv_root library picker (optional)', () => {
       { path: '/plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
       { path: '/plex/tv', section_key: '2', section_type: 'tv', title: 'TV Shows', writable: true },
     ]
+    h.librariesError = null
+    h.librariesRefetch.mockReset()
   })
 
   it('filters the movie picker to section_type "movie" and the tv picker to "tv"', () => {
@@ -164,6 +188,22 @@ describe('Settings — tv_root library picker (optional)', () => {
     fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
       target: { value: 'http://new-plex:32400' },
     })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().tv_root).toBe('')
+  })
+
+  it('does not save a stale tv library re-selection after a Plex change', async () => {
+    h.libraries = [
+      { path: '/old-plex/tv', section_key: '2', section_type: 'tv', title: 'Old TV', writable: true },
+      { path: '/new-plex/tv', section_key: '3', section_type: 'tv', title: 'New TV', writable: true },
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+
+    expect(screen.getByLabelText('TV library folder')).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().tv_root).toBe('')
@@ -227,6 +267,26 @@ describe('Settings — anime library roots (ADR-0015, optional)', () => {
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().anime_movie_root).toBe('/plex/anime-movies')
     expect(lastBody().anime_tv_root).toBe('/plex/anime-tv')
+  })
+
+  it('gates the anime pickers during a Plex connection change exactly like Movies/TV', async () => {
+    // Mid-reconnect the disabled libraries query still serves the OLD server's
+    // cached list; pre-fix the anime pickers stayed enabled, so a stale anime
+    // root could be selected and saved (clearAnime*Root treats the changed
+    // value as a deliberate re-selection). They must be disabled placeholders,
+    // mirroring the Movies/TV pickers.
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+
+    expect(screen.getByLabelText('Anime movies library folder')).toBeDisabled()
+    expect(screen.getByLabelText('Anime TV library folder')).toBeDisabled()
+    // Nothing stale selectable: saving carries no anime root from the old server.
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().anime_movie_root).toBe('')
+    expect(lastBody().anime_tv_root).toBe('')
   })
 
   it('clears anime roots when the Plex connection changes and they are not re-picked', async () => {

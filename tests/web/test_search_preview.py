@@ -63,6 +63,16 @@ async def test_all_prerelease_yields_no_acceptable_release(
     assert len(body["rejected"]) == 2
 
 
+def test_search_preview_contract_documents_manual_error_bodies(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/search-preview"]["post"]["responses"]
+
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+    schema = responses["422"]["content"]["application/json"]["schema"]
+    assert {"$ref": "#/components/schemas/ErrorDetail"} in schema["anyOf"]
+
+
 async def test_search_preview_requires_api_key(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:

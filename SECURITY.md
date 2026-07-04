@@ -25,23 +25,25 @@ there is no bug-bounty program.
 ## How secrets are handled
 
 - Service credentials (Plex token, TMDB / Prowlarr / qBittorrent keys) are entered
-  through the in-app setup wizard and **will be stored encrypted at rest**, never
-  in the image or in `.env`. (The wizard + encryption land with v1; the foundation
-  already enforces the "never in the image or `.env`" half — `.env` is git- and
-  docker-ignored.)
-- Secrets **must never be written to logs** — enforced in review today, and to be
-  backed by a logging redaction filter and a test once the secrets code lands (a
-  regression carried over from a prototype lesson).
+  through the in-app setup wizard and **stored encrypted at rest**, never in the
+  image or in `.env`.
+- First-run setup is guarded by `PLEX_MANAGER_SETUP_TOKEN` in the stock Docker
+  Compose deployment, and the default published host bind is loopback-only. Keep
+  that token out of issue reports, logs, screenshots, and public compose examples.
+- Secrets **must never be written to logs**. The log capture pipeline stores
+  already-formatted messages and context rather than redacting after capture, so
+  the control is call-site hygiene plus tests and quieter `httpx`/`httpcore`
+  logger levels for secret-prone third-party request logs.
 
 ## Automated security checks (CI)
 
 | Check | Tool |
 |---|---|
 | Static analysis (SAST) | CodeQL |
-| Dependency vulnerabilities | `pip-audit` (runtime deps) + Dependabot alerts (incl. dev) |
+| Dependency vulnerabilities | `pip-audit` (runtime deps) + `npm audit --audit-level=high` (frontend deps, including dev tooling) + Dependabot alerts (incl. dev) |
 | Python security lints | `ruff` (bandit `S` rules) |
 | Secret scanning | gitleaks (CI) + GitHub secret scanning (repo setting) |
-| Container image CVEs | Trivy — scans the built image on every PR and on push to `main`; report-only, all severities (the Security tab is the honest tally) |
+| Container image CVEs | Trivy — PR scans are report-only in the job log; push/rescan SARIF in the Security tab covers fixed OS-package CVEs only. Python/frontend library CVEs are owned by the dependency-audit and Dependabot checks above. |
 | Dependency / Action / base-image updates | Dependabot |
 
 GitHub Actions are version-pinned and kept current by Dependabot. Pinning Actions
@@ -59,7 +61,8 @@ committed. Current status:
       `.github/workflows/codeql.yml` (runs on every PR to `main` and on push) —
       do **not** also enable CodeQL *default* setup (the two conflict and default
       would disable the committed workflow).
-- [x] `main` is protected: a PR is required; the `quality`, `analyze` (CodeQL),
+- [x] `main` is protected: a PR is required; the `quality`, `tests-py314`,
+      `frontend`, `analyze (python)`, `analyze (javascript-typescript)`,
       `secret-scan`, `dependency-audit`, and `build` (container) checks must
       pass; branches must be up to date; and force-pushes and deletion are
       blocked. Admins are **not** forced through the gate, so the solo maintainer

@@ -114,12 +114,24 @@ export function useUpdateSettings() {
   return useMutation({
     mutationFn: async (body: SettingsUpdate): Promise<SettingsResponse> =>
       unwrap(await client.PUT('/api/v1/settings', { body })),
-    onSuccess: (data) => {
+    onSuccess: (data, variables) => {
+      const previous = qc.getQueryData<SettingsResponse>(queryKeys.settings)
+      const plexConnectionChanged =
+        previous === undefined ||
+        (typeof variables.plex_url === 'string' &&
+          variables.plex_url !== (previous.plex_url ?? '')) ||
+        (typeof variables.plex_token === 'string' && variables.plex_token.length > 0)
       qc.setQueryData(queryKeys.settings, data)
-      // The Plex URL/token may have changed; the movies_root picker must refetch
-      // against the newly-saved connection — and clear any prior unconfigured/auth
-      // error, which retry:false otherwise leaves stuck until the page remounts.
-      void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+      if (plexConnectionChanged) {
+        // A library path belongs to a specific Plex server. Drop the whole cached
+        // picker result before the form re-enables it, so old folders cannot remain
+        // selectable while the new connection refetch is in flight.
+        qc.removeQueries({ queryKey: queryKeys.plexLibraries })
+      } else {
+        // Clear any prior unconfigured/auth error, which retry:false otherwise leaves
+        // stuck until the page remounts.
+        void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+      }
       // The TMDB api key may have changed; Discover's home + search results are
       // keyed on the old credentials, so drop them too. TanStack Query v5's
       // default exact:false prefix match covers both queryKeys.discoverHome
@@ -354,6 +366,7 @@ export function useMarkFailed() {
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
       void qc.invalidateQueries({ queryKey: ['blocklist'] })
     },
   })

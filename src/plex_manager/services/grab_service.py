@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     DownloadHistory,
     DownloadHistoryEvent,
@@ -49,6 +49,7 @@ __all__ = [
     "NoGrabSourceError",
     "RequestNotActiveError",
     "SeasonRequiredError",
+    "TorrentAlreadyTrackedError",
     "grab",
 ]
 
@@ -203,15 +204,29 @@ def _reuse_conflicts(
     return not set(episodes).issubset(set(existing.episodes))
 
 
+class TorrentAlreadyTrackedError(Exception):
+    """The same torrent hash is already active under another request."""
+
+    def __init__(self, torrent_hash: str, owner_request_id: int | None) -> None:
+        self.torrent_hash = torrent_hash
+        self.owner_request_id = owner_request_id
+        super().__init__(f"torrent {torrent_hash} is already tracked by request {owner_request_id}")
+
+
 async def _reuse_terminal_row(
+    session: AsyncSession,
     download_repo: SqlDownloadRepository,
     download_id: int,
     torrent_hash: str,
     request_id: int | None,
     *,
+    source: str,
+    tmdb_id: int | None,
+    year: int | None,
     season: int | None,
     episodes: list[int] | None,
-) -> DownloadRecord:
+    media_type: str | None,
+) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
     A previously-failed (not blocklisted) release may legitimately be grabbed
@@ -244,23 +259,34 @@ async def _reuse_terminal_row(
     Unconditional (not ``is not None``-gated) so a movie reuse correctly clears
     any stale season/episodes back to ``None`` too.
     """
-    await download_repo.update_status(
+    claimed = await download_repo.update_status_if_in(
         download_id,
         DownloadState.Downloading.value,
+        _TERMINAL_STATUS_VALUES,
         progress=0.0,
         seed_ratio=0.0,
         clear_failed_reason=True,
         clear_first_seen_at=True,
         clear_download_path=True,
         media_request_id=request_id,
+        replace_grab_metadata=True,
+        magnet_link=source,
+        tmdb_id=tmdb_id,
+        year=year,
         season=season,
         episodes=episodes,
-        set_scope=True,
+        media_type=media_type,
     )
+    if not claimed:
+        await session.rollback()
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is None:  # pragma: no cover - the row existed before the CAS
+            raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
+        return record, False
     record = await download_repo.get_by_hash(torrent_hash)
     if record is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
-    return record
+    return record, True
 
 
 async def grab(
@@ -304,6 +330,7 @@ async def grab(
     if source is None:
         raise NoGrabSourceError(candidate.guid)
 
+    request_media_type: str | None = None
     # Reject a stale/terminal request id BEFORE handing anything to the client. If
     # this request is already terminal, a newer ACTIVE request for the same media
     # owns the ``uq_media_requests_active`` slot, so re-arming this row to
@@ -314,6 +341,7 @@ async def grab(
         if request is not None:
             if request.status in TERMINAL_REQUEST_STATUS_VALUES:
                 raise RequestNotActiveError(request_id)
+            request_media_type = request.media_type
             # Domain-boundary backstop: branch on the request's ACTUAL media
             # type, never on whether the caller merely passed a ``season``. The
             # endpoint already enforces this (422 before even previewing), but
@@ -335,6 +363,8 @@ async def grab(
     if known_hash is not None:
         pre = await download_repo.get_by_hash(known_hash)
         if pre is not None and pre.status not in _TERMINAL_STATUS_VALUES:
+            if request_id is not None and pre.media_request_id != request_id:
+                raise TorrentAlreadyTrackedError(known_hash, pre.media_request_id)
             # Idempotent only when the SCOPE matches. The same physical torrent
             # active for a DIFFERENT season (a multi-season pack re-grabbed per
             # season) must not be returned as a no-op -- that leaves the new season
@@ -372,6 +402,8 @@ async def grab(
 
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
+        if request_id is not None and existing.media_request_id != request_id:
+            raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
         # Same scope-match guard as the known-hash precheck, for the case the indexer
         # gave no hash so this is the first time we see the real one from qbt.add.
         # Re-adding the same magnet is a qBittorrent no-op, so nothing is orphaned.
@@ -386,14 +418,65 @@ async def grab(
         return existing
 
     if existing is not None:
-        record = await _reuse_terminal_row(
-            download_repo,
-            existing.id,
-            torrent_hash,
-            request_id,
-            season=season,
-            episodes=episodes,
-        )
+        try:
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
+                download_repo,
+                existing.id,
+                torrent_hash,
+                request_id,
+                source=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+                episodes=episodes,
+                media_type=request_media_type,
+            )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+                    # The reuse race was lost to THIS request's OTHER grab (two
+                    # seasons of one multi-season pack racing to resurrect the same
+                    # terminal row). The winner's row carries the winner's scope, so
+                    # returning it for a NON-covered scope would report this grab as
+                    # success while the requested season/episodes stay silently
+                    # untracked — the exact lie the non-race active paths guard with
+                    # ``_reuse_conflicts``. Apply the same check here.
+                    if _reuse_conflicts(record, season, episodes):
+                        raise DownloadScopeConflictError(
+                            torrent_hash,
+                            active_season=record.season,
+                            active_episodes=record.episodes,
+                            requested_season=season,
+                            requested_episodes=episodes,
+                        )
+                    return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+        except IntegrityError:
+            await session.rollback()
+            if request_id is not None:
+                active = await download_repo.find_active_for_request(request_id, season=season)
+                if active is not None and active.torrent_hash != torrent_hash:
+                    try:
+                        await qbt.remove(torrent_hash, delete_files=True)
+                    except Exception:
+                        # Static message + ids in extra= (log-hygiene convention, #35):
+                        # request_id/torrent_hash both trace from the /queue/grab body,
+                        # so they cross the same log-safe barriers as every other
+                        # request-derived log value -- CodeQL taints extra= fields too.
+                        _logger.warning(
+                            "failed to remove orphaned torrent after losing a "
+                            "terminal-row reuse race; it may keep seeding until "
+                            "removed manually",
+                            exc_info=True,
+                            extra={
+                                "request_id": safe_int(request_id),
+                                "torrent_hash": safe_text(torrent_hash),
+                            },
+                        )
+                    raise AlreadyDownloadingError(request_id) from None
+            raise
     else:
         try:
             record = await download_repo.create(
@@ -405,6 +488,7 @@ async def grab(
                 year=year,
                 season=season,
                 episodes=episodes,
+                media_type=request_media_type,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release
@@ -425,23 +509,30 @@ async def grab(
                     try:
                         await qbt.remove(torrent_hash, delete_files=True)
                     except Exception:
+                        # request_id/torrent_hash trace from the /queue/grab body
+                        # (body.request_id -> the resolved request.id passed here),
+                        # so they go through the same log-safe barriers as every
+                        # other request-derived log value -- CodeQL taints ``extra``
+                        # fields like message args (log-hygiene convention, #35).
                         _logger.warning(
-                            "failed to remove orphaned torrent %s after losing a "
-                            "parallel grab for this request",
-                            torrent_hash,
+                            "failed to remove orphaned torrent after losing a "
+                            "parallel grab for this request; it may keep seeding "
+                            "until removed manually",
                             exc_info=True,
-                            # request_id traces from the /queue/grab body
-                            # (body.request_id -> the resolved request.id passed
-                            # here), so it goes through the same log-safe int
-                            # barrier as every other request-derived log value --
-                            # CodeQL taints ``extra`` fields like message args.
-                            extra={"request_id": safe_int(request_id)},
+                            extra={
+                                "request_id": safe_int(request_id),
+                                "torrent_hash": safe_text(torrent_hash),
+                            },
                         )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)
             if winner is None:  # pragma: no cover - the conflicting row must exist
                 raise
             if winner.status not in _TERMINAL_STATUS_VALUES:
+                if request_id is not None and winner.media_request_id != request_id:
+                    raise TorrentAlreadyTrackedError(
+                        torrent_hash, winner.media_request_id
+                    ) from None
                 # Same scope-conflict guard as the non-race precheck: two grabs for
                 # the same hash but a DIFFERENT tv scope can race past the prechecks,
                 # the loser hitting UNIQUE(torrent_hash) here. Returning the winner's
@@ -456,14 +547,39 @@ async def grab(
                         requested_episodes=episodes,
                     ) from None
                 return winner
-            record = await _reuse_terminal_row(
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
                 download_repo,
                 winner.id,
                 torrent_hash,
                 request_id,
+                source=source,
+                tmdb_id=tmdb_id,
+                year=year,
                 season=season,
                 episodes=episodes,
+                media_type=request_media_type,
             )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(
+                            torrent_hash, record.media_request_id
+                        ) from None
+                    # Mirror of the non-race branch above: a reuse race lost to THIS
+                    # request's other grab must still refuse a non-covered scope
+                    # instead of returning the winner's row as success (the requested
+                    # season/episodes would be silently untracked).
+                    if _reuse_conflicts(record, season, episodes):
+                        raise DownloadScopeConflictError(
+                            torrent_hash,
+                            active_season=record.season,
+                            active_episodes=record.episodes,
+                            requested_season=season,
+                            requested_episodes=episodes,
+                        ) from None
+                    return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
     session.add(
         DownloadHistory(
             tmdb_id=tmdb_id,

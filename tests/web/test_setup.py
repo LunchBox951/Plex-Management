@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import httpx
+import pytest
+from fastapi import FastAPI
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.config import get_settings
 from plex_manager.models import SystemSettings
 
 SessionMaker = async_sessionmaker[AsyncSession]
+_SETUP_TOKEN = "boot-token"  # noqa: S105 - fixed test bootstrap token
+_SETUP_HEADERS = {"X-Setup-Token": _SETUP_TOKEN}
 
 _COMPLETE_BODY = {
     "plex_url": "http://plex.local:32400",
@@ -23,16 +28,110 @@ _COMPLETE_BODY = {
 }
 
 
+@pytest.fixture(autouse=True)
+def configured_setup_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", _SETUP_TOKEN)
+    get_settings.cache_clear()
+
+
 async def test_status_pre_init_has_no_key(client: httpx.AsyncClient) -> None:
     response = await client.get("/api/v1/setup/status")
     assert response.status_code == 200
     body = response.json()
     assert body["initialized"] is False
     assert body["app_api_key"] is None
+    assert body["setup_token_required"] is True
+
+
+async def test_status_reports_setup_token_requirement(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", _SETUP_TOKEN)
+    get_settings.cache_clear()
+
+    response = await client.get("/api/v1/setup/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["initialized"] is False
+    assert body["app_api_key"] is None
+    assert body["setup_token_required"] is True
+
+
+async def test_status_reports_setup_token_requirement_for_remote_pre_init(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.get("/api/v1/setup/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["initialized"] is False
+    assert body["setup_token_required"] is True
+
+
+async def test_complete_requires_configured_setup_token_pre_init(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", _SETUP_TOKEN)
+    get_settings.cache_clear()
+
+    missing = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    assert missing.status_code == 401
+    assert missing.json()["detail"] == "invalid_setup_token"
+
+    wrong = await client.post(
+        "/api/v1/setup/complete",
+        json=_COMPLETE_BODY,
+        headers={"X-Setup-Token": "wrong"},
+    )
+    assert wrong.status_code == 401
+    assert wrong.json()["detail"] == "invalid_setup_token"
+
+    ok = await client.post(
+        "/api/v1/setup/complete",
+        json=_COMPLETE_BODY,
+        headers=_SETUP_HEADERS,
+    )
+    assert ok.status_code == 200
+    assert ok.json()["initialized"] is True
+
+
+async def test_complete_rejects_remote_client_without_setup_token(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as remote:
+        response = await remote.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+
+
+async def test_complete_rejects_loopback_client_with_nonlocal_host(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://attacker.test") as remote:
+        response = await remote.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+
+
+async def test_complete_rejects_loopback_client_with_cross_origin(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 45231))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.post(
+            "/api/v1/setup/complete",
+            json=_COMPLETE_BODY,
+            headers={"Origin": "http://attacker.test"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
 
 
 async def test_complete_flips_initialized_and_issues_key(client: httpx.AsyncClient) -> None:
-    response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    response = await client.post(
+        "/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["initialized"] is True
@@ -63,7 +162,9 @@ async def test_complete_stores_the_key_encrypted_not_plaintext(
 ) -> None:
     # The bearer token is revealed once in the response, but it is stored
     # Fernet-encrypted at rest — a DB-backup leak must not yield a usable key.
-    response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    response = await client.post(
+        "/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS
+    )
     assert response.status_code == 200
     issued_key = response.json()["app_api_key"]
     assert isinstance(issued_key, str) and issued_key
@@ -89,7 +190,7 @@ async def test_complete_stores_the_key_encrypted_not_plaintext(
 async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> None:
     # Setup is one-shot: the first call initializes; a second is rejected so an
     # anonymous caller can't overwrite stored creds or re-disclose the app key.
-    first = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    first = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS)
     assert first.status_code == 200
     second = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
     assert second.status_code == 409
@@ -99,7 +200,9 @@ async def test_complete_is_rejected_after_init(client: httpx.AsyncClient) -> Non
 async def test_complete_without_tv_root_leaves_it_unset(client: httpx.AsyncClient) -> None:
     # tv_root is optional -- an install may complete setup with only a Movies
     # library. It reads back as None, never an empty string.
-    response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    response = await client.post(
+        "/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS
+    )
     assert response.status_code == 200
     issued_key = response.json()["app_api_key"]
 
@@ -109,7 +212,7 @@ async def test_complete_without_tv_root_leaves_it_unset(client: httpx.AsyncClien
 
 async def test_complete_with_tv_root_stores_it(client: httpx.AsyncClient) -> None:
     body = {**_COMPLETE_BODY, "tv_root": "/library/tv"}
-    response = await client.post("/api/v1/setup/complete", json=body)
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
     assert response.status_code == 200
     issued_key = response.json()["app_api_key"]
 
@@ -117,11 +220,96 @@ async def test_complete_with_tv_root_stores_it(client: httpx.AsyncClient) -> Non
     assert settings.json()["tv_root"] == "/library/tv"
 
 
+async def test_complete_with_only_tv_root_leaves_movies_root_unset(
+    client: httpx.AsyncClient,
+) -> None:
+    body = {**_COMPLETE_BODY, "movies_root": None, "tv_root": "/library/tv"}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.json()["movies_root"] is None
+    assert settings.json()["tv_root"] == "/library/tv"
+
+
+async def test_complete_rejects_missing_library_roots(client: httpx.AsyncClient) -> None:
+    body = {key: value for key, value in _COMPLETE_BODY.items() if key != "movies_root"}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
+async def test_complete_rejects_blank_library_roots(client: httpx.AsyncClient) -> None:
+    body = {**_COMPLETE_BODY, "movies_root": "   ", "tv_root": ""}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
+def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/setup/complete"]["post"]["responses"]
+
+    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+
+
+def test_complete_contract_documents_library_root_invariant(app: FastAPI) -> None:
+    schema = app.openapi()["components"]["schemas"]["SetupCompleteRequest"]
+
+    # The invariant quantifies over EVERY library root, including the ADR-0015
+    # anime roots -- an anime-only install is completable, so the contract must
+    # document all four alternatives.
+    assert schema["allOf"] == [
+        {
+            "anyOf": [
+                {
+                    "required": [field],
+                    "properties": {field: {"type": "string", "pattern": "\\S"}},
+                }
+                for field in ("movies_root", "tv_root", "anime_movie_root", "anime_tv_root")
+            ]
+        }
+    ]
+
+
+async def test_complete_with_only_anime_movie_root_succeeds(client: httpx.AsyncClient) -> None:
+    # ADR-0015 anime-only install: the wizard's completion gate counts the anime
+    # roots, so the runtime validator must too -- pre-fix it considered only
+    # movies_root/tv_root and 422'd a body the UI legitimately allows.
+    body = {key: value for key, value in _COMPLETE_BODY.items() if key != "movies_root"}
+    body["anime_movie_root"] = "/library/anime-movies"
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    got = settings.json()
+    assert got["anime_movie_root"] == "/library/anime-movies"
+    assert got["movies_root"] is None
+    assert got["tv_root"] is None
+
+
+async def test_complete_rejects_all_roots_blank_including_anime(
+    client: httpx.AsyncClient,
+) -> None:
+    # Blank strings normalize to None for EVERY root -- all four blank is still
+    # an honest 422, never an install with no importable destination.
+    body = {key: value for key, value in _COMPLETE_BODY.items() if key != "movies_root"}
+    body.update({"movies_root": " ", "tv_root": "", "anime_movie_root": "  ", "anime_tv_root": ""})
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
 async def test_complete_without_anime_roots_leaves_them_unset(client: httpx.AsyncClient) -> None:
     # Anime roots (ADR-0015) are optional, mirroring tv_root: an install may
     # complete setup with neither configured. They read back as None, never an
     # empty string.
-    response = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    response = await client.post(
+        "/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS
+    )
     assert response.status_code == 200
     issued_key = response.json()["app_api_key"]
 
@@ -137,7 +325,7 @@ async def test_complete_with_anime_roots_stores_them(client: httpx.AsyncClient) 
         "anime_movie_root": "/library/anime-movies",
         "anime_tv_root": "/library/anime-tv",
     }
-    response = await client.post("/api/v1/setup/complete", json=body)
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
     assert response.status_code == 200
     issued_key = response.json()["app_api_key"]
 
@@ -154,7 +342,7 @@ async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(
     # only the first /complete wins. The second must be rejected WITHOUT re-minting
     # the key or re-writing creds — the original key must still authenticate, and
     # the stored creds must be intact and singular.
-    first = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY)
+    first = await client.post("/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS)
     assert first.status_code == 200
     issued_key = first.json()["app_api_key"]
 

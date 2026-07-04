@@ -12,8 +12,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import socket
+import ssl
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 
@@ -21,6 +24,11 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
+    QbittorrentSourceError,
+)
+from plex_manager.adapters.qbittorrent.adapter import (
+    _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
+    SafeFetchNetworkBackend,
 )
 
 BASE_URL = "http://qbit.local:8080"
@@ -51,7 +59,7 @@ INFO_ROWS: list[dict[str, Any]] = [
         "state": "metaDL",  # magnet metadata being fetched
         "progress": 0.0,
         "ratio": 0.0,
-        "save_path": "/downloads/movies",
+        "save_path": "/downloads/movies/",
         "content_path": "/downloads/movies",  # echoes save_path -> dropped to None
         "eta": -1,
         "ratio_limit": 1.5,
@@ -105,10 +113,19 @@ def _router(*, add_status: int = 200, webapi_version: str = "2.11.0") -> Any:
     return handler
 
 
-def _client(handler: Any | None = None) -> QbittorrentClient:
+def _client(
+    handler: Any | None = None, trusted_source_origin: str | None = None
+) -> QbittorrentClient:
     transport = httpx.MockTransport(handler or _router())
     http = httpx.AsyncClient(transport=transport)
-    return QbittorrentClient(http, BASE_URL, USERNAME, PASSWORD)
+    return QbittorrentClient(
+        http,
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        source_client=http,
+        trusted_source_origin=trusted_source_origin,
+    )
 
 
 async def test_add_magnet_returns_derived_hash() -> None:
@@ -282,9 +299,11 @@ async def test_relogin_on_403() -> None:
 _INFO_DICT = b"d6:lengthi100e4:name8:test.txt12:piece lengthi16384ee"
 _TORRENT_BYTES = b"d8:announce14:http://x/annce4:info" + _INFO_DICT + b"e"
 _TORRENT_HASH = hashlib.sha1(_INFO_DICT).hexdigest()  # noqa: S324
+_FAKE_INFO_DICT = b"d6:lengthi1e4:name8:fake.txte"
+_NESTED_INFO_TORRENT_BYTES = b"d3:food4:info" + _FAKE_INFO_DICT + b"e4:info" + _INFO_DICT + b"e"
 
-DOWNLOAD_URL = "http://indexer.local/file.torrent"
-REDIRECT_URL = "http://indexer.local/redirect"
+DOWNLOAD_URL = "http://93.184.216.34/file.torrent"
+REDIRECT_URL = "http://93.184.216.34/redirect"
 REDIRECT_MAGNET = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98&dn=Redirected"
 REDIRECT_HASH = "fedcba9876543210fedcba9876543210fedcba98"
 
@@ -303,6 +322,23 @@ async def test_add_torrent_file_url_computes_bencode_hash() -> None:
     assert info_hash == _TORRENT_HASH
 
 
+async def test_add_torrent_file_hashes_top_level_info_dict() -> None:
+    """A nested key named ``info`` must not shadow the torrent's top-level info dict."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=_NESTED_INFO_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    assert info_hash == _TORRENT_HASH
+    assert info_hash != hashlib.sha1(_FAKE_INFO_DICT).hexdigest()  # noqa: S324
+
+
 async def test_add_http_redirect_to_magnet_is_followed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
@@ -315,6 +351,650 @@ async def test_add_http_redirect_to_magnet_is_followed() -> None:
 
     info_hash = await _client(handler).add(REDIRECT_URL, "/downloads", "plex-manager")
     assert info_hash == REDIRECT_HASH
+
+
+async def test_add_opaque_http_url_is_rejected_before_client_add() -> None:
+    """An HTTP release URL that is neither a magnet redirect nor a locally hashable
+    .torrent must fail before /torrents/add. Otherwise the app returns an error
+    after qBittorrent already accepted an untracked torrent."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=b"not a torrent")
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_uppercase_http_url_uses_resolver_before_client_add() -> None:
+    """URI schemes are case-insensitive. Uppercase HTTP(S) must not bypass the
+    local resolver/safety checks and get handed to qBittorrent as an opaque URL."""
+    seen: list[str] = []
+    upper_url = "HTTP://93.184.216.34/file.torrent"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == upper_url:
+            return httpx.Response(200, content=b"not a torrent")
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(upper_url, "/downloads", "plex-manager")
+
+    assert any(url.lower() == upper_url.lower() for url in seen)
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_oversized_declared_content_length_raises_source_error() -> None:
+    """A source declaring a Content-Length past the cap is vetoed BEFORE the body is
+    buffered and before any qBittorrent request — a RELEASE problem, so the distinct
+    QbittorrentSourceError (422 / per-release auto-grab failure), never the base
+    class that reads as a client outage. (The old test's 2_000_001 bytes fell UNDER
+    the raised 10 MiB cap and was actually exercising the unhashable-body path.)"""
+    seen: list[str] = []
+    oversized_len = _MAX_TORRENT_BYTES + 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            # Tiny body: the declared-size veto must fire on the HEADER alone,
+            # before a single body byte is consumed.
+            return httpx.Response(
+                200,
+                content=b"d",
+                headers={"Content-Length": str(oversized_len)},
+            )
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_oversized_streamed_body_raises_source_error() -> None:
+    """A source with NO Content-Length whose streamed total crosses the cap is cut
+    off mid-stream with the same SourceError subtype — the authoritative cap the
+    declared-size check is only an early-abort optimization for."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            # Bencode-dict lead byte + one byte past the cap; no Content-Length
+            # header, so only the streamed-total check can veto it.
+            response = httpx.Response(200, content=b"d" + b"x" * _MAX_TORRENT_BYTES)
+            response.headers.pop("Content-Length", None)
+            return response
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_loopback_http_url_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add("http://127.0.0.1/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_add_cgnat_http_url_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add("http://100.64.0.1/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_add_nat64_loopback_http_url_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(
+            "http://[64:ff9b::7f00:1]/file.torrent", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_add_http_url_with_invalid_port_is_rejected_before_fetch() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(
+            "http://93.184.216.34:99999/file.torrent", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_add_unresolvable_http_host_is_rejected_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    url = "http://unresolvable.invalid/file.torrent"
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        raise socket.gaierror("no address")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == url:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(url, "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+# --------------------------------------------------------------------------- #
+# Trusted source origin — the operator-configured Prowlarr endpoint
+# --------------------------------------------------------------------------- #
+PROWLARR_ORIGIN = "http://127.0.0.1:9696"
+PROWLARR_DOWNLOAD_URL = f"{PROWLARR_ORIGIN}/1/download?apikey=x&file=y.torrent"
+
+
+async def test_add_torrent_from_configured_prowlarr_private_origin_is_allowed() -> None:
+    """Prowlarr routinely serves magnetless .torrent downloadUrls pointing at
+    ITSELF, and self-hosted Prowlarr lives on 127.0.0.1 / RFC1918 / a compose
+    alias — exactly what the SSRF veto rejects. The operator-configured Prowlarr
+    origin (the app already trusts that URL with an API key for every search
+    call) must be fetchable, or every magnetless private-tracker release is
+    ungrabbable, manually and via auto-grab."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_DOWNLOAD_URL:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
+    info_hash = await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert info_hash == _TORRENT_HASH
+    assert any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_other_private_hosts_stay_vetoed_despite_trusted_prowlarr() -> None:
+    """The allowance is for EXACTLY the configured origin — any other private
+    address keeps the full SSRF veto (never a blanket private-range opening)."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://192.168.1.50/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []  # vetoed before any fetch
+
+    # Same HOST as Prowlarr but a different port is a different origin: vetoed.
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9999/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_redirect_off_trusted_prowlarr_to_private_host_is_vetoed() -> None:
+    """The trust is PER HOP: a redirect from the configured Prowlarr origin to a
+    private third party re-enters the normal veto — Prowlarr being trusted must
+    not let it (or a hostile indexer definition behind it) steer the fetcher
+    into the internal network."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_DOWNLOAD_URL:
+            return httpx.Response(302, headers={"Location": "http://10.0.0.7/file.torrent"})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    # The trusted hop was fetched; the private redirect target never was, and
+    # nothing reached /torrents/add.
+    assert seen == [PROWLARR_DOWNLOAD_URL]
+
+
+async def test_add_malformed_redirect_location_raises_source_error() -> None:
+    """A redirect hop with a MALFORMED Location (`http://[::1`) is attacker-
+    suppliable indexer output and must surface as the SourceError subtype
+    (422 / per-release auto-grab fall-through), never a raw error that 500s the
+    grab and aborts the whole auto-grab cycle. Two layers can refuse it: httpx
+    pre-parses Location (RemoteProtocolError -> a RequestError, already mapped
+    to SourceError), and for any Location httpx tolerates but the stdlib
+    refuses, the adapter's own ``urljoin`` guard converts the ValueError. This
+    test locks the end-to-end taxonomy whichever layer fires."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(302, headers={"Location": "http://[::1"})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_malformed_source_url_raises_source_error() -> None:
+    """An indexer-supplied source URL urlparse itself refuses (bad IPv6 literal)
+    is a release problem: SourceError, never a raw ValueError."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add("http://[::1", "/downloads", "plex-manager")
+
+    assert seen == []  # vetoed before any fetch or client call
+
+
+async def test_malformed_trusted_origin_degrades_to_closed_veto(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed STORED Prowlarr URL must not crash the client constructor
+    (pre-fix: ValueError -> a 500 on every qbt-dependent route, even pure DB
+    paths like mark-failed?remove_torrent=false). The CLIENT is healthy — only
+    the trust anchor is bad — so it degrades to NO trusted origin: the SSRF
+    veto stays fully closed, a visible warning is logged, and normal client
+    operations keep working."""
+    with caplog.at_level("WARNING"):
+        client = _client(trusted_source_origin="http://[::1")  # does not raise
+
+    assert any("not a usable trusted source origin" in record.message for record in caplog.records)
+
+    # Client healthy: a normal magnet add works.
+    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert info_hash == MAGNET_HASH
+
+    # Veto fully closed: private source URLs are still rejected (no accidental
+    # trust from the unusable origin).
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/file.torrent", "/downloads", "plex-manager")
+
+
+class _RecordingBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        raise httpcore.ConnectError("stop after target selection")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+class _DummyNetworkStream(httpcore.AsyncNetworkStream):
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        _ = max_bytes, timeout
+        return b""
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        _ = buffer, timeout
+
+    async def aclose(self) -> None:
+        return None
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = ssl_context, server_hostname, timeout
+        return self
+
+    def get_extra_info(self, info: str) -> Any:
+        _ = info
+        return None
+
+
+class _FailFirstBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        if len(self.hosts) == 1:
+            raise httpcore.ConnectError("first address failed")
+        return _DummyNetworkStream()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        address = "93.184.216.34" if calls == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 80))]
+
+    delegate = _RecordingBackend()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(httpcore.ConnectError):
+        await SafeFetchNetworkBackend(delegate).connect_tcp("indexer.example", 80)
+
+    assert delegate.hosts == ["93.184.216.34"]
+    assert calls == 1
+
+
+async def test_safe_fetch_backend_allows_private_answer_for_trusted_host_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection-time backend mirrors the per-hop URL allowance: the
+    operator-configured Prowlarr host+port may resolve to a private address
+    (compose alias / LAN name), while the SAME private answer for any other
+    host stays a refused connect."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", 9696))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    trusted = SafeFetchNetworkBackend(_AcceptingBackend(), ("prowlarr.local", 9696))
+    stream = await trusted.connect_tcp("prowlarr.local", 9696)
+    assert isinstance(stream, _DummyNetworkStream)
+
+    # Same private DNS answer, untrusted host: refused before any connect.
+    delegate = _RecordingBackend()
+    untrusted = SafeFetchNetworkBackend(delegate, ("prowlarr.local", 9696))
+    with pytest.raises(httpcore.ConnectError):
+        await untrusted.connect_tcp("indexer.example", 9696)
+    assert delegate.hosts == []
+
+    # Trusted host on a DIFFERENT port is a different endpoint: refused too.
+    with pytest.raises(httpcore.ConnectError):
+        await untrusted.connect_tcp("prowlarr.local", 9999)
+    assert delegate.hosts == []
+
+
+class _AcceptingBackend(httpcore.AsyncNetworkBackend):
+    """A delegate that accepts every connect."""
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = host, port, timeout, local_address, socket_options
+        return _DummyNetworkStream()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_safe_fetch_backend_tries_next_vetted_dns_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80)),
+        ]
+
+    delegate = _FailFirstBackend()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    stream = await SafeFetchNetworkBackend(delegate).connect_tcp("indexer.example", 80)
+
+    assert isinstance(stream, _DummyNetworkStream)
+    assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
+
+
+class _TimeoutFirstBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        if len(self.hosts) == 1:
+            # ConnectTimeout is a TimeoutException, NOT a ConnectError subclass.
+            raise httpcore.ConnectTimeout("first address timed out")
+        return _DummyNetworkStream()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_safe_fetch_backend_tries_next_address_on_connect_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken-IPv6 dual-stack host raises ConnectTimeout on its first resolved
+    address; the retry loop must still try the remaining vetted address rather than
+    abandon the working IPv4 fallback (ConnectTimeout is not a ConnectError)."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80)),
+        ]
+
+    delegate = _TimeoutFirstBackend()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    stream = await SafeFetchNetworkBackend(delegate).connect_tcp("indexer.example", 80)
+
+    assert isinstance(stream, _DummyNetworkStream)
+    assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
+
+
+async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=b"d3:foo3:bare")
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    # A bencoded dict with no info key is unhashable -> a source problem (422),
+    # not a client outage: the distinct QbittorrentSourceError, never 502.
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"d4:infoi42ee",  # info -> integer
+        b"d4:info4:abcde",  # info -> string
+        b"d4:infoli1eee",  # info -> list
+    ],
+)
+async def test_add_torrent_with_non_dict_info_value_is_rejected_before_client_add(
+    body: bytes,
+) -> None:
+    """An ``info`` key whose VALUE is not a bencoded dict is not a torrent: pre-fix
+    the local hasher hashed the arbitrary value anyway, fabricating an "info-hash"
+    and letting the invalid body reach /torrents/add (a client-failure surface — or
+    a download tracked under a hash qBittorrent never reports). It must instead be
+    unhashable -> the per-release SourceError, with nothing handed to the client."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=body)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
 
 
 def _control_handler(seen: list[str], *, webapi_version: str) -> Any:
@@ -409,10 +1089,11 @@ async def test_info_non_json_200_raises_qbittorrent_error() -> None:
     assert PASSWORD not in message
 
 
-async def test_add_unreachable_http_source_raises_qbittorrent_error() -> None:
+async def test_add_unreachable_http_source_raises_source_error() -> None:
     """A release exposing only a download_url whose indexer/Prowlarr URL is
-    unreachable surfaces a wrapped, retryable QbittorrentError on the grab path —
-    never an opaque httpx transport error -> 500."""
+    unreachable is a SOURCE problem (qBittorrent was never contacted): the
+    SourceError subtype — never an opaque httpx transport error -> 500, and never
+    the base class whose 502 would blame a healthy client."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
@@ -421,7 +1102,7 @@ async def test_add_unreachable_http_source_raises_qbittorrent_error() -> None:
             raise httpx.ConnectError("connection refused", request=request)
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError) as exc_info:
+    with pytest.raises(QbittorrentSourceError) as exc_info:
         await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
     # No url / secret leak in the surfaced message.
     assert DOWNLOAD_URL not in str(exc_info.value)

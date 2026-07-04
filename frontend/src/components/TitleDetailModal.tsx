@@ -372,6 +372,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     liveRequest ? seasonStatusFor(liveRequest, currentSeason) : null,
     requestId !== null,
   )
+  const reportTarget = reportFor
+    ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
+    : null
+  const reportActionable = reportTarget !== null && reportTarget.status !== 'importing'
+
+  useEffect(() => {
+    if (reportFor && !reportActionable) {
+      setReportFor(null)
+    }
+  }, [reportFor, reportActionable])
 
   const runPreview = useCallback(
     // `seasonOverride` lets a caller preview a season that hasn't made it into
@@ -449,9 +459,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       // request) must not arm Grab — gate on the returned status, not just the id.
       // For tv this is the SELECTED (resolved) season's own status (`created.seasons`
       // is now populated), never the show-level rollup.
-      setCreatedGrabbable(isSeasonGrabbable(created, resolvedSeason))
+      const grabbable = isSeasonGrabbable(created, resolvedSeason)
+      setCreatedGrabbable(grabbable)
       toast({ title: `Requested ${titleName}`, intent: 'success' })
-      await runPreview(created.id, resolvedSeason)
+      if (grabbable) {
+        await runPreview(created.id, resolvedSeason)
+      } else {
+        setPreview(null)
+      }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
@@ -491,7 +506,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // Blocklist the bad release and re-arm the request to search again. Mirrors the
   // Queue screen's mark-failed confirm; no separate "issues" record is created.
   const runReport = useCallback(async () => {
-    if (!reportFor) return
+    if (!reportFor || !reportActionable) {
+      setReportFor(null)
+      return
+    }
     try {
       await markFailed.mutateAsync({ downloadId: reportFor.downloadId, blocklist: true })
       toast({
@@ -507,7 +525,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         intent: 'error',
       })
     }
-  }, [reportFor, markFailed, toast])
+  }, [reportFor, reportActionable, markFailed, toast])
 
   // Report an IMPORTED/available title (ADR-0014): blocklist the release, purge its
   // torrent + library file, and re-search inline. Distinct from `runReport` above
@@ -760,7 +778,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           <div className="flex items-center gap-3">
             <StatusBadge status={requestStatus('downloading')} />
             <div className="flex flex-1 items-center gap-3">
-              <ProgressBar value={queueItem?.progress ?? 0} />
+              <ProgressBar value={queueItem?.progress ?? 0} label="Download progress" />
               <span className="font-mono text-xs text-muted tabular-nums">
                 {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
               </span>
@@ -941,7 +959,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         ) : null}
       </div>
 
-      {reportFor ? (
+      {reportFor && reportActionable ? (
         <Dialog
           open
           onOpenChange={(next) => {

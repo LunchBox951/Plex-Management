@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -10,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.release import ParsedRelease, ScoredRelease
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import (
+    Blocklist,
+    Download,
+    DownloadHistory,
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.services import grab_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
@@ -18,7 +27,9 @@ from plex_manager.services.grab_service import (
     GrabError,
     RequestNotActiveError,
     SeasonRequiredError,
+    TorrentAlreadyTrackedError,
 )
+from plex_manager.services.queue_service import mark_failed
 from tests.web.fakes import FakeQbittorrent, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -84,6 +95,7 @@ async def test_grab_reuses_terminal_row_and_reowns_to_current_request(
         )
     assert len(rows) == 1  # reused, not duplicated
     assert row.media_request_id == new_id  # re-owned to the CURRENT request
+    assert row.tmdb_id == 200  # stale identity refreshed to the CURRENT media
     assert row.failed_reason is None  # stale failure reason cleared
 
 
@@ -688,6 +700,64 @@ async def test_grab_reuse_refreshes_tv_scope_to_current_grab(
     assert row.media_request_id == new_id
 
 
+async def test_grab_reuse_refreshes_metadata_used_by_blocklist(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A terminal row reused for a new request must not keep the old tmdb/year/season
+    identity, or a later mark-failed blocklists the wrong media item."""
+    async with sessionmaker_() as session:
+        old = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Old", status=RequestStatus.completed
+        )
+        new = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="New", status=RequestStatus.searching
+        )
+        session.add_all([old, new])
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=old.id,
+                tmdb_id=100,
+                year=1990,
+                season=1,
+                magnet_link="magnet:?xt=urn:btih:old",
+            )
+        )
+        await session.commit()
+        new_id = new.id
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=new_id,
+            tmdb_id=200,
+            year=2024,
+            season=2,
+        )
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        assert row.tmdb_id == 200
+        assert row.year == 2024
+        # The request is a movie, so the merged grab invariant coerces caller
+        # season/episodes back to NULL while still refreshing the row's identity.
+        assert row.season is None
+        assert row.media_type == MediaType.movie
+        assert row.magnet_link == f"magnet:?xt=urn:btih:{_HASH}"
+        await mark_failed(session, FakeQbittorrent(), download_id=row.id, blocklist=True)
+
+    async with sessionmaker_() as session:
+        entry = (await session.execute(select(Blocklist))).scalar_one()
+    assert entry.tmdb_id == 200
+    assert entry.media_type == MediaType.movie
+
+
 async def test_grab_reuse_refreshes_episodes_for_same_season_regrab(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -733,3 +803,381 @@ async def test_grab_reuse_refreshes_episodes_for_same_season_regrab(
             await session.execute(select(Download).where(Download.torrent_hash == hash_))
         ).scalar_one()
     assert row.episodes_json == [4, 5]
+
+
+async def test_grab_rejects_same_active_hash_owned_by_another_request_precheck(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Same-hash idempotency is only valid for the same request. Returning another
+    request's active row would leave the current request unchanged while reporting
+    success."""
+    async with sessionmaker_() as session:
+        owner = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Owner", status=RequestStatus.downloading
+        )
+        current = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add_all([owner, current])
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=owner.id,
+                tmdb_id=100,
+            )
+        )
+        await session.commit()
+        current_id = current.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(TorrentAlreadyTrackedError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=current_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.added == []  # rejected before handing anything to qBittorrent
+    async with sessionmaker_() as session:
+        current = await session.get(MediaRequest, current_id)
+        assert current is not None and current.status == RequestStatus.searching
+        assert (await session.execute(select(DownloadHistory))).scalars().all() == []
+
+
+class _HashReturningQbt(FakeQbittorrent):
+    def __init__(self, info_hash: str) -> None:
+        super().__init__()
+        self._info_hash = info_hash
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        self.added.append((magnet_or_url, save_path, category))
+        return self._info_hash
+
+
+async def test_grab_rejects_same_active_hash_owned_by_another_request_after_add(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The same ownership check also applies when the hash is only known after
+    qBittorrent returns it."""
+    async with sessionmaker_() as session:
+        owner = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Owner", status=RequestStatus.downloading
+        )
+        current = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add_all([owner, current])
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=owner.id,
+                tmdb_id=100,
+            )
+        )
+        await session.commit()
+        current_id = current.id
+
+    cand = candidate("Some.Movie.2020.1080p.WEB-DL.x264-GROUP", info_hash=None, magnet=True)
+    parsed = ParsedRelease(
+        raw_title=cand.title, clean_title="Some Movie", source=QualitySource.WEBDL
+    )
+    scored = ScoredRelease(
+        candidate=cand, parsed=parsed, quality=WEBDL1080P, profile_index=19, score=1.0
+    )
+    qbt = _HashReturningQbt(_HASH)
+    async with sessionmaker_() as session:
+        with pytest.raises(TorrentAlreadyTrackedError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=scored,
+                request_id=current_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.added != []
+    async with sessionmaker_() as session:
+        current = await session.get(MediaRequest, current_id)
+        assert current is not None and current.status == RequestStatus.searching
+        assert (await session.execute(select(DownloadHistory))).scalars().all() == []
+
+
+class _CompetingActiveDuringAddQbt(FakeQbittorrent):
+    def __init__(self, sessionmaker_: SessionMaker, request_id: int, info_hash: str) -> None:
+        super().__init__()
+        self._sessionmaker = sessionmaker_
+        self._request_id = request_id
+        self._info_hash = info_hash
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        self.added.append((magnet_or_url, save_path, category))
+        async with self._sessionmaker() as session:
+            session.add(
+                Download(
+                    torrent_hash="b" * 40,
+                    status="downloading",
+                    media_request_id=self._request_id,
+                    tmdb_id=999,
+                )
+            )
+            await session.commit()
+        return self._info_hash
+
+
+class _CompetingHashOwnerDuringAddQbt(FakeQbittorrent):
+    def __init__(self, sessionmaker_: SessionMaker, owner_request_id: int, info_hash: str) -> None:
+        super().__init__()
+        self._sessionmaker = sessionmaker_
+        self._owner_request_id = owner_request_id
+        self._info_hash = info_hash
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        self.added.append((magnet_or_url, save_path, category))
+        async with self._sessionmaker() as session:
+            session.add(
+                Download(
+                    torrent_hash=self._info_hash,
+                    status="downloading",
+                    media_request_id=self._owner_request_id,
+                    tmdb_id=100,
+                )
+            )
+            await session.commit()
+        return self._info_hash
+
+
+async def test_grab_insert_conflict_rejects_same_hash_owned_by_another_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """If another request wins the same torrent_hash UNIQUE race, recovery must
+    reject ownership transfer instead of returning the other request's active row
+    as if this request had grabbed successfully."""
+    async with sessionmaker_() as session:
+        owner = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Owner", status=RequestStatus.downloading
+        )
+        current = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add_all([owner, current])
+        await session.flush()
+        owner_id, current_id = owner.id, current.id
+        await session.commit()
+
+    qbt = _CompetingHashOwnerDuringAddQbt(sessionmaker_, owner_id, _HASH)
+    async with sessionmaker_() as session:
+        with pytest.raises(TorrentAlreadyTrackedError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=current_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.added != []
+    async with sessionmaker_() as session:
+        current = await session.get(MediaRequest, current_id)
+        assert current is not None and current.status == RequestStatus.searching
+        rows = (await session.execute(select(Download))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].media_request_id == owner_id
+        assert (await session.execute(select(DownloadHistory))).scalars().all() == []
+
+
+async def test_grab_terminal_reuse_removes_orphan_when_parallel_active_wins(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Terminal-row reuse must use the same IntegrityError cleanup path as create:
+    if another release wins the request's active slot after qBittorrent accepted
+    this torrent, remove the newly-added torrent before returning a conflict."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=None,
+                tmdb_id=100,
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    qbt = _CompetingActiveDuringAddQbt(sessionmaker_, request_id, _HASH)
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=request_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.removed == [(_HASH, True)]
+
+
+async def test_grab_terminal_reuse_cas_lost_rejects_new_owner(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a terminal row is a CAS claim. If another request moves the row back
+    to active first, this grab must not return the newly active row as success."""
+    async with sessionmaker_() as session:
+        owner = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="Owner", status=RequestStatus.downloading
+        )
+        current = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="Current", status=RequestStatus.searching
+        )
+        session.add_all([owner, current])
+        await session.flush()
+        owner_id, current_id = owner.id, current.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=None,
+                tmdb_id=999,
+            )
+        )
+        await session.commit()
+
+    real_update = grab_service.SqlDownloadRepository.update_status_if_in
+
+    async def racing_update(
+        self: grab_service.SqlDownloadRepository,
+        download_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        **kwargs: Any,
+    ) -> bool:
+        async with sessionmaker_() as other:
+            row = await other.get(Download, download_id)
+            assert row is not None
+            row.status = "downloading"
+            row.media_request_id = owner_id
+            row.tmdb_id = 100
+            await other.commit()
+        return await real_update(self, download_id, status, allowed_from, **kwargs)
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "update_status_if_in", racing_update)
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(TorrentAlreadyTrackedError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=current_id,
+                tmdb_id=200,
+            )
+
+    assert qbt.added != []
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        current = await session.get(MediaRequest, current_id)
+        assert row.status == "downloading"
+        assert row.media_request_id == owner_id
+        assert current is not None and current.status == RequestStatus.searching
+        assert (await session.execute(select(DownloadHistory))).scalars().all() == []
+
+
+async def test_grab_terminal_reuse_cas_lost_to_same_request_conflicting_scope_raises(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse-race loser within ONE request: two grabs (e.g. two seasons of the same
+    multi-season pack) race to resurrect the same terminal row. The loser sees the
+    row now active under the SAME ``media_request_id`` — but carrying the WINNER's
+    scope (season 1). Returning it would report the season-2 grab as success while
+    season 2 stays silently untracked (the importer only ever processes the active
+    row's stored scope). The loser must hit the same ``_reuse_conflicts`` guard the
+    non-race active paths apply and raise ``DownloadScopeConflictError``."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=900, media_type=MediaType.tv, title="Some Show", status=RequestStatus.pending
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(SeasonRequest(media_request_id=request_id, season_number=1, status="pending"))
+        session.add(SeasonRequest(media_request_id=request_id, season_number=2, status="pending"))
+        # The pack's prior life ended terminal (failed, not blocklisted).
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=request_id,
+                tmdb_id=900,
+                failed_reason="prior failure",
+            )
+        )
+        await session.commit()
+
+    real_update = grab_service.SqlDownloadRepository.update_status_if_in
+
+    async def racing_update(
+        self: grab_service.SqlDownloadRepository,
+        download_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        **kwargs: Any,
+    ) -> bool:
+        # The SAME request's season-1 grab claims the terminal row just before this
+        # (season-2) grab's CAS lands, stamping the winner's scope.
+        async with sessionmaker_() as other:
+            row = await other.get(Download, download_id)
+            assert row is not None
+            row.status = "downloading"
+            row.media_request_id = request_id
+            row.season = 1
+            row.episodes_json = None
+            await other.commit()
+        return await real_update(self, download_id, status, allowed_from, **kwargs)
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "update_status_if_in", racing_update)
+
+    async with sessionmaker_() as session:
+        with pytest.raises(DownloadScopeConflictError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+            )
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # The winner's claim is intact; the losing season was never falsely marked.
+    assert row.status == "downloading"
+    assert row.season == 1
+    assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "pending"}

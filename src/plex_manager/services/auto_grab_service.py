@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -74,6 +75,7 @@ from plex_manager.services.grab_service import (
     NoGrabSourceError,
     RequestNotActiveError,
     SeasonRequiredError,
+    TorrentAlreadyTrackedError,
 )
 
 if TYPE_CHECKING:
@@ -135,8 +137,9 @@ BACKOFF_SCHEDULE: tuple[timedelta, ...] = (
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
 
 # At most this many GRAB attempts per scope in one cycle. When the top-ranked
-# accepted release can't be grabbed for a PER-RELEASE reason (no usable source, or
-# its hash is already active for a different scope), the worker falls through to the
+# accepted release can't be grabbed for a PER-RELEASE reason (no usable source, an
+# unresolvable/vetoed source, or its hash is already active for a different scope
+# or a different request), the worker falls through to the
 # next-ranked accepted release rather than parking a still-grabbable scope behind
 # backoff. Bounded so a scope whose every candidate is ungrabbable can't monopolise
 # the grab loop (or hammer qBittorrent's add). This caps GRAB attempts ONLY -- the
@@ -455,7 +458,8 @@ async def run_grab_cycle(
       scope to ``downloading`` and commits), falling through to the next-ranked
       accepted release -- bounded by :data:`MAX_GRAB_ATTEMPTS_PER_SCOPE` -- when the
       top pick hits a PER-RELEASE grab failure ({``NoGrabSourceError``,
-      ``DownloadScopeConflictError``}); if nothing is acceptable, or every accepted
+      ``QbittorrentSourceError``, ``DownloadScopeConflictError``,
+      ``TorrentAlreadyTrackedError``}); if nothing is acceptable, or every accepted
       release is ungrabbable, park it at ``no_acceptable_release`` and schedule the
       escalating backoff.
 
@@ -549,10 +553,11 @@ async def run_grab_cycle(
             episodes=None,
         )
 
-        # Try the accepted releases in rank order until one grabs. Only the two
-        # PER-RELEASE failures {NoGrabSourceError, DownloadScopeConflictError} --
-        # neither of which leaves anything live to track -- fall through to the
-        # next-ranked candidate; every OTHER outcome settles the scope on the spot
+        # Try the accepted releases in rank order until one grabs. Only the four
+        # PER-RELEASE failures {NoGrabSourceError, QbittorrentSourceError,
+        # DownloadScopeConflictError, TorrentAlreadyTrackedError} -- none of which
+        # leaves anything live to track -- fall through to the next-ranked candidate;
+        # every OTHER outcome settles the scope on the spot
         # (a grab, an operational GrabError, or a concurrency/shape refusal), so a
         # single top-pick hiccup never hides a grabbable lower-ranked release behind
         # backoff. ``park_scope`` starts True and is cleared by any settling outcome;
@@ -662,13 +667,27 @@ async def run_grab_cycle(
             except (
                 NoGrabSourceError,
                 DownloadScopeConflictError,
+                QbittorrentSourceError,
+                TorrentAlreadyTrackedError,
             ) as exc:
                 # A release WAS accepted but cannot be grabbed right now, and NOTHING
                 # is left live to track: no usable source (``NoGrabSourceError`` --
-                # raised BEFORE anything is handed to the client) or the same physical
-                # torrent is already active for a DIFFERENT scope
-                # (``DownloadScopeConflictError`` -- a multi-season pack; the re-add is
-                # a qBittorrent no-op, so nothing is orphaned). Unlike the settling
+                # raised BEFORE anything is handed to the client); the HTTP source
+                # was vetoed or resolved to neither a magnet nor a locally-hashable
+                # ``.torrent`` (``QbittorrentSourceError`` -- qBittorrent is HEALTHY,
+                # the SOURCE is the problem; raised inside ``qbt.add`` BEFORE the add
+                # POST, so nothing was handed to the client and nothing is orphaned --
+                # exactly a per-release "unusable source", the auto-grab twin of the
+                # manual grab's 422 ``torrent_source_unresolvable``, NOT a client
+                # outage); the same physical torrent is already active for a DIFFERENT
+                # scope of THIS request (``DownloadScopeConflictError`` -- a
+                # multi-season pack; the re-add is a qBittorrent no-op, so nothing is
+                # orphaned); or the torrent's hash is already tracked by a DIFFERENT
+                # request entirely (``TorrentAlreadyTrackedError`` -- that request's
+                # download owns the physical torrent, so any add was an idempotent
+                # no-op on an already-present torrent and this scope owns nothing
+                # live; the manual endpoint's 409 ``torrent_already_tracked`` twin).
+                # Unlike the settling
                 # cases above, a LOWER-ranked accepted release may still be grabbable,
                 # so discard the partial write and fall through to the next candidate
                 # (do NOT ``break``). ``park_scope`` stays True, so an EXHAUSTED list

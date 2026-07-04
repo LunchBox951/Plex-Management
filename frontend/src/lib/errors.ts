@@ -8,6 +8,7 @@ const DETAIL_MESSAGES: Record<string, string> = {
   setup_required: 'Finish first-run setup to continue.',
   service_not_configured: 'That service is not configured yet. Add it in Settings.',
   invalid_api_key: 'Your access key is no longer valid. Re-run setup.',
+  invalid_setup_token: 'Enter the setup token from your server environment.',
   already_initialized: 'This install is already set up.',
   indexer_unavailable: 'The indexer (Prowlarr) is unavailable right now. Try again shortly.',
   indexer_rate_limited: 'The indexer is rate-limiting requests. Try again shortly.',
@@ -15,6 +16,8 @@ const DETAIL_MESSAGES: Record<string, string> = {
   tmdb_auth_failed: 'TMDB rejected the API key. Re-check it in Settings.',
   qbittorrent_unavailable: 'qBittorrent is unavailable right now. Try again shortly.',
   qbittorrent_auth_failed: 'qBittorrent rejected the credentials. Re-check them in Settings.',
+  torrent_source_unresolvable:
+    'That release’s download link did not resolve to a usable torrent. Try another release.',
   upstream_error: 'An upstream service failed. Try again shortly.',
   media_not_found: 'That title could not be found on TMDB.',
   request_not_found: 'That request no longer exists.',

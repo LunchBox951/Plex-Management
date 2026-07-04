@@ -64,6 +64,8 @@ async def test_create_dedups_active_request(
     second = await client.post(
         "/api/v1/requests", json={"tmdb_id": 603, "media_type": "movie"}, headers=_HEADERS
     )
+    assert first.status_code == 201
+    assert second.status_code == 200
     assert first.json()["id"] == second.json()["id"]
 
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
@@ -108,6 +110,41 @@ async def test_create_unknown_media_is_404(
     )
     assert response.status_code == 404
     assert response.json()["detail"] == "media_not_found"
+
+
+async def test_create_tv_request_with_no_aired_seasons_is_404(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=FakeTmdb(shows={44: TvMetadata(tmdb_id=44, title="Show")}))
+
+    response = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 44, "media_type": "tv"}, headers=_HEADERS
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "no_aired_seasons"
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.json()["requests"] == []
+
+
+def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/requests"]["post"]["responses"]
+
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
+    # No 409 documented: media_type is Literal["movie", "tv"], so an unsupported
+    # type is already FastAPI's 422 -- the old media_type_deferred 409 was dead code.
+    assert "409" not in responses
+
+
+def test_get_request_contract_documents_not_found(app: FastAPI) -> None:
+    responses = app.openapi()["paths"]["/api/v1/requests/{request_id}"]["get"]["responses"]
+
+    assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
 
 
 async def test_get_missing_request_is_404(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -185,7 +222,7 @@ async def test_second_post_with_a_new_season_grows_the_tracked_set(
         json={"tmdb_id": _SHOW_ID, "media_type": "tv", "seasons": [1, 2]},
         headers=_HEADERS,
     )
-    assert second.status_code == 201
+    assert second.status_code == 200
     assert second.json()["id"] == request_id  # the SAME request row, dedup'd
     assert sorted(s["season_number"] for s in second.json()["seasons"]) == [1, 2]
 

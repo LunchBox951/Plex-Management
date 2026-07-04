@@ -9,7 +9,7 @@ Prowlarr / TMDB api keys, qBittorrent password) are represented by a masked
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -25,6 +25,7 @@ __all__ = [
     "DiscoverSearchResponse",
     "DiskResponse",
     "DiskRootItem",
+    "ErrorDetail",
     "EvictErrorItem",
     "EvictResponse",
     "EvictionCandidateItem",
@@ -70,6 +71,14 @@ MediaTypeField = Literal["movie", "tv"]
 # sides of the wire. Default ``"none"`` on ``DiscoverResult`` models a missing/degraded
 # decoration honestly (no fabricated presence).
 LibraryStateField = Literal["none", "requested", "processing", "available", "partially_available"]
+
+
+class ErrorDetail(BaseModel):
+    """Machine-readable error body returned by manual HTTPException paths."""
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
 
 
 # --------------------------------------------------------------------------- #
@@ -157,10 +166,37 @@ class ServiceValidateResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # Setup completion + status
 # --------------------------------------------------------------------------- #
+# Every library root ``POST /setup/complete`` accepts; the at-least-one-root
+# invariant quantifies over ALL of them (the wizard's completion gate counts the
+# anime roots since ADR-0015, so an anime-only install must pass the runtime
+# check too — considering only movies/tv here would 422 a body the UI allows).
+_LIBRARY_ROOT_FIELDS: tuple[str, ...] = (
+    "movies_root",
+    "tv_root",
+    "anime_movie_root",
+    "anime_tv_root",
+)
+
+
 class SetupCompleteRequest(BaseModel):
     """The validated credential set written on ``POST /setup/complete``."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        json_schema_extra={
+            "allOf": [
+                {
+                    "anyOf": [
+                        {
+                            "required": [field],
+                            "properties": {field: {"type": "string", "pattern": "\\S"}},
+                        }
+                        for field in _LIBRARY_ROOT_FIELDS
+                    ]
+                }
+            ]
+        },
+    )
 
     plex_url: str
     plex_token: str
@@ -170,17 +206,44 @@ class SetupCompleteRequest(BaseModel):
     qbittorrent_username: str
     qbittorrent_password: str
     tmdb_api_key: str
-    movies_root: str
-    # Optional (mirrors ``movies_root``'s TV sibling): an install may complete
-    # setup with only a Movies library, only a TV library, or both -- see
-    # ``setup_validation.validate_plex``'s "movie-only or tv-only is legit" gate.
-    # Written to the ``tv_root`` setting ONLY when non-empty (setup.complete).
+    # Optional library roots: an install may complete setup with only a Movies
+    # library, only a TV library, or both -- see ``setup_validation.validate_plex``'s
+    # "movie-only or tv-only is legit" gate. Each setting is written only when
+    # non-empty (setup.complete).
+    movies_root: str | None = None
     tv_root: str | None = None
     # Anime library routing (ADR-0015) — OPTIONAL like ``tv_root``: unset means
     # anime imports fall back to ``movies_root``/``tv_root``, identical to
     # behavior before this feature existed. Written ONLY when non-empty.
     anime_movie_root: str | None = None
     anime_tv_root: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_at_least_one_library_root(cls, data: Any) -> Any:
+        """Normalize blank roots to ``None``; require at least one NON-BLANK root.
+
+        Quantifies over EVERY root in :data:`_LIBRARY_ROOT_FIELDS` — including the
+        ADR-0015 anime roots — matching the wizard's completion gate, so an
+        anime-only install that passed the UI is never 422'd here.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        raw = cast("dict[str, object]", data)
+        values = {field: raw.get(field) for field in _LIBRARY_ROOT_FIELDS}
+        if any(value is not None and not isinstance(value, str) for value in values.values()):
+            return raw  # let per-field validation surface the type error
+
+        normalized: dict[str, object] = dict(raw)
+        for field, value in values.items():
+            if isinstance(value, str) and not value.strip():
+                normalized[field] = None
+                values[field] = None
+
+        if not any(isinstance(value, str) and value.strip() for value in values.values()):
+            raise ValueError("at_least_one_library_root_required")
+        return normalized
 
 
 class SetupStatusResponse(BaseModel):
@@ -190,6 +253,7 @@ class SetupStatusResponse(BaseModel):
 
     initialized: bool
     app_api_key: str | None = None
+    setup_token_required: bool = False
 
 
 # --------------------------------------------------------------------------- #

@@ -125,6 +125,23 @@ async def test_grab_creates_download_and_history_and_is_idempotent(
     assert len(qbt.added) == 1
 
 
+def test_queue_contract_documents_manual_error_bodies(app: FastAPI) -> None:
+    paths = app.openapi()["paths"]
+
+    for path in (
+        "/api/v1/queue/grab",
+        "/api/v1/queue/{download_id}/import",
+        "/api/v1/queue/{download_id}/mark-failed",
+    ):
+        responses = paths[path]["post"]["responses"]
+        assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+            "/ErrorDetail"
+        )
+        assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+            "/ErrorDetail"
+        )
+
+
 async def test_get_queue_is_passive_and_does_not_reconcile(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
@@ -203,6 +220,37 @@ async def test_mark_failed_no_removal_works_without_qbittorrent_configured(
     # unconfigured -- NOT 409 service_not_configured. qbt is intentionally NOT overridden.
     await seed(initialized=True, app_api_key=_API_KEY)
     download_id = await _insert_download(sessionmaker_, torrent_hash="d" * 40, status="downloading")
+
+    response = await client.post(
+        f"/api/v1/queue/{download_id}/mark-failed",
+        params={"remove_torrent": "false"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+
+
+async def test_mark_failed_db_only_survives_malformed_stored_prowlarr_url(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # A MALFORMED stored prowlarr_url (PUT /settings does not URL-validate the
+    # field) must not break the qBittorrent client constructor: pre-fix the
+    # trusted-origin parse raised ValueError, so EVERY qbt-dependent route 500'd
+    # -- including this pure-DB mark-failed path that never touches the client.
+    # qBittorrent itself is healthy and fully configured, so the real deps path
+    # (no override) must build the client and serve the request; the only honest
+    # degradation is the SSRF trust anchor staying closed.
+    from plex_manager.web.deps import SettingsStore
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://qb.local:8080")
+        await store.set("qbittorrent_username", "admin")
+        await store.set("qbittorrent_password", "pw")
+        await store.set("prowlarr_url", "http://[::1")  # malformed IPv6 literal
+        await session.commit()
+    download_id = await _insert_download(sessionmaker_, torrent_hash="f" * 40, status="downloading")
 
     response = await client.post(
         f"/api/v1/queue/{download_id}/mark-failed",
@@ -362,6 +410,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
         year: int | None = None,
         season: int | None = None,
         episodes: list[int] | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -375,6 +424,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
                         status=status,
                         media_request_id=media_request_id,
                         tmdb_id=tmdb_id,
+                        media_type=media_type,
                     )
                 )
                 await winner.commit()
@@ -392,6 +442,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            media_type=media_type,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -788,6 +839,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
         year: int | None = None,
         season: int | None = None,
         episodes: list[int] | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -801,6 +853,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
                         status="downloading",
                         media_request_id=media_request_id,
                         tmdb_id=tmdb_id,
+                        media_type=media_type,
                     )
                 )
                 await winner.commit()
@@ -818,6 +871,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
             tmdb_id=tmdb_id,
             year=year,
             season=season,
+            media_type=media_type,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -1001,6 +1055,12 @@ async def test_import_endpoint_anime_movie_routes_to_configured_anime_root(
                 info_hash=torrent_hash,
                 name=video.name,
                 raw_state="stalledUP",
+                # This branch's import defers (re-arms Downloading) unless the
+                # client reports the payload SETTLED (progress 1.0 + a done
+                # state), and its content-path hygiene requires the save_path
+                # alongside content_path.
+                progress=1.0,
+                save_path=str(video.parent),
                 content_path=str(video),
             )
         ]

@@ -69,6 +69,7 @@ __all__ = [
     "LOG_RETENTION_DAYS_DEFAULT",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
+    "SETUP_TOKEN_HEADER_NAME",
     "ServiceNotConfiguredError",
     "SettingsStore",
     "api_key_matches",
@@ -103,9 +104,11 @@ __all__ = [
     "get_tmdb",
     "get_tv_root",
     "get_tv_root_optional",
+    "is_setup_token_required",
     "load_system_settings",
     "require_api_key",
     "require_pre_init_or_api_key",
+    "require_setup_token_pre_init",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -115,6 +118,7 @@ _logger = logging.getLogger(__name__)
 # it, generated clients would treat protected routes as unauthenticated and omit
 # the key.
 API_KEY_HEADER_NAME = "X-Api-Key"
+SETUP_TOKEN_HEADER_NAME = "X-Setup-Token"  # noqa: S105 — header name, not a token
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
@@ -411,6 +415,34 @@ def api_key_matches(provided: str | None, expected: str | None) -> bool:
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _configured_setup_token() -> str | None:
+    token = get_settings().setup_token
+    if token is None:
+        return None
+    value = token.get_secret_value().strip()
+    return value or None
+
+
+def is_setup_token_required(request: Request | None = None) -> bool:
+    """Whether this request requires ``X-Setup-Token`` before initialization.
+
+    True only when a token is BOTH enforced (``dev_auth_bypass`` off) AND actually
+    configured. A server with bypass off but no ``setup_token`` set has nothing to
+    validate a submitted token against, so advertising the requirement would render
+    a setup-token field that can never succeed -- a dead end (north-star #1). This
+    only reports the advisory status; it does not itself gate the setup routes.
+    """
+    _ = request
+    settings = get_settings()
+    return not settings.dev_auth_bypass and _configured_setup_token() is not None
+
+
+def _pre_init_setup_token_valid(request: Request) -> bool:
+    expected_setup_token = _configured_setup_token()
+    provided_setup_token = request.headers.get(SETUP_TOKEN_HEADER_NAME)
+    return api_key_matches(provided_setup_token, expected_setup_token)
+
+
 async def require_api_key(
     provided: Annotated[str | None, Depends(_api_key_header)],
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -435,13 +467,13 @@ async def require_pre_init_or_api_key(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Open before first-run init; require ``X-Api-Key`` once initialized.
+    """Require bootstrap token before first-run init; require ``X-Api-Key`` after.
 
-    The setup ``validate/*`` probes must be callable pre-init (no app key exists
-    yet), but each drives a server-side request to a caller-supplied URL. Leaving
-    them anonymous post-init would turn them into an SSRF / reachability oracle,
-    so once ``initialized`` is set they fall under the same api-key gate as the
-    rest of the API (still skippable via ``dev_auth_bypass``).
+    The setup ``validate/*`` probes must be callable before an app key exists, but
+    each drives a server-side request to a caller-supplied URL. They therefore
+    require ``X-Setup-Token`` pre-init and fall under the same api-key gate as the
+    rest of the API once ``initialized`` is set (still skippable via
+    ``dev_auth_bypass``).
 
     Unlike :func:`require_api_key`, the header is read imperatively from the
     request (not via :class:`APIKeyHeader`): these setup routes are intentionally
@@ -449,12 +481,32 @@ async def require_pre_init_or_api_key(
     """
     system = await load_system_settings(session)
     if system is None or not system.initialized:
+        if get_settings().dev_auth_bypass:
+            return
+        if not _pre_init_setup_token_valid(request):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token"
+            )
         return
     if get_settings().dev_auth_bypass:
         return
     provided = request.headers.get(API_KEY_HEADER_NAME)
     if not api_key_matches(provided, system.app_api_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+
+
+async def require_setup_token_pre_init(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Require the bootstrap setup token only while the install is uninitialized."""
+    system = await load_system_settings(session)
+    if system is not None and system.initialized:
+        return
+    if get_settings().dev_auth_bypass:
+        return
+    if not _pre_init_setup_token_valid(request):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token")
 
 
 # --------------------------------------------------------------------------- #
@@ -495,7 +547,17 @@ async def get_qbittorrent(
     password = await store.get("qbittorrent_password")
     if not url or not username or password is None:
         raise ServiceNotConfiguredError("qbittorrent")
-    return QbittorrentClient(client, url, username, password)
+    # The operator-configured Prowlarr endpoint is the ONE origin the torrent-
+    # source safe-fetch may follow to a private address: Prowlarr serves
+    # magnetless .torrent downloadUrls pointing at itself, and self-hosted
+    # Prowlarr is typically on 127.0.0.1 / RFC1918 / a compose alias the SSRF
+    # veto would otherwise reject — making every magnetless private-tracker
+    # release ungrabbable. The app already trusts this exact URL with an API key
+    # for every search call. None (unconfigured) keeps the veto fully closed.
+    prowlarr_url = await store.get("prowlarr_url")
+    return QbittorrentClient(
+        client, url, username, password, trusted_source_origin=prowlarr_url or None
+    )
 
 
 async def get_qbittorrent_optional(

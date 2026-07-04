@@ -9,7 +9,7 @@ renders so the operator can choose.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.schemas import (
     AcceptedRelease,
+    ErrorDetail,
     RejectedRelease,
     SearchPreviewRequest,
     SearchPreviewResponse,
@@ -43,6 +44,23 @@ router = APIRouter(
     tags=["search-preview"],
     dependencies=[Depends(require_api_key)],
 )
+
+_SEARCH_PREVIEW_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {"model": ErrorDetail, "description": "Request not found"},
+    422: {
+        "description": "Validation error or missing request descriptor",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {"$ref": "#/components/schemas/ErrorDetail"},
+                    ]
+                }
+            }
+        },
+    },
+}
 
 
 def _resolution_label(resolution: Resolution) -> str:
@@ -130,7 +148,7 @@ async def run_preview(
     )
 
 
-@router.post("/search-preview")
+@router.post("/search-preview", responses=_SEARCH_PREVIEW_RESPONSES)
 async def search_preview_endpoint(
     body: SearchPreviewRequest,
     session: Annotated[AsyncSession, Depends(get_session)],

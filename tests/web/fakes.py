@@ -15,6 +15,7 @@ from typing import Literal
 
 from fastapi import FastAPI
 
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.ports.download_client import (
     DownloadClientPort,
@@ -189,13 +190,22 @@ class FakeQbittorrent:
         statuses: list[DownloadStatus] | None = None,
         *,
         files: dict[str, list[DownloadedFile]] | None = None,
+        source_errors: set[str] | None = None,
     ) -> None:
         self.statuses = statuses or []
         self.files = files or {}
         self.added: list[tuple[str, str, str]] = []
         self.removed: list[tuple[str, bool]] = []
+        # Sources (a magnet/HTTP url) for which ``add`` raises
+        # :class:`QbittorrentSourceError`, mirroring the real adapter's honest
+        # "HTTP source resolved to neither a magnet nor a hashable .torrent" — the
+        # client is healthy, the SOURCE is unusable. The real adapter raises this
+        # BEFORE the add POST, so a matched source is NEVER recorded in ``added``.
+        self.source_errors = source_errors or set()
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        if magnet_or_url in self.source_errors:
+            raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
         self.added.append((magnet_or_url, save_path, category))
         # Mirror the real adapter: derive the info-hash from the magnet's btih.
         marker = "urn:btih:"

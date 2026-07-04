@@ -10,7 +10,7 @@
  */
 import createClient, { type Middleware } from 'openapi-fetch'
 import type { paths } from './schema'
-import { clearApiKey, getApiKey } from '../lib/apiKey'
+import { clearApiKey, getApiKey, getSetupToken } from '../lib/apiKey'
 
 /** Fired when any call returns 409 `setup_required`; the shell routes to /setup. */
 export const SETUP_REQUIRED_EVENT = 'plexmgr:setup-required'
@@ -28,6 +28,10 @@ const authMiddleware: Middleware = {
     const key = getApiKey()
     if (key) {
       request.headers.set('X-Api-Key', key)
+    }
+    const setupToken = getSetupToken()
+    if (setupToken) {
+      request.headers.set('X-Setup-Token', setupToken)
     }
     return request
   },

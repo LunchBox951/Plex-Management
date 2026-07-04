@@ -6,6 +6,7 @@ standard. This guide covers the dev workflow.
 ## Prerequisites
 
 - Python **3.12+**
+- Node.js **22+** with npm
 - Docker (for building/running the container)
 - `make` (optional, for the shortcuts below)
 
@@ -13,9 +14,11 @@ standard. This guide covers the dev workflow.
 
 ```bash
 make install      # creates editable install with dev extras + installs pre-commit
+make ui-install   # installs frontend dependencies used by make check
 # equivalent to:
 #   pip install -e ".[dev]"
 #   pre-commit install
+#   npm --prefix frontend ci
 ```
 
 ## Day-to-day
@@ -25,9 +28,22 @@ make lint     # ruff check
 make format   # ruff format
 make type     # pyright (strict)
 make test     # pytest + coverage
-make check    # all of the above — run this before pushing
+make check    # backend + frontend gates — run this before pushing
 make run      # run the app locally (http://localhost:8000)
 ```
+
+`make run` starts the real first-run-capable server, so it requires a bootstrap
+token unless you explicitly enable the development bypass:
+
+```bash
+python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+# or, for local API/docs probing only:
+PLEX_MANAGER_DEV_AUTH_BYPASS=true make run
+```
+
+After completing setup, the `/api/v1/setup/complete` response reveals the
+`app_api_key` once. Use it as `X-Api-Key` for protected API calls; `/docs` shows
+the same security scheme.
 
 CI runs the same gates (`make check`), so green locally ≈ green in CI. The `ruff`
 and `pyright` versions are pinned exactly in `pyproject.toml` and mirrored in

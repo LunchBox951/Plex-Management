@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import weakref
@@ -90,6 +91,11 @@ _RESUMABLE: frozenset[str] = frozenset(
 _AUTO_DRAIN: frozenset[str] = frozenset(
     {DownloadState.ImportPending.value, DownloadState.Importing.value}
 )
+# qBittorrent states whose files are no longer being downloaded or moved. The
+# importer reads the filesystem directly, so it must only touch settled payloads.
+_IMPORT_READY_RAW_STATES: frozenset[str] = frozenset(
+    {"uploading", "stalledUP", "pausedUP", "stoppedUP", "queuedUP", "checkingUP", "forcedUP"}
+)
 
 # Cap on how many per-file rejection reasons a whole-season block's
 # ``failed_reason`` joins together -- a 20+ episode pack where every file is
@@ -99,6 +105,14 @@ _MAX_BLOCK_REASONS: Final = 10
 
 class _NoVideoError(Exception):
     """No importable video file was found under the resolved content path."""
+
+
+class _UnsafeContentPathError(Exception):
+    """The download client reported a content path outside its save path."""
+
+
+def _is_settled_for_import(status: DownloadStatus) -> bool:
+    return status.progress >= 1.0 and status.raw_state in _IMPORT_READY_RAW_STATES
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -111,6 +125,14 @@ def _is_within(root_real: str, candidate_real: str) -> bool:
     return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
 
 
+def _ensure_under_save_path(save_path: str, candidate: str) -> str:
+    root_real = os.path.realpath(save_path)
+    candidate_real = os.path.realpath(candidate)
+    if not _is_within(root_real, candidate_real):
+        raise _UnsafeContentPathError("download content path is outside download save path")
+    return candidate
+
+
 def _resolve_content(status: DownloadStatus | None, download_path: str | None) -> str | None:
     """Resolve the absolute path to a torrent's completed content (file or dir).
 
@@ -120,11 +142,17 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
     used — it can hold other torrents' files, which would scan the wrong tree.
     """
     if status is not None and status.content_path:
-        return status.content_path
+        if status.save_path:
+            return _ensure_under_save_path(status.save_path, status.content_path)
+        raise _UnsafeContentPathError("download client reported content path without save path")
+    if status is not None and status.save_path and status.name:
+        if os.path.isabs(status.name):
+            raise _UnsafeContentPathError("download content path is outside download save path")
+        return _ensure_under_save_path(
+            status.save_path, os.path.join(status.save_path, status.name)
+        )
     if download_path:
         return download_path
-    if status is not None and status.save_path and status.name:
-        return os.path.join(status.save_path, status.name)
     return None
 
 
@@ -202,7 +230,7 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     """
     os.makedirs(dst.parent, exist_ok=True)
     if dst.exists():
-        if dst.stat().st_size == os.path.getsize(src):
+        if _same_file_content(src, dst):
             return False  # already fully imported here — idempotent skip; not ours
         # A differently-sized file is already at the destination: a user's
         # manually-managed library file, or a title Plex availability missed. NEVER
@@ -217,10 +245,29 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
         # exists() check above and this link. Same content (same size) is an
         # idempotent win for the other attempt, NOT a failure to block on; a
         # different size is a genuine conflict, surfaced like the pre-existing case.
-        if dst.exists() and dst.stat().st_size == os.path.getsize(src):
+        if dst.exists() and _same_file_content(src, dst):
             return False  # the race winner's file — not ours to roll back
-        raise
+        raise FileExistsError(f"destination already exists with different content: {dst}") from None
     return True  # we created dst; a later failure may roll it back
+
+
+def _file_digest(path: str | Path) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _same_file_content(src: str, dst: Path) -> bool:
+    # samefile is only the cheap same-inode short-circuit; on any OSError (a side
+    # not stat-able) fall through to the honest size + digest comparison below.
+    with contextlib.suppress(OSError):
+        if os.path.samefile(src, dst):
+            return True
+    if dst.stat().st_size != os.path.getsize(src):
+        return False
+    return _file_digest(src) == _file_digest(dst)
 
 
 def _remove_quietly(path: Path) -> None:
@@ -493,7 +540,30 @@ async def _import_download_locked(
 
     # Locate the completed video file on disk.
     status = await qbt.get_status(row.torrent_hash)
-    content = _resolve_content(status, row.download_path)
+    if status is not None and not _is_settled_for_import(status):
+        # The row may be resumable because a prior reconcile saw completion, but the
+        # live client can still be moving/downloading the payload. Do not validate or
+        # import a changing file tree; re-arm the honest Downloading state and let the
+        # reconciler promote it back to ImportPending when qBittorrent settles.
+        deferred = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Downloading.value,
+            _RESUMABLE,
+            clear_failed_reason=True,
+            progress=status.progress,
+            seed_ratio=status.ratio,
+        )
+        if not deferred:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        await request_repo.set_status(request.id, RequestStatus.downloading.value)
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    try:
+        content = _resolve_content(status, row.download_path)
+    except _UnsafeContentPathError as exc:
+        await _block(session, download_repo, download_id, str(exc), request_id=request.id)
+        return await download_repo.get_by_hash(torrent_hash)
     if content is None:
         await _block(
             session,
@@ -550,7 +620,10 @@ async def _import_download_locked(
     # current state without importing. (The per-download lock already excludes a second
     # concurrent import; this CAS handles the separate mark_failed path.)
     claimed = await download_repo.update_status_if_in(
-        download_id, DownloadState.Importing.value, _RESUMABLE
+        download_id,
+        DownloadState.Importing.value,
+        _RESUMABLE,
+        clear_failed_reason=True,
     )
     if not claimed:
         await session.rollback()
@@ -603,11 +676,25 @@ async def _import_download_locked(
     # did. movies_root is a Plex library location (the picker guarantees the path↔
     # section match), so a scan failure here is a transient Plex error, not a wrong
     # path. Roll the file back before blocking so a later reject / re-search can't
-    # orphan it (the retry re-places it). We own the rollback when THIS attempt placed
-    # dst OR a prior (crashed) attempt of this row placed it and left the breadcrumb
-    # (download_path == dst); a lost-race loser owns neither, so the winner's file is
-    # left intact. Clear the breadcrumb on rollback so the deleted path can't shadow
-    # the torrent's content on a later retry.
+    # orphan it (the retry re-places it).
+    #
+    # OWNERSHIP RULE (Codex PR #21): a file at dst may be rolled back ONLY on proof
+    # it is ours — THIS invocation placed it (``placed``), or a prior attempt of
+    # this row durably recorded placing it (the ``download_path == dst`` breadcrumb
+    # committed above / by the finalize). NEVER by content-match alone: a
+    # same-content file that we did NOT place (a lost placement race, a
+    # user's manually-supplied copy, a prior retry's winner) is byte-for-byte
+    # indistinguishable from our own crashed-before-breadcrumb placement, so an
+    # inference like "resumed Importing + no breadcrumb -> the orphan is ours"
+    # deletes an unowned library file on a transient scan failure. The honest cost
+    # of refusing to guess: a genuinely-ours orphan from a crash INSIDE the
+    # place→breadcrumb window is not rolled back on a repeat scan failure — it
+    # stays on disk, is re-adopted by the next successful retry (idempotent
+    # placement + the finalize stamps ``download_path``), and at worst surfaces
+    # later as an explicit FileExistsError conflict for the operator; deleting
+    # nothing beats maybe-deleting someone else's file. Clear the breadcrumb on
+    # rollback so the deleted path can't shadow the torrent's content on a later
+    # retry.
     try:
         await library.trigger_scan(str(dst.parent), "movie")
     except (PlexLibraryError, PlexAuthError) as exc:
@@ -642,6 +729,7 @@ async def _import_download_locked(
         DownloadState.Imported.value,
         frozenset({DownloadState.Importing.value}),
         download_path=str(dst),
+        clear_failed_reason=True,
     )
     if not finalized:
         await session.rollback()
@@ -722,7 +810,33 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
-    content = _resolve_content(status, download_path)
+    if status is not None and not _is_settled_for_import(status):
+        deferred = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Downloading.value,
+            _RESUMABLE,
+            clear_failed_reason=True,
+            progress=status.progress,
+            seed_ratio=status.ratio,
+        )
+        if not deferred:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        await season_request_service.set_status(
+            session,
+            media_request_id=request.id,
+            season_number=season,
+            status=RequestStatus.downloading.value,
+        )
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    try:
+        content = _resolve_content(status, download_path)
+    except _UnsafeContentPathError as exc:
+        await _block(
+            session, download_repo, download_id, str(exc), request_id=request.id, season=season
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     if content is None:
         await _block(
             session,

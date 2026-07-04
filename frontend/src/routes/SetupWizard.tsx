@@ -7,7 +7,7 @@ import {
   useValidateService,
 } from '../api/hooks'
 import type { PlexLibraryOption, SetupCompleteRequest } from '../api/types'
-import { setApiKey } from '../lib/apiKey'
+import { clearSetupToken, setApiKey, setSetupToken } from '../lib/apiKey'
 import type { ApiError } from '../lib/errors'
 import { cn } from '../lib/cn'
 import { Button } from '../components/ui/Button'
@@ -92,6 +92,13 @@ const EMPTY_FORM: SetupCompleteRequest = {
   anime_tv_root: '',
 }
 
+const EMPTY_TESTING: Record<SetupService, boolean> = {
+  plex: false,
+  prowlarr: false,
+  qbittorrent: false,
+  tmdb: false,
+}
+
 interface TestResult {
   ok: boolean
   message: string
@@ -132,8 +139,9 @@ export function SetupWizard() {
     qbittorrent: null,
     tmdb: null,
   })
-  const [testing, setTesting] = useState<SetupService | null>(null)
+  const [testing, setTesting] = useState<Record<SetupService, boolean>>(EMPTY_TESTING)
   const [mintedKey, setMintedKey] = useState<string | null>(null)
+  const [setupTokenInput, setSetupTokenInput] = useState('')
   // Movie AND tv library folders Plex reports (set when Plex verifies), each
   // tagged by `section_type` — filtered per-picker below. `null` until then.
   const [plexLibraries, setPlexLibraries] = useState<PlexLibraryOption[] | null>(null)
@@ -221,7 +229,7 @@ export function SetupWizard() {
 
   const test = async (service: SetupService) => {
     const gen = validationGen.current[service]
-    setTesting(service)
+    setTesting((prev) => ({ ...prev, [service]: true }))
     try {
       const res = await validate.mutateAsync({ service, body: bodyFor(service, form) })
       if (validationGen.current[service] !== gen) return // fields changed; ignore stale result
@@ -235,10 +243,7 @@ export function SetupWizard() {
         [service]: { ok: false, message: asApiError(error).message },
       }))
     } finally {
-      // Always release this service's spinner. The Test button is disabled while
-      // loading, so a same-service test can't be concurrently in flight; the
-      // (t === service) check only avoids clobbering a DIFFERENT service's spinner.
-      setTesting((t) => (t === service ? null : t))
+      setTesting((prev) => ({ ...prev, [service]: false }))
     }
   }
 
@@ -249,6 +254,8 @@ export function SetupWizard() {
   // `section_type` — split per-picker below.
   const movieLibraries = plexLibraries?.filter((l) => l.section_type === 'movie') ?? null
   const tvLibraries = plexLibraries?.filter((l) => l.section_type === 'tv') ?? null
+  const setupTokenReady =
+    status.data?.setup_token_required !== true || setupTokenInput.trim().length > 0
   // Completion needs at least ONE library root — movies, tv, OR either anime root
   // (ADR-0015). Every root is independently optional (ADR-0011: a movie-only OR a
   // tv-only Plex is legit; the backend normalizes an empty root to None and surfaces
@@ -258,17 +265,21 @@ export function SetupWizard() {
   // own roots) must likewise be completable off an anime root alone, so the anime
   // roots count toward the gate too.
   const hasLibraryRoot =
-    form.movies_root.trim() !== '' ||
+    (form.movies_root ?? '').trim() !== '' ||
     (form.tv_root ?? '').trim() !== '' ||
     (form.anime_movie_root ?? '').trim() !== '' ||
     (form.anime_tv_root ?? '').trim() !== ''
-  const allVerified = servicesVerified && hasLibraryRoot
+  const allVerified = servicesVerified && setupTokenReady && hasLibraryRoot
 
   const onComplete = async () => {
     try {
+      if (status.data?.setup_token_required) {
+        setSetupToken(setupTokenInput.trim())
+      }
       const res = await complete.mutateAsync(form)
       if (res.app_api_key) {
         setApiKey(res.app_api_key)
+        clearSetupToken()
         // Reveal it once before navigating (see the mintedKey branch above).
         setMintedKey(res.app_api_key)
       } else {
@@ -291,6 +302,32 @@ export function SetupWizard() {
           Enter and test each service. Credentials are stored encrypted; you never touch a terminal.
         </p>
       </header>
+
+      {status.data?.setup_token_required ? (
+        <section className="mb-4 rounded-2xl border border-hairline bg-surface p-5">
+          <h2 className="font-display text-lg font-bold text-ink">Setup token</h2>
+          <p className="mt-1 text-sm text-muted">
+            Enter the one-time bootstrap token from your server's environment.
+          </p>
+          <div className="mt-4">
+            <Field
+              label="Setup token"
+              type="password"
+              autoComplete="off"
+              value={setupTokenInput}
+              onChange={(e) => {
+                const value = e.target.value
+                setSetupTokenInput(value)
+                if (value.trim()) {
+                  setSetupToken(value.trim())
+                } else {
+                  clearSetupToken()
+                }
+              }}
+            />
+          </div>
+        </section>
+      ) : null}
 
       <div className="flex flex-col gap-4">
         {SERVICES.map((service) => {
@@ -329,7 +366,8 @@ export function SetupWizard() {
                 <Button
                   variant="secondary"
                   size="sm"
-                  loading={testing === service.key}
+                  loading={testing[service.key]}
+                  disabled={!setupTokenReady}
                   onClick={() => void test(service.key)}
                 >
                   Test connection
@@ -369,7 +407,7 @@ export function SetupWizard() {
             <select
               aria-label="Movies library folder"
               className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
-              value={form.movies_root}
+              value={form.movies_root ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, movies_root: e.target.value }))}
             >
               <option value="">Choose a movie library folder…</option>
@@ -398,7 +436,7 @@ export function SetupWizard() {
               label="Movies library folder"
               type="text"
               placeholder="/library/movies"
-              value={form.movies_root}
+              value={form.movies_root ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, movies_root: e.target.value }))}
             />
             {movieLibraries && movieLibraries.length > 0 ? (
@@ -620,7 +658,7 @@ export function SetupWizard() {
           {verifiedCount}/{SERVICES.length} verified
         </span>
         <Button
-          disabled={!allVerified}
+          disabled={!allVerified || !setupTokenReady}
           loading={complete.isPending}
           onClick={() => void onComplete()}
         >

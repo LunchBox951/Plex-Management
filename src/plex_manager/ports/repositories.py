@@ -87,6 +87,7 @@ class DownloadRecord(BaseModel):
     # only those episode numbers, silently skipping the rest (a season-pack grab
     # scoped to specific missing episodes).
     episodes: list[int] | None = None
+    media_type: str | None = None
     failed_reason: str | None = None
     first_seen_at: datetime | None = None
     download_path: str | None = None
@@ -376,6 +377,7 @@ class DownloadRepository(Protocol):
         year: int | None = None,
         season: int | None = None,
         episodes: list[int] | None = None,
+        media_type: str | None = None,
     ) -> DownloadRecord:
         """Insert a new download and return the persisted record.
 
@@ -397,7 +399,15 @@ class DownloadRepository(Protocol):
         first_seen_at: datetime | None = None,
         clear_first_seen_at: bool = False,
         clear_failed_reason: bool = False,
+        clear_download_path: bool = False,
         media_request_id: int | None = None,
+        replace_grab_metadata: bool = False,
+        magnet_link: str | None = None,
+        tmdb_id: int | None = None,
+        year: int | None = None,
+        season: int | None = None,
+        episodes: list[int] | None = None,
+        media_type: str | None = None,
     ) -> None:
         """Update a download's status and optional progress fields.
 
@@ -542,6 +552,7 @@ class BlocklistRepository(Protocol):
         torrent_hash: str | None,
         source_title: str,
         indexer: str | None,
+        *,
         media_type: str | None = None,
     ) -> bool:
         """Two-tier identity check: hash first, then title/indexer fallback.
@@ -552,7 +563,7 @@ class BlocklistRepository(Protocol):
         raise NotImplementedError
 
     async def list_for_media(
-        self, tmdb_id: int | None = None, media_type: str | None = None
+        self, tmdb_id: int | None = None, *, media_type: str | None = None
     ) -> list[BlocklistRecord]:
         """List blocklist entries, optionally scoped to one media item + namespace."""
         raise NotImplementedError

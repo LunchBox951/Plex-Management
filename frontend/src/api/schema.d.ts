@@ -1093,6 +1093,14 @@ export interface components {
             used_percent: number;
         };
         /**
+         * ErrorDetail
+         * @description Machine-readable error body returned by manual HTTPException paths.
+         */
+        ErrorDetail: {
+            /** Detail */
+            detail: string;
+        };
+        /**
          * EvictErrorItem
          * @description One root's sweep failure inside a manual ``POST /api/v1/ops/evict`` --
          *     a LATER root raising (e.g. a transient Plex error resolving TV watch
@@ -1704,7 +1712,7 @@ export interface components {
             /** Anime Tv Root */
             anime_tv_root?: string | null;
             /** Movies Root */
-            movies_root: string;
+            movies_root?: string | null;
             /** Plex Token */
             plex_token: string;
             /** Plex Url */
@@ -1723,7 +1731,15 @@ export interface components {
             tmdb_api_key: string;
             /** Tv Root */
             tv_root?: string | null;
-        };
+        } & ({
+            movies_root: string;
+        } | {
+            tv_root: string;
+        } | {
+            anime_movie_root: string;
+        } | {
+            anime_tv_root: string;
+        });
         /**
          * SetupStatusResponse
          * @description Install state. ``app_api_key`` is populated only once initialized.
@@ -1733,6 +1749,11 @@ export interface components {
             app_api_key?: string | null;
             /** Initialized */
             initialized: boolean;
+            /**
+             * Setup Token Required
+             * @default false
+             */
+            setup_token_required: boolean;
         };
         /**
          * SubsystemHealthItem
@@ -1789,6 +1810,7 @@ export interface operations {
         parameters: {
             query?: {
                 tmdb_id?: number | null;
+                media_type?: string | null;
             };
             header?: never;
             path?: never;
@@ -1833,6 +1855,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Blocklist entry not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -2153,13 +2184,31 @@ export interface operations {
                     "application/json": components["schemas"]["QueueItem"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Validation error, missing request descriptor, or season mismatch */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };
@@ -2182,6 +2231,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -2216,6 +2283,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -2262,6 +2347,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Existing matching request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
             /** @description Successful Response */
             201: {
                 headers: {
@@ -2269,6 +2363,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Media not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -2300,6 +2403,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Request not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -2436,13 +2548,22 @@ export interface operations {
                     "application/json": components["schemas"]["SearchPreviewResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Request not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Validation error or missing request descriptor */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };
@@ -2563,7 +2684,10 @@ export interface operations {
     complete_api_v1_setup_complete_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -2580,6 +2704,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SetupStatusResponse"];
+                };
+            };
+            /** @description Invalid setup token or API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Setup already initialized */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -2616,7 +2758,12 @@ export interface operations {
     validate_plex_endpoint_api_v1_setup_validate_plex_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -2635,6 +2782,15 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
+            /** @description Invalid setup token or API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -2649,7 +2805,12 @@ export interface operations {
     validate_prowlarr_endpoint_api_v1_setup_validate_prowlarr_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -2668,6 +2829,15 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
+            /** @description Invalid setup token or API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -2682,7 +2852,12 @@ export interface operations {
     validate_qbittorrent_endpoint_api_v1_setup_validate_qbittorrent_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -2701,6 +2876,15 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
+            /** @description Invalid setup token or API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -2715,7 +2899,12 @@ export interface operations {
     validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
+                "X-Setup-Token"?: string | null;
+                /** @description Required after setup is initialized. */
+                "X-Api-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -2732,6 +2921,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
+                };
+            };
+            /** @description Invalid setup token or API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
             /** @description Validation Error */

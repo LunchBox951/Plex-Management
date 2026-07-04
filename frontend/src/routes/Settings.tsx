@@ -261,9 +261,6 @@ function AppKeySection() {
 export function Settings() {
   const { data, isLoading, isError, error, refetch } = useSettings()
   const update = useUpdateSettings()
-  // Movie AND tv folders Plex reports (409 if unconfigured), each tagged by
-  // `section_type` — filtered per-picker below.
-  const libraries = usePlexLibraries()
   const { toast } = useToast()
 
   // Controlled state, seeded once the settings have loaded.
@@ -278,6 +275,11 @@ export function Settings() {
   useEffect(() => {
     if (data && form === null) setForm(initialForm(data))
   }, [data, form])
+  const plexConnectionChanged =
+    data !== undefined &&
+    form !== null &&
+    (form.plex_url !== (data.plex_url ?? '') || form.plex_token.length > 0)
+  const libraries = usePlexLibraries(!plexConnectionChanged) // movie folders Plex reports
 
   if (isLoading || (data && form === null)) {
     return (
@@ -512,7 +514,36 @@ export function Settings() {
           <h2 className="font-display text-sm font-semibold text-ink">Library</h2>
           <p className="mt-1 text-xs text-faint">Where imported movies are placed.</p>
           <div className="mt-4 flex flex-col gap-2">
-            {!manualPath && movieLibraries.length > 0 ? (
+            {plexConnectionChanged ? (
+              <select
+                aria-label="Movies library folder"
+                className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                value=""
+                disabled
+                onChange={() => undefined}
+              >
+                <option value="">Choose a movie library folder…</option>
+              </select>
+            ) : !manualPath && libraries.isError ? (
+              <StateMessage
+                tone="error"
+                title="Couldn't load Plex libraries"
+                message={
+                  (libraries.error as ApiError | undefined)?.message ??
+                  'Library folders are unavailable right now.'
+                }
+                action={
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="secondary" onClick={() => void libraries.refetch()}>
+                      Retry
+                    </Button>
+                    <Button variant="secondary" onClick={() => setManualPath(true)}>
+                      Use custom path
+                    </Button>
+                  </div>
+                }
+              />
+            ) : !manualPath && movieLibraries.length > 0 ? (
               <>
                 <select
                   aria-label="Movies library folder"
@@ -565,7 +596,17 @@ export function Settings() {
             Where imported tv seasons are placed. Leave unset if you don't request tv shows.
           </p>
           <div className="mt-4 flex flex-col gap-2">
-            {!manualTvPath && tvLibraries.length > 0 ? (
+            {plexConnectionChanged ? (
+              <select
+                aria-label="TV library folder"
+                className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                value=""
+                disabled
+                onChange={() => undefined}
+              >
+                <option value="">No tv library folder…</option>
+              </select>
+            ) : !manualTvPath && tvLibraries.length > 0 ? (
               <>
                 <select
                   aria-label="TV library folder"
@@ -623,7 +664,21 @@ export function Settings() {
           </p>
           <div className="mt-4 flex flex-col gap-4">
             <div className="flex flex-col gap-2">
-              {!manualAnimeMoviePath && movieLibraries.length > 0 ? (
+              {plexConnectionChanged ? (
+                // Same guard as Movies/TV above: while the Plex URL/token is being
+                // changed, the (disabled) libraries query still serves the OLD
+                // server's cached list — a stale anime root must not be selectable
+                // mid-reconnect any more than a stale movies/tv root.
+                <select
+                  aria-label="Anime movies library folder"
+                  className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                  value=""
+                  disabled
+                  onChange={() => undefined}
+                >
+                  <option value="">No anime movies library folder…</option>
+                </select>
+              ) : !manualAnimeMoviePath && movieLibraries.length > 0 ? (
                 <>
                   <select
                     aria-label="Anime movies library folder"
@@ -667,7 +722,17 @@ export function Settings() {
               )}
             </div>
             <div className="flex flex-col gap-2">
-              {!manualAnimeTvPath && tvLibraries.length > 0 ? (
+              {plexConnectionChanged ? (
+                <select
+                  aria-label="Anime TV library folder"
+                  className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                  value=""
+                  disabled
+                  onChange={() => undefined}
+                >
+                  <option value="">No anime TV library folder…</option>
+                </select>
+              ) : !manualAnimeTvPath && tvLibraries.length > 0 ? (
                 <>
                   <select
                     aria-label="Anime TV library folder"

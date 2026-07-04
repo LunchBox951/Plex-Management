@@ -1,55 +1,97 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import { useCompleteSetup, useSetupStatus, useValidateService } from '../api/hooks'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { PlexLibraryOption, ServiceValidateResponse } from '../api/types'
 import { SetupWizard } from './SetupWizard'
 
-vi.mock('../api/hooks', () => ({
-  useSetupStatus: vi.fn(),
-  useValidateService: vi.fn(),
-  useCompleteSetup: vi.fn(),
+const h = vi.hoisted(() => ({
+  validate: vi.fn(),
+  complete: vi.fn(),
+  setApiKey: vi.fn(),
+  setSetupToken: vi.fn(),
+  clearSetupToken: vi.fn(),
+  initialized: false,
+  setupTokenRequired: false,
 }))
 
-vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
+vi.mock('../api/hooks', () => ({
+  useSetupStatus: () => ({
+    data: {
+      initialized: h.initialized,
+      app_api_key: null,
+      setup_token_required: h.setupTokenRequired,
+    },
+    isLoading: false,
+  }),
+  useValidateService: () => ({ mutateAsync: h.validate, isPending: false }),
+  useCompleteSetup: () => ({ mutateAsync: h.complete, isPending: false }),
+}))
 
-interface ValidateArgs {
-  service: string
-  body: Record<string, string>
+vi.mock('../lib/apiKey', () => ({
+  setApiKey: h.setApiKey,
+  setSetupToken: h.setSetupToken,
+  clearSetupToken: h.clearSetupToken,
+}))
+
+vi.mock('../components/ui/toast', () => ({
+  useToast: () => ({ toast: vi.fn() }),
+}))
+
+const Wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => {
+    resolve = res
+  })
+  return { promise, resolve }
 }
 
-// Plex reports one movie AND one tv folder, each tagged by `section_type`; every
-// other service just verifies clean.
-const validateMock = vi.fn(async (args: ValidateArgs) => {
-  if (args.service === 'plex') {
-    return {
-      ok: true,
-      message: 'Connected',
-      libraries: [
-        { path: '/media/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
-        { path: '/media/tv', section_key: '2', section_type: 'tv', title: 'TV Shows', writable: true },
-      ],
-    }
-  }
-  return { ok: true, message: 'Connected' }
-})
+function plexOk(libraries: PlexLibraryOption[] = []): ServiceValidateResponse {
+  return { ok: true, message: 'Plex ok', libraries }
+}
 
-describe('SetupWizard — tv library picker', () => {
+const movieLibrary: PlexLibraryOption = {
+  path: '/media/movies',
+  section_key: '1',
+  section_type: 'movie',
+  title: 'Movies',
+  writable: true,
+}
+
+const tvLibrary: PlexLibraryOption = {
+  path: '/media/tv',
+  section_key: '2',
+  section_type: 'tv',
+  title: 'TV Shows',
+  writable: true,
+}
+
+function mockAllServicesOk() {
+  h.validate.mockImplementation(async ({ service }: { service: string }) => {
+    if (service === 'plex') {
+      return plexOk([movieLibrary, tvLibrary])
+    }
+    return { ok: true, message: `${service} ok` }
+  })
+}
+
+describe('SetupWizard', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
-    ;(useSetupStatus as unknown as Mock).mockReturnValue({
-      isLoading: false,
-      data: { initialized: false, app_api_key: null },
-    })
-    ;(useValidateService as unknown as Mock).mockReturnValue({
-      mutateAsync: validateMock,
-      isPending: false,
-    })
-    ;(useCompleteSetup as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    h.validate.mockReset()
+    h.complete.mockReset()
+    h.setApiKey.mockReset()
+    h.setSetupToken.mockReset()
+    h.clearSetupToken.mockReset()
+    h.initialized = false
+    h.setupTokenRequired = false
   })
 
   it('filters the movie picker to section_type "movie" and the tv picker to "tv"', async () => {
-    render(<SetupWizard />, { wrapper: MemoryRouter })
-    // Plex is the first service section.
+    mockAllServicesOk()
+
+    render(<SetupWizard />, { wrapper: Wrapper })
     fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
 
     const movieSelect = await screen.findByLabelText('Movies library folder')
@@ -63,32 +105,30 @@ describe('SetupWizard — tv library picker', () => {
   })
 
   it('never requires a tv library folder to be chosen (tv_root is optional)', async () => {
-    render(<SetupWizard />, { wrapper: MemoryRouter })
+    mockAllServicesOk()
+
+    render(<SetupWizard />, { wrapper: Wrapper })
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
       fireEvent.click(button)
     }
-    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
 
-    // Choose the required MOVIE folder...
     const movieSelect = await screen.findByLabelText('Movies library folder')
     fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
 
-    // ...but never touch the tv picker — setup still completes.
     expect(screen.queryByLabelText('TV library folder')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
   })
 
   it('completes a tv-only install: tv folder chosen, movies left unset', async () => {
-    // ADR-0011: a tv-only Plex is legit. The completion gate must accept a tv_root
-    // with an empty movies_root — otherwise a tv-only operator (no movie library to
-    // point at) can never finish setup.
-    render(<SetupWizard />, { wrapper: MemoryRouter })
+    mockAllServicesOk()
+
+    render(<SetupWizard />, { wrapper: Wrapper })
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
       fireEvent.click(button)
     }
-    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
 
-    // Choose ONLY the tv folder; never touch the movie picker.
     const tvSelect = await screen.findByLabelText('TV library folder')
     fireEvent.change(tvSelect, { target: { value: '/media/tv' } })
 
@@ -96,19 +136,22 @@ describe('SetupWizard — tv library picker', () => {
   })
 
   it('disables completion until at least one library root is chosen', async () => {
-    render(<SetupWizard />, { wrapper: MemoryRouter })
+    mockAllServicesOk()
+
+    render(<SetupWizard />, { wrapper: Wrapper })
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
       fireEvent.click(button)
     }
-    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
 
-    // All services verified but neither library root chosen -> still blocked.
     await screen.findByLabelText('Movies library folder')
     expect(screen.getByRole('button', { name: /complete setup/i })).toBeDisabled()
   })
 
   it('shows the tv section as optional when no folder is chosen', async () => {
-    render(<SetupWizard />, { wrapper: MemoryRouter })
+    mockAllServicesOk()
+
+    render(<SetupWizard />, { wrapper: Wrapper })
     fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
     const tvSelect = await screen.findByLabelText('TV library folder')
     // Scoped to the TV Library section -- the Anime library section (ADR-0015)
@@ -122,16 +165,14 @@ describe('SetupWizard — tv library picker', () => {
 
 describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
-    ;(useSetupStatus as unknown as Mock).mockReturnValue({
-      isLoading: false,
-      data: { initialized: false, app_api_key: null },
-    })
-    ;(useValidateService as unknown as Mock).mockReturnValue({
-      mutateAsync: validateMock,
-      isPending: false,
-    })
-    ;(useCompleteSetup as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    h.validate.mockReset()
+    h.complete.mockReset()
+    h.setApiKey.mockReset()
+    h.setSetupToken.mockReset()
+    h.clearSetupToken.mockReset()
+    h.initialized = false
+    h.setupTokenRequired = false
+    mockAllServicesOk()
   })
 
   it('reuses the Movies/TV Plex library lists for the anime pickers', async () => {
@@ -153,7 +194,7 @@ describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
       fireEvent.click(button)
     }
-    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
 
     const movieSelect = await screen.findByLabelText('Movies library folder')
     fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
@@ -174,7 +215,7 @@ describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
       fireEvent.click(button)
     }
-    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
 
     // Choose ONLY the anime movies folder; never touch the Movies or TV pickers.
     const animeMovieSelect = await screen.findByLabelText('Anime movies library folder')
@@ -187,16 +228,12 @@ describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
   })
 
   it('submits chosen anime roots on complete', async () => {
-    const completeMock = vi.fn().mockResolvedValue({ app_api_key: null })
-    ;(useCompleteSetup as unknown as Mock).mockReturnValue({
-      mutateAsync: completeMock,
-      isPending: false,
-    })
+    h.complete.mockResolvedValue({ app_api_key: null })
     render(<SetupWizard />, { wrapper: MemoryRouter })
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
       fireEvent.click(button)
     }
-    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
 
     const movieSelect = await screen.findByLabelText('Movies library folder')
     fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
@@ -205,8 +242,151 @@ describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
     })
 
     fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
-    await waitFor(() => expect(completeMock).toHaveBeenCalledTimes(1))
-    const body = completeMock.mock.calls[0]![0] as Record<string, string>
+    await waitFor(() => expect(h.complete).toHaveBeenCalledTimes(1))
+    const body = h.complete.mock.calls[0]![0] as Record<string, string>
     expect(body.anime_movie_root).toBe('/media/movies')
+  })
+})
+
+describe('SetupWizard — validation & completion flow', () => {
+  beforeEach(() => {
+    h.validate.mockReset()
+    h.complete.mockReset()
+    h.setApiKey.mockReset()
+    h.setSetupToken.mockReset()
+    h.clearSetupToken.mockReset()
+    h.initialized = false
+    h.setupTokenRequired = false
+  })
+
+  it('ignores a stale validation success after fields are edited', async () => {
+    const pending = deferred<ServiceValidateResponse>()
+    h.validate.mockReturnValueOnce(pending.promise)
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    fireEvent.change(screen.getByLabelText('Server URL'), {
+      target: { value: 'http://old-plex:32400' },
+    })
+    fireEvent.change(screen.getByLabelText('Plex token'), { target: { value: 'old-token' } })
+    fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
+    fireEvent.change(screen.getByLabelText('Server URL'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+
+    await act(async () => {
+      pending.resolve(plexOk([movieLibrary]))
+      await pending.promise
+    })
+
+    expect(screen.queryByText('Plex ok')).not.toBeInTheDocument()
+    expect(screen.getByText('0/4 verified')).toBeInTheDocument()
+    // Movies + TV + the Anime library section (ADR-0015) each hint at Plex.
+    expect(screen.getAllByText(/Verify Plex above/i)).toHaveLength(3)
+  })
+
+  it('stores and reveals the one-time setup key before navigating away', async () => {
+    h.validate.mockImplementation(async ({ service }: { service: string }) => {
+      if (service === 'plex') {
+        return plexOk([movieLibrary])
+      }
+      return { ok: true, message: `${service} ok` }
+    })
+    h.complete.mockResolvedValue({ app_api_key: 'one-time-key' })
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    fireEvent.change(screen.getByLabelText('Server URL'), {
+      target: { value: 'http://plex:32400' },
+    })
+    fireEvent.change(screen.getByLabelText('Plex token'), { target: { value: 'plex-token' } })
+    fireEvent.change(screen.getAllByLabelText('URL')[0]!, {
+      target: { value: 'http://prowlarr:9696' },
+    })
+    fireEvent.change(screen.getAllByLabelText('API key')[0]!, {
+      target: { value: 'prowlarr-key' },
+    })
+    fireEvent.change(screen.getAllByLabelText('URL')[1]!, {
+      target: { value: 'http://qbittorrent:8080' },
+    })
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'admin' } })
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'password' } })
+    fireEvent.change(screen.getAllByLabelText('API key')[1]!, {
+      target: { value: 'tmdb-key' },
+    })
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    fireEvent.click(testButtons[0]!)
+    await screen.findByText('Plex ok')
+    fireEvent.change(screen.getByLabelText('Movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+    fireEvent.click(testButtons[1]!)
+    await screen.findByText('prowlarr ok')
+    fireEvent.click(testButtons[2]!)
+    await screen.findByText('qbittorrent ok')
+    fireEvent.click(testButtons[3]!)
+    await screen.findByText('tmdb ok')
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
+
+    await waitFor(() => expect(h.setApiKey).toHaveBeenCalledWith('one-time-key'))
+    expect(await screen.findByText('one-time-key')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /continue/i })).toBeInTheDocument()
+  })
+
+  it('requires the configured setup token before validation or completion', async () => {
+    h.setupTokenRequired = true
+    h.validate.mockResolvedValue({ ok: true, message: 'Plex ok', libraries: [] })
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    expect(screen.getByLabelText('Setup token')).toBeInTheDocument()
+    expect(testButtons[0]).toBeDisabled()
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeDisabled()
+
+    fireEvent.change(screen.getByLabelText('Setup token'), {
+      target: { value: 'boot-token' },
+    })
+
+    expect(h.setSetupToken).toHaveBeenCalledWith('boot-token')
+    expect(testButtons[0]).toBeEnabled()
+
+    fireEvent.click(testButtons[0]!)
+    await waitFor(() => expect(h.validate).toHaveBeenCalled())
+
+    fireEvent.change(screen.getByLabelText('Setup token'), {
+      target: { value: '' },
+    })
+    expect(h.clearSetupToken).toHaveBeenCalled()
+    expect(testButtons[0]).toBeDisabled()
+  })
+
+  it('keeps each service test disabled while its own validation is pending', async () => {
+    const plexPending = deferred<ServiceValidateResponse>()
+    const prowlarrPending = deferred<ServiceValidateResponse>()
+    h.validate.mockImplementation(({ service }: { service: string }) =>
+      service === 'plex' ? plexPending.promise : prowlarrPending.promise,
+    )
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    fireEvent.click(testButtons[0]!)
+    await waitFor(() => expect(testButtons[0]).toBeDisabled())
+
+    fireEvent.click(testButtons[1]!)
+    await waitFor(() => {
+      expect(testButtons[0]).toBeDisabled()
+      expect(testButtons[1]).toBeDisabled()
+    })
+
+    await act(async () => {
+      plexPending.resolve(plexOk())
+      prowlarrPending.resolve({ ok: true, message: 'Prowlarr ok' })
+      await Promise.all([plexPending.promise, prowlarrPending.promise])
+    })
   })
 })
