@@ -68,16 +68,35 @@ def _require_http_url(url: str) -> ServiceValidateResponse | None:
     into a clear, retryable rejection instead of an opaque ``httpx`` transport
     error. Returns ``None`` when ``url`` is acceptable to try.
 
-    ``urlsplit`` (and reading ``.hostname``) itself RAISES ``ValueError`` on a
-    malformed bracketed host -- an unterminated IPv6 literal (``http://[::1``) or
-    an invalid IPvFuture form (``http://[v7.x]``) -- so both are guarded: a parse
-    failure is exactly the "obviously-broken input" this rejects, surfaced as the
-    same retryable ``ok=False`` rather than crashing the validate endpoint with a
-    500.
+    ``urlsplit`` (and reading ``.hostname`` / ``.port``) itself RAISES
+    ``ValueError`` on several obviously-broken inputs, all of which are guarded so
+    a parse failure surfaces as the same retryable ``ok=False`` rather than
+    crashing the validate endpoint with a 500:
+
+    * a malformed bracketed host -- an unterminated IPv6 literal (``http://[::1``)
+      or an invalid IPvFuture form (``http://[v7.x]``) -- trips ``.hostname``;
+    * a non-numeric (``http://x:bad``) or out-of-range (``http://x:99999``) port
+      trips ``.port``. Without touching ``.port`` these slip past the hostname
+      check and reach httpx, which raises ``httpx.InvalidURL`` -- and that is NOT
+      an ``httpx.HTTPError`` subclass, so it would escape the endpoints' transport
+      handlers as a 500 instead of this rejection.
+
+    Raw control characters (C0 + DEL) are rejected up front, BEFORE parsing or any
+    log/probe: ``urlsplit`` silently tolerates or strips some of them
+    (``http://\\nplex.local`` parses to a plausible host), but httpx then raises
+    the same uncaught ``httpx.InvalidURL`` for the non-printable byte. A CR/LF- or
+    NUL-bearing URL is exactly "obviously-broken input", so it gets the honest
+    ``ok=False`` here rather than a 500 (and never reaches an outbound request).
     """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
     try:
         parts = urlsplit(url)
         hostname = parts.hostname
+        # Reading ``.port`` validates it -- urllib raises ValueError for a
+        # non-numeric or out-of-range port, which we reject rather than let httpx
+        # turn into an uncaught InvalidURL (or a doomed connect attempt).
+        _port = parts.port
     except ValueError:
         return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
     if parts.scheme not in {"http", "https"} or not hostname:

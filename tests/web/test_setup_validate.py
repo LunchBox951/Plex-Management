@@ -118,6 +118,14 @@ async def test_validate_prowlarr_bad_key(client: httpx.AsyncClient, app: FastAPI
         # this documented ok=False rejection (Codex PR #35 P2).
         "http://[::1",  # unterminated IPv6 literal
         "http://[vG.x]",  # invalid IPvFuture (non-hex version)
+        # Malformed / out-of-range ports and raw control characters: urlsplit()
+        # tolerates these and returns a plausible hostname, but httpx then raises
+        # httpx.InvalidURL -- which is NOT an httpx.HTTPError subclass, so without
+        # the .port touch / control-char guard the endpoint 500'd (Codex PR #35 P2).
+        "http://prowlarr.local:bad",  # non-numeric port -> httpx.InvalidURL
+        "http://prowlarr.local:99999",  # out-of-range port
+        "http://\nprowlarr.local",  # embedded newline (CR/LF log-forging shape)
+        "http://prowlarr.local/\x01",  # control char in path
     ],
 )
 async def test_validate_prowlarr_rejects_non_http_url(
@@ -359,6 +367,12 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
         "not a url at all",
         "http://[::1",
         "http://[vG.x]",
+        # Malformed port / control chars -> uncaught httpx.InvalidURL otherwise
+        # (Codex PR #35 P2).
+        "http://qb.local:bad",
+        "http://qb.local:99999",
+        "http://\nqb.local",
+        "http://qb.local/\x01",
     ],
 )
 async def test_validate_qbittorrent_rejects_non_http_url(
@@ -386,6 +400,12 @@ async def test_validate_qbittorrent_rejects_non_http_url(
         "not a url at all",
         "http://[::1",
         "http://[vG.x]",
+        # Malformed port / control chars -> uncaught httpx.InvalidURL otherwise
+        # (Codex PR #35 P2).
+        "http://plex.local:bad",
+        "http://plex.local:99999",
+        "http://\nplex.local",
+        "http://plex.local/\x01",
     ],
 )
 async def test_validate_plex_rejects_non_http_url(
