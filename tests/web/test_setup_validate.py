@@ -403,6 +403,7 @@ async def test_validate_qbittorrent_rejects_non_http_url(
         # Malformed port / control chars -> uncaught httpx.InvalidURL otherwise
         # (Codex PR #35 P2).
         "http://plex.local:bad",
+        "http://plex.local:0",
         "http://plex.local:99999",
         "http://\nplex.local",
         "http://plex.local/\x01",

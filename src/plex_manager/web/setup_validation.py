@@ -96,10 +96,11 @@ def _require_http_url(url: str) -> ServiceValidateResponse | None:
         # Reading ``.port`` validates it -- urllib raises ValueError for a
         # non-numeric or out-of-range port, which we reject rather than let httpx
         # turn into an uncaught InvalidURL (or a doomed connect attempt).
-        _port = parts.port
+        port = parts.port
     except ValueError:
         return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
-    if parts.scheme not in {"http", "https"} or not hostname:
+    # Port 0 parses cleanly but is never connectable -- reject it up front too.
+    if parts.scheme not in {"http", "https"} or not hostname or port == 0:
         return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
     return None
 
