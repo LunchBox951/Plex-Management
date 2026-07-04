@@ -30,6 +30,50 @@ _logger = logging.getLogger(__name__)
 
 DiscoverCategory = Literal["trending", "popular", "upcoming", "trending_tv", "popular_tv"]
 
+# The library-state a Discover/Search tile is decorated with (issue #29). Structurally
+# identical to ``web.schemas.LibraryStateField`` -- defined here (not imported) so the
+# services layer keeps no web dependency; the two Literals are mutually assignable and
+# MUST stay in sync (also with the client's ``lib/tileState.ts`` / ``lib/status.ts``).
+LibraryState = Literal["none", "requested", "processing", "available", "partially_available"]
+
+# Request statuses that are "in flight" -- a grab is being worked but the title is not
+# yet watchable. Collapsed onto the single ``"processing"`` tile state (the tile is a
+# hint, not the request detail; the modal owns the granular lifecycle). Kept in sync
+# with ``lib/status.ts``'s intent table and ``RequestStatus`` in ``models.py``.
+_PROCESSING_REQUEST_STATUSES: frozenset[str] = frozenset(
+    {"searching", "downloading", "completed", "no_acceptable_release", "import_blocked"}
+)
+
+
+def derive_library_state(request_status: str | None, present: bool) -> LibraryState:
+    """Fold a request-store status + Plex presence into the tile's base library-state.
+
+    The SERVER base state for a Discover/Search tile: the request status (if the title
+    has a request row) drives ``requested``/``processing``/``available``/
+    ``partially_available``; a settled-but-not-available status (``failed``/``evicted``/
+    ``cancelled``), an unknown status, or NO request row all fall back to Plex presence
+    -- ``"available"`` when the title is in the library, else ``"none"``. The presence
+    fallback is what flags "owned but never requested through the app", the beta's
+    dominant case. Never fabricates presence: absent request + absent from Plex is an
+    honest ``"none"``.
+
+    Kept in sync with ``lib/tileState.ts`` (the client overlays the live request
+    lifecycle on top of this base) and ``_SETTLED_REQUEST_STATUSES`` in
+    ``repositories/requests.py``.
+    """
+    if request_status == "pending":
+        return "requested"
+    if request_status in _PROCESSING_REQUEST_STATUSES:
+        return "processing"
+    if request_status == "available":
+        return "available"
+    if request_status == "partially_available":
+        return "partially_available"
+    # None, a settled-non-available status (failed/evicted/cancelled), or an unknown
+    # status: presence is the only honest signal left.
+    return "available" if present else "none"
+
+
 # Ordered rows the home composes. Order + titles live here (a code constant, no DB)
 # — the recommendation engine that decides rows dynamically is deferred. The tv
 # rows are appended after the movie rows (no reordering of the existing three, so

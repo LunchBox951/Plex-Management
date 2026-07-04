@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -184,6 +185,41 @@ class SqlRequestRepository:
         )
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
+
+    async def display_statuses_by_tmdb_ids(
+        self, keys: Sequence[tuple[int, str]]
+    ) -> dict[tuple[int, str], str]:
+        """Batch the DISPLAY status per ``(tmdb_id, media_type)`` — see the port docstring.
+
+        ONE ``SELECT ... WHERE tmdb_id IN (...)`` over the distinct tmdb ids, then
+        the pairs are grouped in Python: a composite ``(tmdb_id, media_type)`` tuple
+        IN is deliberately avoided (SQLite/PostgreSQL differ on tuple IN, and the
+        backend is a config swap). Rows come back ``id``-ascending, so per key the
+        first non-settled row is the lowest-id ACTIVE one (matching ``find_active``)
+        and ``group[-1]`` is the newest fallback when every row is settled.
+        """
+        key_set = set(keys)
+        if not key_set:
+            return {}
+        tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
+        stmt = (
+            select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids)).order_by(MediaRequest.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        grouped: dict[tuple[int, str], list[MediaRequest]] = {}
+        for row in rows:
+            key = (row.tmdb_id, row.media_type.value)
+            if key not in key_set:
+                continue  # a tmdb id shared across movie/tv namespaces, other type
+            grouped.setdefault(key, []).append(row)
+        result: dict[tuple[int, str], str] = {}
+        for key, group in grouped.items():
+            # Prefer a non-settled (active) row so a stale settled row never shadows
+            # a fresh re-request; else the newest by id (mirrors the modal's liveRequest).
+            active = next((r for r in group if r.status not in _SETTLED_REQUEST_STATUSES), None)
+            chosen = active if active is not None else group[-1]
+            result[key] = chosen.status.value
+        return result
 
     async def find_earliest_available(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return the OLDEST ``available`` request for this media (lowest id), or None.

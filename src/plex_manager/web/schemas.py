@@ -63,6 +63,14 @@ __all__ = [
 
 MediaTypeField = Literal["movie", "tv"]
 
+# The library-state a Discover/Search tile is decorated with (issue #29). The SERVER
+# base state: presence (from Plex) folded with the request-store status. Kept in sync
+# with ``services.discovery_service.derive_library_state`` (Python) and the client's
+# ``lib/tileState.ts`` / ``lib/status.ts`` (TS) -- the same status→state table on both
+# sides of the wire. Default ``"none"`` on ``DiscoverResult`` models a missing/degraded
+# decoration honestly (no fabricated presence).
+LibraryStateField = Literal["none", "requested", "processing", "available", "partially_available"]
+
 
 # --------------------------------------------------------------------------- #
 # Setup wizard — connection validation (unauthenticated, pre-init)
@@ -319,6 +327,11 @@ class DiscoverResult(BaseModel):
     overview: str | None = None
     poster_url: str | None = None
     backdrop_url: str | None = None
+    # Response-only library-state hint for the tile (issue #29): no DB column, no
+    # migration -- computed per page from Plex presence + the request store. Default
+    # ``"none"`` keeps construction back-compatible and honestly models a page that
+    # was NOT decorated (Plex unconfigured/unreachable) rather than a fake "not owned".
+    library_state: LibraryStateField = "none"
 
 
 class DiscoverSearchResponse(BaseModel):

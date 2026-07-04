@@ -1,9 +1,12 @@
-"""discovery_service — the tv discover rows (trending_tv / popular_tv)."""
+"""discovery_service — the tv discover rows (trending_tv / popular_tv) + tile state."""
 
 from __future__ import annotations
 
+import pytest
+
 from plex_manager.ports.metadata import MediaSearchResult
 from plex_manager.services import discovery_service
+from plex_manager.services.discovery_service import derive_library_state
 from tests.web.fakes import FakeTmdb
 
 
@@ -45,3 +48,42 @@ async def test_home_appends_tv_rows_after_the_movie_rows() -> None:
     by_type = {row.row_type: row.items for row in feed.rows}
     assert [item.title for item in by_type["trending_tv"]] == ["Trending Show"]
     assert [item.title for item in by_type["popular_tv"]] == ["Popular Show"]
+
+
+# --------------------------------------------------------------------------- #
+# derive_library_state — the server base tile state (issue #29)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("present", [True, False])
+def test_pending_is_requested_regardless_of_presence(present: bool) -> None:
+    # A request status always wins over presence (a request row exists), so a
+    # pending title reads "requested" whether or not Plex already has (a stale copy of) it.
+    assert derive_library_state("pending", present) == "requested"
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["searching", "downloading", "completed", "no_acceptable_release", "import_blocked"],
+)
+@pytest.mark.parametrize("present", [True, False])
+def test_in_flight_statuses_collapse_to_processing(status: str, present: bool) -> None:
+    assert derive_library_state(status, present) == "processing"
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_available_request_is_available(present: bool) -> None:
+    assert derive_library_state("available", present) == "available"
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_partially_available_request_is_partial(present: bool) -> None:
+    assert derive_library_state("partially_available", present) == "partially_available"
+
+
+@pytest.mark.parametrize("status", [None, "failed", "evicted", "cancelled", "totally_unknown"])
+def test_no_active_request_falls_back_to_presence(status: str | None) -> None:
+    # None (no request row), a settled-non-available status, or an unrecognised status
+    # all defer to Plex presence -- "available" when owned, "none" when not. This is the
+    # "owned but never requested through the app" path (the beta's dominant case) and
+    # the honest neutral for an unknown status; never a fabricated presence.
+    assert derive_library_state(status, present=True) == "available"
+    assert derive_library_state(status, present=False) == "none"
