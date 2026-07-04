@@ -97,6 +97,19 @@ async def purge_library_path(fs: FileSystemPort, library_path: str) -> PurgeResu
     idempotent no-op success. Classifies the result rather than logging it: the
     caller (eviction / report-issue) owns the context-specific message + logger.
     """
+    # Fail an out-of-root breadcrumb CLOSED and FAST, BEFORE the (potentially huge,
+    # recursive) reclaimable_bytes walk. A stale/misconfigured breadcrumb can point at
+    # an existing directory outside every configured root (an old library root, or even
+    # ``/``); measuring it first would walk that whole outside tree only for the delete
+    # below to then refuse it. ``delete_guard_refuses`` is the same walk-free
+    # containment predicate ``delete`` applies (the exact refusal decision, as a
+    # read-only query), so this changes nothing for an in-root path -- it only short-
+    # circuits the exact paths ``delete`` was always going to refuse.
+    if await asyncio.to_thread(fs.delete_guard_refuses, library_path):
+        return PurgeResult(
+            PurgeOutcome.refused, 0, "path resolves outside every configured library root"
+        )
+
     # Reclaimable bytes MUST be read before the delete: a file's link count is
     # only knowable while the path still exists (hardlink-aware accounting, ADR-0012
     # / ADR-0014). A measurement failure is "unknown -> 0", never an abort.

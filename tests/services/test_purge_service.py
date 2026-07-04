@@ -50,6 +50,45 @@ async def test_purge_refuses_a_path_outside_every_configured_root(tmp_path: Path
     assert outside.exists()  # never touched
 
 
+class _RecordingReclaimFileSystem(LocalFileSystem):
+    """A :class:`LocalFileSystem` that records every ``reclaimable_bytes`` call, so a
+    test can prove the (potentially huge, recursive) measurement is SKIPPED for an
+    out-of-root breadcrumb the containment guard refuses."""
+
+    def __init__(self, library_roots: list[str]) -> None:
+        super().__init__(library_roots=library_roots)
+        self.reclaim_calls: list[str] = []
+
+    def reclaimable_bytes(self, path: str) -> int:
+        self.reclaim_calls.append(path)
+        return super().reclaimable_bytes(path)
+
+
+async def test_purge_refuses_out_of_root_path_without_measuring_it(tmp_path: Path) -> None:
+    # An out-of-root breadcrumb pointing at a real (possibly enormous) directory must
+    # fail CLOSED and FAST -- containment is checked BEFORE reclaimable_bytes, so the
+    # recursive walk never runs on a tree the delete was only going to refuse anyway.
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    (outside_dir / "victim.mkv").write_bytes(b"keep me")
+    fs = _RecordingReclaimFileSystem(library_roots=[str(root)])
+
+    result = await purge_service.purge_library_path(fs, str(outside_dir))
+
+    assert result.outcome is PurgeOutcome.refused
+    assert fs.reclaim_calls == []  # measurement was never entered for the out-of-root path
+    assert outside_dir.exists()
+
+    # Sanity: an IN-root path DOES get measured (the guard only short-circuits bad paths).
+    target = root / "Some Movie (2020).mkv"
+    target.write_bytes(b"x" * 2048)
+    ok = await purge_service.purge_library_path(fs, str(target))
+    assert ok.outcome is PurgeOutcome.deleted
+    assert fs.reclaim_calls == [str(target)]
+
+
 async def test_purge_already_gone_in_root_path_is_an_idempotent_deleted(tmp_path: Path) -> None:
     # A breadcrumb pointing at an already-removed (but in-root) path is an honest,
     # idempotent success -- not an error (a retried purge must not fail).
