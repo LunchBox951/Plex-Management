@@ -74,6 +74,8 @@ __all__ = [
     "SettingsStore",
     "api_key_matches",
     "ensure_system_settings",
+    "get_anime_movie_root_optional",
+    "get_anime_tv_root_optional",
     "get_auto_grab_enabled",
     "get_autograb_status",
     "get_disk_pressure_target_percent",
@@ -157,6 +159,13 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # north-star #1 "turn this bot off with a button, never a terminal" switch. The
     # manual Grab button stays the override regardless.
     "auto_grab_enabled",
+    # Anime library routing (ADR-0015): two OPTIONAL roots, mirroring tv_root's
+    # optional treatment exactly. Unset ⇒ anime imports fall back to
+    # movies_root/tv_root, i.e. identical behavior to before this feature
+    # existed. Read via get_anime_movie_root_optional/get_anime_tv_root_optional
+    # below.
+    "anime_movie_root",
+    "anime_tv_root",
 )
 
 # Keys whose values are secrets: stored encrypted, masked on read. Everything
@@ -584,20 +593,31 @@ def get_filesystem() -> FileSystemPort:
     return LocalFileSystem()
 
 
-def get_eviction_filesystem(movies_root: str | None, tv_root: str | None) -> FileSystemPort:
+def get_eviction_filesystem(
+    movies_root: str | None,
+    tv_root: str | None,
+    anime_movie_root: str | None = None,
+    anime_tv_root: str | None = None,
+) -> FileSystemPort:
     """Build the ONLY :class:`FileSystemPort` instance eviction's ``delete()`` may
-    ever be handed (ADR-0012): scoped to whichever of the two library roots are
+    ever be handed (ADR-0012): scoped to whichever of the library roots are
     actually configured, so the containment guard has something real to check
     against. :func:`get_filesystem`'s default instance has NO roots and refuses
     everything — using it here would make every eviction sweep a silent no-op.
 
     Takes plain values (not other ``Depends``) so it composes identically from
-    the periodic eviction loop (``web/app.py``) and a future manual
-    ``POST /api/v1/ops/evict`` trigger, both of which already resolve
-    ``movies_root``/``tv_root`` via :func:`get_movies_root_optional`/
-    :func:`get_tv_root_optional`.
+    the periodic eviction loop (``web/app.py``), the manual
+    ``POST /api/v1/ops/evict`` trigger, and the report-issue purge path, all of
+    which already resolve ``movies_root``/``tv_root``/``anime_movie_root``/
+    ``anime_tv_root`` via the matching ``get_*_root_optional`` dependencies.
+
+    The anime roots (ADR-0015) default to ``None`` so no existing caller breaks
+    at import time; every real call site passes them explicitly. Without them
+    here, an anime title's ``library_path`` sits outside every configured root
+    and the delete-guard refuses it — a report-issue purge would silently leave
+    the bad file on disk after blocklisting and re-searching.
     """
-    roots = [root for root in (movies_root, tv_root) if root]
+    roots = [root for root in (movies_root, tv_root, anime_movie_root, anime_tv_root) if root]
     return LocalFileSystem(library_roots=roots)
 
 
@@ -683,6 +703,30 @@ async def get_tv_root_optional(
     guards must see it as such.
     """
     return await SettingsStore(session).get("tv_root") or None
+
+
+async def get_anime_movie_root_optional(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> str | None:
+    """Return the anime-movies library root, or ``None`` when unset (ADR-0015).
+
+    Mirrors :func:`get_movies_root_optional`'s falsy-to-``None`` normalization.
+    Unset is the common case — importing then routes an anime movie to the
+    normal ``movies_root`` exactly as before this setting existed.
+    """
+    return await SettingsStore(session).get("anime_movie_root") or None
+
+
+async def get_anime_tv_root_optional(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> str | None:
+    """Return the anime-TV library root, or ``None`` when unset (ADR-0015).
+
+    Mirrors :func:`get_tv_root_optional`'s falsy-to-``None`` normalization.
+    Unset is the common case — importing then routes an anime episode to the
+    normal ``tv_root`` exactly as before this setting existed.
+    """
+    return await SettingsStore(session).get("anime_tv_root") or None
 
 
 # --------------------------------------------------------------------------- #

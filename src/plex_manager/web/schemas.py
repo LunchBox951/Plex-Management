@@ -64,6 +64,14 @@ __all__ = [
 
 MediaTypeField = Literal["movie", "tv"]
 
+# The library-state a Discover/Search tile is decorated with (issue #29). The SERVER
+# base state: presence (from Plex) folded with the request-store status. Kept in sync
+# with ``services.discovery_service.derive_library_state`` (Python) and the client's
+# ``lib/tileState.ts`` / ``lib/status.ts`` (TS) -- the same status→state table on both
+# sides of the wire. Default ``"none"`` on ``DiscoverResult`` models a missing/degraded
+# decoration honestly (no fabricated presence).
+LibraryStateField = Literal["none", "requested", "processing", "available", "partially_available"]
+
 
 class ErrorDetail(BaseModel):
     """Machine-readable error body returned by manual HTTPException paths."""
@@ -195,6 +203,11 @@ class SetupCompleteRequest(BaseModel):
     # non-empty (setup.complete).
     movies_root: str | None = None
     tv_root: str | None = None
+    # Anime library routing (ADR-0015) — OPTIONAL like ``tv_root``: unset means
+    # anime imports fall back to ``movies_root``/``tv_root``, identical to
+    # behavior before this feature existed. Written ONLY when non-empty.
+    anime_movie_root: str | None = None
+    anime_tv_root: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -254,6 +267,11 @@ class SettingsResponse(BaseModel):
     tmdb_api_key: str | None = None
     movies_root: str | None = None
     tv_root: str | None = None
+    # Anime library routing (ADR-0015) — same "unset = falls back" semantics as
+    # ``movies_root``/``tv_root`` above; ``None`` means the setting is unset (an
+    # anime import routes to the normal root), not that anime is unsupported.
+    anime_movie_root: str | None = None
+    anime_tv_root: str | None = None
     # Operability beta (ADR-0012) — the eviction/log-retention knobs from
     # ``web.deps.KNOWN_SETTING_KEYS``. ``None`` means "unset" (the typed getters
     # in ``web.deps`` — e.g. ``get_eviction_grace_days`` — fall back to their own
@@ -310,6 +328,11 @@ class SettingsUpdate(BaseModel):
     tmdb_api_key: str | None = Field(default=None)
     movies_root: str | None = Field(default=None)
     tv_root: str | None = Field(default=None)
+    # Anime library routing (ADR-0015) — see ``SettingsResponse`` above; both
+    # optional, same "unset/absent -> unchanged" write semantics as every other
+    # field on this partial-upsert model.
+    anime_movie_root: str | None = Field(default=None)
+    anime_tv_root: str | None = Field(default=None)
     # Operability beta (ADR-0012) — see ``SettingsResponse`` above for the wire
     # semantics; bounded with ``ge``/``le`` so a malformed operator input is a
     # visible 422, not a value that silently sails past ``web.deps``'s own
@@ -371,6 +394,11 @@ class DiscoverResult(BaseModel):
     overview: str | None = None
     poster_url: str | None = None
     backdrop_url: str | None = None
+    # Response-only library-state hint for the tile (issue #29): no DB column, no
+    # migration -- computed per page from Plex presence + the request store. Default
+    # ``"none"`` keeps construction back-compatible and honestly models a page that
+    # was NOT decorated (Plex unconfigured/unreachable) rather than a fake "not owned".
+    library_state: LibraryStateField = "none"
 
 
 class DiscoverSearchResponse(BaseModel):
@@ -863,7 +891,7 @@ class EvictErrorItem(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    root: Literal["movies_root", "tv_root"]
+    root: Literal["movies_root", "tv_root", "anime_movie_root", "anime_tv_root"]
     detail: str
 
 

@@ -19,8 +19,12 @@ import { useToast } from '../components/ui/toast'
 // field here, which is a required string) and get their own dedicated Library
 // sections below rather than the generic field loop, so they are excluded here
 // — keeps `form[field.key]` a plain `string` for every key this type actually
-// carries.
-type FormKey = Exclude<keyof SetupCompleteRequest, 'movies_root' | 'tv_root'>
+// carries. `anime_movie_root`/`anime_tv_root` (ADR-0015) get the SAME
+// treatment — optional, their own section, excluded from the generic loop.
+type FormKey = Exclude<
+  keyof SetupCompleteRequest,
+  'movies_root' | 'tv_root' | 'anime_movie_root' | 'anime_tv_root'
+>
 
 interface FieldDef {
   key: FormKey
@@ -84,6 +88,8 @@ const EMPTY_FORM: SetupCompleteRequest = {
   tmdb_api_key: '',
   movies_root: '',
   tv_root: '',
+  anime_movie_root: '',
+  anime_tv_root: '',
 }
 
 const EMPTY_TESTING: Record<SetupService, boolean> = {
@@ -143,6 +149,9 @@ export function SetupWizard() {
   const [manualPath, setManualPath] = useState(false)
   // Same, for the (optional) tv library folder.
   const [manualTvPath, setManualTvPath] = useState(false)
+  // Same, for the (optional) anime library folders (ADR-0015).
+  const [manualAnimeMoviePath, setManualAnimeMoviePath] = useState(false)
+  const [manualAnimeTvPath, setManualAnimeTvPath] = useState(false)
   // Per-service generation: bumped on every edit so an in-flight validation whose
   // fields changed underneath it is discarded (never marks stale creds verified).
   const validationGen = useRef<Record<SetupService, number>>({
@@ -206,7 +215,15 @@ export function SetupWizard() {
       setPlexLibraries(null)
       setManualPath(false)
       setManualTvPath(false)
-      setForm((prev) => ({ ...prev, movies_root: '', tv_root: '' }))
+      setManualAnimeMoviePath(false)
+      setManualAnimeTvPath(false)
+      setForm((prev) => ({
+        ...prev,
+        movies_root: '',
+        tv_root: '',
+        anime_movie_root: '',
+        anime_tv_root: '',
+      }))
     }
   }
 
@@ -239,12 +256,19 @@ export function SetupWizard() {
   const tvLibraries = plexLibraries?.filter((l) => l.section_type === 'tv') ?? null
   const setupTokenReady =
     status.data?.setup_token_required !== true || setupTokenInput.trim().length > 0
-  // Completion needs at least ONE library root — movies OR tv. Both roots are
-  // independently optional (ADR-0011: a movie-only OR a tv-only Plex is legit; the
-  // backend normalizes an empty root to None and surfaces a per-type ImportBlocked
-  // only for the missing kind). Forcing movies_root would lock a tv-only operator
-  // out of setup entirely — they have no movie library to point at.
-  const hasLibraryRoot = (form.movies_root ?? '').trim() !== '' || (form.tv_root ?? '').trim() !== ''
+  // Completion needs at least ONE library root — movies, tv, OR either anime root
+  // (ADR-0015). Every root is independently optional (ADR-0011: a movie-only OR a
+  // tv-only Plex is legit; the backend normalizes an empty root to None and surfaces
+  // a per-type ImportBlocked only for the missing kind). Forcing movies_root would
+  // lock a tv-only operator out of setup entirely — they have no movie library to
+  // point at. An anime-ONLY install (backend-supported: anime imports route to their
+  // own roots) must likewise be completable off an anime root alone, so the anime
+  // roots count toward the gate too.
+  const hasLibraryRoot =
+    (form.movies_root ?? '').trim() !== '' ||
+    (form.tv_root ?? '').trim() !== '' ||
+    (form.anime_movie_root ?? '').trim() !== '' ||
+    (form.anime_tv_root ?? '').trim() !== ''
   const allVerified = servicesVerified && setupTokenReady && hasLibraryRoot
 
   const onComplete = async () => {
@@ -501,6 +525,130 @@ export function SetupWizard() {
                 writable), or leave blank to skip TV.
               </p>
             )}
+          </div>
+        )}
+      </section>
+
+      {/* Anime library routing (ADR-0015) — both entirely OPTIONAL and never
+          gate `allVerified`/`hasLibraryRoot`: unset anime roots simply route
+          anime imports to the Movies/TV roots above, identical to behavior
+          before this feature existed. Reuses the SAME Plex library lists
+          (an anime library is an ordinary Plex movie/tv section). */}
+      <section className="mt-4 rounded-2xl border border-hairline bg-surface p-5 transition-colors">
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="font-display text-lg font-bold text-ink">Anime library</h2>
+          <span className="font-mono text-xs text-faint">optional</span>
+        </div>
+        <p className="mt-1 text-sm text-muted">
+          Route anime movies/episodes to a separate Plex library instead of the Movies/TV
+          folders above. Leave unset to keep anime in the normal libraries.
+        </p>
+        {!plexVerified ? (
+          <p className="mt-4 text-sm text-faint">
+            Verify Plex above to choose your anime library folders.
+          </p>
+        ) : (
+          <div className="mt-4 flex flex-col gap-4">
+            <div className="flex flex-col gap-2">
+              {!manualAnimeMoviePath && movieLibraries && movieLibraries.length > 0 ? (
+                <>
+                  <select
+                    aria-label="Anime movies library folder"
+                    className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                    value={form.anime_movie_root ?? ''}
+                    onChange={(e) => setForm((prev) => ({ ...prev, anime_movie_root: e.target.value }))}
+                  >
+                    <option value="">No anime movies library folder…</option>
+                    {movieLibraries.map((lib) => (
+                      <option
+                        key={`${lib.section_key}:${lib.path}`}
+                        value={lib.path}
+                        disabled={lib.writable === false}
+                      >
+                        {lib.title} — {lib.path}
+                        {lib.writable === false ? ' · not writable by the app' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="self-start text-xs text-gold hover:underline"
+                    onClick={() => setManualAnimeMoviePath(true)}
+                  >
+                    Use a custom path instead
+                  </button>
+                </>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <Field
+                    label="Anime movies library folder"
+                    type="text"
+                    placeholder="/library/anime-movies"
+                    value={form.anime_movie_root ?? ''}
+                    onChange={(e) => setForm((prev) => ({ ...prev, anime_movie_root: e.target.value }))}
+                  />
+                  {movieLibraries && movieLibraries.length > 0 ? (
+                    <button
+                      type="button"
+                      className="self-start text-xs text-gold hover:underline"
+                      onClick={() => setManualAnimeMoviePath(false)}
+                    >
+                      ← Pick from a Plex library instead
+                    </button>
+                  ) : null}
+                </div>
+              )}
+            </div>
+            <div className="flex flex-col gap-2">
+              {!manualAnimeTvPath && tvLibraries && tvLibraries.length > 0 ? (
+                <>
+                  <select
+                    aria-label="Anime TV library folder"
+                    className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                    value={form.anime_tv_root ?? ''}
+                    onChange={(e) => setForm((prev) => ({ ...prev, anime_tv_root: e.target.value }))}
+                  >
+                    <option value="">No anime TV library folder…</option>
+                    {tvLibraries.map((lib) => (
+                      <option
+                        key={`${lib.section_key}:${lib.path}`}
+                        value={lib.path}
+                        disabled={lib.writable === false}
+                      >
+                        {lib.title} — {lib.path}
+                        {lib.writable === false ? ' · not writable by the app' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="self-start text-xs text-gold hover:underline"
+                    onClick={() => setManualAnimeTvPath(true)}
+                  >
+                    Use a custom path instead
+                  </button>
+                </>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <Field
+                    label="Anime TV library folder"
+                    type="text"
+                    placeholder="/library/anime-tv"
+                    value={form.anime_tv_root ?? ''}
+                    onChange={(e) => setForm((prev) => ({ ...prev, anime_tv_root: e.target.value }))}
+                  />
+                  {tvLibraries && tvLibraries.length > 0 ? (
+                    <button
+                      type="button"
+                      className="self-start text-xs text-gold hover:underline"
+                      onClick={() => setManualAnimeTvPath(false)}
+                    >
+                      ← Pick from a Plex library instead
+                    </button>
+                  ) : null}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </section>

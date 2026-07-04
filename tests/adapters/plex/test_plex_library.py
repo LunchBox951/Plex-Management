@@ -361,6 +361,129 @@ async def test_is_available_tv_caches_presence_but_repages_absence() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# present_ids — batched tile decoration (issue #29)
+# --------------------------------------------------------------------------- #
+def _make_counting_grid_handler(calls: dict[str, int]) -> Callable[[httpx.Request], httpx.Response]:
+    """A handler serving BOTH the movie (section 1) and show (section 2) crawls, the
+    show ``/children`` (which present_ids must NEVER hit), and section ``/refresh``.
+    Records per-path call counts so a test can prove the crawl fan-out.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        calls["_total"] = calls.get("_total", 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(200, json=MOVIES_ALL)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL)
+        if path == "/library/metadata/100/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_100)
+        if re.fullmatch(r"/library/sections/\d+/refresh", path):
+            return httpx.Response(200)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_present_ids_movie_subset_in_a_single_crawl() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_counting_grid_handler(calls), base_url="http://present-movie:32400")
+    present = await adapter.present_ids([(27205, "movie"), (129, "movie"), (55555, "movie")])
+    assert present == frozenset({(27205, "movie"), (129, "movie")})
+    # ONE crawl: the sections list + the single movie section's /all. A movie-only
+    # page never touches the show sections (no per-title fan-out).
+    assert calls["/library/sections"] == 1
+    assert calls["/library/sections/1/all"] == 1
+    assert "/library/sections/2/all" not in calls
+
+
+async def test_present_ids_tv_subset_without_a_children_crawl() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_counting_grid_handler(calls), base_url="http://present-tv:32400")
+    present = await adapter.present_ids([(1399, "tv"), (9999, "tv")])
+    assert present == frozenset({(1399, "tv")})
+    # Show-level presence is a single guid crawl of the show section -- NEVER the
+    # per-show /children fetch (that is _TV_SEASONS_CACHE's expensive job, not a tile's).
+    assert calls["/library/sections/2/all"] == 1
+    assert "/library/metadata/100/children" not in calls
+    # A tv-only page never crawls the movie sections either.
+    assert "/library/sections/1/all" not in calls
+
+
+async def test_present_ids_mixed_movie_and_tv() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_counting_grid_handler(calls), base_url="http://present-mixed:32400")
+    present = await adapter.present_ids(
+        [(27205, "movie"), (55555, "movie"), (1399, "tv"), (9999, "tv")]
+    )
+    assert present == frozenset({(27205, "movie"), (1399, "tv")})
+    # One movie crawl + one show crawl (+ the shared sections list) -- and still no
+    # /children fan-out for the show.
+    assert calls["/library/sections/1/all"] == 1
+    assert calls["/library/sections/2/all"] == 1
+    assert "/library/metadata/100/children" not in calls
+
+
+async def test_present_ids_second_call_is_served_from_cache() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_counting_grid_handler(calls), base_url="http://present-cache:32400")
+    await adapter.present_ids([(27205, "movie"), (1399, "tv")])
+    warmed = calls["_total"]
+    # A second identical page load re-uses the warmed movie + show snapshots: zero
+    # new HTTP (tiles tolerate the short TTL staleness -- use_cache=True semantics).
+    again = await adapter.present_ids([(27205, "movie"), (1399, "tv")])
+    assert again == frozenset({(27205, "movie"), (1399, "tv")})
+    assert calls["_total"] == warmed
+
+
+async def test_present_ids_empty_keys_touches_no_network() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_counting_grid_handler(calls), base_url="http://present-empty:32400")
+    assert await adapter.present_ids([]) == frozenset()
+    assert calls == {}
+
+
+async def test_trigger_scan_tv_invalidates_the_show_presence_cache() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_counting_grid_handler(calls), base_url="http://present-invalidate:32400"
+    )
+    # Warm the show-presence snapshot.
+    await adapter.present_ids([(1399, "tv")])
+    assert calls["/library/sections/2/all"] == 1
+    # A tv scan (a just-imported show) must drop the snapshot so the show promotes to
+    # "available" on tiles without waiting the full TTL: the next present_ids re-crawls.
+    await adapter.trigger_scan("/data/tv/New Show (2024)", "tv")
+    await adapter.present_ids([(1399, "tv")])
+    assert calls["/library/sections/2/all"] == 2  # re-crawled, not served stale
+
+
+async def test_present_ids_propagates_auth_error() -> None:
+    # Honesty: a 401 must PROPAGATE (the router degrades to no-badge on it), never be
+    # swallowed into an empty "nothing present" set (the prototype's swallowed-False bug).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    adapter = _adapter(handler, base_url="http://present-401:32400")
+    with pytest.raises(PlexAuthError):
+        await adapter.present_ids([(27205, "movie")])
+
+
+async def test_present_ids_propagates_library_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    adapter = _adapter(handler, base_url="http://present-500:32400")
+    with pytest.raises(PlexLibraryError):
+        await adapter.present_ids([(1399, "tv")])
+
+
+# --------------------------------------------------------------------------- #
 # is_available — pagination
 # --------------------------------------------------------------------------- #
 ONE_MOVIE_SECTION: dict[str, Any] = {

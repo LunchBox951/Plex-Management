@@ -153,9 +153,110 @@ describe('SetupWizard', () => {
 
     render(<SetupWizard />, { wrapper: Wrapper })
     fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
-    await screen.findByLabelText('TV library folder')
+    const tvSelect = await screen.findByLabelText('TV library folder')
+    // Scoped to the TV Library section -- the Anime library section (ADR-0015)
+    // also renders an "optional" badge, so an unscoped query would now match
+    // both.
+    const tvSection = tvSelect.closest('section')
+    expect(tvSection).not.toBeNull()
+    expect(within(tvSection!).getByText(/^optional$/i)).toBeInTheDocument()
+  })
+})
 
-    expect(screen.getByText(/^optional$/i)).toBeInTheDocument()
+describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
+  beforeEach(() => {
+    h.validate.mockReset()
+    h.complete.mockReset()
+    h.setApiKey.mockReset()
+    h.setSetupToken.mockReset()
+    h.clearSetupToken.mockReset()
+    h.initialized = false
+    h.setupTokenRequired = false
+    mockAllServicesOk()
+  })
+
+  it('reuses the Movies/TV Plex library lists for the anime pickers', async () => {
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
+
+    const animeMovieSelect = await screen.findByLabelText('Anime movies library folder')
+    const animeTvSelect = screen.getByLabelText('Anime TV library folder')
+
+    expect(within(animeMovieSelect).getByText(/Movies —/)).toBeInTheDocument()
+    expect(within(animeMovieSelect).queryByText(/TV Shows/)).not.toBeInTheDocument()
+
+    expect(within(animeTvSelect).getByText(/TV Shows —/)).toBeInTheDocument()
+    expect(within(animeTvSelect).queryByText(/^Movies —/)).not.toBeInTheDocument()
+  })
+
+  it('never requires an anime library folder -- setup completes with neither chosen', async () => {
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
+
+    const movieSelect = await screen.findByLabelText('Movies library folder')
+    fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
+
+    // Anime pickers are visible but never touched -- setup still completes.
+    expect(screen.queryByLabelText('Anime movies library folder')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Anime TV library folder')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
+  })
+
+  it('completes an anime-only install: an anime root chosen, movies/tv left unset', async () => {
+    // FINDING 2: an anime-only install is backend-supported (anime imports route to
+    // their own roots). The completion gate must count anime_movie_root/anime_tv_root,
+    // so choosing ONLY an anime folder — with movies_root and tv_root empty — enables
+    // completion. Before the fix the gate only accepted movies_root/tv_root, locking an
+    // anime-only operator out of setup entirely.
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
+
+    // Choose ONLY the anime movies folder; never touch the Movies or TV pickers.
+    const animeMovieSelect = await screen.findByLabelText('Anime movies library folder')
+    fireEvent.change(animeMovieSelect, { target: { value: '/media/movies' } })
+
+    // movies_root and tv_root remain unset, yet completion is enabled off the anime root.
+    expect((screen.getByLabelText('Movies library folder') as HTMLSelectElement).value).toBe('')
+    expect((screen.getByLabelText('TV library folder') as HTMLSelectElement).value).toBe('')
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
+  })
+
+  it('submits chosen anime roots on complete', async () => {
+    h.complete.mockResolvedValue({ app_api_key: null })
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(4))
+
+    const movieSelect = await screen.findByLabelText('Movies library folder')
+    fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
+    fireEvent.change(screen.getByLabelText('Anime movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
+    await waitFor(() => expect(h.complete).toHaveBeenCalledTimes(1))
+    const body = h.complete.mock.calls[0]![0] as Record<string, string>
+    expect(body.anime_movie_root).toBe('/media/movies')
+  })
+})
+
+describe('SetupWizard — validation & completion flow', () => {
+  beforeEach(() => {
+    h.validate.mockReset()
+    h.complete.mockReset()
+    h.setApiKey.mockReset()
+    h.setSetupToken.mockReset()
+    h.clearSetupToken.mockReset()
+    h.initialized = false
+    h.setupTokenRequired = false
   })
 
   it('ignores a stale validation success after fields are edited', async () => {
@@ -180,7 +281,8 @@ describe('SetupWizard', () => {
 
     expect(screen.queryByText('Plex ok')).not.toBeInTheDocument()
     expect(screen.getByText('0/4 verified')).toBeInTheDocument()
-    expect(screen.getAllByText(/Verify Plex above/i)).toHaveLength(2)
+    // Movies + TV + the Anime library section (ADR-0015) each hint at Plex.
+    expect(screen.getAllByText(/Verify Plex above/i)).toHaveLength(3)
   })
 
   it('stores and reveals the one-time setup key before navigating away', async () => {

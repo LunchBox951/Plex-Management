@@ -40,7 +40,6 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from plex_manager.domain.disk_usage import used_percent
@@ -56,9 +55,12 @@ from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import purge_service, season_request_service
 from plex_manager.services.health_service import read_disk_usage
+from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.ports.filesystem import FileSystemPort
@@ -146,38 +148,55 @@ def _size_bytes(path: str) -> int | None:
         return None
 
 
-def _under_root(library_path: str | None, root_path: str) -> bool:
-    """Whether ``library_path`` is ``root_path`` itself or a descendant (lexical).
+def _owned_by_root(library_path: str | None, root_path: str, all_roots: Sequence[str]) -> bool:
+    """Whether ``library_path`` BELONGS to ``root_path``'s sweep: ``root_path`` is
+    its DEEPEST containing configured root (see :func:`~plex_manager.services.
+    library_roots.deepest_containing_root`).
 
-    Scopes a per-root sweep to content actually stored UNDER that root. A sweep runs
+    Scopes a per-root sweep to content actually OWNED by that root. A sweep runs
     for one ``(media_type, root_path)``; a stale/moved row whose ``library_path`` sits
     under a DIFFERENT configured root (or an old, since-changed root) must not be a
     candidate for THIS root: it would either consume the projected target here without
     being deletable (starving valid candidates for the pressured root), or — worse —
-    delete space from the wrong filesystem while THIS root's pressure is measured. The
-    ``fs.delete`` escape guard is the symlink-safe filesystem check; this is the
-    cheaper candidate-selection scope, applied BEFORE the per-row Plex/os.walk work.
-    A ``None`` breadcrumb is a SEPARATE concern (a row predating the breadcrumb, or
-    not yet imported): callers keep those as candidates so ``_evict_one`` skips them
-    with its honest "no breadcrumb" log rather than dropping them silently here.
+    delete space from the wrong filesystem while THIS root's pressure is measured.
+
+    Nested configured roots (e.g. ``anime_movie_root=/media/movies/anime`` inside
+    ``movies_root=/media/movies``) are why plain lexical containment against
+    ``root_path`` alone is NOT enough: the parent root's sweep would also match every
+    breadcrumb under the nested child — evicting the child mount's content under the
+    PARENT's disk pressure, even though the child is its own filesystem with its own
+    usage and its own sweep iteration. Deepest-match assignment gives every breadcrumb
+    exactly ONE owning sweep. ``all_roots`` is every configured root (``root_path``
+    itself is always included below, so a caller-supplied scope can never silently
+    orphan the very root being swept). The ``fs.delete`` escape guard is the
+    symlink-safe filesystem check; this is the cheaper candidate-selection scope,
+    applied BEFORE the per-row Plex/os.walk work. A ``None`` breadcrumb is a SEPARATE
+    concern (a row predating the breadcrumb, or not yet imported): callers keep those
+    as candidates so ``_evict_one`` skips them with its honest "no breadcrumb" log
+    rather than dropping them silently here.
     """
     if library_path is None:
         return False
-    try:
-        return PurePosixPath(library_path).is_relative_to(PurePosixPath(root_path))
-    except ValueError:  # pragma: no cover - is_relative_to only raises on bad args
-        return False
+    scope = tuple(all_roots) if root_path in all_roots else (*all_roots, root_path)
+    return deepest_containing_root(library_path, scope) == root_path
 
 
 async def _movie_candidates(
-    session: AsyncSession, library: LibraryPort, root_total_bytes: int, root_path: str
+    session: AsyncSession,
+    library: LibraryPort,
+    root_total_bytes: int,
+    root_path: str,
+    all_roots: Sequence[str],
 ) -> list[tuple[EvictionCandidate, _Pending]]:
-    """Every ``available`` movie request UNDER ``root_path`` as an :class:`EvictionCandidate`.
+    """Every ``available`` movie request OWNED by ``root_path`` as an
+    :class:`EvictionCandidate`.
 
     ``partially_available`` is deliberately NOT queried here: it is a TV-only
     rollup status a plain movie request can never reach (see ``RequestStatus``),
     so ``available`` is the complete "fully imported" set for movies. Rows whose
-    ``library_path`` is not under ``root_path`` are skipped (see :func:`_under_root`).
+    ``library_path`` is not owned by ``root_path`` — under a different configured
+    root, a NESTED more-specific root, or no root at all — are skipped (see
+    :func:`_owned_by_root`).
     """
     request_repo = SqlRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
@@ -185,7 +204,7 @@ async def _movie_candidates(
         row
         for row in await request_repo.list_by_status(RequestStatus.available.value)
         if row.media_type == "movie"
-        and (row.library_path is None or _under_root(row.library_path, root_path))
+        and (row.library_path is None or _owned_by_root(row.library_path, root_path, all_roots))
     ]
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row in rows:
@@ -218,15 +237,21 @@ async def _movie_candidates(
 
 
 async def _season_candidates(
-    session: AsyncSession, library: LibraryPort, root_total_bytes: int, root_path: str
+    session: AsyncSession,
+    library: LibraryPort,
+    root_total_bytes: int,
+    root_path: str,
+    all_roots: Sequence[str],
 ) -> list[tuple[EvictionCandidate, _Pending]]:
-    """Every ``available`` TV season UNDER ``root_path`` as an :class:`EvictionCandidate`.
+    """Every ``available`` TV season OWNED by ``root_path`` as an
+    :class:`EvictionCandidate`.
 
     The pin (``keep_forever``) and the title live on the PARENT show
     (``MediaRequest``), never on the season row itself, so pinning a series
     protects every one of its seasons — each parent is fetched once (cached in
     ``parents``) even when a show has several tracked seasons. Season rows whose
-    ``library_path`` is not under ``root_path`` are skipped (see :func:`_under_root`).
+    ``library_path`` is not owned by ``root_path`` (see :func:`_owned_by_root`)
+    are skipped.
     """
     season_repo = SqlSeasonRequestRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -234,7 +259,7 @@ async def _season_candidates(
     rows = [
         row
         for row in await season_repo.list_by_status(RequestStatus.available.value)
-        if row.library_path is None or _under_root(row.library_path, root_path)
+        if row.library_path is None or _owned_by_root(row.library_path, root_path, all_roots)
     ]
     parents: dict[int, RequestRecord] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
@@ -517,6 +542,7 @@ async def assemble_candidates(
     media_type: Literal["movie", "tv"],
     root_path: str,
     root_total_bytes: int,
+    all_roots: Sequence[str] | None = None,
 ) -> list[EvictionCandidate]:
     """Assemble every ``available`` movie / TV-season under ``root_path`` into a
     RAW :class:`~plex_manager.domain.eviction.EvictionCandidate` list -- fresh
@@ -536,11 +562,20 @@ async def assemble_candidates(
     syscall per sweep, not two. A caller that has not read it can pass any
     consistent total; ``0`` yields ``size_percent=0.0`` for every candidate (an
     honest "unknown share", never a fabricated guess).
+
+    ``all_roots`` is EVERY configured library root, so nested-root ownership can
+    be assigned to the most specific root (see :func:`_owned_by_root`) -- a
+    breadcrumb under a nested child root is NEVER a candidate for the parent's
+    sweep. ``None`` (the single-root default, for tests / a caller with one
+    root) scopes against ``root_path`` alone, which is exactly the pre-nesting
+    behavior; every production caller (the periodic tick, the manual evict
+    trigger, the disk preview, retention telemetry) passes the full set.
     """
+    scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
     pairs = (
-        await _movie_candidates(session, library, root_total_bytes, root_path)
+        await _movie_candidates(session, library, root_total_bytes, root_path, scope)
         if media_type == "movie"
-        else await _season_candidates(session, library, root_total_bytes, root_path)
+        else await _season_candidates(session, library, root_total_bytes, root_path, scope)
     )
     return [candidate for candidate, _pending in pairs]
 
@@ -552,6 +587,7 @@ async def preview_candidates(
     media_type: Literal["movie", "tv"],
     root_path: str,
     grace_days: int,
+    all_roots: Sequence[str] | None = None,
 ) -> list[EvictionCandidate]:
     """Read-only, ranked preview of one root's eviction candidates.
 
@@ -584,6 +620,7 @@ async def preview_candidates(
         media_type=media_type,
         root_path=root_path,
         root_total_bytes=disk.total_bytes,
+        all_roots=all_roots,
     )
     grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
     return rank_eviction_candidates(candidates, grace_cutoff)
@@ -600,6 +637,7 @@ async def run_eviction_sweep(
     target_pct: float,
     grace_days: int,
     proactive: bool = False,
+    all_roots: Sequence[str] | None = None,
 ) -> list[EvictionOutcome]:
     """One sweep pass for ONE configured root/media-kind.
 
@@ -657,10 +695,14 @@ async def run_eviction_sweep(
         # this check is skipped for it (it always needs the full candidate set).
         return []
 
+    # Nested-root ownership scope: see ``assemble_candidates``'s ``all_roots``
+    # docstring — a breadcrumb owned by a nested more-specific root is never a
+    # candidate for this (parent) root's pressure.
+    scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
     pairs = (
-        await _movie_candidates(session, library, disk.total_bytes, root_path)
+        await _movie_candidates(session, library, disk.total_bytes, root_path, scope)
         if media_type == "movie"
-        else await _season_candidates(session, library, disk.total_bytes, root_path)
+        else await _season_candidates(session, library, disk.total_bytes, root_path, scope)
     )
     if not pairs:
         return []

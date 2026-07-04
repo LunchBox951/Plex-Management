@@ -207,6 +207,60 @@ async def test_evict_never_touches_a_pinned_keep_forever_title(
     assert movie_file.exists()
 
 
+async def test_evict_sweeps_a_configured_anime_movie_root(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """ADR-0015: an anime title's ``library_path`` lives under
+    ``anime_movie_root``, which must be BOTH enumerated by the pressure sweep
+    (``eviction_service._owned_by_root`` only considers enumerated roots) AND
+    included in the delete-guard's allowlist -- otherwise the anime root is
+    silently never a pressure-eviction candidate."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    anime_root = tmp_path / "anime-movies"
+    anime_root.mkdir()
+    movie_file = anime_root / "Stale Anime Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.movie,
+            title="Stale Anime Movie",
+            status=RequestStatus.available,
+            library_path=str(movie_file),
+            is_anime=True,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        store = SettingsStore(session)
+        await store.set("anime_movie_root", str(anime_root))
+        await store.set("eviction_enabled", "true")
+        await store.set("disk_pressure_threshold_percent", "0")
+        await store.set("disk_pressure_target_percent", "0")
+        await store.set("eviction_grace_days", "30")
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["evicted"]) == 1
+    assert body["evicted"][0]["request_id"] == request_id
+    assert not movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.evicted
+
+
 _TV_TMDB_ID = 6161
 
 

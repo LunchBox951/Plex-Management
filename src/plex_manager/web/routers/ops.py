@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final, Literal, cast
 
@@ -52,6 +53,8 @@ from plex_manager.services.health_service import (
 from plex_manager.services.log_capture_service import RING_BUFFER_MAXLEN, LogCaptureHandler
 from plex_manager.web.deps import (
     SettingsStore,
+    get_anime_movie_root_optional,
+    get_anime_tv_root_optional,
     get_autograb_status,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
@@ -135,6 +138,8 @@ async def health_endpoint(
     )
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
+    anime_movie_root = await get_anime_movie_root_optional(session)
+    anime_tv_root = await get_anime_tv_root_optional(session)
     snapshot = await collect_health_snapshot(
         session=session,
         client=client,
@@ -142,7 +147,15 @@ async def health_endpoint(
         creds=creds,
         reconcile_status=reconcile_status,
         autograb_status=autograb_status,
-        library_roots={"movies_root": movies_root, "tv_root": tv_root},
+        library_roots={
+            "movies_root": movies_root,
+            "tv_root": tv_root,
+            # ADR-0015 anime library routing — surfaced here too so an anime
+            # disk (a separate mount from movies_root/tv_root) shows its own
+            # usage gauge on the Status dashboard instead of a silent gap.
+            "anime_movie_root": anime_movie_root,
+            "anime_tv_root": anime_tv_root,
+        },
     )
     return HealthResponse(
         subsystems=[
@@ -361,6 +374,7 @@ async def _disk_root_item(
     label: str,
     media_type: Literal["movie", "tv"],
     root_path: str,
+    all_roots: Sequence[str],
     grace_days: int,
     cache: TtlCache[DiskRootItem],
 ) -> DiskRootItem:
@@ -417,12 +431,17 @@ async def _disk_root_item(
     candidates: list[EvictionCandidateItem] = []
     if library is not None:
         try:
+            # ``all_roots`` scopes the preview to breadcrumbs this root OWNS
+            # (deepest containing root) so a nested anime root's content is
+            # previewed under ITS row, never double-listed under the parent's
+            # -- the same assignment the real sweep uses.
             ranked = await eviction_service.preview_candidates(
                 session=session,
                 library=library,
                 media_type=media_type,
                 root_path=root_path,
                 grace_days=grace_days,
+                all_roots=all_roots,
             )
         except (PlexLibraryError, PlexAuthError) as exc:
             # Plex IS configured but unreachable/rejecting the token: the disk
@@ -481,7 +500,14 @@ async def disk_endpoint(
     """
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
+    anime_movie_root = await get_anime_movie_root_optional(session)
+    anime_tv_root = await get_anime_tv_root_optional(session)
     grace_days = await get_eviction_grace_days(session)
+
+    # Ownership scope for every root's preview (see _disk_root_item): with
+    # nested configured roots, each breadcrumb is listed only under its most
+    # specific root's row.
+    all_roots: list[str] = [r for r in (movies_root, tv_root, anime_movie_root, anime_tv_root) if r]
 
     roots: list[DiskRootItem] = []
     if movies_root:
@@ -492,6 +518,7 @@ async def disk_endpoint(
                 label="movies_root",
                 media_type="movie",
                 root_path=movies_root,
+                all_roots=all_roots,
                 grace_days=grace_days,
                 cache=cache,
             )
@@ -504,6 +531,39 @@ async def disk_endpoint(
                 label="tv_root",
                 media_type="tv",
                 root_path=tv_root,
+                all_roots=all_roots,
+                grace_days=grace_days,
+                cache=cache,
+            )
+        )
+    # ADR-0015 anime library routing — its own DiskRootItem rows, so a separate
+    # anime disk is never a silent gap on the Status page. Cached (like every
+    # other root) by ``f"{media_type}:{root_path}"``; an operator who points an
+    # anime root at the SAME path as movies_root/tv_root gets the earlier
+    # role's cached entry back (same acceptable same-path caveat as pointing
+    # movies_root and tv_root at one shared path today).
+    if anime_movie_root:
+        roots.append(
+            await _disk_root_item(
+                session=session,
+                library=library,
+                label="anime_movie_root",
+                media_type="movie",
+                root_path=anime_movie_root,
+                all_roots=all_roots,
+                grace_days=grace_days,
+                cache=cache,
+            )
+        )
+    if anime_tv_root:
+        roots.append(
+            await _disk_root_item(
+                session=session,
+                library=library,
+                label="anime_tv_root",
+                media_type="tv",
+                root_path=anime_tv_root,
+                all_roots=all_roots,
                 grace_days=grace_days,
                 cache=cache,
             )
@@ -552,17 +612,36 @@ async def evict_endpoint(
     """
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
+    anime_movie_root = await get_anime_movie_root_optional(session)
+    anime_tv_root = await get_anime_tv_root_optional(session)
     threshold_pct = await get_disk_pressure_threshold_percent(session)
     target_pct = await get_disk_pressure_target_percent(session)
     grace_days = await get_eviction_grace_days(session)
-    fs = get_eviction_filesystem(movies_root, tv_root)
+    fs = get_eviction_filesystem(movies_root, tv_root, anime_movie_root, anime_tv_root)
 
+    # ADR-0015: the anime roots get their own rows so the pressure sweep can
+    # actually reach anime content -- ``eviction_service._owned_by_root`` assigns
+    # each breadcrumb to its DEEPEST containing configured root, so an anime
+    # library_path is never a candidate unless its root is listed here, even
+    # though ``fs`` above already allows deleting it.
     roots: tuple[
-        tuple[Literal["movie", "tv"], Literal["movies_root", "tv_root"], str | None], ...
+        tuple[
+            Literal["movie", "tv"],
+            Literal["movies_root", "tv_root", "anime_movie_root", "anime_tv_root"],
+            str | None,
+        ],
+        ...,
     ] = (
         ("movie", "movies_root", movies_root),
         ("tv", "tv_root", tv_root),
+        ("movie", "anime_movie_root", anime_movie_root),
+        ("tv", "anime_tv_root", anime_tv_root),
     )
+    # The nested-root ownership scope for every per-root sweep: with an anime
+    # root nested inside movies_root/tv_root, a breadcrumb belongs ONLY to its
+    # most specific root's sweep -- the parent's pressure must never evict the
+    # child mount's content (see eviction_service._owned_by_root).
+    all_roots: list[str] = [r for _mt, _label, r in roots if r]
     outcomes: list[EvictionOutcome] = []
     errors: list[EvictErrorItem] = []
     for media_type, root_label, root in roots:
@@ -576,6 +655,7 @@ async def evict_endpoint(
                     fs=fs,
                     media_type=media_type,
                     root_path=root,
+                    all_roots=all_roots,
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,

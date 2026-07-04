@@ -252,6 +252,35 @@ async def test_disk_preview_is_cached_and_a_second_poll_never_re_hits_plex(
     assert second.json() == first.json()
 
 
+async def test_disk_reports_anime_roots_as_their_own_rows(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """ADR-0015: a configured anime root gets its own ``DiskRootItem`` row --
+    without this, a separate anime disk never shows its usage on the Status
+    dashboard, a silent gap."""
+    movies_dir = tmp_path / "movies"
+    anime_movie_dir = tmp_path / "anime-movies"
+    anime_tv_dir = tmp_path / "anime-tv"
+    movies_dir.mkdir()
+    anime_movie_dir.mkdir()
+    anime_tv_dir.mkdir()
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("movies_root", str(movies_dir))
+        await store.set("anime_movie_root", str(anime_movie_dir))
+        await store.set("anime_tv_root", str(anime_tv_dir))
+        await session.commit()
+
+    response = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    labels = {root["root"]: root["path"] for root in response.json()["roots"]}
+    assert labels == {
+        "movies_root": str(movies_dir),
+        "anime_movie_root": str(anime_movie_dir),
+        "anime_tv_root": str(anime_tv_dir),
+    }
+
+
 async def test_disk_preview_cache_is_scoped_per_root(
     client: httpx.AsyncClient,
     app: FastAPI,

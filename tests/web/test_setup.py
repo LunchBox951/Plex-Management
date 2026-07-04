@@ -274,6 +274,38 @@ def test_complete_contract_documents_library_root_invariant(app: FastAPI) -> Non
     ]
 
 
+async def test_complete_without_anime_roots_leaves_them_unset(client: httpx.AsyncClient) -> None:
+    # Anime roots (ADR-0015) are optional, mirroring tv_root: an install may
+    # complete setup with neither configured. They read back as None, never an
+    # empty string.
+    response = await client.post(
+        "/api/v1/setup/complete", json=_COMPLETE_BODY, headers=_SETUP_HEADERS
+    )
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    body = settings.json()
+    assert body["anime_movie_root"] is None
+    assert body["anime_tv_root"] is None
+
+
+async def test_complete_with_anime_roots_stores_them(client: httpx.AsyncClient) -> None:
+    body = {
+        **_COMPLETE_BODY,
+        "anime_movie_root": "/library/anime-movies",
+        "anime_tv_root": "/library/anime-tv",
+    }
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    got = settings.json()
+    assert got["anime_movie_root"] == "/library/anime-movies"
+    assert got["anime_tv_root"] == "/library/anime-tv"
+
+
 async def test_double_complete_yields_exactly_one_key_and_one_set_of_creds(
     client: httpx.AsyncClient,
 ) -> None:
