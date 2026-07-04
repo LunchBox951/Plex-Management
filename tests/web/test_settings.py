@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 import httpx
+import pytest
+from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -20,6 +23,8 @@ from plex_manager.web.deps import (
     get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
+    load_system_settings,
+    require_api_key,
 )
 from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
 
@@ -46,7 +51,6 @@ def test_settings_update_rejects_target_above_threshold() -> None:
     # R2-2: a disk_pressure_target above the trigger threshold makes every root in the
     # [threshold, target] band read "under pressure" yet select nothing -> a silent
     # dead band. When both are sent together it must be a visible 422, not accepted.
-    import pytest
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
@@ -329,3 +333,202 @@ async def test_put_single_field_threshold_above_stored_target_still_succeeds(
     async with sessionmaker_() as session:
         assert await get_disk_pressure_threshold_percent(session) == 90.0
         assert await get_disk_pressure_target_percent(session) == 80.0  # untouched
+
+
+# --------------------------------------------------------------------------- #
+# App-key reveal / rotate (issue #28's OAuth-deferral hardening)
+# --------------------------------------------------------------------------- #
+async def test_reveal_app_key_returns_the_current_key(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json() == {"app_api_key": _API_KEY}
+
+
+async def test_reveal_app_key_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key")
+    assert response.status_code == 401
+
+
+async def test_rotate_app_key_mints_a_new_key_and_invalidates_the_old_one(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    rotate = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key != _API_KEY
+    assert len(new_key) > 20  # matches setup.complete()'s token_urlsafe(32) shape
+
+    # The OLD key (still in this request's headers) is immediately invalid --
+    # rotation replaces the single live key, so every other device holding the
+    # old value is locked out at once.
+    old_key_check = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert old_key_check.status_code == 401
+
+    # The NEW key works.
+    new_key_check = await client.get("/api/v1/settings", headers={"X-Api-Key": new_key})
+    assert new_key_check.status_code == 200
+
+
+async def test_rotate_app_key_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.post("/api/v1/settings/app-key/rotate")
+    assert response.status_code == 401
+
+
+async def test_rotate_app_key_cas_rejects_racing_rotation_with_stale_key(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two rotations racing with the SAME old key must not clobber each other.
+
+    Both requests clear ``require_api_key`` against the old stored key before
+    either commits; the compare-and-swap must turn the loser into an honest 409
+    instead of silently overwriting the winner's freshly minted key (which would
+    leave the winner's client displaying an already-dead key).
+
+    The race is simulated deterministically: while THIS request is in flight (it
+    has already authenticated against the old key), a concurrent rotation commits
+    a new key in a separate session. The handler's in-transaction re-read must
+    observe that change and bail out 409, leaving the concurrent winner's key
+    intact.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    winner_key = "winner-rotation-committed-mid-flight-0123456789"
+    state = {"raced": False}
+
+    async def racing_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        if not state["raced"]:
+            # Fire exactly once: a competing rotation commits its own new key on a
+            # separate session AFTER this request authenticated against the old key
+            # but BEFORE it writes its own.
+            state["raced"] = True
+            async with sessionmaker_() as other:
+                other_row = await real_ensure(other)
+                other_row.app_api_key = winner_key
+                await other.commit()
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", racing_ensure)
+
+    losing = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert losing.status_code == 409
+    assert losing.json()["detail"] == "app_key_changed"
+
+    # The concurrent winner's key survived -- the loser did not overwrite it.
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == winner_key
+
+
+async def test_rotate_app_key_lock_serializes_two_concurrent_rotations(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two genuinely concurrent rotations with the SAME old key: exactly one wins.
+
+    This exercises the window the previous CAS test could not: BOTH requests are
+    forced into the handler and past authentication (against the old key) BEFORE
+    EITHER commits, so a bare check-then-act would let both re-read the old key,
+    both pass the compare, and both 200 -- the second silently clobbering the
+    first's freshly minted key. The rendezvous is a barrier planted in
+    ``ensure_system_settings`` (which runs BEFORE ``_rotate_lock`` is acquired):
+    neither request can proceed to the locked read-modify-write until both have
+    entered the handler, guaranteeing the both-in-flight-before-any-commit
+    interleaving. ``_rotate_lock`` must then serialize them into one 200 + one 409;
+    without the lock this assertion fails with two 200s.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    # Barrier(2): the first request to reach it blocks until the second arrives,
+    # so BOTH are inside the handler (authenticated, nothing committed yet) before
+    # either advances to acquire _rotate_lock.
+    both_in_handler = asyncio.Barrier(2)
+
+    async def rendezvous_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        # Timeout so a regression that never lets both sides in (or a broken lock)
+        # fails loudly instead of hanging the suite.
+        await asyncio.wait_for(both_in_handler.wait(), timeout=5.0)
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", rendezvous_ensure)
+
+    first, second = await asyncio.gather(
+        client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
+        client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
+    )
+
+    # Exactly one 200 (the winner) and one 409 (the loser) -- never two 200s.
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    winner, loser = (first, second) if first.status_code == 200 else (second, first)
+    assert loser.json()["detail"] == "app_key_changed"
+
+    # The stored key is the winner's minted key, and the OLD key is dead -- the
+    # loser did not clobber the winner with a second, unreturned key.
+    new_key = winner.json()["app_api_key"]
+    assert new_key != _API_KEY
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == new_key
+
+
+async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A rotation that authenticated against a now-superseded key gets 409, not 200.
+
+    A first rotation commits and advances the stored key. A second request that
+    had already cleared auth against the OLD key (simulated by stubbing the auth
+    dependency, exactly what a same-old-key racer would have done before the first
+    committed) reaches the handler with that stale key; the CAS must reject it 409
+    and must not clobber the first rotation's result.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    first = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert first.status_code == 200
+    new_key = first.json()["app_api_key"]
+
+    # The racing second request already passed require_api_key against the old key.
+    app.dependency_overrides[require_api_key] = lambda: None
+    try:
+        stale = await client.post(
+            "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
+        )
+    finally:
+        del app.dependency_overrides[require_api_key]
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"] == "app_key_changed"
+
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == new_key

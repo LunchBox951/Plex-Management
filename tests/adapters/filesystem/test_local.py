@@ -32,6 +32,73 @@ def test_move_relocates_file_and_creates_parent(tmp_path: Path) -> None:
     assert dst.read_text() == "payload"
 
 
+def test_move_rolls_back_partial_copy_on_cross_device_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force shutil.move's internal os.rename attempt to fail cross-device so it
+    # takes its copy2-then-unlink-source fallback branch, then make that copy
+    # fail partway through (e.g. ENOSPC mid-write) after it has already
+    # created/truncated dst.
+    src = tmp_path / "src.mkv"
+    src.write_text("the full expected payload")
+    dst = tmp_path / "library" / "movie" / "dst.mkv"
+
+    def _refuse_rename(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device rename")
+
+    def _failing_copyfile(_src: str, dst_arg: str, **_kwargs: object) -> None:
+        Path(dst_arg).write_text("short")  # partial write
+        raise OSError(errno.ENOSPC, "simulated disk full mid-copy")
+
+    monkeypatch.setattr(os, "rename", _refuse_rename)
+    # shutil.move's copy fallback defaults to shutil.copy2, whose *default
+    # arg* binding captures the original copy2 object at shutil.move's own
+    # definition time -- patching shutil.copy2 directly would not affect that
+    # already-bound default. copy2 itself calls copyfile(...) as a bare
+    # module-global name, resolved dynamically at call time, so patching
+    # shutil.copyfile IS observed.
+    monkeypatch.setattr(shutil, "copyfile", _failing_copyfile)
+
+    with pytest.raises(OSError, match="disk full"):
+        LocalFileSystem().move(src, dst)
+
+    assert not dst.exists()  # partial destination cleaned up
+    assert src.exists()  # source untouched -- copy failed before unlink
+    assert src.read_text() == "the full expected payload"
+
+
+def test_move_rolls_back_partial_directory_tree_on_cross_device_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Directory case: shutil.move's cross-device fallback for a directory is a
+    # full copytree, which can be interrupted mid-walk leaving a partially
+    # populated destination tree.
+    src = tmp_path / "src_season"
+    src.mkdir()
+    (src / "e01.mkv").write_text("episode one")
+    (src / "e02.mkv").write_text("episode two")
+    dst = tmp_path / "library" / "show" / "season_01"
+
+    def _refuse_rename(_src: str, _dst: str) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device rename")
+
+    def _failing_copytree(*_args: object, **_kwargs: object) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
+        (dst / "e01.mkv").write_text("episode one")  # partial tree
+        raise OSError(errno.ENOSPC, "simulated disk full mid-copytree")
+
+    monkeypatch.setattr(os, "rename", _refuse_rename)
+    monkeypatch.setattr(shutil, "copytree", _failing_copytree)
+
+    with pytest.raises(OSError, match="disk full"):
+        LocalFileSystem().move(src, dst)
+
+    assert not dst.exists()  # partial destination tree cleaned up
+    assert src.exists()  # source untouched
+    assert (src / "e01.mkv").exists()
+    assert (src / "e02.mkv").exists()
+
+
 def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     src = tmp_path / "src.mkv"
     src.write_text("payload")
@@ -393,6 +460,86 @@ def test_delete_rejects_symlink_escaping_the_configured_root(tmp_path: Path) -> 
         LocalFileSystem([os.fspath(root)]).delete(os.fspath(escaping_link))
 
     assert secret.exists()  # the real target outside the root is untouched
+
+
+def test_delete_guard_refuses_agrees_with_delete_on_a_symlink_escaping_the_root(
+    tmp_path: Path,
+) -> None:
+    """The extracted refusal predicate ``delete`` shares with the retention-telemetry
+    would-evict simulation: it must refuse EXACTLY what ``delete`` raises on -- a
+    breadcrumb lexically under the root that realpaths (via a symlinked component)
+    outside it -- and allow a genuinely in-root path, all WITHOUT deleting anything."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.mkv").write_bytes(b"x" * 10)
+    # A symlinked COMPONENT: root/escaped -> outside, so root/escaped/secret.mkv is
+    # lexically under root but resolves outside it.
+    os.symlink(outside, root / "escaped")
+    escaping = os.fspath(root / "escaped" / "secret.mkv")
+    in_root = os.fspath(root / "Some Movie" / "movie.mkv")
+
+    fs = LocalFileSystem([os.fspath(root)])
+    assert fs.delete_guard_refuses(escaping) is True
+    assert fs.delete_guard_refuses(in_root) is False
+    assert fs.delete_guard_refuses("") is True  # empty path fails closed
+    # No configured root -> everything is refused (fails closed), same as delete.
+    assert LocalFileSystem().delete_guard_refuses(in_root) is True
+    # Agreement with delete(): the refused path raises, the allowed path does not.
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        fs.delete(escaping)
+    assert (outside / "secret.mkv").exists()  # never deleted
+
+
+def test_delete_removes_the_guarded_resolution_never_a_reresolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5 P1 (guard/delete TOCTOU): ``delete`` must remove the path it RESOLVED at
+    guard time, never a fresh re-resolution of ``path``. If containment were checked
+    on one realpath and the removal computed another, a symlinked path COMPONENT
+    repointed in between would let eviction delete outside every configured root even
+    though the guard passed. True atomicity between the two calls can't be forced in
+    a test, so we simulate that repoint by monkeypatching ``os.path.realpath`` to
+    answer in-root the FIRST time it resolves the target and out-of-root on any LATER
+    call: the pre-fix double resolution would delete the escaped file, the fixed
+    single resolution deletes only the guarded in-root one."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    in_root = root / "Some Movie (2020)" / "movie.mkv"
+    in_root.parent.mkdir(parents=True)
+    in_root.write_bytes(b"x" * 100)
+    outside = tmp_path / "outside" / "escape.mkv"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x" * 100)
+
+    # Roots are resolved in the constructor, BEFORE the monkeypatch, so containment
+    # is still measured against the genuine in-root realpath.
+    fs = LocalFileSystem([os.fspath(root)])
+
+    real_realpath = os.path.realpath
+    in_root_real = real_realpath(os.fspath(in_root))
+    outside_real = real_realpath(os.fspath(outside))
+    target = os.fspath(in_root)
+    resolves = {"count": 0}
+
+    def repointing_realpath(candidate: str) -> str:
+        if os.fspath(candidate) == target:
+            resolves["count"] += 1
+            # First resolution (the guard) stays in-root; a COMPONENT repoint makes
+            # every subsequent resolution of the same path escape the root.
+            return in_root_real if resolves["count"] == 1 else outside_real
+        return real_realpath(candidate)
+
+    monkeypatch.setattr(os.path, "realpath", repointing_realpath)
+
+    fs.delete(target)
+
+    # The target was resolved exactly once, and it is the guarded (in-root) path
+    # that was removed -- the escaped file is untouched.
+    assert resolves["count"] == 1
+    assert not in_root.exists()
+    assert outside.exists()
 
 
 def test_delete_removes_a_symlink_breadcrumb_without_touching_its_target(

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi, type Mock } from 'vitest'
 import { useRequests } from '../api/hooks'
@@ -74,5 +74,47 @@ describe('Requests — per-season status list', () => {
     })
     render(<Requests />, { wrapper: MemoryRouter })
     expect(screen.queryByText(/S1/)).not.toBeInTheDocument()
+  })
+})
+
+describe('Requests — poster rendering (issue #26)', () => {
+  // Decorative posters carry alt="" (implicit role "presentation", not "img"),
+  // so query the DOM node directly rather than by accessible role.
+  it('renders an <img> with the poster_url when present', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [movieRequest({ poster_url: 'https://image.tmdb.org/t/p/w200/poster.jpg' })],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    const { container } = render(<Requests />, { wrapper: MemoryRouter })
+    const img = container.querySelector('img')
+    expect(img).toHaveAttribute('src', 'https://image.tmdb.org/t/p/w200/poster.jpg')
+  })
+
+  it('renders the gradient placeholder when poster_url is null', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ poster_url: null })] },
+      isLoading: false,
+      isError: false,
+    })
+    const { container } = render(<Requests />, { wrapper: MemoryRouter })
+    expect(container.querySelector('img')).not.toBeInTheDocument()
+  })
+
+  it('falls back to the gradient placeholder when the poster image fails to load', async () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [movieRequest({ poster_url: 'https://image.tmdb.org/t/p/w200/broken.jpg' })],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    const { container } = render(<Requests />, { wrapper: MemoryRouter })
+    const img = container.querySelector('img')
+    expect(img).not.toBeNull()
+    fireEvent.error(img as HTMLImageElement)
+    await waitFor(() => expect(container.querySelector('img')).not.toBeInTheDocument())
   })
 })

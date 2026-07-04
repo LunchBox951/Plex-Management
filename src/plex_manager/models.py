@@ -299,6 +299,16 @@ class MediaRequest(Base):
     # ``SeasonRequest``, but the pin itself lives on the parent show, so pinning a
     # series protects every one of its seasons.
     keep_forever: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    # Auto-grab scheduling (ADR-0013). ``search_attempts`` counts the number of
+    # background auto-grab searches that returned nothing acceptable for this
+    # (movie) request; it drives the escalating per-scope backoff. ``next_search_at``
+    # is the earliest instant the auto-grab worker may search this request again --
+    # ``NULL`` means "due now" (a freshly-created request is searched on the next
+    # tick). Both are movie-scoped here; the TV mirror lives on ``SeasonRequest``,
+    # since a TV grab is always per-season. Only touched by the auto-grab worker;
+    # the manual grab path never reads or writes them.
+    search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SeasonRequest(Base):
@@ -331,6 +341,13 @@ class SeasonRequest(Base):
     # reconstruct" rule, same eviction target. ``None`` for seasons imported
     # before this breadcrumb existed.
     library_path: Mapped[str | None] = mapped_column(String)
+    # Auto-grab scheduling (ADR-0013) — the per-season mirror of the identically
+    # named columns on ``MediaRequest``. A TV grab is always per-season, so the
+    # backoff ladder is tracked here (not on the parent, whose status is a computed
+    # rollup). ``search_attempts`` counts nothing-acceptable searches for this
+    # season; ``next_search_at`` gates the next auto-grab search (``NULL`` = due now).
+    search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

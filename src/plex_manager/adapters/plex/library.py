@@ -375,12 +375,16 @@ class PlexLibrary:
         # earlier page — if THIS page (esp. a live ``use_cache=False`` probe)
         # finds no movie section, that old positive must not be left sitting
         # in the cache: the movie library could genuinely have been removed
-        # from Plex, and default (``use_cache=True``) callers -- the Settings
-        # folder picker, the scan path -- would otherwise keep being handed
-        # the now-gone location for up to the full TTL after a live probe
-        # already saw it disappear. Invalidate rather than merely skip the
-        # ``set``, so the very next default call re-pages instead of serving
-        # a stale positive.
+        # from Plex, and default (``use_cache=True``) callers -- the scan path,
+        # the availability fast paths -- would otherwise keep being handed the
+        # now-gone location for up to the full TTL after a live probe already
+        # saw it disappear. Invalidate rather than merely skip the ``set``, so
+        # the very next default call re-pages instead of serving a stale
+        # positive. (The Settings folder picker itself no longer relies on this
+        # invalidation for FRESHNESS -- ``plex_libraries_endpoint`` now always
+        # passes ``use_cache=False`` [issue #15: a 2nd movie section added in
+        # Plex must appear immediately, not after up to 300s] -- but this call
+        # still WARMS the cache for the fast paths that follow.)
         if any(section.type == "movie" for section in sections):
             _SECTIONS_CACHE.set(self._cache_key, tuple(sections))
         else:

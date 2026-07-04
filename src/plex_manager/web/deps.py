@@ -49,10 +49,16 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.services import log_capture_service
-from plex_manager.services.health_service import ReconcileStatus, SubsystemHealth, TtlCache
+from plex_manager.services.health_service import (
+    AutograbStatus,
+    ReconcileStatus,
+    SubsystemHealth,
+    TtlCache,
+)
 
 __all__ = [
     "API_KEY_HEADER_NAME",
+    "AUTO_GRAB_ENABLED_DEFAULT",
     "DISK_PRESSURE_TARGET_PERCENT_DEFAULT",
     "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
     "EVICTION_ENABLED_DEFAULT",
@@ -65,7 +71,10 @@ __all__ = [
     "SECRET_SETTING_KEYS",
     "ServiceNotConfiguredError",
     "SettingsStore",
+    "api_key_matches",
     "ensure_system_settings",
+    "get_auto_grab_enabled",
+    "get_autograb_status",
     "get_disk_pressure_target_percent",
     "get_disk_pressure_threshold_percent",
     "get_eviction_enabled",
@@ -137,6 +146,12 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "eviction_proactive_enabled",
     "eviction_interval_minutes",
     "log_retention_days",
+    # Auto-grab worker (ADR-0013): the master on/off switch for the background
+    # request->search->grab loop. Web-editable, plain boolean config (default ON),
+    # read every tick so a web toggle takes effect on the next cycle -- the
+    # north-star #1 "turn this bot off with a button, never a terminal" switch. The
+    # manual Grab button stays the override regardless.
+    "auto_grab_enabled",
 )
 
 # Keys whose values are secrets: stored encrypted, masked on read. Everything
@@ -346,10 +361,29 @@ def get_reconcile_status(request: Request) -> ReconcileStatus:
     return current
 
 
+def get_autograb_status(request: Request) -> AutograbStatus:
+    """Return ``app.state.autograb_status`` for a read-only HTTP response
+    (``GET /api/v1/ops/health``'s auto-grab panel, ADR-0013).
+
+    The exact mirror of :func:`get_reconcile_status`: lazily creates + stores a
+    fresh, never-run :class:`AutograbStatus` if absent so the health endpoint stays
+    honest ("the loop hasn't run yet") rather than 503ing -- a real deployment
+    always has one by the time it serves traffic (``lifespan`` sets it up front,
+    mutated in place by ``_autograb_once``/``_autograb_loop`` in ``web/app.py``);
+    this lazy path only matters for a test exercising the router without going
+    through ``lifespan``.
+    """
+    current = getattr(request.app.state, "autograb_status", None)
+    if not isinstance(current, AutograbStatus):
+        current = AutograbStatus()
+        request.app.state.autograb_status = current
+    return current
+
+
 # --------------------------------------------------------------------------- #
 # Authentication
 # --------------------------------------------------------------------------- #
-def _api_key_matches(provided: str | None, expected: str | None) -> bool:
+def api_key_matches(provided: str | None, expected: str | None) -> bool:
     """Constant-time check of the incoming header against the stored key.
 
     ``expected`` is the decrypted ``SystemSettings.app_api_key`` (the column is
@@ -383,7 +417,7 @@ async def require_api_key(
         return
     system = await load_system_settings(session)
     expected = system.app_api_key if system is not None else None
-    if not _api_key_matches(provided, expected):
+    if not api_key_matches(provided, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 
@@ -409,7 +443,7 @@ async def require_pre_init_or_api_key(
     if get_settings().dev_auth_bypass:
         return
     provided = request.headers.get(API_KEY_HEADER_NAME)
-    if not _api_key_matches(provided, system.app_api_key):
+    if not api_key_matches(provided, system.app_api_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
 
@@ -594,6 +628,9 @@ EVICTION_ENABLED_DEFAULT: bool = True
 EVICTION_PROACTIVE_ENABLED_DEFAULT: bool = False
 EVICTION_INTERVAL_MINUTES_DEFAULT: float = 30.0
 LOG_RETENTION_DAYS_DEFAULT: int = 7
+# Auto-grab worker (ADR-0013): the background request->search->grab loop runs by
+# default; an operator can turn it off from Settings without touching a terminal.
+AUTO_GRAB_ENABLED_DEFAULT: bool = True
 
 # Values that parse as boolean-true; anything else (including unset/unparsable)
 # is false. Matches the plain-string ``settings.value`` storage -- there is no
@@ -685,3 +722,8 @@ async def get_eviction_interval_minutes(session: AsyncSession) -> float:
 async def get_log_retention_days(session: AsyncSession) -> int:
     """How many days of captured ``log_events`` rows the retention sweep keeps (default 7)."""
     return await _get_int_setting(session, "log_retention_days", LOG_RETENTION_DAYS_DEFAULT)
+
+
+async def get_auto_grab_enabled(session: AsyncSession) -> bool:
+    """Whether the background auto-grab worker may run at all (default true, ADR-0013)."""
+    return await _get_bool_setting(session, "auto_grab_enabled", AUTO_GRAB_ENABLED_DEFAULT)

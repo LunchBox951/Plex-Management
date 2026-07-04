@@ -1103,6 +1103,9 @@ class _SlowDeleteFileSystem:
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        raise NotImplementedError
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
@@ -1475,6 +1478,9 @@ class _PinsSecondCandidateOnFirstDeleteFs:
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        raise NotImplementedError
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
@@ -1605,6 +1611,9 @@ class _ConcurrentSecondEvictFs:
         raise NotImplementedError
 
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        raise NotImplementedError
+
+    def delete_guard_refuses(self, path: str) -> bool:
         raise NotImplementedError
 
     def reclaimable_bytes(self, path: str) -> int:

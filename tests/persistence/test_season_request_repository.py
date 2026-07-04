@@ -8,12 +8,19 @@ uniqueness constraint itself is pinned separately in
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
 from plex_manager.repositories import SqlSeasonRequestRepository
+
+# The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
+# ONLY to the parked ``no_acceptable_release``.
+_DUE_STATUSES = frozenset({"pending", "no_acceptable_release", "searching"})
+_NOW = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 
 
 async def _make_show(session: AsyncSession, tmdb_id: int = 900) -> MediaRequest:
@@ -229,3 +236,40 @@ async def test_set_library_path_missing_row_raises(session: AsyncSession) -> Non
     repo = SqlSeasonRequestRepository(session)
     with pytest.raises(LookupError):
         await repo.set_library_path(999, "/data/library/tv/Ghost/Season 01")
+
+
+# --------------------------------------------------------------------------- #
+# list_due_for_search — the backoff gate applies ONLY to parked seasons (ADR-0013)
+# --------------------------------------------------------------------------- #
+async def test_list_due_returns_searching_season_with_stale_future_backoff(
+    session: AsyncSession,
+) -> None:
+    """The season-level mirror of the movie rule: a season re-armed to ``searching``
+    (a failed download) may still carry a stale ``next_search_at`` from a PRIOR
+    ``no_acceptable_release`` backoff. ``searching`` is EAGER -- due IMMEDIATELY,
+    never suppressed until that stale future timestamp expires."""
+    show = await _make_show(session, tmdb_id=930)
+    repo = SqlSeasonRequestRepository(session)
+    season = await repo.ensure(show.id, 1, status="searching")
+    await repo.schedule_search(
+        season.id, search_attempts=3, next_search_at=_NOW + timedelta(hours=24)
+    )
+
+    due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
+    assert [r.id for r in due] == [season.id]
+
+
+async def test_list_due_suppresses_parked_season_until_backoff_elapses(
+    session: AsyncSession,
+) -> None:
+    """A parked ``no_acceptable_release`` season earned its backoff: a FUTURE
+    ``next_search_at`` means NOT due yet (existing behavior, pinned)."""
+    show = await _make_show(session, tmdb_id=931)
+    repo = SqlSeasonRequestRepository(session)
+    season = await repo.ensure(show.id, 1, status="no_acceptable_release")
+    await repo.schedule_search(
+        season.id, search_attempts=1, next_search_at=_NOW + timedelta(hours=1)
+    )
+
+    due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
+    assert due == []
