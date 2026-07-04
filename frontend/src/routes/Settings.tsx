@@ -664,7 +664,21 @@ export function Settings() {
           </p>
           <div className="mt-4 flex flex-col gap-4">
             <div className="flex flex-col gap-2">
-              {!manualAnimeMoviePath && movieLibraries.length > 0 ? (
+              {plexConnectionChanged ? (
+                // Same guard as Movies/TV above: while the Plex URL/token is being
+                // changed, the (disabled) libraries query still serves the OLD
+                // server's cached list — a stale anime root must not be selectable
+                // mid-reconnect any more than a stale movies/tv root.
+                <select
+                  aria-label="Anime movies library folder"
+                  className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                  value=""
+                  disabled
+                  onChange={() => undefined}
+                >
+                  <option value="">No anime movies library folder…</option>
+                </select>
+              ) : !manualAnimeMoviePath && movieLibraries.length > 0 ? (
                 <>
                   <select
                     aria-label="Anime movies library folder"
@@ -708,7 +722,17 @@ export function Settings() {
               )}
             </div>
             <div className="flex flex-col gap-2">
-              {!manualAnimeTvPath && tvLibraries.length > 0 ? (
+              {plexConnectionChanged ? (
+                <select
+                  aria-label="Anime TV library folder"
+                  className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none disabled:text-faint"
+                  value=""
+                  disabled
+                  onChange={() => undefined}
+                >
+                  <option value="">No anime TV library folder…</option>
+                </select>
+              ) : !manualAnimeTvPath && tvLibraries.length > 0 ? (
                 <>
                   <select
                     aria-label="Anime TV library folder"
