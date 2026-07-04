@@ -480,18 +480,23 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
         assert request is not None and request.status == RequestStatus.import_blocked
 
 
-async def test_crash_resume_without_breadcrumb_rolls_back_orphaned_placement_on_scan_failure(
+async def test_scan_failure_never_deletes_unproven_identical_destination_file(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
-    # Crash window: the prior attempt published dst but crashed before writing the
-    # download_path breadcrumb. A resumed Importing row that re-adopts the same-content
-    # destination must still own that orphan for scan-failure rollback.
+    # A resumed ``Importing`` row with NO download_path breadcrumb finds an
+    # IDENTICAL file already at dst. That file cannot be proven ours: it is
+    # byte-for-byte indistinguishable from a user's manually-placed copy (or a
+    # prior retry's winner) — the old ``recovered_orphan`` inference treated it as
+    # our crash orphan and unlinked it when the Plex scan failed transiently,
+    # deleting an unowned library file. Ownership must come only from placing the
+    # file THIS invocation or from the durable breadcrumb; content-match alone
+    # NEVER authorizes a rollback, so the file must survive the scan failure.
     movies_root = tmp_path / "library"
     movies_root.mkdir()
     video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     _make_video(video)
     dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
-    _make_video(dst)
+    _make_video(dst)  # identical content, NOT placed by this import, no breadcrumb
     download_id, request_id = await _seed(
         sessionmaker_,
         request_status=RequestStatus.downloading,
@@ -501,10 +506,14 @@ async def test_crash_resume_without_breadcrumb_rolls_back_orphaned_placement_on_
 
     record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
 
+    # Honest, retryable block — and the unproven identical file survives intact.
+    # (A genuinely-ours crash orphan in the place→breadcrumb window looks the same
+    # and also survives: it is re-adopted by the next successful retry; deleting
+    # nothing beats maybe-deleting the user's file.)
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
     assert record.download_path is None
-    assert not dst.exists()
+    assert dst.exists(), "scan-failure rollback deleted a file this import never placed"
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked

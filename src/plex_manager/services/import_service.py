@@ -445,7 +445,6 @@ async def _import_download_locked(
     torrent_hash = row.torrent_hash
     season = row.season
     episodes = row.episodes_json
-    starting_status = row.status
     if row.status not in _RESUMABLE:
         return await download_repo.get_by_hash(torrent_hash)  # already done / not importable
     if row.media_request_id is None:
@@ -648,21 +647,30 @@ async def _import_download_locked(
             download_id, DownloadState.Importing.value, download_path=str(dst)
         )
         await session.commit()
-    recovered_orphan = (
-        not placed
-        and starting_status == DownloadState.Importing.value
-        and row.download_path is None
-    )
 
     # Targeted Plex scan of the movie folder — the partial scan the prototype never
     # did. movies_root is a Plex library location (the picker guarantees the path↔
     # section match), so a scan failure here is a transient Plex error, not a wrong
     # path. Roll the file back before blocking so a later reject / re-search can't
-    # orphan it (the retry re-places it). We own the rollback when THIS attempt placed
-    # dst OR a prior (crashed) attempt of this row placed it and left the breadcrumb
-    # (download_path == dst); a lost-race loser owns neither, so the winner's file is
-    # left intact. Clear the breadcrumb on rollback so the deleted path can't shadow
-    # the torrent's content on a later retry.
+    # orphan it (the retry re-places it).
+    #
+    # OWNERSHIP RULE (Codex PR #21): a file at dst may be rolled back ONLY on proof
+    # it is ours — THIS invocation placed it (``placed``), or a prior attempt of
+    # this row durably recorded placing it (the ``download_path == dst`` breadcrumb
+    # committed above / by the finalize). NEVER by content-match alone: a
+    # same-content file that we did NOT place (a lost placement race, a
+    # user's manually-supplied copy, a prior retry's winner) is byte-for-byte
+    # indistinguishable from our own crashed-before-breadcrumb placement, so an
+    # inference like "resumed Importing + no breadcrumb -> the orphan is ours"
+    # deletes an unowned library file on a transient scan failure. The honest cost
+    # of refusing to guess: a genuinely-ours orphan from a crash INSIDE the
+    # place→breadcrumb window is not rolled back on a repeat scan failure — it
+    # stays on disk, is re-adopted by the next successful retry (idempotent
+    # placement + the finalize stamps ``download_path``), and at worst surfaces
+    # later as an explicit FileExistsError conflict for the operator; deleting
+    # nothing beats maybe-deleting someone else's file. Clear the breadcrumb on
+    # rollback so the deleted path can't shadow the torrent's content on a later
+    # retry.
     try:
         await library.trigger_scan(str(dst.parent), "movie")
     except (PlexLibraryError, PlexAuthError) as exc:
@@ -671,7 +679,7 @@ async def _import_download_locked(
         # sessionmaker uses ``expire_on_commit=False`` and the claim CAS's
         # ``synchronize_session="fetch"`` refreshes only ``status`` — changing either
         # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
-        owns_placement = placed or recovered_orphan or row.download_path == str(dst)
+        owns_placement = placed or row.download_path == str(dst)
         if owns_placement:
             await asyncio.to_thread(_remove_quietly, dst)
         await _block(
