@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react'
-import { useMarkFailed, useQueue } from '../api/hooks'
+import { useImportDownload, useMarkFailed, useQueue } from '../api/hooks'
 import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
 import { downloadStatus } from '../lib/status'
@@ -41,6 +41,7 @@ interface PendingAction {
 export function Queue() {
   const { data, isLoading, isError, error, refetch } = useQueue({ poll: true })
   const markFailed = useMarkFailed()
+  const importDownload = useImportDownload()
   const { toast } = useToast()
   const [pending, setPending] = useState<PendingAction | null>(null)
 
@@ -56,6 +57,22 @@ export function Queue() {
       setPending(null)
     } catch (err) {
       toast({ title: 'Action failed', description: (err as ApiError).message, intent: 'error' })
+    }
+  }
+
+  // Operator retry for an import_blocked row (e.g. a naming conflict the
+  // operator resolved out of band) — the same /queue/{id}/import the modal's
+  // "Retry import" button calls.
+  async function runImport(item: QueueItem) {
+    try {
+      await importDownload.mutateAsync(item.id)
+      toast({ title: 'Retrying import', intent: 'success' })
+    } catch (err) {
+      toast({
+        title: 'Import retry failed',
+        description: (err as ApiError).message,
+        intent: 'error',
+      })
     }
   }
 
@@ -92,7 +109,9 @@ export function Queue() {
             key={item.id}
             item={item}
             disabled={markFailed.isPending}
+            importPending={importDownload.isPending}
             onAction={(target, blocklist) => setPending({ item: target, blocklist })}
+            onRetry={() => void runImport(item)}
           />
         ))}
       </div>
@@ -157,11 +176,15 @@ export function Queue() {
 function QueueCard({
   item,
   disabled,
+  importPending,
   onAction,
+  onRetry,
 }: {
   item: QueueItem
   disabled: boolean
+  importPending: boolean
   onAction: (item: QueueItem, blocklist: boolean) => void
+  onRetry: () => void
 }) {
   const presentation = downloadStatus(item.status)
   const isDownloadingLike = presentation.intent === 'downloading'
@@ -186,6 +209,16 @@ function QueueCard({
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {item.status === 'import_blocked' ? (
+            <Button
+              size="sm"
+              loading={importPending}
+              disabled={importPending || disabled}
+              onClick={onRetry}
+            >
+              Retry import
+            </Button>
+          ) : null}
           <Button
             variant="danger"
             size="sm"

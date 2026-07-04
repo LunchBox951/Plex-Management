@@ -9,6 +9,7 @@ const NAV = [
   { to: '/status', label: 'Status', end: false },
   { to: '/logs', label: 'Logs', end: false },
   { to: '/settings', label: 'Settings', end: false },
+  { to: '/blocklist', label: 'Blocklist', end: false },
 ]
 
 export function Layout() {
