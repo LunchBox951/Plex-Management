@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
-import { useDiscoverHome, useDiscoverSearch } from '../api/hooks'
+import { useDiscoverHome, useDiscoverSearch, useRequests } from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
+import { deriveTileState } from '../lib/tileState'
 import { PosterCard } from '../components/ui/PosterCard'
+import { StatusBadge } from '../components/ui/StatusBadge'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { TitleDetailModal } from '../components/TitleDetailModal'
 import { Row } from '../components/Row'
@@ -24,6 +26,12 @@ export function Discover() {
 
   const search = useDiscoverSearch(debounced)
   const home = useDiscoverHome()
+  // The live request lifecycle for the tile overlay — TanStack dedupes this poll with
+  // the modal's own useRequests() by queryKey, so it costs no extra network.
+  const requests = useRequests({ poll: true })
+
+  // The per-tile badge state: server base (library_state) + the live request overlay.
+  const tileState = (item: DiscoverResult) => deriveTileState(item, requests.data?.requests)
 
   // One selected-title + modal state, shared across the home and search branches.
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
@@ -74,13 +82,18 @@ export function Discover() {
           />
         ) : (
           <>
-            <Spotlight item={home.data?.spotlight ?? null} onOpen={openTitle} />
+            <Spotlight
+              item={home.data?.spotlight ?? null}
+              onOpen={openTitle}
+              state={home.data?.spotlight ? tileState(home.data.spotlight) : null}
+            />
             {(home.data?.rows ?? []).map((row) => (
               <Row
                 key={row.row_type}
                 title={row.title}
                 items={row.items}
                 onSelect={openTitle}
+                tileState={tileState}
               />
             ))}
           </>
@@ -106,16 +119,20 @@ export function Discover() {
         <StateMessage title="No matches" message={`Nothing on TMDB matched “${debounced}”.`} />
       ) : (
         <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-x-4 gap-y-5">
-          {results.map((title) => (
-            <PosterCard
-              key={`${title.media_type}-${title.tmdb_id}`}
-              title={title.title}
-              year={title.year ?? null}
-              posterUrl={title.poster_url ?? null}
-              seed={title.tmdb_id}
-              onClick={() => openTitle(title)}
-            />
-          ))}
+          {results.map((title) => {
+            const state = tileState(title)
+            return (
+              <PosterCard
+                key={`${title.media_type}-${title.tmdb_id}`}
+                title={title.title}
+                year={title.year ?? null}
+                posterUrl={title.poster_url ?? null}
+                seed={title.tmdb_id}
+                onClick={() => openTitle(title)}
+                badge={state ? <StatusBadge status={state} /> : undefined}
+              />
+            )
+          })}
         </div>
       )}
 
