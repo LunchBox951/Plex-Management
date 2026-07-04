@@ -2213,6 +2213,28 @@
                 "required": [
                   "tv_root"
                 ]
+              },
+              {
+                "properties": {
+                  "anime_movie_root": {
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "anime_movie_root"
+                ]
+              },
+              {
+                "properties": {
+                  "anime_tv_root": {
+                    "pattern": "\\S",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "anime_tv_root"
+                ]
               }
             ]
           }

@@ -166,6 +166,18 @@ class ServiceValidateResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # Setup completion + status
 # --------------------------------------------------------------------------- #
+# Every library root ``POST /setup/complete`` accepts; the at-least-one-root
+# invariant quantifies over ALL of them (the wizard's completion gate counts the
+# anime roots since ADR-0015, so an anime-only install must pass the runtime
+# check too — considering only movies/tv here would 422 a body the UI allows).
+_LIBRARY_ROOT_FIELDS: tuple[str, ...] = (
+    "movies_root",
+    "tv_root",
+    "anime_movie_root",
+    "anime_tv_root",
+)
+
+
 class SetupCompleteRequest(BaseModel):
     """The validated credential set written on ``POST /setup/complete``."""
 
@@ -176,13 +188,10 @@ class SetupCompleteRequest(BaseModel):
                 {
                     "anyOf": [
                         {
-                            "required": ["movies_root"],
-                            "properties": {"movies_root": {"type": "string", "pattern": "\\S"}},
-                        },
-                        {
-                            "required": ["tv_root"],
-                            "properties": {"tv_root": {"type": "string", "pattern": "\\S"}},
-                        },
+                            "required": [field],
+                            "properties": {field: {"type": "string", "pattern": "\\S"}},
+                        }
+                        for field in _LIBRARY_ROOT_FIELDS
                     ]
                 }
             ]
@@ -212,24 +221,27 @@ class SetupCompleteRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def require_at_least_one_library_root(cls, data: Any) -> Any:
+        """Normalize blank roots to ``None``; require at least one NON-BLANK root.
+
+        Quantifies over EVERY root in :data:`_LIBRARY_ROOT_FIELDS` — including the
+        ADR-0015 anime roots — matching the wizard's completion gate, so an
+        anime-only install that passed the UI is never 422'd here.
+        """
         if not isinstance(data, dict):
             return data
 
         raw = cast("dict[str, object]", data)
-        movies_root = raw.get("movies_root")
-        tv_root = raw.get("tv_root")
-        if any(root is not None and not isinstance(root, str) for root in (movies_root, tv_root)):
-            return raw
+        values = {field: raw.get(field) for field in _LIBRARY_ROOT_FIELDS}
+        if any(value is not None and not isinstance(value, str) for value in values.values()):
+            return raw  # let per-field validation surface the type error
 
         normalized: dict[str, object] = dict(raw)
-        if isinstance(movies_root, str) and not movies_root.strip():
-            normalized["movies_root"] = None
-            movies_root = None
-        if isinstance(tv_root, str) and not tv_root.strip():
-            normalized["tv_root"] = None
-            tv_root = None
+        for field, value in values.items():
+            if isinstance(value, str) and not value.strip():
+                normalized[field] = None
+                values[field] = None
 
-        if not any(isinstance(root, str) and root.strip() for root in (movies_root, tv_root)):
+        if not any(isinstance(value, str) and value.strip() for value in values.values()):
             raise ValueError("at_least_one_library_root_required")
         return normalized
 

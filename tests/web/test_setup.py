@@ -258,20 +258,49 @@ def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
 def test_complete_contract_documents_library_root_invariant(app: FastAPI) -> None:
     schema = app.openapi()["components"]["schemas"]["SetupCompleteRequest"]
 
+    # The invariant quantifies over EVERY library root, including the ADR-0015
+    # anime roots -- an anime-only install is completable, so the contract must
+    # document all four alternatives.
     assert schema["allOf"] == [
         {
             "anyOf": [
                 {
-                    "required": ["movies_root"],
-                    "properties": {"movies_root": {"type": "string", "pattern": "\\S"}},
-                },
-                {
-                    "required": ["tv_root"],
-                    "properties": {"tv_root": {"type": "string", "pattern": "\\S"}},
-                },
+                    "required": [field],
+                    "properties": {field: {"type": "string", "pattern": "\\S"}},
+                }
+                for field in ("movies_root", "tv_root", "anime_movie_root", "anime_tv_root")
             ]
         }
     ]
+
+
+async def test_complete_with_only_anime_movie_root_succeeds(client: httpx.AsyncClient) -> None:
+    # ADR-0015 anime-only install: the wizard's completion gate counts the anime
+    # roots, so the runtime validator must too -- pre-fix it considered only
+    # movies_root/tv_root and 422'd a body the UI legitimately allows.
+    body = {key: value for key, value in _COMPLETE_BODY.items() if key != "movies_root"}
+    body["anime_movie_root"] = "/library/anime-movies"
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    got = settings.json()
+    assert got["anime_movie_root"] == "/library/anime-movies"
+    assert got["movies_root"] is None
+    assert got["tv_root"] is None
+
+
+async def test_complete_rejects_all_roots_blank_including_anime(
+    client: httpx.AsyncClient,
+) -> None:
+    # Blank strings normalize to None for EVERY root -- all four blank is still
+    # an honest 422, never an install with no importable destination.
+    body = {key: value for key, value in _COMPLETE_BODY.items() if key != "movies_root"}
+    body.update({"movies_root": " ", "tv_root": "", "anime_movie_root": "  ", "anime_tv_root": ""})
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
 
 
 async def test_complete_without_anime_roots_leaves_them_unset(client: httpx.AsyncClient) -> None:

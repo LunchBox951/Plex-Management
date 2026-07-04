@@ -1735,6 +1735,10 @@ export interface components {
             movies_root: string;
         } | {
             tv_root: string;
+        } | {
+            anime_movie_root: string;
+        } | {
+            anime_tv_root: string;
         });
         /**
          * SetupStatusResponse
