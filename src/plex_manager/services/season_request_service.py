@@ -51,6 +51,7 @@ __all__ = [
     "mark_completed",
     "mark_no_acceptable_release",
     "reset_for_research",
+    "set_installed_quality",
     "set_library_path",
     "set_status",
     "set_status_if_in",
@@ -592,6 +593,25 @@ async def set_library_path(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.set_library_path(row.id, library_path)
+
+
+async def set_installed_quality(
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    quality_id: int,
+    profile_index: int | None,
+) -> None:
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.set_installed_quality(
+        row.id,
+        quality_id=quality_id,
+        profile_index=profile_index,
+    )
 
 
 async def clear_library_path(

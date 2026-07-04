@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+from plex_manager.domain.quality import WEBDL720P, WEBDL1080P
+from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import ParsedRelease
-from plex_manager.domain.season_pack import classify_release_scope, covers_requested_episodes
+from plex_manager.domain.season_pack import (
+    MultiSeasonRequestIntent,
+    SeasonPackSeasonState,
+    classify_release_scope,
+    covers_requested_episodes,
+    plan_multi_season_pack,
+)
 
 
 def _parsed(
@@ -111,3 +119,173 @@ def test_covers_requested_episodes_unknown_scope_conservative_reject() -> None:
     # No season at all -> "unknown" scope -- conservative reject, mirroring the
     # missing-season posture already used elsewhere.
     assert covers_requested_episodes(_parsed(season=None, episode=None), requested=[4]) is False
+
+
+# -- multi-season pack eligibility (issue #24 follow-up) --
+
+
+def _intent(
+    mode: str,
+    requested_seasons: list[int],
+    states: list[SeasonPackSeasonState],
+) -> MultiSeasonRequestIntent:
+    return MultiSeasonRequestIntent(
+        mode=mode,
+        requested_seasons=tuple(requested_seasons),
+        seasons=tuple(states),
+    )
+
+
+def _season(
+    season_number: int,
+    status: str = "pending",
+    quality_id: int | None = None,
+    profile_index: int | None = None,
+) -> SeasonPackSeasonState:
+    return SeasonPackSeasonState(
+        season_number=season_number,
+        status=status,
+        installed_quality_id=quality_id,
+        installed_profile_index=profile_index,
+    )
+
+
+def test_plan_whole_show_accepts_partial_pack_for_tracked_seasons() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2, 3],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2, 3, 4, 5],
+            [_season(1), _season(2), _season(3), _season(4), _season(5)],
+        ),
+    )
+
+    assert plan.accepted is True
+    assert plan.target_seasons == (1, 2, 3)
+    assert plan.ignored_seasons == ()
+
+
+def test_plan_explicit_seasons_rejects_pack_with_extra_season() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2, 3],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "explicit_seasons",
+            [1, 2],
+            [_season(1), _season(2), _season(3)],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.reason == "explicit_season_set_mismatch"
+    assert plan.target_seasons == ()
+    assert plan.ignored_seasons == (3,)
+
+
+def test_plan_same_quality_overlap_accepts_when_useful_outnumbers_waste() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2, 3],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2, 3],
+            [
+                _season(1, "available", WEBDL1080P.id),
+                _season(2),
+                _season(3),
+            ],
+        ),
+    )
+
+    assert plan.accepted is True
+    assert plan.target_seasons == (2, 3)
+    assert plan.waste_seasons == (1,)
+
+
+def test_plan_same_quality_overlap_rejects_when_waste_ties_or_wins() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2, 3],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2, 3],
+            [
+                _season(1, "available", WEBDL1080P.id),
+                _season(2, "available", WEBDL1080P.id),
+                _season(3),
+            ],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.reason == "useful_seasons_not_majority"
+    assert plan.target_seasons == (3,)
+    assert plan.waste_seasons == (1, 2)
+
+
+def test_plan_higher_quality_overlap_targets_upgrade() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2],
+            [
+                _season(1, "available", WEBDL720P.id),
+                _season(2),
+            ],
+        ),
+    )
+
+    assert plan.accepted is True
+    assert plan.target_seasons == (1, 2)
+    assert plan.upgrade_seasons == (1,)
+    assert plan.waste_seasons == ()
+
+
+def test_plan_unknown_legacy_quality_is_waste_not_upgrade() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2],
+            [
+                _season(1, "available", None),
+                _season(2),
+            ],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.reason == "useful_seasons_not_majority"
+    assert plan.target_seasons == (2,)
+    assert plan.upgrade_seasons == ()
+    assert plan.waste_seasons == (1,)
+
+
+def test_plan_null_installed_quality_ignores_stale_profile_index() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2],
+            [
+                _season(1, "available", None, profile_index=0),
+                _season(2),
+            ],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.upgrade_seasons == ()
+    assert plan.waste_seasons == (1,)

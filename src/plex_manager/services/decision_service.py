@@ -42,6 +42,7 @@ from plex_manager.services.log_capture_service import DECISION_TELEMETRY_LOGGER_
 if TYPE_CHECKING:
     from plex_manager.domain.quality_profile import QualityProfile
     from plex_manager.domain.release import CandidateRelease, ParsedRelease
+    from plex_manager.domain.season_pack import MultiSeasonRequestIntent
     from plex_manager.ports.indexer import IndexerPort
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import BlocklistRepository
@@ -79,6 +80,7 @@ async def preview(
     year: int | None = None,
     season: int | None = None,
     episodes: list[int] | None = None,
+    multi_season_intent: MultiSeasonRequestIntent | None = None,
 ) -> DecisionResult:
     """Search the indexers and run the decision engine; return the ranked result.
 
@@ -191,6 +193,7 @@ async def preview(
         _media_match,
         _blocklisted,
         prefer_season_pack=prefer_season_pack,
+        multi_season_intent=multi_season_intent,
     )
     _log_multi_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
     _log_not_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)

@@ -80,6 +80,14 @@ def test_fresh_schema_uses_migration_enum_check_constraint_names() -> None:
         engine.dispose()
 
 
+def _season_request_cols(db: Path) -> set[str]:
+    con = sqlite3.connect(db)
+    try:
+        return {r[1] for r in con.execute("PRAGMA table_info(season_requests)")}
+    finally:
+        con.close()
+
+
 def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> None:
     db = tmp_path / "fresh.db"
     up = _alembic(db, "upgrade", "head")
@@ -93,7 +101,13 @@ def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> No
     # existing-install regression below) are the ONLY tests that actually run
     # that migration through Alembic rather than via ``Base.metadata.create_all``.
     assert "log_events" in tables
-    assert {"library_path", "keep_forever"} <= _media_request_cols(db)
+    assert {
+        "library_path",
+        "keep_forever",
+        "tv_request_mode",
+        "requested_seasons_json",
+    } <= _media_request_cols(db)
+    assert {"installed_quality_id", "installed_profile_index"} <= _season_request_cols(db)
 
     down = _alembic(db, "downgrade", "base")
     assert down.returncode == 0, down.stderr
@@ -114,7 +128,13 @@ def test_existing_install_upgrades_across_the_tv_revision(tmp_path: Path) -> Non
     assert {"season", "episodes_json"} <= dl_cols
 
     assert "log_events" in tables
-    assert {"library_path", "keep_forever"} <= _media_request_cols(db)
+    assert {
+        "library_path",
+        "keep_forever",
+        "tv_request_mode",
+        "requested_seasons_json",
+    } <= _media_request_cols(db)
+    assert {"installed_quality_id", "installed_profile_index"} <= _season_request_cols(db)
 
 
 def _upgrade(db_path: Path, revision: str, monkeypatch: pytest.MonkeyPatch) -> None:

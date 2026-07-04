@@ -146,7 +146,15 @@ async def _to_response(
         poster_url=record.poster_url,
         backdrop_url=record.backdrop_url,
         seasons=(
-            [SeasonStatus(season_number=s.season_number, status=s.status) for s in seasons]
+            [
+                SeasonStatus(
+                    season_number=s.season_number,
+                    status=s.status,
+                    installed_quality_id=s.installed_quality_id,
+                    installed_profile_index=s.installed_profile_index,
+                )
+                for s in seasons
+            ]
             if seasons is not None
             else None
         ),

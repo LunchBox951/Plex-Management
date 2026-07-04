@@ -46,6 +46,8 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         status=row.status.value,
         tmdb_id=tmdb_id,
         library_path=row.library_path,
+        installed_quality_id=row.installed_quality_id,
+        installed_profile_index=row.installed_profile_index,
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
         # NULL (every pre-migration row) reads as ``False`` -- the safe default
@@ -464,6 +466,16 @@ class SqlSeasonRequestRepository:
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = library_path
+        await self._session.flush()
+
+    async def set_installed_quality(
+        self, season_request_id: int, *, quality_id: int, profile_index: int | None
+    ) -> None:
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.installed_quality_id = quality_id
+        row.installed_profile_index = profile_index
         await self._session.flush()
 
     async def clear_library_path(self, season_request_id: int) -> None:

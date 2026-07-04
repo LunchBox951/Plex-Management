@@ -80,6 +80,12 @@ def _to_accepted(scored: ScoredRelease) -> AcceptedRelease:
         indexer=candidate.indexer_name,
         info_hash=candidate.info_hash,
         guid=candidate.guid,
+        covered_seasons=scored.covered_seasons,
+        target_seasons=scored.target_seasons,
+        upgrade_seasons=scored.upgrade_seasons,
+        waste_seasons=scored.waste_seasons,
+        ignored_seasons=scored.ignored_seasons,
+        skipped_seasons=scored.skipped_seasons,
     )
 
 

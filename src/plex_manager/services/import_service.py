@@ -52,6 +52,8 @@ from plex_manager.domain.naming import (
     plex_tv_episode_relative_path,
     plex_tv_season_relative_dir,
 )
+from plex_manager.domain.quality import Quality
+from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int
 from plex_manager.models import (
@@ -252,6 +254,21 @@ class _UnsafeContentPathError(Exception):
 
 def _is_settled_for_import(status: DownloadStatus) -> bool:
     return status.progress >= 1.0 and status.raw_state in _IMPORT_READY_RAW_STATES
+
+
+def _lowest_profile_quality(
+    results: tuple[EpisodeImportResult, ...],
+    profile: QualityProfile,
+) -> tuple[Quality, int | None]:
+    pairs: list[tuple[Quality, int | None]] = []
+    for result in results:
+        quality = resolve_quality(
+            result.parsed.source,
+            result.parsed.resolution,
+            result.parsed.modifier,
+        )
+        pairs.append((quality, profile.get_index(quality.id)))
+    return min(pairs, key=lambda pair: pair[1] if pair[1] is not None else -1)
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -1403,6 +1420,16 @@ async def _import_tv_locked(
         # deletion target for this season.
         await season_request_service.set_library_path(
             session, media_request_id=request.id, season_number=season, library_path=str(season_dir)
+        )
+        installed_quality, installed_profile_index = _lowest_profile_quality(
+            validation.accepted, profile
+        )
+        await season_request_service.set_installed_quality(
+            session,
+            media_request_id=request.id,
+            season_number=season,
+            quality_id=installed_quality.id,
+            profile_index=installed_profile_index,
         )
         await season_request_service.mark_completed(
             session, media_request_id=request.id, season_number=season

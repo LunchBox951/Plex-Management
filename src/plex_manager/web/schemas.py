@@ -837,6 +837,8 @@ class SeasonStatus(BaseModel):
 
     season_number: int
     status: str
+    installed_quality_id: int | None = None
+    installed_profile_index: int | None = None
 
 
 class RequestResponse(BaseModel):
@@ -928,6 +930,12 @@ class AcceptedRelease(BaseModel):
     indexer: str
     info_hash: str | None = None
     guid: str
+    covered_seasons: tuple[int, ...] = ()
+    target_seasons: tuple[int, ...] = ()
+    upgrade_seasons: tuple[int, ...] = ()
+    waste_seasons: tuple[int, ...] = ()
+    ignored_seasons: tuple[int, ...] = ()
+    skipped_seasons: tuple[int, ...] = ()
 
 
 class RejectedRelease(BaseModel):

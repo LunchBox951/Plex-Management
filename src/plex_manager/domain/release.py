@@ -147,6 +147,8 @@ class ScoredRelease(BaseModel):
     comparison key). ``score`` is a display-only projection of the engine's
     final rank (higher = ranked earlier); it never drives selection and must
     not be used to re-sort or compare across separate decision runs.
+    Multi-season scope tuples are empty for ordinary releases and populated only
+    when a policy-aware multi-season pack is accepted.
     """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
@@ -156,3 +158,9 @@ class ScoredRelease(BaseModel):
     quality: Quality
     profile_index: int
     score: float
+    covered_seasons: tuple[int, ...] = ()
+    target_seasons: tuple[int, ...] = ()
+    upgrade_seasons: tuple[int, ...] = ()
+    waste_seasons: tuple[int, ...] = ()
+    ignored_seasons: tuple[int, ...] = ()
+    skipped_seasons: tuple[int, ...] = ()

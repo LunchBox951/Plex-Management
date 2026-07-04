@@ -54,7 +54,11 @@ from plex_manager.domain.quality_service import (
     compare_by_profile,
 )
 from plex_manager.domain.release import CandidateRelease, ParsedRelease, ScoredRelease
-from plex_manager.domain.season_pack import classify_release_scope
+from plex_manager.domain.season_pack import (
+    MultiSeasonRequestIntent,
+    classify_release_scope,
+    plan_multi_season_pack,
+)
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
@@ -114,6 +118,7 @@ def decide(
     is_blocklisted: BlocklistCheck,
     *,
     prefer_season_pack: bool = False,
+    multi_season_intent: MultiSeasonRequestIntent | None = None,
 ) -> DecisionResult:
     """Run the parse -> match -> gate -> filter -> rank pipeline over ``candidates``.
 
@@ -140,12 +145,9 @@ def decide(
             rejected.append((candidate, RejectionReason.WRONG_MEDIA))
             continue
 
-        # Multi-season-pack gate: mirrors Sonarr's MultiSeasonSpecification. This
-        # app's one-download-one-season model can't satisfy several seasons from a
-        # single grab (import would strand every sibling season's SeasonRequest),
-        # so a multi-season pack is a permanent rejection, never scored -- the
-        # beta posture is "borrow proven brains" (issue #24), not "prefer it".
-        if classify_release_scope(parsed) == _MULTI_SEASON_SCOPE:
+        scope = classify_release_scope(parsed)
+        multi_season_plan = None
+        if scope == _MULTI_SEASON_SCOPE and multi_season_intent is None:
             rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
             continue
 
@@ -156,7 +158,8 @@ def decide(
         # to survive to scoring (and get auto-grabbed) once every season pack was
         # exhausted/blocklisted -- confirmed live ("The Last Man on Earth" S04 was
         # auto-grabbed as single episodes three times).
-        if prefer_season_pack and classify_release_scope(parsed) not in _PACK_SCOPES:
+        multi_season_with_intent = scope == _MULTI_SEASON_SCOPE and multi_season_intent is not None
+        if prefer_season_pack and scope not in _PACK_SCOPES and not multi_season_with_intent:
             rejected.append((candidate, RejectionReason.NOT_SEASON_PACK))
             continue
 
@@ -166,6 +169,21 @@ def decide(
         if not verdict.accepted:
             rejected.append((candidate, verdict.reason or RejectionReason.QUALITY_NOT_WANTED))
             continue
+
+        if scope == _MULTI_SEASON_SCOPE:
+            if multi_season_intent is None:  # pragma: no cover - guarded above
+                rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
+                continue
+            season_numbers = parsed.season if isinstance(parsed.season, list) else []
+            multi_season_plan = plan_multi_season_pack(
+                pack_seasons=season_numbers,
+                candidate_quality_id=quality.id,
+                profile=profile,
+                intent=multi_season_intent,
+            )
+            if not multi_season_plan.accepted:
+                rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
+                continue
 
         if is_blocklisted(candidate, parsed):
             rejected.append((candidate, RejectionReason.BLOCKLISTED))
@@ -181,6 +199,29 @@ def decide(
                 quality=quality,
                 profile_index=profile_index,
                 score=0.0,  # placeholder; real value is a post-sort rank projection (#105)
+                covered_seasons=(
+                    multi_season_plan.covered_seasons if multi_season_plan is not None else ()
+                ),
+                target_seasons=(
+                    multi_season_plan.target_seasons if multi_season_plan is not None else ()
+                ),
+                upgrade_seasons=(
+                    multi_season_plan.upgrade_seasons if multi_season_plan is not None else ()
+                ),
+                waste_seasons=(
+                    multi_season_plan.waste_seasons if multi_season_plan is not None else ()
+                ),
+                ignored_seasons=(
+                    multi_season_plan.ignored_seasons if multi_season_plan is not None else ()
+                ),
+                skipped_seasons=(
+                    (
+                        multi_season_plan.waste_seasons
+                        + multi_season_plan.ignored_seasons
+                    )
+                    if multi_season_plan is not None
+                    else ()
+                ),
             )
         )
 

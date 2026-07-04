@@ -388,6 +388,11 @@ class MediaRequest(Base):
     # create path) reads ``NULL`` -- treated as "not an eviction regrab", the safe
     # default that never triggers an unintended cancel.
     eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
+    # TV-only request intent for multi-season pack eligibility. ``whole_show`` means
+    # the operator asked for every tracked season; ``explicit_seasons`` means the
+    # operator named a finite season set, persisted in ``requested_seasons_json``.
+    tv_request_mode: Mapped[str | None] = mapped_column(String)
+    requested_seasons_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
 
 
 class RequestDedupLock(Base):
@@ -446,6 +451,10 @@ class SeasonRequest(Base):
     # season; ``next_search_at`` gates the next auto-grab search (``NULL`` = due now).
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Quality imported for this season. Used by multi-season pack planning to
+    # decide whether overlap is a real upgrade or wasted same/lower-quality work.
+    installed_quality_id: Mapped[int | None] = mapped_column()
+    installed_profile_index: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
     # ONLY for a season row ``season_request_service.ensure_seasons`` created because
