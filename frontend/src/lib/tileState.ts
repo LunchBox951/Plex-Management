@@ -12,8 +12,10 @@
  * The client overlay WINS for a live active/available request, using the exact
  * `(tmdb_id, media_type)` correlation `TitleDetailModal` implements. A settled
  * NON-available request (failed/evicted/cancelled) must NOT shadow the server base
- * (e.g. a title still present in Plex, or a fresh re-request): it falls through to
- * the base instead.
+ * with a "Failed"/"Evicted" badge — but its presence ALSO proves the request the
+ * server saw at page load is gone, so the request-derived portion of that base
+ * (`requested`/`processing`) is now stale and must not fall through either. It
+ * degrades to the presence-derived truth instead (see `settledBaseFallback`).
  *
  * This status→state table mirrors the server's `derive_library_state`
  * (services/discovery_service.py); a drift makes base and overlay disagree on a tile.
@@ -63,12 +65,50 @@ export function deriveTileState(
   const active = matches.find((r) => !isSettled(r.status))
   const liveRequest = active ?? matches[matches.length - 1] ?? null
 
-  // Overlay wins for a live active/available request; a settled-bad row does not.
-  if (liveRequest && !OVERLAY_SUPPRESSED.has(liveRequest.status)) {
-    return requestStatus(liveRequest.status)
+  if (liveRequest) {
+    // Overlay wins for a live active/available request.
+    if (!OVERLAY_SUPPRESSED.has(liveRequest.status)) {
+      return requestStatus(liveRequest.status)
+    }
+    // A settled-bad row (failed/cancelled/evicted) does not badge the tile — and it
+    // proves the request the server folded into `library_state` at page load is now
+    // gone, so the request-derived base (`requested`/`processing`) is stale and must
+    // not fall through either. Degrade to presence-derived truth.
+    return settledBaseFallback(result.library_state, liveRequest.status)
   }
 
+  // No live row for this title: the server base is the only source of truth.
   return libraryStateToPresentation(result.library_state)
+}
+
+/**
+ * The server base with its stale REQUEST-derived portion stripped, for a tile whose
+ * live request row has SETTLED to a non-available terminal state.
+ *
+ * `failed` / `cancelled` end the request lifecycle but say nothing about Plex
+ * presence, an independent fact — so `available` / `partially_available` survive,
+ * while `requested` / `processing` (the base the now-dead request produced) degrade
+ * to unbadged.
+ *
+ * `evicted` is stricter: ADR-0012 eviction means the disk-pressure sweep DELETED the
+ * file, which directly contradicts a page-load `available` / `partially_available`
+ * snapshot. The live evicted row is fresher than that snapshot — and the correlation
+ * would have preferred an active re-request over it if one existed, so there is none
+ * — so we drop presence too. The tile degrades to unbadged rather than claim a file
+ * that was just deleted; the modal, when opened, shows the true live status.
+ */
+function settledBaseFallback(
+  state: DiscoverResult['library_state'],
+  settledStatus: string,
+): StatusPresentation | null {
+  if (settledStatus === 'evicted') return null
+  switch (state) {
+    case 'available':
+    case 'partially_available':
+      return libraryStateToPresentation(state)
+    default:
+      return null
+  }
 }
 
 /** A settled request status — matches the backend `_SETTLED_REQUEST_STATUSES`. */

@@ -108,6 +108,73 @@ describe('deriveTileState — live request overlay', () => {
   })
 })
 
+describe('deriveTileState — settled row degrades a stale request-derived base', () => {
+  // The server base was computed at page load; the live poll shows the request has
+  // since settled. The stale request-derived base must NOT fall through as "Requested".
+  it('degrades a stale "requested" base to none when the live row failed', () => {
+    const state = deriveTileState(
+      result({ library_state: 'requested' }),
+      [request({ status: 'failed' })],
+    )
+    expect(state).toBeNull()
+  })
+
+  it('degrades a stale "processing" base to none when the live row cancelled', () => {
+    const state = deriveTileState(
+      result({ library_state: 'processing' }),
+      [request({ status: 'cancelled' })],
+    )
+    expect(state).toBeNull()
+  })
+
+  it('keeps presence-derived "available" through a settled failed row', () => {
+    // Library presence is independent of the request lifecycle — failed doesn't evict.
+    const state = deriveTileState(
+      result({ library_state: 'available' }),
+      [request({ status: 'failed' })],
+    )
+    expect(state).toEqual({ label: 'In library', intent: 'available' })
+  })
+
+  it('keeps presence-derived "partially_available" through a settled cancelled row', () => {
+    const state = deriveTileState(
+      result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
+      [request({ tmdb_id: 7, media_type: 'tv', status: 'cancelled' })],
+    )
+    expect(state).toEqual({ label: 'Partially available', intent: 'available' })
+  })
+
+  it('drops even a stale "available" base when the live row is evicted', () => {
+    // ADR-0012: eviction DELETED the file, contradicting the page-load presence
+    // snapshot. The fresher live evicted row wins — degrade to unbadged, don't claim
+    // a file that was just deleted.
+    const state = deriveTileState(
+      result({ library_state: 'available' }),
+      [request({ status: 'evicted' })],
+    )
+    expect(state).toBeNull()
+  })
+
+  it('drops a stale "partially_available" base when the live row is evicted', () => {
+    const state = deriveTileState(
+      result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
+      [request({ tmdb_id: 7, media_type: 'tv', status: 'evicted' })],
+    )
+    expect(state).toBeNull()
+  })
+
+  it('leaves the no-live-row case unchanged (server base is the only truth)', () => {
+    expect(deriveTileState(result({ library_state: 'requested' }), [])).toEqual({
+      label: 'Requested',
+      intent: 'neutral',
+    })
+    expect(deriveTileState(result({ library_state: 'available' }), [])).toEqual({
+      label: 'In library',
+      intent: 'available',
+    })
+  })
+})
+
 describe('deriveTileState — movie/tv correlation isolation', () => {
   it('does not apply a tv request to a movie tile with the same tmdb_id', () => {
     const state = deriveTileState(
