@@ -1,14 +1,35 @@
 import { useState, type ReactNode } from 'react'
 import { useRequests } from '../api/hooks'
-import type { RequestResponse } from '../api/types'
+import type { DiscoverResult, RequestResponse } from '../api/types'
 import { Button } from '../components/ui/Button'
 import { LinkButton } from '../components/ui/LinkButton'
 import { StatusBadge } from '../components/ui/StatusBadge'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
+import { TitleDetailModal } from '../components/TitleDetailModal'
 import { requestStatus } from '../lib/status'
 
+/**
+ * Adapt a request row to the shape `TitleDetailModal` expects. The modal
+ * self-correlates live state by `(tmdb_id, media_type)` off its own polled
+ * `useRequests`/`useQueue`, so this is just enough to identify the title and
+ * paint its poster while that correlation resolves — `overview` is omitted
+ * (requests don't carry it and the modal never reads it) and `media_type` is
+ * NARROWED (never cast) from the backend's free string to the literal union,
+ * per the "UI only ever sets these" contract in types.ts.
+ */
+function requestToDiscoverResult(request: RequestResponse): DiscoverResult {
+  return {
+    media_type: request.media_type === 'tv' ? 'tv' : 'movie',
+    tmdb_id: request.tmdb_id,
+    title: request.title,
+    year: request.year ?? null,
+    poster_url: request.poster_url ?? null,
+    backdrop_url: request.backdrop_url ?? null,
+  }
+}
+
 /** One request rendered as a row card (poster · title/meta · status). */
-function RequestRow({ request }: { request: RequestResponse }) {
+function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () => void }) {
   const meta: string[] = []
   if (request.year != null) meta.push(String(request.year))
   meta.push(request.media_type)
@@ -20,43 +41,58 @@ function RequestRow({ request }: { request: RequestResponse }) {
   const showImg = Boolean(request.poster_url) && !imgFailed
 
   return (
-    <li className="flex items-center gap-4 rounded-xl border border-hairline bg-surface p-4">
-      {showImg ? (
-        <img
-          src={request.poster_url ?? undefined}
-          alt=""
-          loading="lazy"
-          className="aspect-[2/3] w-11 shrink-0 rounded object-cover"
-          onError={() => setImgFailed(true)}
-        />
-      ) : (
-        <div className="aspect-[2/3] w-11 shrink-0 rounded bg-poster bg-gradient-to-b from-white/10 to-transparent" />
-      )}
-      <div className="min-w-0 flex-1">
-        <p className="truncate font-display font-semibold text-ink">{request.title}</p>
-        <p className="mt-0.5 flex items-center gap-2 font-mono text-xs text-muted">
-          <span className="truncate">{meta.join(' · ')}</span>
-          {request.is_anime ? (
-            <span className="shrink-0 rounded bg-gold/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-gold">
-              ANIME
-            </span>
+    <li className="rounded-xl border border-hairline bg-surface">
+      {/* role="button" (not a native <button>) so the block-level row content
+          (div/p/ul/li) stays valid HTML5 — mirrors the PosterCard convention. */}
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={onOpen}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onOpen()
+          }
+        }}
+        className="flex w-full cursor-pointer items-center gap-4 rounded-xl p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+      >
+        {showImg ? (
+          <img
+            src={request.poster_url ?? undefined}
+            alt=""
+            loading="lazy"
+            className="aspect-[2/3] w-11 shrink-0 rounded object-cover"
+            onError={() => setImgFailed(true)}
+          />
+        ) : (
+          <div className="aspect-[2/3] w-11 shrink-0 rounded bg-poster bg-gradient-to-b from-white/10 to-transparent" />
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="truncate font-display font-semibold text-ink">{request.title}</p>
+          <p className="mt-0.5 flex items-center gap-2 font-mono text-xs text-muted">
+            <span className="truncate">{meta.join(' · ')}</span>
+            {request.is_anime ? (
+              <span className="shrink-0 rounded bg-gold/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-gold">
+                ANIME
+              </span>
+            ) : null}
+          </p>
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-1.5">
+          <StatusBadge status={requestStatus(request.status)} />
+          {request.media_type === 'tv' && request.seasons && request.seasons.length > 0 ? (
+            <ul className="flex flex-wrap justify-end gap-1">
+              {request.seasons.map((season) => (
+                <li key={season.season_number}>
+                  <StatusBadge
+                    status={requestStatus(season.status)}
+                    detail={`S${season.season_number}`}
+                  />
+                </li>
+              ))}
+            </ul>
           ) : null}
-        </p>
-      </div>
-      <div className="flex shrink-0 flex-col items-end gap-1.5">
-        <StatusBadge status={requestStatus(request.status)} />
-        {request.media_type === 'tv' && request.seasons && request.seasons.length > 0 ? (
-          <ul className="flex flex-wrap justify-end gap-1">
-            {request.seasons.map((season) => (
-              <li key={season.season_number}>
-                <StatusBadge
-                  status={requestStatus(season.status)}
-                  detail={`S${season.season_number}`}
-                />
-              </li>
-            ))}
-          </ul>
-        ) : null}
+        </div>
       </div>
     </li>
   )
@@ -65,6 +101,18 @@ function RequestRow({ request }: { request: RequestResponse }) {
 export function Requests() {
   const { data, isLoading, isError, error, refetch } = useRequests({ poll: true })
   const requests = data?.requests ?? []
+
+  // The same TitleDetailModal Discover uses — reused, not forked. It correlates
+  // its own live state by (tmdb_id, media_type), so opening it from a request
+  // row reproduces the full state-aware action zone (re-search, retry-import,
+  // report a problem, cancel, keep-forever) right where the stuck status lives.
+  const [selected, setSelected] = useState<DiscoverResult | null>(null)
+  const [modalOpen, setModalOpen] = useState(false)
+
+  const openRequest = (request: RequestResponse) => {
+    setSelected(requestToDiscoverResult(request))
+    setModalOpen(true)
+  }
 
   let body: ReactNode
   if (isLoading) {
@@ -94,7 +142,7 @@ export function Requests() {
     body = (
       <ul className="flex flex-col gap-3">
         {requests.map((request) => (
-          <RequestRow key={request.id} request={request} />
+          <RequestRow key={request.id} request={request} onOpen={() => openRequest(request)} />
         ))}
       </ul>
     )
@@ -111,6 +159,9 @@ export function Requests() {
         ) : null}
       </header>
       {body}
+      {selected !== null ? (
+        <TitleDetailModal title={selected} open={modalOpen} onOpenChange={setModalOpen} />
+      ) : null}
     </div>
   )
 }
