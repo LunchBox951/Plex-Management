@@ -129,9 +129,49 @@ describe('deriveTileState — settled row degrades a stale request-derived base'
 
   it('keeps presence-derived "available" through a settled failed row', () => {
     // Library presence is independent of the request lifecycle — failed doesn't evict.
+    // The settled row is the ONLY row: an old failure beside a genuinely-present
+    // title (the dominant "owned, never re-requested" case).
     const state = deriveTileState(
       result({ library_state: 'available' }),
       [request({ status: 'failed' })],
+    )
+    expect(state).toEqual({ label: 'In library', intent: 'available' })
+  })
+
+  it('drops the "available" base when a movie re-request beside an older available row failed', () => {
+    // The movie create path NEVER creates a second row while Plex still has the
+    // title (its fresh is_available(use_cache=False) check dedups to the in-library
+    // row instead) — so a newer request coexisting with an older `available` row
+    // proves the title read ABSENT at create time. When that re-request settles,
+    // the page-load `available` base is stale history: unbadge, don't flip back to
+    // "In library" for a file the create already proved gone.
+    const state = deriveTileState(result({ library_state: 'available' }), [
+      request({ id: 1, status: 'available' }),
+      request({ id: 2, status: 'failed' }),
+    ])
+    expect(state).toBeNull()
+  })
+
+  it('drops the "available" base when a movie re-request beside an older available row cancelled', () => {
+    const state = deriveTileState(result({ library_state: 'available' }), [
+      request({ id: 1, status: 'available' }),
+      request({ id: 2, status: 'cancelled' }),
+    ])
+    expect(state).toBeNull()
+  })
+
+  it('keeps the tv "available" base when a season re-request beside an older available row failed', () => {
+    // TV is deliberately NOT covered by the movie contradiction rule: a season-level
+    // re-request (e.g. a newly aired season) is legitimately created while the show
+    // remains partially/fully present (_present_seasons_or_empty only dedups when
+    // EVERY requested season is present), so its failure says nothing about the
+    // seasons already on disk.
+    const state = deriveTileState(
+      result({ tmdb_id: 7, media_type: 'tv', library_state: 'available' }),
+      [
+        request({ id: 1, tmdb_id: 7, media_type: 'tv', status: 'available' }),
+        request({ id: 2, tmdb_id: 7, media_type: 'tv', status: 'failed' }),
+      ],
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })

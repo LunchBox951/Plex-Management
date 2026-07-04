@@ -76,7 +76,24 @@ export function deriveTileState(
     // gone, so the request-derived base (`requested`/`processing`/
     // `partially_available`) is stale and must not fall through either. Degrade to
     // presence-derived truth.
-    return settledBaseFallback(result.library_state, liveRequest.status)
+    //
+    // MOVIE re-request contradiction: a settled liveRequest that coexists with an
+    // OLDER `available` row proves the page-load `available` base stale too. The
+    // movie create path (request_service.create_request) NEVER creates a second row
+    // while Plex still has the title — its fresh `is_available(use_cache=False)`
+    // check dedups to the existing in-library row instead — so the newer request's
+    // very existence means the title read ABSENT at create time (the G7
+    // removed-then-re-requested path). Not applied to tv: a season-level re-request
+    // (e.g. a newly aired season) is legitimately created while the show remains
+    // partially/fully present, so its failure says nothing about the seasons on disk.
+    const rerequestContradictsPresence =
+      result.media_type === 'movie' &&
+      matches.some((r) => r !== liveRequest && r.status === 'available')
+    return settledBaseFallback(
+      result.library_state,
+      liveRequest.status,
+      rerequestContradictsPresence,
+    )
   }
 
   // No live row for this title: the server base is the only source of truth.
@@ -98,7 +115,15 @@ export function deriveTileState(
  * don't invalidate, and a request row in `available` cannot itself settle to
  * failed/cancelled (cancel excludes it; ADR-0014 report-issue re-arms to an ACTIVE
  * status, which the overlay shows live), so a settled row beside an `available` base
- * is an old row beside a genuinely-present title.
+ * is usually an old row beside a genuinely-present title.
+ *
+ * The exception is `presenceContradicted` (movies only, see the caller): when the
+ * settled row is a RE-REQUEST that coexists with an older `available` row, the movie
+ * create path's fresh Plex check proved the title ABSENT at create time (it would
+ * have deduped to the in-library row otherwise), so the page-load `available` base is
+ * itself stale history — drop it. The two narrow ways a movie re-request exists
+ * WITHOUT proven absence (Plex unconfigured, or a transient outage during the create's
+ * check) also can't verify presence, so degrading to unbadged stays the honest hint.
  *
  * `evicted` is stricter: ADR-0012 eviction means the disk-pressure sweep DELETED the
  * file, which directly contradicts a page-load `available` snapshot. The live evicted
@@ -114,8 +139,9 @@ export function deriveTileState(
 function settledBaseFallback(
   state: DiscoverResult['library_state'],
   settledStatus: string,
+  presenceContradicted: boolean,
 ): StatusPresentation | null {
-  if (settledStatus === 'evicted') return null
+  if (settledStatus === 'evicted' || presenceContradicted) return null
   return state === 'available' ? libraryStateToPresentation(state) : null
 }
 
