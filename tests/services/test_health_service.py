@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.services import health_service
 from plex_manager.services.health_service import (
+    AutograbStatus,
     HealthCredentials,
     ReconcileStatus,
     SubsystemHealth,
@@ -365,6 +366,7 @@ async def test_collect_health_snapshot_offloads_disk_reads_and_never_blocks(
                 cache=TtlCache(),
                 creds=HealthCredentials(),
                 reconcile_status=ReconcileStatus(),
+                autograb_status=AutograbStatus(),
                 library_roots={"movies_root": str(tmp_path), "tv_root": None},
             )
         )
@@ -427,6 +429,9 @@ async def test_collect_health_snapshot_wires_everything_together(
     reconcile_status = ReconcileStatus()
     reconcile_status.mark_run_started()
     reconcile_status.mark_ok()
+    autograb_status = AutograbStatus()
+    autograb_status.mark_run_started()
+    autograb_status.mark_ok()
 
     async with sessionmaker_() as session, _client(_fail) as client:
         snapshot = await collect_health_snapshot(
@@ -435,6 +440,7 @@ async def test_collect_health_snapshot_wires_everything_together(
             cache=TtlCache(),
             creds=HealthCredentials(),
             reconcile_status=reconcile_status,
+            autograb_status=autograb_status,
             library_roots={"movies_root": str(tmp_path), "tv_root": None},
         )
 
@@ -444,6 +450,8 @@ async def test_collect_health_snapshot_wires_everything_together(
     assert [g.root for g in snapshot.disks] == ["movies_root"]
     assert snapshot.reconcile.last_ok_at is not None
     assert snapshot.reconcile.consecutive_failures == 0
+    assert snapshot.autograb.last_ok_at is not None
+    assert snapshot.autograb.consecutive_failures == 0
 
 
 def test_ttl_cache_get_set_and_expiry() -> None:

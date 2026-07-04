@@ -188,9 +188,10 @@ export interface paths {
         };
         /**
          * Health Endpoint
-         * @description One read: per-subsystem reachability, disk gauges, and the reconcile
-         *     loop's own health. Each upstream probe is TTL-cached (~15s) so polling this
-         *     every few seconds never hammers an upstream or burns the TMDB rate limit.
+         * @description One read: per-subsystem reachability, disk gauges, and the reconcile +
+         *     auto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so
+         *     polling this every few seconds never hammers an upstream or burns the TMDB
+         *     rate limit.
          */
         get: operations["health_endpoint_api_v1_ops_health_get"];
         put?: never;
@@ -820,6 +821,39 @@ export interface components {
             app_api_key: string;
         };
         /**
+         * AutograbStatusItem
+         * @description The background auto-grab loop's own health (ADR-0013), mirrored from
+         *     ``services.health_service.AutograbStatusSnapshot``. The exact shape of
+         *     ``ReconcileStatusItem`` above, for the separate ``_autograb_loop`` -- a
+         *     Prowlarr outage surfaces here as a failing loop so the operator sees WHY
+         *     nothing is being grabbed, not just that requests sit at ``pending``.
+         *
+         *     ``cooled_down_scopes`` is how many scopes are CURRENTLY in a grab-pipeline
+         *     cooldown (ADR-0013): scopes whose grab keeps failing, skipped so they don't
+         *     starve the search budget -- a non-zero count is the operator's signal that the
+         *     grab pipeline (not the search) is what's broken.
+         */
+        AutograbStatusItem: {
+            /**
+             * Consecutive Failures
+             * @default 0
+             */
+            consecutive_failures: number;
+            /**
+             * Cooled Down Scopes
+             * @default 0
+             */
+            cooled_down_scopes: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+        };
+        /**
          * BlocklistEntry
          * @description A blocklist entry as returned to the client.
          */
@@ -1099,6 +1133,7 @@ export interface components {
          *     healthy, is the reconcile loop running, how full is the disk".
          */
         HealthResponse: {
+            autograb: components["schemas"]["AutograbStatusItem"];
             /** Disks */
             disks: components["schemas"]["DiskGaugeItem"][];
             reconcile: components["schemas"]["ReconcileStatusItem"];
@@ -1475,6 +1510,8 @@ export interface components {
          *     NEVER serialized.
          */
         SettingsResponse: {
+            /** Auto Grab Enabled */
+            auto_grab_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
             disk_pressure_target_percent?: number | null;
             /** Disk Pressure Threshold Percent */
@@ -1518,6 +1555,8 @@ export interface components {
          *     encrypted at rest. ``None`` / absent fields are left unchanged.
          */
         SettingsUpdate: {
+            /** Auto Grab Enabled */
+            auto_grab_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
             disk_pressure_target_percent?: number | null;
             /** Disk Pressure Threshold Percent */

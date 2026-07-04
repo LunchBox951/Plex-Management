@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, case, or_, select, update
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.repositories import RequestRecord
@@ -31,6 +31,17 @@ _SETTLED_REQUEST_STATUSES: frozenset[RequestStatus] = frozenset(
 )
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Coerce a stored timestamp to tz-aware UTC (SQLite returns naive values).
+
+    Mirrors ``repositories.downloads._as_utc``: the app always stores UTC, and the
+    auto-grab worker does aware-datetime arithmetic on ``next_search_at``.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 def _to_record(row: MediaRequest) -> RequestRecord:
     """Map a ``MediaRequest`` ORM row to its frozen read-model DTO."""
     return RequestRecord(
@@ -46,6 +57,8 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         backdrop_url=row.backdrop_url,
         library_path=row.library_path,
         keep_forever=bool(row.keep_forever),
+        search_attempts=row.search_attempts,
+        next_search_at=_as_utc(row.next_search_at),
     )
 
 
@@ -86,6 +99,55 @@ class SqlRequestRepository:
         stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
+
+    async def list_due_for_search(
+        self, statuses: frozenset[str], now: datetime
+    ) -> list[RequestRecord]:
+        # The ``next_search_at`` backoff gate applies ONLY to a PARKED
+        # (``no_acceptable_release``) request -- it earned its escalating backoff and
+        # must wait it out. ``pending`` and ``searching`` are EAGER: always due
+        # immediately, so a request deliberately re-armed to ``searching`` (a failed
+        # download) during a stale 24h backoff window is picked up on the very next
+        # tick instead of staying suppressed until that stale timestamp expires
+        # (ADR-0013 §3). ``search_attempts``/``next_search_at`` are only ever bumped
+        # when a scope is PARKED, so an eager row's leftover timestamp is exactly the
+        # staleness this rule ignores.
+        parked = MediaRequest.status == RequestStatus.no_acceptable_release
+        due = or_(
+            ~parked,  # eager (pending/searching): always due
+            MediaRequest.next_search_at.is_(None),  # never scheduled: due now
+            MediaRequest.next_search_at <= now,  # parked + backoff elapsed
+        )
+        # Effective due-time for ordering: a parked row sorts by its scheduled
+        # backoff; an eager row collapses to NULL so it sorts due-now, never behind a
+        # parked row by a stale ``next_search_at`` (case unmatched -> NULL).
+        effective_due = case((parked, MediaRequest.next_search_at))
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.media_type == MediaType.movie,
+                MediaRequest.status.in_([RequestStatus(s) for s in statuses]),
+                due,
+            )
+            # NULL ("due now") first, then oldest-scheduled, then ``id`` as the
+            # deterministic tiebreak. ``nulls_first()`` is EXPLICIT because the
+            # default NULL ordering differs by backend (SQLite sorts NULLs first,
+            # PostgreSQL last) and Postgres is a config swap -- a never-searched
+            # request (search-on-approve) must outrank a scheduled-but-overdue one.
+            .order_by(effective_due.asc().nulls_first(), MediaRequest.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def schedule_search(
+        self, request_id: int, *, search_attempts: int, next_search_at: datetime | None
+    ) -> None:
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.search_attempts = search_attempts
+        row.next_search_at = next_search_at
+        await self._session.flush()
 
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         stmt = (

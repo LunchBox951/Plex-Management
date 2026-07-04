@@ -59,6 +59,13 @@ class RequestRecord(BaseModel):
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` must never
     # select this title, regardless of watch state or disk pressure.
     keep_forever: bool = False
+    # Auto-grab scheduling (ADR-0013): the escalating-backoff bookkeeping the
+    # background worker reads to decide the next search delay. ``search_attempts``
+    # counts nothing-acceptable searches so far; ``next_search_at`` is the earliest
+    # instant the worker may search again (``None`` = due now). Movie-scoped; the
+    # TV mirror lives on ``SeasonRequestRecord``.
+    search_attempts: int = 0
+    next_search_at: datetime | None = None
 
 
 class DownloadRecord(BaseModel):
@@ -104,6 +111,11 @@ class SeasonRequestRecord(BaseModel):
     # The per-season mirror of ``RequestRecord.library_path`` (ADR-0012): the
     # final placed path this season's import wrote into, ``None`` until set.
     library_path: str | None = None
+    # Auto-grab scheduling (ADR-0013): the per-season mirror of
+    # ``RequestRecord.search_attempts`` / ``next_search_at`` -- a TV grab is always
+    # per-season, so the backoff ladder is tracked here.
+    search_attempts: int = 0
+    next_search_at: datetime | None = None
 
 
 class BlocklistRecord(BaseModel):
@@ -183,6 +195,31 @@ class RequestRepository(Protocol):
 
     async def list_by_status(self, status: str | None = None) -> list[RequestRecord]:
         """List requests, optionally filtered by ``status``."""
+        raise NotImplementedError
+
+    async def list_due_for_search(
+        self, statuses: frozenset[str], now: datetime
+    ) -> list[RequestRecord]:
+        """List MOVIE requests due for an auto-grab search (ADR-0013).
+
+        Returns every ``media_type == 'movie'`` request whose ``status`` is in
+        ``statuses`` AND whose ``next_search_at`` is either ``NULL`` (never
+        scheduled -> due now, so a freshly created request is searched on the
+        next tick) or ``<= now``. Ordered NULLs-first then oldest-due-first so a
+        per-cycle search cap picks the most-overdue scopes. TV requests are
+        deliberately excluded -- a TV grab is per-season, driven by
+        :meth:`SeasonRequestRepository.list_due_for_search` instead.
+        """
+        raise NotImplementedError
+
+    async def schedule_search(
+        self, request_id: int, *, search_attempts: int, next_search_at: datetime | None
+    ) -> None:
+        """Persist the auto-grab backoff bookkeeping for a request (ADR-0013).
+
+        Sets ``search_attempts`` and ``next_search_at`` together; never touches
+        ``status`` (the caller drives that via the honest state transitions).
+        """
         raise NotImplementedError
 
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
@@ -394,6 +431,30 @@ class SeasonRequestRepository(Protocol):
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         """List season requests, optionally filtered by ``status``."""
+        raise NotImplementedError
+
+    async def list_due_for_search(
+        self, statuses: frozenset[str], now: datetime
+    ) -> list[SeasonRequestRecord]:
+        """List season requests due for an auto-grab search (ADR-0013).
+
+        The per-season mirror of :meth:`RequestRepository.list_due_for_search`:
+        every season whose ``status`` is in ``statuses`` and whose
+        ``next_search_at`` is ``NULL`` (due now) or ``<= now``, ordered
+        NULLs-first then oldest-due-first. Each record carries its parent show's
+        denormalized ``tmdb_id`` (as everywhere in this repo).
+        """
+        raise NotImplementedError
+
+    async def schedule_search(
+        self, season_request_id: int, *, search_attempts: int, next_search_at: datetime | None
+    ) -> None:
+        """Persist a season's auto-grab backoff bookkeeping (ADR-0013).
+
+        The per-season mirror of :meth:`RequestRepository.schedule_search`; never
+        touches ``status`` and never recomputes the parent rollup (the backoff
+        columns do not feed ``rollup_status``).
+        """
         raise NotImplementedError
 
     async def ensure(
