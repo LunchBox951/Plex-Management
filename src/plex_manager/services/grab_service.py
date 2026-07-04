@@ -436,6 +436,21 @@ async def grab(
                 if record.status not in _TERMINAL_STATUS_VALUES:
                     if request_id is not None and record.media_request_id != request_id:
                         raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+                    # The reuse race was lost to THIS request's OTHER grab (two
+                    # seasons of one multi-season pack racing to resurrect the same
+                    # terminal row). The winner's row carries the winner's scope, so
+                    # returning it for a NON-covered scope would report this grab as
+                    # success while the requested season/episodes stay silently
+                    # untracked — the exact lie the non-race active paths guard with
+                    # ``_reuse_conflicts``. Apply the same check here.
+                    if _reuse_conflicts(record, season, episodes):
+                        raise DownloadScopeConflictError(
+                            torrent_hash,
+                            active_season=record.season,
+                            active_episodes=record.episodes,
+                            requested_season=season,
+                            requested_episodes=episodes,
+                        )
                     return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
         except IntegrityError:
@@ -550,6 +565,18 @@ async def grab(
                     if request_id is not None and record.media_request_id != request_id:
                         raise TorrentAlreadyTrackedError(
                             torrent_hash, record.media_request_id
+                        ) from None
+                    # Mirror of the non-race branch above: a reuse race lost to THIS
+                    # request's other grab must still refuse a non-covered scope
+                    # instead of returning the winner's row as success (the requested
+                    # season/episodes would be silently untracked).
+                    if _reuse_conflicts(record, season, episodes):
+                        raise DownloadScopeConflictError(
+                            torrent_hash,
+                            active_season=record.season,
+                            active_episodes=record.episodes,
+                            requested_season=season,
+                            requested_episodes=episodes,
                         ) from None
                     return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None

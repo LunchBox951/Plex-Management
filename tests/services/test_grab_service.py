@@ -1096,3 +1096,88 @@ async def test_grab_terminal_reuse_cas_lost_rejects_new_owner(
         assert row.media_request_id == owner_id
         assert current is not None and current.status == RequestStatus.searching
         assert (await session.execute(select(DownloadHistory))).scalars().all() == []
+
+
+async def test_grab_terminal_reuse_cas_lost_to_same_request_conflicting_scope_raises(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse-race loser within ONE request: two grabs (e.g. two seasons of the same
+    multi-season pack) race to resurrect the same terminal row. The loser sees the
+    row now active under the SAME ``media_request_id`` — but carrying the WINNER's
+    scope (season 1). Returning it would report the season-2 grab as success while
+    season 2 stays silently untracked (the importer only ever processes the active
+    row's stored scope). The loser must hit the same ``_reuse_conflicts`` guard the
+    non-race active paths apply and raise ``DownloadScopeConflictError``."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=900, media_type=MediaType.tv, title="Some Show", status=RequestStatus.pending
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(SeasonRequest(media_request_id=request_id, season_number=1, status="pending"))
+        session.add(SeasonRequest(media_request_id=request_id, season_number=2, status="pending"))
+        # The pack's prior life ended terminal (failed, not blocklisted).
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=request_id,
+                tmdb_id=900,
+                failed_reason="prior failure",
+            )
+        )
+        await session.commit()
+
+    real_update = grab_service.SqlDownloadRepository.update_status_if_in
+
+    async def racing_update(
+        self: grab_service.SqlDownloadRepository,
+        download_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        **kwargs: Any,
+    ) -> bool:
+        # The SAME request's season-1 grab claims the terminal row just before this
+        # (season-2) grab's CAS lands, stamping the winner's scope.
+        async with sessionmaker_() as other:
+            row = await other.get(Download, download_id)
+            assert row is not None
+            row.status = "downloading"
+            row.media_request_id = request_id
+            row.season = 1
+            row.episodes_json = None
+            await other.commit()
+        return await real_update(self, download_id, status, allowed_from, **kwargs)
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "update_status_if_in", racing_update)
+
+    async with sessionmaker_() as session:
+        with pytest.raises(DownloadScopeConflictError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+            )
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # The winner's claim is intact; the losing season was never falsely marked.
+    assert row.status == "downloading"
+    assert row.season == 1
+    assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "pending"}
