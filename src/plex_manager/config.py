@@ -72,26 +72,30 @@ def _has_setup_token(settings: Settings) -> bool:
     return token is not None and bool(token.get_secret_value().strip())
 
 
-def validate_startup_exposure(settings: Settings) -> None:
-    """Refuse startup that would expose tokenless first-run setup.
+def validate_startup_exposure(settings: Settings, *, initialized: bool) -> None:
+    """Refuse startup that would expose tokenless FIRST-RUN setup.
 
-    With ``dev_auth_bypass`` off and no (non-blank) ``setup_token``, an
-    uninitialized server would be unclaimable-yet-exposed: the pre-init setup
-    dependencies 401 every request (there is no token to match), while
-    ``/setup/status`` honestly advertises that no token is required — a setup
-    deadlock. And the alternative — allowing tokenless pre-init — would let
-    anyone who can reach the port drive the setup ``validate/*`` probes
-    (server-side requests to caller-supplied URLs) and complete first-run setup,
-    claiming the install. So the only honest posture is to refuse to serve at
-    all until the operator picks one: set a token or explicitly enable the dev
-    bypass.
+    Only a first-run-capable server (``initialized`` False) is refused. With
+    ``dev_auth_bypass`` off and no (non-blank) ``setup_token``, an uninitialized
+    server would be unclaimable-yet-exposed: the pre-init setup dependencies 401
+    every request (there is no token to match), while ``/setup/status`` honestly
+    advertises that no token is required — a setup deadlock. And the alternative
+    — allowing tokenless pre-init — would let anyone who can reach the port
+    drive the setup ``validate/*`` probes (server-side requests to
+    caller-supplied URLs) and complete first-run setup, claiming the install. So
+    the only honest posture is to refuse to serve until the operator picks one:
+    set a token or explicitly enable the dev bypass.
 
-    Called from BOTH launch paths so they cannot diverge: the console entry
-    point (``python -m plex_manager`` / the Docker entrypoint) before uvicorn
-    starts, and the ASGI ``lifespan`` for anything that serves
-    ``plex_manager.web.app:app`` directly (``uvicorn plex_manager.web.app:app``,
-    ASGI platforms) and would otherwise skip the ``__main__`` guard entirely.
+    An INITIALIZED install is exempt: every post-init route is gated by the app
+    API key and the setup token is never consulted again, so requiring the env
+    var forever would break ordinary restarts/upgrades of a healthy install for
+    no protective gain. ``initialized`` lives in the database, so the guard is
+    enforced from the ASGI ``lifespan`` (the one place every launch path —
+    ``python -m plex_manager``, the Docker entrypoint, a bare
+    ``uvicorn plex_manager.web.app:app`` — passes through once the state is
+    known); ``__main__`` deliberately carries no separate pre-uvicorn check, so
+    the paths cannot diverge.
     """
-    if settings.dev_auth_bypass or _has_setup_token(settings):
+    if initialized or settings.dev_auth_bypass or _has_setup_token(settings):
         return
     raise SystemExit(_UNSAFE_STARTUP_MESSAGE)

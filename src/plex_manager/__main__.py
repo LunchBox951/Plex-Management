@@ -1,21 +1,25 @@
-"""Console entry point: ``python -m plex_manager`` (and the ``plex-manager`` script)."""
+"""Console entry point: ``python -m plex_manager`` (and the ``plex-manager`` script).
+
+Deliberately NO tokenless-exposure check here: whether the setup token is
+required depends on ``SystemSettings.initialized`` (DB state this synchronous
+entry point cannot see), and the ASGI ``lifespan`` — which every launch path
+runs, including this one via uvicorn — enforces
+:func:`plex_manager.config.validate_startup_exposure` once that state is known.
+A second, config-only check here would refuse initialized installs that no
+longer need the token (restarts/upgrades) and could drift from the lifespan's
+enforcement.
+"""
 
 from __future__ import annotations
 
 import uvicorn
 
-# Re-exported so callers/tests may keep importing it from the entry point; the
-# guard itself lives in ``config`` because the ASGI ``lifespan`` applies the SAME
-# check on launch paths that never run this module (see validate_startup_exposure).
-from plex_manager.config import get_settings, validate_startup_exposure
-
-__all__ = ["main", "validate_startup_exposure"]
+from plex_manager.config import get_settings
 
 
 def main() -> None:
     """Run the ASGI server using the configured host/port."""
     settings = get_settings()
-    validate_startup_exposure(settings)
     uvicorn.run(
         "plex_manager.web.app:app",
         host=settings.host,

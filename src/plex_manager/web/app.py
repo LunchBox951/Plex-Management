@@ -642,22 +642,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     previously defined but unused), and its sibling drain/eviction background
     tasks — each on its OWN interval, never the 15s reconcile tick.
     """
-    # Uniform launch-path guard (Codex PR #21): ``python -m plex_manager`` refuses
-    # tokenless first-run exposure before uvicorn starts, but anything serving
-    # ``plex_manager.web.app:app`` directly (uvicorn CLI, an ASGI platform) skipped
-    # that ``__main__``-only check — and then deadlocked setup: the pre-init gate
-    # 401s every call (no token to match) while /setup/status honestly advertises
-    # no token is needed. Enforcing the SAME guard here makes the divergent state
-    # unservable on every launch path instead of loosening pre-init auth (tokenless
-    # pre-init would expose the validate/* SSRF probes and let anyone who can reach
-    # the port claim the install). Raised BEFORE any persistence/task setup.
-    validate_startup_exposure(get_settings())
     maker = get_sessionmaker()
     app.state.sessionmaker = maker
     async with maker() as session:
         system = await ensure_system_settings(session)
         initialized = system.initialized
         await session.commit()
+    # Uniform launch-path guard (Codex PR #21): every launch path — the console
+    # entry point / Docker entrypoint AND anything serving
+    # ``plex_manager.web.app:app`` directly — passes through this lifespan, so
+    # enforcing here (and ONLY here) means advertisement and enforcement cannot
+    # diverge. Tokenless + bypass-off would otherwise deadlock first-run setup
+    # (the pre-init gate 401s every call while /setup/status honestly advertises
+    # no token) — and loosening pre-init auth instead would expose the
+    # validate/* SSRF probes and let anyone who can reach the port claim the
+    # install. Enforced AFTER the ``initialized`` read because only a
+    # FIRST-RUN-CAPABLE server is refused: an initialized install is API-key
+    # gated everywhere and never consults the setup token again, so it must
+    # keep restarting/upgrading tokenless.
+    validate_startup_exposure(get_settings(), initialized=initialized)
     prepare_encryption(initialized=initialized)
 
     app.state.http_client = create_upstream_http_client()
