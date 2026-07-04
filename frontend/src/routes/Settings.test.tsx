@@ -178,6 +178,87 @@ describe('Settings — tv_root library picker (optional)', () => {
   })
 })
 
+describe('Settings — anime library roots (ADR-0015, optional)', () => {
+  beforeEach(() => {
+    h.mutateAsync.mockReset()
+    h.mutateAsync.mockResolvedValue({})
+    h.settingsData = {
+      plex_url: 'http://plex:32400',
+      plex_token: '***',
+      prowlarr_url: 'http://prowlarr:9696',
+      prowlarr_api_key: '***',
+      qbittorrent_url: 'http://qb:8080',
+      qbittorrent_username: 'admin',
+      qbittorrent_password: '***',
+      tmdb_api_key: '***',
+      movies_root: '/plex/movies',
+      tv_root: '/plex/tv',
+      anime_movie_root: null,
+      anime_tv_root: null,
+    }
+    h.libraries = [
+      { path: '/plex/movies', section_key: '1', section_type: 'movie', title: 'Movies', writable: true },
+      { path: '/plex/tv', section_key: '2', section_type: 'tv', title: 'TV Shows', writable: true },
+      { path: '/plex/anime-movies', section_key: '3', section_type: 'movie', title: 'Anime Movies', writable: true },
+      { path: '/plex/anime-tv', section_key: '4', section_type: 'tv', title: 'Anime', writable: true },
+    ]
+  })
+
+  it('never blocks Save when neither anime root is chosen', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().anime_movie_root).toBe('')
+    expect(lastBody().anime_tv_root).toBe('')
+    // The normal roots are untouched by the anime-only pickers being unset.
+    expect(lastBody().movies_root).toBe('/plex/movies')
+    expect(lastBody().tv_root).toBe('/plex/tv')
+  })
+
+  it('picks anime roots from the same Plex library lists as Movies/TV and saves them', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('Anime movies library folder'), {
+      target: { value: '/plex/anime-movies' },
+    })
+    fireEvent.change(screen.getByLabelText('Anime TV library folder'), {
+      target: { value: '/plex/anime-tv' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().anime_movie_root).toBe('/plex/anime-movies')
+    expect(lastBody().anime_tv_root).toBe('/plex/anime-tv')
+  })
+
+  it('clears anime roots when the Plex connection changes and they are not re-picked', async () => {
+    h.settingsData = {
+      ...h.settingsData!,
+      anime_movie_root: '/plex/anime-movies',
+      anime_tv_root: '/plex/anime-tv',
+    }
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
+      target: { value: 'http://new-plex:32400' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().anime_movie_root).toBe('')
+    expect(lastBody().anime_tv_root).toBe('')
+  })
+
+  it('keeps anime roots when the Plex connection is untouched', async () => {
+    h.settingsData = {
+      ...h.settingsData!,
+      anime_movie_root: '/plex/anime-movies',
+      anime_tv_root: '/plex/anime-tv',
+    }
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().anime_movie_root).toBe('/plex/anime-movies')
+    expect(lastBody().anime_tv_root).toBe('/plex/anime-tv')
+  })
+})
+
 describe('Settings — operability fields (ADR-0012, R3-1)', () => {
   beforeEach(() => {
     h.mutateAsync.mockReset()

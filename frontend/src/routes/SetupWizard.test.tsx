@@ -110,7 +110,81 @@ describe('SetupWizard — tv library picker', () => {
   it('shows the tv section as optional when no folder is chosen', async () => {
     render(<SetupWizard />, { wrapper: MemoryRouter })
     fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
-    await screen.findByLabelText('TV library folder')
-    expect(screen.getByText(/^optional$/i)).toBeInTheDocument()
+    const tvSelect = await screen.findByLabelText('TV library folder')
+    // Scoped to the TV Library section -- the Anime library section (ADR-0015)
+    // also renders an "optional" badge, so an unscoped query would now match
+    // both.
+    const tvSection = tvSelect.closest('section')
+    expect(tvSection).not.toBeNull()
+    expect(within(tvSection!).getByText(/^optional$/i)).toBeInTheDocument()
+  })
+})
+
+describe('SetupWizard — anime library pickers (ADR-0015, optional)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useSetupStatus as unknown as Mock).mockReturnValue({
+      isLoading: false,
+      data: { initialized: false, app_api_key: null },
+    })
+    ;(useValidateService as unknown as Mock).mockReturnValue({
+      mutateAsync: validateMock,
+      isPending: false,
+    })
+    ;(useCompleteSetup as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+  })
+
+  it('reuses the Movies/TV Plex library lists for the anime pickers', async () => {
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
+
+    const animeMovieSelect = await screen.findByLabelText('Anime movies library folder')
+    const animeTvSelect = screen.getByLabelText('Anime TV library folder')
+
+    expect(within(animeMovieSelect).getByText(/Movies —/)).toBeInTheDocument()
+    expect(within(animeMovieSelect).queryByText(/TV Shows/)).not.toBeInTheDocument()
+
+    expect(within(animeTvSelect).getByText(/TV Shows —/)).toBeInTheDocument()
+    expect(within(animeTvSelect).queryByText(/^Movies —/)).not.toBeInTheDocument()
+  })
+
+  it('never requires an anime library folder -- setup completes with neither chosen', async () => {
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+
+    const movieSelect = await screen.findByLabelText('Movies library folder')
+    fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
+
+    // Anime pickers are visible but never touched -- setup still completes.
+    expect(screen.queryByLabelText('Anime movies library folder')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Anime TV library folder')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
+  })
+
+  it('submits chosen anime roots on complete', async () => {
+    const completeMock = vi.fn().mockResolvedValue({ app_api_key: null })
+    ;(useCompleteSetup as unknown as Mock).mockReturnValue({
+      mutateAsync: completeMock,
+      isPending: false,
+    })
+    render(<SetupWizard />, { wrapper: MemoryRouter })
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(validateMock).toHaveBeenCalledTimes(4))
+
+    const movieSelect = await screen.findByLabelText('Movies library folder')
+    fireEvent.change(movieSelect, { target: { value: '/media/movies' } })
+    fireEvent.change(screen.getByLabelText('Anime movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
+    await waitFor(() => expect(completeMock).toHaveBeenCalledTimes(1))
+    const body = completeMock.mock.calls[0]![0] as Record<string, string>
+    expect(body.anime_movie_root).toBe('/media/movies')
   })
 })

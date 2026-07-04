@@ -1101,7 +1101,7 @@ export interface components {
              * Root
              * @enum {string}
              */
-            root: "movies_root" | "tv_root";
+            root: "movies_root" | "tv_root" | "anime_movie_root" | "anime_tv_root";
         };
         /**
          * EvictResponse
@@ -1598,6 +1598,10 @@ export interface components {
          *     NEVER serialized.
          */
         SettingsResponse: {
+            /** Anime Movie Root */
+            anime_movie_root?: string | null;
+            /** Anime Tv Root */
+            anime_tv_root?: string | null;
             /** Auto Grab Enabled */
             auto_grab_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
@@ -1643,6 +1647,10 @@ export interface components {
          *     encrypted at rest. ``None`` / absent fields are left unchanged.
          */
         SettingsUpdate: {
+            /** Anime Movie Root */
+            anime_movie_root?: string | null;
+            /** Anime Tv Root */
+            anime_tv_root?: string | null;
             /** Auto Grab Enabled */
             auto_grab_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
@@ -1685,6 +1693,10 @@ export interface components {
          * @description The validated credential set written on ``POST /setup/complete``.
          */
         SetupCompleteRequest: {
+            /** Anime Movie Root */
+            anime_movie_root?: string | null;
+            /** Anime Tv Root */
+            anime_tv_root?: string | null;
             /** Movies Root */
             movies_root: string;
             /** Plex Token */

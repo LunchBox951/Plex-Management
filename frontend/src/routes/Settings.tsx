@@ -44,6 +44,10 @@ interface FormState {
   tmdb_api_key: string
   movies_root: string
   tv_root: string
+  // Anime library routing (ADR-0015) — both OPTIONAL, mirroring tv_root
+  // exactly: unset means anime imports fall back to movies_root/tv_root.
+  anime_movie_root: string
+  anime_tv_root: string
   // Operability (ADR-0012) — stored as strings so a number input can hold an
   // in-progress edit (e.g. a momentarily empty field while retyping) without
   // fighting the controlled-input value; parsed back to a number on save.
@@ -71,6 +75,8 @@ function initialForm(data: SettingsResponse): FormState {
     tmdb_api_key: '',
     movies_root: data.movies_root ?? '',
     tv_root: data.tv_root ?? '',
+    anime_movie_root: data.anime_movie_root ?? '',
+    anime_tv_root: data.anime_tv_root ?? '',
     disk_pressure_threshold_percent: String(
       data.disk_pressure_threshold_percent ?? DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
     ),
@@ -96,6 +102,8 @@ type TextKey =
   | 'qbittorrent_username'
   | 'movies_root'
   | 'tv_root'
+  | 'anime_movie_root'
+  | 'anime_tv_root'
 type SecretKey = 'plex_token' | 'prowlarr_api_key' | 'qbittorrent_password' | 'tmdb_api_key'
 type NumberKey =
   | 'disk_pressure_threshold_percent'
@@ -264,6 +272,9 @@ export function Settings() {
   const [manualPath, setManualPath] = useState(false)
   // Same, for the (optional) tv library folder.
   const [manualTvPath, setManualTvPath] = useState(false)
+  // Same, for the (optional) anime library folders (ADR-0015).
+  const [manualAnimeMoviePath, setManualAnimeMoviePath] = useState(false)
+  const [manualAnimeTvPath, setManualAnimeTvPath] = useState(false)
   useEffect(() => {
     if (data && form === null) setForm(initialForm(data))
   }, [data, form])
@@ -389,6 +400,13 @@ export function Settings() {
     const clearMoviesRoot = plexConnectionChanged && !moviesRootReselected
     const tvRootReselected = form.tv_root !== (data.tv_root ?? '')
     const clearTvRoot = plexConnectionChanged && !tvRootReselected
+    // Anime roots (ADR-0015) get the SAME treatment: a Plex reconnect must not
+    // carry an old server's anime root over any more than it may for
+    // movies_root/tv_root.
+    const animeMovieRootReselected = form.anime_movie_root !== (data.anime_movie_root ?? '')
+    const clearAnimeMovieRoot = plexConnectionChanged && !animeMovieRootReselected
+    const animeTvRootReselected = form.anime_tv_root !== (data.anime_tv_root ?? '')
+    const clearAnimeTvRoot = plexConnectionChanged && !animeTvRootReselected
 
     // Plaintext fields always written; secrets only when the user typed a value,
     // so an untouched secret stays the backend's no-op (left unchanged).
@@ -399,6 +417,8 @@ export function Settings() {
       qbittorrent_username: form.qbittorrent_username,
       movies_root: clearMoviesRoot ? '' : form.movies_root,
       tv_root: clearTvRoot ? '' : form.tv_root,
+      anime_movie_root: clearAnimeMovieRoot ? '' : form.anime_movie_root,
+      anime_tv_root: clearAnimeTvRoot ? '' : form.anime_tv_root,
       // Operability (ADR-0012) knobs are always written (not secrets, and there
       // is no "leave unchanged" state to preserve like the passwords above) so
       // the form is a faithful, web-only editor for every safety knob. A
@@ -435,6 +455,8 @@ export function Settings() {
               tmdb_api_key: '',
               ...(clearMoviesRoot ? { movies_root: '' } : {}),
               ...(clearTvRoot ? { tv_root: '' } : {}),
+              ...(clearAnimeMovieRoot ? { anime_movie_root: '' } : {}),
+              ...(clearAnimeTvRoot ? { anime_tv_root: '' } : {}),
             }
           : prev,
       )
@@ -585,6 +607,109 @@ export function Settings() {
                 ) : null}
               </>
             )}
+          </div>
+        </section>
+
+        {/* Anime library routing (ADR-0015) — both OPTIONAL and reuse the SAME
+            Plex library list as Movies/TV above (an anime library is an
+            ordinary Plex movie/tv section, just a different one). Unset =
+            anime imports fall back to the Movies/TV roots above, identical to
+            behavior before this feature existed. Neither field gates Save. */}
+        <section className="rounded-xl border border-hairline bg-surface p-5">
+          <h2 className="font-display text-sm font-semibold text-ink">Anime library</h2>
+          <p className="mt-1 text-xs text-faint">
+            Optional. Route anime movies/episodes to a separate Plex library instead of the
+            Movies/TV folders above. Leave unset to keep anime in the normal libraries.
+          </p>
+          <div className="mt-4 flex flex-col gap-4">
+            <div className="flex flex-col gap-2">
+              {!manualAnimeMoviePath && movieLibraries.length > 0 ? (
+                <>
+                  <select
+                    aria-label="Anime movies library folder"
+                    className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                    value={form.anime_movie_root}
+                    onChange={(e) => setField('anime_movie_root', e.target.value)}
+                  >
+                    <option value="">No anime movies library folder…</option>
+                    {movieLibraries.map((lib) => (
+                      <option
+                        key={`${lib.section_key}:${lib.path}`}
+                        value={lib.path}
+                        disabled={lib.writable === false}
+                      >
+                        {lib.title} — {lib.path}
+                        {lib.writable === false ? ' · not writable by the app' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="self-start text-xs text-gold hover:underline"
+                    onClick={() => setManualAnimeMoviePath(true)}
+                  >
+                    Use a custom path instead
+                  </button>
+                </>
+              ) : (
+                <>
+                  {textField('anime_movie_root', 'Anime movies library folder', '/library/anime-movies')}
+                  {movieLibraries.length > 0 ? (
+                    <button
+                      type="button"
+                      className="self-start text-xs text-gold hover:underline"
+                      onClick={() => setManualAnimeMoviePath(false)}
+                    >
+                      ← Pick from a Plex library instead
+                    </button>
+                  ) : null}
+                </>
+              )}
+            </div>
+            <div className="flex flex-col gap-2">
+              {!manualAnimeTvPath && tvLibraries.length > 0 ? (
+                <>
+                  <select
+                    aria-label="Anime TV library folder"
+                    className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+                    value={form.anime_tv_root}
+                    onChange={(e) => setField('anime_tv_root', e.target.value)}
+                  >
+                    <option value="">No anime TV library folder…</option>
+                    {tvLibraries.map((lib) => (
+                      <option
+                        key={`${lib.section_key}:${lib.path}`}
+                        value={lib.path}
+                        disabled={lib.writable === false}
+                      >
+                        {lib.title} — {lib.path}
+                        {lib.writable === false ? ' · not writable by the app' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="self-start text-xs text-gold hover:underline"
+                    onClick={() => setManualAnimeTvPath(true)}
+                  >
+                    Use a custom path instead
+                  </button>
+                </>
+              ) : (
+                <>
+                  {textField('anime_tv_root', 'Anime TV library folder', '/library/anime-tv')}
+                  {tvLibraries.length > 0 ? (
+                    <button
+                      type="button"
+                      className="self-start text-xs text-gold hover:underline"
+                      onClick={() => setManualAnimeTvPath(false)}
+                    >
+                      ← Pick from a Plex library instead
+                    </button>
+                  ) : null}
+                </>
+              )}
+            </div>
           </div>
         </section>
 
