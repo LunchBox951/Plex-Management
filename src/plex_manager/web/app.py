@@ -29,7 +29,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings
+from plex_manager.config import get_settings, validate_startup_exposure
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -642,6 +642,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     previously defined but unused), and its sibling drain/eviction background
     tasks — each on its OWN interval, never the 15s reconcile tick.
     """
+    # Uniform launch-path guard (Codex PR #21): ``python -m plex_manager`` refuses
+    # tokenless first-run exposure before uvicorn starts, but anything serving
+    # ``plex_manager.web.app:app`` directly (uvicorn CLI, an ASGI platform) skipped
+    # that ``__main__``-only check — and then deadlocked setup: the pre-init gate
+    # 401s every call (no token to match) while /setup/status honestly advertises
+    # no token is needed. Enforcing the SAME guard here makes the divergent state
+    # unservable on every launch path instead of loosening pre-init auth (tokenless
+    # pre-init would expose the validate/* SSRF probes and let anyone who can reach
+    # the port claim the install). Raised BEFORE any persistence/task setup.
+    validate_startup_exposure(get_settings())
     maker = get_sessionmaker()
     app.state.sessionmaker = maker
     async with maker() as session:

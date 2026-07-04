@@ -4,24 +4,12 @@ from __future__ import annotations
 
 import uvicorn
 
-from plex_manager.config import Settings, get_settings
+# Re-exported so callers/tests may keep importing it from the entry point; the
+# guard itself lives in ``config`` because the ASGI ``lifespan`` applies the SAME
+# check on launch paths that never run this module (see validate_startup_exposure).
+from plex_manager.config import get_settings, validate_startup_exposure
 
-_UNSAFE_BIND_MESSAGE = (
-    "Refusing to start a first-run-capable server without PLEX_MANAGER_SETUP_TOKEN. "
-    "Set PLEX_MANAGER_SETUP_TOKEN or explicitly enable PLEX_MANAGER_DEV_AUTH_BYPASS."
-)
-
-
-def _has_setup_token(settings: Settings) -> bool:
-    token = settings.setup_token
-    return token is not None and bool(token.get_secret_value().strip())
-
-
-def validate_startup_exposure(settings: Settings) -> None:
-    """Refuse startup that would expose tokenless first-run setup."""
-    if settings.dev_auth_bypass or _has_setup_token(settings):
-        return
-    raise SystemExit(_UNSAFE_BIND_MESSAGE)
+__all__ = ["main", "validate_startup_exposure"]
 
 
 def main() -> None:

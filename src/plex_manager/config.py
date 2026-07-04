@@ -59,3 +59,39 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the cached application settings."""
     return Settings()
+
+
+_UNSAFE_STARTUP_MESSAGE = (
+    "Refusing to start a first-run-capable server without PLEX_MANAGER_SETUP_TOKEN. "
+    "Set PLEX_MANAGER_SETUP_TOKEN or explicitly enable PLEX_MANAGER_DEV_AUTH_BYPASS."
+)
+
+
+def _has_setup_token(settings: Settings) -> bool:
+    token = settings.setup_token
+    return token is not None and bool(token.get_secret_value().strip())
+
+
+def validate_startup_exposure(settings: Settings) -> None:
+    """Refuse startup that would expose tokenless first-run setup.
+
+    With ``dev_auth_bypass`` off and no (non-blank) ``setup_token``, an
+    uninitialized server would be unclaimable-yet-exposed: the pre-init setup
+    dependencies 401 every request (there is no token to match), while
+    ``/setup/status`` honestly advertises that no token is required — a setup
+    deadlock. And the alternative — allowing tokenless pre-init — would let
+    anyone who can reach the port drive the setup ``validate/*`` probes
+    (server-side requests to caller-supplied URLs) and complete first-run setup,
+    claiming the install. So the only honest posture is to refuse to serve at
+    all until the operator picks one: set a token or explicitly enable the dev
+    bypass.
+
+    Called from BOTH launch paths so they cannot diverge: the console entry
+    point (``python -m plex_manager`` / the Docker entrypoint) before uvicorn
+    starts, and the ASGI ``lifespan`` for anything that serves
+    ``plex_manager.web.app:app`` directly (``uvicorn plex_manager.web.app:app``,
+    ASGI platforms) and would otherwise skip the ``__main__`` guard entirely.
+    """
+    if settings.dev_auth_bypass or _has_setup_token(settings):
+        return
+    raise SystemExit(_UNSAFE_STARTUP_MESSAGE)
