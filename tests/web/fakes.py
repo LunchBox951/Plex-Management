@@ -34,6 +34,7 @@ from plex_manager.web.deps import (
     get_library_optional,
     get_prowlarr,
     get_qbittorrent,
+    get_qbittorrent_optional,
     get_tmdb,
 )
 
@@ -260,6 +261,7 @@ class FakeLibrary:
         available_tv_seasons: dict[int, frozenset[int]] | None = None,
         sections: list[LibrarySection] | None = None,
         watch_states: dict[tuple[int, str, int | None], WatchState] | None = None,
+        raises: Exception | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
@@ -268,6 +270,11 @@ class FakeLibrary:
         self.scan_calls: list[tuple[str, str]] = []
         self.watch_states = watch_states or {}
         self.watch_state_calls: list[tuple[int, str, int | None]] = []
+        # When set, ``is_available``/``present_seasons`` raise this instead of
+        # returning -- lets a caller exercise the best-effort "log and treat as
+        # not-present" error path (see request_service._already_in_library /
+        # _present_seasons_or_empty, season_request_service._present_seasons).
+        self.raises = raises
 
     async def is_available(
         self,
@@ -277,6 +284,8 @@ class FakeLibrary:
         use_cache: bool = True,
         season: int | None = None,
     ) -> bool:
+        if self.raises is not None:
+            raise self.raises
         # No cache to bypass; ``use_cache`` is accepted to match LibraryPort.
         if media_type == "tv":
             seasons = self.available_tv_seasons.get(tmdb_id)
@@ -286,6 +295,8 @@ class FakeLibrary:
         return tmdb_id in self.available_ids
 
     async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        if self.raises is not None:
+            raise self.raises
         # The show's present seasons in one lookup (mirrors PlexLibrary's single
         # crawl); empty for an absent show, matching the real adapter.
         return self.available_tv_seasons.get(tmdb_id, frozenset())
@@ -294,7 +305,8 @@ class FakeLibrary:
         self.scanned.append(path)
         self.scan_calls.append((path, media_type))
 
-    async def list_sections(self) -> list[LibrarySection]:
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+        del use_cache  # the fake has no cache to bypass
         return list(self.sections)
 
     async def watch_state(
@@ -322,7 +334,9 @@ def override_adapters(
 
     ``library`` overrides BOTH the required (``get_library``) and optional
     (``get_library_optional``) Plex dependencies, so the request-dedupe and import
-    endpoints see the same fake.
+    endpoints see the same fake. ``qbt`` likewise overrides BOTH the required
+    (``get_qbittorrent``) and optional (``get_qbittorrent_optional``, the mark-failed
+    endpoint's DB-only-friendly variant) qBittorrent dependencies.
     """
     if tmdb is not None:
         app.dependency_overrides[get_tmdb] = lambda: tmdb
@@ -330,6 +344,7 @@ def override_adapters(
         app.dependency_overrides[get_prowlarr] = lambda: prowlarr
     if qbt is not None:
         app.dependency_overrides[get_qbittorrent] = lambda: qbt
+        app.dependency_overrides[get_qbittorrent_optional] = lambda: qbt
     if library is not None:
         app.dependency_overrides[get_library] = lambda: library
         app.dependency_overrides[get_library_optional] = lambda: library

@@ -222,14 +222,15 @@ def test_prefer_season_pack_breaks_ties_toward_the_pack() -> None:
     assert result.no_acceptable_release is False
 
 
-def test_prefer_season_pack_prefers_a_multi_season_pack_over_a_single_episode() -> None:
-    # A whole-season grab: no exact S02 pack, but an S01-S03 multi-season pack that
-    # covers S02 and a HIGHER-seeded single episode. The multi-season pack must win --
-    # it can satisfy the whole requested season, a single episode cannot. Before the
-    # fix multi_season_pack earned no scope bonus and the single episode's seeder edge
-    # made it the top grab.
-    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP", seeders=10)
-    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=500)
+def test_multi_season_pack_is_permanently_rejected_not_preferred() -> None:
+    # Issue #24 beta posture (mirrors Sonarr's MultiSeasonSpecification): a
+    # multi-season pack (S01-S03) is a PERMANENT rejection, never scored -- even
+    # for a whole-season grab where it covers the requested season and out-seeds
+    # the alternative. This app's one-download-one-season model can't satisfy
+    # several seasons from a single grab without stranding sibling
+    # SeasonRequests, so the engine must never prefer/accept one.
+    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP", seeders=500)
+    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=10)
     result = decide(
         [multi, single],
         FakeParser(),
@@ -238,7 +239,37 @@ def test_prefer_season_pack_prefers_a_multi_season_pack_over_a_single_episode() 
         _never_blocklisted,
         prefer_season_pack=True,
     )
-    assert result.accepted[0].candidate.title == "Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP"
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02E05.1080p.WEB-DL.x264-GRP"]
+    assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
+
+
+def test_multi_season_pack_rejected_even_without_prefer_season_pack() -> None:
+    # The rejection is unconditional -- it does not depend on the
+    # prefer_season_pack tiebreak being enabled (e.g. specific episodes named, or
+    # a plain unscoped search).
+    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP")
+    result = decide([multi], FakeParser(), default_profile(), _always_media, _never_blocklisted)
+    assert result.accepted == []
+    assert result.no_acceptable_release is True
+    assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
+
+
+def test_single_season_pack_still_classified_and_preferred() -> None:
+    # A single-season pack (S02, no episode token) is unaffected by the
+    # multi-season gate: classify_release_scope still reports "season_pack" and
+    # it still earns the prefer_season_pack tiebreak over a single episode.
+    pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
+    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=500)
+    result = decide(
+        [pack, single],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+    assert result.accepted[0].candidate.title == "Show.S02.1080p.WEB-DL.x264-GRP"
+    assert result.rejected == []
 
 
 def test_prefer_season_pack_never_beats_a_higher_quality_release() -> None:

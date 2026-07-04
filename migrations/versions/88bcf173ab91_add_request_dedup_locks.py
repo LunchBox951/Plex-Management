@@ -1,7 +1,7 @@
 """add request dedup locks
 
 Revision ID: 88bcf173ab91
-Revises: 41d427bd38e6
+Revises: 088a027cb4ec
 Create Date: 2026-07-01 00:00:00.000000
 """
 
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "88bcf173ab91"
-down_revision: str | None = "41d427bd38e6"
+down_revision: str | None = "088a027cb4ec"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

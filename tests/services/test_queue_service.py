@@ -73,8 +73,9 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
     )
 
     # The client reports nothing — the torrent is gone beyond the grace window.
+    qbt = FakeQbittorrent(statuses=[])
     async with sessionmaker_() as session:
-        queue = await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+        queue = await queue_service.reconcile_and_list(qbt, session)
 
     # The blocklist + re-search fired, so the download completed FailedPending ->
     # Failed and drops out of the active queue (no zombie row left behind).
@@ -97,6 +98,9 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
     assert request.status is RequestStatus.searching
     # The row reached the terminal Failed state (not stranded at failed_pending).
     assert failed.status == "failed"
+    # ADR-0014 seeding-leak fix: the reconcile-driven failure removed the torrent
+    # WITH its data (mirrors the operator mark-failed path in test_queue.py).
+    assert qbt.removed == [(_HASH, True)]
 
 
 async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate(
@@ -189,7 +193,9 @@ async def test_mark_failed_routes_downloading_through_failed_pending(
         download_id = download.id
 
     async with sessionmaker_() as session:
-        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=False
+        )
     assert record.status == "failed"
 
 
@@ -206,7 +212,9 @@ async def test_mark_failed_routes_import_pending_through_failed_pending(
         download_id = download.id
 
     async with sessionmaker_() as session:
-        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=True)
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=True
+        )
     assert record.status == "failed"
 
     async with sessionmaker_() as session:
@@ -289,7 +297,9 @@ async def test_mark_failed_without_blocklist_rearms_request(
         request_id, download_id = request.id, download.id
 
     async with sessionmaker_() as session:
-        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=False
+        )
     assert record.status == "failed"
 
     async with sessionmaker_() as session:
@@ -424,7 +434,9 @@ async def test_mark_failed_for_tv_rearms_the_season_not_the_request_directly(
         request_id, season_id, download_id = request.id, season_row.id, download.id
 
     async with sessionmaker_() as session:
-        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=False
+        )
     assert record.status == "failed"
 
     async with sessionmaker_() as session:
@@ -486,6 +498,64 @@ async def test_missing_beyond_grace_never_regresses_an_already_available_season(
     assert download.status == "failed"  # this attempt's own failure stays visible
 
 
+class _TxRecordingQbt(FakeQbittorrent):
+    """A :class:`FakeQbittorrent` that records whether the session was mid-transaction
+    at each ``remove`` -- so a test can prove the reconcile-driven removal runs AFTER
+    the commit (``in_transaction()`` False), not inside the open write transaction."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        super().__init__(statuses=[])
+        self._session = session
+        self.in_tx_at_remove: list[bool] = []
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        self.in_tx_at_remove.append(self._session.in_transaction())
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_reconcile_removes_the_failed_torrent_after_the_commit(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding #3: qbt.remove is external client I/O, so it must run AFTER
+    ``reconcile_and_list``'s final commit, never inside the open reconcile write
+    transaction (which would hold SQLite's write lock across the round-trip)."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    async with sessionmaker_() as session:
+        qbt = _TxRecordingQbt(session)
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The removal happened (seeding-leak fix) AND it happened post-commit (outside a
+    # transaction), proving it no longer runs inside the reconcile write transaction.
+    assert qbt.removed == [(_HASH, True)]
+    assert qbt.in_tx_at_remove == [False]
+
+
+async def test_reconcile_does_not_remove_when_the_commit_fails(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding #3's honesty guarantee: because the removal is deferred to AFTER the
+    commit, a commit failure means NO torrent removal was even attempted -- the DB and
+    the client stay consistent (nothing deleted against a rolled-back transaction)."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+
+        async def _boom() -> None:
+            raise RuntimeError("commit blew up")
+
+        monkeypatch.setattr(session, "commit", _boom)
+        with pytest.raises(RuntimeError):
+            await queue_service.reconcile_and_list(qbt, session)
+
+    assert qbt.removed == []  # the post-commit removal loop was never reached
+
+
 async def test_mark_failed_never_regresses_an_already_available_season(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -516,7 +586,9 @@ async def test_mark_failed_never_regresses_an_already_available_season(
         request_id, season_id, download_id = request.id, season_row.id, download.id
 
     async with sessionmaker_() as session:
-        record = await queue_service.mark_failed(session, download_id=download_id, blocklist=False)
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=False
+        )
     assert record.status == "failed"
 
     async with sessionmaker_() as session:

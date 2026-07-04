@@ -34,12 +34,14 @@ from plex_manager.services.grab_service import (
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
+    ServiceNotConfiguredError,
     get_filesystem,
     get_library,
     get_movies_root_optional,
     get_parser,
     get_prowlarr,
     get_qbittorrent,
+    get_qbittorrent_optional,
     get_quality_profile,
     get_session,
     get_tv_root_optional,
@@ -303,12 +305,31 @@ async def import_endpoint(
 async def mark_failed_endpoint(
     download_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
     blocklist: Annotated[bool, Query()] = False,
+    remove_torrent: Annotated[bool, Query()] = True,
 ) -> QueueItem:
-    """Operator move: mark a download failed (optionally blocklisting the release)."""
+    """Operator move: mark a download failed (optionally blocklisting the release).
+
+    ``remove_torrent`` (default true): also remove the torrent + its data from the
+    client, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup
+    never blocks the fail/blocklist/re-arm.
+
+    qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): the DB-only
+    fail/blocklist/re-arm path never touches it, so ``remove_torrent=false`` still
+    works on an install with qBittorrent unconfigured. When removal IS requested but
+    the client is unconfigured, this re-imposes the honest 409 ``service_not_configured``
+    up front (before any state change) rather than silently skipping the removal.
+    """
+    if remove_torrent and qbt is None:
+        raise ServiceNotConfiguredError("qbittorrent")
     try:
         record = await queue_service.mark_failed(
-            session, download_id=download_id, blocklist=blocklist
+            session,
+            qbt,
+            download_id=download_id,
+            blocklist=blocklist,
+            remove_torrent=remove_torrent,
         )
     except LookupError as exc:
         raise HTTPException(

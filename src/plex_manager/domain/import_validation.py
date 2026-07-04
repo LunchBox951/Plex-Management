@@ -33,6 +33,7 @@ imports a port or adapter, so it stays trivially testable and I/O-free.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -66,10 +67,22 @@ __all__ = [
 
 # Files whose *name* marks them as a sample/extra rather than the feature. These
 # are dropped from consideration up front so a 40 MB "sample.mkv" can never be
-# chosen as the largest-file feature when the real movie is also present.
+# chosen as the largest-file feature when the real movie is also present. A match
+# is title-aware (see :func:`_looks_like_sample_name`): a movie/show genuinely
+# titled "Proof" or "Trailer Park Boys" is not dropped just because its own name
+# matches one of these ambiguous marker words.
+#
+# The trailing boundary is a NON-consuming lookahead (``(?=...)``), not a matched
+# separator. A consuming trailing separator would be eaten by one match and then
+# be unavailable as the *leading* boundary of the very next token, so two adjacent
+# markers (``Proof.Trailer``) would hide the second from ``finditer``: the
+# title-explained ``Proof`` match would swallow the ``.`` and ``Trailer`` — a real
+# extra marker — would never be examined, letting the extra survive as a feature
+# candidate. The lookahead leaves that separator in place so consecutive markers
+# are each seen (see :func:`_looks_like_sample_name`).
 _SAMPLE_EXTRAS = re.compile(
     r"(?:^|[\s._\-])(?:sample|trailer|extras?|featurette|behind[\s._\-]?the[\s._\-]?scenes|"
-    r"deleted[\s._\-]?scene|rarbg\.com)(?:$|[\s._\-])",
+    r"deleted[\s._\-]?scene|proof|rarbg\.com)(?=$|[\s._\-])",
     re.IGNORECASE,
 )
 
@@ -215,8 +228,38 @@ def _is_video(name: str) -> bool:
     return _extension(name) in VIDEO_EXTENSIONS
 
 
-def _looks_like_sample_name(name: str) -> bool:
-    return _SAMPLE_EXTRAS.search(name) is not None
+def _marker_key(marker_match: str) -> str:
+    """Canonicalise a ``_SAMPLE_EXTRAS`` match to a separator-agnostic key.
+
+    A match carries its leading boundary char (``.trailer``) or none at the start
+    of the string (``trailer``); internal separators vary too (``behind.the.scenes``
+    vs ``behind the scenes``). Collapsing every run of separators to a single space
+    and stripping yields one canonical key per marker, so the same marker keys
+    identically wherever it appears — letting the title/filename occurrence COUNTS
+    line up in :func:`_looks_like_sample_name`.
+    """
+    return re.sub(r"[\s._\-]+", " ", marker_match.lower()).strip()
+
+
+def _looks_like_sample_name(name: str, expected_title: str) -> bool:
+    """Return ``True`` when ``name`` carries a sample/extra marker NOT explained by the title.
+
+    ``_SAMPLE_EXTRAS`` matches ambiguous tokens (``proof``, ``trailer``, ``sample``,
+    ...) that are also valid movie/show titles. The carve-out is COUNT-based, not a
+    set-subset test: a marker is a genuine sample/extra only when the FILE NAME
+    carries it MORE times than the expected (canonical TMDB) title legitimately
+    does. A movie titled ``Proof`` explains one ``proof`` in the filename, and a
+    show titled ``Trailer Park Boys: The Movie`` explains one ``trailer`` — but a
+    SECOND ``trailer`` in ``Trailer.Park.Boys.The.Movie.Trailer.2006`` is a real
+    extra marker and rejects. A subset test would instead excuse EVERY occurrence
+    once the word appeared anywhere in the title, letting that trailing ``Trailer``
+    ride along as the feature.
+    """
+    title_markers = Counter(
+        _marker_key(match.group(0)) for match in _SAMPLE_EXTRAS.finditer(expected_title)
+    )
+    name_markers = Counter(_marker_key(match.group(0)) for match in _SAMPLE_EXTRAS.finditer(name))
+    return any(count > title_markers[key] for key, count in name_markers.items())
 
 
 def _is_multi_part(relative_path: str, expected_title: str) -> bool:
@@ -251,8 +294,11 @@ def validate_import(
 
     Steps (movies-first):
 
-    1. Keep only video-extension files and drop names that mark a sample/extra; if
-       nothing survives, reject :attr:`~ImportRejectionReason.NO_VIDEO_FILE`.
+    1. Keep only video-extension files and drop names that mark a sample/extra —
+       UNLESS the marker word(s) are explained by ``expected_title`` (a movie
+       genuinely titled ``Proof`` is not dropped just because ``Proof`` also
+       matches the sample/extra marker regex); if nothing survives, reject
+       :attr:`~ImportRejectionReason.NO_VIDEO_FILE`.
     2. Choose the largest survivor by ``size_bytes`` as the feature.
     3. Parse its basename and run the SAME identity gate the grab path uses
        (:func:`matches_media`, title+year fallback because a file carries no
@@ -274,7 +320,7 @@ def validate_import(
         video
         for video in files
         if _is_video(_basename(video.relative_path))
-        and not _looks_like_sample_name(_basename(video.relative_path))
+        and not _looks_like_sample_name(_basename(video.relative_path), expected_title)
     ]
     if not videos:
         return ImportValidation(
@@ -394,7 +440,9 @@ def validate_season_import(
 
     1. Non-video-extension names and sample/extra-named files
        (:func:`_looks_like_sample_name`) are dropped up front, silently — same as
-       :func:`validate_import`; they were never episode candidates.
+       :func:`validate_import`, including the same title carve-out (a show whose
+       title contains an ambiguous marker word, e.g. ``Trailer Park Boys``, is not
+       silently emptied of every episode file); they were never episode candidates.
     2. Parse the FULL folder-qualified relative path — a season-pack folder
        routinely carries the season/quality tokens an individual episode filename
        omits (mirrors :func:`validate_import`'s folder-qualified parse).
@@ -437,7 +485,7 @@ def validate_season_import(
 
     for video in files:
         name = _basename(video.relative_path)
-        if not _is_video(name) or _looks_like_sample_name(name):
+        if not _is_video(name) or _looks_like_sample_name(name, expected_title):
             continue
 
         # Parse the FULL relative path (folder included) — see step 2 above.

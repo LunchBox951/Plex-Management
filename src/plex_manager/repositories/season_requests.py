@@ -9,9 +9,10 @@ itself carries no ``tmdb_id`` column.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
@@ -25,6 +26,17 @@ if TYPE_CHECKING:
 __all__ = ["SqlSeasonRequestRepository"]
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Coerce a stored timestamp to tz-aware UTC (SQLite returns naive values).
+
+    Mirrors ``repositories.downloads._as_utc``; the auto-grab worker does
+    aware-datetime arithmetic on ``next_search_at``.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
     """Map a ``SeasonRequest`` ORM row (+ its parent's ``tmdb_id``) to the DTO."""
     return SeasonRequestRecord(
@@ -34,6 +46,8 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         status=row.status.value,
         tmdb_id=tmdb_id,
         library_path=row.library_path,
+        search_attempts=row.search_attempts,
+        next_search_at=_as_utc(row.next_search_at),
     )
 
 
@@ -127,6 +141,50 @@ class SqlSeasonRequestRepository:
             records.append(_to_record(row, tmdb_ids[row.media_request_id]))
         return records
 
+    async def list_due_for_search(
+        self, statuses: frozenset[str], now: datetime
+    ) -> list[SeasonRequestRecord]:
+        # JOIN to the parent's tmdb_id in ONE query (no per-row follow-up), same as
+        # ``list_for_requests``. The ``next_search_at`` backoff gate applies ONLY to a
+        # PARKED (``no_acceptable_release``) season; ``pending``/``searching`` are
+        # EAGER (always due immediately) so a season re-armed to ``searching`` (a
+        # failed download) during a stale backoff window is picked up on the very next
+        # tick, never suppressed until that stale timestamp expires -- the season-level
+        # mirror of ``SqlRequestRepository.list_due_for_search`` (see its docstring,
+        # ADR-0013 §3). NULL ("due now") first via an EXPLICIT ``nulls_first()`` --
+        # the default NULL ordering is backend-dependent (Postgres is a swap).
+        parked = SeasonRequest.status == RequestStatus.no_acceptable_release
+        due = or_(
+            ~parked,  # eager (pending/searching): always due
+            SeasonRequest.next_search_at.is_(None),  # never scheduled: due now
+            SeasonRequest.next_search_at <= now,  # parked + backoff elapsed
+        )
+        # A parked season sorts by its scheduled backoff; an eager season collapses
+        # to NULL so it sorts due-now, never behind a parked one by a stale timestamp.
+        effective_due = case((parked, SeasonRequest.next_search_at))
+        stmt = (
+            select(SeasonRequest, MediaRequest.tmdb_id)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(
+                SeasonRequest.status.in_([RequestStatus(s) for s in statuses]),
+                due,
+            )
+            .order_by(effective_due.asc().nulls_first(), SeasonRequest.id)
+        )
+        return [
+            _to_record(row, tmdb_id) for row, tmdb_id in (await self._session.execute(stmt)).all()
+        ]
+
+    async def schedule_search(
+        self, season_request_id: int, *, search_attempts: int, next_search_at: datetime | None
+    ) -> None:
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.search_attempts = search_attempts
+        row.next_search_at = next_search_at
+        await self._session.flush()
+
     async def ensure(
         self, media_request_id: int, season_number: int, *, status: str
     ) -> SeasonRequestRecord:
@@ -212,4 +270,19 @@ class SqlSeasonRequestRepository:
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = library_path
+        await self._session.flush()
+
+    async def clear_library_path(self, season_request_id: int) -> None:
+        """Drop the eviction/purge breadcrumb (ADR-0014's report-issue verb).
+
+        The season-level mirror of ``SqlRequestRepository.reset_for_research``'s
+        ``library_path`` clear: after report-issue purges the season's placed file
+        the breadcrumb must not keep pointing at a path that no longer exists (a
+        later sweep would only skip+log it, but leaving a stale breadcrumb is
+        dishonest). No-op-safe if the row vanished.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.library_path = None
         await self._session.flush()

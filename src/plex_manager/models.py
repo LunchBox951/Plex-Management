@@ -100,6 +100,17 @@ class RequestStatus(StrEnum):
     # now-off-disk row must never block a fresh active request for the same
     # media, so a re-request creates a new row rather than resurrecting this one.
     evicted = "evicted"
+    # The operator cancelled a not-yet-imported request (ADR-0014's cancel verb):
+    # "I don't want this anymore", distinct from report-issue's "redo it". SETTLED
+    # (terminal) and, exactly like ``available``/``failed``/``evicted``, deliberately
+    # OUTSIDE ``uq_media_requests_active``'s predicate so a later fresh request for
+    # the same media is allowed (the cancelled row is kept only for history). The
+    # ``status`` column is a plain VARCHAR (``native_enum=False`` => no CHECK
+    # constraint, see ``41d427bd38e6``) and ``cancelled`` (9 chars) fits the existing
+    # length, so adding this member needs NO column migration; and because the active
+    # partial index is an INCLUSION list that never named ``cancelled``, it is
+    # excluded by omission -- no index migration either (mirrors ``evicted``).
+    cancelled = "cancelled"
 
 
 class BlocklistReason(StrEnum):
@@ -125,6 +136,12 @@ class DownloadHistoryEvent(StrEnum):
     # hardening migration's CHECK explicitly includes this value for migrated
     # databases, and ``Base.metadata.create_all`` does the same for fresh ones.
     evicted = "evicted"
+    # ADR-0014 correction verbs: the audit row a report-issue / cancel writes. Like
+    # ``evicted`` these are not tied to a live torrent (``torrent_hash`` may be the
+    # culprit's, or ``None`` when no download ever existed). Same plain-VARCHAR
+    # ``event_type`` column, so neither member needs a migration of its own.
+    reported = "reported"
+    cancelled = "cancelled"
 
 
 def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
@@ -301,6 +318,16 @@ class MediaRequest(Base):
     # ``SeasonRequest``, but the pin itself lives on the parent show, so pinning a
     # series protects every one of its seasons.
     keep_forever: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    # Auto-grab scheduling (ADR-0013). ``search_attempts`` counts the number of
+    # background auto-grab searches that returned nothing acceptable for this
+    # (movie) request; it drives the escalating per-scope backoff. ``next_search_at``
+    # is the earliest instant the auto-grab worker may search this request again --
+    # ``NULL`` means "due now" (a freshly-created request is searched on the next
+    # tick). Both are movie-scoped here; the TV mirror lives on ``SeasonRequest``,
+    # since a TV grab is always per-season. Only touched by the auto-grab worker;
+    # the manual grab path never reads or writes them.
+    search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RequestDedupLock(Base):
@@ -348,6 +375,13 @@ class SeasonRequest(Base):
     # reconstruct" rule, same eviction target. ``None`` for seasons imported
     # before this breadcrumb existed.
     library_path: Mapped[str | None] = mapped_column(String)
+    # Auto-grab scheduling (ADR-0013) — the per-season mirror of the identically
+    # named columns on ``MediaRequest``. A TV grab is always per-season, so the
+    # backoff ladder is tracked here (not on the parent, whose status is a computed
+    # rollup). ``search_attempts`` counts nothing-acceptable searches for this
+    # season; ``next_search_at`` gates the next auto-grab search (``NULL`` = due now).
+    search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

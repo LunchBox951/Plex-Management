@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     DownloadHistory,
     DownloadHistoryEvent,
@@ -445,12 +446,19 @@ async def grab(
                     try:
                         await qbt.remove(torrent_hash, delete_files=True)
                     except Exception:
+                        # Static message + ids in extra= (log-hygiene convention, #35):
+                        # request_id/torrent_hash both trace from the /queue/grab body,
+                        # so they cross the same log-safe barriers as every other
+                        # request-derived log value -- CodeQL taints extra= fields too.
                         _logger.warning(
-                            "failed to remove orphaned torrent %s after losing a "
-                            "terminal-row reuse race for request %s",
-                            torrent_hash,
-                            request_id,
+                            "failed to remove orphaned torrent after losing a "
+                            "terminal-row reuse race; it may keep seeding until "
+                            "removed manually",
                             exc_info=True,
+                            extra={
+                                "request_id": safe_int(request_id),
+                                "torrent_hash": safe_text(torrent_hash),
+                            },
                         )
                     raise AlreadyDownloadingError(request_id) from None
             raise
@@ -486,12 +494,20 @@ async def grab(
                     try:
                         await qbt.remove(torrent_hash, delete_files=True)
                     except Exception:
+                        # request_id/torrent_hash trace from the /queue/grab body
+                        # (body.request_id -> the resolved request.id passed here),
+                        # so they go through the same log-safe barriers as every
+                        # other request-derived log value -- CodeQL taints ``extra``
+                        # fields like message args (log-hygiene convention, #35).
                         _logger.warning(
-                            "failed to remove orphaned torrent %s after losing a "
-                            "parallel grab for request %s",
-                            torrent_hash,
-                            request_id,
+                            "failed to remove orphaned torrent after losing a "
+                            "parallel grab for this request; it may keep seeding "
+                            "until removed manually",
                             exc_info=True,
+                            extra={
+                                "request_id": safe_int(request_id),
+                                "torrent_hash": safe_text(torrent_hash),
+                            },
                         )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)

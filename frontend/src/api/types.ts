@@ -46,6 +46,7 @@ export type QbittorrentValidateRequest = Schemas['QbittorrentValidateRequest']
 export type TmdbValidateRequest = Schemas['TmdbValidateRequest']
 
 export type KeepForeverBody = Schemas['KeepForeverBody']
+export type AppApiKeyResponse = Schemas['AppApiKeyResponse']
 
 /* ------------------------------------------------------------------- ops -- */
 // ADR-0012 — health/status dashboard, log viewer, disk-pressure eviction.

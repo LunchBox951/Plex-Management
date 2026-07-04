@@ -8,13 +8,15 @@ index over active statuses rejects the loser; ``create_request`` catches the
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex import PlexLibrary
-from plex_manager.adapters.plex.library import reset_caches
+from plex_manager.adapters.plex.library import PlexLibraryError, reset_caches
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
@@ -103,6 +105,29 @@ async def test_mark_no_acceptable_release_never_unterminates_finished_request(
         row = await session.get(MediaRequest, request_id)
     assert row is not None
     assert row.status is terminal_status  # untouched, not no_acceptable_release
+
+
+async def test_movie_availability_check_failure_logs_tmdb_id_via_extra(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Plex outage during the in-library short-circuit is logged with
+    ``tmdb_id`` carried via ``extra=`` (never interpolated into the message text)
+    -- see CONTRIBUTING.md's logging convention / CodeQL py/log-injection."""
+    tmdb = FakeTmdb(movies={999: MovieMetadata(tmdb_id=999, title="Arrival", year=2016)})
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.request_service"):
+        async with sessionmaker_() as session:
+            record = await request_service.create_request(
+                session, tmdb, tmdb_id=999, media_type="movie", library=library
+            )
+
+    assert record.status == RequestStatus.pending.value  # never blocked by the outage
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a warning to be logged"
+    assert "999" not in warnings[0].getMessage()  # the id is not interpolated into the text
+    assert getattr(warnings[0], "tmdb_id", None) == 999  # ...but present as a structured field
 
 
 async def test_create_request_collapses_racing_in_library_available_rows(
@@ -374,6 +399,31 @@ async def test_create_request_tv_seasons_param_creates_only_named_seasons(
 
     # Only the NAMED season is tracked, even though the show has 10 aired seasons.
     assert await _season_numbers(sessionmaker_, record.id) == {2}
+
+
+async def test_tv_season_presence_check_failure_logs_tmdb_id_via_extra(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The TV analogue of the movie availability-check-failure test: a Plex outage
+    during the per-season presence crawl logs ``tmdb_id`` via ``extra=``, never
+    interpolated into the message text."""
+    tmdb = FakeTmdb(
+        shows={5099: TvMetadata(tmdb_id=5099, title="Some Show", year=2020, season_count=3)}
+    )
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.request_service"):
+        async with sessionmaker_() as session:
+            record = await request_service.create_request(
+                session, tmdb, tmdb_id=5099, media_type="tv", seasons=[1], library=library
+            )
+
+    assert record.status == RequestStatus.pending.value  # never blocked by the outage
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a warning to be logged"
+    assert "5099" not in warnings[0].getMessage()
+    assert getattr(warnings[0], "tmdb_id", None) == 5099
 
 
 async def test_create_request_tv_second_post_with_new_seasons_grows_the_tracked_set(

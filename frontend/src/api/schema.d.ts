@@ -188,9 +188,10 @@ export interface paths {
         };
         /**
          * Health Endpoint
-         * @description One read: per-subsystem reachability, disk gauges, and the reconcile
-         *     loop's own health. Each upstream probe is TTL-cached (~15s) so polling this
-         *     every few seconds never hammers an upstream or burns the TMDB rate limit.
+         * @description One read: per-subsystem reachability, disk gauges, and the reconcile +
+         *     auto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so
+         *     polling this every few seconds never hammers an upstream or burns the TMDB
+         *     rate limit.
          */
         get: operations["health_endpoint_api_v1_ops_health_get"];
         put?: never;
@@ -383,6 +384,16 @@ export interface paths {
         /**
          * Mark Failed Endpoint
          * @description Operator move: mark a download failed (optionally blocklisting the release).
+         *
+         *     ``remove_torrent`` (default true): also remove the torrent + its data from the
+         *     client, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup
+         *     never blocks the fail/blocklist/re-arm.
+         *
+         *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): the DB-only
+         *     fail/blocklist/re-arm path never touches it, so ``remove_torrent=false`` still
+         *     works on an install with qBittorrent unconfigured. When removal IS requested but
+         *     the client is unconfigured, this re-imposes the honest 409 ``service_not_configured``
+         *     up front (before any state change) rather than silently skipping the removal.
          */
         post: operations["mark_failed_endpoint_api_v1_queue__download_id__mark_failed_post"];
         delete?: never;
@@ -442,6 +453,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/requests/{request_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Request Endpoint
+         * @description Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.
+         *
+         *     Removes any active torrent(s) WITH data (best-effort) and flips the request
+         *     (and every tracked season, for tv) to the settled ``cancelled`` status; the
+         *     row is kept for history and nothing is re-grabbed. A request past the
+         *     not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
+         *     to redo an imported title instead.
+         *
+         *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
+         *     ``pending``/``searching``/``no_acceptable_release`` request with NO active download
+         *     rows is a pure DB settle that never touches the client, so it still works on an
+         *     install with qBittorrent unconfigured. When there ARE active torrents to remove but
+         *     the client is unconfigured, the service refuses up front (409
+         *     ``service_not_configured``) rather than silently leaking a seeding torrent.
+         */
+        post: operations["cancel_request_endpoint_api_v1_requests__request_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/requests/{request_id}/keep-forever": {
         parameters: {
             query?: never;
@@ -462,6 +506,32 @@ export interface paths {
          *     a silent no-op.
          */
         post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/requests/{request_id}/report-issue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report Issue Endpoint
+         * @description Report a bad imported/available movie or TV season (ADR-0014).
+         *
+         *     Blocklists the culprit release, removes its torrent + the library file, and
+         *     synchronously re-searches for a DIFFERENT release (the honest
+         *     ``no_acceptable_release`` park if nothing is acceptable). Requires Plex +
+         *     qBittorrent + Prowlarr configured (their deps 409 ``service_not_configured``
+         *     otherwise). The correction-without-a-terminal button for "this file is bad".
+         */
+        post: operations["report_issue_endpoint_api_v1_requests__request_id__report_issue_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -521,6 +591,75 @@ export interface paths {
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/app-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Reveal App Key Endpoint
+         * @description Return the current app ``X-Api-Key`` in plaintext.
+         *
+         *     Authenticated: the caller already proved they hold a currently-valid key
+         *     (``require_api_key`` on the whole router), so this is not a privilege
+         *     escalation -- it is the break-glass recovery path for a NEW device/browser
+         *     that needs to be paired without re-running setup, and the belt-and-braces
+         *     answer to "I'm about to lose my only saved copy" (issue #28's OAuth-deferral
+         *     analysis: total key loss is the one genuine gap in keeping a static key for
+         *     the beta).
+         */
+        get: operations["reveal_app_key_endpoint_api_v1_settings_app_key_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/app-key/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate App Key Endpoint
+         * @description Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
+         *
+         *     Every OTHER device/browser with the OLD key saved (localStorage) is
+         *     immediately locked out -- there is exactly one live key at a time, matching
+         *     ``require_api_key``'s single-key comparison. The frontend caller of this
+         *     endpoint MUST persist the returned key immediately so the session that just
+         *     rotated it survives (the new key is never shown again after this response).
+         *
+         *     Compare-and-swap against concurrent rotations: two rotate requests carrying
+         *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
+         *     value) before either commits. Without a guard the write that commits second
+         *     would silently overwrite the first's freshly minted key, so the client that
+         *     fired the first request would be left displaying an already-dead key. The
+         *     re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
+         *     is a true atomic read-modify-write rather than check-then-act: the compare and
+         *     the write cannot interleave with another rotation, so the loser's re-read runs
+         *     only AFTER the winner has committed. Inside THIS request's own transaction we
+         *     re-read the stored key and require it to still equal the key the request
+         *     authenticated with; if it has already changed, the race happened and we answer
+         *     409 (``app_key_changed``) rather than clobber the winner. The check is skipped
+         *     under ``dev_auth_bypass`` (there is no authenticated key to compare against),
+         *     exactly like ``require_api_key`` itself.
+         */
+        post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -734,6 +873,54 @@ export interface components {
             source: string;
             /** Title */
             title: string;
+        };
+        /**
+         * AppApiKeyResponse
+         * @description The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+         *
+         *     Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
+         *     reveal is the belt-and-braces recovery path for a lost/forgotten key on a
+         *     device that still has it saved, and rotate mints and returns a brand-new key
+         *     ONCE — the plaintext is never retrievable again after this response, only the
+         *     Fernet-encrypted column at rest (matching the one-time disclosure setup's
+         *     ``/complete`` already gives the initial key).
+         */
+        AppApiKeyResponse: {
+            /** App Api Key */
+            app_api_key: string;
+        };
+        /**
+         * AutograbStatusItem
+         * @description The background auto-grab loop's own health (ADR-0013), mirrored from
+         *     ``services.health_service.AutograbStatusSnapshot``. The exact shape of
+         *     ``ReconcileStatusItem`` above, for the separate ``_autograb_loop`` -- a
+         *     Prowlarr outage surfaces here as a failing loop so the operator sees WHY
+         *     nothing is being grabbed, not just that requests sit at ``pending``.
+         *
+         *     ``cooled_down_scopes`` is how many scopes are CURRENTLY in a grab-pipeline
+         *     cooldown (ADR-0013): scopes whose grab keeps failing, skipped so they don't
+         *     starve the search budget -- a non-zero count is the operator's signal that the
+         *     grab pipeline (not the search) is what's broken.
+         */
+        AutograbStatusItem: {
+            /**
+             * Consecutive Failures
+             * @default 0
+             */
+            consecutive_failures: number;
+            /**
+             * Cooled Down Scopes
+             * @default 0
+             */
+            cooled_down_scopes: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
         };
         /**
          * BlocklistEntry
@@ -1023,6 +1210,7 @@ export interface components {
          *     healthy, is the reconcile loop running, how full is the disk".
          */
         HealthResponse: {
+            autograb: components["schemas"]["AutograbStatusItem"];
             /** Disks */
             disks: components["schemas"]["DiskGaugeItem"][];
             reconcile: components["schemas"]["ReconcileStatusItem"];
@@ -1283,6 +1471,25 @@ export interface components {
             title: string;
         };
         /**
+         * ReportIssueBody
+         * @description ``POST /requests/{id}/report-issue`` -- report a bad imported file (ADR-0014).
+         *
+         *     ``reason`` is one of the operator-choosable :class:`BlocklistReason` values
+         *     (``failed`` is auto-only and deliberately excluded). ``season`` is REQUIRED for
+         *     a tv request (report-issue is per-season, mirroring grab) and ignored for a
+         *     movie. The verb blocklists the culprit release, purges the torrent + library
+         *     file, and synchronously re-searches (see ``correction_service.report_issue``).
+         */
+        ReportIssueBody: {
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "bad_quality" | "wrong_media" | "user_reported";
+            /** Season */
+            season?: number | null;
+        };
+        /**
          * RequestListResponse
          * @description A list of media requests.
          */
@@ -1399,6 +1606,8 @@ export interface components {
          *     NEVER serialized.
          */
         SettingsResponse: {
+            /** Auto Grab Enabled */
+            auto_grab_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
             disk_pressure_target_percent?: number | null;
             /** Disk Pressure Threshold Percent */
@@ -1442,6 +1651,8 @@ export interface components {
          *     encrypted at rest. ``None`` / absent fields are left unchanged.
          */
         SettingsUpdate: {
+            /** Auto Grab Enabled */
+            auto_grab_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
             disk_pressure_target_percent?: number | null;
             /** Disk Pressure Threshold Percent */
@@ -2033,6 +2244,7 @@ export interface operations {
         parameters: {
             query?: {
                 blocklist?: boolean;
+                remove_torrent?: boolean;
             };
             header?: never;
             path: {
@@ -2200,6 +2412,37 @@ export interface operations {
             };
         };
     };
+    cancel_request_endpoint_api_v1_requests__request_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post: {
         parameters: {
             query?: never;
@@ -2212,6 +2455,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["KeepForeverBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_issue_endpoint_api_v1_requests__request_id__report_issue_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReportIssueBody"];
             };
         };
         responses: {
@@ -2326,6 +2604,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reveal_app_key_endpoint_api_v1_settings_app_key_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppApiKeyResponse"];
+                };
+            };
+        };
+    };
+    rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppApiKeyResponse"];
                 };
             };
         };

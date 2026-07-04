@@ -29,6 +29,8 @@ const DETAIL_MESSAGES: Record<string, string> = {
   download_not_found: 'That download no longer exists.',
   invalid_state_transition: 'That action is not allowed from the current state.',
   blocklist_entry_not_found: 'That blocklist entry no longer exists.',
+  app_key_changed:
+    'The app key changed while this request was in flight — refresh and retry.',
 }
 
 export interface ApiError {

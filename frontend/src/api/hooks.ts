@@ -6,7 +6,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
+import { setApiKey } from '../lib/apiKey'
 import type {
+  AppApiKeyResponse,
   BlocklistResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
@@ -130,6 +132,42 @@ export function useUpdateSettings() {
         // stuck until the page remounts.
         void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
       }
+      // The TMDB api key may have changed; Discover's home + search results are
+      // keyed on the old credentials, so drop them too. TanStack Query v5's
+      // default exact:false prefix match covers both queryKeys.discoverHome
+      // (['discover','home']) and every queryKeys.discover(query, year) variant
+      // (['discover', query, year]) with this one call (issue #14).
+      void qc.invalidateQueries({ queryKey: ['discover'] })
+    },
+  })
+}
+
+/**
+ * Reveal the CURRENT app X-Api-Key in plaintext — the break-glass recovery
+ * path for a new device/browser, without re-running setup. On-demand
+ * (mutation, not a query) so the key is only ever fetched on an explicit
+ * "Reveal" click, never pre-fetched/cached.
+ */
+export function useRevealAppKey() {
+  return useMutation({
+    mutationFn: async (): Promise<AppApiKeyResponse> =>
+      unwrap(await client.GET('/api/v1/settings/app-key')),
+  })
+}
+
+/**
+ * Mint a brand-new app X-Api-Key, invalidating the old one everywhere. The
+ * CALLER'S own stored key must be updated immediately (via setApiKey) or the
+ * current session's very next request would 401 with no saved key to fall
+ * back to — every OTHER device/browser holding the old key is, correctly,
+ * locked out until it's re-paired with the new one.
+ */
+export function useRotateAppKey() {
+  return useMutation({
+    mutationFn: async (): Promise<AppApiKeyResponse> =>
+      unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
+    onSuccess: (data) => {
+      setApiKey(data.app_api_key)
     },
   })
 }
@@ -225,6 +263,60 @@ export function useSetKeepForever() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.requests })
       void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
+    },
+  })
+}
+
+/** The operator-choosable report-issue reasons (ADR-0014) — the `BlocklistReason`
+ * values minus the auto-only `failed`. Mirrors the backend `ReportIssueBody`. */
+export type ReportReason = 'bad_quality' | 'wrong_media' | 'user_reported'
+
+/**
+ * Report a bad imported/available movie or TV season (ADR-0014): blocklist the
+ * culprit release, purge its torrent + library file, and synchronously re-search
+ * for a different release. Returns the updated request (re-grabbing, or parked at
+ * no_acceptable_release). Invalidates requests + queue + blocklist so every
+ * surface reflects the correction at once.
+ */
+export function useReportIssue() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (args: {
+      requestId: number
+      reason: ReportReason
+      season?: number | null
+    }): Promise<RequestResponse> =>
+      unwrap(
+        await client.POST('/api/v1/requests/{request_id}/report-issue', {
+          params: { path: { request_id: args.requestId } },
+          body: { reason: args.reason, season: args.season ?? null },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: ['blocklist'] })
+    },
+  })
+}
+
+/**
+ * Cancel a not-yet-imported request (ADR-0014): drop any active torrent(s) and
+ * settle the request to `cancelled`. The honest opposite of report-issue —
+ * nothing is re-grabbed. Invalidates requests + queue.
+ */
+export function useCancelRequest() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (requestId: number): Promise<RequestResponse> =>
+      unwrap(
+        await client.POST('/api/v1/requests/{request_id}/cancel', {
+          params: { path: { request_id: requestId } },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
     },
   })
 }

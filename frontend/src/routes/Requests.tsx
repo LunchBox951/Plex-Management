@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useRequests } from '../api/hooks'
 import type { RequestResponse } from '../api/types'
 import { Button } from '../components/ui/Button'
@@ -13,9 +13,25 @@ function RequestRow({ request }: { request: RequestResponse }) {
   if (request.year != null) meta.push(String(request.year))
   meta.push(request.media_type)
 
+  // Fall back to the gradient placeholder both when there's no poster_url AND
+  // when a real one fails to load (404 / expired TMDB URL) — a bad URL must
+  // never leave a broken-image icon sitting in the row.
+  const [imgFailed, setImgFailed] = useState(false)
+  const showImg = Boolean(request.poster_url) && !imgFailed
+
   return (
     <li className="flex items-center gap-4 rounded-xl border border-hairline bg-surface p-4">
-      <div className="aspect-[2/3] w-11 shrink-0 rounded bg-poster bg-gradient-to-b from-white/10 to-transparent" />
+      {showImg ? (
+        <img
+          src={request.poster_url ?? undefined}
+          alt=""
+          loading="lazy"
+          className="aspect-[2/3] w-11 shrink-0 rounded object-cover"
+          onError={() => setImgFailed(true)}
+        />
+      ) : (
+        <div className="aspect-[2/3] w-11 shrink-0 rounded bg-poster bg-gradient-to-b from-white/10 to-transparent" />
+      )}
       <div className="min-w-0 flex-1">
         <p className="truncate font-display font-semibold text-ink">{request.title}</p>
         <p className="mt-0.5 flex items-center gap-2 font-mono text-xs text-muted">

@@ -1103,6 +1103,13 @@ class _SlowDeleteFileSystem:
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        # These fakes only ever model in-root deletion targets (real tmp_path files
+        # the test intends to delete), so purge_library_path's pre-measure containment
+        # gate must pass -- return False (delete would NOT refuse) so it proceeds to
+        # measure + delete as before.
+        return False
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
@@ -1475,6 +1482,13 @@ class _PinsSecondCandidateOnFirstDeleteFs:
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
 
+    def delete_guard_refuses(self, path: str) -> bool:
+        # These fakes only ever model in-root deletion targets (real tmp_path files
+        # the test intends to delete), so purge_library_path's pre-measure containment
+        # gate must pass -- return False (delete would NOT refuse) so it proceeds to
+        # measure + delete as before.
+        return False
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
@@ -1606,6 +1620,13 @@ class _ConcurrentSecondEvictFs:
 
     def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
         raise NotImplementedError
+
+    def delete_guard_refuses(self, path: str) -> bool:
+        # These fakes only ever model in-root deletion targets (real tmp_path files
+        # the test intends to delete), so purge_library_path's pre-measure containment
+        # gate must pass -- return False (delete would NOT refuse) so it proceeds to
+        # measure + delete as before.
+        return False
 
     def reclaimable_bytes(self, path: str) -> int:
         try:

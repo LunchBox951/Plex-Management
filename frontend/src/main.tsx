@@ -5,6 +5,7 @@ import { RouterProvider } from 'react-router-dom'
 import { ToastProvider } from './components/ui/toast'
 import { queryClient } from './lib/queryClient'
 import { router } from './router'
+import './fonts'
 import './styles/index.css'
 
 const rootEl = document.getElementById('root')

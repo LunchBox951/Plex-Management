@@ -43,11 +43,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
-from plex_manager.adapters.filesystem.local import LocalFileSystemError
-from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.domain.eviction import (
     EvictionCandidate,
+    pressure_relieved,
     rank_eviction_candidates,
     select_evictions,
 )
@@ -55,8 +54,9 @@ from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestSt
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import season_request_service
+from plex_manager.services import purge_service, season_request_service
 from plex_manager.services.health_service import read_disk_usage
+from plex_manager.services.purge_service import PurgeOutcome
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,7 +65,12 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.repositories import RequestRecord
 
-__all__ = ["EvictionOutcome", "preview_candidates", "run_eviction_sweep"]
+__all__ = [
+    "EvictionOutcome",
+    "assemble_candidates",
+    "preview_candidates",
+    "run_eviction_sweep",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -380,45 +385,34 @@ async def _evict_one(
         )
         return None
 
-    # Hardlink-aware reclaimable-bytes measurement (R4-6, ADR-0012) -- MUST run
-    # BEFORE the delete below: a file's link count can only be read while the
-    # path still exists, and a same-filesystem import's hardlinked library copy
-    # (see ``fs.hardlink_or_copy``) genuinely frees NOTHING when only IT is
-    # removed (the download client's own seed copy keeps the inode alive). A
-    # measurement failure (mirrors ``_size_bytes``'s "unknown" fallback) counts
-    # as "nothing reclaimed" rather than aborting the eviction -- the delete
-    # below, not this accounting, is the authoritative, honest action. Offloaded
-    # for the same reason as every other blocking FS primitive in this module
-    # (a season directory walk is real, synchronous disk I/O).
-    try:
-        freed_bytes = await asyncio.to_thread(fs.reclaimable_bytes, library_path)
-    except OSError:
-        freed_bytes = 0
-
-    try:
-        # A whole directory tree (``shutil.rmtree``) or a large file -- real,
-        # synchronous disk I/O -- so this ALWAYS runs off the event loop
-        # (mirrors ``import_service``'s ``asyncio.to_thread``-wrapped copy).
-        await asyncio.to_thread(fs.delete, library_path)
-    except LocalFileSystemError as exc:
+    # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are
+    # both done by the shared ``purge_service.purge_library_path`` primitive
+    # (ADR-0014, "reuse don't duplicate") -- same accounting-before-delete order
+    # (a file's link count is only readable while it still exists, R4-6, ADR-0012),
+    # same containment guard, same idempotent already-gone no-op. Eviction keeps
+    # its OWN log message + logger for each outcome (the primitive classifies, the
+    # caller logs) so the existing honest skip messages are unchanged.
+    purge = await purge_service.purge_library_path(fs, library_path)
+    if purge.outcome is PurgeOutcome.refused:
         # The root-containment guard refused (a stale/misconfigured breadcrumb
         # pointing outside every currently-configured library root) -- never
         # silently skipped, never mis-deleted.
         _logger.warning(
             "eviction of %r refused by the filesystem guard (%s); skipping",
             candidate.title,
-            exc,
+            purge.detail,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
         )
         return None
-    except OSError as exc:
+    if purge.outcome is PurgeOutcome.error:
         _logger.warning(
             "eviction of %r failed (%s); will retry next sweep",
             candidate.title,
-            type(exc).__name__,
+            purge.detail,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
         )
         return None
+    freed_bytes = purge.freed_bytes
 
     season_note = f" season {candidate.season}" if candidate.season is not None else ""
 
@@ -488,19 +482,17 @@ async def _evict_one(
     # create_request's is_available / present_seasons (use_cache=False) would
     # otherwise trust that stale item and record the re-request as 'available' -> the
     # deleted files are never re-fetched. Best-effort + symmetric with the import
-    # pipeline's post-place scan: the eviction itself already committed, so a Plex
-    # outage here is logged (Plex will catch up on its next scheduled scan), never a
-    # failure that undoes a completed eviction.
-    try:
-        await library.trigger_scan(library_path, candidate.media_type)
-    except (PlexLibraryError, PlexAuthError) as exc:
-        _logger.warning(
-            "post-eviction Plex refresh failed for %r (%s); Plex may briefly still "
-            "report it present until its next scheduled scan",
-            candidate.title,
-            type(exc).__name__,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
-        )
+    # pipeline's post-place scan (shared ``purge_service.trigger_library_scan``,
+    # ADR-0014): the eviction itself already committed, so a Plex outage here is
+    # logged (Plex will catch up on its next scheduled scan), never a failure that
+    # undoes a completed eviction.
+    await purge_service.trigger_library_scan(
+        library,
+        library_path=library_path,
+        media_type=candidate.media_type,
+        context="eviction",
+        extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+    )
 
     _logger.info(
         "evicted %r%s: watched, past grace period, disk-pressure relief",
@@ -516,6 +508,41 @@ async def _evict_one(
         library_path=library_path,
         freed_bytes=freed_bytes,
     )
+
+
+async def assemble_candidates(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    media_type: Literal["movie", "tv"],
+    root_path: str,
+    root_total_bytes: int,
+) -> list[EvictionCandidate]:
+    """Assemble every ``available`` movie / TV-season under ``root_path`` into a
+    RAW :class:`~plex_manager.domain.eviction.EvictionCandidate` list -- fresh
+    Plex watch state + a walked on-disk size per row -- with NO grace or
+    eligibility filtering applied. The caller decides what to filter.
+
+    This is the raw superset behind BOTH :func:`preview_candidates` (which simply
+    ranks it) and the retention-telemetry sweep (which needs the ranked /
+    would-evict subsets AND every row with any recorded view -- including a
+    started-but-unfinished season the eligibility filter drops -- from one read).
+    Read-only: never deletes, never flips a status, never writes history.
+
+    ``root_total_bytes`` is threaded in (rather than read here) so each
+    candidate's ``size_percent`` is measured against the right root capacity from
+    the SAME :func:`~plex_manager.services.health_service.read_disk_usage` the
+    caller already performed for its own pressure/skip decision -- one disk-usage
+    syscall per sweep, not two. A caller that has not read it can pass any
+    consistent total; ``0`` yields ``size_percent=0.0`` for every candidate (an
+    honest "unknown share", never a fabricated guess).
+    """
+    pairs = (
+        await _movie_candidates(session, library, root_total_bytes, root_path)
+        if media_type == "movie"
+        else await _season_candidates(session, library, root_total_bytes, root_path)
+    )
+    return [candidate for candidate, _pending in pairs]
 
 
 async def preview_candidates(
@@ -551,12 +578,13 @@ async def preview_candidates(
         )
         return []
 
-    pairs = (
-        await _movie_candidates(session, library, disk.total_bytes, root_path)
-        if media_type == "movie"
-        else await _season_candidates(session, library, disk.total_bytes, root_path)
+    candidates = await assemble_candidates(
+        session=session,
+        library=library,
+        media_type=media_type,
+        root_path=root_path,
+        root_total_bytes=disk.total_bytes,
     )
-    candidates = [candidate for candidate, _pending in pairs]
     grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
     return rank_eviction_candidates(candidates, grace_cutoff)
 
@@ -693,8 +721,7 @@ async def run_eviction_sweep(
     # very first check below already finds `projected <= target_pct`.
     if extra_pool and disk.total_bytes > 0:
         for candidate in extra_pool:
-            freed_pct = (freed_bytes_total / disk.total_bytes) * 100.0
-            if disk_used_pct - freed_pct <= target_pct:
+            if pressure_relieved(disk_used_pct, freed_bytes_total, disk.total_bytes, target_pct):
                 break
             await _attempt(candidate)
 

@@ -67,6 +67,84 @@
         "title": "AcceptedRelease",
         "type": "object"
       },
+      "AppApiKeyResponse": {
+        "description": "The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.\n\nAuthenticated-only (both endpoints require a currently-valid ``X-Api-Key``):\nreveal is the belt-and-braces recovery path for a lost/forgotten key on a\ndevice that still has it saved, and rotate mints and returns a brand-new key\nONCE \u2014 the plaintext is never retrievable again after this response, only the\nFernet-encrypted column at rest (matching the one-time disclosure setup's\n``/complete`` already gives the initial key).",
+        "properties": {
+          "app_api_key": {
+            "title": "App Api Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "app_api_key"
+        ],
+        "title": "AppApiKeyResponse",
+        "type": "object"
+      },
+      "AutograbStatusItem": {
+        "description": "The background auto-grab loop's own health (ADR-0013), mirrored from\n``services.health_service.AutograbStatusSnapshot``. The exact shape of\n``ReconcileStatusItem`` above, for the separate ``_autograb_loop`` -- a\nProwlarr outage surfaces here as a failing loop so the operator sees WHY\nnothing is being grabbed, not just that requests sit at ``pending``.\n\n``cooled_down_scopes`` is how many scopes are CURRENTLY in a grab-pipeline\ncooldown (ADR-0013): scopes whose grab keeps failing, skipped so they don't\nstarve the search budget -- a non-zero count is the operator's signal that the\ngrab pipeline (not the search) is what's broken.",
+        "properties": {
+          "consecutive_failures": {
+            "default": 0,
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "cooled_down_scopes": {
+            "default": 0,
+            "title": "Cooled Down Scopes",
+            "type": "integer"
+          },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
+          "last_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Type"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Ok At"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          }
+        },
+        "title": "AutograbStatusItem",
+        "type": "object"
+      },
       "BlocklistEntry": {
         "description": "A blocklist entry as returned to the client.",
         "properties": {
@@ -767,6 +845,9 @@
       "HealthResponse": {
         "description": "``GET /api/v1/ops/health`` -- one read answering \"is every subsystem\nhealthy, is the reconcile loop running, how full is the disk\".",
         "properties": {
+          "autograb": {
+            "$ref": "#/components/schemas/AutograbStatusItem"
+          },
           "disks": {
             "items": {
               "$ref": "#/components/schemas/DiskGaugeItem"
@@ -788,7 +869,8 @@
         "required": [
           "subsystems",
           "disks",
-          "reconcile"
+          "reconcile",
+          "autograb"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -1309,6 +1391,36 @@
         "title": "RejectedRelease",
         "type": "object"
       },
+      "ReportIssueBody": {
+        "description": "``POST /requests/{id}/report-issue`` -- report a bad imported file (ADR-0014).\n\n``reason`` is one of the operator-choosable :class:`BlocklistReason` values\n(``failed`` is auto-only and deliberately excluded). ``season`` is REQUIRED for\na tv request (report-issue is per-season, mirroring grab) and ignored for a\nmovie. The verb blocklists the culprit release, purges the torrent + library\nfile, and synchronously re-searches (see ``correction_service.report_issue``).",
+        "properties": {
+          "reason": {
+            "enum": [
+              "bad_quality",
+              "wrong_media",
+              "user_reported"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ReportIssueBody",
+        "type": "object"
+      },
       "RequestListResponse": {
         "description": "A list of media requests.",
         "properties": {
@@ -1604,6 +1716,17 @@
       "SettingsResponse": {
         "description": "Redacted view of stored service config.\n\nPlaintext (non-secret) values are returned as-is; secret values are shown as\n``\"***\"`` when configured and ``None`` when unset \u2014 the plaintext secret is\nNEVER serialized.",
         "properties": {
+          "auto_grab_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Enabled"
+          },
           "disk_pressure_target_percent": {
             "anyOf": [
               {
@@ -1798,6 +1921,17 @@
       "SettingsUpdate": {
         "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
         "properties": {
+          "auto_grab_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Enabled"
+          },
           "disk_pressure_target_percent": {
             "anyOf": [
               {
@@ -2573,7 +2707,7 @@
     },
     "/api/v1/ops/health": {
       "get": {
-        "description": "One read: per-subsystem reachability, disk gauges, and the reconcile\nloop's own health. Each upstream probe is TTL-cached (~15s) so polling this\nevery few seconds never hammers an upstream or burns the TMDB rate limit.",
+        "description": "One read: per-subsystem reachability, disk gauges, and the reconcile +\nauto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so\npolling this every few seconds never hammers an upstream or burns the TMDB\nrate limit.",
         "operationId": "health_endpoint_api_v1_ops_health_get",
         "responses": {
           "200": {
@@ -3058,7 +3192,7 @@
     },
     "/api/v1/queue/{download_id}/mark-failed": {
       "post": {
-        "description": "Operator move: mark a download failed (optionally blocklisting the release).",
+        "description": "Operator move: mark a download failed (optionally blocklisting the release).\n\n``remove_torrent`` (default true): also remove the torrent + its data from the\nclient, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup\nnever blocks the fail/blocklist/re-arm.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): the DB-only\nfail/blocklist/re-arm path never touches it, so ``remove_torrent=false`` still\nworks on an install with qBittorrent unconfigured. When removal IS requested but\nthe client is unconfigured, this re-imposes the honest 409 ``service_not_configured``\nup front (before any state change) rather than silently skipping the removal.",
         "operationId": "mark_failed_endpoint_api_v1_queue__download_id__mark_failed_post",
         "parameters": [
           {
@@ -3077,6 +3211,16 @@
             "schema": {
               "default": false,
               "title": "Blocklist",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "remove_torrent",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Remove Torrent",
               "type": "boolean"
             }
           }
@@ -3294,6 +3438,54 @@
         ]
       }
     },
+    "/api/v1/requests/{request_id}/cancel": {
+      "post": {
+        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a\n``pending``/``searching``/``no_acceptable_release`` request with NO active download\nrows is a pure DB settle that never touches the client, so it still works on an\ninstall with qBittorrent unconfigured. When there ARE active torrents to remove but\nthe client is unconfigured, the service refuses up front (409\n``service_not_configured``) rather than silently leaking a seeding torrent.",
+        "operationId": "cancel_request_endpoint_api_v1_requests__request_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Cancel Request Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
     "/api/v1/requests/{request_id}/keep-forever": {
       "post": {
         "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op.",
@@ -3347,6 +3539,64 @@
           }
         ],
         "summary": "Keep Forever Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/{request_id}/report-issue": {
+      "post": {
+        "description": "Report a bad imported/available movie or TV season (ADR-0014).\n\nBlocklists the culprit release, removes its torrent + the library file, and\nsynchronously re-searches for a DIFFERENT release (the honest\n``no_acceptable_release`` park if nothing is acceptable). Requires Plex +\nqBittorrent + Prowlarr configured (their deps 409 ``service_not_configured``\notherwise). The correction-without-a-terminal button for \"this file is bad\".",
+        "operationId": "report_issue_endpoint_api_v1_requests__request_id__report_issue_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportIssueBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Report Issue Endpoint",
         "tags": [
           "requests"
         ]
@@ -3483,6 +3733,60 @@
           }
         ],
         "summary": "Put Settings Endpoint",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/v1/settings/app-key": {
+      "get": {
+        "description": "Return the current app ``X-Api-Key`` in plaintext.\n\nAuthenticated: the caller already proved they hold a currently-valid key\n(``require_api_key`` on the whole router), so this is not a privilege\nescalation -- it is the break-glass recovery path for a NEW device/browser\nthat needs to be paired without re-running setup, and the belt-and-braces\nanswer to \"I'm about to lose my only saved copy\" (issue #28's OAuth-deferral\nanalysis: total key loss is the one genuine gap in keeping a static key for\nthe beta).",
+        "operationId": "reveal_app_key_endpoint_api_v1_settings_app_key_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppApiKeyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Reveal App Key Endpoint",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/v1/settings/app-key/rotate": {
+      "post": {
+        "description": "Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.\n\nEvery OTHER device/browser with the OLD key saved (localStorage) is\nimmediately locked out -- there is exactly one live key at a time, matching\n``require_api_key``'s single-key comparison. The frontend caller of this\nendpoint MUST persist the returned key immediately so the session that just\nrotated it survives (the new key is never shown again after this response).\n\nCompare-and-swap against concurrent rotations: two rotate requests carrying\nthe SAME old key can both clear ``require_api_key`` (each reads the old stored\nvalue) before either commits. Without a guard the write that commits second\nwould silently overwrite the first's freshly minted key, so the client that\nfired the first request would be left displaying an already-dead key. The\nre-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it\nis a true atomic read-modify-write rather than check-then-act: the compare and\nthe write cannot interleave with another rotation, so the loser's re-read runs\nonly AFTER the winner has committed. Inside THIS request's own transaction we\nre-read the stored key and require it to still equal the key the request\nauthenticated with; if it has already changed, the race happened and we answer\n409 (``app_key_changed``) rather than clobber the winner. The check is skipped\nunder ``dev_auth_bypass`` (there is no authenticated key to compare against),\nexactly like ``require_api_key`` itself.",
+        "operationId": "rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppApiKeyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Rotate App Key Endpoint",
         "tags": [
           "settings"
         ]

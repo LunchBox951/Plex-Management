@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.season_rollup import rollup_status
+from plex_manager.logsafe import safe_int
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -44,10 +45,12 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import SeasonRequestRecord
 
 __all__ = [
+    "clear_library_path",
     "ensure_seasons",
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
+    "reset_for_research",
     "set_library_path",
     "set_status",
     "set_status_if_in",
@@ -79,12 +82,35 @@ _TERMINAL_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.available,
         RequestStatus.failed,
         RequestStatus.evicted,
+        # ADR-0014: a cancelled season is terminal for the same reason as
+        # evicted -- a stale later signal must never drag it back to searching.
+        RequestStatus.cancelled,
     )
+)
+
+# Season statuses at which a season's content is imported and on disk -- watchable
+# now (``available``, Plex-confirmed) or awaiting Plex confirmation (``completed``,
+# "Finalizing"). These are exactly the moments a MOVIE stamps its parent's
+# ``completed_at`` (``SqlRequestRepository.mark_completed``/``.mark_available``);
+# ``_recompute_parent`` stamps the TV parent's ``completed_at`` the first time a
+# tracked season reaches one of them via a GENUINE import/availability transition
+# (``mark_completed``/``mark_available``, which pass ``stamp_completion=True``) --
+# NOT via the ``ensure_seasons`` creation path (see there). ``evicted`` is
+# deliberately EXCLUDED: its file is gone, so an eviction-time rollup must never be
+# mistaken for a fresh completion -- and the eviction path never stamps anyway (it
+# runs with ``tolerate_active_conflict=True`` AND the default
+# ``stamp_completion=False``; see _recompute_parent).
+_REAL_DONE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value for s in (RequestStatus.completed, RequestStatus.available)
 )
 
 
 async def _recompute_parent(
-    session: AsyncSession, media_request_id: int, *, tolerate_active_conflict: bool = False
+    session: AsyncSession,
+    media_request_id: int,
+    *,
+    tolerate_active_conflict: bool = False,
+    stamp_completion: bool = False,
 ) -> None:
     """Re-read every tracked season's status, fold via ``rollup_status``, persist.
 
@@ -94,6 +120,23 @@ async def _recompute_parent(
     tracked seasons yet (should not happen once ``ensure_seasons`` has run at
     least once) is a no-op rather than a crash -- ``rollup_status`` itself raises
     on an empty sequence, so guard before calling it.
+
+    Besides the rollup ``status``, this also stamps the parent's ``completed_at``
+    the first time a tracked season is imported/on disk (``completed``/
+    ``available``) -- the TV analogue of the movie-level stamp in
+    ``mark_completed``/``mark_available`` (which a computed TV rollup never runs),
+    so ``MediaRequest.completed_at`` is no longer permanently ``None`` for a TV
+    request. That stamp is gated on ``stamp_completion`` (default ``False``),
+    passed ``True`` ONLY by :func:`mark_completed`/:func:`mark_available` -- a
+    GENUINE import/availability transition -- and left ``False`` by every other
+    caller, crucially :func:`ensure_seasons`: a request that MIXES an
+    already-in-Plex season (which ``ensure_seasons`` creates ``available`` with NO
+    ``library_path`` -- no import ever ran) with a still-missing one must NOT
+    record a completion at REQUEST time, or the later-imported season's
+    time-to-watch interval would start from request/Plex-verification time rather
+    than its own import completion (retention_telemetry_service). See the inline
+    comment on the stamp for the season-level (not rollup-level) check and why it
+    is confined to the strict, non-eviction branch.
 
     ``tolerate_active_conflict`` (default ``False`` -- unchanged for every normal
     season transition, which must keep recomputing the rollup STRICTLY so dedup
@@ -121,12 +164,37 @@ async def _recompute_parent(
     if not seasons:
         return
     status = rollup_status([season.status for season in seasons])
+    request_repo = SqlRequestRepository(session)
     if not tolerate_active_conflict:
-        await SqlRequestRepository(session).set_status(media_request_id, status)
+        await request_repo.set_status(media_request_id, status)
+        # Stamp the parent's FIRST-completion timestamp when a GENUINE import/
+        # availability transition (``mark_completed``/``mark_available``, which pass
+        # ``stamp_completion=True``) has landed a tracked season on disk
+        # (``completed``/``available``). A TV ``MediaRequest.status`` is a pure fold
+        # of its seasons and never goes through the movie-level ``mark_completed``/
+        # ``mark_available`` that stamp ``completed_at`` directly, so without this the
+        # parent's ``completed_at`` stays ``None`` forever and every TV time-to-watch
+        # interval reads "unknown" (retention_telemetry_service). Gated on
+        # ``stamp_completion`` so the ``ensure_seasons`` CREATION path never fires it:
+        # an already-in-Plex season is created ``available`` with NO ``library_path``
+        # (no import ran), and stamping at that request-time moment would start a
+        # later-imported sibling's time-to-watch interval from verification time
+        # rather than its own import. Checked at the SEASON level, not off ``status``:
+        # rollup precedence (``downloading`` etc.) can mask a just-completed season
+        # while a sibling is still in flight, but the show's first completion has
+        # still happened. Idempotent via the ``is None`` guard in the repo -- a later
+        # season completing never moves the first stamp. Only in this strict
+        # (forward-transition) branch: the ``tolerate_active_conflict`` path below is
+        # eviction's alone, and an eviction (file gone) is never a completion -- see
+        # ``_REAL_DONE_SEASON_STATUS_VALUES``.
+        if stamp_completion and any(
+            season.status in _REAL_DONE_SEASON_STATUS_VALUES for season in seasons
+        ):
+            await request_repo.stamp_completed_at_if_unset(media_request_id)
         return
     try:
         async with session.begin_nested():
-            await SqlRequestRepository(session).set_status(media_request_id, status)
+            await request_repo.set_status(media_request_id, status)
     except IntegrityError:
         # A NEWER active request for the same (tmdb_id, media_type) already holds
         # ``uq_media_requests_active``'s slot -- the parent rollup write collided,
@@ -135,10 +203,10 @@ async def _recompute_parent(
         # history row are unaffected and still commit. Never silently swallowed --
         # logged so an operator can see the coarse rollup is momentarily stale.
         _logger.warning(
-            "parent rollup write for media request %s skipped: a newer active "
+            "parent rollup write skipped: a newer active "
             "request already occupies the active-dedup slot for this show; the "
             "season's own status/history are unaffected",
-            media_request_id,
+            extra={"request_id": safe_int(media_request_id)},
         )
 
 
@@ -161,9 +229,9 @@ async def _present_seasons(library: LibraryPort, tmdb_id: int) -> frozenset[int]
         return await library.present_seasons(tmdb_id)
     except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
         _logger.warning(
-            "plex season-availability crawl failed for tmdb %s (%s); proceeding with a request",
-            tmdb_id,
+            "plex season-availability crawl failed (%s); proceeding with a request",
             type(exc).__name__,
+            extra={"tmdb_id": safe_int(tmdb_id)},
         )
         return frozenset()
 
@@ -356,6 +424,31 @@ async def set_library_path(
     await season_repo.set_library_path(row.id, library_path)
 
 
+async def clear_library_path(
+    session: AsyncSession, *, media_request_id: int, season_number: int
+) -> None:
+    """Drop one season's eviction/purge breadcrumb (ADR-0014's report-issue verb).
+
+    The season-level analogue of ``SqlRequestRepository.clear_library_path`` and the
+    counterpart of :func:`set_library_path`: report-issue re-arms the season (claiming
+    the parent's active-dedup slot via :func:`reset_for_research` with
+    ``clear_library_path=False``) BEFORE it knows whether the purge will succeed, then
+    clears the breadcrumb HERE only once the file was actually removed. A failed/refused
+    purge leaves the breadcrumb intact so the orphan stays reclaimable (honesty over
+    silence).
+
+    Resolves the row via ``ensure()`` (idempotent get-or-create) rather than requiring a
+    pre-known ``SeasonRequest`` id. Does NOT recompute the parent rollup -- clearing
+    ``library_path`` is not a status transition, so it never re-touches the parent's
+    ``uq_media_requests_active`` slot.
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.clear_library_path(row.id)
+
+
 async def mark_completed(
     session: AsyncSession, *, media_request_id: int, season_number: int
 ) -> None:
@@ -371,7 +464,7 @@ async def mark_completed(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.mark_completed(row.id)
-    await _recompute_parent(session, media_request_id)
+    await _recompute_parent(session, media_request_id, stamp_completion=True)
 
 
 async def mark_available(
@@ -383,6 +476,41 @@ async def mark_available(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.mark_available(row.id)
+    await _recompute_parent(session, media_request_id, stamp_completion=True)
+
+
+async def reset_for_research(
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    clear_library_path: bool = True,
+) -> None:
+    """Re-arm ONE reported season for a fresh search (ADR-0014's report-issue verb).
+
+    The season-level analogue of ``SqlRequestRepository.reset_for_research``: sets
+    the season back to the non-terminal ``searching`` then recomputes the parent
+    rollup so the show reflects the re-armed season. Unlike :func:`set_status` this is
+    UNCONDITIONAL (no ``skip_if_terminal``): report-issue deliberately re-opens an
+    already-``available``/``completed`` season -- that is the whole point of "this
+    imported file is bad, redo it".
+
+    ``clear_library_path`` (default ``True``) also clears the season's ``library_path``
+    purge breadcrumb -- correct when the file was actually deleted. report-issue passes
+    ``False`` when the purge failed/was refused (the season directory may still be on
+    disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
+    reclaim the orphan, never stranded with no handle (honesty over silence).
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.set_status(row.id, RequestStatus.searching.value)
+    # Fresh search, fresh backoff ladder (ADR-0013): the culprit's accrued
+    # search_attempts must not throttle the operator's explicit redo.
+    await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
+    if clear_library_path:
+        await season_repo.clear_library_path(row.id)
     await _recompute_parent(session, media_request_id)
 
 

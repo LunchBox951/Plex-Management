@@ -91,6 +91,59 @@ function ReconcilePanel({ reconcile }: { reconcile: HealthResponse['reconcile'] 
   )
 }
 
+/** The background auto-grab loop's own health (ADR-0013) — a Prowlarr outage
+ * surfaces here as a failing loop, so the operator sees WHY nothing is being
+ * grabbed rather than requests silently stuck at "pending". */
+function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
+  const hasRun = autograb.last_run_at !== null
+  const healthy = hasRun && autograb.consecutive_failures === 0
+  const tone: DotTone = !hasRun ? 'neutral' : healthy ? 'ok' : 'error'
+  const label = !hasRun ? 'starting up' : healthy ? 'running clean' : 'failing'
+  return (
+    <div className="rounded-xl border border-hairline bg-surface p-4">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="font-display text-sm font-semibold text-ink">Auto-grab loop</h3>
+        <Dot tone={tone} label={label} />
+      </div>
+      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs text-muted">
+        <dt>Last run</dt>
+        <dd className="text-right">{formatTimestamp(autograb.last_run_at)}</dd>
+        <dt>Last success</dt>
+        <dd className="text-right">{formatTimestamp(autograb.last_ok_at)}</dd>
+        <dt>Consecutive failures</dt>
+        <dd
+          className={cn(
+            'text-right',
+            autograb.consecutive_failures > 0 ? 'font-semibold text-error' : '',
+          )}
+        >
+          {autograb.consecutive_failures}
+        </dd>
+        {/* Scopes whose grab keeps failing (GrabError) are cooled down so they don't
+            starve the search budget — a non-zero count means the grab pipeline, not
+            the search, is what's broken. */}
+        <dt>Cooling scopes</dt>
+        <dd
+          className={cn(
+            'text-right',
+            autograb.cooled_down_scopes > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {autograb.cooled_down_scopes}
+        </dd>
+        {autograb.last_error_type ? (
+          <>
+            <dt>Last error</dt>
+            <dd className="text-right text-error">
+              {autograb.last_error_type} · {formatTimestamp(autograb.last_error_at)}
+            </dd>
+          </>
+        ) : null}
+      </dl>
+    </div>
+  )
+}
+
 /** One configured library root: a usage bar, plus a ranked preview of what a
  * pressure sweep WOULD evict from it (never evicts anything itself — the
  * preview lists every eligible title regardless of current pressure, so the
@@ -270,9 +323,12 @@ export function Status() {
       {health.data ? (
         <section>
           <h2 className="mb-3 font-mono text-xs font-semibold tracking-wide text-faint uppercase">
-            Reconcile
+            Background loops
           </h2>
-          <ReconcilePanel reconcile={health.data.reconcile} />
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <ReconcilePanel reconcile={health.data.reconcile} />
+            <AutograbPanel autograb={health.data.autograb} />
+          </div>
         </section>
       ) : null}
 
