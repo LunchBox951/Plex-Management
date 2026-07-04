@@ -16,6 +16,9 @@
     "gen:check": "openapi-typescript ../docs/api/openapi.json -o /tmp/plexmgr-schema-check.d.ts && diff -u src/api/schema.d.ts /tmp/plexmgr-schema-check.d.ts"
   },
   "dependencies": {
+    "@fontsource/archivo": "^5.2.8",
+    "@fontsource/hanken-grotesk": "^5.2.8",
+    "@fontsource/ibm-plex-mono": "^5.2.7",
     "@radix-ui/react-dialog": "^1.1.6",
     "@radix-ui/react-toast": "^1.2.6",
     "@tanstack/react-query": "^5.66.0",

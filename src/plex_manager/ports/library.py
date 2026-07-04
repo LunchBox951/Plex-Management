@@ -92,8 +92,16 @@ class LibraryPort(Protocol):
         versa) and the full-refresh fallback stays scoped to the relevant kind.
         """
 
-    async def list_sections(self) -> list[LibrarySection]:
-        """Return the configured library sections."""
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+        """Return the configured library sections.
+
+        ``use_cache=False`` forces a fresh read of the server, bypassing the
+        adapter's own TTL-cached snapshot -- for callers where staleness itself
+        is user-visible (the Settings library picker, the setup wizard's "Test
+        connection", the health dashboard's live probe), never for the warmed
+        fast paths (``is_available``, ``trigger_scan``, ``watch_state``) that
+        rely on this staying cheap.
+        """
         raise NotImplementedError
 
     async def watch_state(

@@ -5,14 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#0A0C10" />
-    <!-- TODO(ADR-0005): self-host these woff2 before :stable so the appliance never
-         depends on an external CDN (works offline). Fine for the alpha. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Hanken+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
-      rel="stylesheet"
-    />
+    <!-- Fonts (Archivo / Hanken Grotesk / IBM Plex Mono) are self-hosted via
+         @fontsource, bundled as woff2 at build time and imported in
+         src/main.tsx -- no external CDN dependency (ADR-0005). -->
     <title>Plex Manager</title>
   </head>
   <body>

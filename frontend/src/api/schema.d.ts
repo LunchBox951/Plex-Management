@@ -527,6 +527,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/settings/app-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Reveal App Key Endpoint
+         * @description Return the current app ``X-Api-Key`` in plaintext.
+         *
+         *     Authenticated: the caller already proved they hold a currently-valid key
+         *     (``require_api_key`` on the whole router), so this is not a privilege
+         *     escalation -- it is the break-glass recovery path for a NEW device/browser
+         *     that needs to be paired without re-running setup, and the belt-and-braces
+         *     answer to "I'm about to lose my only saved copy" (issue #28's OAuth-deferral
+         *     analysis: total key loss is the one genuine gap in keeping a static key for
+         *     the beta).
+         */
+        get: operations["reveal_app_key_endpoint_api_v1_settings_app_key_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/app-key/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate App Key Endpoint
+         * @description Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
+         *
+         *     Every OTHER device/browser with the OLD key saved (localStorage) is
+         *     immediately locked out -- there is exactly one live key at a time, matching
+         *     ``require_api_key``'s single-key comparison. The frontend caller of this
+         *     endpoint MUST persist the returned key immediately so the session that just
+         *     rotated it survives (the new key is never shown again after this response).
+         *
+         *     Compare-and-swap against concurrent rotations: two rotate requests carrying
+         *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
+         *     value) before either commits. Without a guard the write that commits second
+         *     would silently overwrite the first's freshly minted key, so the client that
+         *     fired the first request would be left displaying an already-dead key. The
+         *     re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
+         *     is a true atomic read-modify-write rather than check-then-act: the compare and
+         *     the write cannot interleave with another rotation, so the loser's re-read runs
+         *     only AFTER the winner has committed. Inside THIS request's own transaction we
+         *     re-read the stored key and require it to still equal the key the request
+         *     authenticated with; if it has already changed, the race happened and we answer
+         *     409 (``app_key_changed``) rather than clobber the winner. The check is skipped
+         *     under ``dev_auth_bypass`` (there is no authenticated key to compare against),
+         *     exactly like ``require_api_key`` itself.
+         */
+        post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/settings/plex-libraries": {
         parameters: {
             query?: never;
@@ -734,6 +803,21 @@ export interface components {
             source: string;
             /** Title */
             title: string;
+        };
+        /**
+         * AppApiKeyResponse
+         * @description The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+         *
+         *     Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
+         *     reveal is the belt-and-braces recovery path for a lost/forgotten key on a
+         *     device that still has it saved, and rotate mints and returns a brand-new key
+         *     ONCE — the plaintext is never retrievable again after this response, only the
+         *     Fernet-encrypted column at rest (matching the one-time disclosure setup's
+         *     ``/complete`` already gives the initial key).
+         */
+        AppApiKeyResponse: {
+            /** App Api Key */
+            app_api_key: string;
         };
         /**
          * BlocklistEntry
@@ -2200,6 +2284,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reveal_app_key_endpoint_api_v1_settings_app_key_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppApiKeyResponse"];
+                };
+            };
+        };
+    };
+    rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppApiKeyResponse"];
                 };
             };
         };
