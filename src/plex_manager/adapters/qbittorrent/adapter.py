@@ -208,8 +208,17 @@ def _normalize_btih(value: str) -> str:
 
 
 def _info_hash_from_magnet(magnet: str) -> str | None:
-    """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter."""
-    parsed = urlparse(magnet)
+    """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter.
+
+    Total: an UNPARSABLE magnet (an attacker-controlled redirect can supply e.g.
+    ``magnet://[::1x/…`` whose bogus netloc makes ``urlparse`` raise ValueError)
+    returns ``None`` — no hash derivable — instead of escaping the source-error
+    taxonomy with a raw ValueError.
+    """
+    try:
+        parsed = urlparse(magnet)
+    except ValueError:
+        return None
     if parsed.scheme != "magnet":
         return None
     for xt in parse_qs(parsed.query).get("xt", []):
@@ -389,13 +398,16 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
     CONFIGURED Prowlarr endpoint: compared by URL origin (scheme + casefolded
     host + effective port), deliberately NEVER by resolved addresses — a
     hostile DNS answer must not be able to claim the trust. ``None`` for a
-    non-http(s), hostless, or malformed-port URL (nothing trustable).
+    non-http(s), hostless, malformed-port, or entirely UNPARSABLE URL (e.g. a
+    bad IPv6 literal makes ``urlparse``/``parsed.hostname`` raise ValueError):
+    nothing trustable — the caller keeps the SSRF veto fully closed rather
+    than crashing outside the source-error taxonomy.
     """
-    parsed = urlparse(url)
-    scheme = parsed.scheme.casefold()
-    if scheme not in ("http", "https") or not parsed.hostname:
-        return None
     try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.casefold()
+        if scheme not in ("http", "https") or not parsed.hostname:
+            return None
         port = parsed.port
     except ValueError:
         return None
@@ -403,14 +415,22 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
 
 
 async def _assert_safe_fetch_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        # An UNPARSABLE source URL (e.g. `http://[::1` — urlparse raises on the
+        # bad IPv6 literal) is a release problem like any other malformed source:
+        # SourceError, never a raw ValueError that 500s the manual grab and
+        # aborts the auto-grab cycle.
+        raise QbittorrentSourceError("unsupported torrent source URL") from exc
+    if parsed.scheme not in ("http", "https") or not hostname:
         # A source-URL veto (e.g. a redirect hop left http(s)) -- SourceError, so
         # a hostile/broken redirect chain is a 422 release problem, not a "client
         # down" 502.
         raise QbittorrentSourceError("unsupported torrent source URL")
     port = _safe_fetch_port(parsed, parsed.scheme)
-    await _safe_fetch_addresses_async(parsed.hostname, port)
+    await _safe_fetch_addresses_async(hostname, port)
 
 
 class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -617,6 +637,21 @@ class QbittorrentClient:
         self._trusted_source_origin = (
             _source_origin_triple(trusted_source_origin) if trusted_source_origin else None
         )
+        if trusted_source_origin and self._trusted_source_origin is None:
+            # The stored Prowlarr URL is not a usable origin (malformed IPv6
+            # literal / bad port / non-http scheme — PUT /settings does not
+            # URL-validate this field, so it need not be a corrupt row). The
+            # CLIENT is healthy, so degrade honestly: keep the SSRF veto fully
+            # closed (no trusted origin) and say so, rather than crash the
+            # constructor (a 500 on every qbt-dependent route, including pure
+            # DB paths) or report qBittorrent itself as unconfigured. Magnetless
+            # Prowlarr-self downloadUrls will surface as per-release source
+            # errors until the setting is fixed. Static message: no URL in logs.
+            _logger.warning(
+                "configured Prowlarr URL is not a usable trusted source origin; "
+                "torrent-source fetches keep the strict SSRF veto (fix the "
+                "Prowlarr URL in Settings)"
+            )
         self._logged_in = False
         # info_hash -> (fetched_at, properties json) — bounds /properties calls.
         self._properties_cache: dict[str, tuple[datetime, dict[str, object]]] = {}
@@ -733,7 +768,15 @@ class QbittorrentClient:
                             break
                         if location.startswith("magnet:"):
                             return location, None
-                        current = urljoin(current, location)
+                        try:
+                            current = urljoin(current, location)
+                        except ValueError as exc:
+                            # A MALFORMED redirect Location (e.g. `http://[::1` --
+                            # urljoin's urlsplit raises on the bad IPv6 literal) is
+                            # attacker-suppliable indexer output: a release problem,
+                            # never a raw ValueError that 500s the manual grab and
+                            # aborts the whole auto-grab cycle.
+                            raise QbittorrentSourceError("unsupported torrent source URL") from exc
                         continue
                     if response.status_code == _HTTP_OK:
                         content_length = response.headers.get("Content-Length")
@@ -807,7 +850,13 @@ class QbittorrentClient:
         torrent_bytes: bytes | None = None
         info_hash: str | None = None
 
-        scheme = urlparse(magnet_or_url).scheme.casefold()
+        try:
+            scheme = urlparse(magnet_or_url).scheme.casefold()
+        except ValueError as exc:
+            # An indexer-supplied source that urlparse itself refuses (bad IPv6
+            # literal) is a release problem -> the SourceError subtype, never a
+            # raw ValueError escaping the taxonomy.
+            raise QbittorrentSourceError("unsupported torrent source URL") from exc
         if scheme == "magnet":
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)

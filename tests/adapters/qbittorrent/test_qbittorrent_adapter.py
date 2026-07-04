@@ -639,6 +639,74 @@ async def test_redirect_off_trusted_prowlarr_to_private_host_is_vetoed() -> None
     assert seen == [PROWLARR_DOWNLOAD_URL]
 
 
+async def test_add_malformed_redirect_location_raises_source_error() -> None:
+    """A redirect hop with a MALFORMED Location (`http://[::1`) is attacker-
+    suppliable indexer output and must surface as the SourceError subtype
+    (422 / per-release auto-grab fall-through), never a raw error that 500s the
+    grab and aborts the whole auto-grab cycle. Two layers can refuse it: httpx
+    pre-parses Location (RemoteProtocolError -> a RequestError, already mapped
+    to SourceError), and for any Location httpx tolerates but the stdlib
+    refuses, the adapter's own ``urljoin`` guard converts the ValueError. This
+    test locks the end-to-end taxonomy whichever layer fires."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(302, headers={"Location": "http://[::1"})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_malformed_source_url_raises_source_error() -> None:
+    """An indexer-supplied source URL urlparse itself refuses (bad IPv6 literal)
+    is a release problem: SourceError, never a raw ValueError."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add("http://[::1", "/downloads", "plex-manager")
+
+    assert seen == []  # vetoed before any fetch or client call
+
+
+async def test_malformed_trusted_origin_degrades_to_closed_veto(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed STORED Prowlarr URL must not crash the client constructor
+    (pre-fix: ValueError -> a 500 on every qbt-dependent route, even pure DB
+    paths like mark-failed?remove_torrent=false). The CLIENT is healthy — only
+    the trust anchor is bad — so it degrades to NO trusted origin: the SSRF
+    veto stays fully closed, a visible warning is logged, and normal client
+    operations keep working."""
+    with caplog.at_level("WARNING"):
+        client = _client(trusted_source_origin="http://[::1")  # does not raise
+
+    assert any("not a usable trusted source origin" in record.message for record in caplog.records)
+
+    # Client healthy: a normal magnet add works.
+    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert info_hash == MAGNET_HASH
+
+    # Veto fully closed: private source URLs are still rejected (no accidental
+    # trust from the unusable origin).
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/file.torrent", "/downloads", "plex-manager")
+
+
 class _RecordingBackend(httpcore.AsyncNetworkBackend):
     def __init__(self) -> None:
         self.hosts: list[str] = []

@@ -228,6 +228,37 @@ async def test_mark_failed_no_removal_works_without_qbittorrent_configured(
     assert response.json()["status"] == "failed"
 
 
+async def test_mark_failed_db_only_survives_malformed_stored_prowlarr_url(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # A MALFORMED stored prowlarr_url (PUT /settings does not URL-validate the
+    # field) must not break the qBittorrent client constructor: pre-fix the
+    # trusted-origin parse raised ValueError, so EVERY qbt-dependent route 500'd
+    # -- including this pure-DB mark-failed path that never touches the client.
+    # qBittorrent itself is healthy and fully configured, so the real deps path
+    # (no override) must build the client and serve the request; the only honest
+    # degradation is the SSRF trust anchor staying closed.
+    from plex_manager.web.deps import SettingsStore
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://qb.local:8080")
+        await store.set("qbittorrent_username", "admin")
+        await store.set("qbittorrent_password", "pw")
+        await store.set("prowlarr_url", "http://[::1")  # malformed IPv6 literal
+        await session.commit()
+    download_id = await _insert_download(sessionmaker_, torrent_hash="f" * 40, status="downloading")
+
+    response = await client.post(
+        f"/api/v1/queue/{download_id}/mark-failed",
+        params={"remove_torrent": "false"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+
+
 async def test_mark_failed_with_removal_still_409s_when_qbittorrent_unconfigured(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
