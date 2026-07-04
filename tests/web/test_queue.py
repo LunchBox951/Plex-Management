@@ -193,6 +193,45 @@ async def test_mark_failed_blocklists(
     assert qbt.removed == [("c" * 40, True)]
 
 
+async def test_mark_failed_no_removal_works_without_qbittorrent_configured(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # The DB-only fail/blocklist/re-arm path never touches qBittorrent, so
+    # mark-failed?remove_torrent=false must still succeed on an install with the client
+    # unconfigured -- NOT 409 service_not_configured. qbt is intentionally NOT overridden.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(sessionmaker_, torrent_hash="d" * 40, status="downloading")
+
+    response = await client.post(
+        f"/api/v1/queue/{download_id}/mark-failed",
+        params={"remove_torrent": "false"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+
+
+async def test_mark_failed_with_removal_still_409s_when_qbittorrent_unconfigured(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # The honest counterpart: when removal IS requested but qBittorrent is unconfigured,
+    # refuse up front (409 service_not_configured) -- never silently skip the removal,
+    # and never mutate the row.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(sessionmaker_, torrent_hash="e" * 40, status="downloading")
+
+    response = await client.post(
+        f"/api/v1/queue/{download_id}/mark-failed",
+        params={"remove_torrent": "true"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "service_not_configured"
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None and row.status == "downloading"  # untouched
+
+
 async def test_grab_refuses_cam_only_release_and_adds_nothing(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:

@@ -34,6 +34,7 @@ from plex_manager.web.deps import (
     get_library_optional,
     get_prowlarr,
     get_qbittorrent,
+    get_qbittorrent_optional,
     get_tmdb,
 )
 
@@ -333,7 +334,9 @@ def override_adapters(
 
     ``library`` overrides BOTH the required (``get_library``) and optional
     (``get_library_optional``) Plex dependencies, so the request-dedupe and import
-    endpoints see the same fake.
+    endpoints see the same fake. ``qbt`` likewise overrides BOTH the required
+    (``get_qbittorrent``) and optional (``get_qbittorrent_optional``, the mark-failed
+    endpoint's DB-only-friendly variant) qBittorrent dependencies.
     """
     if tmdb is not None:
         app.dependency_overrides[get_tmdb] = lambda: tmdb
@@ -341,6 +344,7 @@ def override_adapters(
         app.dependency_overrides[get_prowlarr] = lambda: prowlarr
     if qbt is not None:
         app.dependency_overrides[get_qbittorrent] = lambda: qbt
+        app.dependency_overrides[get_qbittorrent_optional] = lambda: qbt
     if library is not None:
         app.dependency_overrides[get_library] = lambda: library
         app.dependency_overrides[get_library_optional] = lambda: library

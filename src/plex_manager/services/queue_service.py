@@ -227,7 +227,7 @@ async def reconcile_and_list(
 
 async def mark_failed(
     session: AsyncSession,
-    qbt: DownloadClientPort,
+    qbt: DownloadClientPort | None,
     *,
     download_id: int,
     blocklist: bool,
@@ -240,7 +240,16 @@ async def mark_failed(
     bad torrent seeding forever; now it is removed best-effort (a failure is
     logged, never raised -- the DB fail/blocklist/re-arm stands regardless, and an
     already-gone hash is a no-op success).
+
+    ``qbt`` may be ``None`` ONLY when ``remove_torrent`` is ``False`` (the DB-only
+    path): the caller (the mark-failed endpoint) resolves qBittorrent optionally so a
+    fail/blocklist/re-arm still works on an install without the client configured. A
+    ``None`` client with ``remove_torrent=True`` is a caller bug -- the endpoint has
+    already 409'd that combination up front -- so it is refused loudly here rather than
+    silently skipping the removal (honesty over silence).
     """
+    if remove_torrent and qbt is None:
+        raise ValueError("mark_failed(remove_torrent=True) requires a qBittorrent client")
     download_repo = SqlDownloadRepository(session)
     row = await session.get(Download, download_id)
     if row is None:
@@ -306,8 +315,10 @@ async def mark_failed(
     # Close the seeding leak (ADR-0014): remove the torrent + its data AFTER the
     # DB fail/blocklist/re-arm has committed, so a client hiccup never undoes that
     # committed state. Best-effort + already-gone-is-a-no-op (see
-    # ``purge_service.remove_torrent``).
-    if remove_torrent:
+    # ``purge_service.remove_torrent``). ``qbt is not None`` is guaranteed by the
+    # top-of-function guard whenever ``remove_torrent`` is True; the explicit check
+    # narrows the optional type for the type checker.
+    if remove_torrent and qbt is not None:
         await purge_service.remove_torrent(
             qbt,
             row.torrent_hash,

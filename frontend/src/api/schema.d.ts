@@ -388,6 +388,12 @@ export interface paths {
          *     ``remove_torrent`` (default true): also remove the torrent + its data from the
          *     client, closing the seeding leak (ADR-0014) -- best-effort, so a client hiccup
          *     never blocks the fail/blocklist/re-arm.
+         *
+         *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): the DB-only
+         *     fail/blocklist/re-arm path never touches it, so ``remove_torrent=false`` still
+         *     works on an install with qBittorrent unconfigured. When removal IS requested but
+         *     the client is unconfigured, this re-imposes the honest 409 ``service_not_configured``
+         *     up front (before any state change) rather than silently skipping the removal.
          */
         post: operations["mark_failed_endpoint_api_v1_queue__download_id__mark_failed_post"];
         delete?: never;
