@@ -148,9 +148,33 @@ class LocalFileSystem:
         return shutil.disk_usage(probe).free
 
     def move(self, src: Path, dst: Path) -> None:
-        """Move ``src`` to ``dst`` (atomic rename when on the same device)."""
+        """Move ``src`` to ``dst`` (atomic rename when on the same device).
+
+        ``shutil.move`` tries ``os.rename`` first and only falls back to a
+        content copy + unlink-source on a genuine cross-device failure
+        (``EXDEV``). If that copy fallback raises partway through (disk full,
+        killed process, I/O error), the exception propagates with a partially
+        written ``dst`` left on disk and ``src`` still intact — the same
+        partial-file hazard :meth:`hardlink_or_copy`'s copy fallback already
+        guards against. Mirror that fix here: on failure, if ``dst`` did NOT
+        pre-exist (so any partial file left behind is ours to remove), best-
+        effort clean it up — a file or a partially populated directory tree,
+        since ``shutil.move``'s copy fallback for a directory is a full
+        ``copytree`` that can be interrupted mid-walk — then re-raise the
+        ORIGINAL, unmasked error (north-star #3: honesty).
+        """
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(os.fspath(src), os.fspath(dst))
+        dst_preexisted = os.path.lexists(dst)
+        try:
+            shutil.move(os.fspath(src), os.fspath(dst))
+        except OSError:
+            if not dst_preexisted:
+                with contextlib.suppress(OSError):
+                    if os.path.isdir(dst) and not os.path.islink(dst):
+                        shutil.rmtree(dst)
+                    else:
+                        os.unlink(dst)
+            raise
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
@@ -245,6 +269,45 @@ class LocalFileSystem:
         """
         return list(_iter_video_files(root))
 
+    def resolve_guarded(self, path: str) -> str | None:
+        """Resolve ``path`` to its realpath, returning it ONLY if that resolved
+        target sits within a configured library root -- else ``None`` (a refusal).
+
+        The SINGLE resolve-and-check that both :meth:`delete` and
+        :meth:`delete_guard_refuses` share, so ``path``'s symlink chain is resolved
+        EXACTLY ONCE. That is the whole point: :meth:`delete` removes the very path
+        this returned and never re-resolves ``path`` afterwards, so a symlinked path
+        COMPONENT repointed AFTER the containment check can no longer redirect the
+        removal outside every root (the guard/delete TOCTOU) -- there is no second
+        resolution left to disagree with the checked one. ``path`` is resolved with
+        :func:`os.path.realpath` (dereferencing every symlink in the chain,
+        mirroring :func:`_iter_video_files`'s containment check), and it fails
+        CLOSED -- an empty ``path``, or no configured roots, returns ``None``.
+        """
+        if not path:
+            return None
+        real = os.path.realpath(path)
+        if not any(_is_within(root, real) for root in self._library_roots):
+            return None
+        return real
+
+    def delete_guard_refuses(self, path: str) -> bool:
+        """Whether :meth:`delete` would REFUSE ``path`` as outside every configured
+        library root -- the pure containment predicate, no delete attempted.
+
+        A thin boolean view over :meth:`resolve_guarded` (the single shared
+        resolve-and-check ``delete`` itself now uses), so a read-only caller (the
+        retention-telemetry would-evict SIMULATION) can pre-filter the same paths a
+        real sweep's ``delete`` would refuse WITHOUT deleting anything and WITHOUT
+        reimplementing the check -- so its would-evict count/bytes can never count
+        space a real sweep would refuse to free, and can never drift from
+        ``delete``'s own guard. Mirrors ``delete``: ``path`` is resolved to its
+        realpath (dereferencing a symlinked COMPONENT that would escape the root,
+        not just a symlink final entry), and it fails CLOSED -- an empty path, or no
+        configured roots, refuses.
+        """
+        return self.resolve_guarded(path) is None
+
     def delete(self, path: str) -> None:
         """Delete ``path`` (a file, a symlink, or a whole directory tree) from local disk.
 
@@ -256,6 +319,14 @@ class LocalFileSystem:
         skipped: eviction must never be able to reach outside a configured
         library root, and a caller passing a wrong path is a bug worth surfacing
         loudly even if that wrong path happens not to exist.
+
+        ``path`` is resolved EXACTLY ONCE (via :meth:`resolve_guarded`) and it is
+        that single resolved target -- the one whose containment was checked -- that
+        is removed below; ``path`` is never re-resolved afterwards. This closes a
+        guard/delete TOCTOU: were the containment check and the removal to resolve
+        ``path`` independently, a symlinked path COMPONENT repointed between them
+        could send the removal outside every configured root even though the check
+        passed. There is no such second resolution here.
 
         Containment is checked against the RESOLVED path, but the actual REMOVAL
         never dereferences a symlink: when ``path`` ITSELF is a symlink (e.g. a
@@ -277,8 +348,12 @@ class LocalFileSystem:
         success, or a breadcrumb pointing at something already removed
         out-of-band) sees a clean, idempotent success.
         """
-        real = os.path.realpath(path) if path else ""
-        if not real or not any(_is_within(root, real) for root in self._library_roots):
+        # Resolve-and-check ONCE: the returned ``real`` is the path whose containment
+        # was just affirmed, and it -- never a fresh re-resolution of ``path`` -- is
+        # what the real-file/tree removal below acts on (closes the guard/delete
+        # TOCTOU; see the docstring).
+        real = self.resolve_guarded(path)
+        if real is None:
             raise LocalFileSystemError(
                 f"refusing to delete {path!r}: outside every configured library root"
             )

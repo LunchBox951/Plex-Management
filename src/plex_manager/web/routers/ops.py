@@ -41,6 +41,7 @@ from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service
 from plex_manager.services.eviction_service import EvictionOutcome
 from plex_manager.services.health_service import (
+    AutograbStatus,
     HealthCredentials,
     ReconcileStatus,
     SubsystemHealth,
@@ -51,6 +52,7 @@ from plex_manager.services.health_service import (
 from plex_manager.services.log_capture_service import RING_BUFFER_MAXLEN, LogCaptureHandler
 from plex_manager.web.deps import (
     SettingsStore,
+    get_autograb_status,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_eviction_filesystem,
@@ -67,6 +69,7 @@ from plex_manager.web.deps import (
     require_api_key,
 )
 from plex_manager.web.schemas import (
+    AutograbStatusItem,
     DiskGaugeItem,
     DiskResponse,
     DiskRootItem,
@@ -113,10 +116,12 @@ async def health_endpoint(
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     cache: Annotated[TtlCache[SubsystemHealth], Depends(get_health_cache)],
     reconcile_status: Annotated[ReconcileStatus, Depends(get_reconcile_status)],
+    autograb_status: Annotated[AutograbStatus, Depends(get_autograb_status)],
 ) -> HealthResponse:
-    """One read: per-subsystem reachability, disk gauges, and the reconcile
-    loop's own health. Each upstream probe is TTL-cached (~15s) so polling this
-    every few seconds never hammers an upstream or burns the TMDB rate limit."""
+    """One read: per-subsystem reachability, disk gauges, and the reconcile +
+    auto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so
+    polling this every few seconds never hammers an upstream or burns the TMDB
+    rate limit."""
     store = SettingsStore(session)
     creds = HealthCredentials(
         plex_url=await store.get("plex_url"),
@@ -136,6 +141,7 @@ async def health_endpoint(
         cache=cache,
         creds=creds,
         reconcile_status=reconcile_status,
+        autograb_status=autograb_status,
         library_roots={"movies_root": movies_root, "tv_root": tv_root},
     )
     return HealthResponse(
@@ -162,6 +168,14 @@ async def health_endpoint(
             last_error_type=snapshot.reconcile.last_error_type,
             last_error_at=snapshot.reconcile.last_error_at,
             consecutive_failures=snapshot.reconcile.consecutive_failures,
+        ),
+        autograb=AutograbStatusItem(
+            last_run_at=snapshot.autograb.last_run_at,
+            last_ok_at=snapshot.autograb.last_ok_at,
+            last_error_type=snapshot.autograb.last_error_type,
+            last_error_at=snapshot.autograb.last_error_at,
+            consecutive_failures=snapshot.autograb.consecutive_failures,
+            cooled_down_scopes=snapshot.autograb.cooled_down_scopes,
         ),
     )
 

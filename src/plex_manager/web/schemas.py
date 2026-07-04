@@ -215,6 +215,27 @@ class SettingsResponse(BaseModel):
     eviction_proactive_enabled: bool | None = None
     eviction_interval_minutes: float | None = None
     log_retention_days: int | None = None
+    # Auto-grab worker (ADR-0013) — the master on/off switch for the background
+    # request->search->grab loop (default ON in ``web.deps``; ``None`` = unset =
+    # the default applies). Plain boolean config, same wire semantics as
+    # ``eviction_enabled`` above.
+    auto_grab_enabled: bool | None = None
+
+
+class AppApiKeyResponse(BaseModel):
+    """The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+
+    Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
+    reveal is the belt-and-braces recovery path for a lost/forgotten key on a
+    device that still has it saved, and rotate mints and returns a brand-new key
+    ONCE — the plaintext is never retrievable again after this response, only the
+    Fernet-encrypted column at rest (matching the one-time disclosure setup's
+    ``/complete`` already gives the initial key).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    app_api_key: str
 
 
 class SettingsUpdate(BaseModel):
@@ -248,6 +269,9 @@ class SettingsUpdate(BaseModel):
     eviction_proactive_enabled: bool | None = Field(default=None)
     eviction_interval_minutes: float | None = Field(default=None, gt=0)
     log_retention_days: int | None = Field(default=None, ge=0)
+    # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
+    # bounds to enforce.
+    auto_grab_enabled: bool | None = Field(default=None)
 
     @model_validator(mode="after")
     def _target_at_or_below_threshold(self) -> SettingsUpdate:
@@ -609,6 +633,28 @@ class ReconcileStatusItem(BaseModel):
     consecutive_failures: int = 0
 
 
+class AutograbStatusItem(BaseModel):
+    """The background auto-grab loop's own health (ADR-0013), mirrored from
+    ``services.health_service.AutograbStatusSnapshot``. The exact shape of
+    ``ReconcileStatusItem`` above, for the separate ``_autograb_loop`` -- a
+    Prowlarr outage surfaces here as a failing loop so the operator sees WHY
+    nothing is being grabbed, not just that requests sit at ``pending``.
+
+    ``cooled_down_scopes`` is how many scopes are CURRENTLY in a grab-pipeline
+    cooldown (ADR-0013): scopes whose grab keeps failing, skipped so they don't
+    starve the search budget -- a non-zero count is the operator's signal that the
+    grab pipeline (not the search) is what's broken."""
+
+    model_config = ConfigDict(frozen=True)
+
+    last_run_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error_type: str | None = None
+    last_error_at: datetime | None = None
+    consecutive_failures: int = 0
+    cooled_down_scopes: int = 0
+
+
 class HealthResponse(BaseModel):
     """``GET /api/v1/ops/health`` -- one read answering "is every subsystem
     healthy, is the reconcile loop running, how full is the disk"."""
@@ -618,6 +664,7 @@ class HealthResponse(BaseModel):
     subsystems: list[SubsystemHealthItem]
     disks: list[DiskGaugeItem]
     reconcile: ReconcileStatusItem
+    autograb: AutograbStatusItem
 
 
 # --------------------------------------------------------------------------- #

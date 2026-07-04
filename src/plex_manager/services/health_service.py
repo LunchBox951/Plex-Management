@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
+    "AutograbStatus",
+    "AutograbStatusSnapshot",
     "DiskGauge",
     "HealthCredentials",
     "HealthSnapshot",
@@ -73,6 +75,7 @@ __all__ = [
     "collect_disk_gauges",
     "collect_health_snapshot",
     "read_disk_usage",
+    "snapshot_autograb",
     "snapshot_reconcile",
 ]
 
@@ -222,6 +225,76 @@ def snapshot_reconcile(status: ReconcileStatus) -> ReconcileStatusSnapshot:
     )
 
 
+@dataclass
+class AutograbStatus:
+    """Mutable, in-process record of the BACKGROUND AUTO-GRAB LOOP's own health
+    (ADR-0013) -- the exact mirror of :class:`ReconcileStatus`, for the separate
+    ``_autograb_loop`` in ``web/app.py``.
+
+    Deliberately a SEPARATE signal from both the subsystem cards and the reconcile
+    loop: the auto-grab loop can complete a cycle cleanly (``mark_ok``) while
+    Prowlarr is degraded -- and, conversely, a Prowlarr outage surfaces here as a
+    failing loop (``mark_error``) so the operator sees WHY nothing is being grabbed,
+    not just that requests sit at ``pending``. Never persisted (a fresh process
+    legitimately has no history yet); mutated in place like ``ReconcileStatus``.
+    """
+
+    last_run_at: datetime | None = field(default=None)
+    last_ok_at: datetime | None = field(default=None)
+    last_error_type: str | None = field(default=None)
+    last_error_at: datetime | None = field(default=None)
+    consecutive_failures: int = field(default=0)
+    # How many scopes are CURRENTLY inside a grab-pipeline cooldown (ADR-0013):
+    # scopes whose grab keeps raising ``GrabError`` and are being skipped so they
+    # don't starve the per-cycle search budget. Surfaced so the operator SEES the
+    # grab pipeline failing (honesty over silence), not just eager requests that
+    # never reach ``downloading``. Set from each cycle's ``AutograbCycleResult``;
+    # orthogonal to the error streak, so ``mark_ok``/``mark_error`` leave it alone.
+    cooled_down_scopes: int = field(default=0)
+
+    def mark_run_started(self) -> None:
+        """Stamp the top of a new cycle -- called unconditionally, success or not."""
+        self.last_run_at = _now()
+
+    def mark_ok(self) -> None:
+        """A cycle completed without raising: clear any prior error, reset the streak."""
+        self.last_ok_at = _now()
+        self.last_error_type = None
+        self.last_error_at = None
+        self.consecutive_failures = 0
+
+    def mark_error(self, exc: BaseException) -> None:
+        """A cycle raised: record the exception TYPE only (never its message -- no
+        secret leak) and extend the consecutive-failure streak."""
+        self.last_error_type = type(exc).__name__
+        self.last_error_at = _now()
+        self.consecutive_failures += 1
+
+
+@dataclass(frozen=True)
+class AutograbStatusSnapshot:
+    """An immutable copy of :class:`AutograbStatus`, safe to hand to a response."""
+
+    last_run_at: datetime | None
+    last_ok_at: datetime | None
+    last_error_type: str | None
+    last_error_at: datetime | None
+    consecutive_failures: int
+    cooled_down_scopes: int
+
+
+def snapshot_autograb(status: AutograbStatus) -> AutograbStatusSnapshot:
+    """Take an immutable point-in-time copy of the live, mutable ``status``."""
+    return AutograbStatusSnapshot(
+        last_run_at=status.last_run_at,
+        last_ok_at=status.last_ok_at,
+        last_error_type=status.last_error_type,
+        last_error_at=status.last_error_at,
+        consecutive_failures=status.consecutive_failures,
+        cooled_down_scopes=status.cooled_down_scopes,
+    )
+
+
 @dataclass(frozen=True)
 class HealthCredentials:
     """Every credential :func:`check_subsystems` might need, all optional.
@@ -249,6 +322,7 @@ class HealthSnapshot:
     subsystems: tuple[SubsystemHealth, ...]
     disks: tuple[DiskGauge, ...]
     reconcile: ReconcileStatusSnapshot
+    autograb: AutograbStatusSnapshot
 
 
 # --------------------------------------------------------------------------- #
@@ -478,6 +552,7 @@ async def collect_health_snapshot(
     cache: TtlCache[SubsystemHealth],
     creds: HealthCredentials,
     reconcile_status: ReconcileStatus,
+    autograb_status: AutograbStatus,
     library_roots: dict[str, str | None],
 ) -> HealthSnapshot:
     """Aggregate every health signal into one snapshot for the dashboard.
@@ -497,4 +572,5 @@ async def collect_health_snapshot(
         subsystems=tuple(subsystems),
         disks=tuple(disks),
         reconcile=snapshot_reconcile(reconcile_status),
+        autograb=snapshot_autograb(autograb_status),
     )
