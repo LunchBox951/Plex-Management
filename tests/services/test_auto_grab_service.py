@@ -577,6 +577,69 @@ async def test_scope_conflict_on_top_pick_grabs_lower_ranked_release(
         assert grabbed_row.status == "downloading"
 
 
+async def test_torrent_tracked_by_other_request_grabs_next_release_cycle_survives(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Request A's top-ranked accepted release carries a hash ALREADY actively
+    # tracked by a DIFFERENT request entirely -> grab_service raises
+    # TorrentAlreadyTrackedError at the known-hash precheck (nothing handed to the
+    # client; the other request's download owns the physical torrent). That is a
+    # PER-RELEASE failure for A: the worker must fall through and GRAB A's
+    # lower-ranked release, and the cycle must survive to process request B --
+    # pre-fix the error escaped run_grab_cycle and aborted the whole pass.
+    other_id = await _seed_movie(
+        sessionmaker_, tmdb_id=999, status=RequestStatus.downloading, title="Other Movie"
+    )
+    a_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    b_id = await _seed_movie(sessionmaker_, tmdb_id=604)
+    async with sessionmaker_() as session:
+        # The shared hash ("aaaa...") is actively downloading for the OTHER request.
+        session.add(
+            Download(
+                torrent_hash="a" * 40,
+                status="downloading",
+                media_request_id=other_id,
+                tmdb_id=999,
+            )
+        )
+        await session.commit()
+    prowlarr = _PerTmdbProwlarr(
+        {
+            603: [
+                candidate("Some.Movie.2020.1080p.WEB-DL.x264-DUPE", info_hash="a" * 40, seeders=99),
+                candidate("Some.Movie.2020.1080p.WEB-DL.x264-ALT", info_hash="b" * 40, seeders=10),
+            ],
+            604: good_and_cam_candidates(),
+        }
+    )
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.searched == 2  # the cycle survived A's duplicate-hash top pick
+    assert result.grabbed == 2  # A's fallback release AND B both grabbed
+    assert result.no_acceptable == 0
+    assert result.grab_errors == 0  # per-release, never an operational error
+    assert result.last_grab_error is None
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, a_id)
+        b = await session.get(MediaRequest, b_id)
+        assert a is not None and b is not None
+        assert a.status == RequestStatus.downloading
+        assert b.status == RequestStatus.downloading
+        # A's download tracks the FALLBACK hash, never the other request's torrent.
+        a_row = (
+            await session.execute(select(Download).where(Download.media_request_id == a_id))
+        ).scalar_one()
+        assert a_row.torrent_hash == "b" * 40
+        # The other request's download is untouched.
+        other_row = (
+            await session.execute(select(Download).where(Download.media_request_id == other_id))
+        ).scalar_one()
+        assert other_row.torrent_hash == "a" * 40
+        assert other_row.status == "downloading"
+
+
 async def test_all_accepted_ungrabbable_parks_on_backoff(sessionmaker_: SessionMaker) -> None:
     # Every accepted release is sourceless (NoGrabSourceError) -> the list is
     # exhausted with no successful grab, so the scope parks on the escalating backoff
