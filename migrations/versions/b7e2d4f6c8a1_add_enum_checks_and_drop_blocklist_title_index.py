@@ -69,6 +69,34 @@ _ENUM_CHECKS = (
 )
 
 
+# SQLite cannot ADD CONSTRAINT in place, so ``batch_alter_table`` recreates each
+# table -- and SQLAlchemy's SQLite reflection does NOT carry partial (WHERE'd) or
+# expression indexes across that recreate, silently dropping the two ACTIVE-row
+# unique guards. Re-issue them (verbatim from ``models.py``) after every batch
+# pass, in BOTH directions. ``IF NOT EXISTS`` makes this a no-op on PostgreSQL,
+# where batch mode is a plain ALTER and the indexes were never lost.
+_PARTIAL_INDEX_DDL = (
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_media_requests_active
+    ON media_requests (tmdb_id, media_type)
+    WHERE status IN ('pending', 'searching', 'no_acceptable_release',
+                     'downloading', 'import_blocked', 'completed',
+                     'partially_available')
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_downloads_active_request
+    ON downloads (media_request_id, coalesce(season, -1))
+    WHERE media_request_id IS NOT NULL
+      AND status NOT IN ('imported', 'failed', 'no_acceptable_release')
+    """,
+)
+
+
+def _restore_partial_indexes() -> None:
+    for ddl in _PARTIAL_INDEX_DDL:
+        op.execute(sa.text(ddl))
+
+
 def _quoted(values: tuple[str, ...]) -> str:
     return ", ".join(f"'{value}'" for value in values)
 
@@ -130,11 +158,15 @@ def upgrade() -> None:
                 _constraint_sql(column, values, nullable),
             )
 
+    _restore_partial_indexes()
+
 
 def downgrade() -> None:
     for table, column, _values, _nullable in reversed(_ENUM_CHECKS):
         with op.batch_alter_table(table, schema=None) as batch_op:
             batch_op.drop_constraint(_constraint_name(table, column), type_="check")
+
+    _restore_partial_indexes()
 
     with op.batch_alter_table("blocklist", schema=None) as batch_op:
         batch_op.create_index("ix_blocklist_source_title", ["source_title"], unique=False)
