@@ -23,7 +23,7 @@ dependencies = [
     # Release-name parser (borrowed brains, ADR-0008). Pinned exactly: the
     # parse output drives the safety-critical CAM/TS hard cutoff, so a silent
     # upgrade must never shift classification (golden tests guard it too).
-    "guessit==4.0.2",
+    "guessit==4.1.0",
     # Fernet encryption for secrets at rest (ADR-0005).
     "cryptography>=42",
 ]
