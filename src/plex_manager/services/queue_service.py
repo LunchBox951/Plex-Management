@@ -71,17 +71,18 @@ def _utcnow() -> datetime:
 
 async def _handle_failed(
     session: AsyncSession,
-    qbt: DownloadClientPort,
     event: DownloadFailed,
     rows: list[DownloadRecord],
 ) -> None:
-    """Blocklist a failed release, re-arm its request, and remove the torrent.
+    """Blocklist a failed release and re-arm its request (DB writes only).
 
-    The torrent removal (``qbt.remove(delete_files=True)``, best-effort) closes the
-    seeding leak (ADR-0014): before this, a reconcile-driven blocklist-and-research
-    left the bad torrent seeding and holding disk indefinitely. Removing an
-    already-gone hash (the common case here -- the row usually failed BECAUSE it
-    went ClientMissing) is a no-op success.
+    Does NOT remove the torrent: that ``qbt.remove(delete_files=True)`` is external
+    client I/O and must not run inside the reconcile write transaction -- holding
+    SQLite's write lock across a network round-trip, and (worse) a later write failure
+    in the same transaction would roll the DB back AFTER the torrent was already
+    deleted. :func:`reconcile_and_list` instead collects the failed hashes and removes
+    them best-effort AFTER its final commit (mirroring :func:`mark_failed`'s own
+    after-commit removal); an already-gone hash is a no-op success there.
     """
     blocklist_repo = SqlBlocklistRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -136,16 +137,6 @@ async def _handle_failed(
         await SqlDownloadRepository(session).update_status(
             record.id, DownloadState.Failed.value, failed_reason=event.reason
         )
-
-    # Close the seeding leak (ADR-0014): remove the blocklisted torrent + its data.
-    # Best-effort (logged, never raised) so a client hiccup never undoes the
-    # blocklist/re-arm just written; an already-gone hash is a no-op success.
-    await purge_service.remove_torrent(
-        qbt,
-        event.torrent_hash,
-        context="a reconcile-driven download failure",
-        extra={"torrent_hash": event.torrent_hash, "tmdb_id": event.tmdb_id},
-    )
 
 
 async def list_queue(session: AsyncSession) -> list[DownloadRecord]:
@@ -218,10 +209,30 @@ async def reconcile_and_list(
                 row.id, progress=live.progress, seed_ratio=live.ratio
             )
 
-    for event in failed_download_events(transitions, rows, occurred_at=now):
-        await _handle_failed(session, qbt, event, rows)
+    # Collect the failed events during the transaction (blocklist + re-arm are DB
+    # writes), then remove their torrents AFTER the commit below -- qbt.remove is
+    # external client I/O and must not run while the reconcile write transaction holds
+    # SQLite's write lock (nor before a later write that could roll the DB back after
+    # the torrent was already deleted).
+    failed_events = list(failed_download_events(transitions, rows, occurred_at=now))
+    for event in failed_events:
+        await _handle_failed(session, event, rows)
 
     await session.commit()
+
+    # Close the seeding leak (ADR-0014) AFTER the commit, mirroring mark_failed's
+    # after-commit removal: a client hiccup here never undoes the committed
+    # blocklist/re-arm, and an already-gone hash (the common case -- the row usually
+    # failed BECAUSE it went ClientMissing) is a no-op success. Best-effort per hash,
+    # preserving the per-hash log extra.
+    for event in failed_events:
+        await purge_service.remove_torrent(
+            qbt,
+            event.torrent_hash,
+            context="a reconcile-driven download failure",
+            extra={"torrent_hash": event.torrent_hash, "tmdb_id": event.tmdb_id},
+        )
+
     return await download_repo.list_active()
 
 

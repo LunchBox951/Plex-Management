@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -438,6 +439,64 @@ async def test_missing_beyond_grace_never_regresses_an_already_available_season(
     assert request is not None
     assert request.status is RequestStatus.available  # rollup unaffected
     assert download.status == "failed"  # this attempt's own failure stays visible
+
+
+class _TxRecordingQbt(FakeQbittorrent):
+    """A :class:`FakeQbittorrent` that records whether the session was mid-transaction
+    at each ``remove`` -- so a test can prove the reconcile-driven removal runs AFTER
+    the commit (``in_transaction()`` False), not inside the open write transaction."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        super().__init__(statuses=[])
+        self._session = session
+        self.in_tx_at_remove: list[bool] = []
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        self.in_tx_at_remove.append(self._session.in_transaction())
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_reconcile_removes_the_failed_torrent_after_the_commit(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding #3: qbt.remove is external client I/O, so it must run AFTER
+    ``reconcile_and_list``'s final commit, never inside the open reconcile write
+    transaction (which would hold SQLite's write lock across the round-trip)."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    async with sessionmaker_() as session:
+        qbt = _TxRecordingQbt(session)
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The removal happened (seeding-leak fix) AND it happened post-commit (outside a
+    # transaction), proving it no longer runs inside the reconcile write transaction.
+    assert qbt.removed == [(_HASH, True)]
+    assert qbt.in_tx_at_remove == [False]
+
+
+async def test_reconcile_does_not_remove_when_the_commit_fails(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding #3's honesty guarantee: because the removal is deferred to AFTER the
+    commit, a commit failure means NO torrent removal was even attempted -- the DB and
+    the client stay consistent (nothing deleted against a rolled-back transaction)."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+
+        async def _boom() -> None:
+            raise RuntimeError("commit blew up")
+
+        monkeypatch.setattr(session, "commit", _boom)
+        with pytest.raises(RuntimeError):
+            await queue_service.reconcile_and_list(qbt, session)
+
+    assert qbt.removed == []  # the post-commit removal loop was never reached
 
 
 async def test_mark_failed_never_regresses_an_already_available_season(
