@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import plex_manager.db as db_module
 from plex_manager.adapters import encryption
 from plex_manager.config import Settings, get_settings, validate_startup_exposure
-from plex_manager.db import Base
 from plex_manager.models import SystemSettings
 from plex_manager.web.app import create_app
 
@@ -77,7 +76,7 @@ async def tokenless_lifespan_env(
     monkeypatch.setattr(db_module, "_sessionmaker", None)
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(db_module.Base.metadata.create_all)
     await engine.dispose()
     try:
         yield db_path
