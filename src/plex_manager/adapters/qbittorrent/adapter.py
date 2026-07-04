@@ -42,12 +42,18 @@ from datetime import UTC, datetime
 from typing import Final, cast
 from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
 
+import anyio.to_thread
 import httpcore
 import httpx
 
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 
-__all__ = ["QbittorrentAuthError", "QbittorrentClient", "QbittorrentError"]
+__all__ = [
+    "QbittorrentAuthError",
+    "QbittorrentClient",
+    "QbittorrentError",
+    "QbittorrentSourceError",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -58,7 +64,10 @@ _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
-_MAX_TORRENT_BYTES: Final = 1_000_000
+# A .torrent metafile is normally tens of KB, but a large multi-file pack with a
+# small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
+# real metafile yet still a hard ceiling against a hostile/unbounded source body.
+_MAX_TORRENT_BYTES: Final = 10 * 1024 * 1024
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
@@ -88,6 +97,17 @@ class QbittorrentAuthError(QbittorrentError):
 
     A surfaced error — never a silent failure. The message never includes the
     password or session id.
+    """
+
+
+class QbittorrentSourceError(QbittorrentError):
+    """An HTTP(S) torrent source could not be resolved to a trackable torrent.
+
+    Distinct from a client outage: qBittorrent itself is healthy — the SOURCE (an
+    indexer download URL) served neither a magnet redirect nor a locally-hashable
+    ``.torrent`` body, so there is nothing addable. Mapped to a 422 (the request
+    is well-formed but unprocessable), never the dishonest 502
+    ``qbittorrent_unavailable`` that would blame a client which is working fine.
     """
 
 
@@ -329,12 +349,24 @@ def _safe_fetch_addresses(host: str, port: int | None) -> list[str]:
     return addresses
 
 
-def _assert_safe_fetch_url(url: str) -> None:
+async def _safe_fetch_addresses_async(host: str, port: int | None) -> list[str]:
+    """Resolve + vet ``host`` off the event loop.
+
+    ``_safe_fetch_addresses`` calls the blocking ``socket.getaddrinfo``; run inside
+    an async path (this and ``SafeFetchNetworkBackend.connect_tcp``) it would stall
+    the whole event loop for the resolver's timeout. Offload to a worker thread so a
+    slow or hostile DNS answer never blocks unrelated requests (httpx already pulls
+    in anyio).
+    """
+    return await anyio.to_thread.run_sync(_safe_fetch_addresses, host, port)
+
+
+async def _assert_safe_fetch_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise QbittorrentError("unsupported torrent source URL")
     port = _safe_fetch_port(parsed, parsed.scheme)
-    _safe_fetch_addresses(parsed.hostname, port)
+    await _safe_fetch_addresses_async(parsed.hostname, port)
 
 
 class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -364,10 +396,14 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
         try:
-            addresses = _safe_fetch_addresses(host, port)
+            addresses = await _safe_fetch_addresses_async(host, port)
         except QbittorrentError as exc:
             raise httpcore.ConnectError("unsafe torrent source URL") from exc
-        last_error: httpcore.ConnectError | None = None
+        # ``ConnectTimeout`` is a ``TimeoutException`` subclass, NOT a
+        # ``ConnectError`` -- a broken-IPv6 dual-stack host times out on its AAAA
+        # address, so catching only ``ConnectError`` would abandon the working IPv4
+        # fallback. Catch both so every resolved address is actually tried.
+        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
         for address in addresses:
             try:
                 return await self._delegate.connect_tcp(
@@ -377,7 +413,7 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
                     local_address=local_address,
                     socket_options=socket_options,
                 )
-            except httpcore.ConnectError as exc:
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 last_error = exc
         if last_error is not None:
             raise last_error
@@ -410,7 +446,9 @@ class _SafeFetchResponseStream(httpx.AsyncByteStream):
     async def aclose(self) -> None:
         aclose = getattr(self._stream, "aclose", None)
         if aclose is not None:
-            await cast("Callable[[], Awaitable[None]]", aclose)()
+            # Non-string cast so Callable/Awaitable are runtime-used imports
+            # (a string form trips CodeQL's py/unused-import, alert #259).
+            await cast(Callable[[], Awaitable[None]], aclose)()
 
 
 class _SafeFetchTransport(httpx.AsyncBaseTransport):
@@ -467,7 +505,11 @@ def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     if (
         content_path is not None
         and save_path
-        and os.path.realpath(content_path) == os.path.realpath(save_path)
+        # Pure lexical compare: the intent is only to drop content_path when it
+        # echoes save_path modulo a trailing slash. realpath() would do a blocking
+        # per-component lstat against qBittorrent's FOREIGN filesystem namespace on
+        # a reconciler/health hot path -- normpath needs no I/O and is correct here.
+        and os.path.normpath(content_path) == os.path.normpath(save_path)
     ):
         content_path = None
     eta = _i(torrent.get("eta"))
@@ -603,7 +645,7 @@ class QbittorrentClient:
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
-            _assert_safe_fetch_url(current)
+            await _assert_safe_fetch_url(current)
             try:
                 async with client.stream("GET", current, follow_redirects=False) as response:
                     if response.is_redirect:
@@ -618,10 +660,14 @@ class QbittorrentClient:
                         content_length = response.headers.get("Content-Length")
                         if content_length is not None:
                             try:
-                                if int(content_length) > _MAX_TORRENT_BYTES:
-                                    raise QbittorrentError("torrent file is too large")
+                                declared_size = int(content_length)
                             except ValueError:
-                                pass
+                                # A malformed Content-Length is only an early-abort
+                                # optimization lost -- the streamed byte cap below
+                                # still enforces _MAX_TORRENT_BYTES authoritatively.
+                                declared_size = None
+                            if declared_size is not None and declared_size > _MAX_TORRENT_BYTES:
+                                raise QbittorrentError("torrent file is too large")
                         chunks: list[bytes] = []
                         total = 0
                         async for chunk in response.aiter_bytes():
@@ -671,12 +717,12 @@ class QbittorrentClient:
             elif body is not None:
                 info_hash = _info_hash_from_torrent(body)
                 if info_hash is None:
-                    raise QbittorrentError("could not determine torrent hash for HTTP source")
+                    raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
                 torrent_bytes = body
             else:
                 # Could not resolve to a magnet or locally hashable .torrent. Do
                 # not ask qBittorrent to add an untrackable opaque URL.
-                raise QbittorrentError("could not determine torrent hash for HTTP source")
+                raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
         elif scheme:
             raise QbittorrentError("unsupported torrent source URL")
         else:

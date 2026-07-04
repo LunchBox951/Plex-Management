@@ -24,6 +24,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
+    QbittorrentSourceError,
 )
 from plex_manager.adapters.qbittorrent.adapter import SafeFetchNetworkBackend
 
@@ -356,7 +357,7 @@ async def test_add_opaque_http_url_is_rejected_before_client_add() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
 
     assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
@@ -378,7 +379,7 @@ async def test_add_uppercase_http_url_uses_resolver_before_client_add() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(upper_url, "/downloads", "plex-manager")
 
     assert any(url.lower() == upper_url.lower() for url in seen)
@@ -634,6 +635,60 @@ async def test_safe_fetch_backend_tries_next_vetted_dns_answer(
     assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
 
 
+class _TimeoutFirstBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        if len(self.hosts) == 1:
+            # ConnectTimeout is a TimeoutException, NOT a ConnectError subclass.
+            raise httpcore.ConnectTimeout("first address timed out")
+        return _DummyNetworkStream()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_safe_fetch_backend_tries_next_address_on_connect_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken-IPv6 dual-stack host raises ConnectTimeout on its first resolved
+    address; the retry loop must still try the remaining vetted address rather than
+    abandon the working IPv4 fallback (ConnectTimeout is not a ConnectError)."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80)),
+        ]
+
+    delegate = _TimeoutFirstBackend()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    stream = await SafeFetchNetworkBackend(delegate).connect_tcp("indexer.example", 80)
+
+    assert isinstance(stream, _DummyNetworkStream)
+    assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
+
+
 async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:
     seen: list[str] = []
 
@@ -647,7 +702,9 @@ async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add(
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    # A bencoded dict with no info key is unhashable -> a source problem (422),
+    # not a client outage: the distinct QbittorrentSourceError, never 502.
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
 
     assert not any(url.endswith("/api/v2/torrents/add") for url in seen)

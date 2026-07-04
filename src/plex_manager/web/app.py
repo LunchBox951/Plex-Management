@@ -23,7 +23,11 @@ from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
-from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
+from plex_manager.adapters.qbittorrent import (
+    QbittorrentAuthError,
+    QbittorrentError,
+    QbittorrentSourceError,
+)
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.config import get_settings
 from plex_manager.db import get_sessionmaker
@@ -607,6 +611,9 @@ _ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
     TmdbAuthError: (502, "tmdb_auth_failed"),
     TmdbApiError: (502, "tmdb_unavailable"),
     QbittorrentAuthError: (502, "qbittorrent_auth_failed"),
+    # A well-formed grab whose HTTP source resolves to no addable torrent — the
+    # client is healthy, so 422 (unprocessable), never a dishonest 502 outage.
+    QbittorrentSourceError: (422, "torrent_source_unresolvable"),
     QbittorrentError: (502, "qbittorrent_unavailable"),
     PlexAuthError: (502, "plex_auth_failed"),
     PlexLibraryError: (502, "plex_unavailable"),
