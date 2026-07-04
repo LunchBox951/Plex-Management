@@ -34,6 +34,8 @@ from plex_manager.services.grab_service import (
 from plex_manager.services.queue_service import InvalidStateTransitionError
 from plex_manager.web.deps import (
     ServiceNotConfiguredError,
+    get_anime_movie_root_optional,
+    get_anime_tv_root_optional,
     get_filesystem,
     get_library,
     get_movies_root_optional,
@@ -260,6 +262,8 @@ async def import_endpoint(
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
     movies_root: Annotated[str | None, Depends(get_movies_root_optional)],
     tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
+    anime_movie_root: Annotated[str | None, Depends(get_anime_movie_root_optional)],
+    anime_tv_root: Annotated[str | None, Depends(get_anime_tv_root_optional)],
 ) -> QueueItem:
     """Operator retry: (re)run the import for a download (e.g. an ImportBlocked row).
 
@@ -281,6 +285,8 @@ async def import_endpoint(
         session=session,
         movies_root=movies_root,
         tv_root=tv_root,
+        anime_movie_root=anime_movie_root,
+        anime_tv_root=anime_tv_root,
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found")
