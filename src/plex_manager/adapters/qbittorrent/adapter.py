@@ -134,7 +134,16 @@ def _bencode_skip(data: bytes, idx: int) -> int:
         raise ValueError("unexpected end of bencode data")
     ch = data[idx : idx + 1]
     if ch == b"i":  # integer: i<number>e
-        return data.index(b"e", idx + 1) + 1
+        end = data.index(b"e", idx + 1)
+        digits = data[idx + 1 : end]
+        if digits[:1] == b"-":
+            digits = digits[1:]
+        if not digits.isdigit():
+            # Non-digit garbage between i..e: honoring this docstring's "raises
+            # on malformed input" contract keeps a mangled body from being
+            # hashed as if it were a well-formed .torrent.
+            raise ValueError(f"invalid bencode integer at position {idx}")
+        return end + 1
     if ch in (b"l", b"d"):  # list / dict: container<elements>e
         idx += 1
         while idx < len(data) and data[idx : idx + 1] != b"e":
@@ -182,6 +191,15 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
             key, value_start = _bencode_string(data, idx)
             value_end = _bencode_skip(data, value_start)
             if key == b"info":
+                # The info VALUE must itself be a bencoded dict. Hashing an
+                # arbitrary non-dict value (integer/string/list) would fabricate
+                # an "info-hash" for a body that is not a torrent, letting an
+                # invalid source reach /torrents/add — surfacing as a client
+                # failure, or worse being tracked under a hash qBittorrent will
+                # never report. No dict -> no hash derivable -> the caller's
+                # no-hash path raises the per-release SourceError.
+                if data[value_start : value_start + 1] != b"d":
+                    return None
                 return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()  # noqa: S324
             idx = value_end
     except (ValueError, RecursionError):

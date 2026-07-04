@@ -963,6 +963,40 @@ async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add(
     assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"d4:infoi42ee",  # info -> integer
+        b"d4:info4:abcde",  # info -> string
+        b"d4:infoli1eee",  # info -> list
+    ],
+)
+async def test_add_torrent_with_non_dict_info_value_is_rejected_before_client_add(
+    body: bytes,
+) -> None:
+    """An ``info`` key whose VALUE is not a bencoded dict is not a torrent: pre-fix
+    the local hasher hashed the arbitrary value anyway, fabricating an "info-hash"
+    and letting the invalid body reach /torrents/add (a client-failure surface — or
+    a download tracked under a hash qBittorrent never reports). It must instead be
+    unhashable -> the per-release SourceError, with nothing handed to the client."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            return httpx.Response(200, content=body)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
 def _control_handler(seen: list[str], *, webapi_version: str) -> Any:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
