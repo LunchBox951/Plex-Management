@@ -229,16 +229,17 @@ async def report_issue_endpoint(
     # way the eviction trigger does -- the ONLY FileSystemPort whose delete() guard
     # has real roots to check against (see get_eviction_filesystem).
     #
-    # ADR-0015: an anime request's library_path lives under the anime root (when
-    # one is configured), NOT movies_root/tv_root -- so both the mount-check
-    # ``root_path`` AND the delete-guard's root list must use the ANIME root for
-    # is_anime content, or the mount check 409s against the wrong mount and the
-    # purge below is refused (the file stays on disk after "successful"
-    # blocklist + re-search).
-    if record.media_type == "movie":
-        root_path = anime_movie_root if record.is_anime and anime_movie_root else movies_root
-    else:
-        root_path = anime_tv_root if record.is_anime and anime_tv_root else tv_root
+    # ADR-0015 fix: hand the service the FULL set of configured roots and let it derive
+    # which one to mount-check FROM the stored library_path breadcrumb, rather than
+    # picking a single root here from ``is_anime`` + the currently-configured anime
+    # root. That earlier is_anime-based pick was wrong whenever the breadcrumb lived
+    # under a DIFFERENT root than the current config implies -- e.g. anime imported
+    # BEFORE an anime root was configured, whose file is under movies_root/tv_root:
+    # it would 409 against an empty newly-configured anime root, or (worse) wave the
+    # check through against a mounted anime root while the real root was unmounted and
+    # strand the old file. The delete-guard's fs is built from the SAME root set, so a
+    # breadcrumb under whichever root holds it is deletable.
+    roots = [r for r in (movies_root, tv_root, anime_movie_root, anime_tv_root) if r]
     fs = get_eviction_filesystem(movies_root, tv_root, anime_movie_root, anime_tv_root)
     try:
         updated = await correction_service.report_issue(
@@ -252,7 +253,7 @@ async def report_issue_endpoint(
             request_id=request_id,
             reason=body.reason,
             season=body.season,
-            root_path=root_path,
+            library_roots=roots,
         )
     except correction_service.RequestNotFoundError as exc:
         raise HTTPException(

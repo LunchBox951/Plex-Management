@@ -146,7 +146,7 @@ async def test_report_issue_movie_blocklists_purges_removes_and_regrabs(
             request_id=request_id,
             reason="bad_quality",
             season=None,
-            root_path=str(root),
+            library_roots=[str(root)],
         )
 
     # (c) the library file was purged, (b) the culprit torrent removed WITH data.
@@ -207,7 +207,7 @@ async def test_report_issue_movie_reset_clears_library_path(
             request_id=request_id,
             reason="user_reported",
             season=None,
-            root_path=str(root),
+            library_roots=[str(root)],
         )
 
     async with sessionmaker_() as session:
@@ -224,14 +224,14 @@ async def test_report_issue_refuses_when_media_root_unmounted(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
     # Foot-gun failsafe: an unmounted/empty root aborts the WHOLE verb -- nothing
-    # is blocklisted, removed, purged, or flipped (the file isn't really gone).
+    # is blocklisted, removed, purged, or flipped (the file isn't really gone). The
+    # root to verify is DERIVED from the stored breadcrumb (ADR-0015 fix): the
+    # library_path sits under ``root``, which is an EMPTY stub dir (a freshly-
+    # unmounted mountpoint), so the mount check on THAT root trips.
     root = tmp_path / "movies"
-    root.mkdir()
-    movie_file = root / "Some Movie (2020).mkv"
-    movie_file.write_bytes(b"x" * 512)
+    root.mkdir()  # exists but EMPTY -> reads as "not mounted"
+    movie_file = root / "Some Movie (2020).mkv"  # never written -> the drive is gone
     request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
-
-    missing_root = tmp_path / "unmounted"  # never created -> not a mount
 
     qbt = FakeQbittorrent()
     with pytest.raises(correction_service.MediaRootUnavailableError):
@@ -247,16 +247,140 @@ async def test_report_issue_refuses_when_media_root_unmounted(
                 request_id=request_id,
                 reason="bad_quality",
                 season=None,
-                root_path=str(missing_root),
+                library_roots=[str(root)],
             )
 
-    assert movie_file.exists()  # nothing was purged
     assert qbt.removed == []  # nothing was removed
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
     assert request is not None
     assert request.status == RequestStatus.available.value  # untouched
+    assert blocklist == []
+
+
+async def test_report_issue_legacy_anime_breadcrumb_under_movies_root_does_not_refuse(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # FINDING 1 (a): an anime title imported BEFORE an anime root was configured has
+    # its library_path under movies_root. With an anime root NOW configured but EMPTY
+    # (freshly created), the OLD is_anime-based pick checked that empty anime root and
+    # spuriously 409'd. The fix derives the check-root from the breadcrumb -> movies_root
+    # (mounted, non-empty) -> the verb proceeds and purges the real file.
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_root = tmp_path / "anime-movies"
+    anime_root.mkdir()  # configured but EMPTY (nothing ever imported here)
+    movie_file = movies_root / "Some Anime Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(movies_root), str(anime_root)]),
+            FakeLibrary(),
+            FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER", info_hash=_ALT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            # Both roots configured; the breadcrumb is under movies_root, not anime_root.
+            library_roots=[str(movies_root), str(anime_root)],
+        )
+
+    # No spurious refusal: the real file (under movies_root) was purged and re-grabbed.
+    assert not movie_file.exists()
+    assert (_CULPRIT, True) in qbt.removed
+    assert updated.status == RequestStatus.downloading.value
+
+
+async def test_report_issue_trips_failsafe_when_the_breadcrumbs_own_root_is_unmounted(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # FINDING 1 (b): the breadcrumb is under movies_root, which is MISSING (unmounted),
+    # while a DIFFERENT root (anime_root) happens to be mounted. The OLD is_anime pick
+    # verified the mounted anime root, waved the check through, and then the purge no-op'd
+    # on the not-present file -> blocklist + re-grab a duplicate, STRANDING the old file
+    # once the drive returns. The fix verifies the breadcrumb's REAL root -> refuses.
+    movies_root = tmp_path / "movies"  # never created -> unmounted
+    anime_root = tmp_path / "anime-movies"
+    anime_root.mkdir()
+    (anime_root / "keep").write_bytes(b"x")  # a DIFFERENT, mounted root
+    movie_file = movies_root / "Some Anime Movie (2020).mkv"
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.MediaRootUnavailableError):
+        async with sessionmaker_() as session:
+            await correction_service.report_issue(
+                session,
+                qbt,
+                LocalFileSystem(library_roots=[str(movies_root), str(anime_root)]),
+                FakeLibrary(),
+                FakeProwlarr(
+                    [candidate("Some.Anime.Movie.2020.1080p.WEB-DL.x264", info_hash=_ALT)]
+                ),
+                GuessitParser(),
+                default_profile(),
+                request_id=request_id,
+                reason="bad_quality",
+                season=None,
+                library_roots=[str(movies_root), str(anime_root)],
+            )
+
+    # The failsafe fired: nothing removed, the request untouched, no blocklist row.
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status == RequestStatus.available.value
+    assert blocklist == []
+
+
+async def test_report_issue_refuses_when_breadcrumb_is_outside_every_configured_root(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # FINDING 1 (c): the stored breadcrumb resolves under NONE of the configured roots
+    # (a stale/misconfigured path, or a root removed from config). Fail HONESTLY up front
+    # -- a visible, correctable refusal -- never a silent blocklist + re-grab against a
+    # file we cannot even locate to purge (which would strand it).
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    (movies_root / "keep").write_bytes(b"x")  # mounted, non-empty
+    orphan = tmp_path / "somewhere-else"
+    orphan.mkdir()
+    movie_file = orphan / "Some Movie (2020).mkv"  # under NO configured root
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.MediaRootUnavailableError):
+        async with sessionmaker_() as session:
+            await correction_service.report_issue(
+                session,
+                qbt,
+                LocalFileSystem(library_roots=[str(movies_root)]),
+                FakeLibrary(),
+                FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264", info_hash=_ALT)]),
+                GuessitParser(),
+                default_profile(),
+                request_id=request_id,
+                reason="bad_quality",
+                season=None,
+                library_roots=[str(movies_root)],
+            )
+
+    # Honest refusal before any side effect: file intact, nothing removed/blocklisted.
+    assert movie_file.exists()
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status == RequestStatus.available.value
     assert blocklist == []
 
 
@@ -291,7 +415,7 @@ async def test_report_issue_rejects_a_not_reportable_movie(
                 request_id=request_id,
                 reason="bad_quality",
                 season=None,
-                root_path=str(root),
+                library_roots=[str(root)],
             )
 
 
@@ -356,7 +480,7 @@ async def test_report_issue_tv_season_purges_and_parks_on_nothing_acceptable(
             request_id=request_id,
             reason="wrong_media",
             season=1,
-            root_path=str(tv_root),
+            library_roots=[str(tv_root)],
         )
 
     assert not season_dir.exists()  # the season tree was purged
@@ -411,7 +535,7 @@ async def test_report_issue_tv_requires_a_season(
                 request_id=request_id,
                 reason="bad_quality",
                 season=None,
-                root_path=str(root),
+                library_roots=[str(root)],
             )
 
 
@@ -792,7 +916,7 @@ async def test_report_issue_blocklists_the_imported_culprit_not_a_newer_failed_a
             request_id=request_id,
             reason="bad_quality",
             season=1,
-            root_path=str(tv_root),
+            library_roots=[str(tv_root)],
         )
 
     # The IMPORTED torrent (the seed) was removed WITH data, never the failed row's.
@@ -841,7 +965,7 @@ async def test_report_issue_refuses_when_an_active_sibling_owns_the_dedup_slot(
                 request_id=settled_id,
                 reason="bad_quality",
                 season=None,
-                root_path=str(root),
+                library_roots=[str(root)],
             )
 
     # Nothing touched: the file is still there, no torrent removed, no blocklist row.
@@ -879,7 +1003,7 @@ async def test_report_issue_parks_when_the_indexer_fails_during_research(
             request_id=request_id,
             reason="bad_quality",
             season=None,
-            root_path=str(root),
+            library_roots=[str(root)],
         )
 
     # The purge + blocklist still happened; the indexer failure did NOT propagate --
@@ -916,7 +1040,7 @@ async def test_report_issue_preserves_the_breadcrumb_when_the_purge_fails(
             request_id=request_id,
             reason="user_reported",
             season=None,
-            root_path=str(root),
+            library_roots=[str(root)],
         )
 
     async with sessionmaker_() as session:
@@ -978,7 +1102,7 @@ async def test_report_issue_researches_the_whole_season_after_an_episode_scoped_
             request_id=request_id,
             reason="bad_quality",
             season=1,
-            root_path=str(tv_root),
+            library_roots=[str(tv_root)],
         )
 
     # The re-search searched the WHOLE season, not just the culprit's episode subset:
@@ -1255,7 +1379,7 @@ async def test_report_issue_refuses_when_a_sibling_claims_the_slot_between_check
                 request_id=settled_id,
                 reason="bad_quality",
                 season=None,
-                root_path=str(root),
+                library_roots=[str(root)],
             )
 
     # The irreversible steps never ran: file on disk, torrent never removed.
@@ -1298,7 +1422,7 @@ async def test_report_issue_leaves_scope_searching_when_the_regrab_client_fails(
             request_id=request_id,
             reason="bad_quality",
             season=None,
-            root_path=str(root),
+            library_roots=[str(root)],
         )
 
     # No exception escaped; the scope self-heals at 'searching' (NOT parked, NOT downloading).

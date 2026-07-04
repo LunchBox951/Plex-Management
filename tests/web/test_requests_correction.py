@@ -177,6 +177,55 @@ async def test_report_issue_endpoint_purges_anime_content_under_the_anime_root(
     assert (_CULPRIT, True) in qbt.removed
 
 
+async def test_report_issue_endpoint_purges_legacy_anime_under_movies_root(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """FINDING 1 (a): an anime title imported BEFORE an anime root was configured has
+    its ``library_path`` under ``movies_root``. With an anime root NOW configured but
+    still EMPTY, the old is_anime-based mount check verified that empty anime root and
+    spuriously 409'd. The endpoint now hands the service the full root set and the
+    failsafe derives the check-root from the breadcrumb -> movies_root (mounted) -> the
+    purge + re-grab proceed against the real file, no spurious media_root_unavailable."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_root = tmp_path / "anime-movies"
+    anime_root.mkdir()  # configured but EMPTY (a freshly-added anime root)
+    movie_file = movies_root / "Some Anime Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    await _set_setting(sessionmaker_, "movies_root", str(movies_root))
+    await _set_setting(sessionmaker_, "anime_movie_root", str(anime_root))
+    request_id = await _seed_available_movie(
+        sessionmaker_, library_path=str(movie_file), is_anime=True
+    )
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        library=FakeLibrary(),
+        qbt=qbt,
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER", info_hash=_ALT)]
+        ),
+    )
+
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/report-issue",
+        json={"reason": "bad_quality"},
+        headers=_HEADERS,
+    )
+    # No spurious 409 against the empty anime root: the breadcrumb's REAL root
+    # (movies_root) is mounted, so the correction runs.
+    assert response.status_code == 200
+    assert response.json()["status"] == "downloading"
+    assert not movie_file.exists()
+    assert (_CULPRIT, True) in qbt.removed
+
+
 async def test_report_issue_endpoint_404_for_unknown_request(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
