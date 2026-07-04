@@ -7,6 +7,7 @@ wiring is a drop-in later. All methods are async.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
@@ -80,6 +81,29 @@ class LibraryPort(Protocol):
         SINGLE library crawl instead of one per season. Always reflects the library
         as it is NOW (like ``is_available(use_cache=False)`` — never trusts a cached
         absence); empty when the show is absent or has no indexed season.
+        """
+        raise NotImplementedError
+
+    async def present_ids(
+        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        """Return the subset of ``(tmdb_id, media_type)`` pairs present in the library.
+
+        The BATCH presence accessor for tile decoration (Discover/Search): a whole
+        page's keys are answered from AT MOST one movie crawl plus one show crawl
+        total -- never one library read per title (the prototype's "20 tiles = 20
+        crawls" anti-pattern). Cache-backed (``use_cache=True`` semantics): tiles are
+        HINTS and tolerate the short presence-cache staleness, so this reads the
+        warmed full-crawl snapshot rather than re-paging Plex per page-load. The
+        authoritative fresh dedup decision stays on the create path
+        (``is_available(use_cache=False)``), never here.
+
+        Presence is SHOW-LEVEL for TV (the show is in the library), the granularity
+        a tile needs -- per-season detail stays in the title modal. Only ever yields
+        ``"available"``/absent per key: a request-rollup status
+        (``requested``/``processing``/``partially_available``) is NOT a presence
+        concept and comes from the request store, not here. A section type is only
+        crawled when at least one requested key is of that type.
         """
         raise NotImplementedError
 

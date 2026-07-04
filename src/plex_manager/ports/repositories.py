@@ -233,6 +233,23 @@ class RequestRepository(Protocol):
         """
         raise NotImplementedError
 
+    async def display_statuses_by_tmdb_ids(
+        self, keys: Sequence[tuple[int, str]]
+    ) -> dict[tuple[int, str], str]:
+        """Batch the DISPLAY request status per ``(tmdb_id, media_type)`` for tiles.
+
+        The batched analogue of :meth:`find_active` for Discover/Search tile
+        decoration: one query answers a whole page's keys instead of a per-title
+        fan-out. Unlike ``find_active`` it returns the DISPLAY status -- a
+        non-settled/active row wins, else the newest row by id (mirroring the title
+        modal's ``liveRequest`` selection) -- so a settled ``available`` IS returned
+        (``find_active`` deliberately excludes it). For TV the parent
+        ``MediaRequest.status`` carries the persisted per-season rollup
+        (``partially_available``/...), so no per-season fan-out is needed. Keys with
+        no request row are simply ABSENT from the mapping (never a fabricated status).
+        """
+        raise NotImplementedError
+
     async def create(
         self,
         *,

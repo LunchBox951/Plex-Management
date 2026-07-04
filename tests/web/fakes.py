@@ -9,6 +9,7 @@ faked.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -300,6 +301,21 @@ class FakeLibrary:
         # The show's present seasons in one lookup (mirrors PlexLibrary's single
         # crawl); empty for an absent show, matching the real adapter.
         return self.available_tv_seasons.get(tmdb_id, frozenset())
+
+    async def present_ids(
+        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        if self.raises is not None:
+            raise self.raises
+        # Movie presence from the in-library id set; show-level TV presence from the
+        # seasons map's keys (a show is "present" if any season is tracked) -- the
+        # granularity the batch tile accessor needs. Mirrors PlexLibrary.present_ids.
+        return frozenset(
+            key
+            for key in keys
+            if (key[1] == "movie" and key[0] in self.available_ids)
+            or (key[1] == "tv" and key[0] in self.available_tv_seasons)
+        )
 
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         self.scanned.append(path)
