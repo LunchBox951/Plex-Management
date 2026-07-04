@@ -693,4 +693,62 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
   })
+
+  it('does not let a stale cancelled row shadow a fresh active re-request', async () => {
+    // ADR-0014: after cancelling then re-requesting the same title, the older
+    // `cancelled` row must not shadow the newer active one — the modal must target the
+    // fresh id, not the settled cancelled one. (liveRequest treats cancelled as settled.)
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 7, status: 'cancelled' }),
+          movieRequest({ id: 8, status: 'searching' }),
+        ],
+      },
+    })
+    const cancelMock = mutation(movieRequest({ id: 8, status: 'cancelled' }))
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    // The Cancel action is offered (liveRequest resolved to the active `searching` row,
+    // not the cancelled one — a cancelled liveRequest is not cancellable), and targets id 8.
+    fireEvent.click(screen.getByRole('button', { name: /cancel request/i }))
+    const confirms = screen.getAllByRole('button', { name: /cancel request/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+    await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(8))
+  })
+
+  it('hides Cancel when a TV season is already imported even if the rollup is cancellable', () => {
+    // season_rollup precedence rolls {available, downloading} up to `downloading` (in
+    // CANCELLABLE_STATUSES), but the backend cancel_request refuses the whole request
+    // because S1 is available. The modal must mirror that per-season guard and NOT offer
+    // a Cancel button that would deterministically 409.
+    const tvTitle: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 77,
+      title: 'Mixed Show',
+      year: 2022,
+    }
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          {
+            id: 20,
+            tmdb_id: 77,
+            media_type: 'tv',
+            title: 'Mixed Show',
+            status: 'downloading',
+            is_anime: false,
+            keep_forever: false,
+            seasons: [
+              { season_number: 1, status: 'available' },
+              { season_number: 2, status: 'downloading' },
+            ],
+          } satisfies RequestResponse,
+        ],
+      },
+    })
+    render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
 })

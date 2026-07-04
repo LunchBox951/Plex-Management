@@ -160,7 +160,12 @@ function isGrabbableStatus(status: string): boolean {
     status !== 'available' &&
     status !== 'completed' &&
     status !== 'failed' &&
-    status !== 'evicted'
+    status !== 'evicted' &&
+    // ADR-0014: a `cancelled` request is settled and terminal for grab (the backend
+    // rejects a cancelled id in /queue/grab with request_not_active); a fresh
+    // "Request again" must be made before grabbing. Mirrors the backend's
+    // `_SETTLED_REQUEST_STATUSES` / `TERMINAL_REQUEST_STATUS_VALUES`.
+    status !== 'cancelled'
   )
 }
 
@@ -273,7 +278,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
     )
     const active = matches.find(
-      (r) => r.status !== 'available' && r.status !== 'failed' && r.status !== 'evicted',
+      (r) =>
+        r.status !== 'available' &&
+        r.status !== 'failed' &&
+        r.status !== 'evicted' &&
+        // ADR-0014: `cancelled` is settled too — a stale cancelled row must not shadow
+        // a fresh active re-request for the same title (which would make the modal keep
+        // targeting the dead cancelled id). Mirrors the backend `_SETTLED_REQUEST_STATUSES`.
+        r.status !== 'cancelled',
     )
     return active ?? matches[matches.length - 1] ?? null
   }, [requestsQuery.data, title])
@@ -674,7 +686,17 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // Cancel the whole request (ADR-0014) — only while it is genuinely not-yet-imported.
   // Gated on the PARENT request status (for tv the rollup), so a partially_available
   // show never offers a wholesale cancel that the backend would 409.
-  const canCancel = liveRequest != null && CANCELLABLE_STATUSES.has(liveRequest.status)
+  //
+  // The parent rollup alone is NOT sufficient for tv: season_rollup precedence lets an
+  // in-flight season outrank an already-DONE sibling, so a show with S1 `available` and
+  // S2 `downloading` rolls up to the cancellable `downloading` even though the backend
+  // `cancel_request()` deterministically refuses (not_cancellable) because S1 is
+  // imported. Mirror that per-season guard here so we never offer a button that 409s.
+  const anySeasonImported = (liveRequest?.seasons ?? []).some(
+    (s) => s.status === 'available' || s.status === 'completed',
+  )
+  const canCancel =
+    liveRequest != null && CANCELLABLE_STATUSES.has(liveRequest.status) && !anySeasonImported
   const cancelButton = canCancel ? (
     <Button variant="secondary" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
       Cancel request
