@@ -281,3 +281,71 @@ async def test_list_due_orders_eager_scope_ahead_of_overdue_parked(
 
     due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
     assert [r.id for r in due] == [eager.id, parked.id]
+
+
+# --------------------------------------------------------------------------- #
+# display_statuses_by_tmdb_ids — batched tile decoration (issue #29)
+# --------------------------------------------------------------------------- #
+async def test_display_statuses_returns_active_row(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=100, media_type="movie", title="A", status="downloading")
+    statuses = await repo.display_statuses_by_tmdb_ids([(100, "movie")])
+    assert statuses == {(100, "movie"): "downloading"}
+
+
+async def test_display_statuses_returns_available_row(session: AsyncSession) -> None:
+    # The find_active trap: find_active EXCLUDES available, but the tile must show it
+    # ("In library"). display_statuses returns the DISPLAY status, so available IS returned.
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=101, media_type="movie", title="Owned", status="available")
+    statuses = await repo.display_statuses_by_tmdb_ids([(101, "movie")])
+    assert statuses == {(101, "movie"): "available"}
+
+
+async def test_display_statuses_prefers_active_over_older_settled(session: AsyncSession) -> None:
+    # A stale settled row must never shadow a fresh active re-request for the same key
+    # (mirrors the modal's liveRequest selection + find_active's non-settled preference).
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=102, media_type="movie", title="Old", status="available")
+    await repo.create(tmdb_id=102, media_type="movie", title="Fresh", status="pending")
+    statuses = await repo.display_statuses_by_tmdb_ids([(102, "movie")])
+    assert statuses == {(102, "movie"): "pending"}
+
+
+async def test_display_statuses_newest_settled_when_all_settled(session: AsyncSession) -> None:
+    # No active row: fall back to the newest (highest id) settled row.
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=103, media_type="movie", title="Gone", status="available")
+    await repo.create(tmdb_id=103, media_type="movie", title="Evicted later", status="evicted")
+    statuses = await repo.display_statuses_by_tmdb_ids([(103, "movie")])
+    assert statuses == {(103, "movie"): "evicted"}
+
+
+async def test_display_statuses_omits_keys_without_rows(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=104, media_type="movie", title="Has row", status="pending")
+    statuses = await repo.display_statuses_by_tmdb_ids([(104, "movie"), (999, "movie")])
+    assert statuses == {(104, "movie"): "pending"}
+
+
+async def test_display_statuses_does_not_conflate_movie_and_tv(session: AsyncSession) -> None:
+    # Same tmdb_id under both namespaces: each key gets ITS OWN status, never bled across.
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=105, media_type="movie", title="Movie", status="downloading")
+    await repo.create(tmdb_id=105, media_type="tv", title="Show", status="pending")
+    statuses = await repo.display_statuses_by_tmdb_ids([(105, "movie"), (105, "tv")])
+    assert statuses == {(105, "movie"): "downloading", (105, "tv"): "pending"}
+
+
+async def test_display_statuses_returns_tv_parent_rollup(session: AsyncSession) -> None:
+    # For TV the parent MediaRequest.status carries the persisted per-season rollup,
+    # so partially_available is returned directly -- no per-season fan-out needed.
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=106, media_type="tv", title="Partial", status="partially_available")
+    statuses = await repo.display_statuses_by_tmdb_ids([(106, "tv")])
+    assert statuses == {(106, "tv"): "partially_available"}
+
+
+async def test_display_statuses_empty_input_returns_empty(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    assert await repo.display_statuses_by_tmdb_ids([]) == {}

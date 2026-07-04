@@ -56,6 +56,7 @@ const TITLE: DiscoverResult = {
   tmdb_id: 42,
   title: 'Test Movie',
   year: 2021,
+  library_state: 'none',
 }
 
 function mutation(resolved: unknown) {
@@ -241,6 +242,7 @@ describe('TitleDetailModal — tv season selector', () => {
     tmdb_id: 100,
     title: 'Test Show',
     year: 2022,
+    library_state: 'none',
   }
 
   beforeEach(() => vi.clearAllMocks())
@@ -728,6 +730,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       tmdb_id: 77,
       title: 'Mixed Show',
       year: 2022,
+      library_state: 'none',
     }
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: {

@@ -390,6 +390,18 @@
             ],
             "title": "Backdrop Url"
           },
+          "library_state": {
+            "default": "none",
+            "enum": [
+              "none",
+              "requested",
+              "processing",
+              "available",
+              "partially_available"
+            ],
+            "title": "Library State",
+            "type": "string"
+          },
           "media_type": {
             "enum": [
               "movie",

@@ -1,16 +1,20 @@
 import type { DiscoverResult } from '../api/types'
+import type { StatusPresentation } from '../lib/status'
 import { Button } from './ui/Button'
+import { StatusBadge } from './ui/StatusBadge'
 
 interface SpotlightProps {
   item: DiscoverResult | null
   onOpen: (item: DiscoverResult) => void
+  /** The hero's library-state badge (issue #29) — same affordance as the tiles. */
+  state?: StatusPresentation | null
 }
 
 /**
  * A full-bleed cinematic hero. The backdrop carries the mood; a left-to-bottom
  * dark scrim keeps the title, overview, and CTA legible over any artwork.
  */
-export function Spotlight({ item, onOpen }: SpotlightProps) {
+export function Spotlight({ item, onOpen, state }: SpotlightProps) {
   if (!item) return null
 
   const meta = [item.media_type === 'tv' ? 'TV' : 'Movie', item.year]
@@ -35,7 +39,10 @@ export function Spotlight({ item, onOpen }: SpotlightProps) {
 
       <div className="relative flex min-h-[20rem] flex-col justify-end gap-3 p-6 sm:min-h-[24rem] sm:p-10">
         <div className="max-w-2xl">
-          <div className="font-mono text-xs tracking-wide text-gold">{meta}</div>
+          <div className="flex items-center gap-3">
+            <div className="font-mono text-xs tracking-wide text-gold">{meta}</div>
+            {state ? <StatusBadge status={state} /> : null}
+          </div>
           <h2 className="mt-2 font-display text-3xl font-extrabold text-ink sm:text-4xl">
             {item.title}
           </h2>

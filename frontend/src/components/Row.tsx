@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DiscoverResult } from '../api/types'
+import type { StatusPresentation } from '../lib/status'
 import { PosterCard } from './ui/PosterCard'
+import { StatusBadge } from './ui/StatusBadge'
 
 interface RowProps {
   title: string
@@ -8,6 +10,8 @@ interface RowProps {
   onSelect: (item: DiscoverResult) => void
   /** Render skeletons instead of nothing while the first page loads. */
   loading?: boolean
+  /** Per-tile library-state badge (issue #29); `null` leaves a tile unbadged. */
+  tileState?: (item: DiscoverResult) => StatusPresentation | null
 }
 
 /** How far each chevron scrolls — a little under one viewport of posters. */
@@ -17,7 +21,7 @@ const SCROLL_STEP = 600
  * A titled, horizontally-scrollable poster strip. Chevrons scroll the track and
  * self-disable at each end; on touch/trackpad the native scroll still works.
  */
-export function Row({ title, items, onSelect, loading = false }: RowProps) {
+export function Row({ title, items, onSelect, loading = false, tileState }: RowProps) {
   const trackRef = useRef<HTMLDivElement>(null)
   const [atStart, setAtStart] = useState(true)
   const [atEnd, setAtEnd] = useState(false)
@@ -79,20 +83,24 @@ export function Row({ title, items, onSelect, loading = false }: RowProps) {
                   className="aspect-[2/3] w-[150px] shrink-0 snap-start animate-pulse rounded-[7px] bg-poster ring-1 ring-white/5"
                 />
               ))
-            : items.map((item) => (
-                <div
-                  key={`${item.media_type}-${item.tmdb_id}`}
-                  className="w-[150px] shrink-0 snap-start"
-                >
-                  <PosterCard
-                    title={item.title}
-                    year={item.year ?? null}
-                    posterUrl={item.poster_url ?? null}
-                    seed={item.tmdb_id}
-                    onClick={() => onSelect(item)}
-                  />
-                </div>
-              ))}
+            : items.map((item) => {
+                const state = tileState?.(item) ?? null
+                return (
+                  <div
+                    key={`${item.media_type}-${item.tmdb_id}`}
+                    className="w-[150px] shrink-0 snap-start"
+                  >
+                    <PosterCard
+                      title={item.title}
+                      year={item.year ?? null}
+                      posterUrl={item.poster_url ?? null}
+                      seed={item.tmdb_id}
+                      onClick={() => onSelect(item)}
+                      badge={state ? <StatusBadge status={state} /> : undefined}
+                    />
+                  </div>
+                )
+              })}
         </div>
 
         {/* Right-edge fade hints there's more to scroll. */}

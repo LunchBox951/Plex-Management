@@ -1016,6 +1016,12 @@ export interface components {
             /** Backdrop Url */
             backdrop_url?: string | null;
             /**
+             * Library State
+             * @default none
+             * @enum {string}
+             */
+            library_state: "none" | "requested" | "processing" | "available" | "partially_available";
+            /**
              * Media Type
              * @enum {string}
              */

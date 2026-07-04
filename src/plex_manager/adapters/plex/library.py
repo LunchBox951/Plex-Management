@@ -106,6 +106,12 @@ class _TtlCache[V]:
 # cannot be per-instance.
 _SECTIONS_CACHE: _TtlCache[tuple[LibrarySection, ...]] = _TtlCache(_CACHE_TTL_SECONDS)
 _PRESENT_TMDB_CACHE: _TtlCache[frozenset[int]] = _TtlCache(_CACHE_TTL_SECONDS)
+# Show-level TV presence: the frozenset of ALL show tmdb ids in the library, from a
+# single cheap ``/all`` guid crawl of the show sections (NO per-show ``/children``
+# fetch -- that per-season crawl is what ``_TV_SEASONS_CACHE`` below pays for). Feeds
+# the SHOW-level ``present_ids`` tile decoration only; same key/positive-only
+# discipline as ``_PRESENT_TMDB_CACHE`` (only a freshly-paged snapshot is stored).
+_PRESENT_SHOW_TMDB_CACHE: _TtlCache[frozenset[int]] = _TtlCache(_CACHE_TTL_SECONDS)
 # TV presence is per-season: tmdb id -> the frozenset of season numbers with at
 # least one episode present (``leafCount>0``). Same key/pattern/positive-only
 # discipline as ``_PRESENT_TMDB_CACHE`` (see its comment on ``is_available``) —
@@ -117,6 +123,7 @@ def reset_caches() -> None:
     """Clear the module-level caches. Test-isolation helper (not part of the port)."""
     _SECTIONS_CACHE.clear()
     _PRESENT_TMDB_CACHE.clear()
+    _PRESENT_SHOW_TMDB_CACHE.clear()
     _TV_SEASONS_CACHE.clear()
 
 
@@ -481,6 +488,62 @@ class PlexLibrary:
                 break
             start += _PAGE_SIZE
 
+    async def _collect_present_show_ids(self) -> frozenset[int]:
+        """Page every SHOW section and gather the tmdb ids of its shows (guid-only).
+
+        The show-level mirror of :meth:`_collect_present_tmdb_ids` — reuses the same
+        section-type-agnostic ``_collect_section_tmdb_ids`` pager (one
+        ``/all?includeGuids=1`` walk per section), so a show's presence costs a
+        single guid read and NEVER the per-show ``/children`` fetch
+        ``_collect_present_tv_seasons`` pays for per-season granularity. Deliberately
+        cheaper than the season crawl because tiles only need "is the show here", not
+        which seasons.
+        """
+        present: set[int] = set()
+        for section in await self.list_sections():
+            if section.type != "show":
+                continue
+            await self._collect_section_tmdb_ids(section.key, present)
+        return frozenset(present)
+
+    async def present_ids(
+        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        """The batch presence accessor — see :meth:`LibraryPort.present_ids`.
+
+        Partitions ``keys`` by media type and answers each partition from its OWN
+        full-crawl snapshot: movies from ``_PRESENT_TMDB_CACHE`` (one movie-section
+        crawl), TV shows from ``_PRESENT_SHOW_TMDB_CACHE`` (one show-section guid
+        crawl, no per-show ``/children``). A section type is crawled ONLY when a key
+        of that type is present, so a movie-only page never touches the show sections
+        (and vice versa). Cached-presence-only, like the other tile-facing reads: a
+        warmed snapshot is trusted (tiles tolerate the short TTL); a miss pages Plex
+        once and warms the cache for the next page-load.
+        """
+        movie_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "movie"}
+        show_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "tv"}
+        present_movies: frozenset[int] = frozenset()
+        if movie_ids:
+            cached_movies = _PRESENT_TMDB_CACHE.get(self._cache_key)
+            if cached_movies is None:
+                cached_movies = await self._collect_present_tmdb_ids()
+                _PRESENT_TMDB_CACHE.set(self._cache_key, cached_movies)
+            present_movies = cached_movies
+        present_shows: frozenset[int] = frozenset()
+        if show_ids:
+            cached_shows = _PRESENT_SHOW_TMDB_CACHE.get(self._cache_key)
+            if cached_shows is None:
+                cached_shows = await self._collect_present_show_ids()
+                _PRESENT_SHOW_TMDB_CACHE.set(self._cache_key, cached_shows)
+            present_shows = cached_shows
+        result: set[tuple[int, Literal["movie", "tv"]]] = set()
+        for tmdb_id, media_type in keys:
+            if (media_type == "movie" and tmdb_id in present_movies) or (
+                media_type == "tv" and tmdb_id in present_shows
+            ):
+                result.add((tmdb_id, media_type))
+        return frozenset(result)
+
     async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
         """The seasons already present for ``tmdb_id`` — resolved in ONE fresh crawl.
 
@@ -611,6 +674,10 @@ class PlexLibrary:
                 _PRESENT_TMDB_CACHE.invalidate(self._cache_key)
             else:
                 _TV_SEASONS_CACHE.invalidate(self._cache_key)
+                # Also drop the show-level tile-presence snapshot: a just-imported
+                # NEW show must promote to "available" on Discover tiles without
+                # waiting the full TTL, exactly as the season cache above.
+                _PRESENT_SHOW_TMDB_CACHE.invalidate(self._cache_key)
 
     async def watch_state(
         self,
