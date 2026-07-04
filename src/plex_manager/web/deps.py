@@ -538,7 +538,17 @@ async def get_qbittorrent(
     password = await store.get("qbittorrent_password")
     if not url or not username or password is None:
         raise ServiceNotConfiguredError("qbittorrent")
-    return QbittorrentClient(client, url, username, password)
+    # The operator-configured Prowlarr endpoint is the ONE origin the torrent-
+    # source safe-fetch may follow to a private address: Prowlarr serves
+    # magnetless .torrent downloadUrls pointing at itself, and self-hosted
+    # Prowlarr is typically on 127.0.0.1 / RFC1918 / a compose alias the SSRF
+    # veto would otherwise reject — making every magnetless private-tracker
+    # release ungrabbable. The app already trusts this exact URL with an API key
+    # for every search call. None (unconfigured) keeps the veto fully closed.
+    prowlarr_url = await store.get("prowlarr_url")
+    return QbittorrentClient(
+        client, url, username, password, trusted_source_origin=prowlarr_url or None
+    )
 
 
 async def get_qbittorrent_optional(

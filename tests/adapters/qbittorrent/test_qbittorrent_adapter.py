@@ -113,10 +113,19 @@ def _router(*, add_status: int = 200, webapi_version: str = "2.11.0") -> Any:
     return handler
 
 
-def _client(handler: Any | None = None) -> QbittorrentClient:
+def _client(
+    handler: Any | None = None, trusted_source_origin: str | None = None
+) -> QbittorrentClient:
     transport = httpx.MockTransport(handler or _router())
     http = httpx.AsyncClient(transport=transport)
-    return QbittorrentClient(http, BASE_URL, USERNAME, PASSWORD, source_client=http)
+    return QbittorrentClient(
+        http,
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        source_client=http,
+        trusted_source_origin=trusted_source_origin,
+    )
 
 
 async def test_add_magnet_returns_derived_hash() -> None:
@@ -545,6 +554,91 @@ async def test_add_unresolvable_http_host_is_rejected_before_fetch(
     assert seen == []
 
 
+# --------------------------------------------------------------------------- #
+# Trusted source origin — the operator-configured Prowlarr endpoint
+# --------------------------------------------------------------------------- #
+PROWLARR_ORIGIN = "http://127.0.0.1:9696"
+PROWLARR_DOWNLOAD_URL = f"{PROWLARR_ORIGIN}/1/download?apikey=x&file=y.torrent"
+
+
+async def test_add_torrent_from_configured_prowlarr_private_origin_is_allowed() -> None:
+    """Prowlarr routinely serves magnetless .torrent downloadUrls pointing at
+    ITSELF, and self-hosted Prowlarr lives on 127.0.0.1 / RFC1918 / a compose
+    alias — exactly what the SSRF veto rejects. The operator-configured Prowlarr
+    origin (the app already trusts that URL with an API key for every search
+    call) must be fetchable, or every magnetless private-tracker release is
+    ungrabbable, manually and via auto-grab."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_DOWNLOAD_URL:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
+    info_hash = await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert info_hash == _TORRENT_HASH
+    assert any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_other_private_hosts_stay_vetoed_despite_trusted_prowlarr() -> None:
+    """The allowance is for EXACTLY the configured origin — any other private
+    address keeps the full SSRF veto (never a blanket private-range opening)."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://192.168.1.50/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []  # vetoed before any fetch
+
+    # Same HOST as Prowlarr but a different port is a different origin: vetoed.
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9999/file.torrent", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_redirect_off_trusted_prowlarr_to_private_host_is_vetoed() -> None:
+    """The trust is PER HOP: a redirect from the configured Prowlarr origin to a
+    private third party re-enters the normal veto — Prowlarr being trusted must
+    not let it (or a hostile indexer definition behind it) steer the fetcher
+    into the internal network."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_DOWNLOAD_URL:
+            return httpx.Response(302, headers={"Location": "http://10.0.0.7/file.torrent"})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    # The trusted hop was fetched; the private redirect target never was, and
+    # nothing reached /torrents/add.
+    assert seen == [PROWLARR_DOWNLOAD_URL]
+
+
 class _RecordingBackend(httpcore.AsyncNetworkBackend):
     def __init__(self) -> None:
         self.hosts: list[str] = []
@@ -649,6 +743,63 @@ async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
 
     assert delegate.hosts == ["93.184.216.34"]
     assert calls == 1
+
+
+async def test_safe_fetch_backend_allows_private_answer_for_trusted_host_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection-time backend mirrors the per-hop URL allowance: the
+    operator-configured Prowlarr host+port may resolve to a private address
+    (compose alias / LAN name), while the SAME private answer for any other
+    host stays a refused connect."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", 9696))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    trusted = SafeFetchNetworkBackend(_AcceptingBackend(), ("prowlarr.local", 9696))
+    stream = await trusted.connect_tcp("prowlarr.local", 9696)
+    assert isinstance(stream, _DummyNetworkStream)
+
+    # Same private DNS answer, untrusted host: refused before any connect.
+    delegate = _RecordingBackend()
+    untrusted = SafeFetchNetworkBackend(delegate, ("prowlarr.local", 9696))
+    with pytest.raises(httpcore.ConnectError):
+        await untrusted.connect_tcp("indexer.example", 9696)
+    assert delegate.hosts == []
+
+    # Trusted host on a DIFFERENT port is a different endpoint: refused too.
+    with pytest.raises(httpcore.ConnectError):
+        await untrusted.connect_tcp("prowlarr.local", 9999)
+    assert delegate.hosts == []
+
+
+class _AcceptingBackend(httpcore.AsyncNetworkBackend):
+    """A delegate that accepts every connect."""
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = host, port, timeout, local_address, socket_options
+        return _DummyNetworkStream()
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
 
 
 async def test_safe_fetch_backend_tries_next_vetted_dns_answer(

@@ -346,11 +346,14 @@ def _safe_fetch_port(parsed: ParseResult, scheme: str) -> int:
     return port or (443 if scheme == "https" else 80)
 
 
-def _safe_fetch_addresses(host: str, port: int | None) -> list[str]:
+def _safe_fetch_addresses(host: str, port: int | None, allow_blocked: bool = False) -> list[str]:
     # All three vetoes below are SOURCE problems (an unsafe or unresolvable fetch
     # target; qBittorrent never contacted) -> the SourceError subtype, never the
-    # base class that would read as a client outage.
-    if _is_blocked_address(host):
+    # base class that would read as a client outage. ``allow_blocked`` skips ONLY
+    # the private/non-global address vetoes (never the resolve-failure one) for the
+    # single operator-configured trusted source origin — the Prowlarr endpoint the
+    # app already talks to for every API call (see ``_source_origin_triple``).
+    if not allow_blocked and _is_blocked_address(host):
         raise QbittorrentSourceError("unsafe torrent source URL")
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -358,12 +361,16 @@ def _safe_fetch_addresses(host: str, port: int | None) -> list[str]:
         raise QbittorrentSourceError("unsafe torrent source URL") from exc
 
     addresses = [info[4][0] for info in infos if isinstance(info[4][0], str)]
-    if not addresses or any(_is_blocked_address(address) for address in addresses):
+    if not addresses or (
+        not allow_blocked and any(_is_blocked_address(address) for address in addresses)
+    ):
         raise QbittorrentSourceError("unsafe torrent source URL")
     return addresses
 
 
-async def _safe_fetch_addresses_async(host: str, port: int | None) -> list[str]:
+async def _safe_fetch_addresses_async(
+    host: str, port: int | None, allow_blocked: bool = False
+) -> list[str]:
     """Resolve + vet ``host`` off the event loop.
 
     ``_safe_fetch_addresses`` calls the blocking ``socket.getaddrinfo``; run inside
@@ -372,7 +379,27 @@ async def _safe_fetch_addresses_async(host: str, port: int | None) -> list[str]:
     slow or hostile DNS answer never blocks unrelated requests (httpx already pulls
     in anyio).
     """
-    return await anyio.to_thread.run_sync(_safe_fetch_addresses, host, port)
+    return await anyio.to_thread.run_sync(_safe_fetch_addresses, host, port, allow_blocked)
+
+
+def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
+    """Normalize a URL to its ``(scheme, host, port)`` origin, or ``None``.
+
+    The identity used to match a torrent-source hop against the OPERATOR-
+    CONFIGURED Prowlarr endpoint: compared by URL origin (scheme + casefolded
+    host + effective port), deliberately NEVER by resolved addresses — a
+    hostile DNS answer must not be able to claim the trust. ``None`` for a
+    non-http(s), hostless, or malformed-port URL (nothing trustable).
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.casefold()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return scheme, parsed.hostname.casefold(), port or (443 if scheme == "https" else 80)
 
 
 async def _assert_safe_fetch_url(url: str) -> None:
@@ -395,14 +422,27 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
     backend makes the connection-time lookup the authority: it resolves once,
     rejects any non-global answer, then asks the real backend to connect to the
     vetted IP while httpcore keeps the original origin for Host and TLS SNI.
+
+    ``trusted_host_port`` is the single OPERATOR-CONFIGURED trusted source
+    endpoint (the Prowlarr host + effective port, derived from the same
+    configured base URL the app already calls for every Prowlarr API request):
+    a connection to exactly that host+port may resolve to a private address
+    (``http://prowlarr:9696`` on a compose network, ``127.0.0.1``, RFC1918 —
+    the normal self-hosted layout). Every other host keeps the full veto, so a
+    redirect OFF the configured endpoint re-enters the normal SSRF guard.
     """
 
-    def __init__(self, delegate: httpcore.AsyncNetworkBackend | None = None) -> None:
+    def __init__(
+        self,
+        delegate: httpcore.AsyncNetworkBackend | None = None,
+        trusted_host_port: tuple[str, int] | None = None,
+    ) -> None:
         self._delegate: httpcore.AsyncNetworkBackend = (
             delegate
             if delegate is not None
             else cast(httpcore.AsyncNetworkBackend, httpcore.AnyIOBackend())
         )
+        self._trusted_host_port = trusted_host_port
 
     async def connect_tcp(
         self,
@@ -412,8 +452,11 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
+        trusted = self._trusted_host_port is not None and (
+            (host.casefold(), port) == self._trusted_host_port
+        )
         try:
-            addresses = await _safe_fetch_addresses_async(host, port)
+            addresses = await _safe_fetch_addresses_async(host, port, allow_blocked=trusted)
         except QbittorrentError as exc:
             raise httpcore.ConnectError("unsafe torrent source URL") from exc
         # ``ConnectTimeout`` is a ``TimeoutException`` subclass, NOT a
@@ -471,9 +514,9 @@ class _SafeFetchResponseStream(httpx.AsyncByteStream):
 class _SafeFetchTransport(httpx.AsyncBaseTransport):
     """Async HTTP transport for untrusted indexer/Prowlarr torrent URLs."""
 
-    def __init__(self) -> None:
+    def __init__(self, trusted_host_port: tuple[str, int] | None = None) -> None:
         self._pool = httpcore.AsyncConnectionPool(
-            network_backend=SafeFetchNetworkBackend(),
+            network_backend=SafeFetchNetworkBackend(trusted_host_port=trusted_host_port),
             http1=True,
             http2=False,
             retries=0,
@@ -556,12 +599,24 @@ class QbittorrentClient:
         username: str,
         password: str,
         source_client: httpx.AsyncClient | None = None,
+        trusted_source_origin: str | None = None,
     ) -> None:
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._username = username
         self._password = password
         self._source_client = source_client
+        # The OPERATOR-CONFIGURED Prowlarr base URL (the endpoint the app already
+        # trusts with an API key for every search call), normalized to its
+        # (scheme, host, port) origin. A torrent-source hop on EXACTLY this origin
+        # skips the private-address SSRF veto — Prowlarr routinely serves magnetless
+        # .torrent downloadUrls pointing at itself, and on the normal self-hosted
+        # layout that host is 127.0.0.1 / RFC1918 / a compose alias, which the veto
+        # would otherwise make ungrabbable. Matching is by URL origin, never DNS
+        # results, and per hop: a redirect OFF this origin re-enters the full veto.
+        self._trusted_source_origin = (
+            _source_origin_triple(trusted_source_origin) if trusted_source_origin else None
+        )
         self._logged_in = False
         # info_hash -> (fetched_at, properties json) — bounds /properties calls.
         self._properties_cache: dict[str, tuple[datetime, dict[str, object]]] = {}
@@ -662,7 +717,14 @@ class QbittorrentClient:
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
-            await _assert_safe_fetch_url(current)
+            # Per-hop trust check, by URL ORIGIN only (never DNS results): a hop on
+            # exactly the operator-configured Prowlarr origin skips the private-
+            # address veto (Prowlarr serves .torrent downloadUrls pointing at itself,
+            # typically a private/compose address); any redirect OFF that origin --
+            # including to another private host -- re-enters the full SSRF veto on
+            # its own next iteration.
+            if not self._is_trusted_source_url(current):
+                await _assert_safe_fetch_url(current)
             try:
                 async with client.stream("GET", current, follow_redirects=False) as response:
                     if response.is_redirect:
@@ -711,11 +773,26 @@ class QbittorrentClient:
                 raise QbittorrentSourceError("torrent source request failed") from exc
         return None, None
 
+    def _is_trusted_source_url(self, url: str) -> bool:
+        """Whether ``url`` sits on the operator-configured trusted source origin."""
+        if self._trusted_source_origin is None:
+            return False
+        return _source_origin_triple(url) == self._trusted_source_origin
+
     async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
         if self._source_client is not None:
             return await self._resolve_http_source_with_client(self._source_client, url)
+        # The connection-time backend needs the same single allowance the per-hop
+        # URL check grants: the trusted origin's host may legitimately resolve to a
+        # private address. (scheme is enforced at the URL level; host+port is the
+        # connection's identity.)
+        trusted_host_port = (
+            (self._trusted_source_origin[1], self._trusted_source_origin[2])
+            if self._trusted_source_origin is not None
+            else None
+        )
         async with httpx.AsyncClient(
-            transport=_SafeFetchTransport(),
+            transport=_SafeFetchTransport(trusted_host_port=trusted_host_port),
             timeout=30.0,
             trust_env=False,
         ) as client:
