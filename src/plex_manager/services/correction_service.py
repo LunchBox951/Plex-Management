@@ -80,11 +80,10 @@ from plex_manager.services import (
     request_service,
     season_request_service,
 )
+from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.domain.quality_profile import QualityProfile
@@ -94,6 +93,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import RequestRecord, SeasonRequestRecord
+    from plex_manager.services.library_roots import LibraryRoots
 
 __all__ = [
     "CANCELLABLE_REQUEST_STATUS_VALUES",
@@ -266,12 +266,17 @@ class MediaRootUnavailableError(Exception):
     still really there (``fs.delete`` would silently no-op on the not-present path).
 
     ADR-0015 fix: the root to verify is derived FROM the stored ``library_path``
-    breadcrumb (whichever configured root actually contains it), never from the
-    request's ``is_anime`` flag + the currently-configured anime root -- a title
-    imported before its anime root existed lives under ``movies_root``/``tv_root``.
-    Raised both when that containing root is unmounted/empty AND when the breadcrumb
-    sits under NONE of the configured roots (an honest, correctable refusal rather
-    than a silent blocklist+re-grab against a file we cannot locate to purge).
+    breadcrumb -- the DEEPEST configured root containing it (see
+    :func:`~plex_manager.services.library_roots.deepest_containing_root`; nested
+    roots must resolve to the most specific owner, never a mounted parent of a
+    down child mount), never from the request's ``is_anime`` flag + the
+    currently-configured anime root -- a title imported before its anime root
+    existed lives under ``movies_root``/``tv_root``. Raised when that owning root
+    is unmounted/empty, when the breadcrumb sits under NONE of the configured
+    roots (an honest, correctable refusal rather than a silent blocklist+re-grab
+    against a file we cannot locate to purge), and when a NO-breadcrumb row's
+    media-type-appropriate fallback root is unset/unmounted (see the failsafe
+    comment in :func:`report_issue`).
     """
 
     def __init__(self, request_id: int, root_path: str | None) -> None:
@@ -366,35 +371,6 @@ def _root_is_mounted(root_path: str | None) -> bool:
         return False
 
 
-def _containing_root(library_path: str, roots: Sequence[str]) -> str | None:
-    """Return the configured library root that CONTAINS ``library_path`` (the root
-    itself, or an ancestor of it), or ``None`` if it sits under none of them.
-
-    This is the ADR-0015 fix's core: the report-issue mount failsafe derives which
-    root to verify FROM the stored breadcrumb, never from the request's ``is_anime``
-    flag + the currently-configured anime root. A title imported BEFORE its anime
-    root was configured has a ``library_path`` under ``movies_root``/``tv_root``, so
-    an is_anime-based pick would check the WRONG root -- spuriously refusing when the
-    real root is fine, or waving the check through against a mounted anime root while
-    the real root is unmounted (stranding the old file).
-
-    Containment is realpath-based, mirroring the filesystem delete-guard's own check
-    (:meth:`LocalFileSystem.resolve_guarded`) so this failsafe verifies the SAME root
-    under which the purge's guard would accept the breadcrumb. Lexical realpath
-    normalization holds even when the root is unmounted/absent (no symlink to resolve),
-    so the containing root is still found and then reported unmounted by
-    :func:`_root_is_mounted`.
-    """
-    candidate = os.path.realpath(library_path)
-    for root in roots:
-        if not root:
-            continue
-        root_real = os.path.realpath(root)
-        if candidate == root_real or candidate.startswith(root_real + os.sep):
-            return root
-    return None
-
-
 @dataclass(frozen=True)
 class _ReportTarget:
     """The resolved report-issue target: which season (``None`` for a movie), its
@@ -432,7 +408,7 @@ async def report_issue(
     request_id: int,
     reason: str,
     season: int | None,
-    library_roots: Sequence[str],
+    roots: LibraryRoots,
 ) -> RequestRecord:
     """Report a bad imported file: blocklist + purge (torrent + library) + re-search.
 
@@ -473,22 +449,31 @@ async def report_issue(
 
     # Foot-gun failsafe (ADR-0015 fix): refuse if the breadcrumb's own root is
     # unmounted/empty (see MediaRootUnavailableError). The root to verify is DERIVED
-    # from the stored ``library_path`` -- whichever configured root actually contains
-    # it -- never from ``is_anime`` + the currently-configured anime root, so a title
-    # imported before its anime root existed (file under movies_root/tv_root) is
-    # checked against its REAL root. A breadcrumb under NO configured root fails
-    # honestly here (correctable) rather than silently blocklisting + re-grabbing
-    # against a file we cannot even locate to purge. Checked BEFORE any
-    # blocklist/remove/flip so a missing drive aborts the whole verb rather than firing
-    # against content that is not really gone. When there is no breadcrumb at all
-    # (target.library_path is None -- e.g. a title recorded available straight from
-    # Plex with no download of ours), there is nothing of ours on disk to strand, so
-    # the failsafe has nothing to guard and the re-search below simply grabs a fresh
-    # copy.
+    # from the stored ``library_path`` -- the DEEPEST configured root containing it
+    # (nested roots: e.g. an anime root mounted inside movies_root must be verified
+    # itself, never its mounted parent) -- never from ``is_anime`` + the currently-
+    # configured anime root, so a title imported before its anime root existed (file
+    # under movies_root/tv_root) is checked against its REAL root. A breadcrumb under
+    # NO configured root fails honestly here (correctable) rather than silently
+    # blocklisting + re-grabbing against a file we cannot even locate to purge.
+    # Checked BEFORE any blocklist/remove/flip so a missing drive aborts the whole
+    # verb rather than firing against content that is not really gone.
+    #
+    # A row with NO breadcrumb (a title recorded available straight from Plex, or one
+    # predating the library_path column) has no path to derive an owner from, so the
+    # failsafe falls back to the media-type-appropriate root (the anime root for an
+    # is_anime row when configured, else the normal root -- the pre-fix pick, and the
+    # same root the file most plausibly lives under). Skipping the check entirely
+    # would let a report against an unmounted library blocklist + re-grab a duplicate
+    # of a file that is still really there once the drive returns.
     if target.library_path is not None:
-        check_root = _containing_root(target.library_path, library_roots)
+        check_root = deepest_containing_root(target.library_path, roots.configured())
         if check_root is None or not await asyncio.to_thread(_root_is_mounted, check_root):
             raise MediaRootUnavailableError(request_id, check_root or target.library_path)
+    else:
+        fallback_root = roots.fallback_for(request.media_type, is_anime=request.is_anime)
+        if not await asyncio.to_thread(_root_is_mounted, fallback_root):
+            raise MediaRootUnavailableError(request_id, fallback_root)
 
     is_tv = target.season is not None
     media_type = "tv" if is_tv else "movie"
