@@ -41,6 +41,7 @@ from typing import Literal
 
 __all__ = [
     "EvictionCandidate",
+    "pressure_relieved",
     "rank_eviction_candidates",
     "select_evictions",
 ]
@@ -195,3 +196,35 @@ def select_evictions(
         projected -= candidate.size_percent
 
     return selected
+
+
+def pressure_relieved(
+    used_pct: float, freed_bytes: int, total_bytes: int, target_pct: float
+) -> bool:
+    """Whether ``freed_bytes`` reclaimed so far bring projected used% at/under target.
+
+    The single stop condition shared by two callers so neither reimplements it:
+
+    * :func:`~plex_manager.services.eviction_service.run_eviction_sweep`'s
+      reclaimable-aware candidate extension — after the estimate-based
+      :func:`select_evictions` prefix under-delivers (a hardlinked import frees
+      far less than its nominal size), it keeps drawing stalest-first candidates
+      until this returns ``True``.
+    * the retention-telemetry would-evict SIMULATION
+      (:func:`~plex_manager.services.retention_telemetry_service.
+      run_retention_telemetry_sweep`), which projects the same extension against
+      measured reclaimable bytes without deleting anything — so its would-evict
+      count/bytes match what a real pressure sweep would do, hardlinks and all.
+
+    ``freed_bytes`` is expressed relative to ``total_bytes`` (the root's capacity)
+    and subtracted from ``used_pct``; the projection is at/under ``target_pct``
+    once enough has been freed. A non-positive ``total_bytes`` cannot be projected
+    against, so it reports ``True`` ("nothing more can be honestly shown to help —
+    stop") rather than looping forever on an unknowable total; every real caller
+    additionally guards ``total_bytes > 0`` before extending, so that branch is a
+    defensive floor, not the normal path.
+    """
+    if total_bytes <= 0:
+        return True
+    freed_pct = (freed_bytes / total_bytes) * 100.0
+    return used_pct - freed_pct <= target_pct

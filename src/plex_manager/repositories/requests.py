@@ -250,6 +250,40 @@ class SqlRequestRepository:
             row.completed_at = now
         await self._session.flush()
 
+    async def stamp_completed_at_if_unset(self, request_id: int) -> None:
+        """Stamp ``completed_at`` = now, but ONLY if it is currently unset.
+
+        Records a request's FIRST completion and never moves once set. A MOVIE
+        request stamps ``completed_at`` directly in ``mark_completed`` /
+        ``mark_available``; a TV ``MediaRequest.status``, by contrast, is a pure
+        COMPUTED fold of its per-season rows and never itself goes through those
+        methods, so without this its ``completed_at`` would stay ``None`` forever
+        -- every TV time-to-watch interval would read "unknown". The TV
+        parent-rollup path (``season_request_service._recompute_parent``) calls
+        this the first time a tracked season reaches ``completed``/``available``,
+        the per-season analogue of the movie stamp point. Idempotent: a later
+        season completing re-enters here but the ``None`` guard leaves the first
+        stamp intact, so ``completed_at`` honestly records the show's FIRST
+        completion, never the latest.
+        The stamp is a single conditional UPDATE (``WHERE completed_at IS
+        NULL``), not read-check-write: two seasons of the same show importing
+        concurrently each hold only their own per-download lock, so an
+        identity-map read here can be stale -- the guarded statement lets
+        exactly one writer win and the first stamp stand.
+        """
+        result = await self._session.execute(
+            update(MediaRequest)
+            .where(MediaRequest.id == request_id, MediaRequest.completed_at.is_(None))
+            .values(completed_at=datetime.now(UTC))
+            .execution_options(synchronize_session="fetch")
+        )
+        if isinstance(result, CursorResult) and result.rowcount == 0:
+            row = await self._session.get(MediaRequest, request_id)
+            if row is None:
+                raise LookupError(f"media request {request_id} does not exist")
+            # Already stamped (possibly by a concurrent sibling-season import):
+            # the FIRST stamp stands, nothing to do.
+
     async def set_library_path(self, request_id: int, library_path: str) -> None:
         """Store the final placed path this request's import wrote into (ADR-0012)."""
         row = await self._session.get(MediaRequest, request_id)

@@ -59,6 +59,8 @@ __all__ = [
     "LOG_PRUNE_INTERVAL_SECONDS",
     "QUEUE_MAXSIZE",
     "RING_BUFFER_MAXLEN",
+    "TELEMETRY_LOGGER_NAME",
+    "TELEMETRY_LOG_RETENTION_DAYS",
     "CapturedLogRecord",
     "LogCaptureHandler",
     "configure_logging",
@@ -87,6 +89,38 @@ LOG_DRAIN_INTERVAL_SECONDS: Final = 2.0
 #: ``DELETE ... WHERE created_at < cutoff`` is a single indexed range delete, so
 #: this need not run anywhere near as often as the drain itself.
 LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
+
+#: The retention-telemetry sweep's own logger name (``services.
+#: retention_telemetry_service`` constructs its module logger from THIS
+#: constant, not ``__name__`` — see that module's docstring), and its
+#: dedicated retention window in days. Beta-week telemetry (ADR-0012 follow-up:
+#: a DELETE-NOTHING periodic observer logging what a pressure sweep WOULD do)
+#: is exactly the dataset the beta needs to survive the WHOLE week, not just
+#: whatever ``log_retention_days`` the operator has set — the general default
+#: is 7 days, which would otherwise prune day-1 telemetry before day 7 even
+#: arrives. Rather than bumping the general retention (which would also retain
+#: ordinary noisy INFO/WARNING/ERROR chatter far longer than needed, growing
+#: ``log_events`` for no benefit), :func:`prune_once` gives rows from THIS one
+#: logger their own cutoff — using the existing ``LogEvent.logger`` column as the
+#: marker, no schema change. This constant is a FLOOR, not a fixed window:
+#: :func:`prune_once` retains telemetry for ``max(TELEMETRY_LOG_RETENTION_DAYS,
+#: log_retention_days)`` days, so it is never pruned earlier than 30 days AND
+#: never earlier than the operator's own general retention (an operator who sets
+#: ``log_retention_days`` to 60/90 keeps telemetry that long too — a fixed 30-day
+#: cutoff would otherwise prune telemetry BEFORE their own ordinary logs, which
+#: is never what raising retention means). 30 days is a generous margin over one
+#: beta week; not (yet) a web-editable setting of its own for week 1 — the
+#: "smallest honest change" the beta blueprint asks for, not a new knob nobody
+#: has asked to tune yet.
+TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.retention_telemetry_service"
+TELEMETRY_LOG_RETENTION_DAYS: Final = 30
+
+#: The level the retention-telemetry logger is pinned to (in
+#: :func:`configure_logging`), independent of the operator's ``config.log_level``.
+#: The telemetry sweep logs its beta dataset at INFO; without this pin, a WARNING/
+#: ERROR operator floor would filter those records at the ``_logger.info`` call
+#: BEFORE the durable-log handler ever saw them (see :func:`configure_logging`).
+_TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
 
 #: Third-party HTTP client loggers that MUST be kept quieter than whatever the
 #: operator sets ``config.log_level`` to. ``httpx`` logs ``"HTTP Request: %s %s
@@ -262,6 +296,26 @@ class LogCaptureHandler(logging.Handler):
         with self._lock:
             return list(self.ring_buffer)[-limit:]
 
+    def free_slots(self) -> int:
+        """Best-effort count of currently-unused durable-queue slots
+        (``queue.maxsize - queue.qsize()``, floored at 0).
+
+        A CHEAP, non-blocking read (``asyncio.Queue.qsize`` is a plain ``len``
+        under the GIL — no ``await``, no I/O) for a producer that wants to pace
+        its own burst under the queue's LIVE headroom rather than a static
+        assumption of an empty queue: e.g. the retention-telemetry sweep sizes
+        its per-tick emission budget from this so it cannot, by itself, overrun
+        the queue ON TOP OF the ambient INFO backlog already sitting in it
+        (ordinary chatter plus a drain tick that has not run yet). INHERENTLY
+        racy — the drain task and other threads' loggers mutate the queue
+        between this read and the producer's later :meth:`emit` calls — so the
+        result is an UPPER BOUND to keep a margin under, never an exact
+        reservation. Any record that still loses that race is counted in
+        :attr:`dropped_count` (see :meth:`_enqueue`), so residual loss stays
+        VISIBLE, never silent.
+        """
+        return max(0, self.queue.maxsize - self.queue.qsize())
+
     def _enqueue(self, captured: CapturedLogRecord) -> None:
         """Runs ON THE LOOP THREAD (via ``call_soon_threadsafe``) — safe to touch
         the queue directly here."""
@@ -324,6 +378,21 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     way; a caller passing a non-root ``logger`` (tests, mainly) still gets the
     same quieting so no test path silently relies on the child not having it.
 
+    Symmetrically, pins the retention-telemetry logger
+    (:data:`TELEMETRY_LOGGER_NAME`) to :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so
+    its INFO records reach the durable ``log_events`` sink at ANY operator
+    ``level``. The handler is attached to the ROOT logger, and the telemetry
+    logger is a NON-propagation-broken descendant of root, so its records flow up
+    to that handler on the normal ``propagate=True`` path — but ONLY if they are
+    created in the first place. Left at the inherited effective level, an operator
+    running at WARNING/ERROR would drop every INFO telemetry record at the
+    ``_logger.info`` call site (``isEnabledFor`` short-circuits before any handler
+    runs), and the beta dataset would silently never persist. Pinning THIS one
+    logger to INFO (not the root, which would un-quiet ALL of the app's INFO
+    chatter and spam the operator's floor) lets exactly the telemetry records
+    through; the LogCaptureHandler itself has no level filter, so once created
+    they reach its DB queue regardless of the root logger's own level.
+
     Returns the handler so the caller (``web/app.py``'s ``lifespan``) can store it
     (e.g. on ``app.state.log_handler``) for the drain task and the future log
     viewer / export endpoints to read from, and detach it again on shutdown via
@@ -336,6 +405,7 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target.setLevel(_resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
+    logging.getLogger(TELEMETRY_LOGGER_NAME).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler
 
 
@@ -398,12 +468,38 @@ async def drain_once(
 
 
 async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
-    """Delete every ``log_events`` row older than ``retention_days``.
+    """Delete every stale ``log_events`` row -- TWO separate cutoffs, TWO deletes.
 
-    Returns the number of rows removed. ``retention_days <= 0`` is treated as
-    "keep nothing older than now" rather than skipped — an operator who
-    deliberately sets it to 0 gets the honest behaviour, not a silently ignored
-    setting.
+    Every logger EXCEPT :data:`TELEMETRY_LOGGER_NAME` is pruned on the
+    operator-editable ``retention_days`` (the web-editable ``log_retention_days``
+    setting, default 7) exactly as before. Rows FROM that one logger are pruned on
+    their OWN, never-shorter cutoff: ``max(TELEMETRY_LOG_RETENTION_DAYS,
+    retention_days)`` days. That ``max`` is the whole point of the carve-out —
+
+    * an operator on the default (or any ``retention_days`` below 30) still keeps
+      the beta-week telemetry a full 30 days, so a short general retention can
+      never prune the dataset before the week is up; and
+    * an operator who deliberately RAISES ``log_retention_days`` to 60/90 keeps
+      telemetry AT LEAST as long as everything else — the carve-out is a floor,
+      never a ceiling, so telemetry is never pruned EARLIER than the operator's
+      own window (the bug a fixed 30-day cutoff would introduce above 30).
+
+    See :data:`TELEMETRY_LOGGER_NAME`'s docstring for the full rationale.
+
+    Returns the total rows removed across both deletes. ``retention_days <= 0``
+    is treated as "keep nothing older than now" rather than skipped for the
+    ordinary cutoff — an operator who deliberately sets it to 0 gets the honest
+    behaviour, not a silently ignored setting; the telemetry cutoff still holds
+    its 30-day floor either way (``max(30, 0) == 30``).
     """
-    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-    return await repo.prune_older_than(cutoff)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=retention_days)
+    pruned = await repo.prune_older_than(
+        cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=True
+    )
+    telemetry_retention_days = max(TELEMETRY_LOG_RETENTION_DAYS, retention_days)
+    telemetry_cutoff = now - timedelta(days=telemetry_retention_days)
+    pruned += await repo.prune_older_than(
+        telemetry_cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=False
+    )
+    return pruned

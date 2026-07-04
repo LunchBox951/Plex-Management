@@ -82,9 +82,29 @@ _TERMINAL_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     )
 )
 
+# Season statuses at which a season's content is imported and on disk -- watchable
+# now (``available``, Plex-confirmed) or awaiting Plex confirmation (``completed``,
+# "Finalizing"). These are exactly the moments a MOVIE stamps its parent's
+# ``completed_at`` (``SqlRequestRepository.mark_completed``/``.mark_available``);
+# ``_recompute_parent`` stamps the TV parent's ``completed_at`` the first time a
+# tracked season reaches one of them via a GENUINE import/availability transition
+# (``mark_completed``/``mark_available``, which pass ``stamp_completion=True``) --
+# NOT via the ``ensure_seasons`` creation path (see there). ``evicted`` is
+# deliberately EXCLUDED: its file is gone, so an eviction-time rollup must never be
+# mistaken for a fresh completion -- and the eviction path never stamps anyway (it
+# runs with ``tolerate_active_conflict=True`` AND the default
+# ``stamp_completion=False``; see _recompute_parent).
+_REAL_DONE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value for s in (RequestStatus.completed, RequestStatus.available)
+)
+
 
 async def _recompute_parent(
-    session: AsyncSession, media_request_id: int, *, tolerate_active_conflict: bool = False
+    session: AsyncSession,
+    media_request_id: int,
+    *,
+    tolerate_active_conflict: bool = False,
+    stamp_completion: bool = False,
 ) -> None:
     """Re-read every tracked season's status, fold via ``rollup_status``, persist.
 
@@ -94,6 +114,23 @@ async def _recompute_parent(
     tracked seasons yet (should not happen once ``ensure_seasons`` has run at
     least once) is a no-op rather than a crash -- ``rollup_status`` itself raises
     on an empty sequence, so guard before calling it.
+
+    Besides the rollup ``status``, this also stamps the parent's ``completed_at``
+    the first time a tracked season is imported/on disk (``completed``/
+    ``available``) -- the TV analogue of the movie-level stamp in
+    ``mark_completed``/``mark_available`` (which a computed TV rollup never runs),
+    so ``MediaRequest.completed_at`` is no longer permanently ``None`` for a TV
+    request. That stamp is gated on ``stamp_completion`` (default ``False``),
+    passed ``True`` ONLY by :func:`mark_completed`/:func:`mark_available` -- a
+    GENUINE import/availability transition -- and left ``False`` by every other
+    caller, crucially :func:`ensure_seasons`: a request that MIXES an
+    already-in-Plex season (which ``ensure_seasons`` creates ``available`` with NO
+    ``library_path`` -- no import ever ran) with a still-missing one must NOT
+    record a completion at REQUEST time, or the later-imported season's
+    time-to-watch interval would start from request/Plex-verification time rather
+    than its own import completion (retention_telemetry_service). See the inline
+    comment on the stamp for the season-level (not rollup-level) check and why it
+    is confined to the strict, non-eviction branch.
 
     ``tolerate_active_conflict`` (default ``False`` -- unchanged for every normal
     season transition, which must keep recomputing the rollup STRICTLY so dedup
@@ -121,12 +158,37 @@ async def _recompute_parent(
     if not seasons:
         return
     status = rollup_status([season.status for season in seasons])
+    request_repo = SqlRequestRepository(session)
     if not tolerate_active_conflict:
-        await SqlRequestRepository(session).set_status(media_request_id, status)
+        await request_repo.set_status(media_request_id, status)
+        # Stamp the parent's FIRST-completion timestamp when a GENUINE import/
+        # availability transition (``mark_completed``/``mark_available``, which pass
+        # ``stamp_completion=True``) has landed a tracked season on disk
+        # (``completed``/``available``). A TV ``MediaRequest.status`` is a pure fold
+        # of its seasons and never goes through the movie-level ``mark_completed``/
+        # ``mark_available`` that stamp ``completed_at`` directly, so without this the
+        # parent's ``completed_at`` stays ``None`` forever and every TV time-to-watch
+        # interval reads "unknown" (retention_telemetry_service). Gated on
+        # ``stamp_completion`` so the ``ensure_seasons`` CREATION path never fires it:
+        # an already-in-Plex season is created ``available`` with NO ``library_path``
+        # (no import ran), and stamping at that request-time moment would start a
+        # later-imported sibling's time-to-watch interval from verification time
+        # rather than its own import. Checked at the SEASON level, not off ``status``:
+        # rollup precedence (``downloading`` etc.) can mask a just-completed season
+        # while a sibling is still in flight, but the show's first completion has
+        # still happened. Idempotent via the ``is None`` guard in the repo -- a later
+        # season completing never moves the first stamp. Only in this strict
+        # (forward-transition) branch: the ``tolerate_active_conflict`` path below is
+        # eviction's alone, and an eviction (file gone) is never a completion -- see
+        # ``_REAL_DONE_SEASON_STATUS_VALUES``.
+        if stamp_completion and any(
+            season.status in _REAL_DONE_SEASON_STATUS_VALUES for season in seasons
+        ):
+            await request_repo.stamp_completed_at_if_unset(media_request_id)
         return
     try:
         async with session.begin_nested():
-            await SqlRequestRepository(session).set_status(media_request_id, status)
+            await request_repo.set_status(media_request_id, status)
     except IntegrityError:
         # A NEWER active request for the same (tmdb_id, media_type) already holds
         # ``uq_media_requests_active``'s slot -- the parent rollup write collided,
@@ -371,7 +433,7 @@ async def mark_completed(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.mark_completed(row.id)
-    await _recompute_parent(session, media_request_id)
+    await _recompute_parent(session, media_request_id, stamp_completion=True)
 
 
 async def mark_available(
@@ -383,7 +445,7 @@ async def mark_available(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.mark_available(row.id)
-    await _recompute_parent(session, media_request_id)
+    await _recompute_parent(session, media_request_id, stamp_completion=True)
 
 
 async def mark_no_acceptable_release(
