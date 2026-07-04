@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -53,6 +54,55 @@ def _is_writable(path: str) -> bool:
     surfaces later as an honest, retryable ``ImportBlocked``, never a silent fail.
     """
     return os.path.isdir(path) and os.access(path, os.W_OK)
+
+
+def _require_http_url(url: str) -> ServiceValidateResponse | None:
+    """Reject a malformed / non-http(s) URL before it reaches an outbound request.
+
+    This is honest input hygiene, NOT a claimed SSRF sanitizer: it narrows the
+    scheme to ``http``/``https`` and requires a hostname, but the host/port/path
+    itself is still fully operator-controlled by design (these are "test
+    connection" probes against an operator-supplied, usually-private service —
+    see the SSRF risk-acceptance note on alert #247). Its job is only to turn an
+    obviously-broken input (``file://...``, a scheme-less string, an empty host)
+    into a clear, retryable rejection instead of an opaque ``httpx`` transport
+    error. Returns ``None`` when ``url`` is acceptable to try.
+
+    ``urlsplit`` (and reading ``.hostname`` / ``.port``) itself RAISES
+    ``ValueError`` on several obviously-broken inputs, all of which are guarded so
+    a parse failure surfaces as the same retryable ``ok=False`` rather than
+    crashing the validate endpoint with a 500:
+
+    * a malformed bracketed host -- an unterminated IPv6 literal (``http://[::1``)
+      or an invalid IPvFuture form (``http://[v7.x]``) -- trips ``.hostname``;
+    * a non-numeric (``http://x:bad``) or out-of-range (``http://x:99999``) port
+      trips ``.port``. Without touching ``.port`` these slip past the hostname
+      check and reach httpx, which raises ``httpx.InvalidURL`` -- and that is NOT
+      an ``httpx.HTTPError`` subclass, so it would escape the endpoints' transport
+      handlers as a 500 instead of this rejection.
+
+    Raw control characters (C0 + DEL) are rejected up front, BEFORE parsing or any
+    log/probe: ``urlsplit`` silently tolerates or strips some of them
+    (``http://\\nplex.local`` parses to a plausible host), but httpx then raises
+    the same uncaught ``httpx.InvalidURL`` for the non-printable byte. A CR/LF- or
+    NUL-bearing URL is exactly "obviously-broken input", so it gets the honest
+    ``ok=False`` here rather than a 500 (and never reaches an outbound request).
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        # Reading ``.port`` validates it -- urllib raises ValueError for a
+        # non-numeric or out-of-range port, which we reject rather than let httpx
+        # turn into an uncaught InvalidURL (or a doomed connect attempt).
+        port = parts.port
+    except ValueError:
+        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
+    # Port 0 parses cleanly but is never connectable -- reject it up front too.
+    if parts.scheme not in {"http", "https"} or not hostname or port == 0:
+        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
+    return None
 
 
 def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
@@ -105,6 +155,9 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
     always reflect reality, never a section list cached from a previous healthy
     probe up to 300s stale.
     """
+    rejection = _require_http_url(url)
+    if rejection is not None:
+        return rejection
     try:
         sections = await PlexLibrary(client, url, token).list_sections(use_cache=False)
     except PlexAuthError:
@@ -137,6 +190,9 @@ async def validate_prowlarr(
     client: httpx.AsyncClient, url: str, api_key: str
 ) -> ServiceValidateResponse:
     """Check Prowlarr + api key via ``GET /api/v1/system/status`` (key in header)."""
+    rejection = _require_http_url(url)
+    if rejection is not None:
+        return rejection
     try:
         response = await client.get(
             f"{url.rstrip('/')}/api/v1/system/status",
@@ -166,6 +222,9 @@ async def validate_qbittorrent(
     client: httpx.AsyncClient, url: str, username: str, password: str
 ) -> ServiceValidateResponse:
     """Check qBittorrent + credentials by logging in and listing torrents."""
+    rejection = _require_http_url(url)
+    if rejection is not None:
+        return rejection
     adapter = QbittorrentClient(client, url, username, password)
     try:
         await adapter.get_all_statuses()

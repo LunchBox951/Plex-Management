@@ -980,7 +980,10 @@ async def run_import_cycle(
                 )
             except Exception:
                 await session.rollback()
-                _logger.exception("import of download %s failed; will retry next cycle", row.id)
+                _logger.exception(
+                    "import of download failed; will retry next cycle",
+                    extra={"download_id": row.id},
+                )
 
 
 async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession) -> None:
@@ -1000,7 +1003,8 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
-                "availability check failed for tmdb %s; will retry next cycle", request.tmdb_id
+                "availability check failed; will retry next cycle",
+                extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
             )
 
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
@@ -1022,7 +1026,10 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
-                "availability check failed for tmdb %s season %s; will retry next cycle",
-                season_request.tmdb_id,
+                "availability check failed for season %s; will retry next cycle",
                 season_request.season_number,
+                extra={
+                    "tmdb_id": season_request.tmdb_id,
+                    "request_id": season_request.media_request_id,
+                },
             )

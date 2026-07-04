@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
+from plex_manager.logsafe import safe_int
 from plex_manager.models import (
     DownloadHistory,
     DownloadHistoryEvent,
@@ -426,10 +427,15 @@ async def grab(
                     except Exception:
                         _logger.warning(
                             "failed to remove orphaned torrent %s after losing a "
-                            "parallel grab for request %s",
+                            "parallel grab for this request",
                             torrent_hash,
-                            request_id,
                             exc_info=True,
+                            # request_id traces from the /queue/grab body
+                            # (body.request_id -> the resolved request.id passed
+                            # here), so it goes through the same log-safe int
+                            # barrier as every other request-derived log value --
+                            # CodeQL taints ``extra`` fields like message args.
+                            extra={"request_id": safe_int(request_id)},
                         )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)

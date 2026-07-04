@@ -9,9 +9,13 @@ season-status write recomputes and persists the rollup in the SAME call.
 
 from __future__ import annotations
 
+import logging
+
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.services import season_request_service
 from tests.web.fakes import FakeLibrary
@@ -70,6 +74,30 @@ async def test_ensure_seasons_marks_already_in_plex_seasons_available_and_rolls_
         # A mix of available + pending seasons rolls up to partially_available, not
         # a dishonest fully-available or plain pending.
         assert show.status is RequestStatus.partially_available
+
+
+async def test_ensure_seasons_presence_check_failure_logs_tmdb_id_via_extra(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Plex outage during the presence crawl logs ``tmdb_id`` via ``extra=``,
+    never interpolated into the message text, and every season still falls
+    through to ``pending`` (never blocked)."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=7099)
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.season_request_service"):
+        async with sessionmaker_() as session:
+            records = await season_request_service.ensure_seasons(
+                session, library, media_request_id=show_id, tmdb_id=7099, seasons=[1, 2]
+            )
+            await session.commit()
+
+    assert {r.status for r in records} == {"pending"}
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a warning to be logged"
+    assert "7099" not in warnings[0].getMessage()
+    assert getattr(warnings[0], "tmdb_id", None) == 7099
 
 
 async def test_ensure_seasons_is_idempotent_and_grows_the_tracked_set(

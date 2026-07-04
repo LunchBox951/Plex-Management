@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.season_rollup import rollup_status
+from plex_manager.logsafe import safe_int
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -197,10 +198,10 @@ async def _recompute_parent(
         # history row are unaffected and still commit. Never silently swallowed --
         # logged so an operator can see the coarse rollup is momentarily stale.
         _logger.warning(
-            "parent rollup write for media request %s skipped: a newer active "
+            "parent rollup write skipped: a newer active "
             "request already occupies the active-dedup slot for this show; the "
             "season's own status/history are unaffected",
-            media_request_id,
+            extra={"request_id": media_request_id},
         )
 
 
@@ -223,9 +224,9 @@ async def _present_seasons(library: LibraryPort, tmdb_id: int) -> frozenset[int]
         return await library.present_seasons(tmdb_id)
     except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
         _logger.warning(
-            "plex season-availability crawl failed for tmdb %s (%s); proceeding with a request",
-            tmdb_id,
+            "plex season-availability crawl failed (%s); proceeding with a request",
             type(exc).__name__,
+            extra={"tmdb_id": safe_int(tmdb_id)},
         )
         return frozenset()
 
