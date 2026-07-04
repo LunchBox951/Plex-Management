@@ -45,6 +45,14 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-      - name: Audit frontend dependencies including dev tooling
+      # The REQUIRED gate audits only what actually ships (production deps): a new
+      # advisory in a build-only tool (vite/eslint/etc.) must not block every merge.
+      - name: Audit shipped frontend dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
+      # The full dev tree is still audited, but informationally: advisories surface
+      # in the log without blocking, and are triaged rather than merge-gating.
+      - name: Audit frontend dev tooling (informational)
         working-directory: frontend
         run: npm audit --audit-level=high
+        continue-on-error: true

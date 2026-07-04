@@ -13,8 +13,8 @@ permissions:
   security-events: write
 
 jobs:
-  analyze:
-    name: analyze (${{ matrix.language }})
+  codeql:
+    name: codeql (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -30,3 +30,23 @@ jobs:
       - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
+
+  # Branch protection requires a status check literally named ``analyze``. The
+  # per-language matrix above reports ``codeql (python)`` / ``codeql
+  # (javascript-typescript)`` -- distinct contexts that would leave the required
+  # ``analyze`` check pending forever. This summary job re-publishes that single
+  # required context and fails unless EVERY matrix leg succeeded (``needs`` rolls
+  # the whole matrix up into one result), so the security gate is preserved.
+  analyze:
+    name: analyze
+    needs: codeql
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Require every CodeQL language analysis to succeed
+        run: |
+          if [ "${{ needs.codeql.result }}" != "success" ]; then
+            echo "CodeQL analysis did not succeed (result: ${{ needs.codeql.result }})."
+            exit 1
+          fi
+          echo "All CodeQL language analyses succeeded."
