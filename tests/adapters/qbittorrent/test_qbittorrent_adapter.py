@@ -26,7 +26,10 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentError,
     QbittorrentSourceError,
 )
-from plex_manager.adapters.qbittorrent.adapter import SafeFetchNetworkBackend
+from plex_manager.adapters.qbittorrent.adapter import (
+    _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
+    SafeFetchNetworkBackend,
+)
 
 BASE_URL = "http://qbit.local:8080"
 USERNAME = "admin"
@@ -386,27 +389,58 @@ async def test_add_uppercase_http_url_uses_resolver_before_client_add() -> None:
     assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
 
 
-async def test_add_oversized_torrent_body_is_rejected_before_buffering_to_client() -> None:
-    """A malicious indexer response must not be buffered and uploaded to qBittorrent
-    without a small .torrent size cap."""
+async def test_add_oversized_declared_content_length_raises_source_error() -> None:
+    """A source declaring a Content-Length past the cap is vetoed BEFORE the body is
+    buffered and before any qBittorrent request — a RELEASE problem, so the distinct
+    QbittorrentSourceError (422 / per-release auto-grab failure), never the base
+    class that reads as a client outage. (The old test's 2_000_001 bytes fell UNDER
+    the raised 10 MiB cap and was actually exercising the unhashable-body path.)"""
     seen: list[str] = []
-    oversized_len = 2_000_001
+    oversized_len = _MAX_TORRENT_BYTES + 1
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(str(request.url))
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
+            # Tiny body: the declared-size veto must fire on the HEADER alone,
+            # before a single body byte is consumed.
             return httpx.Response(
                 200,
-                content=b"d" + (b"x" * (oversized_len - 1)),
+                content=b"d",
                 headers={"Content-Length": str(oversized_len)},
             )
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_add_oversized_streamed_body_raises_source_error() -> None:
+    """A source with NO Content-Length whose streamed total crosses the cap is cut
+    off mid-stream with the same SourceError subtype — the authoritative cap the
+    declared-size check is only an early-abort optimization for."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == DOWNLOAD_URL:
+            # Bencode-dict lead byte + one byte past the cap; no Content-Length
+            # header, so only the streamed-total check can veto it.
+            response = httpx.Response(200, content=b"d" + b"x" * _MAX_TORRENT_BYTES)
+            response.headers.pop("Content-Length", None)
+            return response
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
 
     assert not any(url.endswith("/api/v2/torrents/add") for url in seen)
@@ -423,7 +457,7 @@ async def test_add_loopback_http_url_is_rejected_before_fetch() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add("http://127.0.0.1/file.torrent", "/downloads", "plex-manager")
 
     assert seen == []
@@ -440,7 +474,7 @@ async def test_add_cgnat_http_url_is_rejected_before_fetch() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add("http://100.64.0.1/file.torrent", "/downloads", "plex-manager")
 
     assert seen == []
@@ -457,7 +491,7 @@ async def test_add_nat64_loopback_http_url_is_rejected_before_fetch() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(
             "http://[64:ff9b::7f00:1]/file.torrent", "/downloads", "plex-manager"
         )
@@ -476,7 +510,7 @@ async def test_add_http_url_with_invalid_port_is_rejected_before_fetch() -> None
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(
             "http://93.184.216.34:99999/file.torrent", "/downloads", "plex-manager"
         )
@@ -505,7 +539,7 @@ async def test_add_unresolvable_http_host_is_rejected_before_fetch(
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
-    with pytest.raises(QbittorrentError):
+    with pytest.raises(QbittorrentSourceError):
         await _client(handler).add(url, "/downloads", "plex-manager")
 
     assert seen == []
@@ -802,10 +836,11 @@ async def test_info_non_json_200_raises_qbittorrent_error() -> None:
     assert PASSWORD not in message
 
 
-async def test_add_unreachable_http_source_raises_qbittorrent_error() -> None:
+async def test_add_unreachable_http_source_raises_source_error() -> None:
     """A release exposing only a download_url whose indexer/Prowlarr URL is
-    unreachable surfaces a wrapped, retryable QbittorrentError on the grab path —
-    never an opaque httpx transport error -> 500."""
+    unreachable is a SOURCE problem (qBittorrent was never contacted): the
+    SourceError subtype — never an opaque httpx transport error -> 500, and never
+    the base class whose 502 would blame a healthy client."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
@@ -814,7 +849,7 @@ async def test_add_unreachable_http_source_raises_qbittorrent_error() -> None:
             raise httpx.ConnectError("connection refused", request=request)
         return httpx.Response(404)
 
-    with pytest.raises(QbittorrentError) as exc_info:
+    with pytest.raises(QbittorrentSourceError) as exc_info:
         await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
     # No url / secret leak in the surfaced message.
     assert DOWNLOAD_URL not in str(exc_info.value)

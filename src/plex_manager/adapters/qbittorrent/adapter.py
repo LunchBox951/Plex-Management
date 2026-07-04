@@ -101,13 +101,22 @@ class QbittorrentAuthError(QbittorrentError):
 
 
 class QbittorrentSourceError(QbittorrentError):
-    """An HTTP(S) torrent source could not be resolved to a trackable torrent.
+    """A torrent SOURCE was vetoed or could not be resolved to a trackable torrent.
 
-    Distinct from a client outage: qBittorrent itself is healthy — the SOURCE (an
-    indexer download URL) served neither a magnet redirect nor a locally-hashable
-    ``.torrent`` body, so there is nothing addable. Mapped to a 422 (the request
-    is well-formed but unprocessable), never the dishonest 502
-    ``qbittorrent_unavailable`` that would blame a client which is working fine.
+    Distinct from a client outage: qBittorrent itself is healthy and (in every
+    case) was never asked to add anything — the SOURCE (an indexer download URL)
+    is the problem. Every pre-client source veto raises this subtype, not the
+    base class: an unsupported/malformed URL, an unsafe (non-global / NAT64 /
+    unresolvable) fetch target, an oversized ``.torrent`` body (declared or
+    streamed past the cap), a source fetch that failed in transport, or a body
+    that is neither a magnet redirect nor a locally-hashable ``.torrent``.
+
+    This taxonomy is load-bearing: the web layer maps it to a 422 (the request
+    is well-formed but unprocessable) instead of the dishonest 502
+    ``qbittorrent_unavailable`` that would blame a healthy client, and the
+    auto-grab worker treats it as a PER-RELEASE failure (try the next accepted
+    release, park on exhaustion) instead of aborting the whole cycle as a
+    client outage.
     """
 
 
@@ -331,21 +340,26 @@ def _safe_fetch_port(parsed: ParseResult, scheme: str) -> int:
     try:
         port = parsed.port
     except ValueError as exc:
-        raise QbittorrentError("unsupported torrent source URL") from exc
+        # A source-URL veto (qBittorrent never contacted) -> the SourceError
+        # subtype, so the 422 mapping / per-release auto-grab handling apply.
+        raise QbittorrentSourceError("unsupported torrent source URL") from exc
     return port or (443 if scheme == "https" else 80)
 
 
 def _safe_fetch_addresses(host: str, port: int | None) -> list[str]:
+    # All three vetoes below are SOURCE problems (an unsafe or unresolvable fetch
+    # target; qBittorrent never contacted) -> the SourceError subtype, never the
+    # base class that would read as a client outage.
     if _is_blocked_address(host):
-        raise QbittorrentError("unsafe torrent source URL")
+        raise QbittorrentSourceError("unsafe torrent source URL")
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        raise QbittorrentError("unsafe torrent source URL") from exc
+        raise QbittorrentSourceError("unsafe torrent source URL") from exc
 
     addresses = [info[4][0] for info in infos if isinstance(info[4][0], str)]
     if not addresses or any(_is_blocked_address(address) for address in addresses):
-        raise QbittorrentError("unsafe torrent source URL")
+        raise QbittorrentSourceError("unsafe torrent source URL")
     return addresses
 
 
@@ -364,7 +378,10 @@ async def _safe_fetch_addresses_async(host: str, port: int | None) -> list[str]:
 async def _assert_safe_fetch_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise QbittorrentError("unsupported torrent source URL")
+        # A source-URL veto (e.g. a redirect hop left http(s)) -- SourceError, so
+        # a hostile/broken redirect chain is a 422 release problem, not a "client
+        # down" 502.
+        raise QbittorrentSourceError("unsupported torrent source URL")
     port = _safe_fetch_port(parsed, parsed.scheme)
     await _safe_fetch_addresses_async(parsed.hostname, port)
 
@@ -666,14 +683,19 @@ class QbittorrentClient:
                                 # optimization lost -- the streamed byte cap below
                                 # still enforces _MAX_TORRENT_BYTES authoritatively.
                                 declared_size = None
+                            # Oversized source: a RELEASE problem (no qBittorrent
+                            # request was made) -> the SourceError subtype, so the
+                            # manual grab 422s and auto-grab fails just this
+                            # release, never the 502 / cycle-abort a client outage
+                            # earns. Same for the streamed cap below.
                             if declared_size is not None and declared_size > _MAX_TORRENT_BYTES:
-                                raise QbittorrentError("torrent file is too large")
+                                raise QbittorrentSourceError("torrent file is too large")
                         chunks: list[bytes] = []
                         total = 0
                         async for chunk in response.aiter_bytes():
                             total += len(chunk)
                             if total > _MAX_TORRENT_BYTES:
-                                raise QbittorrentError("torrent file is too large")
+                                raise QbittorrentSourceError("torrent file is too large")
                             chunks.append(chunk)
                         body = b"".join(chunks)
                         if body[:1] == b"d":
@@ -681,9 +703,12 @@ class QbittorrentClient:
                     break
             except httpx.RequestError as exc:
                 # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):
-                # surface a retryable error rather than letting httpx's transport error
-                # escape as an opaque 500 on the grab path. No url/secret in the message.
-                raise QbittorrentError("qBittorrent request failed") from exc
+                # a SOURCE problem -- qBittorrent was never contacted, so the
+                # SourceError subtype (and an honest message; the old base-class
+                # "qBittorrent request failed" blamed a healthy client). Still never
+                # an opaque httpx error -> 500; no url/secret in the message. The
+                # auto-grab park backoff retries a transiently-down source later.
+                raise QbittorrentSourceError("torrent source request failed") from exc
         return None, None
 
     async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
@@ -724,7 +749,9 @@ class QbittorrentClient:
                 # not ask qBittorrent to add an untrackable opaque URL.
                 raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
         elif scheme:
-            raise QbittorrentError("unsupported torrent source URL")
+            # An unsupported scheme (ftp:// etc.) is a source veto -- nothing was
+            # (or will be) handed to qBittorrent -> the SourceError subtype.
+            raise QbittorrentSourceError("unsupported torrent source URL")
         else:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
