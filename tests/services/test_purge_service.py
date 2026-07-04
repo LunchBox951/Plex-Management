@@ -89,6 +89,52 @@ async def test_purge_refuses_out_of_root_path_without_measuring_it(tmp_path: Pat
     assert fs.reclaim_calls == [str(target)]
 
 
+async def test_purge_deletes_a_path_under_an_anime_root_when_guard_includes_it(
+    tmp_path: Path,
+) -> None:
+    """ADR-0015: an anime title's ``library_path`` lives under its own anime
+    root, not ``movies_root``/``tv_root``. The delete-guard must include the
+    anime root too, or the purge is silently refused and the bad file stays on
+    disk after a "successful" blocklist + re-search (the regression the
+    routing feature would otherwise introduce)."""
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_root = tmp_path / "anime-movies"
+    anime_root.mkdir()
+    target = anime_root / "Some Anime Movie (2020).mkv"
+    target.write_bytes(b"x" * 2048)
+    fs = LocalFileSystem(library_roots=[str(movies_root), str(anime_root)])
+
+    result = await purge_service.purge_library_path(fs, str(target))
+
+    assert result.outcome is PurgeOutcome.deleted
+    assert result.freed_bytes == 2048
+    assert not target.exists()
+
+
+async def test_purge_refuses_an_anime_path_when_the_guard_omits_the_anime_root(
+    tmp_path: Path,
+) -> None:
+    """The regression this ADR-0015 fix prevents, encoded directly: without the
+    anime root in the guard's allowlist, an in-anime-root breadcrumb is
+    indistinguishable from any other out-of-root path and is refused, not
+    deleted."""
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_root = tmp_path / "anime-movies"
+    anime_root.mkdir()
+    target = anime_root / "Some Anime Movie (2020).mkv"
+    target.write_bytes(b"x" * 2048)
+    # Anime root deliberately OMITTED from library_roots.
+    fs = LocalFileSystem(library_roots=[str(movies_root)])
+
+    result = await purge_service.purge_library_path(fs, str(target))
+
+    assert result.outcome is PurgeOutcome.refused
+    assert result.freed_bytes == 0
+    assert target.exists()  # never touched -- the bad file would silently remain
+
+
 async def test_purge_already_gone_in_root_path_is_an_idempotent_deleted(tmp_path: Path) -> None:
     # A breadcrumb pointing at an already-removed (but in-root) path is an honest,
     # idempotent success -- not an error (a retried purge must not fail).

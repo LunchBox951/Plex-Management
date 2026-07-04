@@ -342,6 +342,8 @@ async def import_download(
     session: AsyncSession,
     movies_root: str | None = None,
     tv_root: str | None = None,
+    anime_movie_root: str | None = None,
+    anime_tv_root: str | None = None,
 ) -> DownloadRecord | None:
     """Validate, import, and scan a single completed download.
 
@@ -355,6 +357,12 @@ async def import_download(
     ``tv_root`` is unset gets the same treatment ("tv library root is not
     configured"). Neither ever crashes, and an install that has only ONE of the
     two roots configured still imports that type normally.
+
+    ``anime_movie_root``/``anime_tv_root`` (ADR-0015) are likewise optional: when
+    the owning request is ``is_anime`` AND the matching anime root is configured,
+    the anime root is used INSTEAD of ``movies_root``/``tv_root``; otherwise
+    anime content falls back to the normal root exactly as before this feature
+    existed (Overseerr's optional-override-else-default shape).
 
     Serialized per download id: the reconcile loop and an operator's
     POST /queue/{id}/import retry must never import the SAME row concurrently.
@@ -370,6 +378,8 @@ async def import_download(
             session=session,
             movies_root=movies_root,
             tv_root=tv_root,
+            anime_movie_root=anime_movie_root,
+            anime_tv_root=anime_tv_root,
         )
 
 
@@ -384,6 +394,8 @@ async def _import_download_locked(
     session: AsyncSession,
     movies_root: str | None = None,
     tv_root: str | None = None,
+    anime_movie_root: str | None = None,
+    anime_tv_root: str | None = None,
 ) -> DownloadRecord | None:
     download_repo = SqlDownloadRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -410,7 +422,11 @@ async def _import_download_locked(
         return await download_repo.get_by_hash(torrent_hash)
 
     if request.media_type == "tv":
-        if tv_root is None:
+        # ADR-0015: an anime episode routes to anime_tv_root when the request is
+        # is_anime AND that root is configured; otherwise it falls back to the
+        # normal tv_root exactly as before this feature existed.
+        effective_tv_root = anime_tv_root if request.is_anime and anime_tv_root else tv_root
+        if effective_tv_root is None:
             await _block(
                 session,
                 download_repo,
@@ -441,7 +457,7 @@ async def _import_download_locked(
             parser=parser,
             profile=profile,
             session=session,
-            tv_root=tv_root,
+            tv_root=effective_tv_root,
             torrent_hash=torrent_hash,
         )
     if request.media_type != "movie":  # pragma: no cover - MediaType enum has only movie/tv
@@ -454,10 +470,18 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
-    if movies_root is None:
-        # Mirrors the tv branch's ``tv_root is None`` guard above: an honest,
-        # retryable block rather than gating this whole cycle on movies_root being
-        # set (an install with only the TV root configured must still import TV).
+    # ADR-0015: an anime movie routes to anime_movie_root when the request is
+    # is_anime AND that root is configured; otherwise it falls back to the
+    # normal movies_root exactly as before this feature existed.
+    effective_movies_root = (
+        anime_movie_root if request.is_anime and anime_movie_root else movies_root
+    )
+    if effective_movies_root is None:
+        # Mirrors the tv branch's ``effective_tv_root is None`` guard above: an
+        # honest, retryable block rather than gating this whole cycle on
+        # movies_root being set (an install with only the TV root configured
+        # must still import TV; an anime-only install with only anime_movie_root
+        # configured must still import anime movies).
         await _block(
             session,
             download_repo,
@@ -511,7 +535,7 @@ async def _import_download_locked(
 
     ext = os.path.splitext(src)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
-    dst = Path(movies_root) / relative
+    dst = Path(effective_movies_root) / relative
 
     # Claim ``Importing`` with a compare-and-swap BEFORE the (possibly long) copy: the
     # queue shows progress and no DB transaction is held open across the copy. A crash
@@ -948,6 +972,8 @@ async def run_import_cycle(
     session: AsyncSession,
     movies_root: str | None = None,
     tv_root: str | None = None,
+    anime_movie_root: str | None = None,
+    anime_tv_root: str | None = None,
 ) -> None:
     """Drain freshly-completed (and crash-stranded) imports. Needs the download
     client; the Movies/TV roots are each optional. One item failing never aborts
@@ -957,7 +983,9 @@ async def run_import_cycle(
     reaching ``import_download`` while its root is unset gets its own honest,
     retryable ``ImportBlocked`` (never a crash, never silently skipped) rather
     than gating the whole cycle — an install with only ONE root configured still
-    drains that type normally.
+    drains that type normally. ``anime_movie_root`` / ``anime_tv_root``
+    (ADR-0015) are likewise optional overrides applied only to ``is_anime``
+    requests; see :func:`import_download`.
 
     The completed -> available promotion is a SEPARATE pass
     (:func:`run_availability_cycle`) that needs only Plex, so it keeps working even
@@ -977,6 +1005,8 @@ async def run_import_cycle(
                     session=session,
                     movies_root=movies_root,
                     tv_root=tv_root,
+                    anime_movie_root=anime_movie_root,
+                    anime_tv_root=anime_tv_root,
                 )
             except Exception:
                 await session.rollback()

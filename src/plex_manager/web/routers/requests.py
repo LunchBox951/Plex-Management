@@ -29,6 +29,8 @@ from plex_manager.services.correction_service import (
 from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
     ServiceNotConfiguredError,
+    get_anime_movie_root_optional,
+    get_anime_tv_root_optional,
     get_eviction_filesystem,
     get_library,
     get_library_optional,
@@ -208,6 +210,8 @@ async def report_issue_endpoint(
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
     movies_root: Annotated[str | None, Depends(get_movies_root_optional)],
     tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
+    anime_movie_root: Annotated[str | None, Depends(get_anime_movie_root_optional)],
+    anime_tv_root: Annotated[str | None, Depends(get_anime_tv_root_optional)],
 ) -> RequestResponse:
     """Report a bad imported/available movie or TV season (ADR-0014).
 
@@ -224,8 +228,18 @@ async def report_issue_endpoint(
     # (MediaRootUnavailableError -> 409). Build the root-scoped filesystem the same
     # way the eviction trigger does -- the ONLY FileSystemPort whose delete() guard
     # has real roots to check against (see get_eviction_filesystem).
-    root_path = movies_root if record.media_type == "movie" else tv_root
-    fs = get_eviction_filesystem(movies_root, tv_root)
+    #
+    # ADR-0015: an anime request's library_path lives under the anime root (when
+    # one is configured), NOT movies_root/tv_root -- so both the mount-check
+    # ``root_path`` AND the delete-guard's root list must use the ANIME root for
+    # is_anime content, or the mount check 409s against the wrong mount and the
+    # purge below is refused (the file stays on disk after "successful"
+    # blocklist + re-search).
+    if record.media_type == "movie":
+        root_path = anime_movie_root if record.is_anime and anime_movie_root else movies_root
+    else:
+        root_path = anime_tv_root if record.is_anime and anime_tv_root else tv_root
+    fs = get_eviction_filesystem(movies_root, tv_root, anime_movie_root, anime_tv_root)
     try:
         updated = await correction_service.report_issue(
             session,

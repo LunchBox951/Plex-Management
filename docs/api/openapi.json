@@ -590,7 +590,9 @@
           "root": {
             "enum": [
               "movies_root",
-              "tv_root"
+              "tv_root",
+              "anime_movie_root",
+              "anime_tv_root"
             ],
             "title": "Root",
             "type": "string"
@@ -1702,6 +1704,28 @@
       "SettingsResponse": {
         "description": "Redacted view of stored service config.\n\nPlaintext (non-secret) values are returned as-is; secret values are shown as\n``\"***\"`` when configured and ``None`` when unset \u2014 the plaintext secret is\nNEVER serialized.",
         "properties": {
+          "anime_movie_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anime Movie Root"
+          },
+          "anime_tv_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anime Tv Root"
+          },
           "auto_grab_enabled": {
             "anyOf": [
               {
@@ -1907,6 +1931,28 @@
       "SettingsUpdate": {
         "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
         "properties": {
+          "anime_movie_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anime Movie Root"
+          },
+          "anime_tv_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anime Tv Root"
+          },
           "auto_grab_enabled": {
             "anyOf": [
               {
@@ -2119,6 +2165,28 @@
       "SetupCompleteRequest": {
         "description": "The validated credential set written on ``POST /setup/complete``.",
         "properties": {
+          "anime_movie_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anime Movie Root"
+          },
+          "anime_tv_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anime Tv Root"
+          },
           "movies_root": {
             "title": "Movies Root",
             "type": "string"
