@@ -31,11 +31,10 @@ a terminal):
   data and settle the request (and every tracked season) to the terminal
   ``cancelled`` status. The row is kept for history; nothing is re-grabbed.
 
-Cross-branch note (auto-grab): :func:`report_issue`'s re-arm point is exactly
-where ``feat/auto-grab``'s per-request search backoff (its ``search_attempts`` /
-``next_search_at`` columns) should be RESET once both branches merge -- a
-report-issue re-search must not inherit the failed culprit's accrued backoff.
-Those columns do not exist on this branch, so this is a marked comment, not code.
+Auto-grab interplay (ADR-0013): both ``reset_for_research`` variants reset the
+per-scope search backoff (``search_attempts`` / ``next_search_at``) -- a
+report-issue re-search must not inherit the failed culprit's accrued backoff,
+and a re-armed ``searching`` scope is picked up eagerly by the worker.
 """
 
 from __future__ import annotations

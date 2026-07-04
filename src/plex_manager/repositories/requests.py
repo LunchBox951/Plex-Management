@@ -387,6 +387,11 @@ class SqlRequestRepository:
             row.library_path = None
         row.completed_at = None
         row.library_verified_at = None
+        # A report-issue is the operator saying "look again NOW": the auto-grab
+        # worker's accrued backoff (ADR-0013) belongs to the culprit's history,
+        # not the fresh search, so a later re-park starts the ladder over.
+        row.search_attempts = 0
+        row.next_search_at = None
         await self._session.flush()
 
     async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:

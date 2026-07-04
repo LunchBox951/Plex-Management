@@ -9,6 +9,7 @@ the I/O edges (qBittorrent / Prowlarr / Plex).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,8 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.services import correction_service
+from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.services import correction_service, season_request_service
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -1069,3 +1071,52 @@ async def test_cancel_refuses_when_an_older_imported_seed_hides_under_a_newer_ro
         async with sessionmaker_() as session:
             await correction_service.cancel_request(session, qbt, request_id=request_id)
     assert qbt.removed == []
+
+
+async def test_reset_for_research_resets_autograb_backoff(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A reported title starts the ADR-0013 backoff ladder over: the culprit's
+    accrued search_attempts / next_search_at must not throttle the operator's
+    explicit redo (both the movie repo variant and the season variant)."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.search_attempts = 5
+        row.next_search_at = datetime.now(UTC) + timedelta(hours=24)
+        season = SeasonRequest(
+            media_request_id=request_id,
+            season_number=2,
+            status=RequestStatus.no_acceptable_release,
+            search_attempts=4,
+            next_search_at=datetime.now(UTC) + timedelta(hours=12),
+        )
+        session.add(season)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await SqlRequestRepository(session).reset_for_research(request_id)
+        await season_request_service.reset_for_research(
+            session, media_request_id=request_id, season_number=2
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.searching
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+        srow = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+        assert srow.search_attempts == 0
+        assert srow.next_search_at is None

@@ -480,6 +480,9 @@ async def reset_for_research(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.set_status(row.id, RequestStatus.searching.value)
+    # Fresh search, fresh backoff ladder (ADR-0013): the culprit's accrued
+    # search_attempts must not throttle the operator's explicit redo.
+    await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
     await _recompute_parent(session, media_request_id)
