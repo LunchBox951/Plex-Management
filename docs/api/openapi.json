@@ -3411,6 +3411,48 @@
         ]
       }
     },
+    "/api/v1/events": {
+      "get": {
+        "description": "Stream realtime invalidation events for the authenticated SPA.\n\nThe stream holds no DB session. Each event is a hint to refetch existing REST\nresources, so reconnects and overflow collapse to a broad ``sync`` event.",
+        "operationId": "events_endpoint_api_v1_events_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "itemSchema": {
+                  "properties": {
+                    "data": {
+                      "type": "string"
+                    },
+                    "event": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "retry": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Events Endpoint",
+        "tags": [
+          "events"
+        ]
+      }
+    },
     "/api/v1/ops/disk": {
       "get": {
         "description": "Disk usage per configured library root, plus a ranked preview of what a\npressure sweep WOULD evict from each (never evicts anything itself).\n\nTTL-cached per root (~15s) \u2014 see :func:`_disk_root_item` \u2014 so the Status\npage's ~15s poll never re-hammers Plex/the filesystem on every tick.",

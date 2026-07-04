@@ -45,6 +45,7 @@ import {
   REQUESTS_POLL_INTERVAL_MS,
   queryKeys,
 } from '../lib/queryClient'
+import { useRealtimeConnected } from '../lib/realtimeState'
 
 /* ------------------------------------------------------------------- auth -- */
 
@@ -318,10 +319,11 @@ export function useDiscoverSearch(query: string, year?: number) {
 /* --------------------------------------------------------------- requests -- */
 
 export function useRequests(options?: { poll?: boolean }) {
+  const realtimeConnected = useRealtimeConnected()
   return useQuery({
     queryKey: queryKeys.requests,
     queryFn: async (): Promise<RequestListResponse> => unwrap(await client.GET('/api/v1/requests')),
-    refetchInterval: options?.poll ? REQUESTS_POLL_INTERVAL_MS : false,
+    refetchInterval: options?.poll && !realtimeConnected ? REQUESTS_POLL_INTERVAL_MS : false,
   })
 }
 
@@ -470,11 +472,12 @@ export function useSearchPreview() {
  * admin-only (`require_admin`) and a shared session would just collect 403s.
  */
 export function useQueue(options?: { poll?: boolean; enabled?: boolean }) {
+  const realtimeConnected = useRealtimeConnected()
   return useQuery({
     queryKey: queryKeys.queue,
     enabled: options?.enabled ?? true,
     queryFn: async (): Promise<QueueResponse> => unwrap(await client.GET('/api/v1/queue')),
-    refetchInterval: options?.poll ? POLL_INTERVAL_MS : false,
+    refetchInterval: options?.poll && !realtimeConnected ? POLL_INTERVAL_MS : false,
   })
 }
 

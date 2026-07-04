@@ -74,10 +74,12 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
 )
 from plex_manager.web.errors import install_error_handlers
+from plex_manager.web.events import EventHub, publish_realtime
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
+from plex_manager.web.routers import events as events_router
 from plex_manager.web.routers import ops as ops_router
 from plex_manager.web.routers import quality_profile as quality_profile_router
 from plex_manager.web.routers import queue as queue_router
@@ -210,6 +212,11 @@ async def _reconcile_once(app: FastAPI) -> None:
             # while qBittorrent is down.
             try:
                 await queue_service.reconcile_and_list(qbt, session)
+                publish_realtime(
+                    app,
+                    ("queue", "requests", "discover"),
+                    reason="reconcile",
+                )
                 if library is not None:
                     movies_root = await get_movies_root_optional(session)
                     tv_root = await get_tv_root_optional(session)
@@ -226,6 +233,11 @@ async def _reconcile_once(app: FastAPI) -> None:
                         tv_root=tv_root,
                         anime_movie_root=anime_movie_root,
                         anime_tv_root=anime_tv_root,
+                    )
+                    publish_realtime(
+                        app,
+                        ("queue", "requests", "discover"),
+                        reason="import_cycle",
                     )
             except QbittorrentError as exc:
                 await session.rollback()
@@ -256,6 +268,7 @@ async def _reconcile_once(app: FastAPI) -> None:
         # import already triggered a scan — no request stuck in "Finalizing".
         if library is not None:
             await import_service.run_availability_cycle(library=library, session=session)
+            publish_realtime(app, ("requests", "discover"), reason="availability")
 
     reconcile_status.mark_ok()
 
@@ -327,6 +340,12 @@ async def _autograb_once(app: FastAPI) -> None:
     # eager scopes that keep hitting ``GrabError`` are being cooled so they don't
     # starve the search budget, rather than silently never reaching ``downloading``.
     status.cooled_down_scopes = result.cooled_down
+    if result.grabbed or result.no_acceptable:
+        publish_realtime(
+            app,
+            ("requests", "queue", "discover"),
+            reason="autograb",
+        )
     # An operational GRAB failure (``GrabError`` -- qBittorrent accepted the torrent
     # but no info-hash could be derived, leaving a live untracked torrent) does NOT
     # propagate the way a raised search does: ``run_grab_cycle`` catches it, leaves
@@ -592,6 +611,11 @@ async def _eviction_tick(app: FastAPI) -> float:
                         media_type,
                         root,
                     )
+                    publish_realtime(
+                        app,
+                        ("requests", "discover", "ops:disk", "ops:health"),
+                        reason="eviction",
+                    )
             if proactive_enabled:
                 # A SEPARATE pass, never gated on the pressure sweep above having
                 # fired: opting in means "also clear past-grace watched content
@@ -636,6 +660,11 @@ async def _eviction_tick(app: FastAPI) -> float:
                             len(proactive_evicted),
                             media_type,
                             root,
+                        )
+                        publish_realtime(
+                            app,
+                            ("requests", "discover", "ops:disk", "ops:health"),
+                            reason="eviction",
                         )
     return interval_minutes * 60.0
 
@@ -845,6 +874,7 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
+    app.state.realtime_hub = EventHub()
     app.add_middleware(SetupGuardMiddleware)
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:
@@ -857,6 +887,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
+    app.include_router(events_router.router)
     app.include_router(requests_router.router)
     app.include_router(search_preview_router.router)
     app.include_router(queue_router.router)

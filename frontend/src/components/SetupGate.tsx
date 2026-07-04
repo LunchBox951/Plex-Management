@@ -8,6 +8,7 @@ import { Button } from './ui/Button'
 import { CenteredSpinner, StateMessage } from './ui/feedback'
 import { KeyEntry } from './KeyEntry'
 import { PlexLogin } from './PlexLogin'
+import { RealtimeProvider } from './RealtimeProvider'
 
 /**
  * Gate for every authenticated screen. Reads install state and routes:
@@ -100,7 +101,11 @@ export function SetupGate() {
   }
 
   if (auth.data?.authenticated) {
-    return <Outlet />
+    return (
+      <RealtimeProvider>
+        <Outlet />
+      </RealtimeProvider>
+    )
   }
 
   // usePlexSignIn already seeds /auth/me and invalidates queries on success; the

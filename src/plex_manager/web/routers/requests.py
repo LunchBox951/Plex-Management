@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
@@ -54,6 +54,7 @@ from plex_manager.web.deps import (
     require_api_key,
 )
 from plex_manager.web.errors import AppError
+from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
     CreateRequestBody,
     ErrorDetail,
@@ -177,6 +178,7 @@ async def _to_response(
 async def create_request_endpoint(
     body: CreateRequestBody,
     response: Response,
+    http_request: Request,
     auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
@@ -234,7 +236,14 @@ async def create_request_endpoint(
         ) from exc
     if not result.created:
         response.status_code = status.HTTP_200_OK
-    return await _to_response(session, result.record)
+    response_body = await _to_response(session, result.record)
+    publish_realtime(
+        http_request.app,
+        ("requests", "discover"),
+        reason="request_created" if result.created else "request_updated",
+        request_id=response_body.id,
+    )
+    return response_body
 
 
 @router.get("")
@@ -275,6 +284,7 @@ async def get_request_endpoint(
 async def keep_forever_endpoint(
     request_id: int,
     body: KeepForeverBody,
+    http_request: Request,
     _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestResponse:
@@ -291,13 +301,21 @@ async def keep_forever_endpoint(
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
-    return await _to_response(session, record)
+    response_body = await _to_response(session, record)
+    publish_realtime(
+        http_request.app,
+        ("requests", "discover", "ops:disk"),
+        reason="request_updated",
+        request_id=response_body.id,
+    )
+    return response_body
 
 
 @router.post("/{request_id}/report-issue", responses=_REPORT_ISSUE_RESPONSES)
 async def report_issue_endpoint(
     request_id: int,
     body: ReportIssueBody,
+    http_request: Request,
     _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
@@ -393,12 +411,20 @@ async def report_issue_endpoint(
             "(Settings → Library), then try again.",
             diagnostics=({"root": exc.root_path} if exc.root_path else None),
         ) from exc
-    return await _to_response(session, updated)
+    response_body = await _to_response(session, updated)
+    publish_realtime(
+        http_request.app,
+        ("requests", "queue", "blocklist", "discover"),
+        reason="report_issue",
+        request_id=response_body.id,
+    )
+    return response_body
 
 
 @router.post("/{request_id}/cancel")
 async def cancel_request_endpoint(
     request_id: int,
+    http_request: Request,
     _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
@@ -438,4 +464,11 @@ async def cancel_request_endpoint(
         # honest 409 ``service_not_configured`` the mark-failed endpoint uses -- refused
         # before any state change, so nothing was settled or removed.
         raise ServiceNotConfiguredError("qbittorrent") from exc
-    return await _to_response(session, updated)
+    response_body = await _to_response(session, updated)
+    publish_realtime(
+        http_request.app,
+        ("requests", "queue", "discover"),
+        reason="cancel_request",
+        request_id=response_body.id,
+    )
+    return response_body

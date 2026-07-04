@@ -65,6 +65,7 @@ from plex_manager.web.deps import (
     resolve_log_retention_days,
 )
 from plex_manager.web.errors import AppError
+from plex_manager.web.events import close_realtime_streams
 from plex_manager.web.schemas import (
     AppApiKeyResponse,
     AppApiKeyStatusResponse,
@@ -526,6 +527,7 @@ async def rotate_app_key_endpoint(
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         system.app_api_key = new_key
         await session.commit()
+    close_realtime_streams(request.app, reason="app_key_rotated")
     return AppApiKeyResponse(app_api_key=new_key)
 
 

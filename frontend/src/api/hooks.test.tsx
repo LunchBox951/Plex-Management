@@ -2,19 +2,21 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useEvict,
   useMarkFailed,
   useRelocateDownload,
+  useRequests,
   useRequestsInvalidated,
   useRevokeAppKey,
   useRotateAppKey,
   useUpdateSettings,
 } from './hooks'
 import { client } from './client'
-import { queryKeys } from '../lib/queryClient'
+import { REQUESTS_POLL_INTERVAL_MS, queryKeys } from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
+import { setRealtimeConnected } from '../lib/realtimeState'
 import type {
   AppApiKeyResponse,
   EvictResponse,
@@ -35,9 +37,15 @@ function createWrapper(qc: QueryClient) {
 }
 
 beforeEach(() => {
+  vi.mocked(client.GET).mockReset()
   vi.mocked(client.POST).mockReset()
   vi.mocked(client.PUT).mockReset()
   vi.mocked(client.DELETE).mockReset()
+  setRealtimeConnected(false)
+})
+
+afterEach(() => {
+  vi.useRealTimers()
 })
 
 describe('useUpdateSettings', () => {
@@ -269,5 +277,58 @@ describe('useRevokeAppKey', () => {
     // Revoke clears the SHARED server-side key; it must never write a value into
     // this browser's own key store.
     expect(setApiKeySpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('realtime polling fallback', () => {
+  it('keeps request polling while realtime is disconnected', async () => {
+    vi.useFakeTimers()
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { requests: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useRequests({ poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REQUESTS_POLL_INTERVAL_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(2)
+    unmount()
+    qc.clear()
+  })
+
+  it('disables request polling while realtime is connected', async () => {
+    vi.useFakeTimers()
+    setRealtimeConnected(true)
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { requests: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useRequests({ poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REQUESTS_POLL_INTERVAL_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+    unmount()
+    qc.clear()
   })
 })
