@@ -5,11 +5,15 @@ from __future__ import annotations
 import errno
 import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 
 from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
+from plex_manager.adapters.filesystem.local import (
+    _EMPTY_LOCK_STALE_SECONDS,  # pyright: ignore[reportPrivateUsage]
+)
 
 
 def test_available_bytes_is_positive(tmp_path: Path) -> None:
@@ -225,6 +229,40 @@ def test_cross_device_copy_recovers_stale_publish_lock(
 
     assert dst.read_text() == "payload"
     assert not lock.exists()
+
+
+def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
+    """A crash between creating the lock and writing its pid leaves a zero-byte
+    lock. Once it is older than the threshold it must be reclaimed, not block the
+    destination forever (north-star #1: no terminal-only dead ends)."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock = tmp_path / ".dst.mkv.publish.lock"
+    lock.write_text("")  # poisoned: created, pid never written
+    aged = time.time() - (_EMPTY_LOCK_STALE_SECONDS + 5)
+    os.utime(lock, (aged, aged))
+
+    LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_publish_lock_fresh_empty_lock_is_not_reclaimed(tmp_path: Path) -> None:
+    """A just-created empty lock is a concurrent creator still mid-write, NOT a
+    poisoned one; it must be left alone so the in-flight publisher keeps it."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock = tmp_path / ".dst.mkv.publish.lock"
+    lock.write_text("")  # empty but fresh (mtime == now)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert not dst.exists()
+    assert lock.exists()  # preserved for the in-flight creator
 
 
 def test_cross_device_copy_preserves_active_publish_lock(

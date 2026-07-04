@@ -17,6 +17,7 @@ import errno
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -63,11 +64,43 @@ def _pid_is_running(pid: int) -> bool:
     return True
 
 
-def _lock_is_stale(lock_path: Path) -> bool:
+# How long an EMPTY / unparseable publish lock must sit untouched before it is
+# presumed poisoned (a crash between creating the lock and writing its pid) rather
+# than a concurrent creator still mid-write. Small enough that recovery is prompt,
+# large enough to never race a healthy publisher that has the fd open.
+_EMPTY_LOCK_STALE_SECONDS = 60.0
+
+
+def _lock_is_expired(lock_path: Path) -> bool:
+    """Whether an empty/unparseable lock is old enough (by mtime) to reclaim."""
     try:
-        pid = int(lock_path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
         return False
+    return age > _EMPTY_LOCK_STALE_SECONDS
+
+
+def _lock_is_stale(lock_path: Path) -> bool:
+    """Whether a publish lock can be reclaimed.
+
+    A parseable pid is authoritative: the lock is stale iff that process is gone.
+    An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
+    creates the lock file and writes its pid in two separate steps, so a crash in
+    between leaves a zero-byte lock ``int('')`` can never parse. Rather than block
+    the destination FOREVER (a terminal-only dead end -- violates north-star #1),
+    reclaim such a lock once it is older than a short threshold; a younger empty
+    lock is presumed to be a concurrent creator mid-write and is left untouched.
+    """
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not raw:
+        return _lock_is_expired(lock_path)
+    try:
+        pid = int(raw)
+    except ValueError:
+        return _lock_is_expired(lock_path)
     return not _pid_is_running(pid)
 
 
