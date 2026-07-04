@@ -46,6 +46,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from plex_manager.adapters.prowlarr.adapter import IndexerError
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
@@ -82,6 +83,8 @@ if TYPE_CHECKING:
 __all__ = [
     "CANCELLABLE_REQUEST_STATUS_VALUES",
     "REPORTABLE_STATUS_VALUES",
+    "ActiveDuplicateError",
+    "ImportInProgressError",
     "MediaRootUnavailableError",
     "NotCancellableError",
     "NotReportableError",
@@ -153,6 +156,34 @@ _GRAB_ERRORS: Final = (
     grab_service.SeasonRequiredError,
 )
 
+# The indexer failures the inline RE-SEARCH (``decision_service.preview`` ->
+# ``prowlarr.search``) may raise. Like ``_GRAB_ERRORS`` for the grab step, a
+# report-issue that has ALREADY blocklisted + purged must not then propagate a
+# Prowlarr transport/rate-limit/HTTP failure out as a 5xx that leaves the row lying
+# as ``searching`` with nothing in flight: it lands on the honest, retryable
+# ``no_acceptable_release`` park instead. ``IndexerRateLimitError`` is a subclass of
+# ``IndexerError`` and so is covered.
+_INDEXER_ERRORS: Final = (IndexerError,)
+
+# The ACTIVE download states a cancel may fail out from under -- every non-terminal
+# state EXCEPT ``importing``. An ``importing`` row is mid-copy/scan: failing it would
+# race the importer's finalize compare-and-swap and could strand a placed file in the
+# library under a ``cancelled`` request (see ``ImportInProgressError``). Cancel's
+# per-row transition is a compare-and-swap gated on this set, so a row that raced INTO
+# ``importing`` since the active snapshot fails the swap and aborts the cancel rather
+# than clobbering the importer.
+_CANCELLABLE_DOWNLOAD_STATE_VALUES: Final[frozenset[str]] = frozenset(
+    {
+        DownloadState.Searching.value,
+        DownloadState.Downloading.value,
+        DownloadState.MetadataFetching.value,
+        DownloadState.ImportPending.value,
+        DownloadState.ImportBlocked.value,
+        DownloadState.FailedPending.value,
+        DownloadState.ClientMissing.value,
+    }
+)
+
 
 class RequestNotFoundError(Exception):
     """No request with this id (HTTP 404)."""
@@ -209,6 +240,49 @@ class MediaRootUnavailableError(Exception):
         self.request_id = request_id
         self.root_path = root_path
         super().__init__(f"media root for request {request_id} is unavailable (unmounted/empty)")
+
+
+class ActiveDuplicateError(Exception):
+    """A newer active request for the same media already exists (HTTP 409).
+
+    Report-issue re-arms the reported (SETTLED) request/season to an ACTIVE status
+    (``searching`` for a movie, or a partially_available/searching rollup for a tv
+    season). If a DIFFERENT active request already occupies this media's
+    ``uq_media_requests_active`` slot -- which the partial unique index legitimately
+    allows (an older settled ``available`` request can coexist with a newer active
+    one for a later season; see ``request_service.set_keep_forever``) -- that re-arm
+    would collide on the index, and only AFTER the irreversible blocklist / torrent
+    removal / file purge had already run, rolling the DB back while the media is gone
+    (a half-corrected state). Refuse UP FRONT, before touching anything: the operator
+    acts on the live active request instead.
+    """
+
+    def __init__(self, request_id: int, active_request_id: int) -> None:
+        self.request_id = request_id
+        self.active_request_id = active_request_id
+        super().__init__(
+            f"request {request_id} has a newer active sibling {active_request_id} "
+            f"for the same media; report-issue would collide re-arming it"
+        )
+
+
+class ImportInProgressError(Exception):
+    """A download for this request is finalizing its import (HTTP 409, retryable).
+
+    Cancel must never fail an ``importing`` row: the importer may already have placed
+    the library file and be mid-scan/finalize. If cancel flips the row to ``failed``,
+    the importer's finalize compare-and-swap (``Importing -> Imported``) loses -- and
+    it then deliberately leaves the placed file in the library -- so the request would
+    settle ``cancelled`` with the media still on disk / in Plex (a dishonest, orphaned
+    state). Refuse instead; the operator retries once the import lands (as
+    ``completed``/``import_blocked``), where report-issue takes over the redo.
+    """
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(
+            f"request {request_id} has a download finalizing its import; retry shortly"
+        )
 
 
 def _root_is_mounted(root_path: str | None) -> bool:
@@ -283,6 +357,18 @@ async def report_issue(
     if target.status not in REPORTABLE_STATUS_VALUES:
         raise NotReportableError(request_id, target.status)
 
+    # Active-duplicate failsafe: refuse BEFORE any irreversible side effect if a
+    # DIFFERENT active request already owns this media's uq_media_requests_active slot.
+    # Re-arming THIS (settled) row to an active status would collide on that partial
+    # unique index -- but only AFTER the blocklist/torrent-remove/file-purge below had
+    # already run, rolling the DB back while the media is gone (see ActiveDuplicateError).
+    # ``find_active`` returns THIS request when it is itself active (``completed`` holds
+    # the slot uniquely, so no sibling can exist); it returns a DIFFERENT row only when
+    # this request is settled (``available``) and a newer active one coexists.
+    active_sibling = await request_repo.find_active(request.tmdb_id, request.media_type)
+    if active_sibling is not None and active_sibling.id != request_id:
+        raise ActiveDuplicateError(request_id, active_sibling.id)
+
     # Foot-gun failsafe: refuse if the media root is unmounted/empty (see
     # MediaRootUnavailableError). Checked BEFORE any blocklist/remove/flip so a
     # missing drive aborts the whole verb rather than firing against content that
@@ -295,9 +381,15 @@ async def report_issue(
     season_note = f" season {target.season}" if target.season is not None else ""
     log_extra: dict[str, object] = {"request_id": safe_int(request_id), "tmdb_id": request.tmdb_id}
 
-    # Resolve the culprit release from the imported download for (request, season).
+    # Resolve the culprit release from the IMPORTED download for (request, season) --
+    # the row that actually placed the file being reported (and whose torrent still
+    # hardlink-seeds it), never merely the newest attempt: a season already available
+    # can carry a NEWER supplementary/failed row over the older imported one, and
+    # blocklisting/removing that would leave the real seed untouched so the purge frees
+    # nothing (ADR-0014). ``None`` when the title was recorded available straight from
+    # Plex (no download of ours) -- the blocklist/remove steps below are then skipped.
     download_repo = SqlDownloadRepository(session)
-    culprit = await download_repo.find_latest_for_request(request_id, season=target.season)
+    culprit = await download_repo.find_latest_imported_for_request(request_id, season=target.season)
 
     # (a) blocklist the culprit release (nothing to blocklist if the title was
     # recorded available straight from Plex, with no download of ours).
@@ -325,20 +417,30 @@ async def report_issue(
             extra={"torrent_hash": culprit.torrent_hash, **log_extra},
         )
 
-    # (c) purge the library file via the shared root-guarded primitive.
+    # (c) purge the library file via the shared root-guarded primitive. ``purge_ok``
+    # tracks whether the file was ACTUALLY removed: only then is the ``library_path``
+    # breadcrumb cleared at (e). On ``error`` (a genuine delete failure -- permissions,
+    # transient I/O, a partial rmtree) or ``refused`` (out-of-root breadcrumb) the file
+    # may still be on disk, so the breadcrumb is PRESERVED -- it is the only handle a
+    # later retry / eviction has to reclaim the orphan; losing it would strand the bad
+    # file with no way to purge it (honesty over silence).
+    purge_ok = True
     if target.library_path is not None:
         purge = await purge_service.purge_library_path(fs, target.library_path)
         if purge.outcome is PurgeOutcome.refused:
+            purge_ok = False
             _logger.warning(
                 "report-issue purge of %r refused by the filesystem guard (%s); "
-                "re-searching anyway (a stale/misconfigured breadcrumb)",
+                "re-searching anyway but keeping the breadcrumb (a stale/misconfigured path)",
                 safe_text(request.title),
                 purge.detail,
                 extra=log_extra,
             )
         elif purge.outcome is PurgeOutcome.error:
+            purge_ok = False
             _logger.warning(
-                "report-issue purge of %r failed (%s); re-searching anyway",
+                "report-issue purge of %r failed (%s); re-searching anyway but keeping "
+                "the breadcrumb so the orphaned file stays reclaimable",
                 safe_text(request.title),
                 purge.detail,
                 extra=log_extra,
@@ -363,13 +465,18 @@ async def report_issue(
             extra=log_extra,
         )
 
-    # (e) re-arm the request/season to 'searching' + clear the purge breadcrumbs.
+    # (e) re-arm the request/season to 'searching'. The purge breadcrumb is cleared
+    # ONLY when the file was actually removed (``purge_ok``); a failed/refused purge
+    # keeps it so the orphan stays reclaimable (see (c)).
     if is_tv and target.season is not None:
         await season_request_service.reset_for_research(
-            session, media_request_id=request_id, season_number=target.season
+            session,
+            media_request_id=request_id,
+            season_number=target.season,
+            clear_library_path=purge_ok,
         )
     else:
-        await request_repo.reset_for_research(request_id)
+        await request_repo.reset_for_research(request_id, clear_library_path=purge_ok)
 
     # (f) audit history row.
     session.add(
@@ -391,42 +498,62 @@ async def report_issue(
     # different release is grabbed; nothing acceptable lands on the honest
     # no_acceptable_release park. (Auto-grab cross-branch: reset backoff here once
     # feat/auto-grab merges -- see the module docstring.)
-    episodes = culprit.episodes if culprit is not None else None
-    result = await decision_service.preview(
-        prowlarr,
-        parser,
-        profile,
-        SqlBlocklistRepository(session),
-        tmdb_id=request.tmdb_id,
-        title=request.title,
-        media_type=request.media_type,
-        year=request.year,
-        season=target.season,
-        episodes=episodes,
-    )
-    if not result.accepted:
+    #
+    # ALWAYS whole-scope (``episodes=None``): the purge removed the entire library
+    # target -- for tv that is the whole SEASON directory (``library_path`` is the
+    # season dir, never a single episode), so re-fetching only the culprit's episode
+    # subset would leave the season with the OTHER (also-deleted) episodes missing while
+    # marking it done. A season-directory purge must drive a season-level re-search.
+    try:
+        result = await decision_service.preview(
+            prowlarr,
+            parser,
+            profile,
+            SqlBlocklistRepository(session),
+            tmdb_id=request.tmdb_id,
+            title=request.title,
+            media_type=request.media_type,
+            year=request.year,
+            season=target.season,
+            episodes=None,
+        )
+    except _INDEXER_ERRORS as exc:
+        # The re-search could not reach the indexer AFTER the blocklist/purge/reset
+        # already committed. Park honestly (retryable) rather than propagate a 5xx that
+        # leaves the row lying as 'searching' with nothing actually in flight -- exactly
+        # the posture the empty-preview / grab-failure branches take.
+        _logger.warning(
+            "report-issue re-search for %r failed to reach the indexer (%s); parking as "
+            "no_acceptable_release (retryable)",
+            safe_text(request.title),
+            type(exc).__name__,
+            extra=log_extra,
+        )
         await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
     else:
-        try:
-            await grab_service.grab(
-                qbt,
-                session,
-                scored=result.accepted[0],
-                request_id=request_id,
-                tmdb_id=request.tmdb_id,
-                year=request.year,
-                season=target.season,
-                episodes=episodes,
-            )
-        except _GRAB_ERRORS as exc:
-            _logger.warning(
-                "report-issue re-grab for %r failed (%s); parking as "
-                "no_acceptable_release (retryable)",
-                safe_text(request.title),
-                type(exc).__name__,
-                extra=log_extra,
-            )
+        if not result.accepted:
             await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
+        else:
+            try:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=result.accepted[0],
+                    request_id=request_id,
+                    tmdb_id=request.tmdb_id,
+                    year=request.year,
+                    season=target.season,
+                    episodes=None,
+                )
+            except _GRAB_ERRORS as exc:
+                _logger.warning(
+                    "report-issue re-grab for %r failed (%s); parking as "
+                    "no_acceptable_release (retryable)",
+                    safe_text(request.title),
+                    type(exc).__name__,
+                    extra=log_extra,
+                )
+                await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
 
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
@@ -483,34 +610,49 @@ async def cancel_request(
             if srec.status in _UNCANCELLABLE_SEASON_STATUS_VALUES:
                 raise NotCancellableError(request_id, request.status)
             # Belt-and-suspenders: a season whose status does not read done (e.g.
-            # ``evicted``) but that still owns a non-active imported download has a
-            # torrent that may still be seeding -- the same orphan risk. The newest
-            # row for the season is the settled one; if it is imported, refuse.
-            latest = await download_repo.find_latest_for_request(
+            # ``evicted``, or a ``downloading`` supplementary over an already-imported
+            # episode) but that still owns an IMPORTED download has a torrent that may
+            # still be seeding -- the same orphan risk. Probe for the imported row
+            # SPECIFICALLY, not merely the newest attempt: a newer failed/downloading row
+            # must not hide an older imported seed underneath it.
+            imported = await download_repo.find_latest_imported_for_request(
                 request_id, season=srec.season_number
             )
-            if latest is not None and latest.status == DownloadState.Imported.value:
+            if imported is not None:
                 raise NotCancellableError(request_id, request.status)
 
     active = await download_repo.list_active_for_request(request_id)
+    # Never fail an ``importing`` row (see ImportInProgressError): it is mid-copy/scan,
+    # and flipping it to ``failed`` would make the importer's finalize CAS lose and
+    # strand the placed file. Refuse up front -- no torrent removed, nothing settled.
+    if any(row.status == DownloadState.Importing.value for row in active):
+        raise ImportInProgressError(request_id)
+
+    # Move every active row out of the active set (so the reconciler stops tracking it
+    # and the queue drops it) BEFORE removing any torrent, via a compare-and-swap gated
+    # on the row still being cancellable (not ``importing``/terminal). Doing the whole
+    # transition first means a row that raced INTO ``importing`` since the snapshot fails
+    # its swap and we abort the WHOLE cancel with nothing irreversible done yet (no
+    # torrent removed; the rollback undoes the earlier swaps). Reuses the terminal
+    # ``Failed`` state (an honest "not completed") with a cancel reason -- this write does
+    # NOT go through the reconciler's failed_download_events, so it triggers no
+    # blocklist/re-search (cancel must never re-grab).
+    hashes_to_remove: list[str] = []
     for row in active:
-        # Best-effort remove torrent + data; an already-gone hash is a no-op.
-        await purge_service.remove_torrent(
-            qbt,
-            row.torrent_hash,
-            context="a cancel",
-            extra={"torrent_hash": row.torrent_hash, "request_id": safe_int(request_id)},
-        )
-        # Move the download row out of the active set so the reconciler stops
-        # tracking it and the queue drops it. Reuse the existing terminal ``Failed``
-        # state (an honest "not completed") with a cancel reason -- this write does
-        # NOT go through the reconciler's failed_download_events, so it triggers no
-        # blocklist/re-search (cancel must never re-grab).
-        await download_repo.update_status(
+        moved = await download_repo.update_status_if_in(
             row.id,
             DownloadState.Failed.value,
+            _CANCELLABLE_DOWNLOAD_STATE_VALUES,
             failed_reason="cancelled by operator",
         )
+        if not moved:
+            # The row left the cancellable set underneath us (an import claimed it
+            # ``importing`` during the ``list_active`` -> here gap). Abort the whole
+            # cancel: roll back the swaps done so far and surface a retryable refusal
+            # rather than half-cancelling around a finalizing import.
+            await session.rollback()
+            raise ImportInProgressError(request_id)
+        hashes_to_remove.append(row.torrent_hash)
 
     if request.media_type == "tv":
         # Settle every tracked season to cancelled; the parent rollup then folds to
@@ -539,6 +681,17 @@ async def cancel_request(
         )
     )
     await session.commit()
+
+    # Remove each cancelled torrent + its data AFTER the DB cancel has committed, so a
+    # client hiccup never undoes the committed settle (mirrors queue_service.mark_failed).
+    # Best-effort + already-gone-is-a-no-op (see purge_service.remove_torrent).
+    for torrent_hash in hashes_to_remove:
+        await purge_service.remove_torrent(
+            qbt,
+            torrent_hash,
+            context="a cancel",
+            extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
+        )
 
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row

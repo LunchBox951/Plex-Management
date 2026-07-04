@@ -17,6 +17,8 @@ from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import correction_service, request_service
 from plex_manager.services.correction_service import (
+    ActiveDuplicateError,
+    ImportInProgressError,
     MediaRootUnavailableError,
     NotCancellableError,
     NotReportableError,
@@ -249,6 +251,13 @@ async def report_issue_endpoint(
         ) from exc
     except NotReportableError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_reportable") from exc
+    except ActiveDuplicateError as exc:
+        # A newer active request already owns this media's dedup slot -- re-arming the
+        # reported (settled) row would collide. Refused before any blocklist/purge, so
+        # nothing was touched; the operator acts on the live active request instead.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="active_duplicate"
+        ) from exc
     except MediaRootUnavailableError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="media_root_unavailable"
@@ -278,4 +287,11 @@ async def cancel_request_endpoint(
         ) from exc
     except NotCancellableError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_cancellable") from exc
+    except ImportInProgressError as exc:
+        # A download is finalizing its import: cancelling now would race the importer
+        # and could strand a placed file under a cancelled request. Honest, retryable
+        # 409 -- the operator retries once the import lands (report-issue takes over).
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="import_in_progress"
+        ) from exc
     return await _to_response(session, updated)

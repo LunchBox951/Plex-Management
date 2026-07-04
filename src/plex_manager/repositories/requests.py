@@ -362,23 +362,29 @@ class SqlRequestRepository:
         row.library_path = library_path
         await self._session.flush()
 
-    async def reset_for_research(self, request_id: int) -> None:
+    async def reset_for_research(self, request_id: int, *, clear_library_path: bool = True) -> None:
         """Re-arm a reported movie for a fresh search (ADR-0014's report-issue verb).
 
-        Sets ``status`` back to the non-terminal ``searching`` and clears every
-        breadcrumb that asserted the (now-purged) file is present:
-        ``library_path`` (the eviction/purge target -- the file is gone),
-        ``completed_at`` and ``library_verified_at`` (the honest-availability
-        anchors). The subsequent inline re-grab drives the row on to
-        ``downloading``; if nothing acceptable is found it lands on the honest
-        ``no_acceptable_release`` dead-end -- either way the row never lingers
-        claiming an in-library file it no longer has.
+        Sets ``status`` back to the non-terminal ``searching`` and clears the
+        honest-availability anchors (``completed_at`` / ``library_verified_at``) that
+        asserted the title was in the library. The subsequent inline re-grab drives the
+        row on to ``downloading``; if nothing acceptable is found it lands on the honest
+        ``no_acceptable_release`` dead-end -- either way the row never lingers claiming
+        an in-library file it no longer has.
+
+        ``clear_library_path`` (default ``True``) also nulls the ``library_path`` purge
+        breadcrumb -- correct when the file was actually deleted. The report-issue verb
+        passes ``False`` when the purge failed/was refused (the file may still be on
+        disk): the breadcrumb is then PRESERVED as the only handle a later retry /
+        eviction has to reclaim the orphan (honesty over silence -- never strand a bad
+        file with no way to purge it).
         """
         row = await self._session.get(MediaRequest, request_id)
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.status = RequestStatus.searching
-        row.library_path = None
+        if clear_library_path:
+            row.library_path = None
         row.completed_at = None
         row.library_verified_at = None
         await self._session.flush()

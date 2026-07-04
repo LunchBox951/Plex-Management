@@ -454,24 +454,34 @@ async def mark_available(
 
 
 async def reset_for_research(
-    session: AsyncSession, *, media_request_id: int, season_number: int
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    clear_library_path: bool = True,
 ) -> None:
     """Re-arm ONE reported season for a fresh search (ADR-0014's report-issue verb).
 
     The season-level analogue of ``SqlRequestRepository.reset_for_research``: sets
-    the season back to the non-terminal ``searching`` and clears its
-    ``library_path`` purge breadcrumb (the file was just deleted), then recomputes
-    the parent rollup so the show reflects the re-armed season. Unlike
-    :func:`set_status` this is UNCONDITIONAL (no ``skip_if_terminal``): report-issue
-    deliberately re-opens an already-``available``/``completed`` season -- that is
-    the whole point of "this imported file is bad, redo it".
+    the season back to the non-terminal ``searching`` then recomputes the parent
+    rollup so the show reflects the re-armed season. Unlike :func:`set_status` this is
+    UNCONDITIONAL (no ``skip_if_terminal``): report-issue deliberately re-opens an
+    already-``available``/``completed`` season -- that is the whole point of "this
+    imported file is bad, redo it".
+
+    ``clear_library_path`` (default ``True``) also clears the season's ``library_path``
+    purge breadcrumb -- correct when the file was actually deleted. report-issue passes
+    ``False`` when the purge failed/was refused (the season directory may still be on
+    disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
+    reclaim the orphan, never stranded with no handle (honesty over silence).
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.set_status(row.id, RequestStatus.searching.value)
-    await season_repo.clear_library_path(row.id)
+    if clear_library_path:
+        await season_repo.clear_library_path(row.id)
     await _recompute_parent(session, media_request_id)
 
 

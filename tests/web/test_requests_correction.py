@@ -236,3 +236,85 @@ async def test_cancel_endpoint_409_for_imported_request(
     response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=_HEADERS)
     assert response.status_code == 409
     assert response.json()["detail"] == "not_cancellable"
+
+
+async def test_cancel_endpoint_409_while_import_is_finalizing(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # A download mid-import (`importing`) under a request still reading `downloading`:
+    # the endpoint maps the refusal to a retryable 409 import_in_progress, never a 500,
+    # and the row is left untouched.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="importing",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=_HEADERS)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "import_in_progress"
+    assert qbt.removed == []
+
+
+async def test_report_issue_endpoint_409_when_an_active_sibling_exists(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # An older settled `available` request + a newer active one for the same media:
+    # report-issue on the settled row is refused up front (409 active_duplicate), with
+    # nothing purged/blocklisted.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    await _set_setting(sessionmaker_, "movies_root", str(root))
+    settled_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+    async with sessionmaker_() as session:
+        session.add(
+            MediaRequest(
+                tmdb_id=_TMDB,
+                media_type=MediaType.movie,
+                title="Some Movie",
+                year=2020,
+                status=RequestStatus.searching,
+            )
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        library=FakeLibrary(),
+        qbt=qbt,
+        prowlarr=FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264", info_hash=_ALT)]),
+    )
+    response = await client.post(
+        f"/api/v1/requests/{settled_id}/report-issue",
+        json={"reason": "bad_quality"},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "active_duplicate"
+    assert movie_file.exists()
+    assert qbt.removed == []

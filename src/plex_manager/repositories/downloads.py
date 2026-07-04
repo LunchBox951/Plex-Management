@@ -140,6 +140,45 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
+    async def find_latest_imported_for_request(
+        self, media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        """The most recent IMPORTED download for ``(request, season)``, or ``None``.
+
+        Where :meth:`find_latest_for_request` returns the newest row of ANY status,
+        this returns the newest row that is actually ``imported`` -- the download that
+        OWNS the placed library file (and whose torrent is still hardlink-seeding it).
+        The correction verbs need this, not merely the newest attempt (ADR-0014):
+
+        * report-issue must blocklist + remove the torrent that placed the file, not a
+          LATER supplementary/failed attempt for the same ``(request, season)`` -- a
+          season already ``available`` can be reopened by a supplementary per-episode
+          grab that then fails, leaving a newer ``failed`` row over the older
+          ``imported`` one; blocklisting/removing that failed row would leave the real
+          seed (hardlinking the file) untouched, so the purge frees nothing.
+        * cancel's imported-seed probe must detect an older imported torrent that is
+          still seeding even when a newer non-imported row exists for the season,
+          rather than missing it because the NEWEST row happens not to be imported.
+
+        ``season`` follows the same ``== None`` -> ``IS NULL`` translation as the
+        sibling lookups (movies match the NULL-season rows only).
+        """
+        stmt = (
+            select(Download)
+            .where(
+                Download.media_request_id == media_request_id,
+                Download.season == season,
+                # Literal (not the P4 ``DownloadState`` enum) -- this layer duplicates
+                # the state vocabulary as strings to stay decoupled (see module docstring
+                # and ``_TERMINAL_DOWNLOAD_STATUSES``); ``imported`` is that enum's value.
+                Download.status == "imported",
+            )
+            .order_by(Download.id.desc())
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return _to_record(row) if row is not None else None
+
     async def list_active(self) -> list[DownloadRecord]:
         stmt = (
             select(Download)
