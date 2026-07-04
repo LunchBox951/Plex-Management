@@ -89,10 +89,24 @@ def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -
 
     Decision, via :func:`classify_release_scope`:
 
-    - ``"season_pack"`` / ``"multi_season_pack"`` -> ``True``. A pack covering
-      the requested season inherently contains the requested episode(s); packs
-      are never rejected here (the season gate in
-      :mod:`plex_manager.domain.media_match` already confirms season identity).
+    - ``"season_pack"`` / ``"multi_season_pack"`` -> ``True``. A pack covering the
+      requested season inherently contains the requested episode(s), so this
+      episode-overlap helper never rejects a pack.
+
+      *Division of authority (issue #24 beta posture).* A multi-season pack
+      (``S01-S03``) IS refused for the beta -- this app's one-download-one-season
+      model can't satisfy several seasons from one grab -- but that refusal is
+      owned SOLELY by :func:`plex_manager.domain.decision_engine.decide`'s
+      multi-season gate, which fires with the accurate
+      :attr:`~plex_manager.domain.quality_service.RejectionReason.MULTI_SEASON_PACK`.
+      This helper only backs the media-identity gate (``matches_media``), which
+      runs FIRST; if it returned ``False`` for a multi-season pack, that pack
+      would surface as ``WRONG_MEDIA`` before the decision engine could attribute
+      the true reason -- an honesty-over-silence violation. So the gates stay
+      divided: identity (here) never rejects a pack; the multi-season gate (there)
+      is the single rejection authority. The two never disagree that a
+      multi-season pack is ultimately un-grabbable -- they only agree on WHICH
+      gate surfaces WHY.
     - ``"single_episode"`` -> ``True`` iff the file's own episode number(s)
       (normalized via :func:`episode_numbers`) overlap ``requested`` at all — a
       multi-episode file with even partial overlap is kept, mirroring
