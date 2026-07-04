@@ -19,20 +19,30 @@
  *
  * WHICH base snapshots count as stale is TIME-AWARE, not row-shape-aware. Rows
  * expose no server timestamps, so the client tracks — entirely on its own clock, no
- * server-clock mixing — when THIS session first OBSERVED a row transition into a
- * settled-bad status (see `settleObservedAt`). The degradation applies only to a
- * base fetched BEFORE that observation; a base fetched after it was recomputed by
+ * server-clock mixing — when THIS session first OBSERVED each row in a settled-bad
+ * status (see `settleObservedAt`): a watched TRANSITION records the poll that
+ * carried the settle, and a row ALREADY SETTLED at first sighting records that
+ * first sighting. The first-sighting case is what closes the mount race: a discover
+ * response computed while the row was still `requested`, raced by a first
+ * /requests poll that lands after the settle, would otherwise render its stale
+ * base indefinitely with nothing ever observed. The degradation applies only to a
+ * base fetched BEFORE the observation; a base fetched after it was recomputed by
  * the server with the settled status already in the fold (`derive_library_state`
  * reads the request store fresh per page), so it is trusted verbatim. Without the
  * time gate the suppression would be PERMANENT: a movie re-added to Plex after a
  * failed re-request would never regain its "In library" badge even after Discover
- * refetched a genuinely fresh `available` base. A row already settled when this
- * session first sees it never suppresses anything — its base snapshot was fetched
- * at the same time or later and already reflects the settle.
+ * refetched a genuinely fresh `available` base.
  *
- * On first observing a settle transition the discover queries are invalidated
- * (fire-and-forget), so the suppressed tile self-heals to the server's fresh truth
- * within one refetch instead of waiting for the next visit.
+ * On first observing a settle the discover queries are invalidated (fire-and-forget)
+ * — skipped only when the observing call's own base already postdates the
+ * observation (nothing to heal) — so a suppressed tile self-heals to the server's
+ * fresh truth within one refetch instead of waiting for the next visit. The
+ * first-sighting observation deliberately trades a TRANSIENT beat for the race
+ * above: for a LONG-AGO-settled row whose mount-time discover response resolves
+ * before the first requests poll, the tile is suppressed for one spurious
+ * invalidation + refetch cycle (~seconds, once per session per row), after which
+ * the refetched base postdates the observation and is trusted for the rest of the
+ * session. Bounded and self-healing, versus the indefinite staleness it prevents.
  *
  * This status→state table mirrors the server's `derive_library_state`
  * (services/discovery_service.py); a drift makes base and overlay disagree on a tile.
@@ -47,50 +57,64 @@ import { requestStatus, type StatusPresentation } from './status'
 const OVERLAY_SUPPRESSED = new Set(['failed', 'evicted', 'cancelled'])
 
 // ---------------------------------------------------------------------------
-// Settle-transition observation (client clock only).
+// Settle observation (client clock only).
 //
-// `lastSeenStatus`: the status each request row carried when this session last
-// processed it. `settleObservedAt`: Date.now() at the moment a row was FIRST seen
-// in a settled-bad status having previously been seen in a different, non-settled-
-// bad one — i.e. the client-side observation time of the settle. Comparing that
-// against the discover query's `dataUpdatedAt` (also client clock, via react-query)
-// is sound: no server clock is involved on either side. The residual race — a
-// discover response computed server-side just before the settle but received just
-// after the observation — is bounded by one HTTP round trip and self-heals on the
+// `settleObservedAt`: the client-clock instant each request row was FIRST seen in
+// a settled-bad status — on a watched transition, the timestamp of the poll that
+// carried the settle; on a row ALREADY settled at first sighting, that first
+// sighting (the settle provably happened at or before it — wave 6: without this,
+// a row settling between the discover fetch and the first poll would never be
+// observed and its stale base would render indefinitely). Comparing against the
+// discover query's `dataUpdatedAt` (also client clock, via react-query) is sound:
+// no server clock is involved on either side. The residual race — a discover
+// response computed server-side just before the settle but received just after
+// the observation — is bounded by one HTTP round trip and self-heals on the
 // invalidation refetch below.
 //
 // ADR-0014 report-issue can re-arm a settled row to an ACTIVE status (same id), so
 // seeing a row in a non-settled-bad status clears its observation: the next settle
 // is a NEW event and gets a fresh timestamp.
 // ---------------------------------------------------------------------------
-const lastSeenStatus = new Map<number, string>()
 const settleObservedAt = new Map<number, number>()
 
-/** Test-isolation helper: forget every observed settle transition. */
+/** Test-isolation helper: forget every observed settle. */
 export function resetSettleObservations(): void {
-  lastSeenStatus.clear()
   settleObservedAt.clear()
 }
 
-function trackSettleTransitions(matches: RequestResponse[]): void {
+function trackSettleObservations(
+  matches: RequestResponse[],
+  baseFetchedAt: number | undefined,
+  requestsFetchedAt: number | undefined,
+): void {
+  // The poll snapshot's own receipt time is tighter than render-time Date.now()
+  // (same clock domain either way); fall back when the caller doesn't have it.
+  const observed = requestsFetchedAt ?? Date.now()
   for (const r of matches) {
-    const prev = lastSeenStatus.get(r.id)
     if (!OVERLAY_SUPPRESSED.has(r.status)) {
       // Active (or available) again — e.g. an ADR-0014 report-issue re-arm. Any
       // previous settle observation is history; a future settle is a new event.
       settleObservedAt.delete(r.id)
-    } else if (prev !== undefined && !OVERLAY_SUPPRESSED.has(prev) && !settleObservedAt.has(r.id)) {
-      settleObservedAt.set(r.id, Date.now())
-      // The base snapshot predates this settle — ask react-query to refetch every
-      // discover query (home + any search page; prefix match, same call shape as
-      // useUpdateSettings) so the tile self-heals to the server's fresh fold within
-      // one round trip. Deferred to a microtask: deriveTileState runs during render,
-      // and scheduling refetches synchronously mid-render is a React anti-pattern.
-      queueMicrotask(() => {
-        void queryClient.invalidateQueries({ queryKey: ['discover'] })
-      })
+    } else if (!settleObservedAt.has(r.id)) {
+      // First time this session sees the row settled — either a watched transition
+      // or already settled at first sighting; both record (see the registry
+      // comment on why first sighting counts).
+      settleObservedAt.set(r.id, observed)
+      // Ask react-query to refetch every discover query (home + any search page;
+      // prefix match, same call shape as useUpdateSettings) so a suppressed tile
+      // self-heals to the server's fresh fold within one round trip — unless THIS
+      // call's base already postdates the observation, in which case there is
+      // nothing stale to heal (the long-ago-settle fast path: no spurious refetch
+      // when the mount's discover response resolved after the first poll).
+      // Deferred to a microtask: deriveTileState runs during render, and scheduling
+      // refetches synchronously mid-render is a React anti-pattern. Fires at most
+      // once per row per session (guarded by the `has` check above).
+      if (!(baseFetchedAt !== undefined && baseFetchedAt > observed)) {
+        queueMicrotask(() => {
+          void queryClient.invalidateQueries({ queryKey: ['discover'] })
+        })
+      }
     }
-    lastSeenStatus.set(r.id, r.status)
   }
 }
 
@@ -123,11 +147,17 @@ function libraryStateToPresentation(
  * It gates the stale-base degradation (see the module docstring): a base fetched
  * after the settle was observed is trusted verbatim. Omitted (tests/legacy
  * callers), the base is treated as predating every observed settle.
+ *
+ * `requestsFetchedAt` is the client-clock time the `requests` snapshot was
+ * received — react-query's `dataUpdatedAt` for the /requests poll. It stamps
+ * settle observations (tighter than render-time `Date.now()`, which is the
+ * fallback when omitted; same clock domain either way).
  */
 export function deriveTileState(
   result: DiscoverResult,
   requests: RequestResponse[] | undefined,
   baseFetchedAt?: number,
+  requestsFetchedAt?: number,
 ): StatusPresentation | null {
   // The live request for this exact title — identical correlation to
   // TitleDetailModal.tsx: /requests is id-ascending and the backend allows
@@ -135,7 +165,7 @@ export function deriveTileState(
   const matches = (requests ?? []).filter(
     (r) => r.tmdb_id === result.tmdb_id && r.media_type === result.media_type,
   )
-  trackSettleTransitions(matches)
+  trackSettleObservations(matches, baseFetchedAt, requestsFetchedAt)
   const active = matches.find((r) => !isSettled(r.status))
   const liveRequest = active ?? matches[matches.length - 1] ?? null
 
@@ -148,18 +178,19 @@ export function deriveTileState(
     // A settled-bad row (failed/cancelled/evicted) never badges the tile itself.
     // Whether it also invalidates the server base depends on WHEN the base was
     // fetched relative to the observed settle:
-    //  - settle never observed in-session: the row was already settled when this
-    //    session started, so the base (fetched at or after session start) already
-    //    folds it — trust the base.
     //  - base fetched AFTER the observation: the server recomputed it with the
     //    settled status — trust the base. This is what lifts the suppression after
-    //    a refetch instead of hiding a re-added title forever.
+    //    a refetch instead of hiding a re-added title forever, and what trusts a
+    //    long-ago settle whose base resolved after the first poll.
     //  - base fetched BEFORE the observation (or fetch time unknown): the base
-    //    cannot reflect the settle — degrade its request-derived portion.
-    const observedAt = settleObservedAt.get(liveRequest.id)
-    const basePostdatesSettle =
-      observedAt === undefined || (baseFetchedAt !== undefined && baseFetchedAt > observedAt)
-    if (basePostdatesSettle) {
+    //    cannot be proven to reflect the settle — degrade its request-derived
+    //    portion. First-sighting observations (wave 6) land here too: the settle
+    //    happened at or before the poll that first carried the row, so a base
+    //    older than that poll may predate the settle.
+    // A settled liveRequest ALWAYS has an observation (recorded just above);
+    // `?? Infinity` merely keeps the comparison total for the type system.
+    const observedAt = settleObservedAt.get(liveRequest.id) ?? Number.POSITIVE_INFINITY
+    if (baseFetchedAt !== undefined && baseFetchedAt > observedAt) {
       return libraryStateToPresentation(result.library_state)
     }
 

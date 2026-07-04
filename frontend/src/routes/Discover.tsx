@@ -34,11 +34,12 @@ export function Discover() {
   // Each helper passes ITS OWN query's dataUpdatedAt (client clock) so deriveTileState
   // can tell whether that base snapshot predates an observed request settle — a base
   // refetched after the settle is trusted; only an older one gets the stale-base
-  // degradation (see tileState.ts).
+  // degradation (see tileState.ts). The requests poll's own dataUpdatedAt stamps the
+  // settle observations (same client clock; received-at is tighter than render time).
   const homeTileState = (item: DiscoverResult) =>
-    deriveTileState(item, requests.data?.requests, home.dataUpdatedAt)
+    deriveTileState(item, requests.data?.requests, home.dataUpdatedAt, requests.dataUpdatedAt)
   const searchTileState = (item: DiscoverResult) =>
-    deriveTileState(item, requests.data?.requests, search.dataUpdatedAt)
+    deriveTileState(item, requests.data?.requests, search.dataUpdatedAt, requests.dataUpdatedAt)
 
   // One selected-title + modal state, shared across the home and search branches.
   const [selected, setSelected] = useState<DiscoverResult | null>(null)

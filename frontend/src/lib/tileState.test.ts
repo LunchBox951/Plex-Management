@@ -102,10 +102,12 @@ describe('deriveTileState — live request overlay', () => {
 
   it('does NOT let a settled failed row shadow a server "available"', () => {
     // A failed re-request from the past must not turn an owned title into "Failed":
-    // it falls through to the server base (In library).
+    // it falls through to the server base (In library) once the base is provably
+    // fresher than the settle observation.
     const state = deriveTileState(
       result({ library_state: 'available' }),
       [request({ status: 'failed' })],
+      BASE_AFTER_SETTLE(),
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
@@ -265,16 +267,71 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     })
   })
 
-  it('trusts the base when the settle was never observed in this session', () => {
-    // Rows already settled when the session starts: the base snapshot was fetched
-    // at the same time or later, so the server already folded the settled status —
-    // an "available" base here is presence truth (e.g. re-added long ago), not
-    // stale request history. No suppression.
-    const state = deriveTileState(result({ library_state: 'available' }), [
-      request({ id: 1, status: 'available' }),
-      request({ id: 2, status: 'failed' }),
-    ])
+  it('suppresses a base older than the first poll that already carries the settled row', async () => {
+    // The wave-6 race: the discover response was computed while the row was still
+    // requested/processing; the FIRST /requests poll lands AFTER the settle. There
+    // is no transition to watch — the first sighting IS the observation, and a base
+    // older than that poll cannot be proven to reflect the settle. Suppress AND
+    // queue the one-shot invalidation so the tile self-heals within one refetch.
+    const invalidate = vi
+      .spyOn(queryClient, 'invalidateQueries')
+      .mockResolvedValue(undefined as never)
+    const pollAt = Date.now()
+    const state = deriveTileState(
+      result({ library_state: 'requested' }),
+      [request({ status: 'failed' })],
+      pollAt - 60_000, // base fetched a minute before the poll
+      pollAt,
+    )
+    expect(state).toBeNull()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+    // After the invalidation refetch: a base NEWER than the observation is trusted
+    // verbatim, whatever it says.
+    expect(
+      deriveTileState(
+        result({ library_state: 'available' }),
+        [request({ status: 'failed' })],
+        pollAt + 60_000,
+        pollAt,
+      ),
+    ).toEqual({ label: 'In library', intent: 'available' })
+  })
+
+  it('trusts a long-ago settle when the base is provably fresher than the first poll', async () => {
+    // A row settled in some earlier session, first seen by this session's first
+    // poll, with the mount's discover response resolving AFTER that poll: the base
+    // already folds the settle server-side — trusted immediately, no suppression
+    // beat and no spurious invalidation.
+    const invalidate = vi
+      .spyOn(queryClient, 'invalidateQueries')
+      .mockResolvedValue(undefined as never)
+    const pollAt = Date.now() - 10_000
+    const state = deriveTileState(
+      result({ library_state: 'available' }),
+      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'failed' })],
+      pollAt + 5_000, // base resolved after the poll snapshot
+      pollAt,
+    )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
+  it('fires the invalidation at most once per settled row per session', async () => {
+    const invalidate = vi
+      .spyOn(queryClient, 'invalidateQueries')
+      .mockResolvedValue(undefined as never)
+    const pollAt = Date.now()
+    const tile = result({ library_state: 'requested' })
+    const rows = [request({ status: 'failed' })]
+    // First sighting with an old base: suppressed + invalidation queued.
+    expect(deriveTileState(tile, rows, pollAt - 60_000, pollAt)).toBeNull()
+    // Re-derives (same settled row) never re-fire it, whatever the base age.
+    deriveTileState(tile, rows, pollAt - 60_000, pollAt)
+    deriveTileState(tile, rows, pollAt + 60_000, pollAt)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).toHaveBeenCalledTimes(1)
   })
 
   it('re-arms the observation when a settled row goes active again (report-issue)', () => {
