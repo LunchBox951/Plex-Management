@@ -1109,6 +1109,7 @@ class _SlowDeleteFileSystem:
         # gate must pass -- return False (delete would NOT refuse) so it proceeds to
         # measure + delete as before.
         return False
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
@@ -1487,6 +1488,7 @@ class _PinsSecondCandidateOnFirstDeleteFs:
         # gate must pass -- return False (delete would NOT refuse) so it proceeds to
         # measure + delete as before.
         return False
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
@@ -1625,6 +1627,7 @@ class _ConcurrentSecondEvictFs:
         # gate must pass -- return False (delete would NOT refuse) so it proceeds to
         # measure + delete as before.
         return False
+
     def reclaimable_bytes(self, path: str) -> int:
         try:
             return os.path.getsize(path)
