@@ -1,11 +1,41 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi, type Mock } from 'vitest'
 import { useRequests } from '../api/hooks'
 import type { RequestResponse } from '../api/types'
 import { Requests } from './Requests'
 
-vi.mock('../api/hooks', () => ({ useRequests: vi.fn() }))
+// The row-click path mounts the shared `TitleDetailModal`, which calls every
+// hook below (plus useToast) unconditionally before its own `if (!title)`
+// guard — so the mock must cover the modal's full hook surface, not just
+// `useRequests`, or an unmocked hook returns undefined and the modal throws
+// before the read-only cases below even get a chance to NOT mount it.
+vi.mock('../api/hooks', () => ({
+  useRequests: vi.fn(),
+  useQueue: vi.fn(() => ({ data: { queue: [] } })),
+  useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useSearchPreview: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useGrab: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useMarkFailed: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useImportDownload: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useSetKeepForever: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+}))
+
+vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
+
+// Passthrough Dialog so the modal's content renders as plain DOM — no Radix
+// portal focus-trap noise in a jsdom test environment.
+vi.mock('../components/ui/Dialog', () => ({
+  Dialog: ({ title, children }: { title: string; children: ReactNode }) => (
+    <div>
+      <h2>{title}</h2>
+      {children}
+    </div>
+  ),
+}))
 
 function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
   return {
@@ -116,5 +146,32 @@ describe('Requests — poster rendering (issue #26)', () => {
     expect(img).not.toBeNull()
     fireEvent.error(img as HTMLImageElement)
     await waitFor(() => expect(container.querySelector('img')).not.toBeInTheDocument())
+  })
+})
+
+describe('Requests — opening the shared TitleDetailModal from a row', () => {
+  it('clicking a movie row opens the modal on that title', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'no_acceptable_release' })] },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    fireEvent.click(screen.getByRole('button', { name: /test movie/i }))
+    // The reused modal renders its Dialog title as the title's own name — the
+    // co-located correction surface (re-search, retry-import, ...) is the same
+    // component Discover uses, just opened from a request row instead.
+    expect(screen.getByRole('heading', { name: 'Test Movie' })).toBeInTheDocument()
+  })
+
+  it('clicking a tv row opens the modal (media_type narrows "tv" correctly)', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [tvRequest()] },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    fireEvent.click(screen.getByRole('button', { name: /test show/i }))
+    expect(screen.getByRole('heading', { name: 'Test Show' })).toBeInTheDocument()
   })
 })
