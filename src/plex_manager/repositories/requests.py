@@ -53,6 +53,18 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value
 
 
+def _season_tuple(value: Sequence[Any] | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    return tuple(sorted({int(v) for v in value}))
+
+
+def _season_json(value: Sequence[int] | None) -> list[int] | None:
+    if value is None:
+        return None
+    return list(_season_tuple(value) or [])
+
+
 def _to_record(row: MediaRequest) -> RequestRecord:
     """Map a ``MediaRequest`` ORM row to its frozen read-model DTO."""
     return RequestRecord(
@@ -70,6 +82,8 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         keep_forever=bool(row.keep_forever),
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
+        tv_request_mode=row.tv_request_mode,
+        requested_seasons=_season_tuple(row.requested_seasons_json),
     )
 
 
@@ -298,6 +312,8 @@ class SqlRequestRepository:
         user_id: int | None = None,
         poster_url: str | None = None,
         backdrop_url: str | None = None,
+        tv_request_mode: str | None = None,
+        requested_seasons: Sequence[int] | None = None,
     ) -> RequestRecord:
         row = MediaRequest(
             tmdb_id=tmdb_id,
@@ -309,11 +325,23 @@ class SqlRequestRepository:
             user_id=user_id,
             poster_url=poster_url,
             backdrop_url=backdrop_url,
+            tv_request_mode=tv_request_mode,
+            requested_seasons_json=_season_json(requested_seasons),
         )
         self._session.add(row)
         await self._session.flush()
         await self._session.refresh(row)
         return _to_record(row)
+
+    async def set_tv_request_intent(
+        self, request_id: int, *, mode: str, requested_seasons: Sequence[int] | None
+    ) -> None:
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.tv_request_mode = mode
+        row.requested_seasons_json = _season_json(requested_seasons)
+        await self._session.flush()
 
     async def set_status(self, request_id: int, status: str) -> None:
         row = await self._session.get(MediaRequest, request_id)

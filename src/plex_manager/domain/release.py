@@ -138,6 +138,8 @@ class ScoredRelease(BaseModel):
 
     ``profile_index`` is the candidate's position in the quality profile (the
     comparison key); ``score`` ranks among same-or-grouped qualities.
+    Multi-season scope tuples are empty for ordinary releases and populated only
+    when a policy-aware multi-season pack is accepted.
     """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
@@ -147,3 +149,9 @@ class ScoredRelease(BaseModel):
     quality: Quality
     profile_index: int
     score: float
+    covered_seasons: tuple[int, ...] = ()
+    target_seasons: tuple[int, ...] = ()
+    upgrade_seasons: tuple[int, ...] = ()
+    waste_seasons: tuple[int, ...] = ()
+    ignored_seasons: tuple[int, ...] = ()
+    skipped_seasons: tuple[int, ...] = ()

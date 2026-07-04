@@ -167,6 +167,29 @@ def _season_numbers(seasons: list[int] | None, season_count: int) -> list[int]:
     return seasons if seasons else list(range(1, season_count + 1))
 
 
+def _tv_request_intent(seasons: list[int] | None) -> tuple[str, list[int] | None]:
+    if seasons:
+        return "explicit_seasons", sorted(set(seasons))
+    return "whole_show", None
+
+
+async def _merge_tv_request_intent(
+    repo: SqlRequestRepository, record: RequestRecord, seasons: list[int] | None
+) -> None:
+    incoming_mode, incoming_requested = _tv_request_intent(seasons)
+    if record.tv_request_mode == "whole_show":
+        return
+    if incoming_mode == "whole_show":
+        await repo.set_tv_request_intent(record.id, mode="whole_show", requested_seasons=None)
+        return
+    merged = set(record.requested_seasons or ()) | set(incoming_requested or ())
+    await repo.set_tv_request_intent(
+        record.id,
+        mode="explicit_seasons",
+        requested_seasons=sorted(merged),
+    )
+
+
 async def _resolve_tv_seasons(
     tmdb: MetadataPort, tmdb_id: int, seasons: list[int] | None
 ) -> list[int]:
@@ -330,6 +353,7 @@ async def create_request_result(
                 tmdb_id=tmdb_id,
                 seasons=season_numbers,
             )
+            await _merge_tv_request_intent(repo, existing, seasons)
             await session.commit()
             # ensure_seasons recomputed + persisted the parent rollup; re-read so the
             # returned record's top-level status matches the seasons the response will
@@ -390,6 +414,7 @@ async def create_request_result(
                     tmdb_id=tmdb_id,
                     seasons=season_numbers,
                 )
+                await _merge_tv_request_intent(repo, in_library, seasons)
                 await session.commit()
                 return CreateRequestResult(
                     record=await repo.get(in_library.id) or in_library,
@@ -407,6 +432,10 @@ async def create_request_result(
             user_id=user_id,
             poster_url=detail.poster_url,
             backdrop_url=detail.backdrop_url,
+            tv_request_mode=_tv_request_intent(seasons)[0] if media_type == "tv" else None,
+            requested_seasons=(
+                _tv_request_intent(seasons)[1] if media_type == "tv" else None
+            ),
         )
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.
@@ -451,6 +480,7 @@ async def create_request_result(
                         tmdb_id=tmdb_id,
                         seasons=season_numbers,
                     )
+                    await _merge_tv_request_intent(repo, winner, seasons)
                     await session.commit()
                     winner = await repo.get(winner.id) or winner
                     created = False
@@ -473,6 +503,7 @@ async def create_request_result(
                 tmdb_id=tmdb_id,
                 seasons=season_numbers,
             )
+            await _merge_tv_request_intent(repo, winner, seasons)
             await session.commit()
             # Re-read past the rollup ensure_seasons just persisted (``winner`` was
             # captured before it), so the returned status matches the response's seasons.

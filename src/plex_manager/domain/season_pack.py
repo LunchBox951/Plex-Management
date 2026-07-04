@@ -18,18 +18,59 @@ Pure domain: stdlib only. No I/O, no adapter/web imports.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Literal
 
+from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.release import ParsedRelease
 
 __all__ = [
+    "MultiSeasonPackPlan",
+    "MultiSeasonRequestIntent",
     "ReleaseScope",
+    "SeasonPackSeasonState",
     "classify_release_scope",
     "covers_requested_episodes",
     "episode_numbers",
+    "plan_multi_season_pack",
 ]
 
 ReleaseScope = Literal["single_episode", "season_pack", "multi_season_pack", "unknown"]
+MultiSeasonRequestMode = Literal["whole_show", "explicit_seasons"]
+
+_INSTALLED_STATUSES = frozenset({"completed", "available"})
+
+
+@dataclass(frozen=True)
+class SeasonPackSeasonState:
+    """Current request/library state for one tracked TV season."""
+
+    season_number: int
+    status: str
+    installed_quality_id: int | None = None
+    installed_profile_index: int | None = None
+
+
+@dataclass(frozen=True)
+class MultiSeasonRequestIntent:
+    """Request intent and tracked season rows used to evaluate a multi-season pack."""
+
+    mode: MultiSeasonRequestMode
+    requested_seasons: tuple[int, ...]
+    seasons: tuple[SeasonPackSeasonState, ...]
+
+
+@dataclass(frozen=True)
+class MultiSeasonPackPlan:
+    """Eligibility decision for one multi-season pack candidate."""
+
+    accepted: bool
+    reason: str | None
+    covered_seasons: tuple[int, ...]
+    target_seasons: tuple[int, ...]
+    upgrade_seasons: tuple[int, ...]
+    waste_seasons: tuple[int, ...]
+    ignored_seasons: tuple[int, ...]
 
 
 def classify_release_scope(parsed: ParsedRelease) -> ReleaseScope:
@@ -124,3 +165,99 @@ def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -
         requested_set = set(requested)
         return not requested_set.isdisjoint(episode_numbers(parsed.episode))
     return False
+
+
+def _profile_index(
+    profile: QualityProfile,
+    quality_id: int | None,
+    fallback_index: int | None = None,
+) -> int | None:
+    if quality_id is None:
+        return None
+    index = profile.get_index(quality_id)
+    return index if index is not None else fallback_index
+
+
+def plan_multi_season_pack(
+    *,
+    pack_seasons: Sequence[int],
+    candidate_quality_id: int,
+    profile: QualityProfile,
+    intent: MultiSeasonRequestIntent,
+) -> MultiSeasonPackPlan:
+    """Classify whether a multi-season pack is useful enough to grab.
+
+    This is the pure policy behind issue #24's follow-up behaviour. It does not
+    create seasons and does not perform the grab; it only answers which currently
+    tracked seasons a physical pack should satisfy.
+    """
+    covered = tuple(sorted(set(pack_seasons)))
+    requested = set(intent.requested_seasons)
+    state_by_season = {state.season_number: state for state in intent.seasons}
+    tracked = set(state_by_season)
+
+    if intent.mode == "explicit_seasons" and set(covered) != requested:
+        return MultiSeasonPackPlan(
+            accepted=False,
+            reason="explicit_season_set_mismatch",
+            covered_seasons=covered,
+            target_seasons=(),
+            upgrade_seasons=(),
+            waste_seasons=(),
+            ignored_seasons=tuple(sorted(set(covered) - requested)),
+        )
+
+    eligible = (requested or tracked) & tracked
+    ignored = tuple(sorted(set(covered) - eligible))
+    candidate_index = profile.get_index(candidate_quality_id)
+
+    target: list[int] = []
+    upgrades: list[int] = []
+    waste: list[int] = []
+
+    for season_number in covered:
+        if season_number not in eligible:
+            continue
+        state = state_by_season.get(season_number)
+        if state is None:
+            continue
+        if state.status not in _INSTALLED_STATUSES:
+            target.append(season_number)
+            continue
+
+        installed_index = _profile_index(
+            profile,
+            state.installed_quality_id,
+            state.installed_profile_index,
+        )
+        if (
+            profile.upgrade_allowed
+            and candidate_index is not None
+            and installed_index is not None
+            and candidate_index > installed_index
+        ):
+            target.append(season_number)
+            upgrades.append(season_number)
+        else:
+            waste.append(season_number)
+
+    target_seasons = tuple(target)
+    waste_seasons = tuple(waste)
+    reason: str | None = None
+    accepted = True
+    if not target_seasons:
+        accepted = False
+        reason = "no_useful_seasons"
+    elif waste_seasons and len(target_seasons) <= len(waste_seasons):
+        accepted = False
+        reason = "useful_seasons_not_majority"
+
+    return MultiSeasonPackPlan(
+        accepted=accepted,
+        reason=reason,
+        covered_seasons=covered,
+        target_seasons=target_seasons,
+        upgrade_seasons=tuple(upgrades),
+        waste_seasons=waste_seasons,
+        ignored_seasons=ignored,
+    )
