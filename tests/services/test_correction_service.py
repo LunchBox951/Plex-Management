@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.prowlarr.adapter import IndexerError, IndexerRateLimitError
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.models import (
@@ -31,6 +32,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import correction_service, season_request_service
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate
@@ -62,6 +64,16 @@ class _DeleteFailsFileSystem(LocalFileSystem):
 
     def delete(self, path: str) -> None:
         raise OSError("permission denied")
+
+
+class _AddFailsQbittorrent(FakeQbittorrent):
+    """A :class:`FakeQbittorrent` whose ``add`` raises ``QbittorrentError`` -- models the
+    download client being unreachable/erroring when the inline report-issue RE-GRAB
+    hands it the replacement release. ``remove`` is inherited (the culprit torrent
+    removal earlier in the verb still succeeds)."""
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        raise QbittorrentError("qBittorrent is unreachable")
 
 
 async def _seed_available_movie(
@@ -1120,3 +1132,183 @@ async def test_reset_for_research_resets_autograb_backoff(
         ).scalar_one()
         assert srow.search_attempts == 0
         assert srow.next_search_at is None
+
+
+# --------------------------------------------------------------------------- #
+# Codex round (rebased): PR #32 follow-on findings
+# --------------------------------------------------------------------------- #
+async def test_cancel_with_no_active_rows_settles_without_a_client(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Finding #1: a pending/searching cancel with NO active download rows is a pure DB
+    # settle -- it never touches qBittorrent -- so it must succeed even with the client
+    # UNCONFIGURED (qbt=None), never a spurious service_not_configured.
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.searching,  # not-yet-imported, no download row of its own
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        updated = await correction_service.cancel_request(session, None, request_id=request_id)
+    assert updated.status == RequestStatus.cancelled.value
+
+
+async def test_cancel_with_an_active_torrent_requires_a_client(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Finding #1's honest counterpart: a cancel that owns an ACTIVE torrent genuinely
+    # needs the client to remove it. With qbt=None it must refuse UP FRONT
+    # (DownloadClientRequiredError -> 409 service_not_configured at the endpoint),
+    # never a silent skip that leaks the seeding torrent -- and touch nothing.
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    with pytest.raises(correction_service.DownloadClientRequiredError):
+        async with sessionmaker_() as session:
+            await correction_service.cancel_request(session, None, request_id=request_id)
+
+    # Nothing settled, nothing failed: the guard fired before any mutation.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _CULPRIT))
+        ).scalar_one()
+    assert request is not None and request.status == RequestStatus.downloading
+    assert download.status == "downloading"
+
+
+async def test_report_issue_refuses_when_a_sibling_claims_the_slot_between_check_and_reset(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding #2: the active-slot claim (re-arm to searching) is now done BEFORE the
+    # irreversible torrent-removal/purge. Simulate a racing active sibling grabbing the
+    # dedup slot AFTER the upfront find_active check passed but BEFORE the re-arm flush:
+    # the flush collides on uq_media_requests_active (a REAL IntegrityError), surfaced
+    # as ActiveDuplicateError (409) with NOTHING deleted -- the file untouched, the
+    # torrent still present, the blocklist rolled back.
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    settled_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    real_find = SqlDownloadRepository.find_latest_imported_for_request
+    inserted = {"done": False}
+
+    async def racing_find(
+        self: SqlDownloadRepository, media_request_id: int, *, season: int | None = None
+    ) -> object:
+        # Runs during culprit resolution -- after the upfront find_active check, before
+        # any write of this transaction. Land a NEWER active request for the same media
+        # (a committed sibling), so the later re-arm flush collides for real.
+        if not inserted["done"]:
+            inserted["done"] = True
+            async with sessionmaker_() as competitor:
+                competitor.add(
+                    MediaRequest(
+                        tmdb_id=_TMDB,
+                        media_type=MediaType.movie,
+                        title="Some Movie",
+                        year=2020,
+                        status=RequestStatus.searching,
+                    )
+                )
+                await competitor.commit()
+        return await real_find(self, media_request_id, season=season)
+
+    monkeypatch.setattr(SqlDownloadRepository, "find_latest_imported_for_request", racing_find)
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.ActiveDuplicateError):
+        async with sessionmaker_() as session:
+            await correction_service.report_issue(
+                session,
+                qbt,
+                LocalFileSystem(library_roots=[str(root)]),
+                FakeLibrary(),
+                FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264", info_hash=_ALT)]),
+                GuessitParser(),
+                default_profile(),
+                request_id=settled_id,
+                reason="bad_quality",
+                season=None,
+                root_path=str(root),
+            )
+
+    # The irreversible steps never ran: file on disk, torrent never removed.
+    assert movie_file.exists()
+    assert qbt.removed == []
+    # The blocklist + partial re-arm were rolled back; the reported row is untouched.
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        settled = await session.get(MediaRequest, settled_id)
+    assert blocklist == []
+    assert settled is not None and settled.status == RequestStatus.available
+
+
+async def test_report_issue_leaves_scope_searching_when_the_regrab_client_fails(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # Finding #4: the inline re-grab's qbt.add hits a download-client error AFTER the
+    # blocklist/purge/reset already committed. It must NOT park no_acceptable_release
+    # (a LIE -- releases exist; the CLIENT failed) and must NOT let a 502 escape:
+    # the scope is LEFT at 'searching' (the merged auto-grab worker retries it), and the
+    # committed blocklist/purge/audit all stand.
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    qbt = _AddFailsQbittorrent()
+    async with sessionmaker_() as session:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            # An acceptable alternative IS on offer, so the re-grab is attempted and its
+            # qbt.add is what fails -- not an empty-preview park.
+            FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER", info_hash=_ALT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            root_path=str(root),
+        )
+
+    # No exception escaped; the scope self-heals at 'searching' (NOT parked, NOT downloading).
+    assert updated.status == RequestStatus.searching.value
+    # The correction work stands: file purged, culprit torrent removed, blocklist written.
+    assert not movie_file.exists()
+    assert (_CULPRIT, True) in qbt.removed
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        downloads = (await session.execute(select(Download))).scalars().all()
+    assert len(blocklist) == 1
+    # The failed re-grab created no new active download row -- only the terminal culprit.
+    assert {d.status for d in downloads} == {"imported"}

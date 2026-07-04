@@ -18,6 +18,7 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import correction_service, request_service
 from plex_manager.services.correction_service import (
     ActiveDuplicateError,
+    DownloadClientRequiredError,
     ImportInProgressError,
     MediaRootUnavailableError,
     NotCancellableError,
@@ -27,6 +28,7 @@ from plex_manager.services.correction_service import (
 )
 from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
+    ServiceNotConfiguredError,
     get_eviction_filesystem,
     get_library,
     get_library_optional,
@@ -34,6 +36,7 @@ from plex_manager.web.deps import (
     get_parser,
     get_prowlarr,
     get_qbittorrent,
+    get_qbittorrent_optional,
     get_quality_profile,
     get_session,
     get_tmdb,
@@ -269,7 +272,7 @@ async def report_issue_endpoint(
 async def cancel_request_endpoint(
     request_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
-    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
+    qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
 ) -> RequestResponse:
     """Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.
 
@@ -278,6 +281,13 @@ async def cancel_request_endpoint(
     row is kept for history and nothing is re-grabbed. A request past the
     not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
     to redo an imported title instead.
+
+    qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
+    ``pending``/``searching``/``no_acceptable_release`` request with NO active download
+    rows is a pure DB settle that never touches the client, so it still works on an
+    install with qBittorrent unconfigured. When there ARE active torrents to remove but
+    the client is unconfigured, the service refuses up front (409
+    ``service_not_configured``) rather than silently leaking a seeding torrent.
     """
     try:
         updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
@@ -294,4 +304,9 @@ async def cancel_request_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="import_in_progress"
         ) from exc
+    except DownloadClientRequiredError as exc:
+        # Active torrent(s) to remove, but qBittorrent is unconfigured. Surface the same
+        # honest 409 ``service_not_configured`` the mark-failed endpoint uses -- refused
+        # before any state change, so nothing was settled or removed.
+        raise ServiceNotConfiguredError("qbittorrent") from exc
     return await _to_response(session, updated)

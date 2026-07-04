@@ -3260,7 +3260,7 @@
     },
     "/api/v1/requests/{request_id}/cancel": {
       "post": {
-        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.",
+        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a\n``pending``/``searching``/``no_acceptable_release`` request with NO active download\nrows is a pure DB settle that never touches the client, so it still works on an\ninstall with qBittorrent unconfigured. When there ARE active torrents to remove but\nthe client is unconfigured, the service refuses up front (409\n``service_not_configured``) rather than silently leaking a seeding torrent.",
         "operationId": "cancel_request_endpoint_api_v1_requests__request_id__cancel_post",
         "parameters": [
           {

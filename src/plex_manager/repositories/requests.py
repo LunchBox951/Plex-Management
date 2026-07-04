@@ -394,6 +394,25 @@ class SqlRequestRepository:
         row.next_search_at = None
         await self._session.flush()
 
+    async def clear_library_path(self, request_id: int) -> None:
+        """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).
+
+        The movie-level mirror of ``SqlSeasonRequestRepository.clear_library_path``:
+        report-issue re-arms the request (claiming the active slot) BEFORE it knows
+        whether the purge will succeed, so it keeps the ``library_path`` breadcrumb
+        through the claim and clears it HERE only once the file was actually removed --
+        never as part of the re-arm. Clearing ``library_path`` is not a status change,
+        so this never re-touches ``uq_media_requests_active`` (unlike
+        :meth:`reset_for_research`, whose status flush is the slot claim). No-op-safe if
+        the row vanished is not needed here (the caller just re-armed it), but a missing
+        row is still an honest error rather than a silent skip.
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.library_path = None
+        await self._session.flush()
+
     async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:
         """Set the operator's "keep forever" pin (ADR-0012)."""
         row = await self._session.get(MediaRequest, request_id)

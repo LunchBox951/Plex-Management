@@ -273,6 +273,68 @@ async def test_cancel_endpoint_409_while_import_is_finalizing(
     assert qbt.removed == []
 
 
+async def test_cancel_endpoint_settles_without_qbittorrent_when_no_active_rows(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Finding #1: a cancel for a not-yet-imported request with NO active download rows
+    # is a pure DB settle -- it never touches qBittorrent -- so it must succeed even with
+    # the client UNCONFIGURED. qbt is intentionally NOT overridden (get_qbittorrent_optional
+    # resolves to None), and the endpoint must NOT 409 service_not_configured.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.searching,
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+
+async def test_cancel_endpoint_409_service_not_configured_with_active_torrent(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Finding #1's honest counterpart: a cancel that owns an ACTIVE torrent needs the
+    # client to remove it. With qBittorrent unconfigured (qbt NOT overridden -> None), the
+    # endpoint refuses up front with 409 service_not_configured -- never a silent skip --
+    # and settles/removes nothing.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=_HEADERS)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "service_not_configured"
+    assert response.json()["service"] == "qbittorrent"
+    # Nothing settled: the request is still downloading.
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None and row.status == RequestStatus.downloading
+
+
 async def test_report_issue_endpoint_409_when_an_active_sibling_exists(
     app: FastAPI,
     client: httpx.AsyncClient,

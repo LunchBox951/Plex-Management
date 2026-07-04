@@ -471,6 +471,13 @@ export interface paths {
          *     row is kept for history and nothing is re-grabbed. A request past the
          *     not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
          *     to redo an imported title instead.
+         *
+         *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
+         *     ``pending``/``searching``/``no_acceptable_release`` request with NO active download
+         *     rows is a pure DB settle that never touches the client, so it still works on an
+         *     install with qBittorrent unconfigured. When there ARE active torrents to remove but
+         *     the client is unconfigured, the service refuses up front (409
+         *     ``service_not_configured``) rather than silently leaking a seeding torrent.
          */
         post: operations["cancel_request_endpoint_api_v1_requests__request_id__cancel_post"];
         delete?: never;

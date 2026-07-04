@@ -5,16 +5,27 @@ each self-healing so no human ticket is ever needed (north-star #1: a button, no
 a terminal):
 
 * :func:`report_issue` — "this imported file is bad, redo it." Composes existing
-  primitives IN ORDER: (a) blocklist the culprit release (resolved from the
-  imported download's history), (b) remove its torrent WITH data, (c) purge the
-  library file via the shared root-guarded purge primitive, (d) trigger a Plex
-  scan, (e) re-arm the request/season to ``searching`` and clear the purge
-  breadcrumbs, (f) write an audit history row, (g) synchronously run the SAME
-  decision-engine -> grab path the grab endpoint uses, so the re-search happens
-  inline -- the blocklist now excludes the bad release, guaranteeing a DIFFERENT
-  one is grabbed (or the honest ``no_acceptable_release`` park if nothing is
+  primitives IN ORDER, with the active-slot CLAIM deliberately BEFORE any
+  irreversible step: (a) blocklist the culprit release (resolved from the imported
+  download's history), (b) re-arm the request/season to ``searching`` -- the claim
+  of the ``uq_media_requests_active`` slot -- so a racing re-request that grabbed the
+  slot collides HERE (surfaced as ``ActiveDuplicateError`` 409) while nothing is yet
+  deleted, rather than after the file/torrent are irreversibly gone, (c) remove the
+  culprit torrent WITH data, (d) purge the library file via the shared root-guarded
+  purge primitive (clearing the breadcrumb only when the file was actually removed),
+  (e) trigger a Plex scan, (f) write an audit history row + commit, (g) synchronously
+  run the SAME decision-engine -> grab path the grab endpoint uses, so the re-search
+  happens inline -- the blocklist now excludes the bad release, guaranteeing a
+  DIFFERENT one is grabbed (or the honest ``no_acceptable_release`` park if nothing is
   acceptable). The synchronous re-grab IS the auto re-search AND the undo (the
   content comes back), which is why no recycle bin is needed for the beta.
+
+  Ordering rationale (ADR-0014 race fix): steps (c)/(d) are IRREVERSIBLE, so the
+  slot claim (b) runs first and is committed atomically WITH them -- SQLite
+  serializes writers, so once (b)'s flush holds the slot no competitor can commit a
+  conflicting active row before this transaction's own commit, and the earlier bug
+  (the claim happening AFTER the purge, letting a concurrent re-request's collision
+  roll the DB back while the deletions stood) cannot recur.
 
   Hardlink caveat (ADR-0014): a same-filesystem import hardlinks the library file
   to the download client's seed copy, so purging the library file ALONE frees
@@ -45,7 +56,10 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy.exc import IntegrityError
+
 from plex_manager.adapters.prowlarr.adapter import IndexerError
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
@@ -83,6 +97,7 @@ __all__ = [
     "CANCELLABLE_REQUEST_STATUS_VALUES",
     "REPORTABLE_STATUS_VALUES",
     "ActiveDuplicateError",
+    "DownloadClientRequiredError",
     "ImportInProgressError",
     "MediaRootUnavailableError",
     "NotCancellableError",
@@ -163,6 +178,19 @@ _GRAB_ERRORS: Final = (
 # ``no_acceptable_release`` park instead. ``IndexerRateLimitError`` is a subclass of
 # ``IndexerError`` and so is covered.
 _INDEXER_ERRORS: Final = (IndexerError,)
+
+# The download-client failures the inline RE-GRAB (``grab_service.grab`` ->
+# ``qbt.add``) may raise. Unlike ``_GRAB_ERRORS`` (application-level grab refusals),
+# these are an OPERATIONAL client failure -- qBittorrent is unreachable / erroring
+# -- AFTER the blocklist/purge/reset already committed. Following ADR-0013's
+# park-vs-operational distinction, this must NOT park ``no_acceptable_release`` (that
+# would LIE: releases exist; it is the CLIENT that failed, exactly like auto-grab's
+# ``GrabError`` handling). The report-issue handler catches this family and LEAVES
+# the scope at ``searching`` -- the merged auto-grab worker picks up an eager
+# ``searching`` scope on its next tick, so the state self-heals -- rather than
+# letting a 502 escape after a successful correction. ``QbittorrentAuthError`` is a
+# subclass of ``QbittorrentError`` and so is covered.
+_DOWNLOAD_CLIENT_ERRORS: Final = (QbittorrentError,)
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal
 # state EXCEPT ``importing``. An ``importing`` row is mid-copy/scan: failing it would
@@ -284,6 +312,29 @@ class ImportInProgressError(Exception):
         )
 
 
+class DownloadClientRequiredError(Exception):
+    """A cancel that must remove torrent(s) needs qBittorrent, but it is unconfigured.
+
+    ADR-0014 round follow-up: a cancel for a ``pending``/``searching``/
+    ``no_acceptable_release`` request with NO active download rows is a pure DB settle
+    -- it never touches the client -- so ``cancel_request`` resolves qBittorrent
+    OPTIONALLY (``get_qbittorrent_optional``) and still works on an install without the
+    client configured. But a cancel that DOES own active torrent(s) genuinely needs the
+    client to remove them; skipping that silently would leak a seeding torrent. When
+    active rows exist and the client is ``None``, this is raised BEFORE any state
+    change (nothing settled, no torrent touched) so the endpoint can surface the honest
+    409 ``service_not_configured`` -- mirroring the mark-failed endpoint's own upfront
+    refusal when removal is requested without a configured client.
+    """
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(
+            f"request {request_id} has active torrent(s) to remove but qBittorrent "
+            f"is not configured"
+        )
+
+
 def _root_is_mounted(root_path: str | None) -> bool:
     """Whether ``root_path`` is a present, non-empty directory (an active mount).
 
@@ -346,6 +397,15 @@ async def report_issue(
     status reflects ``downloading`` on a successful replacement grab, or
     ``no_acceptable_release`` / the season rollup when nothing acceptable was
     found). See the module docstring for the full ordered flow and the caveats.
+
+    Re-grab client failure (ADR-0013 park-vs-operational): if the inline re-grab's
+    ``qbt.add`` raises a download-client error (``_DOWNLOAD_CLIENT_ERRORS``) AFTER the
+    blocklist/purge/reset already committed, it is NOT parked ``no_acceptable_release``
+    -- that would LIE (releases exist; the CLIENT failed, exactly like auto-grab's
+    ``GrabError`` handling). Instead the scope is LEFT at ``searching`` and the current
+    state returned normally (a 200, not a 502): the merged auto-grab worker picks up an
+    eager ``searching`` scope on its next tick (~60s), so the state self-heals and the
+    operator sees "searching" rather than an error page after a successful correction.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -391,7 +451,8 @@ async def report_issue(
     culprit = await download_repo.find_latest_imported_for_request(request_id, season=target.season)
 
     # (a) blocklist the culprit release (nothing to blocklist if the title was
-    # recorded available straight from Plex, with no download of ours).
+    # recorded available straight from Plex, with no download of ours). A REVERSIBLE
+    # DB write -- rolled back cleanly if the slot claim (b) collides below.
     if culprit is not None:
         source_title = (
             await blocklist_service.source_title_for(session, culprit.torrent_hash)
@@ -407,8 +468,44 @@ async def report_issue(
             media_type=media_type,
         )
 
-        # (b) remove the torrent WITH data (best-effort) -- the hardlink caveat means
-        # this must go too, not just the library file.
+    # (b) claim the active slot: re-arm the request/season to 'searching' BEFORE any
+    # irreversible step (torrent removal / file purge below). The re-arm flush claims
+    # this media's ``uq_media_requests_active`` slot; a racing re-request that already
+    # grabbed the slot makes this flush raise IntegrityError -- caught here, rolled back
+    # (undoing the reversible blocklist too), and surfaced as ``ActiveDuplicateError``
+    # (409) with NOTHING yet deleted, rather than after the file/torrent are irreversibly
+    # gone and the rollback undoes only the DB (the earlier bug). The upfront
+    # ``find_active`` check above rejects the common case cheaply; this is the
+    # AUTHORITATIVE guard for a sibling appearing in the check->claim gap. The breadcrumb
+    # is deliberately KEPT here (``clear_library_path=False``): ``purge_ok`` is not known
+    # until (d), which clears it only if the file was actually removed.
+    try:
+        if is_tv and target.season is not None:
+            await season_request_service.reset_for_research(
+                session,
+                media_request_id=request_id,
+                season_number=target.season,
+                clear_library_path=False,
+            )
+        else:
+            await request_repo.reset_for_research(request_id, clear_library_path=False)
+    except IntegrityError as exc:
+        # The re-arm collided on ``uq_media_requests_active`` -- a newer active sibling
+        # grabbed the slot between the upfront check and this flush. Roll back (undoing
+        # the blocklist + partial re-arm) so NOTHING is left half-written, then surface
+        # the honest 409. Re-read the sibling for the error's id (best-effort -- it is
+        # informational; the endpoint keys only on the type).
+        await session.rollback()
+        sibling = await request_repo.find_active(request.tmdb_id, request.media_type)
+        raise ActiveDuplicateError(
+            request_id,
+            sibling.id if sibling is not None and sibling.id != request_id else request_id,
+        ) from exc
+
+    # (c) remove the culprit torrent WITH data (best-effort) -- the hardlink caveat
+    # means this must go too, not just the library file. The FIRST irreversible step,
+    # so it runs only AFTER the slot claim (b) succeeded.
+    if culprit is not None:
         await purge_service.remove_torrent(
             qbt,
             culprit.torrent_hash,
@@ -416,13 +513,13 @@ async def report_issue(
             extra={"torrent_hash": culprit.torrent_hash, **log_extra},
         )
 
-    # (c) purge the library file via the shared root-guarded primitive. ``purge_ok``
+    # (d) purge the library file via the shared root-guarded primitive. ``purge_ok``
     # tracks whether the file was ACTUALLY removed: only then is the ``library_path``
-    # breadcrumb cleared at (e). On ``error`` (a genuine delete failure -- permissions,
-    # transient I/O, a partial rmtree) or ``refused`` (out-of-root breadcrumb) the file
-    # may still be on disk, so the breadcrumb is PRESERVED -- it is the only handle a
-    # later retry / eviction has to reclaim the orphan; losing it would strand the bad
-    # file with no way to purge it (honesty over silence).
+    # breadcrumb cleared (the claim at (b) kept it). On ``error`` (a genuine delete
+    # failure -- permissions, transient I/O, a partial rmtree) or ``refused`` (out-of-
+    # root breadcrumb) the file may still be on disk, so the breadcrumb is PRESERVED --
+    # it is the only handle a later retry / eviction has to reclaim the orphan; losing
+    # it would strand the bad file with no way to purge it (honesty over silence).
     purge_ok = True
     if target.library_path is not None:
         purge = await purge_service.purge_library_path(fs, target.library_path)
@@ -444,6 +541,17 @@ async def report_issue(
                 purge.detail,
                 extra=log_extra,
             )
+        if purge_ok:
+            # The file was actually removed, so drop the now-dangling breadcrumb the
+            # claim at (b) preserved. A targeted clear (never a second re-arm) -- the
+            # status/backoff were already set at (b), and clearing library_path is not a
+            # status transition, so it never re-touches ``uq_media_requests_active``.
+            if is_tv and target.season is not None:
+                await season_request_service.clear_library_path(
+                    session, media_request_id=request_id, season_number=target.season
+                )
+            else:
+                await request_repo.clear_library_path(request_id)
     else:
         # No breadcrumb (a title recorded available straight from Plex, or one
         # predating the library_path column): nothing of ours to delete -- honest,
@@ -454,7 +562,7 @@ async def report_issue(
             extra=log_extra,
         )
 
-    # (d) trigger a Plex scan so the removed item drops out of the library.
+    # (e) trigger a Plex scan so the removed item drops out of the library.
     if target.library_path is not None:
         await purge_service.trigger_library_scan(
             library,
@@ -464,20 +572,11 @@ async def report_issue(
             extra=log_extra,
         )
 
-    # (e) re-arm the request/season to 'searching'. The purge breadcrumb is cleared
-    # ONLY when the file was actually removed (``purge_ok``); a failed/refused purge
-    # keeps it so the orphan stays reclaimable (see (c)).
-    if is_tv and target.season is not None:
-        await season_request_service.reset_for_research(
-            session,
-            media_request_id=request_id,
-            season_number=target.season,
-            clear_library_path=purge_ok,
-        )
-    else:
-        await request_repo.reset_for_research(request_id, clear_library_path=purge_ok)
-
-    # (f) audit history row.
+    # (f) audit history row + commit. The blocklist (a), slot claim (b), breadcrumb
+    # clear (d) and this audit row all commit TOGETHER: because SQLite serializes
+    # writers, once (b)'s flush holds the slot no competitor can commit a conflicting
+    # active row before this commit, so the commit cannot fail on the dedup index after
+    # the irreversible (c)/(d) already ran.
     session.add(
         DownloadHistory(
             tmdb_id=request.tmdb_id,
@@ -544,6 +643,21 @@ async def report_issue(
                     season=target.season,
                     episodes=None,
                 )
+            except _DOWNLOAD_CLIENT_ERRORS as exc:
+                # OPERATIONAL client failure (qBittorrent unreachable/erroring), NOT
+                # "nothing acceptable" -- releases exist; the CLIENT failed. Do NOT park
+                # (that would LIE + surface a 502 after a successful correction). Roll
+                # back the grab's partial write and LEAVE the scope at the ``searching``
+                # already committed at (b): the auto-grab worker re-grabs it eagerly next
+                # tick (ADR-0013). The re-read below then returns 'searching' (a 200).
+                await session.rollback()
+                _logger.warning(
+                    "report-issue re-grab for %r hit the download client (%s); leaving "
+                    "the scope at 'searching' for the auto-grab worker to retry",
+                    safe_text(request.title),
+                    type(exc).__name__,
+                    extra=log_extra,
+                )
             except _GRAB_ERRORS as exc:
                 _logger.warning(
                     "report-issue re-grab for %r failed (%s); parking as "
@@ -575,7 +689,7 @@ async def _park_no_acceptable(
 
 async def cancel_request(
     session: AsyncSession,
-    qbt: DownloadClientPort,
+    qbt: DownloadClientPort | None,
     *,
     request_id: int,
 ) -> RequestRecord:
@@ -585,6 +699,15 @@ async def cancel_request(
     closing the seeding leak), marks each of those download rows terminal, and flips
     the request -- and, for TV, every tracked season -- to the settled ``cancelled``
     status (kept only for history; nothing re-grabbed). Returns the updated record.
+
+    ``qbt`` may be ``None``: a cancel for a ``pending``/``searching``/
+    ``no_acceptable_release`` request with NO active download rows is a PURE DB settle
+    that never touches the client, so it must still work on an install with qBittorrent
+    unconfigured (the endpoint resolves it via ``get_qbittorrent_optional``). Active
+    rows ARE discovered first; only if there are torrents to remove but ``qbt is None``
+    is :class:`DownloadClientRequiredError` raised -- BEFORE any state change (the
+    endpoint maps it to an honest 409 ``service_not_configured``), never a silent skip
+    that would leak a seeding torrent.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -626,6 +749,15 @@ async def cancel_request(
     # strand the placed file. Refuse up front -- no torrent removed, nothing settled.
     if any(row.status == DownloadState.Importing.value for row in active):
         raise ImportInProgressError(request_id)
+
+    # A cancel with active rows genuinely needs qBittorrent to remove their torrents;
+    # discover them FIRST (above) so a pure-DB settle with NO active rows still works
+    # unconfigured, and only require the client when there is actually something to
+    # remove. Raised BEFORE any state change (nothing settled, no torrent touched) so
+    # the endpoint surfaces the honest 409 ``service_not_configured`` -- never a silent
+    # skip that leaks a seeding torrent (see DownloadClientRequiredError).
+    if active and qbt is None:
+        raise DownloadClientRequiredError(request_id)
 
     # Move every active row out of the active set (so the reconciler stops tracking it
     # and the queue drops it) BEFORE removing any torrent, via a compare-and-swap gated
@@ -684,13 +816,18 @@ async def cancel_request(
     # Remove each cancelled torrent + its data AFTER the DB cancel has committed, so a
     # client hiccup never undoes the committed settle (mirrors queue_service.mark_failed).
     # Best-effort + already-gone-is-a-no-op (see purge_service.remove_torrent).
-    for torrent_hash in hashes_to_remove:
-        await purge_service.remove_torrent(
-            qbt,
-            torrent_hash,
-            context="a cancel",
-            extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
-        )
+    # ``qbt is not None`` is GUARANTEED whenever ``hashes_to_remove`` is non-empty (the
+    # active-rows-without-a-client guard above refused that combination); the explicit
+    # check narrows the optional type for the checker and is a no-op for the empty
+    # pure-DB-settle case (nothing to remove, and qbt may legitimately be None).
+    if qbt is not None:
+        for torrent_hash in hashes_to_remove:
+            await purge_service.remove_torrent(
+                qbt,
+                torrent_hash,
+                context="a cancel",
+                extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
+            )
 
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row

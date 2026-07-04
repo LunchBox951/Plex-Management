@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import SeasonRequestRecord
 
 __all__ = [
+    "clear_library_path",
     "ensure_seasons",
     "mark_available",
     "mark_completed",
@@ -421,6 +422,31 @@ async def set_library_path(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.set_library_path(row.id, library_path)
+
+
+async def clear_library_path(
+    session: AsyncSession, *, media_request_id: int, season_number: int
+) -> None:
+    """Drop one season's eviction/purge breadcrumb (ADR-0014's report-issue verb).
+
+    The season-level analogue of ``SqlRequestRepository.clear_library_path`` and the
+    counterpart of :func:`set_library_path`: report-issue re-arms the season (claiming
+    the parent's active-dedup slot via :func:`reset_for_research` with
+    ``clear_library_path=False``) BEFORE it knows whether the purge will succeed, then
+    clears the breadcrumb HERE only once the file was actually removed. A failed/refused
+    purge leaves the breadcrumb intact so the orphan stays reclaimable (honesty over
+    silence).
+
+    Resolves the row via ``ensure()`` (idempotent get-or-create) rather than requiring a
+    pre-known ``SeasonRequest`` id. Does NOT recompute the parent rollup -- clearing
+    ``library_path`` is not a status transition, so it never re-touches the parent's
+    ``uq_media_requests_active`` slot.
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.clear_library_path(row.id)
 
 
 async def mark_completed(
