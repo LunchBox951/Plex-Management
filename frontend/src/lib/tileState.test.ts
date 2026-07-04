@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DiscoverResult, RequestResponse } from '../api/types'
-import { deriveTileState } from './tileState'
+import { queryClient } from './queryClient'
+import { deriveTileState, resetSettleObservations } from './tileState'
 
 function result(overrides: Partial<DiscoverResult> = {}): DiscoverResult {
   return {
@@ -28,6 +29,32 @@ function request(overrides: Partial<RequestResponse> = {}): RequestResponse {
     ...overrides,
   }
 }
+
+/**
+ * Simulate this session OBSERVING a settle: one poll shows the row active, the
+ * next shows it settled. The second call both records the observation (client
+ * clock) and derives — its return value is the tile state right after the settle.
+ */
+function observeSettle(
+  tile: DiscoverResult,
+  activeRows: RequestResponse[],
+  settledRows: RequestResponse[],
+  baseFetchedAt?: number,
+) {
+  deriveTileState(tile, activeRows, baseFetchedAt)
+  return deriveTileState(tile, settledRows, baseFetchedAt)
+}
+
+const BASE_BEFORE_SETTLE = () => Date.now() - 60_000
+const BASE_AFTER_SETTLE = () => Date.now() + 60_000
+
+beforeEach(() => {
+  resetSettleObservations()
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 describe('deriveTileState — server base only (no requests)', () => {
   it('maps library_state "available" to the In-library badge', () => {
@@ -108,109 +135,94 @@ describe('deriveTileState — live request overlay', () => {
   })
 })
 
-describe('deriveTileState — settled row degrades a stale request-derived base', () => {
-  // The server base was computed at page load; the live poll shows the request has
-  // since settled. The stale request-derived base must NOT fall through as "Requested".
-  it('degrades a stale "requested" base to none when the live row failed', () => {
-    const state = deriveTileState(
+describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', () => {
+  // The base snapshot was fetched BEFORE this session watched the request settle,
+  // so its request-derived portion cannot reflect the settle and must not fall
+  // through as "Requested".
+  it('degrades a stale "requested" base to none when the live row is seen failing', () => {
+    const state = observeSettle(
       result({ library_state: 'requested' }),
+      [request({ status: 'downloading' })],
       [request({ status: 'failed' })],
+      BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('degrades a stale "processing" base to none when the live row cancelled', () => {
-    const state = deriveTileState(
+  it('degrades a stale "processing" base to none when the live row is seen cancelling', () => {
+    const state = observeSettle(
       result({ library_state: 'processing' }),
+      [request({ status: 'searching' })],
       [request({ status: 'cancelled' })],
+      BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('keeps presence-derived "available" through a settled failed row', () => {
-    // Library presence is independent of the request lifecycle — failed doesn't evict.
-    // The settled row is the ONLY row: an old failure beside a genuinely-present
-    // title (the dominant "owned, never re-requested" case).
-    const state = deriveTileState(
+  it('keeps presence-derived "available" through an observed failed settle', () => {
+    // Library presence is independent of the request lifecycle — failed doesn't
+    // evict, and no older available row contradicts it.
+    const state = observeSettle(
       result({ library_state: 'available' }),
+      [request({ status: 'downloading' })],
       [request({ status: 'failed' })],
+      BASE_BEFORE_SETTLE(),
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
 
-  it('drops the "available" base when a movie re-request beside an older available row failed', () => {
-    // The movie create path NEVER creates a second row while Plex still has the
-    // title (its fresh is_available(use_cache=False) check dedups to the in-library
-    // row instead) — so a newer request coexisting with an older `available` row
-    // proves the title read ABSENT at create time. When that re-request settles,
-    // the page-load `available` base is stale history: unbadge, don't flip back to
-    // "In library" for a file the create already proved gone.
-    const state = deriveTileState(result({ library_state: 'available' }), [
-      request({ id: 1, status: 'available' }),
-      request({ id: 2, status: 'failed' }),
-    ])
-    expect(state).toBeNull()
-  })
-
-  it('drops the "available" base when a movie re-request beside an older available row cancelled', () => {
-    const state = deriveTileState(result({ library_state: 'available' }), [
-      request({ id: 1, status: 'available' }),
-      request({ id: 2, status: 'cancelled' }),
-    ])
-    expect(state).toBeNull()
-  })
-
-  it('keeps the tv "available" base when a season re-request beside an older available row failed', () => {
-    // TV is deliberately NOT covered by the movie contradiction rule: a season-level
-    // re-request (e.g. a newly aired season) is legitimately created while the show
-    // remains partially/fully present (_present_seasons_or_empty only dedups when
-    // EVERY requested season is present), so its failure says nothing about the
-    // seasons already on disk.
-    const state = deriveTileState(
-      result({ tmdb_id: 7, media_type: 'tv', library_state: 'available' }),
-      [
-        request({ id: 1, tmdb_id: 7, media_type: 'tv', status: 'available' }),
-        request({ id: 2, tmdb_id: 7, media_type: 'tv', status: 'failed' }),
-      ],
-    )
-    expect(state).toEqual({ label: 'In library', intent: 'available' })
-  })
-
-  it('degrades a stale "partially_available" base to none when the live row failed', () => {
+  it('degrades a stale "partially_available" base to none on an observed failed settle', () => {
     // `partially_available` is ONLY ever request-derived (the server's presence crawl
-    // is a whole-title boolean — see derive_library_state), so a settled row proves it
-    // stale just like `requested`/`processing`: e.g. the last available season was
-    // reported and the replacement grab failed. Unbadge; don't keep the dead rollup.
-    const state = deriveTileState(
+    // is a whole-title boolean — see derive_library_state), so the settle proves it
+    // stale just like `requested`/`processing`.
+    const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
+      [request({ tmdb_id: 7, media_type: 'tv', status: 'downloading' })],
       [request({ tmdb_id: 7, media_type: 'tv', status: 'failed' })],
+      BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('degrades a stale "partially_available" base to none when the live row cancelled', () => {
-    const state = deriveTileState(
+  it('degrades a stale "partially_available" base to none on an observed cancel', () => {
+    const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
+      [request({ tmdb_id: 7, media_type: 'tv', status: 'searching' })],
       [request({ tmdb_id: 7, media_type: 'tv', status: 'cancelled' })],
+      BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('drops even a stale "available" base when the live row is evicted', () => {
-    // ADR-0012: eviction DELETED the file, contradicting the page-load presence
+  it('drops even a stale "available" base when the row is seen evicting', () => {
+    // ADR-0012: eviction DELETED the file, contradicting the pre-settle presence
     // snapshot. The fresher live evicted row wins — degrade to unbadged, don't claim
-    // a file that was just deleted.
-    const state = deriveTileState(
+    // a file that was just deleted. (available -> evicted is the sweep's own CAS.)
+    const state = observeSettle(
       result({ library_state: 'available' }),
+      [request({ status: 'available' })],
       [request({ status: 'evicted' })],
+      BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('drops a stale "partially_available" base when the live row is evicted', () => {
-    const state = deriveTileState(
+  it('drops a stale "partially_available" base when the row is seen evicting', () => {
+    const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
+      [request({ tmdb_id: 7, media_type: 'tv', status: 'available' })],
       [request({ tmdb_id: 7, media_type: 'tv', status: 'evicted' })],
+      BASE_BEFORE_SETTLE(),
+    )
+    expect(state).toBeNull()
+  })
+
+  it('suppresses when the base fetch time is unknown (conservative default)', () => {
+    const state = observeSettle(
+      result({ library_state: 'requested' }),
+      [request({ status: 'downloading' })],
+      [request({ status: 'failed' })],
+      undefined,
     )
     expect(state).toBeNull()
   })
@@ -224,6 +236,129 @@ describe('deriveTileState — settled row degrades a stale request-derived base'
       label: 'In library',
       intent: 'available',
     })
+  })
+})
+
+describe('deriveTileState — the suppression is time-aware, never permanent', () => {
+  it('trusts a base refetched AFTER the observed settle (movie re-added to Plex)', () => {
+    // The wave-5 scenario: old available row + newer re-request observed failing;
+    // Discover then REFETCHES and the server returns "available" from fresh presence
+    // (the movie was re-added/re-imported). The suppression must lift — hiding the
+    // badge forever would be permanent wrongness, worse than the transient staleness
+    // it replaced.
+    const tile = result({ library_state: 'available' })
+    const activeRows = [
+      request({ id: 1, status: 'available' }),
+      request({ id: 2, status: 'downloading' }),
+    ]
+    const settledRows = [
+      request({ id: 1, status: 'available' }),
+      request({ id: 2, status: 'failed' }),
+    ]
+    // Settle observed against the pre-settle base: suppressed (wave-4 semantics).
+    expect(observeSettle(tile, activeRows, settledRows, BASE_BEFORE_SETTLE())).toBeNull()
+    // The SAME rows after a discover refetch: the fresh base already folds the
+    // failed status server-side, so "available" is presence truth — badge shows.
+    expect(deriveTileState(tile, settledRows, BASE_AFTER_SETTLE())).toEqual({
+      label: 'In library',
+      intent: 'available',
+    })
+  })
+
+  it('trusts the base when the settle was never observed in this session', () => {
+    // Rows already settled when the session starts: the base snapshot was fetched
+    // at the same time or later, so the server already folded the settled status —
+    // an "available" base here is presence truth (e.g. re-added long ago), not
+    // stale request history. No suppression.
+    const state = deriveTileState(result({ library_state: 'available' }), [
+      request({ id: 1, status: 'available' }),
+      request({ id: 2, status: 'failed' }),
+    ])
+    expect(state).toEqual({ label: 'In library', intent: 'available' })
+  })
+
+  it('re-arms the observation when a settled row goes active again (report-issue)', () => {
+    // ADR-0014 report-issue re-arms a settled row to an ACTIVE status (same id).
+    // Seeing it active clears the old observation; a later settle is a new event
+    // against whatever base is current.
+    const tile = result({ library_state: 'requested' })
+    observeSettle(tile, [request({ status: 'downloading' })], [request({ status: 'failed' })])
+    // Re-armed: active again — the overlay simply wins.
+    expect(deriveTileState(tile, [request({ status: 'searching' })])).toEqual({
+      label: 'Searching',
+      intent: 'searching',
+    })
+    // Settles again; a base refetched after THIS settle is still trusted.
+    expect(
+      deriveTileState(tile, [request({ status: 'failed' })], BASE_AFTER_SETTLE()),
+    ).toEqual({ label: 'Requested', intent: 'neutral' })
+  })
+
+  it('invalidates the discover queries when a settle is first observed', async () => {
+    const invalidate = vi
+      .spyOn(queryClient, 'invalidateQueries')
+      .mockResolvedValue(undefined as never)
+    observeSettle(
+      result({ library_state: 'requested' }),
+      [request({ status: 'downloading' })],
+      [request({ status: 'failed' })],
+    )
+    // The invalidation is deferred to a microtask (deriveTileState runs in render).
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+    expect(invalidate).toHaveBeenCalledTimes(1)
+    // Re-deriving with the same settled rows does not re-fire it.
+    deriveTileState(result({ library_state: 'requested' }), [request({ status: 'failed' })])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('deriveTileState — movie re-request contradiction (pre-settle base only)', () => {
+  it('drops the "available" base when a movie re-request beside an older available row fails', () => {
+    // The movie create path NEVER creates a second row while Plex still has the
+    // title (its fresh is_available(use_cache=False) check dedups to the in-library
+    // row instead) — so a newer request coexisting with an older `available` row
+    // proves the title read ABSENT at create time. When that re-request is observed
+    // settling, the pre-settle `available` base is stale history: unbadge.
+    const state = observeSettle(
+      result({ library_state: 'available' }),
+      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'downloading' })],
+      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'failed' })],
+      BASE_BEFORE_SETTLE(),
+    )
+    expect(state).toBeNull()
+  })
+
+  it('drops the "available" base when the observed movie re-request is cancelled', () => {
+    const state = observeSettle(
+      result({ library_state: 'available' }),
+      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'pending' })],
+      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'cancelled' })],
+      BASE_BEFORE_SETTLE(),
+    )
+    expect(state).toBeNull()
+  })
+
+  it('keeps the tv "available" base when a season re-request fails', () => {
+    // TV is deliberately NOT covered by the movie contradiction rule: a season-level
+    // re-request (e.g. a newly aired season) is legitimately created while the show
+    // remains partially/fully present (_present_seasons_or_empty only dedups when
+    // EVERY requested season is present), so its failure says nothing about the
+    // seasons already on disk.
+    const state = observeSettle(
+      result({ tmdb_id: 7, media_type: 'tv', library_state: 'available' }),
+      [
+        request({ id: 1, tmdb_id: 7, media_type: 'tv', status: 'available' }),
+        request({ id: 2, tmdb_id: 7, media_type: 'tv', status: 'downloading' }),
+      ],
+      [
+        request({ id: 1, tmdb_id: 7, media_type: 'tv', status: 'available' }),
+        request({ id: 2, tmdb_id: 7, media_type: 'tv', status: 'failed' }),
+      ],
+      BASE_BEFORE_SETTLE(),
+    )
+    expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
 })
 

@@ -31,7 +31,14 @@ export function Discover() {
   const requests = useRequests({ poll: true })
 
   // The per-tile badge state: server base (library_state) + the live request overlay.
-  const tileState = (item: DiscoverResult) => deriveTileState(item, requests.data?.requests)
+  // Each helper passes ITS OWN query's dataUpdatedAt (client clock) so deriveTileState
+  // can tell whether that base snapshot predates an observed request settle — a base
+  // refetched after the settle is trusted; only an older one gets the stale-base
+  // degradation (see tileState.ts).
+  const homeTileState = (item: DiscoverResult) =>
+    deriveTileState(item, requests.data?.requests, home.dataUpdatedAt)
+  const searchTileState = (item: DiscoverResult) =>
+    deriveTileState(item, requests.data?.requests, search.dataUpdatedAt)
 
   // One selected-title + modal state, shared across the home and search branches.
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
@@ -85,7 +92,7 @@ export function Discover() {
             <Spotlight
               item={home.data?.spotlight ?? null}
               onOpen={openTitle}
-              state={home.data?.spotlight ? tileState(home.data.spotlight) : null}
+              state={home.data?.spotlight ? homeTileState(home.data.spotlight) : null}
             />
             {(home.data?.rows ?? []).map((row) => (
               <Row
@@ -93,7 +100,7 @@ export function Discover() {
                 title={row.title}
                 items={row.items}
                 onSelect={openTitle}
-                tileState={tileState}
+                tileState={homeTileState}
               />
             ))}
           </>
@@ -120,7 +127,7 @@ export function Discover() {
       ) : (
         <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-x-4 gap-y-5">
           {results.map((title) => {
-            const state = tileState(title)
+            const state = searchTileState(title)
             return (
               <PosterCard
                 key={`${title.media_type}-${title.tmdb_id}`}
