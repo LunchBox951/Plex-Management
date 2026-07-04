@@ -237,3 +237,22 @@ async def test_search_tv_show_present_and_partial_request(
     assert response.status_code == 200
     states = {r["tmdb_id"]: r["library_state"] for r in response.json()["results"]}
     assert states == {10: "available", 20: "partially_available"}
+
+
+async def test_search_with_no_results_short_circuits_state_resolution(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # An honest zero-result page must short-circuit before any presence crawl: even a Plex
+    # that would raise never gets consulted, so the empty page returns 200, not a 500.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(results=[]),
+        library=FakeLibrary(raises=PlexLibraryError("must not be called on an empty page")),
+    )
+
+    response = await client.get(
+        "/api/v1/discover/search", params={"query": "nothingmatches"}, headers=_HEADERS
+    )
+    assert response.status_code == 200
+    assert response.json()["results"] == []
