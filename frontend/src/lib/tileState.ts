@@ -14,8 +14,9 @@
  * NON-available request (failed/evicted/cancelled) must NOT shadow the server base
  * with a "Failed"/"Evicted" badge — but its presence ALSO proves the request the
  * server saw at page load is gone, so the request-derived portion of that base
- * (`requested`/`processing`) is now stale and must not fall through either. It
- * degrades to the presence-derived truth instead (see `settledBaseFallback`).
+ * (`requested`/`processing`/`partially_available`) is now stale and must not fall
+ * through either. It degrades to the presence-derived truth instead (see
+ * `settledBaseFallback`).
  *
  * This status→state table mirrors the server's `derive_library_state`
  * (services/discovery_service.py); a drift makes base and overlay disagree on a tile.
@@ -72,8 +73,9 @@ export function deriveTileState(
     }
     // A settled-bad row (failed/cancelled/evicted) does not badge the tile — and it
     // proves the request the server folded into `library_state` at page load is now
-    // gone, so the request-derived base (`requested`/`processing`) is stale and must
-    // not fall through either. Degrade to presence-derived truth.
+    // gone, so the request-derived base (`requested`/`processing`/
+    // `partially_available`) is stale and must not fall through either. Degrade to
+    // presence-derived truth.
     return settledBaseFallback(result.library_state, liveRequest.status)
   }
 
@@ -85,30 +87,32 @@ export function deriveTileState(
  * The server base with its stale REQUEST-derived portion stripped, for a tile whose
  * live request row has SETTLED to a non-available terminal state.
  *
- * `failed` / `cancelled` end the request lifecycle but say nothing about Plex
- * presence, an independent fact — so `available` / `partially_available` survive,
- * while `requested` / `processing` (the base the now-dead request produced) degrade
- * to unbadged.
+ * Which base values are request-derived follows the server's `derive_library_state`
+ * (services/discovery_service.py): `requested`, `processing`, and
+ * `partially_available` come ONLY from a request-store status — the Plex presence
+ * crawl is a whole-title boolean (`available`/`none`) and can never say "partially"
+ * — so a settled live row proves all three stale, and they degrade to unbadged.
+ *
+ * `available` is the one dual-source value: request status OR Plex presence. For
+ * `failed` / `cancelled` it survives — presence is an independent fact those statuses
+ * don't invalidate, and a request row in `available` cannot itself settle to
+ * failed/cancelled (cancel excludes it; ADR-0014 report-issue re-arms to an ACTIVE
+ * status, which the overlay shows live), so a settled row beside an `available` base
+ * is an old row beside a genuinely-present title.
  *
  * `evicted` is stricter: ADR-0012 eviction means the disk-pressure sweep DELETED the
- * file, which directly contradicts a page-load `available` / `partially_available`
- * snapshot. The live evicted row is fresher than that snapshot — and the correlation
- * would have preferred an active re-request over it if one existed, so there is none
- * — so we drop presence too. The tile degrades to unbadged rather than claim a file
- * that was just deleted; the modal, when opened, shows the true live status.
+ * file, which directly contradicts a page-load `available` snapshot. The live evicted
+ * row is fresher than that snapshot — and the correlation would have preferred an
+ * active re-request over it if one existed, so there is none — so `evicted` drops
+ * presence too. The tile degrades to unbadged rather than claim a file that was just
+ * deleted; the modal, when opened, shows the true live status.
  */
 function settledBaseFallback(
   state: DiscoverResult['library_state'],
   settledStatus: string,
 ): StatusPresentation | null {
   if (settledStatus === 'evicted') return null
-  switch (state) {
-    case 'available':
-    case 'partially_available':
-      return libraryStateToPresentation(state)
-    default:
-      return null
-  }
+  return state === 'available' ? libraryStateToPresentation(state) : null
 }
 
 /** A settled request status — matches the backend `_SETTLED_REQUEST_STATUSES`. */

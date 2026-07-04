@@ -136,12 +136,24 @@ describe('deriveTileState — settled row degrades a stale request-derived base'
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
 
-  it('keeps presence-derived "partially_available" through a settled cancelled row', () => {
+  it('degrades a stale "partially_available" base to none when the live row failed', () => {
+    // `partially_available` is ONLY ever request-derived (the server's presence crawl
+    // is a whole-title boolean — see derive_library_state), so a settled row proves it
+    // stale just like `requested`/`processing`: e.g. the last available season was
+    // reported and the replacement grab failed. Unbadge; don't keep the dead rollup.
+    const state = deriveTileState(
+      result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
+      [request({ tmdb_id: 7, media_type: 'tv', status: 'failed' })],
+    )
+    expect(state).toBeNull()
+  })
+
+  it('degrades a stale "partially_available" base to none when the live row cancelled', () => {
     const state = deriveTileState(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
       [request({ tmdb_id: 7, media_type: 'tv', status: 'cancelled' })],
     )
-    expect(state).toEqual({ label: 'Partially available', intent: 'available' })
+    expect(state).toBeNull()
   })
 
   it('drops even a stale "available" base when the live row is evicted', () => {
