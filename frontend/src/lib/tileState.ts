@@ -33,16 +33,22 @@
  * failed re-request would never regain its "In library" badge even after Discover
  * refetched a genuinely fresh `available` base.
  *
- * On first observing a settle the discover queries are invalidated (fire-and-forget)
- * — skipped only when the observing call's own base already postdates the
- * observation (nothing to heal) — so a suppressed tile self-heals to the server's
- * fresh truth within one refetch instead of waiting for the next visit. The
- * first-sighting observation deliberately trades a TRANSIENT beat for the race
- * above: for a LONG-AGO-settled row whose mount-time discover response resolves
- * before the first requests poll, the tile is suppressed for one spurious
- * invalidation + refetch cycle (~seconds, once per session per row), after which
- * the refetched base postdates the observation and is trusted for the rest of the
- * session. Bounded and self-healing, versus the indefinite staleness it prevents.
+ * The trust rule carries a one-RTT ERROR BAR: `dataUpdatedAt` is client RECEIPT
+ * time, but the server read the request rows up to one round trip earlier (state
+ * resolution reads statuses before the Plex presence crawl), so a base that
+ * resolved just after the observation can still have been computed pre-settle and
+ * be wrongly trusted for one beat. That is why, on first observing a settle, the
+ * discover queries are ALWAYS invalidated (fire-and-forget, once per row per
+ * session, never gated on the observing call's own base freshness — wave 7):
+ * `invalidateQueries(['discover'])` marks every sibling cache stale (react-query
+ * refetches active queries immediately; inactive ones on next activation), which
+ * both bounds any wrong-trust from the error bar to one refetch cycle and heals
+ * OLDER cached sibling queries (home vs per-search caches) that still predate the
+ * settle — a freshness-gated skip starved exactly those. Costs: for a
+ * LONG-AGO-settled row, one discover refetch at first sighting (and, when the
+ * mount's discover response resolved before the first poll, one suppressed beat
+ * until that refetch lands) — bounded and self-healing, versus indefinite
+ * staleness in the races it closes.
  *
  * This status→state table mirrors the server's `derive_library_state`
  * (services/discovery_service.py); a drift makes base and overlay disagree on a tile.
@@ -84,7 +90,6 @@ export function resetSettleObservations(): void {
 
 function trackSettleObservations(
   matches: RequestResponse[],
-  baseFetchedAt: number | undefined,
   requestsFetchedAt: number | undefined,
 ): void {
   // The poll snapshot's own receipt time is tighter than render-time Date.now()
@@ -100,20 +105,25 @@ function trackSettleObservations(
       // or already settled at first sighting; both record (see the registry
       // comment on why first sighting counts).
       settleObservedAt.set(r.id, observed)
-      // Ask react-query to refetch every discover query (home + any search page;
-      // prefix match, same call shape as useUpdateSettings) so a suppressed tile
-      // self-heals to the server's fresh fold within one round trip — unless THIS
-      // call's base already postdates the observation, in which case there is
-      // nothing stale to heal (the long-ago-settle fast path: no spurious refetch
-      // when the mount's discover response resolved after the first poll).
+      // Ask react-query to refetch every discover query: invalidateQueries with the
+      // ['discover'] prefix (same call shape as useUpdateSettings) marks ALL sibling
+      // caches stale — active ones refetch immediately, inactive ones on their next
+      // activation — so every base snapshot heals, not just the one this call
+      // happens to render with. Fired UNCONDITIONALLY (wave 7): gating it on the
+      // calling query's own freshness broke the healing twice over — (a) the
+      // receipt-time race: `baseFetchedAt` is client RECEIPT time, but the server
+      // read the request rows up to one RTT earlier, so a base that RESOLVED after
+      // the observation can still have been COMPUTED pre-settle (wrongly trusted;
+      // gated, nothing ever healed it), and (b) sibling caches: an older cached
+      // discover query still predates the settle, but the per-row once-guard meant
+      // the skipped invalidation could never fire again (stuck unbadged). One extra
+      // discover refetch per settled row per session is the whole cost.
       // Deferred to a microtask: deriveTileState runs during render, and scheduling
       // refetches synchronously mid-render is a React anti-pattern. Fires at most
       // once per row per session (guarded by the `has` check above).
-      if (!(baseFetchedAt !== undefined && baseFetchedAt > observed)) {
-        queueMicrotask(() => {
-          void queryClient.invalidateQueries({ queryKey: ['discover'] })
-        })
-      }
+      queueMicrotask(() => {
+        void queryClient.invalidateQueries({ queryKey: ['discover'] })
+      })
     }
   }
 }
@@ -165,7 +175,7 @@ export function deriveTileState(
   const matches = (requests ?? []).filter(
     (r) => r.tmdb_id === result.tmdb_id && r.media_type === result.media_type,
   )
-  trackSettleObservations(matches, baseFetchedAt, requestsFetchedAt)
+  trackSettleObservations(matches, requestsFetchedAt)
   const active = matches.find((r) => !isSettled(r.status))
   const liveRequest = active ?? matches[matches.length - 1] ?? null
 

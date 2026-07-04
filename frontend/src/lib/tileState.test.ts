@@ -298,11 +298,16 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     ).toEqual({ label: 'In library', intent: 'available' })
   })
 
-  it('trusts a long-ago settle when the base is provably fresher than the first poll', async () => {
+  it('trusts a long-ago settle with a fresher base, at the cost of one refetch', async () => {
     // A row settled in some earlier session, first seen by this session's first
     // poll, with the mount's discover response resolving AFTER that poll: the base
     // already folds the settle server-side — trusted immediately, no suppression
-    // beat and no spurious invalidation.
+    // beat. The invalidation still fires ONCE (wave 7): gating it on the observing
+    // call's own base freshness was wrong — receipt time overstates the server's
+    // read time by up to one RTT, and an OLDER cached sibling discover query may
+    // still predate the settle; with the once-per-row guard, a skipped invalidation
+    // could never fire again, starving both of their only heal. One extra discover
+    // refetch per settled row per session is the accepted cost.
     const invalidate = vi
       .spyOn(queryClient, 'invalidateQueries')
       .mockResolvedValue(undefined as never)
@@ -315,7 +320,57 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(invalidate).not.toHaveBeenCalled()
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+    expect(invalidate).toHaveBeenCalledTimes(1)
+  })
+
+  it('still invalidates when the base resolved within the receipt-time race window', async () => {
+    // dataUpdatedAt is client RECEIPT time; the server read the request rows up to
+    // one RTT earlier (statuses are read before the Plex presence crawl). A base
+    // that resolved just AFTER the observation may still have been COMPUTED
+    // pre-settle: the trust rule renders it for this beat (the documented error
+    // bar), so the first observation MUST fire the invalidation regardless — the
+    // refetch replaces a wrongly-trusted stale base within one cycle.
+    const invalidate = vi
+      .spyOn(queryClient, 'invalidateQueries')
+      .mockResolvedValue(undefined as never)
+    const pollAt = Date.now()
+    const state = deriveTileState(
+      result({ library_state: 'requested' }),
+      [request({ status: 'failed' })],
+      pollAt + 50, // resolved 50ms after the observation — inside one RTT
+      pollAt,
+    )
+    // Rendering trusts the base for this beat (the error bar)...
+    expect(state).toEqual({ label: 'Requested', intent: 'neutral' })
+    // ...but the heal is queued unconditionally.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+  })
+
+  it('invalidates for a stale sibling cache even when the observing query is fresh', async () => {
+    // Discover keeps home and per-search caches separate. The settle is first
+    // observed while rendering with a FRESH query (base postdates the observation)
+    // — but an OLDER cached sibling still predates the settle. The invalidation
+    // must fire anyway: it marks ALL ['discover'] caches stale (react-query
+    // refetches active queries immediately, inactive ones on next activation), and
+    // the once-per-row guard means a skipped invalidation would never fire again —
+    // the sibling would render its stale base suppressed forever.
+    const invalidate = vi
+      .spyOn(queryClient, 'invalidateQueries')
+      .mockResolvedValue(undefined as never)
+    const pollAt = Date.now()
+    const rows = [request({ status: 'failed' })]
+    // First observation happens while rendering the FRESH query's tile.
+    deriveTileState(result({ library_state: 'none' }), rows, pollAt + 60_000, pollAt)
+    // The stale sibling's tile renders suppressed (its base predates the settle)...
+    expect(
+      deriveTileState(result({ library_state: 'requested' }), rows, pollAt - 60_000, pollAt),
+    ).toBeNull()
+    // ...and the invalidation was queued by the first observation so it can heal.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+    expect(invalidate).toHaveBeenCalledTimes(1)
   })
 
   it('fires the invalidation at most once per settled row per session', async () => {
