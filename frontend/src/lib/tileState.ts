@@ -105,7 +105,11 @@ export function deriveTileState(
  * row is fresher than that snapshot — and the correlation would have preferred an
  * active re-request over it if one existed, so there is none — so `evicted` drops
  * presence too. The tile degrades to unbadged rather than claim a file that was just
- * deleted; the modal, when opened, shows the true live status.
+ * deleted; the modal, when opened, shows the true live status. This mirrors, and must
+ * stay in sync with, the server's own evicted rule in `derive_library_state`
+ * (services/discovery_service.py), which refuses the presence fallback for an
+ * `evicted` request row for the same reason (warmed presence cache + Plex's
+ * asynchronous scan can both still say "present" right after the delete).
  */
 function settledBaseFallback(
   state: DiscoverResult['library_state'],

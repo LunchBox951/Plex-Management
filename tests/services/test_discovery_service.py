@@ -79,11 +79,22 @@ def test_partially_available_request_is_partial(present: bool) -> None:
     assert derive_library_state("partially_available", present) == "partially_available"
 
 
-@pytest.mark.parametrize("status", [None, "failed", "evicted", "cancelled", "totally_unknown"])
+@pytest.mark.parametrize("status", [None, "failed", "cancelled", "totally_unknown"])
 def test_no_active_request_falls_back_to_presence(status: str | None) -> None:
-    # None (no request row), a settled-non-available status, or an unrecognised status
-    # all defer to Plex presence -- "available" when owned, "none" when not. This is the
-    # "owned but never requested through the app" path (the beta's dominant case) and
-    # the honest neutral for an unknown status; never a fabricated presence.
+    # None (no request row), a settled failed/cancelled status (neither deletes a
+    # library file: cancel only acts pre-import, report-issue purges only while
+    # re-arming to ACTIVE), or an unrecognised status all defer to Plex presence --
+    # "available" when owned, "none" when not. This is the "owned but never requested
+    # through the app" path (the beta's dominant case) and the honest neutral for an
+    # unknown status; never a fabricated presence.
     assert derive_library_state(status, present=True) == "available"
     assert derive_library_state(status, present=False) == "none"
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_evicted_is_authoritative_over_presence(present: bool) -> None:
+    # ADR-0012 eviction just DELETED the file; a True `present` is the warmed
+    # pre-eviction snapshot (or Plex's not-yet-finished scan), so it must not paint
+    # a just-evicted title "available". Mirrors the client settledBaseFallback
+    # evicted rule in lib/tileState.ts.
+    assert derive_library_state("evicted", present) == "none"

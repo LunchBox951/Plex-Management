@@ -50,12 +50,30 @@ def derive_library_state(request_status: str | None, present: bool) -> LibrarySt
 
     The SERVER base state for a Discover/Search tile: the request status (if the title
     has a request row) drives ``requested``/``processing``/``available``/
-    ``partially_available``; a settled-but-not-available status (``failed``/``evicted``/
+    ``partially_available``; a settled-but-not-available status (``failed``/
     ``cancelled``), an unknown status, or NO request row all fall back to Plex presence
     -- ``"available"`` when the title is in the library, else ``"none"``. The presence
     fallback is what flags "owned but never requested through the app", the beta's
     dominant case. Never fabricates presence: absent request + absent from Plex is an
     honest ``"none"``.
+
+    ``evicted`` does NOT fall back to presence: the disk-pressure sweep (ADR-0012)
+    just DELETED the file, and ``present`` can still read True -- the warmed presence
+    snapshot (``_PRESENT_TMDB_CACHE``, 300s TTL) may predate the eviction, and even
+    though ``_evict_one`` triggers a Plex scan + cache invalidation, Plex's refresh is
+    asynchronous and keeps reporting the removed item until its scan completes. The
+    eviction status is the fresher fact, so it is authoritative: ``"none"``.
+    Counter-case, accepted: a long-ago-evicted title manually re-added to Plex outside
+    the app loses its tile badge -- acceptable because tiles are hints (the modal and
+    the create path read presence fresh, ``use_cache=False``) and "just evicted,
+    presence stale" is the common case. This mirrors, and must stay in sync with, the
+    client's ``settledBaseFallback`` evicted rule in ``lib/tileState.ts``, which
+    applies the same reasoning to the page-load base when the LIVE row settles.
+
+    ``failed``/``cancelled`` genuinely defer to presence: neither settle deletes a
+    library file (cancel only acts on not-yet-imported statuses, and ADR-0014
+    report-issue purges only while RE-ARMING the row to an ACTIVE status), so presence
+    is an independent fact those statuses do not invalidate.
 
     Kept in sync with ``lib/tileState.ts`` (the client overlays the live request
     lifecycle on top of this base) and ``_SETTLED_REQUEST_STATUSES`` in
@@ -69,8 +87,13 @@ def derive_library_state(request_status: str | None, present: bool) -> LibrarySt
         return "available"
     if request_status == "partially_available":
         return "partially_available"
-    # None, a settled-non-available status (failed/evicted/cancelled), or an unknown
-    # status: presence is the only honest signal left.
+    if request_status == "evicted":
+        # Authoritative over presence -- the sweep just deleted the file; a True
+        # ``present`` here is the stale pre-eviction snapshot or Plex's own
+        # not-yet-finished scan. See the docstring's evicted paragraph.
+        return "none"
+    # None, a settled-non-available status (failed/cancelled), or an unknown status:
+    # presence is the only honest signal left.
     return "available" if present else "none"
 
 
