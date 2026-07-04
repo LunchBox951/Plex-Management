@@ -249,12 +249,19 @@ export function SetupWizard() {
   // `section_type` — split per-picker below.
   const movieLibraries = plexLibraries?.filter((l) => l.section_type === 'movie') ?? null
   const tvLibraries = plexLibraries?.filter((l) => l.section_type === 'tv') ?? null
-  // Completion needs at least ONE library root — movies OR tv. Both roots are
-  // independently optional (ADR-0011: a movie-only OR a tv-only Plex is legit; the
-  // backend normalizes an empty root to None and surfaces a per-type ImportBlocked
-  // only for the missing kind). Forcing movies_root would lock a tv-only operator
-  // out of setup entirely — they have no movie library to point at.
-  const hasLibraryRoot = form.movies_root.trim() !== '' || (form.tv_root ?? '').trim() !== ''
+  // Completion needs at least ONE library root — movies, tv, OR either anime root
+  // (ADR-0015). Every root is independently optional (ADR-0011: a movie-only OR a
+  // tv-only Plex is legit; the backend normalizes an empty root to None and surfaces
+  // a per-type ImportBlocked only for the missing kind). Forcing movies_root would
+  // lock a tv-only operator out of setup entirely — they have no movie library to
+  // point at. An anime-ONLY install (backend-supported: anime imports route to their
+  // own roots) must likewise be completable off an anime root alone, so the anime
+  // roots count toward the gate too.
+  const hasLibraryRoot =
+    form.movies_root.trim() !== '' ||
+    (form.tv_root ?? '').trim() !== '' ||
+    (form.anime_movie_root ?? '').trim() !== '' ||
+    (form.anime_tv_root ?? '').trim() !== ''
   const allVerified = servicesVerified && hasLibraryRoot
 
   const onComplete = async () => {
