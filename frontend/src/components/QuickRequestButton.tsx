@@ -24,6 +24,14 @@ function asApiError(error: unknown): ApiError {
  * `seasons`, which the backend reads as "track every aired season" (matches
  * the modal's own default) — targeting a single season from the tile would
  * need the season picker, so that stays a one-click-away modal action.
+ * BECAUSE of that whole-series default, the caller's gate (Discover's
+ * `quickRequestable`) renders this for a tv title only when the fresh
+ * `/requests` list holds NO rows at all for it — a true first-time request. A
+ * tv title with a settled season-scoped row (failed/cancelled/evicted season)
+ * re-derives `state === null` too, but a seasons-less POST there would EXPAND
+ * the tracked set to the whole aired series, where the modal's "Request again"
+ * deliberately narrows to the selected season — so every tv retry/re-request
+ * stays a modal action.
  *
  * Sits inside `PosterCard`'s clickable card, whose outer div both opens the
  * detail modal on click AND re-fires that same `onClick` for a keyboard

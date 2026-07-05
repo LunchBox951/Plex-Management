@@ -14,17 +14,18 @@ interface RowProps {
   /** Per-tile library-state badge (issue #29); `null` leaves a tile unbadged. */
   tileState?: (item: DiscoverResult) => StatusPresentation | null
   /**
-   * Whether the shared `/requests` query these tiles derive their state from has
-   * SETTLED — fetched at least once AND not currently invalidated pending a
-   * refetch. Gates the quick-request action on freshness alongside the
-   * `state === null` check: right after a season-scoped tv request is created the
-   * `/requests` query is invalidated but its refetch hasn't landed, so the tile
-   * still derives `null`; a Request click in that window POSTs a seasons-less body
-   * the API reads as "the whole aired series", silently expanding the single-season
-   * request. Defaults `true` for presentational/standalone use; Discover always
-   * passes the real signal.
+   * Whether a tile whose derived state is `null` may offer the one-click Request
+   * action, gating it alongside the `state === null` check. Discover derives this
+   * from the same `/requests` data the tiles' `tileState` consumes: false while
+   * that query hasn't SUCCEEDED yet or is invalidated pending a refetch (a stale
+   * `null` right after a request is created must not offer the button — a
+   * seasons-less tv POST in that window expands the just-created single-season
+   * request to the whole aired series), and false for a tv title with ANY request
+   * rows at all — the tile is first-time-whole-series only; every tv
+   * retry/re-request goes through the modal, which has season context. Omitted
+   * (presentational/standalone use), every null-state tile is requestable.
    */
-  requestsSettled?: boolean
+  quickRequestable?: (item: DiscoverResult) => boolean
 }
 
 /** How far each chevron scrolls — a little under one viewport of posters. */
@@ -40,7 +41,7 @@ export function Row({
   onSelect,
   loading = false,
   tileState,
-  requestsSettled = true,
+  quickRequestable,
 }: RowProps) {
   const trackRef = useRef<HTMLDivElement>(null)
   const [atStart, setAtStart] = useState(true)
@@ -118,7 +119,7 @@ export function Row({
                       onClick={() => onSelect(item)}
                       badge={state ? <StatusBadge status={state} /> : undefined}
                       action={
-                        state === null && requestsSettled ? (
+                        state === null && (quickRequestable?.(item) ?? true) ? (
                           <QuickRequestButton item={item} />
                         ) : undefined
                       }

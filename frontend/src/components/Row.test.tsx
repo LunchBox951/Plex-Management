@@ -67,12 +67,13 @@ describe('Row quick-request action (issue #42)', () => {
     expect(screen.getByText('Requested')).toBeInTheDocument() // the badge on SHOW
   })
 
-  it('suppresses the Request action when requestsSettled is false, even for a null-state tile', () => {
-    // The gate the Codex P2 fix adds: a `state === null` tile is only requestable
-    // once the shared /requests query is fresh. `requestsSettled={false}` models the
-    // stale window (query invalidated / not yet fetched) where the derived null is
-    // untrustworthy — the button must not render, or a click could POST a
-    // seasons-less (whole-series) tv request.
+  it('suppresses the Request action when quickRequestable vetoes, even for a null-state tile', () => {
+    // The gate the Codex P2 fixes add: a `state === null` tile only offers the
+    // one-click Request when Discover's quickRequestable approves — the /requests
+    // data is fresh AND (for tv) the title has no request rows at all. A false here
+    // models the stale window (query invalidated / not yet succeeded) or a tv title
+    // with settled season-scoped history, where a click would POST a seasons-less
+    // (whole-series) body.
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(
       <Row
@@ -80,13 +81,13 @@ describe('Row quick-request action (issue #42)', () => {
         items={[MOVIE]}
         onSelect={() => {}}
         tileState={() => null}
-        requestsSettled={false}
+        quickRequestable={() => false}
       />,
     )
     expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
-  it('renders the Request action for a null-state tile once requestsSettled is true', () => {
+  it('renders the Request action for a null-state tile that quickRequestable approves', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(
       <Row
@@ -94,7 +95,7 @@ describe('Row quick-request action (issue #42)', () => {
         items={[MOVIE]}
         onSelect={() => {}}
         tileState={() => null}
-        requestsSettled={true}
+        quickRequestable={(item) => item.tmdb_id === MOVIE.tmdb_id}
       />,
     )
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
