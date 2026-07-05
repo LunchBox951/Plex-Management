@@ -177,6 +177,7 @@ def test_safe_guid_redacts_everything_outside_the_allowlist(
         "urn:uuid:12345678-1234-5678-1234-567812345678",
         "http://[bad/download?passkey=LEAKEDSECRET",  # malformed -> ValueError arm
         "id with whitespace SECRET",
+        "https://tracker.example.org%2Fdl%3Fpasskey%3DW6SECRET",  # wave 6: encoded tail
         "50%25off?SECRET",
         "a&b=SECRET",
     ],
@@ -184,16 +185,37 @@ def test_safe_guid_redacts_everything_outside_the_allowlist(
 def test_safe_guid_url_machinery_never_passes_through(raw: str) -> None:
     """The property the allowlist inversion buys, stated directly: ANY value
     containing URL machinery (``/ ? & % :`` or whitespace) -- whatever novel URI
-    shape it takes -- comes out as exactly a ``label#hash`` token (label possibly
-    empty), never as the value itself, and never carrying a secret fragment."""
+    shape it takes -- comes out as exactly an ``<allowlisted-label>#<hash>``
+    token (label possibly empty), never as the value itself, and never carrying
+    a secret fragment. The shape regex IS the emit contract: label bytes are
+    restricted to the label allowlist, so no ``% / ? & :`` byte can survive."""
     assert any(c in raw for c in "/?&%: \t"), "test row must contain URL machinery"
     result = safe_guid(raw)
-    # Exactly <allowlist-safe label>#<12-hex sha256 prefix>; no other byte can
-    # appear, so no passkey/query/path/userinfo fragment can survive.
-    assert re.fullmatch(r"[A-Za-z0-9.+\-]*#[0-9a-f]{12}", result)
+    # Exactly <allowlist-validated label>#<12-hex sha256 prefix>; no other byte
+    # can appear, so no passkey/query/path/userinfo fragment can survive.
+    assert re.fullmatch(r"[A-Za-z0-9._\-]{0,64}#[0-9a-f]{12}", result)
     assert result.endswith(f"#{_sha12(raw)}")  # stable correlation hash intact
     assert "SECRET" not in result
+    assert "secret" not in result  # ``hostname`` lowercases -- neither casing may leak
     assert "passkey" not in result
+
+
+def test_safe_guid_validates_the_label_against_the_allowlist_too() -> None:
+    """Wave-6 P1: the label was the last unvalidated emission. A URL whose path/
+    query is PERCENT-ENCODED has no literal ``/`` or ``?``, so ``urlsplit``
+    parses its entire tail as the netloc and ``hostname`` comes back carrying
+    the encoded path/query -- secret included. The label is now emitted only if
+    it fullmatches the strict label allowlist (a legit hostname/scheme always
+    does; a ``%``-bearing blob never can), else the bare-hash token."""
+    raw = "https://tracker.example.org%2Fdl%3Fpasskey%3DSECRET"
+    result = safe_guid(raw)
+    assert result == f"#{_sha12(raw)}"  # bare hash: the swallowed-tail label is dropped
+    assert "SECRET" not in result
+    assert "secret" not in result  # ``hostname`` lowercases -- neither casing leaks
+    assert "%" not in result
+    # Sanity for the other label arm: a clean scheme still labels.
+    magnet = "magnet:?xt=urn:btih:deadbeef"
+    assert safe_guid(magnet) == f"magnet#{_sha12(magnet)}"
 
 
 def test_safe_guid_hash_prefix_is_stable_and_release_distinguishing() -> None:
