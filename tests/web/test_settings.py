@@ -201,6 +201,110 @@ async def test_empty_string_root_reads_back_as_unset(
 
 
 # --------------------------------------------------------------------------- #
+# Service URL shape validation at write time (issue #44)
+# --------------------------------------------------------------------------- #
+_BAD_SERVICE_URLS = [
+    "http://[::1",  # unterminated IPv6 literal -- urlsplit() itself raises ValueError
+    "localhost:9696",  # scheme-less
+    "ftp://x",  # wrong scheme
+    "http://",  # empty host
+    "not a url at all",
+    "http://x:bad",  # non-numeric port -> would otherwise raise httpx.InvalidURL
+    "http://x:0",  # port 0 parses cleanly but is never connectable
+    "http://x:99999",  # out-of-range port
+    "http://\nx",  # embedded control char (CR/LF log-forging shape)
+    "http://x/\x01",  # control char in path
+]
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+@pytest.mark.parametrize("bad_url", _BAD_SERVICE_URLS)
+async def test_put_settings_rejects_malformed_service_url_and_does_not_persist(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    bad_url: str,
+) -> None:
+    # Shape-validated at write time (issue #44): the exact predicate the setup
+    # wizard's "Test connection" probes use (``url_validation.url_shape_error``),
+    # now ALSO enforced on the authenticated PUT /settings write path so a
+    # malformed url is a visible 422 before it is ever persisted, not just a
+    # later opaque failure from the downstream service.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+
+    put = await client.put("/api/v1/settings", json={field: bad_url}, headers=headers)
+    assert put.status_code == 422
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get(field) is None
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+async def test_put_settings_accepts_valid_https_service_url(
+    client: httpx.AsyncClient, seed: SeedFn, field: str
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+
+    put = await client.put(
+        "/api/v1/settings", json={field: "https://example.com:8443"}, headers=headers
+    )
+    assert put.status_code == 200
+    assert put.json()[field] == "https://example.com:8443"
+
+
+async def test_put_settings_partial_update_omitting_urls_leaves_them_untouched(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    await client.put(
+        "/api/v1/settings",
+        json={
+            "plex_url": "http://plex.local:32400",
+            "prowlarr_url": "http://prowlarr.local:9696",
+            "qbittorrent_url": "http://qb.local:8080",
+        },
+        headers=headers,
+    )
+
+    # A later partial update naming only an unrelated field must not fire the
+    # validator for the omitted (absent -> ``None``) url fields, and must leave
+    # every previously-stored url exactly as it was.
+    put = await client.put(
+        "/api/v1/settings", json={"qbittorrent_username": "admin"}, headers=headers
+    )
+    assert put.status_code == 200
+    body = put.json()
+    assert body["plex_url"] == "http://plex.local:32400"
+    assert body["prowlarr_url"] == "http://prowlarr.local:9696"
+    assert body["qbittorrent_url"] == "http://qb.local:8080"
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+async def test_put_settings_empty_string_service_url_clears_and_is_not_shape_checked(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker, field: str
+) -> None:
+    # '' is an explicit clear-to-unset (matching movies_root's convention) --
+    # ALLOWED, never shape-checked/rejected. The adapters already treat a falsy
+    # stored url as unconfigured (an honest 409 service_not_configured), so this
+    # is a valid, intentional write.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    await client.put(
+        "/api/v1/settings", json={field: "http://configured.example:1234"}, headers=headers
+    )
+
+    put = await client.put("/api/v1/settings", json={field: ""}, headers=headers)
+    assert put.status_code == 200
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get(field) == ""
+
+
+# --------------------------------------------------------------------------- #
 # Anime library routing (ADR-0015): anime_movie_root / anime_tv_root
 # --------------------------------------------------------------------------- #
 async def test_get_starts_with_anime_roots_unset(client: httpx.AsyncClient, seed: SeedFn) -> None:

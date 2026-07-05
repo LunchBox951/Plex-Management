@@ -247,6 +247,51 @@ async def test_complete_rejects_blank_library_roots(client: httpx.AsyncClient) -
     assert response.status_code == 422
 
 
+# --------------------------------------------------------------------------- #
+# Service URL shape validation at write time (issue #44)
+# --------------------------------------------------------------------------- #
+_BAD_SERVICE_URLS = [
+    "http://[::1",  # unterminated IPv6 literal -- urlsplit() itself raises ValueError
+    "localhost:9696",  # scheme-less
+    "ftp://x",  # wrong scheme
+    "http://",  # empty host
+    "not a url at all",
+    "http://x:bad",  # non-numeric port -> would otherwise raise httpx.InvalidURL
+    "http://x:0",  # port 0 parses cleanly but is never connectable
+    "http://x:99999",  # out-of-range port
+    "http://\nx",  # embedded control char (CR/LF log-forging shape)
+    "http://x/\x01",  # control char in path
+]
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+@pytest.mark.parametrize("bad_url", _BAD_SERVICE_URLS)
+async def test_complete_rejects_malformed_service_url(
+    client: httpx.AsyncClient, field: str, bad_url: str
+) -> None:
+    # Same shape predicate the setup wizard's "Test connection" probes use
+    # (url_validation.url_shape_error), now ALSO enforced on /setup/complete so a
+    # direct-API caller can't post a url the wizard UI would never let through.
+    body = {**_COMPLETE_BODY, field: bad_url}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+async def test_complete_rejects_empty_string_service_url(
+    client: httpx.AsyncClient, field: str
+) -> None:
+    # Unlike SettingsUpdate's partial-update '' (explicit clear-to-unset,
+    # allowed), SetupCompleteRequest's urls are REQUIRED -- there is no "leave
+    # unchanged" concept on a one-shot install, so an empty string is REJECTED,
+    # closing the direct-API-caller bypass of the wizard's connection probes.
+    body = {**_COMPLETE_BODY, field: ""}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
 def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
     responses = app.openapi()["paths"]["/api/v1/setup/complete"]["post"]["responses"]
 
