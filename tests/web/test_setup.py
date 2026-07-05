@@ -272,6 +272,9 @@ _BAD_SERVICE_URLS = [
     "http://[v7.abc]",  # IPvFuture -- urlsplit tolerates it, httpx raises InvalidURL
     "http://[fe80::1%eth0]",  # IPv6 zone id -- rejected by policy for a base URL
     "http://[fe80::1%25eth0]",  # RFC 6874 percent-encoded zone id -- likewise
+    "http://\N{PILE OF POO}.local",  # IDNA-unencodable label -- httpx.URL() ctor raises
+    "http://xn--zzzzzz",  # bogus punycode A-label -- raises only from httpx .host decode
+    "http://xn--ls8h.local",  # pre-encoded emoji label -- same class, punycode form
 ]
 
 
@@ -314,6 +317,9 @@ async def test_complete_rejects_empty_string_service_url(
         # was Codex PR #53 wave 4's claimed-broken example -- empirically urlsplit,
         # ipaddress AND httpx all accept it, so it must stay accepted.
         "http://[9999::1]:9696",
+        # VALID punycode (café.local) -- guards the wave-5 httpx gate's .host
+        # touch against over-tightening: only UNdecodable xn-- labels reject.
+        "http://xn--caf-dma.local:9696",
     ],
 )
 async def test_complete_accepts_legitimate_base_url_shapes(

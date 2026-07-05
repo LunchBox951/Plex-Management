@@ -444,6 +444,42 @@ async def test_validate_prowlarr_accepts_valid_ipv6_literal_host(
     assert response.json()["ok"] is True
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        # IDNA-unencodable Unicode label: httpx.URL() itself raises InvalidURL
+        # (NOT an HTTPError), so pre-fix the probe 500'd instead of rejecting
+        # (Codex PR #53 P2, wave 5).
+        "http://\N{PILE OF POO}.local",
+        # Bogus punycode A-label: passes the httpx.URL() CONSTRUCTOR and raises a
+        # raw idna.IDNAError only from the lazy .host decode -- the gate touches
+        # .host precisely to cover this second raise point.
+        "http://xn--zzzzzz",
+        # The finding's emoji case pre-encoded to punycode -- same class.
+        "http://xn--ls8h.local",
+    ],
+)
+async def test_validate_prowlarr_rejects_urls_the_http_client_cannot_parse(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # The final catch-all gate mirrors the ACTUAL downstream parser (httpx), so
+    # any urlsplit-vs-httpx divergence -- today IDNA-invalid hostnames -- is an
+    # honest ok=False with a generic message, never an uncaught InvalidURL /
+    # IDNAError 500, and never an outbound request.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "URL is not parseable by the HTTP client."
+
+
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(
     client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
 ) -> None:

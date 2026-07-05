@@ -6,6 +6,13 @@ write-time schema validators on ``SettingsUpdate`` / ``SetupCompleteRequest``
 (``web.schemas``) -- so a malformed URL is rejected with the same message and
 the same edge cases whether it is caught before an outbound probe or before a
 row is ever written.
+
+Import hygiene note: this module imports ``httpx`` (for the final
+parse-with-the-real-consumer gate in :func:`url_shape_error`). That is fine
+HERE -- ``web/`` is an adapter layer where httpx is already an established
+dependency (``setup_validation``'s live probes are built on it) -- but this
+module must never migrate into ``domain/``, which is pure and imports no
+adapter libraries.
 """
 
 from __future__ import annotations
@@ -13,12 +20,15 @@ from __future__ import annotations
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
 from urllib.parse import urlsplit
 
+import httpx
+
 __all__ = [
     "INVALID_IPV4_MESSAGE",
     "INVALID_IPV6_MESSAGE",
     "INVALID_URL_MESSAGE",
     "IPV6_ZONE_ID_MESSAGE",
     "QUERY_FRAGMENT_MESSAGE",
+    "UNPARSEABLE_URL_MESSAGE",
     "url_shape_error",
 ]
 
@@ -30,6 +40,7 @@ INVALID_IPV6_MESSAGE = "Invalid IPv6 address in host."
 # address ("fe80::1%eth0") IS valid IPv6, so calling it "invalid" would be
 # dishonest -- the zone id is simply not supported in a base service URL.
 IPV6_ZONE_ID_MESSAGE = "IPv6 zone ids are not supported in a base URL."
+UNPARSEABLE_URL_MESSAGE = "URL is not parseable by the HTTP client."
 
 # A hostname made of ONLY digits and dots is IPv4-shaped: it can never be a real
 # DNS name (a resolvable TLD is never all-numeric), so it must parse as a proper
@@ -112,6 +123,32 @@ def url_shape_error(url: str) -> str | None:
     Valid IPv6 literals -- including uncommon-looking ones like ``[9999::1]``
     (``9999`` is a legal hex group) and IPv4-mapped ``[::ffff:1.2.3.4]`` -- are
     accepted unchanged.
+
+    FINALLY, the value must round-trip through ``httpx.URL`` itself. Every
+    persisted URL is eventually consumed by httpx (the adapters and the setup
+    probes), so ITS parser is the ground-truth invariant -- each earlier
+    parser-mismatch fix (ports, IPv4-shaped hosts, bracketed IPv6) patched one
+    instance of "urlsplit tolerates it, httpx explodes on it"; this gate closes
+    the CLASS by construction. Today the residue it catches is IDNA-invalid
+    hostnames, which raise from two DIFFERENT places (both covered):
+
+    * an unencodable Unicode label (``http://\U0001f4a9.local``) raises
+      ``httpx.InvalidURL`` from the ``httpx.URL()`` constructor itself;
+    * a bogus or disallowed punycode A-label (``http://xn--zzzzzz``, or the
+      pre-encoded emoji ``http://xn--ls8h.local``) passes the constructor and
+      raises a raw ``idna.IDNAError`` only from the ``.host`` property (httpx
+      decodes ``xn--`` labels lazily there) -- hence the gate touches ``.host``
+      too, and the except is deliberately broad since neither error type is an
+      ``httpx.HTTPError``.
+
+    The specific checks above run FIRST so their specific, actionable messages
+    win; the gate only answers for what is left, with an honest generic message.
+    It also cannot over-tighten: by definition it accepts exactly what the real
+    consumer accepts -- empty labels, overlong labels, underscore hosts,
+    trailing-dot FQDNs, Unicode IDNs (``http://café.local``) and VALID
+    punycode (``http://xn--caf-dma.local``) all parse in httpx 0.28 and continue
+    to pass; those fail later, if at all, as honest retryable connect/DNS
+    errors, not parser crashes.
     """
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in url):
         return INVALID_URL_MESSAGE
@@ -152,4 +189,18 @@ def url_shape_error(url: str) -> str | None:
             IPv4Address(hostname)
         except AddressValueError:
             return INVALID_IPV4_MESSAGE
+    # FINAL catch-all gate: parse with the ACTUAL downstream consumer. Anything
+    # httpx cannot digest WILL fail at request time as an uncaught error, so its
+    # parser is the ground-truth invariant; the specific checks above ran first
+    # so their specific messages win, and this only answers for the residue
+    # (today: IDNA-invalid hostnames). The ``.host`` touch is load-bearing: an
+    # unencodable Unicode label raises httpx.InvalidURL from the constructor,
+    # but a bogus "xn--" punycode label only raises (a raw idna.IDNAError, not
+    # an HTTPError) when httpx lazily decodes it in the .host property. Broad
+    # except is deliberate and honest -- ANY parse failure means the adapters
+    # can never use this value, so reject it now.
+    try:
+        _ = httpx.URL(url).host
+    except Exception:
+        return UNPARSEABLE_URL_MESSAGE
     return None
