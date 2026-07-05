@@ -3,13 +3,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { PosterCard } from './PosterCard'
 
 /**
- * The action slot (issue #42) sits INSIDE the card's own clickable div, which
- * opens the detail modal on click and on a keyboard Enter/Space (see
- * `PosterCard.tsx`'s `onKeyDown`). An action element that plays by the rules —
- * stopping propagation on both its `onClick` and its `onKeyDown` — must be
- * able to act without also triggering the card underneath it. These tests
- * pin that contract at the `PosterCard` level, independent of any one action
- * component (`QuickRequestButton` has its own tests for its own behaviour).
+ * The action slot (issue #42) must coexist with the card's own details trigger
+ * without creating nested interactive controls. These tests pin that contract at
+ * the `PosterCard` level, independent of any one action component
+ * (`QuickRequestButton` has its own tests for its own behaviour).
  */
 function actionButton(onAction: () => void) {
   return (
@@ -48,6 +45,21 @@ describe('PosterCard action slot', () => {
 
     expect(onAction).toHaveBeenCalledTimes(1)
     expect(onClick).not.toHaveBeenCalled()
+  })
+
+  it('keeps action controls outside the card details trigger', () => {
+    const onClick = vi.fn()
+    render(<PosterCard title="Movie" onClick={onClick} action={actionButton(() => {})} />)
+
+    const details = screen.getByRole('button', { name: 'View details for Movie' })
+    const action = screen.getByRole('button', { name: 'Act' })
+
+    expect(details.tagName).toBe('BUTTON')
+    expect(details).not.toContainElement(action)
+    expect(action.closest('[role="button"]')).toBeNull()
+
+    fireEvent.click(details)
+    expect(onClick).toHaveBeenCalledTimes(1)
   })
 
   it('Enter/Space on the focused action button does not open the card', () => {

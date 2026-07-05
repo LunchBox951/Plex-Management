@@ -45,9 +45,7 @@ describe('Row quick-request action (issue #42)', () => {
   })
 
   // The action's accessible name carries the title (`aria-label={`Request ${title}`}`)
-  // so each tile's button is distinct for assistive tech. An exact-string match
-  // selects only the button — the enclosing role="button" card folds this label
-  // into its own name-from-content, so a loose /request/ regex would be ambiguous.
+  // so each tile's button is distinct for assistive tech.
   const REQUEST_MOVIE = 'Request Unbadged Movie'
 
   it('renders the Request action only for a tile whose state is null', () => {
@@ -132,9 +130,9 @@ describe('Row quick-request action (issue #42)', () => {
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
     })
-    // Focus was handed to the enclosing card (the only role="button" left in the
-    // tile once the action unmounts) so a keyboard user isn't dumped to <body>.
-    expect(screen.getByRole('button', { name: /Unbadged Movie/ })).toHaveFocus()
+    // Focus was handed to the card's details trigger so a keyboard user isn't
+    // dumped to <body> when the action unmounts.
+    expect(screen.getByRole('button', { name: 'View details for Unbadged Movie' })).toHaveFocus()
     expect(toastSpy).toHaveBeenCalledWith(
       expect.objectContaining({ intent: 'success', title: expect.stringContaining('Requested') }),
     )
@@ -146,9 +144,8 @@ describe('Row quick-request action (issue #42)', () => {
     render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
 
     const action = screen.getByRole('button', { name: REQUEST_MOVIE })
-    // The action lives inside PosterCard's role="button" div, whose own onKeyDown
-    // opens the modal on Enter/Space. QuickRequestButton must stop that keydown from
-    // bubbling; delete its guard and this keydown reaches the card and fires onSelect.
+    // QuickRequestButton still stops Enter/Space from reaching neighboring card
+    // handlers; activating the action by keyboard must not open details.
     fireEvent.keyDown(action, { key: 'Enter' })
     fireEvent.keyDown(action, { key: ' ' })
 
