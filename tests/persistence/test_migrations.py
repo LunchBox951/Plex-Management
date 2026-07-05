@@ -209,3 +209,73 @@ def test_import_blocked_status_migration_rejects_legacy_duplicate_completed_rows
 
     with pytest.raises(RuntimeError, match="duplicate media_requests"):
         _upgrade(db_path, "41d427bd38e6", monkeypatch)
+
+
+def test_tv_request_intent_backfills_legacy_rows_as_whole_show(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every pre-existing TV request is stamped ``whole_show`` with a NULL season
+    set — the representation the live app uses for a request that named no finite
+    season set (``request_service._tv_request_intent`` -> ``("whole_show", None)``).
+
+    The whole-show/explicit intent bit predates the column and is unrecoverable
+    from the surviving rows, so an ``explicit_seasons`` freeze would fabricate an
+    intent the operator never held. For a TV row with zero ``season_requests``
+    (schema-valid since the initial revision permitted ``media_type='tv'``) that
+    freeze would mean an explicit request for NO seasons — rejecting every
+    multi-season pack. This test pins the ``whole_show`` default and guards
+    movies from being given a TV intent at all.
+    """
+    import json as json_lib
+
+    db_path = tmp_path / "tv-intent-backfill.db"
+    # Stop at main's head — the revision immediately before this one.
+    _upgrade(db_path, "b7e2d4f6c8a1", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO media_requests (id, tmdb_id, media_type, title, status)
+                    VALUES
+                        (1, 42, 'tv', 'No Season Rows', 'completed'),
+                        (2, 99, 'tv', 'Tracks 1-3', 'completed'),
+                        (3, 7, 'movie', 'A Movie', 'completed')
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO season_requests (media_request_id, season_number, status)
+                    VALUES (2, 1, 'completed'), (2, 2, 'completed'), (2, 3, 'completed')
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "9b7a1c5d2e4f", monkeypatch)
+
+    con = sqlite3.connect(db_path)
+    try:
+        rows = {
+            rid: (mode, raw)
+            for rid, mode, raw in con.execute(
+                "SELECT id, tv_request_mode, requested_seasons_json FROM media_requests"
+            )
+        }
+    finally:
+        con.close()
+
+    # Both legacy TV rows -> whole_show, NULL season set (reads back as None),
+    # including the one that never had a season_requests row.
+    for rid in (1, 2):
+        mode, raw = rows[rid]
+        assert mode == "whole_show", rid
+        parsed = json_lib.loads(raw) if isinstance(raw, str) else raw
+        assert parsed is None, rid
+    # The movie is never given a TV request intent.
+    assert rows[3][0] is None
