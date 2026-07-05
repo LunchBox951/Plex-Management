@@ -1,9 +1,15 @@
 import { useEffect, useState } from 'react'
-import { useDiscoverHome, useDiscoverSearch, useRequests } from '../api/hooks'
+import {
+  useDiscoverHome,
+  useDiscoverSearch,
+  useRequests,
+  useRequestsInvalidated,
+} from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
 import { deriveTileState } from '../lib/tileState'
 import { PosterCard } from '../components/ui/PosterCard'
 import { StatusBadge } from '../components/ui/StatusBadge'
+import { QuickRequestButton } from '../components/QuickRequestButton'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { TitleDetailModal } from '../components/TitleDetailModal'
 import { Row } from '../components/Row'
@@ -29,6 +35,41 @@ export function Discover() {
   // The live request lifecycle for the tile overlay — TanStack dedupes this poll with
   // the modal's own useRequests() by queryKey, so it costs no extra network.
   const requests = useRequests({ poll: true })
+
+  // Freshness gate for the one-click Request action. `deriveTileState(...) === null`
+  // alone is not enough: right after a season-scoped tv request is created,
+  // useCreateRequest invalidates /requests but the refetch hasn't landed, so the
+  // tile still derives null. A Request click in that window POSTs `{tmdb_id,
+  // media_type:'tv'}` with seasons omitted, which the API expands to the whole
+  // aired series — silently upgrading a single-season request. Suppress the action
+  // until the requests query has actually settled: completed a fetch WITH data
+  // (`isSuccess` — NOT `isFetched`, which also goes true after a completed-with-
+  // ERROR fetch whose `data` is still undefined, deriving every tile null with
+  // zero request knowledge) AND not currently invalidated pending a refetch
+  // (useRequestsInvalidated — true from invalidateQueries until that refetch
+  // settles; a routine background poll never sets it, so this gate never flickers
+  // per poll).
+  const requestsInvalidated = useRequestsInvalidated()
+  const requestsSettled = requests.isSuccess && !requestsInvalidated
+
+  // Whether a tile whose derived state is null may offer the one-click Request.
+  // Freshness above, plus: a TV tile only qualifies as a TRUE FIRST-TIME request —
+  // no rows at all for (tv, tmdb_id) in the fresh list. A tv title with a SETTLED
+  // season-scoped row (failed/cancelled/evicted season) intentionally re-derives
+  // state === null, but the tile's seasons-omitted POST would expand the tracked
+  // set to the whole aired series, where the modal's "Request again" deliberately
+  // narrows to the selected season — so every tv retry/re-request goes through the
+  // modal (which has season context) and the tile stays dumb. Movies keep the
+  // scope-free behavior: a movie re-request after evicted/cancelled carries no
+  // season scope to corrupt (and dedup makes a stale click a no-op). Reuses the
+  // same rows the tileState helpers already consume — no extra fetch.
+  const quickRequestable = (item: DiscoverResult): boolean => {
+    if (!requestsSettled) return false
+    if (item.media_type !== 'tv') return true
+    return !(requests.data?.requests ?? []).some(
+      (r) => r.tmdb_id === item.tmdb_id && r.media_type === 'tv',
+    )
+  }
 
   // The per-tile badge state: server base (library_state) + the live request overlay.
   // Each helper passes ITS OWN query's dataUpdatedAt (client clock) so deriveTileState
@@ -102,6 +143,7 @@ export function Discover() {
                 items={row.items}
                 onSelect={openTitle}
                 tileState={homeTileState}
+                quickRequestable={quickRequestable}
               />
             ))}
           </>
@@ -138,6 +180,11 @@ export function Discover() {
                 seed={title.tmdb_id}
                 onClick={() => openTitle(title)}
                 badge={state ? <StatusBadge status={state} /> : undefined}
+                action={
+                  state === null && quickRequestable(title) ? (
+                    <QuickRequestButton item={title} />
+                  ) : undefined
+                }
               />
             )
           })}

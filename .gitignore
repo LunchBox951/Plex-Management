@@ -55,3 +55,7 @@ node_modules/
 /sonarr/
 /jackett/
 /prowlarr/
+
+# uv is not the pinned tool here (pyproject.toml + requirements/ own deps);
+# a stray uv.lock some local tooling generates is untracked noise.
+/uv.lock
