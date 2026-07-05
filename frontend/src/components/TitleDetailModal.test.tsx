@@ -701,7 +701,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
     ;(useCancelRequest as unknown as Mock).mockReturnValue(idle())
-    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } });
   })
 
   it('reports an available title via the report-issue endpoint with the chosen reason', async () => {

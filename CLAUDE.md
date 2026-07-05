@@ -11,8 +11,9 @@ into a single app. It is a ground-up rewrite of the `prototype/` service. Read
 [`docs/design/overview.md`](docs/design/overview.md) first; every major decision
 has an ADR under [`docs/adr/`](docs/adr/).
 
-Status: repository foundation only. Detailed v1 feature work is a later effort —
-do not build v1 features unless the task explicitly asks for them.
+Status: v1 beta, feature-complete — the request → watchable → correct loop for
+movies, TV, and anime is built and tested, and a 7-day live beta run is set to
+begin. v1.x feature work is still gated on explicit tasking.
 
 ## North stars (don't violate these)
 
