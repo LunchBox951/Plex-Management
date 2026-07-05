@@ -28,42 +28,45 @@ def upgrade() -> None:
         batch_op.add_column(sa.Column("installed_quality_id", sa.Integer(), nullable=True))
         batch_op.add_column(sa.Column("installed_profile_index", sa.Integer(), nullable=True))
 
-    bind = op.get_bind()
+    # Backfill request intent for TV requests that predate these columns.
+    #
+    # The intent bit -- whole-show ("every tracked season, including ones that
+    # air later") vs. a finite named season set -- was never recorded before
+    # this revision, and it CANNOT be recovered from the surviving rows: a
+    # whole-show request and an explicit "seasons 1..N" request leave IDENTICAL
+    # ``season_requests`` rows (``request_service._season_numbers`` expands an
+    # omitted season list to 1..season_count either way). We therefore stamp
+    # every legacy TV request with the mode the live app itself uses whenever no
+    # finite season set was named: ``whole_show`` with a NULL season set
+    # (``request_service._tv_request_intent`` returns ``("whole_show", None)``
+    # for an omitted/empty ``seasons``). This makes a migrated legacy request
+    # bit-identical to the same request re-created after the migration, and
+    # ``whole_show`` never over-grabs -- ``domain.season_pack.plan_multi_season_pack``
+    # caps eligibility to the seasons already tracked by live ``season_requests``
+    # rows (``eligible = tracked``), so extra seasons carried by a pack are
+    # ignored, never newly grabbed.
+    #
+    # The rejected alternative -- ``explicit_seasons`` frozen to the
+    # migration-time season set -- fabricates an intent the operator never
+    # expressed and misbehaves two ways once the (currently inert) planner is
+    # wired to intent: (a) a legacy TV row with zero ``season_requests`` (a
+    # schema-valid state since the initial revision permitted ``media_type='tv'``)
+    # becomes an explicit request for NO seasons and would reject EVERY
+    # multi-season pack -- an intent no operator can hold; and (b) a legacy
+    # whole-show request for a still-airing show is frozen to today's season set
+    # and would permanently, invisibly reject a later season's pack, diverging
+    # from an identically-intended request created after the migration.
     media_requests = sa.table(
         "media_requests",
-        sa.column("id", sa.Integer()),
         sa.column("media_type", sa.String()),
         sa.column("tv_request_mode", sa.String()),
         sa.column("requested_seasons_json", sa.JSON()),
     )
-    season_requests = sa.table(
-        "season_requests",
-        sa.column("media_request_id", sa.Integer()),
-        sa.column("season_number", sa.Integer()),
+    op.get_bind().execute(
+        media_requests.update()
+        .where(media_requests.c.media_type == "tv")
+        .values(tv_request_mode="whole_show", requested_seasons_json=None)
     )
-    request_ids = [
-        row.id
-        for row in bind.execute(
-            sa.select(media_requests.c.id).where(media_requests.c.media_type == "tv")
-        )
-    ]
-    for request_id in request_ids:
-        seasons = [
-            row.season_number
-            for row in bind.execute(
-                sa.select(season_requests.c.season_number)
-                .where(season_requests.c.media_request_id == request_id)
-                .order_by(season_requests.c.season_number)
-            )
-        ]
-        bind.execute(
-            media_requests.update()
-            .where(media_requests.c.id == request_id)
-            .values(
-                tv_request_mode="explicit_seasons",
-                requested_seasons_json=seasons,
-            )
-        )
 
 
 def downgrade() -> None:

@@ -269,6 +269,61 @@ def test_import_blocked_status_migration_rejects_legacy_duplicate_completed_rows
         _upgrade(db_path, "41d427bd38e6", monkeypatch)
 
 
+def test_tv_request_intent_backfills_legacy_rows_as_whole_show(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy TV rows get ``whole_show`` intent and a NULL finite season set."""
+    import json as json_lib
+
+    db_path = tmp_path / "tv-intent-backfill.db"
+    _upgrade(db_path, "b7e2d4f6c8a1", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO media_requests (id, tmdb_id, media_type, title, status)
+                    VALUES
+                        (1, 42, 'tv', 'No Season Rows', 'completed'),
+                        (2, 99, 'tv', 'Tracks 1-3', 'completed'),
+                        (3, 7, 'movie', 'A Movie', 'completed')
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO season_requests (media_request_id, season_number, status)
+                    VALUES (2, 1, 'completed'), (2, 2, 'completed'), (2, 3, 'completed')
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "9b7a1c5d2e4f", monkeypatch)
+
+    con = sqlite3.connect(db_path)
+    try:
+        rows = {
+            rid: (mode, raw)
+            for rid, mode, raw in con.execute(
+                "SELECT id, tv_request_mode, requested_seasons_json FROM media_requests"
+            )
+        }
+    finally:
+        con.close()
+
+    for rid in (1, 2):
+        mode, raw = rows[rid]
+        assert mode == "whole_show", rid
+        parsed = json_lib.loads(raw) if isinstance(raw, str) else raw
+        assert parsed is None, rid
+    assert rows[3][0] is None
+
+
 def test_release_title_migration_backfills_from_download_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
