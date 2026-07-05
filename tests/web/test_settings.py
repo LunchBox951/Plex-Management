@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
+    AuthContext,
+    AuthMethod,
     SettingsStore,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
@@ -595,7 +597,12 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
     new_key = first.json()["app_api_key"]
 
     # The racing second request already passed require_api_key against the old key.
-    app.dependency_overrides[require_api_key] = lambda: None
+    # ``require_api_key`` now returns an ``AuthContext`` (was ``None``); the stale
+    # racer authenticated via the static key, so mirror that method here so the
+    # rotate handler takes its api-key CAS path and the guard sees an admin.
+    app.dependency_overrides[require_api_key] = lambda: AuthContext(
+        method=AuthMethod.api_key, is_admin=True
+    )
     try:
         stale = await client.post(
             "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
