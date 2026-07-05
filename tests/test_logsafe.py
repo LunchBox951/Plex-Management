@@ -3,15 +3,24 @@
 These are the single-purpose barriers every request-derived log site passes its
 values through (see CONTRIBUTING.md "Logging request-derived values"): ``safe_int``
 re-coerces an id (a no-op for a real int, a taint barrier for CodeQL's
-py/log-injection), and ``safe_text`` collapses CR/LF so a request-derived string
-cannot forge a second log record.
+py/log-injection), ``safe_text`` collapses CR/LF so a request-derived string
+cannot forge a second log record, and ``safe_guid`` additionally strips the
+credential-bearing part of a URL-shaped release GUID (a Prowlarr private-indexer
+GUID can embed a tracker passkey/session token) so a secret is never logged.
 """
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
-from plex_manager.logsafe import safe_int, safe_text
+from plex_manager.logsafe import safe_guid, safe_int, safe_text
+
+
+def _sha12(value: str) -> str:
+    """The 12-hex sha256 prefix ``safe_guid`` appends -- recomputed independently."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
 @pytest.mark.parametrize("value", [0, 1, 999, -5, 2**63])
@@ -45,3 +54,69 @@ def test_safe_text_neutralizes_a_forged_log_record() -> None:
     cleaned = safe_text(forged)
     assert "\n" not in cleaned
     assert "\r" not in cleaned
+
+
+@pytest.mark.parametrize(
+    ("raw", "host", "secret"),
+    [
+        # passkey in the query string -- the classic private-tracker download URL
+        (
+            "https://tracker.example.org/download/123?passkey=SUPERSECRET",
+            "tracker.example.org",
+            "SUPERSECRET",
+        ),
+        # session token embedded in a PATH segment (not just the query)
+        (
+            "https://priv.tracker.net/rss/SECRETPATHTOKEN/movie.torrent",
+            "priv.tracker.net",
+            "SECRETPATHTOKEN",
+        ),
+        # credential in ``user:pass@`` userinfo -- ``hostname`` (not ``netloc``) drops it
+        (
+            "http://someuser:USERPASSKEY@idx.local/file?x=1",
+            "idx.local",
+            "USERPASSKEY",
+        ),
+        # non-default port + apikey query -- host kept, port and secret both dropped
+        (
+            "http://tracker.example.org:8080/get?apikey=TOPSECRET",
+            "tracker.example.org",
+            "TOPSECRET",
+        ),
+    ],
+)
+def test_safe_guid_redacts_url_shaped_guids(raw: str, host: str, secret: str) -> None:
+    """A URL-shaped GUID logs only ``<host>#<sha256-prefix>`` -- host kept for
+    diagnosability, the credential-bearing path/query/userinfo never emitted."""
+    result = safe_guid(raw)
+    assert result == f"{host}#{_sha12(raw)}"
+    assert host in result  # host preserved for diagnosability
+    assert secret not in result  # passkey / token / userinfo credential never leaked
+    assert "?" not in result  # the query string is gone
+    assert "/" not in result  # the path is gone
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Some.Movie.2020.1080p.WEB-DL.x264-GROUP",  # a title-style guid
+        "0123456789abcdef0123456789abcdef",  # a plain hex/info-hash-style id
+        "urn:uuid:12345678-1234-5678-1234-567812345678",  # scheme but NO netloc
+    ],
+)
+def test_safe_guid_passes_non_url_guids_through_unchanged(raw: str) -> None:
+    """A non-URL GUID is not secret-bearing, so it is logged as before (only the
+    ``safe_text`` CR/LF barrier applies)."""
+    assert safe_guid(raw) == safe_text(raw)
+    assert safe_guid(raw) == raw  # nothing to collapse in these inputs
+
+
+def test_safe_guid_hash_prefix_is_stable_and_release_distinguishing() -> None:
+    """The hash is deterministic (so the beta-week analysis can correlate repeated
+    failures of the SAME release) yet varies with the full GUID (so two different
+    releases on the SAME host do not collide)."""
+    url = "https://tracker.example.org/x?passkey=SECRET"
+    assert safe_guid(url) == safe_guid(url)  # stable across calls
+    other = safe_guid("https://tracker.example.org/x?passkey=OTHER")
+    assert other != safe_guid(url)  # same host, different secret -> different hash
+    assert other.startswith("tracker.example.org#")

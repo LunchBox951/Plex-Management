@@ -66,7 +66,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
-from plex_manager.logsafe import safe_text
+from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -717,11 +717,18 @@ async def run_grab_cycle(
                 # ``log_events`` at all. So, unlike the sibling handlers' "type name
                 # only" text, THIS message deliberately interpolates them so the data
                 # this telemetry exists for actually survives the beta week, not just
-                # this process's lifetime. Release identity is external Prowlarr text
-                # -- fine to log (never a secret/credential-bearing URL), but run
-                # through ``safe_text`` (log-hygiene convention, #35): CodeQL's
-                # py/log-injection taints message args and ``extra=`` fields alike,
-                # and CR/LF must not be able to forge a second log record.
+                # this process's lifetime. ``title``/``indexer``/``info_hash`` are
+                # external Prowlarr text run through ``safe_text`` (log-hygiene
+                # convention, #35): CodeQL's py/log-injection taints message args and
+                # ``extra=`` fields alike, and CR/LF must not be able to forge a
+                # second log record. ``guid`` gets the stronger ``safe_guid`` barrier
+                # (Codex P1): a Prowlarr private-indexer GUID is frequently a URL that
+                # embeds a tracker passkey/session token in its path/query, so it is
+                # NOT safe to log verbatim (north star #3). ``safe_guid`` emits only
+                # ``<host>#<sha256-prefix>`` for a URL-shaped GUID -- host kept for
+                # diagnosability, the credential-bearing remainder never persisted to
+                # ``log_events``/``/ops/logs``, and the stable hash still lets the
+                # beta-week analysis correlate repeated failures of the SAME release.
                 await session.rollback()
                 source_failures += 1
                 release = scored.candidate
@@ -732,7 +739,7 @@ async def run_grab_cycle(
                     type(exc).__name__,
                     safe_text(release.title),
                     safe_text(release.indexer_name),
-                    safe_text(release.guid),
+                    safe_guid(release.guid),
                     safe_text(release.info_hash) if release.info_hash else "-",
                     scope.season if scope.season is not None else "-",
                     attempt,
@@ -743,7 +750,7 @@ async def run_grab_cycle(
                         "season": scope.season,
                         "source_title": safe_text(release.title),
                         "indexer": safe_text(release.indexer_name),
-                        "guid": safe_text(release.guid),
+                        "guid": safe_guid(release.guid),
                         "info_hash": safe_text(release.info_hash) if release.info_hash else None,
                         "attempt": attempt,
                         "attempts_total": len(candidates),

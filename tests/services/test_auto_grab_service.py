@@ -795,6 +795,48 @@ async def test_source_error_emits_structured_telemetry(
     assert "source_failures=1" in summaries[0].getMessage()
 
 
+async def test_source_error_redacts_url_shaped_guid(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex P1: a Prowlarr private-indexer GUID is frequently a URL embedding a
+    tracker passkey/session token. The source-unresolvable WARNING persists to
+    ``log_events``/``/ops/logs``, so both its message text AND its ``extra=`` guid
+    field must carry only ``<host>#<sha256-prefix>`` -- host for diagnosability,
+    the credential never emitted (north star #3)."""
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    url_guid = "https://priv.tracker.org/dl/movie?passkey=SUPERSECRETKEY"
+    await _seed_movie(sessionmaker_, tmdb_id=603)
+    # ``source_errors`` keys on the download_url, so the guid is free to be the URL
+    # under test while the qBittorrent source failure is still triggered.
+    prowlarr = FakeProwlarr([candidate(title, magnet=False, guid=url_guid)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.no_acceptable == 1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    record = warnings[0]
+
+    # ``extra=`` guid: host kept + a 12-hex correlatable hash, secret stripped.
+    logged_guid = getattr(record, "guid", None)
+    assert isinstance(logged_guid, str)
+    host, sep, digest = logged_guid.partition("#")
+    assert host == "priv.tracker.org"  # host preserved for diagnosability
+    assert sep == "#"
+    assert len(digest) == 12 and all(c in "0123456789abcdef" for c in digest)
+    assert "SUPERSECRETKEY" not in logged_guid
+    assert "passkey" not in logged_guid
+
+    # ...and NONE of the secret / query string survives into the persisted message.
+    message = record.getMessage()
+    assert "SUPERSECRETKEY" not in message
+    assert "passkey" not in message
+    assert "priv.tracker.org" in message  # host still readable off the message text
+
+
 async def test_no_source_errors_emits_zero_source_failures_in_summary(
     sessionmaker_: SessionMaker,
     caplog: pytest.LogCaptureFixture,
