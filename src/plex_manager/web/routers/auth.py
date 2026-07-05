@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.plex.oauth import PlexOAuthClient, PlexOAuthPending
@@ -244,7 +244,7 @@ async def _consume_pending_state(session: AsyncSession, state_id: int) -> None:
     """Atomically mark a PIN state consumed before issuing a browser session."""
 
     result = cast(
-        "Any",
+        CursorResult[Any],
         await session.execute(
             update(PlexLoginState)
             .where(PlexLoginState.id == state_id, PlexLoginState.consumed_at.is_(None))
