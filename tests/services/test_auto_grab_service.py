@@ -11,6 +11,7 @@ scope behind backoff).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -820,21 +821,24 @@ async def test_source_error_redacts_url_shaped_guid(
     assert len(warnings) == 1
     record = warnings[0]
 
-    # ``extra=`` guid: host kept + a 12-hex correlatable hash, secret stripped.
-    logged_guid = getattr(record, "guid", None)
-    assert isinstance(logged_guid, str)
-    host, sep, digest = logged_guid.partition("#")
-    assert host == "priv.tracker.org"  # host preserved for diagnosability
-    assert sep == "#"
-    assert len(digest) == 12 and all(c in "0123456789abcdef" for c in digest)
-    assert "SUPERSECRETKEY" not in logged_guid
-    assert "passkey" not in logged_guid
+    # The exact redacted token, recomputed INDEPENDENTLY of ``safe_guid`` (so a
+    # broken helper cannot vacuously satisfy this test). Exact-token equality --
+    # never a bare host-substring check, which CodeQL flags as
+    # py/incomplete-url-substring-sanitization ("priv.tracker.org" could sit at
+    # an arbitrary position inside an unredacted URL).
+    expected_guid = f"priv.tracker.org#{hashlib.sha256(url_guid.encode('utf-8')).hexdigest()[:12]}"
 
-    # ...and NONE of the secret / query string survives into the persisted message.
+    # ``extra=`` guid: exactly host + hash, secret stripped.
+    assert getattr(record, "guid", None) == expected_guid
+    assert "SUPERSECRETKEY" not in expected_guid
+    assert "passkey" not in expected_guid
+
+    # ...and the message carries exactly that redacted token (``%r``-formatted),
+    # while NONE of the secret / query string survives into the persisted text.
     message = record.getMessage()
+    assert f"guid={expected_guid!r}" in message
     assert "SUPERSECRETKEY" not in message
     assert "passkey" not in message
-    assert "priv.tracker.org" in message  # host still readable off the message text
 
 
 async def test_no_source_errors_emits_zero_source_failures_in_summary(

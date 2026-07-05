@@ -87,10 +87,13 @@ def test_safe_text_neutralizes_a_forged_log_record() -> None:
 )
 def test_safe_guid_redacts_url_shaped_guids(raw: str, host: str, secret: str) -> None:
     """A URL-shaped GUID logs only ``<host>#<sha256-prefix>`` -- host kept for
-    diagnosability, the credential-bearing path/query/userinfo never emitted."""
+    diagnosability, the credential-bearing path/query/userinfo never emitted.
+
+    The positive check is EXACT-token equality -- never a host-substring ``in``
+    check, which CodeQL flags as py/incomplete-url-substring-sanitization (a
+    host name can sit at an arbitrary position inside an unredacted URL)."""
     result = safe_guid(raw)
-    assert result == f"{host}#{_sha12(raw)}"
-    assert host in result  # host preserved for diagnosability
+    assert result == f"{host}#{_sha12(raw)}"  # exactly host + hash -- nothing else
     assert secret not in result  # passkey / token / userinfo credential never leaked
     assert "?" not in result  # the query string is gone
     assert "/" not in result  # the path is gone
@@ -114,9 +117,11 @@ def test_safe_guid_passes_non_url_guids_through_unchanged(raw: str) -> None:
 def test_safe_guid_hash_prefix_is_stable_and_release_distinguishing() -> None:
     """The hash is deterministic (so the beta-week analysis can correlate repeated
     failures of the SAME release) yet varies with the full GUID (so two different
-    releases on the SAME host do not collide)."""
+    releases on the SAME host do not collide). Exact-token comparisons only --
+    no ``startswith(host)`` shape (py/incomplete-url-substring-sanitization)."""
     url = "https://tracker.example.org/x?passkey=SECRET"
     assert safe_guid(url) == safe_guid(url)  # stable across calls
-    other = safe_guid("https://tracker.example.org/x?passkey=OTHER")
+    other_url = "https://tracker.example.org/x?passkey=OTHER"
+    other = safe_guid(other_url)
     assert other != safe_guid(url)  # same host, different secret -> different hash
-    assert other.startswith("tracker.example.org#")
+    assert other == f"tracker.example.org#{_sha12(other_url)}"  # exact expected token
