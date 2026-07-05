@@ -1,9 +1,14 @@
-"""Plex hosted sign-in helpers.
+"""Plex account verification against plex.tv's JSON v2 API.
 
-This adapter owns the plex.tv PIN flow used for human login. It is separate from
-``PlexLibrary`` because the library adapter talks to one configured Plex server,
-while this module talks to plex.tv and then verifies that the signed-in account
-owns the configured server.
+The browser runs the plex.tv PIN flow itself and hands the resulting token to
+the backend; this adapter re-derives identity and server ownership server-side
+before any user or session is written. It talks to plex.tv's ``api/v2`` JSON
+endpoints (``/user`` returns a flat object, ``/resources`` returns an array) and
+to one Plex server's ``/identity`` probe.
+
+Every failure raises :class:`PlexVerifyError` with a stable ``code`` (a
+user-facing error identifier) and non-secret ``diagnostics`` only — Plex tokens
+never appear in a message, a diagnostics value, or a log line.
 """
 
 from __future__ import annotations
@@ -11,45 +16,46 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from typing import Final, cast
-from urllib.parse import urlencode
 
 import httpx
 
 __all__ = [
     "PlexAccount",
-    "PlexOAuthClient",
-    "PlexOAuthError",
-    "PlexOAuthPending",
-    "PlexPin",
+    "PlexConnection",
     "PlexResource",
-    "owner_has_server",
+    "PlexTvClient",
+    "PlexVerifyError",
+    "account_server_resource",
+    "find_owned_server",
+    "owned_servers",
 ]
 
 _PLEX_TV_BASE_URL: Final = "https://plex.tv"
-_PLEX_AUTH_BASE_URL: Final = "https://app.plex.tv/auth"
+_PLEX_TV_HOST: Final = "plex.tv"
 _HTTP_UNAUTHORIZED: Final = 401
 _HTTP_FORBIDDEN: Final = 403
 
-
-class PlexOAuthError(RuntimeError):
-    """Raised when plex.tv or the configured server returns an unusable response."""
-
-
-class PlexOAuthPending(PlexOAuthError):
-    """Raised while a PIN exists but the user has not approved it yet."""
+# Stable, user-facing error identifiers (see the web error taxonomy).
+_CODE_PLEX_TV_UNREACHABLE: Final = "plex_tv_unreachable_server"
+_CODE_TOKEN_INVALID: Final = "plex_token_invalid"  # noqa: S105 - error code, not a secret
+_CODE_IDENTITY_FAILED: Final = "server_identity_failed"
+_CODE_SERVER_UNREACHABLE: Final = "server_unreachable_from_backend"
 
 
-@dataclass(frozen=True)
-class PlexPin:
-    """One plex.tv PIN login challenge."""
+class PlexVerifyError(RuntimeError):
+    """plex.tv or the Plex server gave an unusable answer during verification.
 
-    pin_id: int
-    code: str
-    auth_url: str
-    expires_at: datetime
-    expires_in: int | None = None
+    ``code`` is a stable, user-facing error identifier (see the web error
+    taxonomy); ``diagnostics`` carries only non-secret context (host, status).
+    """
+
+    def __init__(
+        self, code: str, message: str, *, diagnostics: dict[str, str] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = diagnostics or {}
 
 
 @dataclass(frozen=True)
@@ -63,12 +69,26 @@ class PlexAccount:
 
 
 @dataclass(frozen=True)
+class PlexConnection:
+    """One reachable address advertised for a Plex resource."""
+
+    uri: str
+    address: str | None
+    port: int | None
+    local: bool
+    relay: bool
+    protocol: str | None
+
+
+@dataclass(frozen=True)
 class PlexResource:
-    """One resource from ``/api/resources`` relevant to owner checks."""
+    """One device from ``/api/v2/resources`` relevant to owner/access checks."""
 
     name: str | None
     client_identifier: str | None
     owned: bool
+    provides: tuple[str, ...]
+    connections: tuple[PlexConnection, ...]
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -102,11 +122,12 @@ def _get_int(fields: Mapping[str, object], key: str) -> int | None:
 def _get_bool(fields: Mapping[str, object], key: str) -> bool:
     """Parse a Plex boolean, tolerating every shape plex.tv encodes them in.
 
-    Resource payloads are XML-derived, so a boolean field (e.g. ``owned``) can
-    arrive as a real ``bool``, an ``int`` (``1`` / ``0``), or a string
-    (``"1"`` / ``"0"`` / ``"true"`` / ``"false"``, case-insensitive). Recognizing
-    only ``True`` / ``"true"`` would read the REAL server owner's ``owned=1`` as
-    ``False`` and lock them out of every ``require_admin`` route.
+    v2 JSON uses real booleans, but resource payloads have historically been
+    XML-derived, so a boolean field (e.g. ``owned``) can arrive as a real
+    ``bool``, an ``int`` (``1`` / ``0``), or a string (``"1"`` / ``"0"`` /
+    ``"true"`` / ``"false"``, case-insensitive). Recognizing only ``True`` /
+    ``"true"`` would read the REAL server owner's ``owned=1`` as ``False`` and
+    lock them out of every ``require_admin`` route.
 
     Fails CLOSED for ownership: any value outside the known truthy encodings maps
     to ``False``, so an unexpected shape (an int other than ``1``, an unknown
@@ -126,75 +147,109 @@ def _media_container(payload: Mapping[str, object]) -> Mapping[str, object]:
     return _as_mapping(payload.get("MediaContainer"))
 
 
-def owner_has_server(resources: Sequence[PlexResource], machine_identifier: str) -> bool:
-    """Whether the signed-in account owns the configured Plex server."""
+def _parse_provides(value: object) -> tuple[str, ...]:
+    """Split plex.tv's comma-joined ``provides`` string, dropping empty entries."""
+    if not isinstance(value, str):
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
 
-    return any(
-        resource.owned and resource.client_identifier == machine_identifier
-        for resource in resources
+
+def _parse_connections(value: object) -> tuple[PlexConnection, ...]:
+    connections: list[PlexConnection] = []
+    for item in _as_sequence(value):
+        fields = _as_mapping(item)
+        uri = _get_str(fields, "uri")
+        if uri is None:
+            continue  # a connection without a uri is unusable
+        connections.append(
+            PlexConnection(
+                uri=uri,
+                address=_get_str(fields, "address"),
+                port=_get_int(fields, "port"),
+                local=_get_bool(fields, "local"),
+                relay=_get_bool(fields, "relay"),
+                protocol=_get_str(fields, "protocol"),
+            )
+        )
+    return tuple(connections)
+
+
+def owned_servers(resources: Sequence[PlexResource]) -> list[PlexResource]:
+    """The account's OWN Plex Media Servers (owned and provides 'server')."""
+    return [r for r in resources if r.owned and "server" in r.provides and r.client_identifier]
+
+
+def find_owned_server(
+    resources: Sequence[PlexResource], machine_identifier: str
+) -> PlexResource | None:
+    return next(
+        (r for r in owned_servers(resources) if r.client_identifier == machine_identifier), None
     )
 
 
-class PlexOAuthClient:
-    """Small async client for Plex hosted login and owner verification."""
+def account_server_resource(
+    resources: Sequence[PlexResource], machine_identifier: str
+) -> PlexResource | None:
+    """Any resource (owned or shared) matching the configured server."""
+    return next(
+        (
+            r
+            for r in resources
+            if "server" in r.provides and r.client_identifier == machine_identifier
+        ),
+        None,
+    )
+
+
+class PlexTvClient:
+    """Small async client for plex.tv v2 verification and server identity."""
 
     def __init__(self, client: httpx.AsyncClient, *, client_identifier: str) -> None:
         self._client = client
         self._client_identifier = client_identifier
 
     def __repr__(self) -> str:  # pragma: no cover - trivial redaction guard
-        return f"PlexOAuthClient(client_identifier={self._client_identifier!r})"
-
-    async def create_pin(self, *, return_url: str) -> PlexPin:
-        payload = await self._request_json(
-            "POST",
-            f"{_PLEX_TV_BASE_URL}/api/v2/pins",
-            params={"strong": "true"},
-            headers=self._client_headers(),
-        )
-        return self.parse_pin(
-            payload,
-            client_identifier=self._client_identifier,
-            return_url=return_url,
-        )
-
-    async def poll_pin(self, pin_id: int) -> str:
-        payload = await self._request_json(
-            "GET",
-            f"{_PLEX_TV_BASE_URL}/api/v2/pins/{pin_id}",
-            headers=self._client_headers(),
-        )
-        token = _get_str(payload, "authToken")
-        if token is None:
-            raise PlexOAuthPending("plex pin authorization is still pending")
-        return token
+        return f"PlexTvClient(client_identifier={self._client_identifier!r})"
 
     async def fetch_account(self, auth_token: str) -> PlexAccount:
         payload = await self._request_json(
             "GET",
-            f"{_PLEX_TV_BASE_URL}/users/account.json",
+            f"{_PLEX_TV_BASE_URL}/api/v2/user",
             headers=self._token_headers(auth_token),
+            unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
+            bad_response_code=_CODE_PLEX_TV_UNREACHABLE,
+            invalid_token_code=_CODE_TOKEN_INVALID,
         )
         return self.parse_account(payload)
 
     async def fetch_resources(self, auth_token: str) -> list[PlexResource]:
         payload = await self._request_json(
             "GET",
-            f"{_PLEX_TV_BASE_URL}/api/resources",
+            f"{_PLEX_TV_BASE_URL}/api/v2/resources",
             params={"includeHttps": "1"},
             headers=self._token_headers(auth_token),
+            unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
+            bad_response_code=_CODE_PLEX_TV_UNREACHABLE,
+            invalid_token_code=_CODE_TOKEN_INVALID,
         )
         return self.parse_resources(payload)
 
     async def fetch_server_identity(self, base_url: str, service_token: str) -> str:
+        url = f"{base_url.rstrip('/')}/identity"
         payload = await self._request_json(
             "GET",
-            f"{base_url.rstrip('/')}/identity",
-            headers={"X-Plex-Token": service_token, "Accept": "application/json"},
+            url,
+            headers=self._token_headers(service_token),
+            unreachable_code=_CODE_SERVER_UNREACHABLE,
+            bad_response_code=_CODE_IDENTITY_FAILED,
         )
         identity = _get_str(_media_container(payload), "machineIdentifier")
         if identity is None:
-            raise PlexOAuthError("Plex server identity response did not include machineIdentifier")
+            raise PlexVerifyError(
+                _CODE_IDENTITY_FAILED,
+                "Plex server identity response did not include machineIdentifier",
+                diagnostics={"host": httpx.URL(url).host},
+            )
         return identity
 
     async def _request_json(
@@ -204,25 +259,39 @@ class PlexOAuthClient:
         *,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str],
+        unreachable_code: str,
+        bad_response_code: str,
+        invalid_token_code: str | None = None,
     ) -> Mapping[str, object]:
+        host = httpx.URL(url).host
         try:
             response = await self._client.request(method, url, params=params, headers=headers)
         except httpx.RequestError as exc:
-            raise PlexOAuthError(f"Plex OAuth request failed: {method} {_safe_path(url)}") from exc
+            raise PlexVerifyError(
+                unreachable_code,
+                f"Plex request failed: {method} {_safe_path(url)}",
+                diagnostics={"host": host},
+            ) from exc
         status = response.status_code
-        if status in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
-            raise PlexOAuthError(
-                f"Plex OAuth request rejected: {method} {_safe_path(url)} ({status})"
+        if invalid_token_code is not None and status in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
+            raise PlexVerifyError(
+                invalid_token_code,
+                f"Plex request rejected: {method} {_safe_path(url)} ({status})",
+                diagnostics={"host": host, "status": str(status)},
             )
         if response.is_error:
-            raise PlexOAuthError(
-                f"Plex OAuth request failed: {method} {_safe_path(url)} ({status})"
+            raise PlexVerifyError(
+                bad_response_code,
+                f"Plex request failed: {method} {_safe_path(url)} ({status})",
+                diagnostics={"host": host, "status": str(status)},
             )
         try:
             payload = cast("object", response.json())
         except (json.JSONDecodeError, ValueError) as exc:
-            raise PlexOAuthError(
-                f"Plex OAuth returned a non-JSON response: {method} {_safe_path(url)}"
+            raise PlexVerifyError(
+                bad_response_code,
+                f"Plex returned a non-JSON response: {method} {_safe_path(url)}",
+                diagnostics={"host": host},
             ) from exc
         if isinstance(payload, list):
             return {"items": cast("list[object]", payload)}
@@ -241,86 +310,40 @@ class PlexOAuthClient:
         return headers
 
     @classmethod
-    def parse_pin(
-        cls,
-        payload: Mapping[str, object],
-        *,
-        client_identifier: str = "",
-        now: datetime | None = None,
-        return_url: str | None = None,
-    ) -> PlexPin:
-        pin_id = _get_int(payload, "id")
-        code = _get_str(payload, "code")
-        if pin_id is None or code is None:
-            raise PlexOAuthError("Plex PIN response did not include id and code")
-        expires_in = _get_int(payload, "expiresIn")
-        issued_at = now or datetime.now(UTC)
-        expires_at = issued_at + timedelta(seconds=expires_in or 600)
-        return PlexPin(
-            pin_id=pin_id,
-            code=code,
-            auth_url=_build_auth_url(
-                client_identifier=client_identifier,
-                code=code,
-                return_url=return_url,
-            ),
-            expires_at=expires_at,
-            expires_in=expires_in,
-        )
-
-    @classmethod
     def parse_account(cls, payload: Mapping[str, object]) -> PlexAccount:
-        account = _as_mapping(payload.get("user")) or payload
-        plex_id = _get_int(account, "id")
-        username = _get_str(account, "username") or _get_str(account, "title")
+        # v2 /user is a FLAT object: id/username/title/email/thumb at top level.
+        plex_id = _get_int(payload, "id")
+        username = _get_str(payload, "username") or _get_str(payload, "title")
         if plex_id is None or username is None:
-            raise PlexOAuthError("Plex account response did not include id and username")
+            raise PlexVerifyError(
+                _CODE_PLEX_TV_UNREACHABLE,
+                "Plex account response did not include id and username",
+                diagnostics={"host": _PLEX_TV_HOST},
+            )
         return PlexAccount(
             plex_id=plex_id,
             username=username,
-            email=_get_str(account, "email"),
-            avatar_url=_get_str(account, "thumb"),
+            email=_get_str(payload, "email"),
+            avatar_url=_get_str(payload, "thumb"),
         )
 
     @classmethod
-    def parse_resources(cls, payload: object) -> list[PlexResource]:
-        if isinstance(payload, Mapping):
-            typed_payload = cast("Mapping[str, object]", payload)
-            container = _media_container(typed_payload)
-            raw_items = _as_sequence(container.get("Device"))
-            if not raw_items:
-                raw_items = _as_sequence(typed_payload.get("items"))
-        else:
-            raw_items = _as_sequence(payload)
+    def parse_resources(cls, payload: Mapping[str, object]) -> list[PlexResource]:
+        # v2 /resources is a JSON array; ``_request_json`` wraps it as {"items": [...]}.
         resources: list[PlexResource] = []
-        for item in raw_items:
+        for item in _as_sequence(payload.get("items")):
             fields = _as_mapping(item)
             resources.append(
                 PlexResource(
                     name=_get_str(fields, "name"),
                     client_identifier=_get_str(fields, "clientIdentifier"),
                     owned=_get_bool(fields, "owned"),
+                    provides=_parse_provides(fields.get("provides")),
+                    connections=_parse_connections(fields.get("connections")),
                 )
             )
         return resources
 
 
 def _safe_path(url: str) -> str:
-    parsed = httpx.URL(url)
-    return parsed.path
-
-
-def _build_auth_url(
-    *,
-    client_identifier: str,
-    code: str,
-    return_url: str | None,
-) -> str:
-    params = {
-        "clientID": client_identifier,
-        "code": code,
-        "context[device][product]": "Plex Manager",
-    }
-    if return_url:
-        params["forwardUrl"] = return_url
-    return f"{_PLEX_AUTH_BASE_URL}#?{urlencode(params)}"
+    return httpx.URL(url).path
