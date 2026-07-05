@@ -102,9 +102,11 @@ LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
 #: is 7 days, which would otherwise prune day-1 telemetry before day 7 even
 #: arrives. Rather than bumping the general retention (which would also retain
 #: ordinary noisy INFO/WARNING/ERROR chatter far longer than needed, growing
-#: ``log_events`` for no benefit), :func:`prune_once` gives rows from THIS one
-#: logger their own cutoff — using the existing ``LogEvent.logger`` column as the
-#: marker, no schema change. This constant is a FLOOR, not a fixed window:
+#: ``log_events`` for no benefit), :func:`prune_once` gives rows from the
+#: telemetry loggers (:data:`_TELEMETRY_LOGGERS` — this one plus the decision/
+#: auto-grab emitters below) their own cutoff — using the existing
+#: ``LogEvent.logger`` column as the marker, no schema change. The
+#: retention-days constant is a FLOOR, not a fixed window:
 #: :func:`prune_once` retains telemetry for ``max(TELEMETRY_LOG_RETENTION_DAYS,
 #: log_retention_days)`` days, so it is never pruned earlier than 30 days AND
 #: never earlier than the operator's own general retention (an operator who sets
@@ -130,18 +132,34 @@ _TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
 #: ``source_failures`` rollup) at INFO -- at an operator ``log_level`` of WARNING/
 #: ERROR either dataset would otherwise silently never reach ``log_events``. Each
 #: name equals its module's dotted path; the modules construct their ``_logger``
-#: FROM these constants (retention precedent) so the emitter and the pin below can
-#: never drift apart under a rename. Pinning is per MODULE logger, matching the
-#: retention pin: for ``decision_service`` the aggregate is the module's only INFO
-#: record; for ``auto_grab_service`` the pin additionally admits one rare
-#: non-telemetry INFO ("active download appeared before park") past a WARNING
-#: floor -- accepted collateral, chosen over splintering one module across two
-#: logger names (which would complicate ``log_events`` filtering by ``logger``).
+#: FROM these constants (retention precedent) so the emitter and the treatment
+#: below can never drift apart under a rename. The treatment is per MODULE
+#: logger, matching the retention precedent: for ``decision_service`` the
+#: aggregate is the module's only INFO record; for ``auto_grab_service`` it
+#: additionally covers the enriched per-release source-failure WARNINGs (wanted:
+#: they carry the release identity the #43 "same source keeps failing" analysis
+#: correlates on) and admits one rare non-telemetry INFO ("active download
+#: appeared before park") -- accepted collateral, chosen over splintering one
+#: module across two logger names (which would complicate ``log_events``
+#: filtering by ``logger``).
 DECISION_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.decision_service"
 AUTO_GRAB_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.auto_grab_service"
 
-#: Every logger :func:`configure_logging` pins to :data:`_TELEMETRY_LOGGER_LEVEL`.
-_TELEMETRY_LOGGERS_TO_PIN: Final = (
+#: THE definition of "a telemetry logger" -- deliberately one tuple driving BOTH
+#: telemetry behaviors, so they can never drift apart:
+#:
+#: 1. :func:`configure_logging` pins each name to :data:`_TELEMETRY_LOGGER_LEVEL`
+#:    (INFO), so the dataset is CREATED at any operator ``log_level``; and
+#: 2. :func:`prune_once` gives each name's rows the longer
+#:    :data:`TELEMETRY_LOG_RETENTION_DAYS` floor, so the dataset SURVIVES the
+#:    operator's ``log_retention_days`` (default 7) for the whole beta window.
+#:
+#: Half-treatment is exactly the bug class this tuple exists to prevent: a pinned
+#: -but-not-retained logger emits data that the default prune deletes just as the
+#: beta week completes; a retained-but-not-pinned logger keeps rows it never
+#: creates under a WARNING floor. A logger belongs here iff its records ARE the
+#: beta dataset.
+_TELEMETRY_LOGGERS: Final = (
     TELEMETRY_LOGGER_NAME,
     DECISION_TELEMETRY_LOGGER_NAME,
     AUTO_GRAB_TELEMETRY_LOGGER_NAME,
@@ -404,7 +422,7 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     same quieting so no test path silently relies on the child not having it.
 
     Symmetrically, pins every beta-telemetry logger
-    (:data:`_TELEMETRY_LOGGERS_TO_PIN`: the retention sweep, the decision
+    (:data:`_TELEMETRY_LOGGERS`: the retention sweep, the decision
     multi-season aggregate, and the auto-grab per-cycle summary) to
     :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so their INFO records reach the durable
     ``log_events`` sink at ANY operator ``level``. The handler is attached to the
@@ -432,7 +450,7 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target.setLevel(_resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
-    for name in _TELEMETRY_LOGGERS_TO_PIN:
+    for name in _TELEMETRY_LOGGERS:
         logging.getLogger(name).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler
 
@@ -498,21 +516,28 @@ async def drain_once(
 async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
     """Delete every stale ``log_events`` row -- TWO separate cutoffs, TWO deletes.
 
-    Every logger EXCEPT :data:`TELEMETRY_LOGGER_NAME` is pruned on the
-    operator-editable ``retention_days`` (the web-editable ``log_retention_days``
-    setting, default 7) exactly as before. Rows FROM that one logger are pruned on
-    their OWN, never-shorter cutoff: ``max(TELEMETRY_LOG_RETENTION_DAYS,
-    retention_days)`` days. That ``max`` is the whole point of the carve-out —
+    Every logger EXCEPT the telemetry loggers (:data:`_TELEMETRY_LOGGERS`: the
+    retention sweep, the decision multi-season aggregate, the auto-grab cycle
+    summary) is pruned on the operator-editable ``retention_days`` (the
+    web-editable ``log_retention_days`` setting, default 7) exactly as before.
+    Rows FROM those loggers are pruned on their OWN, never-shorter cutoff:
+    ``max(TELEMETRY_LOG_RETENTION_DAYS, retention_days)`` days. That ``max`` is
+    the whole point of the carve-out —
 
     * an operator on the default (or any ``retention_days`` below 30) still keeps
       the beta-week telemetry a full 30 days, so a short general retention can
-      never prune the dataset before the week is up; and
+      never prune any of the datasets before the week is up (with only the
+      original single-logger carve-out, the #24/#43 rows were deleted at the
+      operator window — day-1 data gone just as the week completed); and
     * an operator who deliberately RAISES ``log_retention_days`` to 60/90 keeps
       telemetry AT LEAST as long as everything else — the carve-out is a floor,
       never a ceiling, so telemetry is never pruned EARLIER than the operator's
       own window (the bug a fixed 30-day cutoff would introduce above 30).
 
-    See :data:`TELEMETRY_LOGGER_NAME`'s docstring for the full rationale.
+    Sharing :data:`_TELEMETRY_LOGGERS` with :func:`configure_logging`'s INFO pin
+    is deliberate — see that tuple's docstring: pinned-but-not-retained (or the
+    reverse) is the half-treatment bug class this coupling prevents. See
+    :data:`TELEMETRY_LOGGER_NAME`'s docstring for the retention-window rationale.
 
     Returns the total rows removed across both deletes. ``retention_days <= 0``
     is treated as "keep nothing older than now" rather than skipped for the
@@ -522,12 +547,10 @@ async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
     """
     now = datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
-    pruned = await repo.prune_older_than(
-        cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=True
-    )
+    pruned = await repo.prune_older_than(cutoff, loggers=_TELEMETRY_LOGGERS, exclude_loggers=True)
     telemetry_retention_days = max(TELEMETRY_LOG_RETENTION_DAYS, retention_days)
     telemetry_cutoff = now - timedelta(days=telemetry_retention_days)
     pruned += await repo.prune_older_than(
-        telemetry_cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=False
+        telemetry_cutoff, loggers=_TELEMETRY_LOGGERS, exclude_loggers=False
     )
     return pruned

@@ -659,8 +659,8 @@ class LogEventRepository(Protocol):
         self,
         cutoff: datetime,
         *,
-        logger_equals: str | None = None,
-        exclude_logger: bool = False,
+        loggers: Sequence[str] | None = None,
+        exclude_loggers: bool = False,
     ) -> int:
         """Delete every record with ``created_at < cutoff``; return the count removed.
 
@@ -669,16 +669,21 @@ class LogEventRepository(Protocol):
         here: this never masks a failure, and the real count lets the sweep log
         what it actually did rather than assuming success.
 
-        ``logger_equals`` optionally scopes the delete to rows whose ``logger``
-        column matches exactly (``None`` = no scoping, every stale row). Combined
-        with ``exclude_logger`` this gives the retention-telemetry sweep
-        (``services.retention_telemetry_service``) its OWN, longer retention
-        window without a schema change: :func:`~plex_manager.services.
-        log_capture_service.prune_once` calls this twice per tick -- once with
-        ``exclude_logger=True`` (the ordinary ``log_retention_days`` cutoff,
-        skipping telemetry rows entirely) and once with ``exclude_logger=False``
-        (telemetry rows only, on their own longer cutoff) -- so a short
-        operator-configured ``log_retention_days`` can never prune telemetry data
-        out from under the beta-week analysis before it is used.
+        ``loggers`` optionally scopes the delete to rows whose ``logger`` column
+        matches one of the given names exactly (``None`` = no scoping, every
+        stale row). Combined with ``exclude_loggers`` this gives the beta-week
+        telemetry emitters (the retention sweep, the decision multi-season
+        aggregate, the auto-grab cycle summary -- ``services.log_capture_service.
+        _TELEMETRY_LOGGERS``) their OWN, longer retention window without a schema
+        change: :func:`~plex_manager.services.log_capture_service.prune_once`
+        calls this twice per tick -- once with ``exclude_loggers=True`` (the
+        ordinary ``log_retention_days`` cutoff, skipping telemetry rows entirely)
+        and once with ``exclude_loggers=False`` (telemetry rows only, on their
+        own longer cutoff) -- so a short operator-configured
+        ``log_retention_days`` can never prune telemetry data out from under the
+        beta-week analysis before it is used. The exclusion delete needs a
+        multi-name ``NOT IN`` in ONE statement -- composing it from per-logger
+        excludes would wrongly delete each telemetry logger's rows on the passes
+        that name a different one.
         """
         raise NotImplementedError
