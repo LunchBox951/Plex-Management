@@ -10,12 +10,14 @@ row is ever written.
 
 from __future__ import annotations
 
-from ipaddress import AddressValueError, IPv4Address
+from ipaddress import AddressValueError, IPv4Address, IPv6Address
 from urllib.parse import urlsplit
 
 __all__ = [
     "INVALID_IPV4_MESSAGE",
+    "INVALID_IPV6_MESSAGE",
     "INVALID_URL_MESSAGE",
+    "IPV6_ZONE_ID_MESSAGE",
     "QUERY_FRAGMENT_MESSAGE",
     "url_shape_error",
 ]
@@ -23,6 +25,11 @@ __all__ = [
 INVALID_URL_MESSAGE = "Enter a valid http(s) URL."
 QUERY_FRAGMENT_MESSAGE = "Base URL must not contain a query or fragment."
 INVALID_IPV4_MESSAGE = "Invalid IPv4 address in host."
+INVALID_IPV6_MESSAGE = "Invalid IPv6 address in host."
+# Deliberately a SEPARATE message from INVALID_IPV6_MESSAGE: a zone-bearing
+# address ("fe80::1%eth0") IS valid IPv6, so calling it "invalid" would be
+# dishonest -- the zone id is simply not supported in a base service URL.
+IPV6_ZONE_ID_MESSAGE = "IPv6 zone ids are not supported in a base URL."
 
 # A hostname made of ONLY digits and dots is IPv4-shaped: it can never be a real
 # DNS name (a resolvable TLD is never all-numeric), so it must parse as a proper
@@ -85,8 +92,26 @@ def url_shape_error(url: str) -> str | None:
     a hostname, but httpx's own URL parser rejects them at request time -- so the
     value would persist and then fail at runtime instead of 422ing here.
     ``ipaddress.IPv4Address`` correctly rejects out-of-range octets AND
-    leading-zero octets. DNS names and IPv6 literals contain non-``[0-9.]``
-    characters and are deliberately NOT validated beyond the existing checks.
+    leading-zero octets. DNS names contain non-``[0-9.]`` characters and are
+    deliberately NOT validated beyond the existing checks.
+
+    A BRACKETED host must be a plain, zone-free IPv6 literal
+    (``ipaddress.IPv6Address``, no scope id) -- mirroring the IPv4 branch. On
+    current CPython ``urlsplit`` itself already rejects most invalid bracket
+    content (``[::1::2]``, ``[gggg::1]``, ``[1.2.3.4]`` all raise ``ValueError``,
+    caught above), so this closes the two forms it still tolerates:
+
+    * an IPvFuture literal (``http://[v7.abc]``) passes ``urlsplit``'s regex but
+      httpx raises the same uncaught ``httpx.InvalidURL`` at request time;
+    * a zone id (``[fe80::1%eth0]``, or the RFC 6874 ``%25``-encoded form) parses
+      everywhere, but is REJECTED BY POLICY with its own honest message: a
+      link-local zone id is meaningless to persist for a base service URL (the
+      interface name is host-specific), and the raw ``%`` in the authority is a
+      percent-encoding hazard for every downstream consumer of the raw string.
+
+    Valid IPv6 literals -- including uncommon-looking ones like ``[9999::1]``
+    (``9999`` is a legal hex group) and IPv4-mapped ``[::ffff:1.2.3.4]`` -- are
+    accepted unchanged.
     """
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in url):
         return INVALID_URL_MESSAGE
@@ -108,9 +133,21 @@ def url_shape_error(url: str) -> str | None:
     # which splits to an EMPTY query) is rejected too.
     if "?" in url or "#" in url:
         return QUERY_FRAGMENT_MESSAGE
-    # An IPv4-shaped host must be a real dotted quad -- urlsplit accepts
-    # "999.999.999.999" / "01.02.03.04" but httpx rejects them at request time.
-    if set(hostname) <= _IPV4_SHAPED_CHARS:
+    if "[" in parts.netloc:
+        # A bracketed host must be a plain, zone-free IPv6 literal. urlsplit
+        # already rejected most invalid bracket content above; this closes what it
+        # still tolerates -- an IPvFuture form ("[v7.abc]", httpx.InvalidURL at
+        # request time) and zone ids ("[fe80::1%eth0]", rejected by policy).
+        # ``.hostname`` is the bracket content with the brackets stripped.
+        try:
+            if IPv6Address(hostname).scope_id is not None:
+                return IPV6_ZONE_ID_MESSAGE
+        except AddressValueError:
+            return INVALID_IPV6_MESSAGE
+    elif set(hostname) <= _IPV4_SHAPED_CHARS:
+        # An IPv4-shaped host (digits and dots only) must be a real dotted quad --
+        # urlsplit accepts "999.999.999.999" / "01.02.03.04" but httpx rejects
+        # them at request time.
         try:
             IPv4Address(hostname)
         except AddressValueError:

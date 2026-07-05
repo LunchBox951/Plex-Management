@@ -222,6 +222,9 @@ _BAD_SERVICE_URLS = [
     "http://x#",  # bare fragment delimiter -- likewise
     "http://999.999.999.999",  # IPv4-shaped host with out-of-range octets
     "http://01.02.03.04",  # IPv4-shaped host with leading-zero octets
+    "http://[v7.abc]",  # IPvFuture -- urlsplit tolerates it, httpx raises InvalidURL
+    "http://[fe80::1%eth0]",  # IPv6 zone id -- rejected by policy for a base URL
+    "http://[fe80::1%25eth0]",  # RFC 6874 percent-encoded zone id -- likewise
 ]
 
 
@@ -271,6 +274,10 @@ async def test_put_settings_accepts_valid_https_service_url(
         "http://prowlarr.local:9696/",  # bare trailing slash
         "http://192.168.1.10:32400",  # valid dotted-quad IPv4 host
         "http://[::1]:32400",  # IPv6 literal host (untouched by the IPv4 check)
+        # VALID IPv6, despite looking suspicious: 9999 is a legal hex group. This
+        # was Codex PR #53 wave 4's claimed-broken example -- empirically urlsplit,
+        # ipaddress AND httpx all accept it, so it must stay accepted.
+        "http://[9999::1]:32400",
     ],
 )
 async def test_put_settings_accepts_legitimate_base_url_shapes(

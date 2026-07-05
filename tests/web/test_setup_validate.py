@@ -389,6 +389,61 @@ async def test_validate_prowlarr_accepts_dotted_quad_ipv4_host(
     assert response.json()["ok"] is True
 
 
+@pytest.mark.parametrize(
+    ("bad_url", "message"),
+    [
+        # IPvFuture: urlsplit's bracket check tolerates the "v<hex>.<...>" form,
+        # but httpx raises InvalidURL (NOT an HTTPError) at request time -- so
+        # pre-fix this was an uncaught 500, not a rejection (Codex PR #53 P2,
+        # wave 4).
+        ("http://[v7.abc]", "Invalid IPv6 address in host."),
+        # Zone ids parse everywhere (urlsplit, ipaddress, even httpx's URL
+        # parser) but are rejected BY POLICY for a base service URL: the
+        # interface name is host-specific and meaningless to persist, and the
+        # raw '%' in the authority is a percent-encoding hazard. Distinct honest
+        # message -- a zone-bearing address IS valid IPv6, so "invalid" would be
+        # a lie.
+        ("http://[fe80::1%eth0]", "IPv6 zone ids are not supported in a base URL."),
+        ("http://[fe80::1%25eth0]:9696", "IPv6 zone ids are not supported in a base URL."),
+    ],
+)
+async def test_validate_prowlarr_rejects_bad_bracketed_ipv6_host(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str, message: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == message
+
+
+async def test_validate_prowlarr_accepts_valid_ipv6_literal_host(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # [9999::1] LOOKS suspicious but is VALID IPv6 (9999 is a legal hex group) --
+    # it was Codex PR #53 wave 4's claimed-broken example, and empirically
+    # urlsplit, ipaddress and httpx all accept it. The bracketed-host check must
+    # not over-tighten: the probe proceeds to the real outbound request.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/system/status"
+        return httpx.Response(200, json={"version": "1.0"})
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://[9999::1]:9696", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    assert response.json()["ok"] is True
+
+
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(
     client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
 ) -> None:
