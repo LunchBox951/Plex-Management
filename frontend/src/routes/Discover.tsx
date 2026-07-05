@@ -4,6 +4,7 @@ import type { DiscoverResult } from '../api/types'
 import { deriveTileState } from '../lib/tileState'
 import { PosterCard } from '../components/ui/PosterCard'
 import { StatusBadge } from '../components/ui/StatusBadge'
+import { QuickRequestButton } from '../components/QuickRequestButton'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { TitleDetailModal } from '../components/TitleDetailModal'
 import { Row } from '../components/Row'
@@ -138,6 +139,7 @@ export function Discover() {
                 seed={title.tmdb_id}
                 onClick={() => openTitle(title)}
                 badge={state ? <StatusBadge status={state} /> : undefined}
+                action={state === null ? <QuickRequestButton item={title} /> : undefined}
               />
             )
           })}

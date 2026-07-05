@@ -3,6 +3,7 @@ import type { DiscoverResult } from '../api/types'
 import type { StatusPresentation } from '../lib/status'
 import { PosterCard } from './ui/PosterCard'
 import { StatusBadge } from './ui/StatusBadge'
+import { QuickRequestButton } from './QuickRequestButton'
 
 interface RowProps {
   title: string
@@ -97,6 +98,7 @@ export function Row({ title, items, onSelect, loading = false, tileState }: RowP
                       seed={item.tmdb_id}
                       onClick={() => onSelect(item)}
                       badge={state ? <StatusBadge status={state} /> : undefined}
+                      action={state === null ? <QuickRequestButton item={item} /> : undefined}
                     />
                   </div>
                 )
