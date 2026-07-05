@@ -97,6 +97,12 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
         title: 'Test.Movie.1080p.WEB-DL',
         seeders: 10,
         info_hash: 'hash1',
+        covered_seasons: [],
+        target_seasons: [],
+        upgrade_seasons: [],
+        waste_seasons: [],
+        ignored_seasons: [],
+        skipped_seasons: [],
       },
     ],
     rejected: [],
@@ -390,6 +396,12 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test.Show.S02.1080p.WEB-DL',
       seeders: 10,
       info_hash: 'hash3',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
     }
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
     ;(useSearchPreview as unknown as Mock).mockReturnValue(
@@ -442,6 +454,12 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test.Show.S02.1080p.WEB-DL',
       seeders: 10,
       info_hash: 'hash2',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
     }
     const createRequestMock = mutation(created)
     const searchPreviewMock = mutation({

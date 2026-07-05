@@ -14,6 +14,12 @@ function accepted(overrides: Partial<AcceptedRelease> = {}): AcceptedRelease {
     title: 'Some.Release.1080p.WEB-DL',
     seeders: 42,
     info_hash: 'abc',
+    covered_seasons: [],
+    target_seasons: [],
+    upgrade_seasons: [],
+    waste_seasons: [],
+    ignored_seasons: [],
+    skipped_seasons: [],
     ...overrides,
   }
 }
