@@ -123,6 +123,51 @@ describe('startRealtimeStream version awareness', () => {
   })
 })
 
+describe('startRealtimeStream backoff', () => {
+  it('escalates reconnect backoff when the stream dies right after headers', async () => {
+    // A proxy/server that returns 200 then closes the body immediately must NOT
+    // pin the reconnect loop at the base delay: backoff resets only after a
+    // connection outlives the stability window, so this flap escalates instead.
+    vi.useFakeTimers()
+    vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue('k')
+    let clock = 0
+    const fetchTimes: number[] = []
+    const fetchImpl = vi.fn(async () => {
+      fetchTimes.push(clock)
+      // 200 with a body that ends at once (one heartbeat comment, then EOF).
+      return { status: 200, ok: true, body: streamFrom(': ping\n\n') } as unknown as Response
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const stop = startRealtimeStream({
+      queryClient: qc,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 1000,
+      maxDelayMs: 60000,
+      // Every connection lives ~0ms (body closes instantly), always below this,
+      // so no cycle is ever treated as "healthy".
+      stabilityWindowMs: 10000,
+      now: () => clock,
+    })
+
+    // Drive many reconnect cycles, keeping the injected clock in lockstep with
+    // the fake timers so `now()` tracks wall time.
+    for (let t = 0; t <= 40000; t += 250) {
+      clock = t
+      await vi.advanceTimersByTimeAsync(250)
+    }
+
+    const gaps = fetchTimes.slice(1).map((t, i) => t - (fetchTimes[i] ?? 0))
+    expect(gaps.length).toBeGreaterThanOrEqual(3)
+    // The delay climbs past the base tier instead of looping at ~2s forever.
+    expect(gaps[gaps.length - 1]).toBeGreaterThan(gaps[0] ?? 0)
+    expect(Math.max(...gaps)).toBeGreaterThanOrEqual(7000)
+
+    stop()
+    qc.clear()
+  })
+})
+
 describe('startRealtimeStream watchdog', () => {
   it('aborts and reconnects when the stream goes silent past the threshold', async () => {
     vi.useFakeTimers()

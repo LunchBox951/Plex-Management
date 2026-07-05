@@ -294,6 +294,48 @@ async def test_events_stream_delivers_sync_published_event_and_heartbeat(
     await _wait_subscribers_zero(app)
 
 
+async def test_events_stream_delivers_event_published_after_heartbeats(
+    app: FastAPI,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An event enqueued after the stream has idled through heartbeats is still
+    delivered — the getter persists across each heartbeat timeout instead of being
+    cancelled, so no event is dropped on the heartbeat boundary (north-star #3)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setattr("plex_manager.web.routers.events._HEARTBEAT_SECONDS", 0.02)
+
+    async with _AsgiStream(app, _HEADERS) as stream:
+        assert stream.status == 200
+        sync = _data_json(await stream.next_frame())
+        assert sync["reason"] == "connected"
+
+        # Idle long enough to cross at least one heartbeat boundary.
+        saw_heartbeat = False
+        for _ in range(50):
+            frame = await stream.next_frame()
+            if frame.startswith(":"):
+                saw_heartbeat = True
+                break
+        assert saw_heartbeat
+
+        # Publish only now, after the getter has already survived a heartbeat.
+        publish_realtime(app, ("queue",), reason="progress", download_id=9)
+        saw_event = False
+        for _ in range(50):
+            frame = await stream.next_frame()
+            if frame.startswith(":"):
+                continue
+            payload = _data_json(frame)
+            if payload.get("download_id") == 9:
+                assert "queue" in payload["topics"]
+                saw_event = True
+                break
+        assert saw_event
+
+    await _wait_subscribers_zero(app)
+
+
 async def test_events_stream_closes_on_app_key_rotation(
     app: FastAPI,
     client: httpx.AsyncClient,

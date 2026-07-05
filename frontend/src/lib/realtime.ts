@@ -124,6 +124,15 @@ export interface RealtimeStreamOptions {
   heartbeatMs?: number
   /** Stale threshold: abort + reconnect after this much silence (~2.5x heartbeat). */
   watchdogMs?: number
+  /**
+   * Minimum lifetime a connection must reach before it counts as "healthy" and is
+   * allowed to reset the reconnect backoff. Without it, backoff would reset on the
+   * bare HTTP 200 — so a proxy/server that accepts the request then closes the
+   * body immediately (or right after the sync frame) pins the reconnect loop at
+   * the base delay forever instead of escalating. Defaults to one heartbeat
+   * interval: a stream that outlives a heartbeat is genuinely established.
+   */
+  stabilityWindowMs?: number
   /** Injectable clock for tests. */
   now?: () => number
 }
@@ -135,6 +144,7 @@ export function startRealtimeStream({
   maxDelayMs = 15000,
   heartbeatMs = 15000,
   watchdogMs = heartbeatMs * 2.5,
+  stabilityWindowMs = heartbeatMs,
   now = () => Date.now(),
 }: RealtimeStreamOptions): () => void {
   let stopped = false
@@ -185,6 +195,7 @@ export function startRealtimeStream({
       }
 
       controller = new AbortController()
+      let connectedAt: number | null = null
       try {
         const response = await fetchImpl('/api/v1/events', {
           headers: { 'X-Api-Key': key },
@@ -200,9 +211,9 @@ export function startRealtimeStream({
         if (!response.ok || response.body === null) {
           throw new Error(`realtime stream failed: ${response.status}`)
         }
-        attempt = 0
         setRealtimeConnected(true)
-        lastByteAt = now()
+        connectedAt = now()
+        lastByteAt = connectedAt
         armWatchdog()
         await parseSseStream(
           response.body,
@@ -224,6 +235,15 @@ export function startRealtimeStream({
       }
 
       if (stopped) return
+      // Reset backoff only once a connection has PROVEN healthy — i.e. it stayed
+      // live for at least the stability window. Resetting on the bare HTTP 200
+      // (before the body is consumed) would let an "accept-then-immediately-close"
+      // proxy pin this loop at the base delay indefinitely, re-opening a server DB
+      // session (require_api_key_short_session) every couple of seconds per tab; a
+      // stream that flaps that fast now escalates its backoff like any other.
+      if (connectedAt !== null && now() - connectedAt >= stabilityWindowMs) {
+        attempt = 0
+      }
       attempt += 1
       await sleep(Math.min(maxDelayMs, baseDelayMs * 2 ** Math.min(attempt, 4)))
     }
