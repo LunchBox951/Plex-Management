@@ -181,13 +181,15 @@ class SqlLogEventRepository:
         self,
         cutoff: datetime,
         *,
-        logger_equals: str | None = None,
-        exclude_logger: bool = False,
+        loggers: Sequence[str] | None = None,
+        exclude_loggers: bool = False,
     ) -> int:
         stmt = delete(LogEvent).where(LogEvent.created_at < cutoff)
-        if logger_equals is not None:
-            matches = LogEvent.logger == logger_equals
-            stmt = stmt.where(~matches if exclude_logger else matches)
+        if loggers is not None:
+            # ``LogEvent.logger`` is NOT NULL, so ``NOT IN`` cannot silently skip
+            # NULL rows -- the exclusion delete really covers every non-telemetry row.
+            matches = LogEvent.logger.in_(loggers)
+            stmt = stmt.where(~matches if exclude_loggers else matches)
         # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
         # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it).
         # The cast target is referenced at runtime (not a string) so CodeQL does

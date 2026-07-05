@@ -208,37 +208,41 @@ async def test_prune_older_than_is_a_noop_when_nothing_is_stale(session: AsyncSe
     assert removed == 0
 
 
-async def test_prune_older_than_excludes_a_logger_when_exclude_logger_is_set(
+async def test_prune_older_than_excludes_every_named_logger_when_exclude_loggers_is_set(
     session: AsyncSession,
 ) -> None:
-    """The retention-telemetry carve-out's building block: rows from the named
-    logger survive an otherwise-stale-matching prune when ``exclude_logger=True``."""
+    """The telemetry carve-out's building block: rows from EVERY named logger
+    survive an otherwise-stale-matching prune when ``exclude_loggers=True`` --
+    a single multi-name ``NOT IN``, because composing per-logger excludes would
+    wrongly delete each telemetry logger's rows on the passes naming another."""
     repo = SqlLogEventRepository(session)
-    await repo.create(level="INFO", logger="telemetry", message="spared", created_at=_T0)
+    await repo.create(level="INFO", logger="telemetry.a", message="spared a", created_at=_T0)
+    await repo.create(level="INFO", logger="telemetry.b", message="spared b", created_at=_T0)
     await repo.create(level="INFO", logger="ordinary", message="pruned", created_at=_T0)
 
     removed = await repo.prune_older_than(
-        _T0 + timedelta(days=1), logger_equals="telemetry", exclude_logger=True
+        _T0 + timedelta(days=1), loggers=("telemetry.a", "telemetry.b"), exclude_loggers=True
     )
     assert removed == 1
 
     remaining = (await session.execute(select(LogEvent))).scalars().all()
-    assert [row.message for row in remaining] == ["spared"]
+    assert sorted(row.message for row in remaining) == ["spared a", "spared b"]
 
 
-async def test_prune_older_than_targets_only_a_logger_when_exclude_logger_is_false(
+async def test_prune_older_than_targets_only_named_loggers_when_exclude_loggers_is_false(
     session: AsyncSession,
 ) -> None:
     """The telemetry-only prune (its own, longer cutoff): only rows from the
-    named logger are deleted, regardless of how stale any other row is."""
+    named loggers are deleted, regardless of how stale any other row is."""
     repo = SqlLogEventRepository(session)
-    await repo.create(level="INFO", logger="telemetry", message="pruned", created_at=_T0)
+    await repo.create(level="INFO", logger="telemetry.a", message="pruned a", created_at=_T0)
+    await repo.create(level="INFO", logger="telemetry.b", message="pruned b", created_at=_T0)
     await repo.create(level="INFO", logger="ordinary", message="spared", created_at=_T0)
 
     removed = await repo.prune_older_than(
-        _T0 + timedelta(days=1), logger_equals="telemetry", exclude_logger=False
+        _T0 + timedelta(days=1), loggers=("telemetry.a", "telemetry.b"), exclude_loggers=False
     )
-    assert removed == 1
+    assert removed == 2
 
     remaining = (await session.execute(select(LogEvent))).scalars().all()
     assert [row.message for row in remaining] == ["spared"]

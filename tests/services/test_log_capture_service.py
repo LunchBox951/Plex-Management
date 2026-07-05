@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.ports.repositories import LogEventCreate, LogEventPage, LogEventRecord
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services.log_capture_service import (
+    AUTO_GRAB_TELEMETRY_LOGGER_NAME,
+    DECISION_TELEMETRY_LOGGER_NAME,
     TELEMETRY_LOG_RETENTION_DAYS,
     TELEMETRY_LOGGER_NAME,
     CapturedLogRecord,
@@ -358,8 +360,8 @@ class _FailingRepo:
         self,
         cutoff: datetime,
         *,
-        logger_equals: str | None = None,
-        exclude_logger: bool = False,
+        loggers: Sequence[str] | None = None,
+        exclude_loggers: bool = False,
     ) -> int:
         raise NotImplementedError
 
@@ -463,6 +465,97 @@ async def test_prune_once_spares_telemetry_rows_within_their_own_longer_retentio
 
         remaining = await repo.list_events(limit=10)
     assert [r.message for r in remaining.results] == ["telemetry, 10 days old"]
+
+
+async def test_prune_once_spares_decision_and_auto_grab_telemetry_rows_too(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex P2 (carve-out gap): the decision multi-season aggregate (#24) and the
+    auto-grab cycle summary (#43) are INFO-pinned into ``log_events`` but were NOT
+    in the long-retention carve-out -- with the default ``log_retention_days=7``
+    their day-1 rows were deleted just as the beta week completed. The carve-out
+    now iterates the same ``_TELEMETRY_LOGGERS`` tuple the INFO pin uses (one
+    definition of "telemetry logger", both behaviors), so a 20-day-old row from
+    EITHER logger survives a 7-day operator window while an equally old ordinary
+    row is still pruned.
+
+    Wave-6 P2 refinement: the auto-grab member is the dedicated ``.telemetry``
+    CHILD, not the module logger -- an OPERATIONAL auto-grab row (search-failure
+    cooldowns, "accepted release unusable", logged on the module logger) obeys
+    the operator's window like any ordinary row, so a failing install's warning
+    stream can never dodge ``log_retention_days`` for 30 days."""
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        await repo.create(
+            level="INFO",
+            logger=DECISION_TELEMETRY_LOGGER_NAME,
+            message="decision telemetry, 20 days old",
+            created_at=now - timedelta(days=20),
+        )
+        await repo.create(
+            level="INFO",
+            logger=AUTO_GRAB_TELEMETRY_LOGGER_NAME,
+            message="auto-grab telemetry, 20 days old",
+            created_at=now - timedelta(days=20),
+        )
+        await repo.create(
+            level="INFO",
+            logger="plex_manager.services.reconciler",
+            message="ordinary, 20 days old",
+            created_at=now - timedelta(days=20),
+        )
+        # An operational auto-grab record rides the MODULE logger -- outside the
+        # carve-out by design (wave-6), so the operator window prunes it.
+        await repo.create(
+            level="WARNING",
+            logger="plex_manager.services.auto_grab_service",
+            message="operational auto-grab warning, 20 days old",
+            created_at=now - timedelta(days=20),
+        )
+        await session.commit()
+
+        removed = await prune_once(repo, retention_days=7)
+        await session.commit()
+        assert removed == 2  # the ordinary row AND the operational auto-grab row
+
+        remaining = await repo.list_events(limit=10)
+    assert sorted(r.message for r in remaining.results) == [
+        "auto-grab telemetry, 20 days old",
+        "decision telemetry, 20 days old",
+    ]
+
+
+async def test_prune_once_thirty_day_cap_applies_to_decision_and_auto_grab_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The new carve-out members share the 30-day FLOOR, not permanent retention:
+    40-day-old decision/auto-grab telemetry rows are past
+    ``TELEMETRY_LOG_RETENTION_DAYS`` and are pruned on that cutoff even with a
+    tiny operator window."""
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        await repo.create(
+            level="INFO",
+            logger=DECISION_TELEMETRY_LOGGER_NAME,
+            message="decision telemetry, 40 days old",
+            created_at=now - timedelta(days=40),
+        )
+        await repo.create(
+            level="INFO",
+            logger=AUTO_GRAB_TELEMETRY_LOGGER_NAME,
+            message="auto-grab telemetry, 40 days old",
+            created_at=now - timedelta(days=40),
+        )
+        await session.commit()
+
+        removed = await prune_once(repo, retention_days=1)
+        await session.commit()
+        assert removed == 2
+
+        remaining = await repo.list_events(limit=10)
+    assert remaining.results == []
 
 
 async def test_prune_once_eventually_prunes_telemetry_rows_past_their_own_retention(

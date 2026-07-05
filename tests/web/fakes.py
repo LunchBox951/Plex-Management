@@ -61,11 +61,16 @@ def candidate(
     seeders: int = 10,
     size_bytes: int = 1_000_000_000,
     magnet: bool = True,
+    guid: str | None = None,
 ) -> CandidateRelease:
-    """Build a torrent :class:`CandidateRelease` (magnet by default)."""
+    """Build a torrent :class:`CandidateRelease` (magnet by default).
+
+    ``guid`` defaults to ``title``; pass an explicit (e.g. URL-shaped) value to
+    exercise GUID-redaction log hygiene.
+    """
     magnet_url = f"magnet:?xt=urn:btih:{info_hash or 'deadbeef'}" if magnet else None
     return CandidateRelease(
-        guid=title,
+        guid=guid if guid is not None else title,
         title=title,
         size_bytes=size_bytes,
         magnet_url=magnet_url,

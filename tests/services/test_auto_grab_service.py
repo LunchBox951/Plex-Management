@@ -11,6 +11,8 @@ scope behind backoff).
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -31,7 +33,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import auto_grab_service
+from plex_manager.services import auto_grab_service, log_capture_service
 from plex_manager.services.auto_grab_service import (
     BACKOFF_SCHEDULE,
     COOLDOWN_SCHEDULE,
@@ -56,6 +58,13 @@ from tests.web.fakes import (
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+_LOGGER_NAME = "plex_manager.services.auto_grab_service"
+# The dedicated telemetry CHILD (wave-6 split): ONLY the issue-#43 records -- the
+# enriched source-failure WARNING and the per-cycle summary INFO -- are emitted
+# here (INFO-pinned + 30-day-retained); operational records stay on the module
+# logger above with ordinary level/retention semantics. ``caplog.at_level`` on
+# the MODULE logger still enables the child's records via level inheritance.
+_TELEMETRY_LOGGER_NAME = "plex_manager.services.auto_grab_service.telemetry"
 
 
 class _RaisingProwlarr:
@@ -735,6 +744,257 @@ async def test_source_error_does_not_abort_cycle_other_scope_grabs(
         assert bad.next_search_at is not None
         assert bad.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
         assert good.status == RequestStatus.downloading  # processed despite A's failure
+
+
+async def test_source_error_emits_structured_telemetry(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Beta-week telemetry (issue #43): a QbittorrentSourceError WARNING carries
+    release identity (source title, indexer, guid/info_hash, season, attempt
+    context) via ``extra=`` -- plus request_id/tmdb_id, the correlation keys
+    ``log_capture_service`` lifts into ``log_events.context_json`` -- and the
+    closing per-cycle summary INFO rolls the count up as ``source_failures``. A
+    TV season scope exercises a non-``None`` ``season`` (the release identity the
+    beta needs to tell "the same source keeps failing" apart from a generic
+    parked state)."""
+    title = "Some.Show.S01.1080p.WEB-DL.x264-BAD"
+    request_id, _season_request_id = await _seed_tv_season(
+        sessionmaker_, tmdb_id=82856, season_number=1
+    )
+    prowlarr = FakeProwlarr([candidate(title, magnet=False)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.no_acceptable == 1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, "exactly one enriched WARNING for the sole source failure"
+    record = warnings[0]
+    # The #43 WARNING is telemetry, so it must ride the dedicated child logger
+    # (INFO-pinned + 30-day-retained) -- never the operational module logger.
+    assert record.name == _TELEMETRY_LOGGER_NAME
+    # ``extra=`` sets each key as a plain LogRecord ATTRIBUTE (not a stdlib-known
+    # one), so ``getattr`` -- never direct attribute access -- matches this
+    # module's other structured-logging tests (e.g. test_request_service.py).
+    assert getattr(record, "request_id", None) == request_id
+    assert getattr(record, "tmdb_id", None) == 82856
+    assert getattr(record, "season", None) == 1
+    assert getattr(record, "source_title", None) == title
+    assert getattr(record, "indexer", None) == "FakeIndexer"
+    assert getattr(record, "guid", None) == title  # ``candidate()`` defaults guid to title
+    assert getattr(record, "info_hash", "unset") is None  # no info_hash on this candidate
+    assert getattr(record, "attempt", None) == 1
+    assert getattr(record, "attempts_total", None) == 1
+    # tmdb_id is a correlation key already lifted into log_events' structured
+    # context_json, so it need not (and does not) appear in the message text;
+    # season/title/indexer/guid are NOT correlation keys, so they must be
+    # readable straight off the persisted message text (see the except clause's
+    # docstring) or this telemetry's whole reason for existing would not survive
+    # into log_events.
+    message = record.getMessage()
+    assert "82856" not in message  # the tmdb_id, deliberately not duplicated into text
+    assert "season=1" in message
+    assert f"title={title!r}" in message
+    assert "indexer='FakeIndexer'" in message
+
+    summaries = [
+        r for r in caplog.records if r.levelname == "INFO" and r.name == _TELEMETRY_LOGGER_NAME
+    ]
+    assert len(summaries) == 1
+    assert getattr(summaries[0], "source_failures", None) == 1
+    assert "source_failures=1" in summaries[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("uri_guid", "expected_label"),
+    [
+        # An http(s) private-tracker download URL: passkey in the query.
+        ("https://priv.tracker.org/dl/movie?passkey=SUPERSECRETKEY", "priv.tracker.org"),
+        # Wave-4 P1: a magnet URI (scheme, NO netloc) -- its percent-encoded
+        # ``tr=`` announce parameter embeds the same passkey; the label falls
+        # back to the scheme so the class of URI stays diagnosable.
+        (
+            "magnet:?xt=urn:btih:deadbeef&tr=https%3A%2F%2Fpriv.tracker.org%2Fa%3Fpasskey%3DSUPERSECRETKEY",
+            "magnet",
+        ),
+        # Wave-5 P1: a SCHEMELESS URL parses as pure path (no scheme, no netloc)
+        # -- only the allowlist inversion catches it; no host parses, so the
+        # token is bare ``#<hash>``.
+        ("priv.tracker.org/dl/movie?passkey=SUPERSECRETKEY", ""),
+    ],
+)
+async def test_source_error_redacts_uri_shaped_guid(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    uri_guid: str,
+    expected_label: str,
+) -> None:
+    """Codex P1 (x3): a Prowlarr private-indexer GUID can be a URI of ANY shape
+    embedding a tracker passkey/session token -- an http(s) URL in its path/
+    query, a magnet URI in its ``tr=`` announce parameters, or a schemeless
+    ``host/path?passkey=`` value. The source-unresolvable WARNING persists to
+    ``log_events``/``/ops/logs``, so both its message text AND its ``extra=``
+    guid field must carry only ``<label>#<sha256-prefix>`` (``safe_guid``'s
+    allowlist admits plain ids ONLY) -- the label for diagnosability, the
+    credential never emitted (north star #3)."""
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    await _seed_movie(sessionmaker_, tmdb_id=603)
+    # ``source_errors`` keys on the download_url, so the guid is free to be the URI
+    # under test while the qBittorrent source failure is still triggered.
+    prowlarr = FakeProwlarr([candidate(title, magnet=False, guid=uri_guid)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.no_acceptable == 1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    record = warnings[0]
+
+    # The exact redacted token, recomputed INDEPENDENTLY of ``safe_guid`` (so a
+    # broken helper cannot vacuously satisfy this test). Exact-token equality --
+    # never a bare host-substring check, which CodeQL flags as
+    # py/incomplete-url-substring-sanitization ("priv.tracker.org" could sit at
+    # an arbitrary position inside an unredacted URL).
+    expected_hash = hashlib.sha256(uri_guid.encode("utf-8")).hexdigest()[:12]
+    expected_guid = f"{expected_label}#{expected_hash}"
+
+    # ``extra=`` guid: exactly label + hash, secret stripped.
+    assert getattr(record, "guid", None) == expected_guid
+    assert "SUPERSECRETKEY" not in expected_guid
+    assert "passkey" not in expected_guid
+
+    # ...and the message carries exactly that redacted token (``%r``-formatted),
+    # while NONE of the secret / query string survives into the persisted text.
+    message = record.getMessage()
+    assert f"guid={expected_guid!r}" in message
+    assert "SUPERSECRETKEY" not in message
+    assert "passkey" not in message
+
+
+async def test_source_error_with_malformed_url_guid_still_parks_and_continues(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex P2 (safe_guid totality): ``urlsplit`` raises ValueError on a
+    malformed URL-ish guid (``http://[bad`` -- unclosed IPv6 bracket). Pre-fix
+    that throw happened INSIDE the ``QbittorrentSourceError`` handler, escaped
+    it, and aborted the ENTIRE grab cycle instead of parking the scope. The
+    barrier is now total: the failure is still recorded (WARNING + summary
+    rollup), the guid is FULLY redacted to the hash-only ``#<sha256>`` token
+    (unparseable means no host to salvage, and the raw text may still embed a
+    credential), and the cycle completes normally."""
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    malformed_guid = "http://[bad"
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr([candidate(title, magnet=False, guid=malformed_guid)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)  # pre-fix: raised ValueError
+
+    # The cycle survived and the scope parked on backoff -- never aborted.
+    assert result.no_acceptable == 1
+    assert result.grab_errors == 0
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.no_acceptable_release
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    expected_guid = f"#{hashlib.sha256(malformed_guid.encode('utf-8')).hexdigest()[:12]}"
+    assert getattr(warnings[0], "guid", None) == expected_guid
+    assert malformed_guid not in warnings[0].getMessage()  # nothing of the raw value
+
+    summaries = [
+        r for r in caplog.records if r.levelname == "INFO" and r.name == _TELEMETRY_LOGGER_NAME
+    ]
+    assert len(summaries) == 1  # the closing summary still ran
+    assert getattr(summaries[0], "source_failures", None) == 1
+
+
+async def test_cycle_summary_reaches_capture_at_warning_operator_floor(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex P2 (log-floor): at ``log_level=WARNING`` the per-cycle summary INFO
+    (the issue-#43 ``source_failures`` rollup) used to be filtered at the
+    ``.info`` call before any handler ran -- the beta dataset silently never
+    persisted. ``configure_logging`` pins the dedicated TELEMETRY CHILD logger
+    to INFO (wave-6 split: the operational module logger keeps ordinary
+    semantics), so the record is still CREATED and propagates to every root
+    handler (the durable ``LogCaptureHandler`` and caplog alike) -- intermediate
+    logger levels never filter propagated records -- while ordinary INFO chatter
+    from non-pinned loggers stays suppressed."""
+    # Drift guard: the pin targets exactly the logger the telemetry emits on.
+    assert _TELEMETRY_LOGGER_NAME == log_capture_service.AUTO_GRAB_TELEMETRY_LOGGER_NAME
+
+    await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+
+    root = logging.getLogger()
+    pinned = logging.getLogger(_TELEMETRY_LOGGER_NAME)
+    saved_root_level = root.level
+    saved_pinned_level = pinned.level
+    # WARNING is the exact operator floor that used to drop the summary INFO.
+    handler = log_capture_service.configure_logging("WARNING")
+    try:
+        result = await _run(sessionmaker_, prowlarr, qbt)
+        # Control 1: an INFO on a NON-pinned sibling logger must still be dropped
+        # by the WARNING floor -- proving the pin (not a permissive root) is what
+        # lets the telemetry through.
+        logging.getLogger("plex_manager.services.request_service").info("floor control")
+        # Control 2: the operational MODULE logger is no longer pinned (wave-6
+        # split) -- its INFO records obey the operator floor like any other.
+        logging.getLogger(_LOGGER_NAME).info("module-logger control")
+    finally:
+        log_capture_service.stop_logging(handler)
+        root.setLevel(saved_root_level)
+        pinned.setLevel(saved_pinned_level)
+
+    assert result.grabbed == 1
+    summaries = [
+        r
+        for r in caplog.records
+        if r.name == _TELEMETRY_LOGGER_NAME and r.getMessage().startswith("auto-grab cycle:")
+    ]
+    assert len(summaries) == 1  # created DESPITE the WARNING floor
+    assert getattr(summaries[0], "source_failures", None) == 0
+    assert not any(r.getMessage() == "floor control" for r in caplog.records)
+    assert not any(r.getMessage() == "module-logger control" for r in caplog.records)
+
+
+async def test_no_source_errors_emits_zero_source_failures_in_summary(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No-regression: a cycle with no ``QbittorrentSourceError`` at all rolls up
+    ``source_failures=0`` in the closing summary INFO -- never fabricated, never
+    omitted."""
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.grabbed == 1
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.downloading
+
+    summaries = [
+        r for r in caplog.records if r.levelname == "INFO" and r.name == _TELEMETRY_LOGGER_NAME
+    ]
+    assert len(summaries) == 1
+    assert getattr(summaries[0], "source_failures", None) == 0
+    assert "source_failures=0" in summaries[0].getMessage()
 
 
 async def test_grab_error_on_top_pick_stops_further_attempts(sessionmaker_: SessionMaker) -> None:
