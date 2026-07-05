@@ -11,6 +11,7 @@ scope behind backoff).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -56,6 +57,7 @@ from tests.web.fakes import (
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+_LOGGER_NAME = "plex_manager.services.auto_grab_service"
 
 
 class _RaisingProwlarr:
@@ -735,6 +737,88 @@ async def test_source_error_does_not_abort_cycle_other_scope_grabs(
         assert bad.next_search_at is not None
         assert bad.next_search_at.replace(tzinfo=UTC) == _NOW + BACKOFF_SCHEDULE[0]
         assert good.status == RequestStatus.downloading  # processed despite A's failure
+
+
+async def test_source_error_emits_structured_telemetry(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Beta-week telemetry (issue #43): a QbittorrentSourceError WARNING carries
+    release identity (source title, indexer, guid/info_hash, season, attempt
+    context) via ``extra=`` -- plus request_id/tmdb_id, the correlation keys
+    ``log_capture_service`` lifts into ``log_events.context_json`` -- and the
+    closing per-cycle summary INFO rolls the count up as ``source_failures``. A
+    TV season scope exercises a non-``None`` ``season`` (the release identity the
+    beta needs to tell "the same source keeps failing" apart from a generic
+    parked state)."""
+    title = "Some.Show.S01.1080p.WEB-DL.x264-BAD"
+    request_id, _season_request_id = await _seed_tv_season(
+        sessionmaker_, tmdb_id=82856, season_number=1
+    )
+    prowlarr = FakeProwlarr([candidate(title, magnet=False)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.no_acceptable == 1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, "exactly one enriched WARNING for the sole source failure"
+    record = warnings[0]
+    # ``extra=`` sets each key as a plain LogRecord ATTRIBUTE (not a stdlib-known
+    # one), so ``getattr`` -- never direct attribute access -- matches this
+    # module's other structured-logging tests (e.g. test_request_service.py).
+    assert getattr(record, "request_id", None) == request_id
+    assert getattr(record, "tmdb_id", None) == 82856
+    assert getattr(record, "season", None) == 1
+    assert getattr(record, "source_title", None) == title
+    assert getattr(record, "indexer", None) == "FakeIndexer"
+    assert getattr(record, "guid", None) == title  # ``candidate()`` defaults guid to title
+    assert getattr(record, "info_hash", "unset") is None  # no info_hash on this candidate
+    assert getattr(record, "attempt", None) == 1
+    assert getattr(record, "attempts_total", None) == 1
+    # tmdb_id is a correlation key already lifted into log_events' structured
+    # context_json, so it need not (and does not) appear in the message text;
+    # season/title/indexer/guid are NOT correlation keys, so they must be
+    # readable straight off the persisted message text (see the except clause's
+    # docstring) or this telemetry's whole reason for existing would not survive
+    # into log_events.
+    message = record.getMessage()
+    assert "82856" not in message  # the tmdb_id, deliberately not duplicated into text
+    assert "season=1" in message
+    assert f"title={title!r}" in message
+    assert "indexer='FakeIndexer'" in message
+
+    summaries = [r for r in caplog.records if r.levelname == "INFO" and r.name == _LOGGER_NAME]
+    assert len(summaries) == 1
+    assert getattr(summaries[0], "source_failures", None) == 1
+    assert "source_failures=1" in summaries[0].getMessage()
+
+
+async def test_no_source_errors_emits_zero_source_failures_in_summary(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No-regression: a cycle with no ``QbittorrentSourceError`` at all rolls up
+    ``source_failures=0`` in the closing summary INFO -- never fabricated, never
+    omitted."""
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert result.grabbed == 1
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.downloading
+
+    summaries = [r for r in caplog.records if r.levelname == "INFO" and r.name == _LOGGER_NAME]
+    assert len(summaries) == 1
+    assert getattr(summaries[0], "source_failures", None) == 0
+    assert "source_failures=0" in summaries[0].getMessage()
 
 
 async def test_grab_error_on_top_pick_stops_further_attempts(sessionmaker_: SessionMaker) -> None:
