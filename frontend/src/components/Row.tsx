@@ -13,6 +13,18 @@ interface RowProps {
   loading?: boolean
   /** Per-tile library-state badge (issue #29); `null` leaves a tile unbadged. */
   tileState?: (item: DiscoverResult) => StatusPresentation | null
+  /**
+   * Whether the shared `/requests` query these tiles derive their state from has
+   * SETTLED — fetched at least once AND not currently invalidated pending a
+   * refetch. Gates the quick-request action on freshness alongside the
+   * `state === null` check: right after a season-scoped tv request is created the
+   * `/requests` query is invalidated but its refetch hasn't landed, so the tile
+   * still derives `null`; a Request click in that window POSTs a seasons-less body
+   * the API reads as "the whole aired series", silently expanding the single-season
+   * request. Defaults `true` for presentational/standalone use; Discover always
+   * passes the real signal.
+   */
+  requestsSettled?: boolean
 }
 
 /** How far each chevron scrolls — a little under one viewport of posters. */
@@ -22,7 +34,14 @@ const SCROLL_STEP = 600
  * A titled, horizontally-scrollable poster strip. Chevrons scroll the track and
  * self-disable at each end; on touch/trackpad the native scroll still works.
  */
-export function Row({ title, items, onSelect, loading = false, tileState }: RowProps) {
+export function Row({
+  title,
+  items,
+  onSelect,
+  loading = false,
+  tileState,
+  requestsSettled = true,
+}: RowProps) {
   const trackRef = useRef<HTMLDivElement>(null)
   const [atStart, setAtStart] = useState(true)
   const [atEnd, setAtEnd] = useState(false)
@@ -98,7 +117,11 @@ export function Row({ title, items, onSelect, loading = false, tileState }: RowP
                       seed={item.tmdb_id}
                       onClick={() => onSelect(item)}
                       badge={state ? <StatusBadge status={state} /> : undefined}
-                      action={state === null ? <QuickRequestButton item={item} /> : undefined}
+                      action={
+                        state === null && requestsSettled ? (
+                          <QuickRequestButton item={item} />
+                        ) : undefined
+                      }
                     />
                   </div>
                 )

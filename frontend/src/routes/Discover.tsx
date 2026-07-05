@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react'
-import { useDiscoverHome, useDiscoverSearch, useRequests } from '../api/hooks'
+import {
+  useDiscoverHome,
+  useDiscoverSearch,
+  useRequests,
+  useRequestsInvalidated,
+} from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
 import { deriveTileState } from '../lib/tileState'
 import { PosterCard } from '../components/ui/PosterCard'
@@ -30,6 +35,20 @@ export function Discover() {
   // The live request lifecycle for the tile overlay — TanStack dedupes this poll with
   // the modal's own useRequests() by queryKey, so it costs no extra network.
   const requests = useRequests({ poll: true })
+
+  // Freshness gate for the one-click Request action. `deriveTileState(...) === null`
+  // alone is not enough: right after a season-scoped tv request is created,
+  // useCreateRequest invalidates /requests but the refetch hasn't landed, so the
+  // tile still derives null. A Request click in that window POSTs `{tmdb_id,
+  // media_type:'tv'}` with seasons omitted, which the API expands to the whole
+  // aired series — silently upgrading a single-season request. Suppress the action
+  // until the requests query has actually settled: fetched at least once
+  // (`isFetched`) AND not currently invalidated pending a refetch
+  // (useRequestsInvalidated — true from invalidateQueries until that refetch
+  // settles; a routine background poll never sets it, so this gate never flickers
+  // per poll).
+  const requestsInvalidated = useRequestsInvalidated()
+  const requestsSettled = requests.isFetched && !requestsInvalidated
 
   // The per-tile badge state: server base (library_state) + the live request overlay.
   // Each helper passes ITS OWN query's dataUpdatedAt (client clock) so deriveTileState
@@ -103,6 +122,7 @@ export function Discover() {
                 items={row.items}
                 onSelect={openTitle}
                 tileState={homeTileState}
+                requestsSettled={requestsSettled}
               />
             ))}
           </>
@@ -139,7 +159,11 @@ export function Discover() {
                 seed={title.tmdb_id}
                 onClick={() => openTitle(title)}
                 badge={state ? <StatusBadge status={state} /> : undefined}
-                action={state === null ? <QuickRequestButton item={title} /> : undefined}
+                action={
+                  state === null && requestsSettled ? (
+                    <QuickRequestButton item={title} />
+                  ) : undefined
+                }
               />
             )
           })}

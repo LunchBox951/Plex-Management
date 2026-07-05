@@ -67,6 +67,39 @@ describe('Row quick-request action (issue #42)', () => {
     expect(screen.getByText('Requested')).toBeInTheDocument() // the badge on SHOW
   })
 
+  it('suppresses the Request action when requestsSettled is false, even for a null-state tile', () => {
+    // The gate the Codex P2 fix adds: a `state === null` tile is only requestable
+    // once the shared /requests query is fresh. `requestsSettled={false}` models the
+    // stale window (query invalidated / not yet fetched) where the derived null is
+    // untrustworthy — the button must not render, or a click could POST a
+    // seasons-less (whole-series) tv request.
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(
+      <Row
+        title="Home row"
+        items={[MOVIE]}
+        onSelect={() => {}}
+        tileState={() => null}
+        requestsSettled={false}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
+  })
+
+  it('renders the Request action for a null-state tile once requestsSettled is true', () => {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(
+      <Row
+        title="Home row"
+        items={[MOVIE]}
+        onSelect={() => {}}
+        tileState={() => null}
+        requestsSettled={true}
+      />,
+    )
+    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+  })
+
   it('hides the action once the tile becomes badged', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     const { rerender } = render(
