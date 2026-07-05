@@ -42,7 +42,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
@@ -51,7 +51,7 @@ from plex_manager.adapters.prowlarr.adapter import ProwlarrIndexer
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentClient
 from plex_manager.adapters.tmdb.adapter import TmdbMetadata
 from plex_manager.config import get_settings
-from plex_manager.db import get_session
+from plex_manager.db import get_session, get_sessionmaker
 from plex_manager.domain.quality_profile import QualityProfile, default_profile
 from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.ports.download_client import DownloadClientPort
@@ -144,6 +144,7 @@ __all__ = [
     "load_system_settings",
     "require_admin",
     "require_api_key",
+    "require_api_key_short_session",
     "require_setup_admin",
     "resolve_bool_setting",
     "resolve_disk_pressure_percents",
@@ -799,6 +800,45 @@ async def require_api_key(
     Skipped entirely when ``settings.dev_auth_bypass`` is set (dev only).
     """
     context = await authenticate_request(request, session, provided_api_key=provided)
+    if context is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    return context
+
+
+async def require_api_key_short_session(
+    request: Request,
+    provided: Annotated[str | None, Depends(_api_key_header)],
+) -> AuthContext:
+    """Auth for long-lived streaming endpoints that must hold no DB session.
+
+    :func:`require_api_key` validates against a session sourced from
+    :func:`get_session` — a *yield* dependency that stays checked out for the
+    whole request lifetime. For an ordinary request that is momentary, but for an
+    SSE stream the "request" lives as long as the browser tab, so the session (and
+    its connection) would be pinned for hours. With the small aiosqlite pool
+    (~5 slots) shared with the reconcile/autograb/eviction workers, a handful of
+    long-lived tabs would exhaust it.
+
+    This accepts the same API-key-or-Plex-session contract as
+    :func:`require_api_key`, but validates it against a session that is opened and
+    **closed up front**, before the endpoint begins streaming. The stream itself
+    therefore holds no connection. The header source remains
+    :class:`APIKeyHeader`, so the OpenAPI security scheme is unchanged and the app
+    factory can still advertise cookie auth as the alternative browser path.
+    """
+    maker_obj = getattr(request.app.state, "sessionmaker", None)
+    maker: async_sessionmaker[AsyncSession]
+    if isinstance(maker_obj, async_sessionmaker):
+        maker = cast("async_sessionmaker[AsyncSession]", maker_obj)
+    else:
+        maker = get_sessionmaker()
+    async with maker() as session:
+        context = await authenticate_request(
+            request,
+            session,
+            provided_api_key=provided,
+            enforce_csrf=False,
+        )
     if context is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
     return context

@@ -1,13 +1,20 @@
 import { QueryClient } from '@tanstack/react-query'
 
 /**
- * Polling cadence for the live surfaces. There is no event stream yet
- * (ADR-0009): `/queue` and `/requests` are polled. When the backend grows SSE,
- * an EventSource handler will write into this same cache and the intervals go
- * away with no component changes.
+ * Polling cadence for the live surfaces. The realtime SSE stream (ADR-0017)
+ * invalidates these same caches when connected, but polling never stops — it
+ * drops to a slow floor (below) as a permanent safety net against a dead or
+ * zombied stream. When disconnected, the fast cadence takes over.
  */
 export const POLL_INTERVAL_MS = 2000
 export const REQUESTS_POLL_INTERVAL_MS = 5000
+// When realtime SSE is connected we do NOT stop polling — we drop to a SLOW
+// floor instead. This is a permanent safety net (Overseerr keeps polling even
+// with its socket up): a dead or zombie stream, or a missed heartbeat the
+// client watchdog somehow fails to catch, still self-heals within one slow tick
+// regardless of the stream's health. Coarse cadence so it costs almost nothing.
+export const QUEUE_REALTIME_FLOOR_MS = 25000
+export const REQUESTS_REALTIME_FLOOR_MS = 45000
 // The Status page's health/disk cards: matches the backend's own ~15s TTL
 // cache on the upstream probes (ADR-0012), so polling faster than this would
 // just re-read the same cached snapshot without learning anything new.

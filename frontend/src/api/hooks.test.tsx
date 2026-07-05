@@ -14,7 +14,11 @@ import {
   useUpdateSettings,
 } from './hooks'
 import { client } from './client'
-import { REQUESTS_POLL_INTERVAL_MS, queryKeys } from '../lib/queryClient'
+import {
+  REQUESTS_POLL_INTERVAL_MS,
+  REQUESTS_REALTIME_FLOOR_MS,
+  queryKeys,
+} from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
 import { setRealtimeConnected } from '../lib/realtimeState'
 import type {
@@ -306,7 +310,7 @@ describe('realtime polling fallback', () => {
     qc.clear()
   })
 
-  it('disables request polling while realtime is connected', async () => {
+  it('drops to a slow polling floor (never off) while realtime is connected', async () => {
     vi.useFakeTimers()
     setRealtimeConnected(true)
     ;(client.GET as unknown as Mock).mockResolvedValue({
@@ -324,10 +328,18 @@ describe('realtime polling fallback', () => {
     })
     expect(client.GET).toHaveBeenCalledTimes(1)
 
+    // Fast cadence is suppressed while connected...
     await act(async () => {
       await vi.advanceTimersByTimeAsync(REQUESTS_POLL_INTERVAL_MS)
     })
     expect(client.GET).toHaveBeenCalledTimes(1)
+
+    // ...but the slow floor still fires — a zombie stream self-heals within one
+    // slow tick regardless of the watchdog.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REQUESTS_REALTIME_FLOOR_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(2)
     unmount()
     qc.clear()
   })

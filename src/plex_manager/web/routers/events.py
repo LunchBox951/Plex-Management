@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, Request
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
-from plex_manager.web.deps import require_api_key
+from plex_manager.web.deps import require_api_key_short_session
 from plex_manager.web.events import get_event_hub
 
 __all__ = ["router"]
@@ -16,7 +16,11 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/events",
     tags=["events"],
-    dependencies=[Depends(require_api_key)],
+    # Auth that owns a short-lived session and closes it BEFORE streaming begins,
+    # so the long-lived SSE connection never pins a DB connection (see
+    # ``require_api_key_short_session``). A plain ``Depends(require_api_key)`` would
+    # hold ``get_session``'s yield-scoped connection for the tab's whole lifetime.
+    dependencies=[Depends(require_api_key_short_session)],
 )
 
 _HEARTBEAT_SECONDS = 15.0

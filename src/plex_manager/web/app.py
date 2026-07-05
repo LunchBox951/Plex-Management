@@ -74,7 +74,7 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
 )
 from plex_manager.web.errors import install_error_handlers
-from plex_manager.web.events import EventHub, publish_realtime
+from plex_manager.web.events import EventHub, publish_realtime, warn_if_multiworker
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
@@ -874,7 +874,11 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
-    app.state.realtime_hub = EventHub()
+    # In-process realtime hub. The hub is single-worker only (see events.py);
+    # warn loudly if the environment hints at a multi-worker deployment that
+    # would silently drop cross-worker events.
+    warn_if_multiworker()
+    app.state.realtime_hub = EventHub(app_version=__version__)
     app.add_middleware(SetupGuardMiddleware)
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:

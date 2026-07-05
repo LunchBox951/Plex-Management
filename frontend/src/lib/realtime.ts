@@ -3,6 +3,7 @@ import { AUTH_INVALID_EVENT } from '../api/client'
 import { clearApiKey, getApiKey } from './apiKey'
 import { queryKeys } from './queryClient'
 import { setRealtimeConnected } from './realtimeState'
+import { setRealtimeReloadRequired } from './realtimeReload'
 
 export interface RealtimeEventPayload {
   seq?: number
@@ -10,11 +11,22 @@ export interface RealtimeEventPayload {
   reason?: string
   request_id?: number
   download_id?: number
+  app_version?: string
 }
 
+/**
+ * Parse an SSE byte stream into typed events.
+ *
+ * ``onBytes`` fires on EVERY received chunk — including heartbeat comment frames
+ * (``: ping``) and any other non-``data`` frames the parser otherwise discards.
+ * The reconnect watchdog relies on this: a healthy but idle stream still emits a
+ * server heartbeat every ~15s, so a silence longer than that means the
+ * connection is dead/zombied even though no application event was due.
+ */
 export async function parseSseStream(
   stream: ReadableStream<Uint8Array>,
   onEvent: (event: RealtimeEventPayload) => void,
+  onBytes?: () => void,
 ): Promise<void> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
@@ -23,6 +35,7 @@ export async function parseSseStream(
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
+    onBytes?.()
     buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
     let boundary = buffer.indexOf('\n\n')
     while (boundary !== -1) {
@@ -107,6 +120,12 @@ export interface RealtimeStreamOptions {
   fetchImpl?: typeof fetch
   baseDelayMs?: number
   maxDelayMs?: number
+  /** Server heartbeat cadence; the watchdog checks at roughly this interval. */
+  heartbeatMs?: number
+  /** Stale threshold: abort + reconnect after this much silence (~2.5x heartbeat). */
+  watchdogMs?: number
+  /** Injectable clock for tests. */
+  now?: () => number
 }
 
 export function startRealtimeStream({
@@ -114,9 +133,46 @@ export function startRealtimeStream({
   fetchImpl = fetch,
   baseDelayMs = 1000,
   maxDelayMs = 15000,
+  heartbeatMs = 15000,
+  watchdogMs = heartbeatMs * 2.5,
+  now = () => Date.now(),
 }: RealtimeStreamOptions): () => void {
   let stopped = false
   let controller: AbortController | null = null
+  let watchdogTimer: ReturnType<typeof window.setInterval> | null = null
+  let lastByteAt = now()
+  // Persists across reconnect iterations: the first sync frame records the
+  // server build; a later reconnect reporting a different build means the image
+  // was rolled (ADR-0004) under a long-lived tab, so we prompt a reload.
+  let knownVersion: string | undefined
+
+  function clearWatchdog(): void {
+    if (watchdogTimer !== null) {
+      window.clearInterval(watchdogTimer)
+      watchdogTimer = null
+    }
+  }
+
+  function armWatchdog(): void {
+    clearWatchdog()
+    watchdogTimer = window.setInterval(() => {
+      if (now() - lastByteAt > watchdogMs) {
+        // Abort WITHOUT setting `stopped`: the run loop's catch falls through to
+        // backoff + reconnect, and the polling floor covers the gap meanwhile.
+        controller?.abort()
+      }
+    }, heartbeatMs)
+  }
+
+  function noteVersion(event: RealtimeEventPayload): void {
+    const version = event.app_version
+    if (typeof version !== 'string') return
+    if (knownVersion === undefined) {
+      knownVersion = version
+    } else if (knownVersion !== version) {
+      setRealtimeReloadRequired(true)
+    }
+  }
 
   async function run(): Promise<void> {
     let attempt = 0
@@ -146,14 +202,28 @@ export function startRealtimeStream({
         }
         attempt = 0
         setRealtimeConnected(true)
-        await parseSseStream(response.body, (event) => applyRealtimeEvent(queryClient, event))
-      } catch (err) {
-        if (stopped || (err instanceof DOMException && err.name === 'AbortError')) return
+        lastByteAt = now()
+        armWatchdog()
+        await parseSseStream(
+          response.body,
+          (event) => {
+            noteVersion(event)
+            applyRealtimeEvent(queryClient, event)
+          },
+          () => {
+            lastByteAt = now()
+          },
+        )
+      } catch {
+        // Network error, a watchdog abort, or a teardown abort. Teardown sets
+        // `stopped` (handled below); everything else falls through to reconnect.
       } finally {
+        clearWatchdog()
         controller = null
         setRealtimeConnected(false)
       }
 
+      if (stopped) return
       attempt += 1
       await sleep(Math.min(maxDelayMs, baseDelayMs * 2 ** Math.min(attempt, 4)))
     }
@@ -163,6 +233,7 @@ export function startRealtimeStream({
 
   return () => {
     stopped = true
+    clearWatchdog()
     controller?.abort()
     setRealtimeConnected(false)
   }

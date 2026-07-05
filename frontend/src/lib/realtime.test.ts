@@ -1,7 +1,9 @@
 import { QueryClient } from '@tanstack/react-query'
-import { describe, expect, it, vi } from 'vitest'
-import { applyRealtimeEvent, parseSseStream } from './realtime'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { applyRealtimeEvent, parseSseStream, startRealtimeStream } from './realtime'
 import { queryKeys } from './queryClient'
+import * as apiKeyLib from './apiKey'
+import { getRealtimeReloadRequired, setRealtimeReloadRequired } from './realtimeReload'
 
 function streamFrom(text: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -11,6 +13,12 @@ function streamFrom(text: string): ReadableStream<Uint8Array> {
     },
   })
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  setRealtimeReloadRequired(false)
+})
 
 describe('parseSseStream', () => {
   it('ignores comments and parses JSON data frames split by blank lines', async () => {
@@ -22,6 +30,22 @@ describe('parseSseStream', () => {
     )
 
     expect(events).toEqual([{ topics: ['requests'], request_id: 7 }])
+  })
+
+  it('signals received bytes even for heartbeat-only comment frames', async () => {
+    const events: unknown[] = []
+    let bytes = 0
+
+    await parseSseStream(
+      streamFrom(': ping\n\n'),
+      (event) => events.push(event),
+      () => {
+        bytes += 1
+      },
+    )
+
+    expect(events).toEqual([])
+    expect(bytes).toBe(1)
   })
 })
 
@@ -56,5 +80,96 @@ describe('applyRealtimeEvent', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['blocklist'] })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsDisk })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
+  })
+})
+
+function syncBody(version: string): ReadableStream<Uint8Array> {
+  return streamFrom(
+    `event: realtime\ndata: {"topics":["sync"],"reason":"connected","app_version":"${version}"}\n\n`,
+  )
+}
+
+describe('startRealtimeStream version awareness', () => {
+  it('prompts a reload when the server build changes across a reconnect', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue('k')
+    const versions = ['1.0.0', '2.0.0'] as const
+    let call = 0
+    const fetchImpl = vi.fn(async () => {
+      const version = versions[Math.min(call, versions.length - 1)] ?? versions[1]
+      call += 1
+      return { status: 200, ok: true, body: syncBody(version) } as unknown as Response
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const stop = startRealtimeStream({
+      queryClient: qc,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+    })
+
+    // First connection: records version 1.0.0, no reload yet.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getRealtimeReloadRequired()).toBe(false)
+
+    // Backoff, then the second connection reports 2.0.0 -> reload latched.
+    await vi.advanceTimersByTimeAsync(50)
+    expect(fetchImpl.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(getRealtimeReloadRequired()).toBe(true)
+
+    stop()
+    qc.clear()
+  })
+})
+
+describe('startRealtimeStream watchdog', () => {
+  it('aborts and reconnects when the stream goes silent past the threshold', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue('k')
+    let clock = 0
+    const fetchImpl = vi.fn(async (_url: unknown, opts: { signal: AbortSignal }) => {
+      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller
+        },
+      })
+      // A real fetch aborts the body read when the signal fires; emulate that so
+      // the parser's pending read rejects and the run loop reconnects.
+      opts.signal.addEventListener('abort', () => {
+        try {
+          streamController?.error(new DOMException('aborted', 'AbortError'))
+        } catch {
+          /* stream already closed */
+        }
+      })
+      return { status: 200, ok: true, body } as unknown as Response
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const stop = startRealtimeStream({
+      queryClient: qc,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+      heartbeatMs: 1000,
+      watchdogMs: 2500,
+      now: () => clock,
+    })
+
+    // First (silent) connection is established.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+
+    // Jump the clock past the stale threshold; the next watchdog tick aborts.
+    clock = 3000
+    await vi.advanceTimersByTimeAsync(1000)
+    // Abort -> reconnect after backoff.
+    await vi.advanceTimersByTimeAsync(50)
+    expect(fetchImpl.mock.calls.length).toBeGreaterThanOrEqual(2)
+
+    stop()
+    qc.clear()
   })
 })

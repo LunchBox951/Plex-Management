@@ -42,7 +42,9 @@ import {
   LOG_TAIL_POLL_INTERVAL_MS,
   OPS_POLL_INTERVAL_MS,
   POLL_INTERVAL_MS,
+  QUEUE_REALTIME_FLOOR_MS,
   REQUESTS_POLL_INTERVAL_MS,
+  REQUESTS_REALTIME_FLOOR_MS,
   queryKeys,
 } from '../lib/queryClient'
 import { useRealtimeConnected } from '../lib/realtimeState'
@@ -323,7 +325,13 @@ export function useRequests(options?: { poll?: boolean }) {
   return useQuery({
     queryKey: queryKeys.requests,
     queryFn: async (): Promise<RequestListResponse> => unwrap(await client.GET('/api/v1/requests')),
-    refetchInterval: options?.poll && !realtimeConnected ? REQUESTS_POLL_INTERVAL_MS : false,
+    // Two-tier: fast cadence when the stream is down, a slow floor (never off)
+    // when it is up — the permanent safety net against a zombie stream.
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? REQUESTS_REALTIME_FLOOR_MS
+        : REQUESTS_POLL_INTERVAL_MS
+      : false,
   })
 }
 
@@ -477,7 +485,13 @@ export function useQueue(options?: { poll?: boolean; enabled?: boolean }) {
     queryKey: queryKeys.queue,
     enabled: options?.enabled ?? true,
     queryFn: async (): Promise<QueueResponse> => unwrap(await client.GET('/api/v1/queue')),
-    refetchInterval: options?.poll && !realtimeConnected ? POLL_INTERVAL_MS : false,
+    // Two-tier: fast cadence when the stream is down, a slow floor (never off)
+    // when it is up — the permanent safety net against a zombie stream.
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? QUEUE_REALTIME_FLOOR_MS
+        : POLL_INTERVAL_MS
+      : false,
   })
 }
 
