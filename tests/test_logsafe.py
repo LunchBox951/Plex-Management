@@ -4,14 +4,16 @@ These are the single-purpose barriers every request-derived log site passes its
 values through (see CONTRIBUTING.md "Logging request-derived values"): ``safe_int``
 re-coerces an id (a no-op for a real int, a taint barrier for CodeQL's
 py/log-injection), ``safe_text`` collapses CR/LF so a request-derived string
-cannot forge a second log record, and ``safe_guid`` additionally strips the
-credential-bearing part of a URL-shaped release GUID (a Prowlarr private-indexer
-GUID can embed a tracker passkey/session token) so a secret is never logged.
+cannot forge a second log record, and ``safe_guid`` allowlists provably plain
+release-GUID ids and redacts EVERYTHING else (a Prowlarr private-indexer GUID
+can be a URI of any shape embedding a tracker passkey/session token) so a
+secret is never logged.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 
 import pytest
 
@@ -104,30 +106,37 @@ def test_safe_guid_redacts_url_shaped_guids(raw: str, host: str, secret: str) ->
 @pytest.mark.parametrize(
     "raw",
     [
-        "Some.Movie.2020.1080p.WEB-DL.x264-GROUP",  # a title-style guid
+        "Some.Movie.2020.1080p.WEB-DL.x264-GROUP",  # a title-style dotted id
         "0123456789abcdef0123456789abcdef",  # a plain hex/info-hash-style id
-        "release 12345 (group)",  # opaque text: no scheme, no netloc
+        "12345678-1234-5678-1234-567812345678",  # a bare uuid
+        "tt0111161",  # an imdb-style id
+        "12345",  # a numeric id
+        "a" * 128,  # exactly the length cap -- still allowlisted
     ],
 )
-def test_safe_guid_passes_plain_schemeless_guids_through_unchanged(raw: str) -> None:
-    """A GUID with NEITHER a URI scheme NOR a netloc is not secret-bearing, so it
-    is logged as before (only the ``safe_text`` CR/LF barrier applies)."""
-    assert safe_guid(raw) == safe_text(raw)
-    assert safe_guid(raw) == raw  # nothing to collapse in these inputs
+def test_safe_guid_passes_allowlisted_plain_ids_through_byte_identical(raw: str) -> None:
+    """The ONLY passthrough: a fullmatch of the strict safe-id allowlist
+    (letters/digits/``._-``, at most 128 chars). Byte-identical -- the allowlisted
+    character class contains no CR/LF, so not even ``safe_text`` reshaping."""
+    assert safe_guid(raw) == raw
 
 
 @pytest.mark.parametrize(
     ("raw", "label", "secret"),
     [
-        # THE wave-4 finding: a magnet URI has a scheme but NO netloc -- the old
-        # "scheme AND netloc" rule under-classified it as a plain id and passed
-        # the full URI through, ``tr=`` announce parameters (percent-encoded
-        # tracker URLs, passkey and all) included.
+        # Wave-4 finding: a magnet URI (scheme, NO netloc) -- its percent-encoded
+        # ``tr=`` announce parameters are tracker URLs, passkey and all.
         (
             "magnet:?xt=urn:btih:deadbeef&tr=https%3A%2F%2Fpriv.tracker.org%2Fa%3Fpasskey%3DTRSECRET",
             "magnet",
             "TRSECRET",
         ),
+        # Wave-5 finding (the hole that inverted this function to an allowlist):
+        # a schemeless URL parses as PURE PATH -- no scheme, no netloc -- so every
+        # "URL-shaped" denylist classified it as a plain id and passed the
+        # passkey through verbatim. The allowlist rejects the ``/`` and ``?`` on
+        # sight; no host parses, hence the bare-hash token.
+        ("tracker.example.org/dl/123?passkey=W5SECRET", "", "W5SECRET"),
         # Scheme-ish opaque ids: deliberate fail-closed collateral (see the
         # helper docstring) -- over-redacting a harmless id costs one label;
         # under-redacting a real URI leaks a credential.
@@ -135,20 +144,56 @@ def test_safe_guid_passes_plain_schemeless_guids_through_unchanged(raw: str) -> 
         ("prowlarr:123", "prowlarr", None),
         # Protocol-relative: netloc without scheme -- the label is the host.
         ("//priv.tracker.org/dl?passkey=PRSECRET", "priv.tracker.org", "PRSECRET"),
+        # Opaque text with spaces/parens: outside the allowlist -> redacted
+        # (collateral of the inversion; still correlatable via the hash).
+        ("release 12345 (group)", "", None),
+        # Over the 128-char cap: no longer provably a short opaque id.
+        ("a" * 129, "", None),
     ],
 )
-def test_safe_guid_redacts_scheme_only_and_netloc_only_uris(
+def test_safe_guid_redacts_everything_outside_the_allowlist(
     raw: str, label: str, secret: str | None
 ) -> None:
-    """Any value with a URI scheme OR a netloc is redacted: the label is the
-    hostname when one exists, otherwise the scheme (``magnet#<hash>``) -- the
-    class of URI stays diagnosable, the credential-bearing remainder does not."""
+    """Anything that fails the safe-id fullmatch redacts to ``<label>#<hash>``:
+    label = hostname if one parses, else the scheme if present, else nothing --
+    diagnosable where possible, never a byte of the credential-bearing remainder."""
     result = safe_guid(raw)
     assert result == f"{label}#{_sha12(raw)}"  # exact token: label + hash, nothing else
     if secret is not None:
         assert secret not in result
     assert "passkey" not in result
     assert "?" not in result
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://tracker.example.org/download/123?passkey=SUPERSECRET",
+        "http://someuser:USERPASSKEY@idx.local/file?x=1",
+        "magnet:?xt=urn:btih:deadbeef&tr=https%3A%2F%2Ft.org%2Fa%3Fpasskey%3DTRSECRET",
+        "tracker.example.org/dl/123?passkey=W5SECRET",  # wave 5: schemeless
+        "//priv.tracker.org/dl?passkey=PRSECRET",  # protocol-relative
+        "prowlarr:123",
+        "urn:uuid:12345678-1234-5678-1234-567812345678",
+        "http://[bad/download?passkey=LEAKEDSECRET",  # malformed -> ValueError arm
+        "id with whitespace SECRET",
+        "50%25off?SECRET",
+        "a&b=SECRET",
+    ],
+)
+def test_safe_guid_url_machinery_never_passes_through(raw: str) -> None:
+    """The property the allowlist inversion buys, stated directly: ANY value
+    containing URL machinery (``/ ? & % :`` or whitespace) -- whatever novel URI
+    shape it takes -- comes out as exactly a ``label#hash`` token (label possibly
+    empty), never as the value itself, and never carrying a secret fragment."""
+    assert any(c in raw for c in "/?&%: \t"), "test row must contain URL machinery"
+    result = safe_guid(raw)
+    # Exactly <allowlist-safe label>#<12-hex sha256 prefix>; no other byte can
+    # appear, so no passkey/query/path/userinfo fragment can survive.
+    assert re.fullmatch(r"[A-Za-z0-9.+\-]*#[0-9a-f]{12}", result)
+    assert result.endswith(f"#{_sha12(raw)}")  # stable correlation hash intact
+    assert "SECRET" not in result
+    assert "passkey" not in result
 
 
 def test_safe_guid_hash_prefix_is_stable_and_release_distinguishing() -> None:

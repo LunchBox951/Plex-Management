@@ -808,6 +808,10 @@ async def test_source_error_emits_structured_telemetry(
             "magnet:?xt=urn:btih:deadbeef&tr=https%3A%2F%2Fpriv.tracker.org%2Fa%3Fpasskey%3DSUPERSECRETKEY",
             "magnet",
         ),
+        # Wave-5 P1: a SCHEMELESS URL parses as pure path (no scheme, no netloc)
+        # -- only the allowlist inversion catches it; no host parses, so the
+        # token is bare ``#<hash>``.
+        ("priv.tracker.org/dl/movie?passkey=SUPERSECRETKEY", ""),
     ],
 )
 async def test_source_error_redacts_uri_shaped_guid(
@@ -816,12 +820,14 @@ async def test_source_error_redacts_uri_shaped_guid(
     uri_guid: str,
     expected_label: str,
 ) -> None:
-    """Codex P1 (x2): a Prowlarr private-indexer GUID is frequently a URI embedding
-    a tracker passkey/session token -- an http(s) URL in its path/query, or a
-    magnet URI in its ``tr=`` announce parameters. The source-unresolvable WARNING
-    persists to ``log_events``/``/ops/logs``, so both its message text AND its
-    ``extra=`` guid field must carry only ``<host-or-scheme>#<sha256-prefix>`` --
-    the label for diagnosability, the credential never emitted (north star #3)."""
+    """Codex P1 (x3): a Prowlarr private-indexer GUID can be a URI of ANY shape
+    embedding a tracker passkey/session token -- an http(s) URL in its path/
+    query, a magnet URI in its ``tr=`` announce parameters, or a schemeless
+    ``host/path?passkey=`` value. The source-unresolvable WARNING persists to
+    ``log_events``/``/ops/logs``, so both its message text AND its ``extra=``
+    guid field must carry only ``<label>#<sha256-prefix>`` (``safe_guid``'s
+    allowlist admits plain ids ONLY) -- the label for diagnosability, the
+    credential never emitted (north star #3)."""
     title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
     await _seed_movie(sessionmaker_, tmdb_id=603)
     # ``source_errors`` keys on the download_url, so the guid is free to be the URI

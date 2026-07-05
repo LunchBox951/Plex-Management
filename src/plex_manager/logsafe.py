@@ -13,7 +13,18 @@ CONTRIBUTING.md "Logging request-derived values".
 """
 
 import hashlib
+import re
+from typing import Final
 from urllib.parse import urlsplit
+
+#: The ONLY shape :func:`safe_guid` ever passes through verbatim: a bounded run
+#: of letters, digits, dots, underscores, and hyphens. This covers every benign
+#: release-GUID id form in the wild -- hex info-hashes, UUIDs, numeric ids,
+#: ``tt``-imdb ids, dotted release names -- while NO URL machinery (``/ : ? & %
+#: @ =`` whitespace, CR/LF) can ever match, so no URI of ANY shape, known or
+#: novel, can reach a log through the passthrough. The 128 cap bounds the log
+#: field and keeps "it matched the allowlist" meaning "it is a short opaque id".
+_SAFE_GUID_ID_RE: Final = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 def safe_int(value: int) -> int:
@@ -27,55 +38,55 @@ def safe_text(value: str) -> str:
 
 
 def safe_guid(value: str) -> str:
-    """Redact a URI-shaped release GUID before logging. Total -- never raises.
+    """Redact a release GUID before logging unless it is a provably plain id.
+    Total -- never raises.
 
     Prowlarr private-indexer GUIDs are frequently URIs that embed a tracker
-    passkey or session token, so logging one verbatim leaks a credential (north
-    star #3: secrets are never logged). ``http(s)`` URLs carry it in path/query/
-    userinfo; **magnet URIs carry it too** -- ``tr=`` announce parameters are
-    percent-encoded tracker URLs, passkey and all -- and a magnet has a scheme
-    but NO network location, so "scheme AND netloc" under-classifies it as a
-    plain id. The rule is therefore: ANY value with a URI scheme OR a network
-    location is redacted to ``"<label>#<12-hex-sha256-prefix>"`` where the label
-    is the hostname when one exists (``https://tracker...`` ->
-    ``tracker...#<hash>``) and otherwise the scheme (``magnet:?...`` ->
-    ``magnet#<hash>``) -- the class of URI stays diagnosable while nothing of
-    the credential-bearing remainder leaves the process, and the stable hash of
-    the *full* GUID still lets beta-week analysis correlate repeated failures of
-    the SAME release. ``urlsplit().hostname`` (never ``netloc``) drops embedded
-    ``user:pass@`` userinfo; the netloc-without-scheme arm also catches
-    protocol-relative ``//host/...?passkey=...`` values.
+    passkey or session token -- ``http(s)`` URLs in path/query/userinfo, magnet
+    URIs in their percent-encoded ``tr=`` announce parameters -- so logging one
+    verbatim leaks a credential (north star #3: secrets are never logged).
 
-    Only a value with NEITHER scheme NOR netloc -- a plain id/hash/title -- is
-    not secret-bearing and passes through :func:`safe_text` unchanged (CR/LF
-    still collapsed). Deliberate fail-closed collateral: an opaque id that
-    merely LOOKS scheme-ish (``prowlarr:123``, ``urn:uuid:...``) is redacted
-    too -- over-redacting a harmless id costs one hash-correlatable label;
-    under-redacting a real URI leaks a credential.
+    This helper is an ALLOWLIST, deliberately: three successive denylist rules
+    each leaked a novel shape ("scheme+netloc" missed malformed-bracket URLs,
+    then magnet's scheme-without-netloc, then schemeless ``host/path?passkey=``
+    values that parse as pure path). Enumerating "URL-shaped" can only ever
+    chase the last leak. Inverted, the question is decidable: a value passes
+    through verbatim ONLY if it fullmatches :data:`_SAFE_GUID_ID_RE` --
+    letters/digits/``._-``, at most 128 chars -- a character class that admits
+    every benign id form (hex hashes, UUIDs, numeric ids, ``tt``-ids, dotted
+    release names) and NO URL machinery whatsoever: nothing containing ``/ : ?
+    & % @ =`` or whitespace can ever pass, so no URI of any shape, known or
+    novel, reaches a log. (The allowlisted shape contains no CR/LF either, so
+    the passthrough is byte-identical -- ``safe_text`` would be a no-op.)
+
+    EVERYTHING else redacts to ``"<label>#<12-hex-sha256-prefix>"``: the label
+    is the hostname when one parses (``https://tracker...`` ->
+    ``tracker...#<hash>``; ``urlsplit().hostname``, never ``netloc``, so
+    ``user:pass@`` userinfo is dropped), else the scheme (``magnet:?...`` ->
+    ``magnet#<hash>``), else nothing (bare ``"#<hash>"``) -- diagnosable where
+    possible, never a byte of the credential-bearing remainder, and the stable
+    hash of the *full* GUID still lets beta-week analysis correlate repeated
+    failures of the SAME release. Deliberate fail-closed collateral: an
+    exotic-but-legit plain id that happens to carry a slash/colon/space (or
+    exceed 128 chars) now redacts too -- it stays correlatable via the hash,
+    and over-redacting a harmless id costs one label while under-redacting a
+    real URI leaks a credential.
 
     A log barrier must be TOTAL: this helper is evaluated inside ``except``
-    handlers (e.g. auto-grab's per-release source-failure WARNING), where a throw
-    would escape the handler and abort the whole surrounding cycle. Two
-    external-input edge cases are therefore absorbed, never raised:
-
-    * ``urlsplit`` itself raises ``ValueError`` on some malformed URL-ish text
-      (e.g. ``http://[bad`` -- an unclosed IPv6 bracket in the netloc). That only
-      happens for a value with a ``//<netloc>`` shape, which may STILL carry a
-      credential (``http://[bad/?passkey=...`` raises identically), so the
-      fallback fails CLOSED: a label-less ``"#<hash>"`` token, never the
-      verbatim value (a plain passthrough here would re-open the very leak this
-      helper exists to close).
-    * The digest encodes with ``surrogatepass``: JSON permits lone surrogates,
-      and a plain ``.encode("utf-8")`` would raise ``UnicodeEncodeError`` (a
-      ``ValueError`` subclass) -- an exotic input must not become a throw or a
-      redaction bypass.
+    handlers (e.g. auto-grab's per-release source-failure WARNING), where a
+    throw would escape the handler and abort the whole surrounding cycle. The
+    regex cannot raise; ``urlsplit``'s ``ValueError`` on malformed netlocs
+    (``http://[bad``) is absorbed into the bare-hash arm; and the digest
+    encodes with ``surrogatepass`` (JSON permits lone surrogates; a plain UTF-8
+    encode would raise ``UnicodeEncodeError`` -- a ``ValueError`` subclass --
+    mid-handler).
     """
+    if _SAFE_GUID_ID_RE.fullmatch(value):
+        return value  # provably a plain opaque id -- byte-identical passthrough
     digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:12]
     try:
         split = urlsplit(value)
-        if not split.scheme and not split.netloc:
-            return safe_text(value)  # plain id/hash/title -- not URI-shaped
         label = split.hostname or split.scheme
     except ValueError:
-        label = ""  # unparseable but URL-ish: fail closed, hash-only token
+        label = ""  # unparseable (malformed netloc): fail closed, hash-only token
     return f"{safe_text(label)}#{digest}"
