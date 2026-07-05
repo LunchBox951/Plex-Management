@@ -21,6 +21,15 @@ class Settings(BaseSettings):
         env_prefix="PLEX_MANAGER_",
         env_file=".env",
         extra="ignore",
+        # Treat a blank env var (``PLEX_MANAGER_AUTH_COOKIE_SECURE=``) as UNSET, so a
+        # docs-following install that copies ``.env.example`` verbatim boots on the
+        # field defaults instead of failing validation. Without this, an empty
+        # string reaching a ``bool | None`` / ``int`` field (auth_cookie_secure,
+        # port, dev_auth_bypass) raises at startup. Audited safe: every optional /
+        # secret field already treats "" as falsy (== its ``None``/default meaning),
+        # and no field assigns empty-string a distinct meaning — so ignoring blanks
+        # never changes behavior for any other knob.
+        env_ignore_empty=True,
     )
 
     app_name: str = "Plex Manager"

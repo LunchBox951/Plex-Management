@@ -29,7 +29,18 @@ export function SetupGate() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.setupStatus })
       navigate('/setup', { replace: true })
     }
-    const onAuthInvalid = () => setAuthMode('key')
+    // An access-key 401: the stored key was rejected (the client already cleared
+    // it). Show KeyEntry AND drop the cached "authenticated" answer from that key
+    // — otherwise a stale ``authenticated: true`` from the prior successful key
+    // login keeps rendering <Outlet/> (below) on protected screens that 401 on
+    // every call. Refetching /auth/me (which never 401s — it returns
+    // ``authenticated: false`` for a key-only session) re-derives honest state;
+    // ``authMode === 'key'`` also takes precedence in the render so KeyEntry shows
+    // immediately, before that refetch resolves.
+    const onAuthInvalid = () => {
+      setAuthMode('key')
+      void queryClient.invalidateQueries({ queryKey: queryKeys.authMe })
+    }
     // A session-cookie 401: the Plex sign-in lapsed. Drop the cached "authenticated"
     // answer and refetch /auth/me so the gate re-derives state — an expired session
     // resolves to `authenticated: false` and falls through to the Plex login, rather
@@ -73,10 +84,9 @@ export function SetupGate() {
 
   if (auth.isLoading) return <CenteredSpinner label="Checking sign-in…" />
 
-  if (auth.data?.authenticated) {
-    return <Outlet />
-  }
-
+  // KeyEntry takes precedence over a cached ``authenticated: true``: after an
+  // access-key 401 the stored key is gone, so that cached answer is stale and
+  // must not strand the operator on <Outlet/> (see ``onAuthInvalid``).
   if (authMode === 'key') {
     return (
       <KeyEntry
@@ -87,6 +97,10 @@ export function SetupGate() {
         onUsePlex={() => setAuthMode('plex')}
       />
     )
+  }
+
+  if (auth.data?.authenticated) {
+    return <Outlet />
   }
 
   return <PlexLogin onUseAccessKey={() => setAuthMode('key')} />

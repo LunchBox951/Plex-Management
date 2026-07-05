@@ -33,6 +33,7 @@ __all__ = [
     "MediaNotFoundError",
     "MediaTypeDeferredError",
     "NoAiredSeasonsError",
+    "RequestOwnedByAnotherUserError",
     "create_request",
     "create_request_result",
     "get_request",
@@ -116,6 +117,26 @@ class MediaTypeDeferredError(Exception):
     def __init__(self, media_type: str) -> None:
         self.media_type = media_type
         super().__init__(f"{media_type} requests are deferred")
+
+
+class RequestOwnedByAnotherUserError(Exception):
+    """A non-admin user tried to dedup onto an active request owned by someone else.
+
+    Until shared ownership is modeled (issue #58), a non-admin authenticated
+    caller must NOT dedup onto an existing active request that belongs to a
+    DIFFERENT user: doing so would (a) for tv mutate the other user's request by
+    adding the caller's seasons (via ``ensure_seasons``), and (b) hand back a
+    record the caller's own per-user list/get immediately hide. Surfaced as HTTP
+    409 with a stable ``requested_by_another_user`` detail — an honest rejection,
+    not a silent mutation of someone else's request. Admins and API-key
+    automation (no user identity) keep the shared dedup behavior, since they can
+    already see every request.
+    """
+
+    def __init__(self, tmdb_id: int, media_type: str) -> None:
+        self.tmdb_id = tmdb_id
+        self.media_type = media_type
+        super().__init__(f"{media_type} tmdb_id={tmdb_id} is already requested by another user")
 
 
 class _Detail(NamedTuple):
@@ -262,6 +283,7 @@ async def create_request(
     tmdb_id: int,
     media_type: str,
     user_id: int | None = None,
+    actor_is_admin: bool = False,
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
 ) -> RequestRecord:
@@ -272,6 +294,7 @@ async def create_request(
         tmdb_id=tmdb_id,
         media_type=media_type,
         user_id=user_id,
+        actor_is_admin=actor_is_admin,
         library=library,
         seasons=seasons,
     )
@@ -285,6 +308,7 @@ async def create_request_result(
     tmdb_id: int,
     media_type: str,
     user_id: int | None = None,
+    actor_is_admin: bool = False,
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
 ) -> CreateRequestResult:
@@ -314,6 +338,13 @@ async def create_request_result(
     never persists a request with nothing to track. The dedup path never raises
     this: an existing request resolving no NEW seasons there just means "nothing
     to add" to an already-viable request, not a dead end.
+
+    Raises :class:`RequestOwnedByAnotherUserError` (surfaced as 409) when a
+    non-admin authenticated caller (``user_id`` set, ``actor_is_admin`` False)
+    dedups onto an existing active request owned by a DIFFERENT user -- rejected
+    before any claim/season mutation, so another user's request is never silently
+    grown or returned behind the caller's per-user filter. Admins and API-key
+    automation (``user_id`` None) keep the shared dedup behavior (issue #58).
     """
     if media_type not in {"movie", "tv"}:
         raise MediaTypeDeferredError(media_type)
@@ -321,6 +352,21 @@ async def create_request_result(
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:
+        # Issue #58: a non-admin authenticated user must not dedup onto an active
+        # request OWNED BY A DIFFERENT USER. Falling through would (a) for tv mutate
+        # the other user's request by adding this caller's seasons via
+        # ensure_seasons below, and (b) return a record the caller's own per-user
+        # list/get immediately hide. Reject honestly (409) BEFORE any claim/mutation.
+        # Admins and API-key automation (user_id is None) keep the shared dedup
+        # behavior — they can already see every request. Full shared-ownership
+        # modeling is tracked in issue #58.
+        if (
+            user_id is not None
+            and not actor_is_admin
+            and existing.user_id is not None
+            and existing.user_id != user_id
+        ):
+            raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
         # The deduped active request may have no owner (e.g. it was created via the
         # API-key automation path, which carries no user identity). Adopt it for the
         # requesting user so the dedup result appears in THEIR request list instead

@@ -3764,6 +3764,16 @@
             },
             "description": "Media not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Already requested by another user"
+          },
           "422": {
             "content": {
               "application/json": {

@@ -149,6 +149,61 @@ def test_owner_has_server_requires_owned_resource_with_matching_machine_id() -> 
     assert owner_has_server(parsed, "other-machine-id") is False
 
 
+@pytest.mark.parametrize(
+    ("raw_owned", "expected"),
+    [
+        # Real booleans.
+        (True, True),
+        (False, False),
+        # Ints (the XML-derived numeric shape).
+        (1, True),
+        (0, False),
+        # Strings, in every casing plex.tv emits.
+        ("1", True),
+        ("0", False),
+        ("true", True),
+        ("false", False),
+        ("True", True),
+        ("TRUE", True),
+        ("False", False),
+        (" true ", True),
+        (" 1 ", True),
+        # Unexpected shapes fail CLOSED (never mis-grant ownership).
+        (2, False),
+        (-1, False),
+        ("yes", False),
+        ("owned", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_parse_resources_owned_accepts_every_plex_boolean_encoding(
+    raw_owned: object, expected: bool
+) -> None:
+    """``owned`` arrives as a bool, an int (1/0), or a string ("1"/"true"/...),
+    because plex.tv resource payloads are XML-derived. All truthy encodings must
+    register as owned; anything unexpected fails CLOSED to False."""
+    parsed = PlexOAuthClient.parse_resources(
+        [{"name": "S", "clientIdentifier": "server-machine-id", "owned": raw_owned}]
+    )
+    assert parsed[0].owned is expected
+
+
+def test_owner_has_server_accepts_numeric_owned_encoding() -> None:
+    """E2E-critical: the REAL owner's resource commonly encodes ``owned`` as ``1``
+    (or ``"1"``). It must still register as owning the configured server — else the
+    owner signs in with permissions=0 and is locked out of every require_admin
+    route."""
+    resources = [
+        {"name": "Shared", "clientIdentifier": "server-machine-id", "owned": "0"},
+        {"name": "Owned Server", "clientIdentifier": "server-machine-id", "owned": 1},
+    ]
+
+    parsed = PlexOAuthClient.parse_resources(resources)
+    assert owner_has_server(parsed, "server-machine-id") is True
+    assert owner_has_server(parsed, "other-machine-id") is False
+
+
 @pytest.mark.asyncio
 async def test_auth_errors_exclude_secret_values() -> None:
     async def handler(_request: httpx.Request) -> httpx.Response:

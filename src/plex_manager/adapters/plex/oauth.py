@@ -100,11 +100,25 @@ def _get_int(fields: Mapping[str, object], key: str) -> int | None:
 
 
 def _get_bool(fields: Mapping[str, object], key: str) -> bool:
+    """Parse a Plex boolean, tolerating every shape plex.tv encodes them in.
+
+    Resource payloads are XML-derived, so a boolean field (e.g. ``owned``) can
+    arrive as a real ``bool``, an ``int`` (``1`` / ``0``), or a string
+    (``"1"`` / ``"0"`` / ``"true"`` / ``"false"``, case-insensitive). Recognizing
+    only ``True`` / ``"true"`` would read the REAL server owner's ``owned=1`` as
+    ``False`` and lock them out of every ``require_admin`` route.
+
+    Fails CLOSED for ownership: any value outside the known truthy encodings maps
+    to ``False``, so an unexpected shape (an int other than ``1``, an unknown
+    string, ``None``) never mis-grants ownership.
+    """
     value = fields.get(key)
     if isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        return value == 1  # 1 -> True; 0 and any other int -> False (fail closed)
     if isinstance(value, str):
-        return value.lower() == "true"
+        return value.strip().lower() in {"1", "true"}
     return False
 
 

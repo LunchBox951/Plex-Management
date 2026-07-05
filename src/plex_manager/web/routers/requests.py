@@ -27,7 +27,11 @@ from plex_manager.services.correction_service import (
     SeasonNotFoundError,
 )
 from plex_manager.services.library_roots import LibraryRoots
-from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
+from plex_manager.services.request_service import (
+    MediaNotFoundError,
+    NoAiredSeasonsError,
+    RequestOwnedByAnotherUserError,
+)
 from plex_manager.web.deps import (
     AuthContext,
     ServiceNotConfiguredError,
@@ -75,6 +79,7 @@ router = APIRouter(
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
+    409: {"model": ErrorDetail, "description": "Already requested by another user"},
 }
 
 
@@ -151,11 +156,20 @@ async def create_request_endpoint(
             library=library,
             seasons=body.seasons,
             user_id=auth.user_id,
+            actor_is_admin=auth.is_admin,
         )
     except MediaNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="media_not_found",
+        ) from exc
+    except RequestOwnedByAnotherUserError as exc:
+        # Issue #58: a non-admin cannot dedup onto another user's active request
+        # (it would mutate/return a row they can't even see). Honest 409, not a
+        # silent no-op or a hidden mutation.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="requested_by_another_user",
         ) from exc
     except NoAiredSeasonsError as exc:
         # The show exists in TMDB but resolved to zero trackable seasons (a data

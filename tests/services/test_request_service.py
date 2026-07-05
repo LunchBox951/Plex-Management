@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex import PlexLibrary
 from plex_manager.adapters.plex.library import PlexLibraryError, reset_caches
-from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest, User
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -682,3 +682,184 @@ async def test_set_keep_forever_missing_request_returns_none(
             session=session, request_id=999999, keep_forever=True
         )
     assert result is None
+
+
+# --------------------------------------------------------------------------- #
+# Ownership on the dedup path (issue #58) — a non-admin must not dedup onto     #
+# ANOTHER user's active request (would mutate/return a row they cannot see).    #
+# --------------------------------------------------------------------------- #
+
+
+async def _make_user(sm: SessionMaker, *, username: str, permissions: int = 0) -> int:
+    async with sm() as session:
+        user = User(username=username, permissions=permissions)
+        session.add(user)
+        await session.commit()
+        return user.id
+
+
+async def test_non_admin_dedup_onto_foreign_owned_tv_request_rejects_and_leaves_it_unmutated(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A non-admin user POSTing a title already actively requested by a DIFFERENT
+    user gets an honest 409 (``RequestOwnedByAnotherUserError``) — and the other
+    user's request is NOT mutated: its tracked TV season set is unchanged, never
+    grown with the intruder's requested season."""
+    owner_id = await _make_user(sessionmaker_, username="owner")
+    intruder_id = await _make_user(sessionmaker_, username="intruder")
+    tmdb = FakeTmdb(shows={7001: TvMetadata(tmdb_id=7001, title="Show", year=2020, season_count=5)})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7001, media_type="tv", seasons=[1], user_id=owner_id
+        )
+    assert await _season_numbers(sessionmaker_, owned.id) == {1}
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7001,
+                media_type="tv",
+                seasons=[2],
+                user_id=intruder_id,
+                actor_is_admin=False,
+            )
+
+    assert await _season_numbers(sessionmaker_, owned.id) == {1}  # NOT grown to {1, 2}
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, owned.id)
+        assert row is not None and row.user_id == owner_id  # still the owner's row
+
+
+async def test_non_admin_dedup_onto_foreign_owned_movie_request_rejects(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The movie analogue: a non-admin cannot dedup onto another user's active
+    movie request (it would return a row the caller's list/get immediately hide)."""
+    owner_id = await _make_user(sessionmaker_, username="owner-m")
+    intruder_id = await _make_user(sessionmaker_, username="intruder-m")
+    tmdb = FakeTmdb(movies={7005: MovieMetadata(tmdb_id=7005, title="Movie", year=2020)})
+
+    async with sessionmaker_() as session:
+        await request_service.create_request(
+            session, tmdb, tmdb_id=7005, media_type="movie", user_id=owner_id
+        )
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7005,
+                media_type="movie",
+                user_id=intruder_id,
+                actor_is_admin=False,
+            )
+
+
+async def test_admin_dedup_onto_foreign_owned_tv_request_keeps_shared_behavior(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Admins are exempt (they can see every request): an admin deduping onto
+    another user's active TV request keeps the current shared behavior — the same
+    row is returned and its tracked season set grows."""
+    owner_id = await _make_user(sessionmaker_, username="owner-a")
+    admin_id = await _make_user(sessionmaker_, username="admin", permissions=1)
+    tmdb = FakeTmdb(shows={7002: TvMetadata(tmdb_id=7002, title="Show", year=2020, season_count=5)})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7002, media_type="tv", seasons=[1], user_id=owner_id
+        )
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7002,
+            media_type="tv",
+            seasons=[2],
+            user_id=admin_id,
+            actor_is_admin=True,
+        )
+    assert result.id == owned.id
+    assert await _season_numbers(sessionmaker_, owned.id) == {1, 2}
+
+
+async def test_key_auth_dedup_onto_owned_tv_request_keeps_shared_behavior(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """API-key automation carries no user identity (``user_id`` is None): it keeps
+    the shared dedup behavior — deduping onto an owned request returns it and grows
+    its season set, exactly as before this ownership guard."""
+    owner_id = await _make_user(sessionmaker_, username="owner-k")
+    tmdb = FakeTmdb(shows={7003: TvMetadata(tmdb_id=7003, title="Show", year=2020, season_count=5)})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7003, media_type="tv", seasons=[1], user_id=owner_id
+        )
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session, tmdb, tmdb_id=7003, media_type="tv", seasons=[2], user_id=None
+        )
+    assert result.id == owned.id
+    assert await _season_numbers(sessionmaker_, owned.id) == {1, 2}
+
+
+async def test_non_admin_claims_ownerless_request_on_dedup_unchanged(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The ownerless-claim path is unaffected: a non-admin deduping onto an
+    UNOWNED active request (e.g. one created by API-key automation) adopts it —
+    no 409 — so the dedup result shows up in their own request list."""
+    claimer_id = await _make_user(sessionmaker_, username="claimer")
+    tmdb = FakeTmdb(movies={7004: MovieMetadata(tmdb_id=7004, title="Movie", year=2020)})
+
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7004, media_type="movie", user_id=None
+        )
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7004,
+            media_type="movie",
+            user_id=claimer_id,
+            actor_is_admin=False,
+        )
+    assert result.id == ownerless.id
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, ownerless.id)
+        assert row is not None and row.user_id == claimer_id  # claimed, not rejected
+
+
+async def test_owner_rededuping_onto_own_tv_request_grows_seasons(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A user re-requesting their OWN active request is never rejected: the tracked
+    season set grows, same as the pre-existing dedup behavior."""
+    owner_id = await _make_user(sessionmaker_, username="self")
+    tmdb = FakeTmdb(shows={7006: TvMetadata(tmdb_id=7006, title="Show", year=2020, season_count=5)})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7006, media_type="tv", seasons=[1], user_id=owner_id
+        )
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7006,
+            media_type="tv",
+            seasons=[2],
+            user_id=owner_id,
+            actor_is_admin=False,
+        )
+    assert result.id == owned.id
+    assert await _season_numbers(sessionmaker_, owned.id) == {1, 2}
