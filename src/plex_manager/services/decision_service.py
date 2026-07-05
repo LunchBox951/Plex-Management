@@ -49,9 +49,14 @@ __all__ = ["preview"]
 
 # The constant equals this module's dotted path (i.e. ``__name__``); constructing
 # the logger FROM it (retention-telemetry precedent) guarantees the emitter can
-# never drift from the INFO pin ``configure_logging`` applies to that same name --
-# without the pin, an operator ``log_level`` of WARNING/ERROR would silently drop
-# the issue-#24 beta aggregate below before the durable log sink ever saw it.
+# never drift from the treatment ``configure_logging``/``prune_once`` key on that
+# exact name: the INFO pin (an operator ``log_level`` of WARNING/ERROR would
+# otherwise silently drop the issue-#24 beta aggregate below before the durable
+# log sink ever saw it) and the 30-day retention floor. Module-logger scope is
+# correct HERE -- the #24 aggregate is this module's ONLY log record, so module
+# scope IS telemetry-only scope; ``auto_grab_service``, whose module logger also
+# carries operational records, uses a dedicated ``.telemetry`` child instead
+# (wave-6 finding: operational rows must not dodge the operator's retention).
 _logger = logging.getLogger(DECISION_TELEMETRY_LOGGER_NAME)
 
 #: Cap on sample release titles carried by the multi-season-pack rejection

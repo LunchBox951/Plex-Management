@@ -128,22 +128,30 @@ _TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
 
 #: The other beta-week telemetry emitters, sharing the retention logger's exact
 #: hazard: ``decision_service`` logs the issue-#24 multi-season-pack aggregate at
-#: INFO, and ``auto_grab_service`` logs the issue-#43 per-cycle summary (with its
-#: ``source_failures`` rollup) at INFO -- at an operator ``log_level`` of WARNING/
-#: ERROR either dataset would otherwise silently never reach ``log_events``. Each
-#: name equals its module's dotted path; the modules construct their ``_logger``
-#: FROM these constants (retention precedent) so the emitter and the treatment
-#: below can never drift apart under a rename. The treatment is per MODULE
-#: logger, matching the retention precedent: for ``decision_service`` the
-#: aggregate is the module's only INFO record; for ``auto_grab_service`` it
-#: additionally covers the enriched per-release source-failure WARNINGs (wanted:
-#: they carry the release identity the #43 "same source keeps failing" analysis
-#: correlates on) and admits one rare non-telemetry INFO ("active download
-#: appeared before park") -- accepted collateral, chosen over splintering one
-#: module across two logger names (which would complicate ``log_events``
-#: filtering by ``logger``).
+#: INFO, and ``auto_grab_service`` logs the issue-#43 records (the enriched
+#: per-release source-failure WARNING and the per-cycle summary INFO with its
+#: ``source_failures`` rollup) -- at an operator ``log_level`` of WARNING/ERROR
+#: the INFO records would otherwise silently never reach ``log_events``. The
+#: modules construct their telemetry logger FROM these constants (retention
+#: precedent) so the emitter and the treatment below can never drift apart
+#: under a rename. The SCOPE differs per module, deliberately:
+#:
+#: * ``decision_service`` uses its MODULE logger (the name equals the module's
+#:   dotted path): the #24 aggregate is that module's ONLY log record, so
+#:   module-logger scope IS telemetry-only scope -- a dedicated child would add
+#:   a second name for zero records separated.
+#: * ``auto_grab_service`` uses a dedicated ``.telemetry`` CHILD logger, because
+#:   its module logger also carries operational records (search-failure
+#:   cooldowns, "accepted release unusable", a park-race INFO). Scoping the
+#:   telemetry treatment to the module logger would let those operational rows
+#:   dodge the operator's ``log_retention_days`` and accumulate for 30 days on a
+#:   failing install (the wave-6 finding). Only the #43 records go through the
+#:   child; everything operational stays on the module logger with ordinary
+#:   level/retention semantics. Child records propagate to the root handlers
+#:   exactly like module records (levels gate only at the EMITTING logger), so
+#:   the durable sink sees them unchanged.
 DECISION_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.decision_service"
-AUTO_GRAB_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.auto_grab_service"
+AUTO_GRAB_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.auto_grab_service.telemetry"
 
 #: THE definition of "a telemetry logger" -- deliberately one tuple driving BOTH
 #: telemetry behaviors, so they can never drift apart:

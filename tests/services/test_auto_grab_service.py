@@ -59,6 +59,12 @@ SessionMaker = async_sessionmaker[AsyncSession]
 
 _NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
 _LOGGER_NAME = "plex_manager.services.auto_grab_service"
+# The dedicated telemetry CHILD (wave-6 split): ONLY the issue-#43 records -- the
+# enriched source-failure WARNING and the per-cycle summary INFO -- are emitted
+# here (INFO-pinned + 30-day-retained); operational records stay on the module
+# logger above with ordinary level/retention semantics. ``caplog.at_level`` on
+# the MODULE logger still enables the child's records via level inheritance.
+_TELEMETRY_LOGGER_NAME = "plex_manager.services.auto_grab_service.telemetry"
 
 
 class _RaisingProwlarr:
@@ -766,6 +772,9 @@ async def test_source_error_emits_structured_telemetry(
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1, "exactly one enriched WARNING for the sole source failure"
     record = warnings[0]
+    # The #43 WARNING is telemetry, so it must ride the dedicated child logger
+    # (INFO-pinned + 30-day-retained) -- never the operational module logger.
+    assert record.name == _TELEMETRY_LOGGER_NAME
     # ``extra=`` sets each key as a plain LogRecord ATTRIBUTE (not a stdlib-known
     # one), so ``getattr`` -- never direct attribute access -- matches this
     # module's other structured-logging tests (e.g. test_request_service.py).
@@ -790,7 +799,9 @@ async def test_source_error_emits_structured_telemetry(
     assert f"title={title!r}" in message
     assert "indexer='FakeIndexer'" in message
 
-    summaries = [r for r in caplog.records if r.levelname == "INFO" and r.name == _LOGGER_NAME]
+    summaries = [
+        r for r in caplog.records if r.levelname == "INFO" and r.name == _TELEMETRY_LOGGER_NAME
+    ]
     assert len(summaries) == 1
     assert getattr(summaries[0], "source_failures", None) == 1
     assert "source_failures=1" in summaries[0].getMessage()
@@ -899,7 +910,9 @@ async def test_source_error_with_malformed_url_guid_still_parks_and_continues(
     assert getattr(warnings[0], "guid", None) == expected_guid
     assert malformed_guid not in warnings[0].getMessage()  # nothing of the raw value
 
-    summaries = [r for r in caplog.records if r.levelname == "INFO" and r.name == _LOGGER_NAME]
+    summaries = [
+        r for r in caplog.records if r.levelname == "INFO" and r.name == _TELEMETRY_LOGGER_NAME
+    ]
     assert len(summaries) == 1  # the closing summary still ran
     assert getattr(summaries[0], "source_failures", None) == 1
 
@@ -910,30 +923,35 @@ async def test_cycle_summary_reaches_capture_at_warning_operator_floor(
 ) -> None:
     """Codex P2 (log-floor): at ``log_level=WARNING`` the per-cycle summary INFO
     (the issue-#43 ``source_failures`` rollup) used to be filtered at the
-    ``_logger.info`` call before any handler ran -- the beta dataset silently
-    never persisted. ``configure_logging`` now pins this module's logger to INFO
-    (retention-telemetry precedent), so the record is still CREATED and flows to
-    every root handler (the durable ``LogCaptureHandler`` and caplog alike),
-    while ordinary INFO chatter from non-pinned loggers stays suppressed."""
-    # Drift guard: the pin targets exactly the logger this module emits on.
-    assert _LOGGER_NAME == log_capture_service.AUTO_GRAB_TELEMETRY_LOGGER_NAME
+    ``.info`` call before any handler ran -- the beta dataset silently never
+    persisted. ``configure_logging`` pins the dedicated TELEMETRY CHILD logger
+    to INFO (wave-6 split: the operational module logger keeps ordinary
+    semantics), so the record is still CREATED and propagates to every root
+    handler (the durable ``LogCaptureHandler`` and caplog alike) -- intermediate
+    logger levels never filter propagated records -- while ordinary INFO chatter
+    from non-pinned loggers stays suppressed."""
+    # Drift guard: the pin targets exactly the logger the telemetry emits on.
+    assert _TELEMETRY_LOGGER_NAME == log_capture_service.AUTO_GRAB_TELEMETRY_LOGGER_NAME
 
     await _seed_movie(sessionmaker_, tmdb_id=603)
     prowlarr = FakeProwlarr(good_and_cam_candidates())
     qbt = FakeQbittorrent()
 
     root = logging.getLogger()
-    pinned = logging.getLogger(_LOGGER_NAME)
+    pinned = logging.getLogger(_TELEMETRY_LOGGER_NAME)
     saved_root_level = root.level
     saved_pinned_level = pinned.level
     # WARNING is the exact operator floor that used to drop the summary INFO.
     handler = log_capture_service.configure_logging("WARNING")
     try:
         result = await _run(sessionmaker_, prowlarr, qbt)
-        # Control: an INFO on a NON-pinned sibling logger must still be dropped
+        # Control 1: an INFO on a NON-pinned sibling logger must still be dropped
         # by the WARNING floor -- proving the pin (not a permissive root) is what
         # lets the telemetry through.
         logging.getLogger("plex_manager.services.request_service").info("floor control")
+        # Control 2: the operational MODULE logger is no longer pinned (wave-6
+        # split) -- its INFO records obey the operator floor like any other.
+        logging.getLogger(_LOGGER_NAME).info("module-logger control")
     finally:
         log_capture_service.stop_logging(handler)
         root.setLevel(saved_root_level)
@@ -943,11 +961,12 @@ async def test_cycle_summary_reaches_capture_at_warning_operator_floor(
     summaries = [
         r
         for r in caplog.records
-        if r.name == _LOGGER_NAME and r.getMessage().startswith("auto-grab cycle:")
+        if r.name == _TELEMETRY_LOGGER_NAME and r.getMessage().startswith("auto-grab cycle:")
     ]
     assert len(summaries) == 1  # created DESPITE the WARNING floor
     assert getattr(summaries[0], "source_failures", None) == 0
     assert not any(r.getMessage() == "floor control" for r in caplog.records)
+    assert not any(r.getMessage() == "module-logger control" for r in caplog.records)
 
 
 async def test_no_source_errors_emits_zero_source_failures_in_summary(
@@ -970,7 +989,9 @@ async def test_no_source_errors_emits_zero_source_failures_in_summary(
         assert row is not None
         assert row.status == RequestStatus.downloading
 
-    summaries = [r for r in caplog.records if r.levelname == "INFO" and r.name == _LOGGER_NAME]
+    summaries = [
+        r for r in caplog.records if r.levelname == "INFO" and r.name == _TELEMETRY_LOGGER_NAME
+    ]
     assert len(summaries) == 1
     assert getattr(summaries[0], "source_failures", None) == 0
     assert "source_failures=0" in summaries[0].getMessage()

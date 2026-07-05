@@ -477,7 +477,13 @@ async def test_prune_once_spares_decision_and_auto_grab_telemetry_rows_too(
     now iterates the same ``_TELEMETRY_LOGGERS`` tuple the INFO pin uses (one
     definition of "telemetry logger", both behaviors), so a 20-day-old row from
     EITHER logger survives a 7-day operator window while an equally old ordinary
-    row is still pruned."""
+    row is still pruned.
+
+    Wave-6 P2 refinement: the auto-grab member is the dedicated ``.telemetry``
+    CHILD, not the module logger -- an OPERATIONAL auto-grab row (search-failure
+    cooldowns, "accepted release unusable", logged on the module logger) obeys
+    the operator's window like any ordinary row, so a failing install's warning
+    stream can never dodge ``log_retention_days`` for 30 days."""
     now = datetime.now(UTC)
     async with sessionmaker_() as session:
         repo = SqlLogEventRepository(session)
@@ -499,11 +505,19 @@ async def test_prune_once_spares_decision_and_auto_grab_telemetry_rows_too(
             message="ordinary, 20 days old",
             created_at=now - timedelta(days=20),
         )
+        # An operational auto-grab record rides the MODULE logger -- outside the
+        # carve-out by design (wave-6), so the operator window prunes it.
+        await repo.create(
+            level="WARNING",
+            logger="plex_manager.services.auto_grab_service",
+            message="operational auto-grab warning, 20 days old",
+            created_at=now - timedelta(days=20),
+        )
         await session.commit()
 
         removed = await prune_once(repo, retention_days=7)
         await session.commit()
-        assert removed == 1  # only the ordinary row
+        assert removed == 2  # the ordinary row AND the operational auto-grab row
 
         remaining = await repo.list_events(limit=10)
     assert sorted(r.message for r in remaining.results) == [

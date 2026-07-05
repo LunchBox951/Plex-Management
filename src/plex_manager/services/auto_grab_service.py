@@ -113,13 +113,21 @@ __all__ = [
     "run_grab_cycle",
 ]
 
-# The constant equals this module's dotted path (i.e. ``__name__``); constructing
-# the logger FROM it (retention-telemetry precedent) guarantees the emitter can
-# never drift from the INFO pin ``configure_logging`` applies to that same name --
-# without the pin, an operator ``log_level`` of WARNING/ERROR would silently drop
-# the issue-#43 per-cycle summary INFO (the ``source_failures`` rollup) before the
-# durable log sink ever saw it.
-_logger = logging.getLogger(AUTO_GRAB_TELEMETRY_LOGGER_NAME)
+# TWO loggers, deliberately split (wave-6 finding). ``_logger`` is the ordinary
+# module logger for OPERATIONAL records (search-failure cooldowns, "accepted
+# release unusable", the park-race INFO): ordinary level semantics, ordinary
+# operator-controlled ``log_retention_days``. ``_telemetry_logger`` is a
+# dedicated ``.telemetry`` CHILD used by the issue-#43 records ONLY -- the
+# enriched source-failure WARNING and the per-cycle summary INFO -- constructed
+# FROM the shared constant (retention precedent) so the emitter can never drift
+# from the treatment ``log_capture_service`` keys on that exact name: the INFO
+# pin (an operator WARNING/ERROR floor must not stop the dataset being CREATED)
+# and the 30-day retention floor (the default 7-day prune must not delete it
+# mid-beta-week). Scoping that treatment to the module logger instead would let
+# every operational warning on a failing install dodge the operator's retention
+# window for 30 days -- exactly what the split prevents.
+_logger = logging.getLogger(__name__)
+_telemetry_logger = logging.getLogger(AUTO_GRAB_TELEMETRY_LOGGER_NAME)
 
 # Request/season statuses the worker re-searches. ``pending`` (never searched),
 # ``no_acceptable_release`` (searched, nothing acceptable -> retry on backoff), and
@@ -743,7 +751,7 @@ async def run_grab_cycle(
                 await session.rollback()
                 source_failures += 1
                 release = scored.candidate
-                _logger.warning(
+                _telemetry_logger.warning(
                     "auto-grab: accepted release source-unresolvable (%s): "
                     "title=%r indexer=%r guid=%r info_hash=%s season=%s, "
                     "attempt %d/%d; trying next accepted release",
@@ -815,7 +823,7 @@ async def run_grab_cycle(
                 no_acceptable += 1
 
     cooled_down = sum(1 for cd in cooldowns.values() if cd.not_before > now)
-    _logger.info(
+    _telemetry_logger.info(
         "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d "
         "grab_errors=%d cooled_down=%d source_failures=%d",
         searched,
