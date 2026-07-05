@@ -7,6 +7,7 @@ from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import ParsedRelease
 from plex_manager.domain.season_pack import (
     MultiSeasonRequestIntent,
+    MultiSeasonRequestMode,
     SeasonPackSeasonState,
     classify_release_scope,
     covers_requested_episodes,
@@ -125,7 +126,7 @@ def test_covers_requested_episodes_unknown_scope_conservative_reject() -> None:
 
 
 def _intent(
-    mode: str,
+    mode: MultiSeasonRequestMode,
     requested_seasons: list[int],
     states: list[SeasonPackSeasonState],
 ) -> MultiSeasonRequestIntent:

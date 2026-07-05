@@ -27,6 +27,7 @@ from plex_manager.domain.release import ParsedRelease
 __all__ = [
     "MultiSeasonPackPlan",
     "MultiSeasonRequestIntent",
+    "MultiSeasonRequestMode",
     "ReleaseScope",
     "SeasonPackSeasonState",
     "classify_release_scope",
