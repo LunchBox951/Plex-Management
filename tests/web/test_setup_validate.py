@@ -285,6 +285,11 @@ async def test_validate_prowlarr_rejects_status_200_without_version(
         "http://prowlarr.local:99999",  # out-of-range port
         "http://\nprowlarr.local",  # embedded newline (CR/LF log-forging shape)
         "http://prowlarr.local/\x01",  # control char in path
+        # Whitespace: urlsplit() still yields a host for a space-bearing authority,
+        # but the raw string is used as the base URL, so httpx fails at request
+        # time -- reject up front like the control chars (Codex PR #53 P2).
+        "http://prowlarr local",  # space in the authority
+        "http://prowlarr.local/base path",  # space anywhere (here in the path)
     ],
 )
 async def test_validate_prowlarr_rejects_non_http_url(
@@ -305,6 +310,174 @@ async def test_validate_prowlarr_rejects_non_http_url(
     body = response.json()
     assert body["ok"] is False
     assert body["message"] == "Enter a valid http(s) URL."
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://prowlarr.local?x=1",
+        "http://prowlarr.local#frag",
+        # BARE delimiters (Codex PR #53 P2, wave 3): urlsplit returns an EMPTY
+        # query/fragment for these, but the raw string -- which the adapters use as
+        # the base URL -- still carries the delimiter, breaking path-appending
+        # identically. The check is on the raw '?'/'#' characters.
+        "http://prowlarr.local?",
+        "http://prowlarr.local#",
+    ],
+)
+async def test_validate_prowlarr_rejects_query_or_fragment(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # The shared shape predicate now also rejects a base URL bearing a query or
+    # fragment (Codex PR #53 P2): adapters append their API path to the raw string,
+    # so a ?query / #fragment would swallow it and hit the wrong endpoint. The
+    # wizard probe surfaces this honestly (ok=False, distinct message) and never
+    # issues the outbound request.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Base URL must not contain a query or fragment."
+
+
+@pytest.mark.parametrize("bad_url", ["http://999.999.999.999", "http://01.02.03.04"])
+async def test_validate_prowlarr_rejects_invalid_ipv4_shaped_host(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # An IPv4-SHAPED host (digits and dots only) must be a real dotted quad
+    # (Codex PR #53 P2, wave 3): urlsplit happily returns these as a hostname, but
+    # httpx's own URL parser rejects them at request time -- so without this check
+    # the value validates, persists, and then fails at runtime. ipaddress.
+    # IPv4Address rejects out-of-range AND leading-zero octets; DNS names and IPv6
+    # literals are not IPv4-shaped and are untouched.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Invalid IPv4 address in host."
+
+
+async def test_validate_prowlarr_accepts_dotted_quad_ipv4_host(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # The IPv4-shaped-host check must not reject a VALID dotted quad -- the probe
+    # proceeds to the real outbound request.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/system/status"
+        return httpx.Response(200, json={"version": "1.0"})
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://192.168.1.10:9696", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    assert response.json()["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("bad_url", "message"),
+    [
+        # IPvFuture: urlsplit's bracket check tolerates the "v<hex>.<...>" form,
+        # but httpx raises InvalidURL (NOT an HTTPError) at request time -- so
+        # pre-fix this was an uncaught 500, not a rejection (Codex PR #53 P2,
+        # wave 4).
+        ("http://[v7.abc]", "Invalid IPv6 address in host."),
+        # Zone ids parse everywhere (urlsplit, ipaddress, even httpx's URL
+        # parser) but are rejected BY POLICY for a base service URL: the
+        # interface name is host-specific and meaningless to persist, and the
+        # raw '%' in the authority is a percent-encoding hazard. Distinct honest
+        # message -- a zone-bearing address IS valid IPv6, so "invalid" would be
+        # a lie.
+        ("http://[fe80::1%eth0]", "IPv6 zone ids are not supported in a base URL."),
+        ("http://[fe80::1%25eth0]:9696", "IPv6 zone ids are not supported in a base URL."),
+    ],
+)
+async def test_validate_prowlarr_rejects_bad_bracketed_ipv6_host(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str, message: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == message
+
+
+async def test_validate_prowlarr_accepts_valid_ipv6_literal_host(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # [9999::1] LOOKS suspicious but is VALID IPv6 (9999 is a legal hex group) --
+    # it was Codex PR #53 wave 4's claimed-broken example, and empirically
+    # urlsplit, ipaddress and httpx all accept it. The bracketed-host check must
+    # not over-tighten: the probe proceeds to the real outbound request.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/system/status"
+        return httpx.Response(200, json={"version": "1.0"})
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://[9999::1]:9696", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    assert response.json()["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        # IDNA-unencodable Unicode label: httpx.URL() itself raises InvalidURL
+        # (NOT an HTTPError), so pre-fix the probe 500'd instead of rejecting
+        # (Codex PR #53 P2, wave 5).
+        "http://\N{PILE OF POO}.local",
+        # Bogus punycode A-label: passes the httpx.URL() CONSTRUCTOR and raises a
+        # raw idna.IDNAError only from the lazy .host decode -- the gate touches
+        # .host precisely to cover this second raise point.
+        "http://xn--zzzzzz",
+        # The finding's emoji case pre-encoded to punycode -- same class.
+        "http://xn--ls8h.local",
+    ],
+)
+async def test_validate_prowlarr_rejects_urls_the_http_client_cannot_parse(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # The final catch-all gate mirrors the ACTUAL downstream parser (httpx), so
+    # any urlsplit-vs-httpx divergence -- today IDNA-invalid hostnames -- is an
+    # honest ok=False with a generic message, never an uncaught InvalidURL /
+    # IDNAError 500, and never an outbound request.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "URL is not parseable by the HTTP client."
 
 
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(
@@ -542,6 +715,9 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
         "http://qb.local:99999",
         "http://\nqb.local",
         "http://qb.local/\x01",
+        # Whitespace in the authority / path -> reject up front (Codex PR #53 P2).
+        "http://qb local",
+        "http://qb.local/base path",
     ],
 )
 async def test_validate_qbittorrent_rejects_non_http_url(
@@ -577,6 +753,9 @@ async def test_validate_qbittorrent_rejects_non_http_url(
         "http://plex.local:99999",
         "http://\nplex.local",
         "http://plex.local/\x01",
+        # Whitespace in the authority / path -> reject up front (Codex PR #53 P2).
+        "http://plex local:32400",
+        "http://plex.local/base path",
     ],
 )
 async def test_validate_plex_rejects_non_http_url(

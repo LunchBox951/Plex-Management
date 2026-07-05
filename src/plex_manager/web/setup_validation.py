@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING, Literal, cast
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -26,6 +25,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
+from plex_manager.web.url_validation import url_shape_error
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -68,41 +68,20 @@ def _require_http_url(url: str) -> ServiceValidateResponse | None:
     into a clear, retryable rejection instead of an opaque ``httpx`` transport
     error. Returns ``None`` when ``url`` is acceptable to try.
 
-    ``urlsplit`` (and reading ``.hostname`` / ``.port``) itself RAISES
-    ``ValueError`` on several obviously-broken inputs, all of which are guarded so
-    a parse failure surfaces as the same retryable ``ok=False`` rather than
-    crashing the validate endpoint with a 500:
-
-    * a malformed bracketed host -- an unterminated IPv6 literal (``http://[::1``)
-      or an invalid IPvFuture form (``http://[v7.x]``) -- trips ``.hostname``;
-    * a non-numeric (``http://x:bad``) or out-of-range (``http://x:99999``) port
-      trips ``.port``. Without touching ``.port`` these slip past the hostname
-      check and reach httpx, which raises ``httpx.InvalidURL`` -- and that is NOT
-      an ``httpx.HTTPError`` subclass, so it would escape the endpoints' transport
-      handlers as a 500 instead of this rejection.
-
-    Raw control characters (C0 + DEL) are rejected up front, BEFORE parsing or any
-    log/probe: ``urlsplit`` silently tolerates or strips some of them
-    (``http://\\nplex.local`` parses to a plausible host), but httpx then raises
-    the same uncaught ``httpx.InvalidURL`` for the non-printable byte. A CR/LF- or
-    NUL-bearing URL is exactly "obviously-broken input", so it gets the honest
-    ``ok=False`` here rather than a 500 (and never reaches an outbound request).
+    The predicate itself lives in
+    :func:`plex_manager.web.url_validation.url_shape_error` — the ONE source of
+    truth shared with the write-time ``SettingsUpdate`` / ``SetupCompleteRequest``
+    schema validators, so a malformed URL is rejected with the identical message
+    and edge cases whether it is caught here (before an outbound probe) or before
+    a row is ever written. See that function's docstring for the full rationale
+    (control chars, malformed bracketed hosts, port parsing) — this wrapper only
+    adapts its ``str | None`` result to this module's ``ServiceValidateResponse``
+    shape.
     """
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
-        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
-    try:
-        parts = urlsplit(url)
-        hostname = parts.hostname
-        # Reading ``.port`` validates it -- urllib raises ValueError for a
-        # non-numeric or out-of-range port, which we reject rather than let httpx
-        # turn into an uncaught InvalidURL (or a doomed connect attempt).
-        port = parts.port
-    except ValueError:
-        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
-    # Port 0 parses cleanly but is never connectable -- reject it up front too.
-    if parts.scheme not in {"http", "https"} or not hostname or port == 0:
-        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
-    return None
+    message = url_shape_error(url)
+    if message is None:
+        return None
+    return ServiceValidateResponse(ok=False, message=message)
 
 
 def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
