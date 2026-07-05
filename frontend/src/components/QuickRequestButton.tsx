@@ -29,7 +29,8 @@ function asApiError(error: unknown): ApiError {
  * detail modal on click AND re-fires that same `onClick` for a keyboard
  * Enter/Space (see `PosterCard.tsx`). Both the mouse `onClick` and the
  * `onKeyDown` here stop propagation so activating this button never also
- * opens the modal underneath it.
+ * opens the modal underneath it. On success it hands keyboard focus back to
+ * that card before unmounting, so a keyboard user keeps their place in the grid.
  */
 export function QuickRequestButton({ item }: QuickRequestButtonProps) {
   const { toast } = useToast()
@@ -41,10 +42,16 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
 
   if (justRequested) return null
 
-  const onRequest = async () => {
+  const onRequest = async (returnFocusTo: HTMLElement | null) => {
     const body: CreateRequestBody = { tmdb_id: item.tmdb_id, media_type: item.media_type }
     try {
       await createRequest.mutateAsync(body)
+      // This button is about to unmount (`justRequested` -> `return null`). Left
+      // alone that drops keyboard focus to <body>, losing the user's place in the
+      // poster grid. Hand focus back to the enclosing card (still mounted, now
+      // heading toward its "Requested" badge) so keyboard nav stays put. A no-op
+      // for mouse users and when there's no focusable card ancestor.
+      returnFocusTo?.focus()
       setJustRequested(true)
       toast({ title: `Requested ${item.title}`, intent: 'success' })
     } catch (error) {
@@ -57,10 +64,16 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
   return (
     <Button
       size="sm"
+      // Every tile's action reads "Request" — give assistive tech the title so a
+      // screen-reader user isn't left with a grid of identical "Request" buttons.
+      aria-label={`Request ${item.title}`}
       loading={createRequest.isPending}
       onClick={(e) => {
         e.stopPropagation()
-        void onRequest()
+        // Resolve the enclosing PosterCard synchronously (before the async
+        // mutation unmounts this button) so `onRequest` can restore focus to it.
+        const card = e.currentTarget.closest<HTMLElement>('[role="button"]')
+        void onRequest(card)
       }}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {

@@ -44,6 +44,12 @@ describe('Row quick-request action (issue #42)', () => {
     vi.clearAllMocks()
   })
 
+  // The action's accessible name carries the title (`aria-label={`Request ${title}`}`)
+  // so each tile's button is distinct for assistive tech. An exact-string match
+  // selects only the button — the enclosing role="button" card folds this label
+  // into its own name-from-content, so a loose /request/ regex would be ambiguous.
+  const REQUEST_MOVIE = 'Request Unbadged Movie'
+
   it('renders the Request action only for a tile whose state is null', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(
@@ -55,7 +61,9 @@ describe('Row quick-request action (issue #42)', () => {
       />,
     )
 
-    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    // SHOW is badged, so it gets no Request action of its own.
+    expect(screen.queryByRole('button', { name: 'Request Already Requested Show' })).not.toBeInTheDocument()
     expect(screen.getByText('Requested')).toBeInTheDocument() // the badge on SHOW
   })
 
@@ -64,22 +72,22 @@ describe('Row quick-request action (issue #42)', () => {
     const { rerender } = render(
       <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />,
     )
-    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
 
     rerender(
       <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />,
     )
-    expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
-  it('hides the button immediately on a successful request', async () => {
+  it('hides the button and returns focus to the card on a successful request', async () => {
     const createMutation = mutation({ id: 99 })
     ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
     render(
       <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: REQUEST_MOVIE }))
 
     await waitFor(() => {
       expect(createMutation.mutateAsync).toHaveBeenCalledWith({
@@ -88,11 +96,29 @@ describe('Row quick-request action (issue #42)', () => {
       } satisfies CreateRequestBody)
     })
     await waitFor(() => {
-      expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
     })
+    // Focus was handed to the enclosing card (the only role="button" left in the
+    // tile once the action unmounts) so a keyboard user isn't dumped to <body>.
+    expect(screen.getByRole('button', { name: /Unbadged Movie/ })).toHaveFocus()
     expect(toastSpy).toHaveBeenCalledWith(
       expect.objectContaining({ intent: 'success', title: expect.stringContaining('Requested') }),
     )
+  })
+
+  it('does not open the card when the Request action is activated by keyboard', () => {
+    const onSelect = vi.fn()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
+
+    const action = screen.getByRole('button', { name: REQUEST_MOVIE })
+    // The action lives inside PosterCard's role="button" div, whose own onKeyDown
+    // opens the modal on Enter/Space. QuickRequestButton must stop that keydown from
+    // bubbling; delete its guard and this keydown reaches the card and fires onSelect.
+    fireEvent.keyDown(action, { key: 'Enter' })
+    fireEvent.keyDown(action, { key: ' ' })
+
+    expect(onSelect).not.toHaveBeenCalled()
   })
 
   it('does not open the card and shows an error toast when the request fails', async () => {
@@ -102,7 +128,7 @@ describe('Row quick-request action (issue #42)', () => {
     )
     render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
 
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: REQUEST_MOVIE }))
 
     await waitFor(() => {
       expect(toastSpy).toHaveBeenCalledWith(
@@ -114,7 +140,7 @@ describe('Row quick-request action (issue #42)', () => {
     })
     // The button survives a failed request (no local "just requested" flip) and the
     // click never bubbled to the card's own onSelect.
-    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
     expect(onSelect).not.toHaveBeenCalled()
   })
 })
