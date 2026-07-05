@@ -4,9 +4,25 @@
       "AcceptedRelease": {
         "description": "A release that passed the quality gate and blocklist, with its ranking.",
         "properties": {
+          "covered_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Covered Seasons",
+            "type": "array"
+          },
           "guid": {
             "title": "Guid",
             "type": "string"
+          },
+          "ignored_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Ignored Seasons",
+            "type": "array"
           },
           "indexer": {
             "title": "Indexer",
@@ -46,13 +62,45 @@
             ],
             "title": "Seeders"
           },
+          "skipped_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Skipped Seasons",
+            "type": "array"
+          },
           "source": {
             "title": "Source",
             "type": "string"
           },
+          "target_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Target Seasons",
+            "type": "array"
+          },
           "title": {
             "title": "Title",
             "type": "string"
+          },
+          "upgrade_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Upgrade Seasons",
+            "type": "array"
+          },
+          "waste_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Waste Seasons",
+            "type": "array"
           }
         },
         "required": [
@@ -1667,6 +1715,28 @@
       "SeasonStatus": {
         "description": "One tracked season's status, embedded in a tv ``RequestResponse``.",
         "properties": {
+          "installed_profile_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed Profile Index"
+          },
+          "installed_quality_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed Quality Id"
+          },
           "season_number": {
             "title": "Season Number",
             "type": "integer"

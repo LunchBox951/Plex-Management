@@ -855,8 +855,18 @@ export interface components {
          * @description A release that passed the quality gate and blocklist, with its ranking.
          */
         AcceptedRelease: {
+            /**
+             * Covered Seasons
+             * @default []
+             */
+            covered_seasons: number[];
             /** Guid */
             guid: string;
+            /**
+             * Ignored Seasons
+             * @default []
+             */
+            ignored_seasons: number[];
             /** Indexer */
             indexer: string;
             /** Info Hash */
@@ -869,10 +879,30 @@ export interface components {
             score: number;
             /** Seeders */
             seeders?: number | null;
+            /**
+             * Skipped Seasons
+             * @default []
+             */
+            skipped_seasons: number[];
             /** Source */
             source: string;
+            /**
+             * Target Seasons
+             * @default []
+             */
+            target_seasons: number[];
             /** Title */
             title: string;
+            /**
+             * Upgrade Seasons
+             * @default []
+             */
+            upgrade_seasons: number[];
+            /**
+             * Waste Seasons
+             * @default []
+             */
+            waste_seasons: number[];
         };
         /**
          * AppApiKeyResponse
@@ -1578,6 +1608,10 @@ export interface components {
          * @description One tracked season's status, embedded in a tv ``RequestResponse``.
          */
         SeasonStatus: {
+            /** Installed Profile Index */
+            installed_profile_index?: number | null;
+            /** Installed Quality Id */
+            installed_quality_id?: number | null;
             /** Season Number */
             season_number: number;
             /** Status */
