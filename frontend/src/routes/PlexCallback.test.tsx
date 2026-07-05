@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { PlexCallback } from './PlexCallback'
@@ -48,7 +48,7 @@ describe('PlexCallback', () => {
     await waitFor(() => expect(h.complete).toHaveBeenCalledWith({ state: 'stored-state' }))
   })
 
-  it('shows a retryable error when no state is available', async () => {
+  it('shows a retryable error with a way back when no state is available', async () => {
     render(
       <MemoryRouter initialEntries={['/auth/plex/callback']}>
         <PlexCallback />
@@ -57,5 +57,22 @@ describe('PlexCallback', () => {
 
     expect(await screen.findByText("Couldn't complete Plex sign-in")).toBeInTheDocument()
     expect(h.complete).not.toHaveBeenCalled()
+    // The error state must offer a way back, not strand the operator on the
+    // callback URL.
+    fireEvent.click(await screen.findByRole('button', { name: 'Back to sign-in' }))
+    expect(h.navigate).toHaveBeenCalledWith('/', { replace: true })
+  })
+
+  it('offers a way back when completion fails', async () => {
+    h.complete.mockRejectedValue(new Error('plex.tv is unavailable'))
+    render(
+      <MemoryRouter initialEntries={['/auth/plex/callback?state=state-123']}>
+        <PlexCallback />
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText("Couldn't complete Plex sign-in")).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: 'Back to sign-in' }))
+    expect(h.navigate).toHaveBeenCalledWith('/', { replace: true })
   })
 })

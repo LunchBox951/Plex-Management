@@ -22,6 +22,7 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.oauth import PlexOAuthError
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
@@ -643,6 +644,13 @@ _ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
     QbittorrentError: (502, "qbittorrent_unavailable"),
     PlexAuthError: (502, "plex_auth_failed"),
     PlexLibraryError: (502, "plex_unavailable"),
+    # The hosted Plex sign-in adapter (plex.tv PIN flow + configured-server
+    # identity probe). The very first login step (create_pin) reaches plex.tv, so
+    # any plex.tv/server hiccup during login MUST surface as an honest, retryable
+    # upstream state rather than an opaque 500 (north-star #3). PlexOAuthPending is
+    # a subclass but is always caught and mapped to 409 in the login endpoint
+    # before it can reach this handler.
+    PlexOAuthError: (502, "plex_login_unavailable"),
 }
 
 

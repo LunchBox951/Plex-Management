@@ -425,6 +425,65 @@ async def test_shared_plex_account_gets_limited_session(
 
 
 @pytest.mark.asyncio
+async def test_plex_start_surfaces_upstream_plextv_failure_as_retryable_state(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A plex.tv hiccup on PIN creation is an honest 502, never an opaque 500."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_settings(sessionmaker_)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/pins":
+            return httpx.Response(503, text="plex.tv is having a moment")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    response = await client.post("/api/v1/auth/plex/start")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "plex_login_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_plex_complete_surfaces_upstream_failure_as_retryable_state(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """An upstream error while verifying the account is a 502, not a 500."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_settings(sessionmaker_)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/pins":
+            return httpx.Response(200, json={"id": 123, "code": "ABCD", "expiresIn": 600})
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/pins/123":
+            return httpx.Response(200, json={"id": 123, "code": "ABCD", "authToken": "user-token"})
+        if request.url.host == "plex.tv" and request.url.path == "/users/account.json":
+            return httpx.Response(500, text="plex.tv account lookup failed")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    start = await client.post("/api/v1/auth/plex/start")
+    assert start.status_code == 200
+    complete = await client.post(
+        "/api/v1/auth/plex/complete", json={"state": start.json()["state"]}
+    )
+
+    assert complete.status_code == 502
+    assert complete.json()["detail"] == "plex_login_unavailable"
+    assert complete.cookies.get("plexmgr.session") is None
+
+
+@pytest.mark.asyncio
 async def test_plex_account_without_configured_server_is_rejected(
     client: httpx.AsyncClient,
     app: FastAPI,

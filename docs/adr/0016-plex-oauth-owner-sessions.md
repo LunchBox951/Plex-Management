@@ -137,8 +137,12 @@ so a session-authed admin and a key-authed admin both rotate correctly.
 
 New tables `auth_sessions` (hashed session tokens, `last_seen_at`, expiry,
 revocation) and `plex_login_states` (pending PIN challenges, hashed browser
-nonce), plus per-user Plex identity columns, all under Alembic migration
-`7bcbce2c2e2b` (parented off the single prior head `b7e2d4f6c8a1`).
+nonce), plus a default-deny flip of the `users.permissions` server default from
+`1` to `0` (a signed-in account is non-admin until proven to own the configured
+server), all under Alembic migration `7bcbce2c2e2b` (parented off the single
+prior head `b7e2d4f6c8a1`). The per-user Plex identity columns
+(`plex_id`, `username`, `email`, `avatar_url`, `encrypted_plex_token`) already
+exist on the base `users` schema and are reused as-is, not added here.
 
 ## Explicitly out of scope
 

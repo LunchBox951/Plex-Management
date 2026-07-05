@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useCompletePlexLogin } from '../api/hooks'
+import { Button } from '../components/ui/Button'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { toApiError } from '../lib/errors'
 import {
@@ -36,9 +37,26 @@ export function PlexCallback() {
   }, [completeLogin, location.search, navigate])
 
   if (error) {
+    // A failed completion is a login-flow dead end unless we hand the operator a
+    // way back (north-star #1). Clear the stale remembered state so returning to
+    // the app lands on a fresh sign-in rather than silently retrying the same
+    // spent PIN, then bounce to the gate, which renders the Plex login screen.
+    const returnToSignIn = () => {
+      clearRememberedPlexLoginState()
+      navigate('/', { replace: true })
+    }
     return (
       <div className="mx-auto max-w-md px-5 py-24">
-        <StateMessage tone="error" title="Couldn't complete Plex sign-in" message={error} />
+        <StateMessage
+          tone="error"
+          title="Couldn't complete Plex sign-in"
+          message={error}
+          action={
+            <Button variant="secondary" onClick={returnToSignIn}>
+              Back to sign-in
+            </Button>
+          }
+        />
       </div>
     )
   }
