@@ -36,6 +36,7 @@ from plex_manager.domain.quality_service import RejectionReason
 from plex_manager.domain.release import IndexerSearchRequest, MediaType
 from plex_manager.domain.season_pack import covers_requested_episodes
 from plex_manager.logsafe import safe_int, safe_text
+from plex_manager.services.log_capture_service import DECISION_TELEMETRY_LOGGER_NAME
 
 if TYPE_CHECKING:
     from plex_manager.domain.quality_profile import QualityProfile
@@ -46,7 +47,12 @@ if TYPE_CHECKING:
 
 __all__ = ["preview"]
 
-_logger = logging.getLogger(__name__)
+# The constant equals this module's dotted path (i.e. ``__name__``); constructing
+# the logger FROM it (retention-telemetry precedent) guarantees the emitter can
+# never drift from the INFO pin ``configure_logging`` applies to that same name --
+# without the pin, an operator ``log_level`` of WARNING/ERROR would silently drop
+# the issue-#24 beta aggregate below before the durable log sink ever saw it.
+_logger = logging.getLogger(DECISION_TELEMETRY_LOGGER_NAME)
 
 #: Cap on sample release titles carried by the multi-season-pack rejection
 #: telemetry INFO below -- enough to spot-check which packs are showing up

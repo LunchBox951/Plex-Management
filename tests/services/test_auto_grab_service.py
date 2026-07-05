@@ -33,7 +33,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import auto_grab_service
+from plex_manager.services import auto_grab_service, log_capture_service
 from plex_manager.services.auto_grab_service import (
     BACKOFF_SCHEDULE,
     COOLDOWN_SCHEDULE,
@@ -839,6 +839,92 @@ async def test_source_error_redacts_url_shaped_guid(
     assert f"guid={expected_guid!r}" in message
     assert "SUPERSECRETKEY" not in message
     assert "passkey" not in message
+
+
+async def test_source_error_with_malformed_url_guid_still_parks_and_continues(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex P2 (safe_guid totality): ``urlsplit`` raises ValueError on a
+    malformed URL-ish guid (``http://[bad`` -- unclosed IPv6 bracket). Pre-fix
+    that throw happened INSIDE the ``QbittorrentSourceError`` handler, escaped
+    it, and aborted the ENTIRE grab cycle instead of parking the scope. The
+    barrier is now total: the failure is still recorded (WARNING + summary
+    rollup), the guid is FULLY redacted to the hash-only ``#<sha256>`` token
+    (unparseable means no host to salvage, and the raw text may still embed a
+    credential), and the cycle completes normally."""
+    title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
+    malformed_guid = "http://[bad"
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr([candidate(title, magnet=False, guid=malformed_guid)])
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        result = await _run(sessionmaker_, prowlarr, qbt)  # pre-fix: raised ValueError
+
+    # The cycle survived and the scope parked on backoff -- never aborted.
+    assert result.no_acceptable == 1
+    assert result.grab_errors == 0
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.no_acceptable_release
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    expected_guid = f"#{hashlib.sha256(malformed_guid.encode('utf-8')).hexdigest()[:12]}"
+    assert getattr(warnings[0], "guid", None) == expected_guid
+    assert malformed_guid not in warnings[0].getMessage()  # nothing of the raw value
+
+    summaries = [r for r in caplog.records if r.levelname == "INFO" and r.name == _LOGGER_NAME]
+    assert len(summaries) == 1  # the closing summary still ran
+    assert getattr(summaries[0], "source_failures", None) == 1
+
+
+async def test_cycle_summary_reaches_capture_at_warning_operator_floor(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex P2 (log-floor): at ``log_level=WARNING`` the per-cycle summary INFO
+    (the issue-#43 ``source_failures`` rollup) used to be filtered at the
+    ``_logger.info`` call before any handler ran -- the beta dataset silently
+    never persisted. ``configure_logging`` now pins this module's logger to INFO
+    (retention-telemetry precedent), so the record is still CREATED and flows to
+    every root handler (the durable ``LogCaptureHandler`` and caplog alike),
+    while ordinary INFO chatter from non-pinned loggers stays suppressed."""
+    # Drift guard: the pin targets exactly the logger this module emits on.
+    assert _LOGGER_NAME == log_capture_service.AUTO_GRAB_TELEMETRY_LOGGER_NAME
+
+    await _seed_movie(sessionmaker_, tmdb_id=603)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+
+    root = logging.getLogger()
+    pinned = logging.getLogger(_LOGGER_NAME)
+    saved_root_level = root.level
+    saved_pinned_level = pinned.level
+    # WARNING is the exact operator floor that used to drop the summary INFO.
+    handler = log_capture_service.configure_logging("WARNING")
+    try:
+        result = await _run(sessionmaker_, prowlarr, qbt)
+        # Control: an INFO on a NON-pinned sibling logger must still be dropped
+        # by the WARNING floor -- proving the pin (not a permissive root) is what
+        # lets the telemetry through.
+        logging.getLogger("plex_manager.services.request_service").info("floor control")
+    finally:
+        log_capture_service.stop_logging(handler)
+        root.setLevel(saved_root_level)
+        pinned.setLevel(saved_pinned_level)
+
+    assert result.grabbed == 1
+    summaries = [
+        r
+        for r in caplog.records
+        if r.name == _LOGGER_NAME and r.getMessage().startswith("auto-grab cycle:")
+    ]
+    assert len(summaries) == 1  # created DESPITE the WARNING floor
+    assert getattr(summaries[0], "source_failures", None) == 0
+    assert not any(r.getMessage() == "floor control" for r in caplog.records)
 
 
 async def test_no_source_errors_emits_zero_source_failures_in_summary(

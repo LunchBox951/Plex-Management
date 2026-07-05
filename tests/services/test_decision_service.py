@@ -14,7 +14,7 @@ from plex_manager.domain.quality_service import RejectionReason
 from plex_manager.domain.release import CandidateRelease
 from plex_manager.models import Blocklist, BlocklistReason
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
-from plex_manager.services import decision_service
+from plex_manager.services import decision_service, log_capture_service
 from tests.web.fakes import FakeProwlarr, candidate, good_and_cam_candidates
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -532,6 +532,64 @@ async def test_preview_logs_multi_season_pack_rejection_telemetry(
     assert "media_type=tv" in message
     assert "season=2" in message
     assert "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP" in message
+
+
+async def test_multi_season_telemetry_reaches_capture_at_warning_operator_floor(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex P2 (log-floor): at ``log_level=WARNING`` the multi-season-pack
+    aggregate INFO (the issue-#24 beta dataset) used to be filtered at the
+    ``_logger.info`` call before any handler ran -- the whole dataset silently
+    never persisted. ``configure_logging`` now pins this module's logger to INFO
+    (retention-telemetry precedent), so the record is still CREATED and flows to
+    every root handler (the durable ``LogCaptureHandler`` and caplog alike),
+    while ordinary INFO chatter from non-pinned loggers stays suppressed."""
+    telemetry_name = log_capture_service.DECISION_TELEMETRY_LOGGER_NAME
+    # Drift guard: the pin targets exactly the logger this module emits on.
+    assert telemetry_name == decision_service.__name__
+
+    multi = candidate(
+        "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP",
+        info_hash="e" * 40,
+        seeders=900,
+    )
+    root = logging.getLogger()
+    pinned = logging.getLogger(telemetry_name)
+    saved_root_level = root.level
+    saved_pinned_level = pinned.level
+    # WARNING is the exact operator floor that used to drop the aggregate INFO.
+    handler = log_capture_service.configure_logging("WARNING")
+    try:
+        async with sessionmaker_() as session:
+            await decision_service.preview(
+                FakeProwlarr([multi]),
+                GuessitParser(),
+                default_profile(),
+                SqlBlocklistRepository(session),
+                tmdb_id=82856,
+                title="The Mandalorian",
+                media_type="tv",
+                year=2019,
+                season=2,
+            )
+        # Control: an INFO on a NON-pinned sibling logger must still be dropped
+        # by the WARNING floor -- proving the pin (not a permissive root) is what
+        # lets the telemetry through.
+        logging.getLogger("plex_manager.services.request_service").info("floor control")
+    finally:
+        log_capture_service.stop_logging(handler)
+        root.setLevel(saved_root_level)
+        pinned.setLevel(saved_pinned_level)
+
+    aggregates = [
+        r
+        for r in caplog.records
+        if r.name == telemetry_name and "multi-season-pack rejection(s)" in r.getMessage()
+    ]
+    assert len(aggregates) == 1  # created DESPITE the WARNING floor
+    assert getattr(aggregates[0], "multi_season_pack_rejections", None) == 1
+    assert not any(r.getMessage() == "floor control" for r in caplog.records)
 
 
 async def test_preview_emits_no_telemetry_when_no_multi_season_pack_rejections(

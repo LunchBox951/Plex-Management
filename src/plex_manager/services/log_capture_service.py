@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import LogEventRepository
 
 __all__ = [
+    "AUTO_GRAB_TELEMETRY_LOGGER_NAME",
+    "DECISION_TELEMETRY_LOGGER_NAME",
     "LOG_DRAIN_INTERVAL_SECONDS",
     "LOG_PRUNE_INTERVAL_SECONDS",
     "QUEUE_MAXSIZE",
@@ -115,12 +117,35 @@ LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
 TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.retention_telemetry_service"
 TELEMETRY_LOG_RETENTION_DAYS: Final = 30
 
-#: The level the retention-telemetry logger is pinned to (in
+#: The level every beta-telemetry logger is pinned to (in
 #: :func:`configure_logging`), independent of the operator's ``config.log_level``.
-#: The telemetry sweep logs its beta dataset at INFO; without this pin, a WARNING/
+#: Telemetry modules log their beta datasets at INFO; without this pin, a WARNING/
 #: ERROR operator floor would filter those records at the ``_logger.info`` call
 #: BEFORE the durable-log handler ever saw them (see :func:`configure_logging`).
 _TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
+
+#: The other beta-week telemetry emitters, sharing the retention logger's exact
+#: hazard: ``decision_service`` logs the issue-#24 multi-season-pack aggregate at
+#: INFO, and ``auto_grab_service`` logs the issue-#43 per-cycle summary (with its
+#: ``source_failures`` rollup) at INFO -- at an operator ``log_level`` of WARNING/
+#: ERROR either dataset would otherwise silently never reach ``log_events``. Each
+#: name equals its module's dotted path; the modules construct their ``_logger``
+#: FROM these constants (retention precedent) so the emitter and the pin below can
+#: never drift apart under a rename. Pinning is per MODULE logger, matching the
+#: retention pin: for ``decision_service`` the aggregate is the module's only INFO
+#: record; for ``auto_grab_service`` the pin additionally admits one rare
+#: non-telemetry INFO ("active download appeared before park") past a WARNING
+#: floor -- accepted collateral, chosen over splintering one module across two
+#: logger names (which would complicate ``log_events`` filtering by ``logger``).
+DECISION_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.decision_service"
+AUTO_GRAB_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.auto_grab_service"
+
+#: Every logger :func:`configure_logging` pins to :data:`_TELEMETRY_LOGGER_LEVEL`.
+_TELEMETRY_LOGGERS_TO_PIN: Final = (
+    TELEMETRY_LOGGER_NAME,
+    DECISION_TELEMETRY_LOGGER_NAME,
+    AUTO_GRAB_TELEMETRY_LOGGER_NAME,
+)
 
 #: Third-party HTTP client loggers that MUST be kept quieter than whatever the
 #: operator sets ``config.log_level`` to. ``httpx`` logs ``"HTTP Request: %s %s
@@ -378,20 +403,22 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     way; a caller passing a non-root ``logger`` (tests, mainly) still gets the
     same quieting so no test path silently relies on the child not having it.
 
-    Symmetrically, pins the retention-telemetry logger
-    (:data:`TELEMETRY_LOGGER_NAME`) to :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so
-    its INFO records reach the durable ``log_events`` sink at ANY operator
-    ``level``. The handler is attached to the ROOT logger, and the telemetry
-    logger is a NON-propagation-broken descendant of root, so its records flow up
-    to that handler on the normal ``propagate=True`` path — but ONLY if they are
-    created in the first place. Left at the inherited effective level, an operator
-    running at WARNING/ERROR would drop every INFO telemetry record at the
-    ``_logger.info`` call site (``isEnabledFor`` short-circuits before any handler
-    runs), and the beta dataset would silently never persist. Pinning THIS one
-    logger to INFO (not the root, which would un-quiet ALL of the app's INFO
-    chatter and spam the operator's floor) lets exactly the telemetry records
-    through; the LogCaptureHandler itself has no level filter, so once created
-    they reach its DB queue regardless of the root logger's own level.
+    Symmetrically, pins every beta-telemetry logger
+    (:data:`_TELEMETRY_LOGGERS_TO_PIN`: the retention sweep, the decision
+    multi-season aggregate, and the auto-grab per-cycle summary) to
+    :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so their INFO records reach the durable
+    ``log_events`` sink at ANY operator ``level``. The handler is attached to the
+    ROOT logger, and each telemetry logger is a NON-propagation-broken descendant
+    of root, so its records flow up to that handler on the normal
+    ``propagate=True`` path — but ONLY if they are created in the first place.
+    Left at the inherited effective level, an operator running at WARNING/ERROR
+    would drop every INFO telemetry record at the ``_logger.info`` call site
+    (``isEnabledFor`` short-circuits before any handler runs), and the beta
+    datasets would silently never persist. Pinning THESE loggers to INFO (not the
+    root, which would un-quiet ALL of the app's INFO chatter and spam the
+    operator's floor) lets exactly the telemetry records through; the
+    LogCaptureHandler itself has no level filter, so once created they reach its
+    DB queue regardless of the root logger's own level.
 
     Returns the handler so the caller (``web/app.py``'s ``lifespan``) can store it
     (e.g. on ``app.state.log_handler``) for the drain task and the future log
@@ -405,7 +432,8 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target.setLevel(_resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
-    logging.getLogger(TELEMETRY_LOGGER_NAME).setLevel(_TELEMETRY_LOGGER_LEVEL)
+    for name in _TELEMETRY_LOGGERS_TO_PIN:
+        logging.getLogger(name).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler
 
 

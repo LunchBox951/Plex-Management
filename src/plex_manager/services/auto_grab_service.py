@@ -86,6 +86,7 @@ from plex_manager.services.grab_service import (
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
 )
+from plex_manager.services.log_capture_service import AUTO_GRAB_TELEMETRY_LOGGER_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -112,7 +113,13 @@ __all__ = [
     "run_grab_cycle",
 ]
 
-_logger = logging.getLogger(__name__)
+# The constant equals this module's dotted path (i.e. ``__name__``); constructing
+# the logger FROM it (retention-telemetry precedent) guarantees the emitter can
+# never drift from the INFO pin ``configure_logging`` applies to that same name --
+# without the pin, an operator ``log_level`` of WARNING/ERROR would silently drop
+# the issue-#43 per-cycle summary INFO (the ``source_failures`` rollup) before the
+# durable log sink ever saw it.
+_logger = logging.getLogger(AUTO_GRAB_TELEMETRY_LOGGER_NAME)
 
 # Request/season statuses the worker re-searches. ``pending`` (never searched),
 # ``no_acceptable_release`` (searched, nothing acceptable -> retry on backoff), and

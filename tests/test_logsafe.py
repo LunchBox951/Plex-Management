@@ -19,8 +19,10 @@ from plex_manager.logsafe import safe_guid, safe_int, safe_text
 
 
 def _sha12(value: str) -> str:
-    """The 12-hex sha256 prefix ``safe_guid`` appends -- recomputed independently."""
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    """The 12-hex sha256 prefix ``safe_guid`` appends -- recomputed independently
+    (``surrogatepass`` mirrors the helper: the barrier is total even for a lone
+    surrogate, which JSON permits and plain UTF-8 encoding would raise on)."""
+    return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
 
 @pytest.mark.parametrize("value", [0, 1, 999, -5, 2**63])
@@ -125,3 +127,36 @@ def test_safe_guid_hash_prefix_is_stable_and_release_distinguishing() -> None:
     other = safe_guid(other_url)
     assert other != safe_guid(url)  # same host, different secret -> different hash
     assert other == f"tracker.example.org#{_sha12(other_url)}"  # exact expected token
+
+
+@pytest.mark.parametrize(
+    ("raw", "secret"),
+    [
+        # ``urlsplit`` raises ValueError on an unclosed IPv6 bracket -- the
+        # canonical case from the review finding.
+        ("http://[bad", None),
+        # THE reason the fallback fails CLOSED rather than passing through: a
+        # malformed netloc raises the SAME ValueError while the value still
+        # carries a credential. A ``safe_text`` passthrough here would re-open
+        # the original P1 leak verbatim.
+        ("http://[bad/download?passkey=LEAKEDSECRET", "LEAKEDSECRET"),
+        ("https://[::1", None),  # unclosed bracket, IPv6-ish
+    ],
+)
+def test_safe_guid_never_raises_on_malformed_url_shaped_guids(raw: str, secret: str | None) -> None:
+    """A log barrier must be total: ``urlsplit``'s ValueError is absorbed, and the
+    unparseable-but-URL-ish value is FULLY redacted to a hash-only ``#<sha256>``
+    token (no host could be parsed, and the raw text may still embed a secret)."""
+    result = safe_guid(raw)  # must not raise -- a throw here would abort a grab cycle
+    assert result == f"#{_sha12(raw)}"  # exact hash-only token: nothing of the value
+    if secret is not None:
+        assert secret not in result
+
+
+def test_safe_guid_is_total_for_lone_surrogates() -> None:
+    """JSON (and thus a Prowlarr response) permits lone surrogates; a plain UTF-8
+    encode of one raises ``UnicodeEncodeError``. ``surrogatepass`` keeps the
+    barrier total AND the redaction intact -- the exotic character must never
+    become a throw or a verbatim-passthrough bypass."""
+    raw = "https://tracker.example.org/x?passkey=S\ud800ECRET"
+    assert safe_guid(raw) == f"tracker.example.org#{_sha12(raw)}"
