@@ -1,9 +1,15 @@
 /** Regression tests for mutation cache invalidation behavior. */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { renderHook, waitFor } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import { useEvict, useMarkFailed, useRotateAppKey, useUpdateSettings } from './hooks'
+import {
+  useEvict,
+  useMarkFailed,
+  useRequestsInvalidated,
+  useRotateAppKey,
+  useUpdateSettings,
+} from './hooks'
 import { client } from './client'
 import { queryKeys } from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
@@ -154,6 +160,34 @@ describe('useMarkFailed', () => {
 
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests }))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue })
+  })
+})
+
+describe('useRequestsInvalidated', () => {
+  it('tracks the /requests invalidated flag reactively (Codex P2 quick-request gate)', async () => {
+    // The flag lives on the query CACHE state, not the useQuery result, and only
+    // invalidateQueries sets it — the fix's whole premise. Prove the bridge hook
+    // sees it flip both ways against a real QueryClient.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    qc.setQueryData(queryKeys.requests, { requests: [] })
+
+    const { result } = renderHook(() => useRequestsInvalidated(), { wrapper: createWrapper(qc) })
+    // A settled, non-invalidated query reads false.
+    expect(result.current).toBe(false)
+
+    // invalidateQueries marks it invalidated (refetchType 'none' keeps the flag set
+    // deterministically instead of racing an immediate refetch).
+    await act(async () => {
+      await qc.invalidateQueries({ queryKey: queryKeys.requests, refetchType: 'none' })
+    })
+    expect(result.current).toBe(true)
+
+    // A settling fetch clears the flag (setQueryData dispatches a success that resets
+    // isInvalidated) — the gate reopens once the refetch lands.
+    act(() => {
+      qc.setQueryData(queryKeys.requests, { requests: [] })
+    })
+    await waitFor(() => expect(result.current).toBe(false))
   })
 })
 

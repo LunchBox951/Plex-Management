@@ -3,6 +3,7 @@ import type { DiscoverResult } from '../api/types'
 import type { StatusPresentation } from '../lib/status'
 import { PosterCard } from './ui/PosterCard'
 import { StatusBadge } from './ui/StatusBadge'
+import { QuickRequestButton } from './QuickRequestButton'
 
 interface RowProps {
   title: string
@@ -12,6 +13,19 @@ interface RowProps {
   loading?: boolean
   /** Per-tile library-state badge (issue #29); `null` leaves a tile unbadged. */
   tileState?: (item: DiscoverResult) => StatusPresentation | null
+  /**
+   * Whether a tile whose derived state is `null` may offer the one-click Request
+   * action, gating it alongside the `state === null` check. Discover derives this
+   * from the same `/requests` data the tiles' `tileState` consumes: false while
+   * that query hasn't SUCCEEDED yet or is invalidated pending a refetch (a stale
+   * `null` right after a request is created must not offer the button — a
+   * seasons-less tv POST in that window expands the just-created single-season
+   * request to the whole aired series), and false for a tv title with ANY request
+   * rows at all — the tile is first-time-whole-series only; every tv
+   * retry/re-request goes through the modal, which has season context. Omitted
+   * (presentational/standalone use), every null-state tile is requestable.
+   */
+  quickRequestable?: (item: DiscoverResult) => boolean
 }
 
 /** How far each chevron scrolls — a little under one viewport of posters. */
@@ -21,7 +35,14 @@ const SCROLL_STEP = 600
  * A titled, horizontally-scrollable poster strip. Chevrons scroll the track and
  * self-disable at each end; on touch/trackpad the native scroll still works.
  */
-export function Row({ title, items, onSelect, loading = false, tileState }: RowProps) {
+export function Row({
+  title,
+  items,
+  onSelect,
+  loading = false,
+  tileState,
+  quickRequestable,
+}: RowProps) {
   const trackRef = useRef<HTMLDivElement>(null)
   const [atStart, setAtStart] = useState(true)
   const [atEnd, setAtEnd] = useState(false)
@@ -97,6 +118,11 @@ export function Row({ title, items, onSelect, loading = false, tileState }: RowP
                       seed={item.tmdb_id}
                       onClick={() => onSelect(item)}
                       badge={state ? <StatusBadge status={state} /> : undefined}
+                      action={
+                        state === null && (quickRequestable?.(item) ?? true) ? (
+                          <QuickRequestButton item={item} />
+                        ) : undefined
+                      }
                     />
                   </div>
                 )
