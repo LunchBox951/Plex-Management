@@ -215,10 +215,7 @@ def decide(
                     multi_season_plan.ignored_seasons if multi_season_plan is not None else ()
                 ),
                 skipped_seasons=(
-                    (
-                        multi_season_plan.waste_seasons
-                        + multi_season_plan.ignored_seasons
-                    )
+                    (multi_season_plan.waste_seasons + multi_season_plan.ignored_seasons)
                     if multi_season_plan is not None
                     else ()
                 ),
