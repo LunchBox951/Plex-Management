@@ -261,6 +261,10 @@ _BAD_SERVICE_URLS = [
     "http://x:99999",  # out-of-range port
     "http://\nx",  # embedded control char (CR/LF log-forging shape)
     "http://x/\x01",  # control char in path
+    "http://plex local",  # whitespace in the authority -- urlsplit still yields a host
+    "http://x/base path",  # whitespace anywhere (here in the path) is rejected too
+    "http://x?y=1",  # query -- adapters append API paths, so a query is swallowed
+    "http://x#frag",  # fragment -- likewise swallows the appended API path
 ]
 
 
@@ -290,6 +294,28 @@ async def test_complete_rejects_empty_string_service_url(
     response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "good_url",
+    [
+        "http://prowlarr.local:9696/prowlarr",  # path-prefix (reverse-proxy) base URL
+        "http://prowlarr.local:9696/",  # bare trailing slash
+    ],
+)
+async def test_complete_accepts_path_prefix_and_trailing_slash_service_url(
+    client: httpx.AsyncClient, good_url: str
+) -> None:
+    # Tightening the shared predicate against query/fragment must NOT reject a
+    # legitimate base URL with a path prefix (a reverse-proxy mount) or a bare
+    # trailing slash -- setup completes and the URL persists verbatim.
+    body = {**_COMPLETE_BODY, "prowlarr_url": good_url}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.json()["prowlarr_url"] == good_url
 
 
 def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:

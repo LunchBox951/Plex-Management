@@ -214,6 +214,10 @@ _BAD_SERVICE_URLS = [
     "http://x:99999",  # out-of-range port
     "http://\nx",  # embedded control char (CR/LF log-forging shape)
     "http://x/\x01",  # control char in path
+    "http://plex local",  # whitespace in the authority -- urlsplit still yields a host
+    "http://x/base path",  # whitespace anywhere (here in the path) is rejected too
+    "http://x?y=1",  # query -- adapters append API paths, so a query is swallowed
+    "http://x#frag",  # fragment -- likewise swallows the appended API path
 ]
 
 
@@ -253,6 +257,28 @@ async def test_put_settings_accepts_valid_https_service_url(
     )
     assert put.status_code == 200
     assert put.json()[field] == "https://example.com:8443"
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+@pytest.mark.parametrize(
+    "good_url",
+    [
+        "http://prowlarr.local:9696/prowlarr",  # path-prefix (reverse-proxy) base URL
+        "http://prowlarr.local:9696/",  # bare trailing slash
+    ],
+)
+async def test_put_settings_accepts_path_prefix_and_trailing_slash_service_url(
+    client: httpx.AsyncClient, seed: SeedFn, field: str, good_url: str
+) -> None:
+    # Tightening the shared predicate against query/fragment must NOT reject a
+    # legitimate base URL that carries a path prefix (a reverse-proxy mount) or a
+    # bare trailing slash -- both round-trip through the write path unchanged.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+
+    put = await client.put("/api/v1/settings", json={field: good_url}, headers=headers)
+    assert put.status_code == 200
+    assert put.json()[field] == good_url
 
 
 async def test_put_settings_partial_update_omitting_urls_leaves_them_untouched(

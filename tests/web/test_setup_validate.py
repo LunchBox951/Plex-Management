@@ -285,6 +285,11 @@ async def test_validate_prowlarr_rejects_status_200_without_version(
         "http://prowlarr.local:99999",  # out-of-range port
         "http://\nprowlarr.local",  # embedded newline (CR/LF log-forging shape)
         "http://prowlarr.local/\x01",  # control char in path
+        # Whitespace: urlsplit() still yields a host for a space-bearing authority,
+        # but the raw string is used as the base URL, so httpx fails at request
+        # time -- reject up front like the control chars (Codex PR #53 P2).
+        "http://prowlarr local",  # space in the authority
+        "http://prowlarr.local/base path",  # space anywhere (here in the path)
     ],
 )
 async def test_validate_prowlarr_rejects_non_http_url(
@@ -305,6 +310,29 @@ async def test_validate_prowlarr_rejects_non_http_url(
     body = response.json()
     assert body["ok"] is False
     assert body["message"] == "Enter a valid http(s) URL."
+
+
+@pytest.mark.parametrize("bad_url", ["http://prowlarr.local?x=1", "http://prowlarr.local#frag"])
+async def test_validate_prowlarr_rejects_query_or_fragment(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # The shared shape predicate now also rejects a base URL bearing a query or
+    # fragment (Codex PR #53 P2): adapters append their API path to the raw string,
+    # so a ?query / #fragment would swallow it and hit the wrong endpoint. The
+    # wizard probe surfaces this honestly (ok=False, distinct message) and never
+    # issues the outbound request.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Base URL must not contain a query or fragment."
 
 
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(
@@ -542,6 +570,9 @@ async def test_validate_qbittorrent_bad_creds(client: httpx.AsyncClient, app: Fa
         "http://qb.local:99999",
         "http://\nqb.local",
         "http://qb.local/\x01",
+        # Whitespace in the authority / path -> reject up front (Codex PR #53 P2).
+        "http://qb local",
+        "http://qb.local/base path",
     ],
 )
 async def test_validate_qbittorrent_rejects_non_http_url(
@@ -577,6 +608,9 @@ async def test_validate_qbittorrent_rejects_non_http_url(
         "http://plex.local:99999",
         "http://\nplex.local",
         "http://plex.local/\x01",
+        # Whitespace in the authority / path -> reject up front (Codex PR #53 P2).
+        "http://plex local:32400",
+        "http://plex.local/base path",
     ],
 )
 async def test_validate_plex_rejects_non_http_url(
