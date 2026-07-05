@@ -433,9 +433,7 @@ async def create_request_result(
             poster_url=detail.poster_url,
             backdrop_url=detail.backdrop_url,
             tv_request_mode=_tv_request_intent(seasons)[0] if media_type == "tv" else None,
-            requested_seasons=(
-                _tv_request_intent(seasons)[1] if media_type == "tv" else None
-            ),
+            requested_seasons=(_tv_request_intent(seasons)[1] if media_type == "tv" else None),
         )
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.
