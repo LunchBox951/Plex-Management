@@ -106,14 +106,49 @@ def test_safe_guid_redacts_url_shaped_guids(raw: str, host: str, secret: str) ->
     [
         "Some.Movie.2020.1080p.WEB-DL.x264-GROUP",  # a title-style guid
         "0123456789abcdef0123456789abcdef",  # a plain hex/info-hash-style id
-        "urn:uuid:12345678-1234-5678-1234-567812345678",  # scheme but NO netloc
+        "release 12345 (group)",  # opaque text: no scheme, no netloc
     ],
 )
-def test_safe_guid_passes_non_url_guids_through_unchanged(raw: str) -> None:
-    """A non-URL GUID is not secret-bearing, so it is logged as before (only the
-    ``safe_text`` CR/LF barrier applies)."""
+def test_safe_guid_passes_plain_schemeless_guids_through_unchanged(raw: str) -> None:
+    """A GUID with NEITHER a URI scheme NOR a netloc is not secret-bearing, so it
+    is logged as before (only the ``safe_text`` CR/LF barrier applies)."""
     assert safe_guid(raw) == safe_text(raw)
     assert safe_guid(raw) == raw  # nothing to collapse in these inputs
+
+
+@pytest.mark.parametrize(
+    ("raw", "label", "secret"),
+    [
+        # THE wave-4 finding: a magnet URI has a scheme but NO netloc -- the old
+        # "scheme AND netloc" rule under-classified it as a plain id and passed
+        # the full URI through, ``tr=`` announce parameters (percent-encoded
+        # tracker URLs, passkey and all) included.
+        (
+            "magnet:?xt=urn:btih:deadbeef&tr=https%3A%2F%2Fpriv.tracker.org%2Fa%3Fpasskey%3DTRSECRET",
+            "magnet",
+            "TRSECRET",
+        ),
+        # Scheme-ish opaque ids: deliberate fail-closed collateral (see the
+        # helper docstring) -- over-redacting a harmless id costs one label;
+        # under-redacting a real URI leaks a credential.
+        ("urn:uuid:12345678-1234-5678-1234-567812345678", "urn", None),
+        ("prowlarr:123", "prowlarr", None),
+        # Protocol-relative: netloc without scheme -- the label is the host.
+        ("//priv.tracker.org/dl?passkey=PRSECRET", "priv.tracker.org", "PRSECRET"),
+    ],
+)
+def test_safe_guid_redacts_scheme_only_and_netloc_only_uris(
+    raw: str, label: str, secret: str | None
+) -> None:
+    """Any value with a URI scheme OR a netloc is redacted: the label is the
+    hostname when one exists, otherwise the scheme (``magnet#<hash>``) -- the
+    class of URI stays diagnosable, the credential-bearing remainder does not."""
+    result = safe_guid(raw)
+    assert result == f"{label}#{_sha12(raw)}"  # exact token: label + hash, nothing else
+    if secret is not None:
+        assert secret not in result
+    assert "passkey" not in result
+    assert "?" not in result
 
 
 def test_safe_guid_hash_prefix_is_stable_and_release_distinguishing() -> None:

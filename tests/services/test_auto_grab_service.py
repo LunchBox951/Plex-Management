@@ -796,21 +796,37 @@ async def test_source_error_emits_structured_telemetry(
     assert "source_failures=1" in summaries[0].getMessage()
 
 
-async def test_source_error_redacts_url_shaped_guid(
+@pytest.mark.parametrize(
+    ("uri_guid", "expected_label"),
+    [
+        # An http(s) private-tracker download URL: passkey in the query.
+        ("https://priv.tracker.org/dl/movie?passkey=SUPERSECRETKEY", "priv.tracker.org"),
+        # Wave-4 P1: a magnet URI (scheme, NO netloc) -- its percent-encoded
+        # ``tr=`` announce parameter embeds the same passkey; the label falls
+        # back to the scheme so the class of URI stays diagnosable.
+        (
+            "magnet:?xt=urn:btih:deadbeef&tr=https%3A%2F%2Fpriv.tracker.org%2Fa%3Fpasskey%3DSUPERSECRETKEY",
+            "magnet",
+        ),
+    ],
+)
+async def test_source_error_redacts_uri_shaped_guid(
     sessionmaker_: SessionMaker,
     caplog: pytest.LogCaptureFixture,
+    uri_guid: str,
+    expected_label: str,
 ) -> None:
-    """Codex P1: a Prowlarr private-indexer GUID is frequently a URL embedding a
-    tracker passkey/session token. The source-unresolvable WARNING persists to
-    ``log_events``/``/ops/logs``, so both its message text AND its ``extra=`` guid
-    field must carry only ``<host>#<sha256-prefix>`` -- host for diagnosability,
-    the credential never emitted (north star #3)."""
+    """Codex P1 (x2): a Prowlarr private-indexer GUID is frequently a URI embedding
+    a tracker passkey/session token -- an http(s) URL in its path/query, or a
+    magnet URI in its ``tr=`` announce parameters. The source-unresolvable WARNING
+    persists to ``log_events``/``/ops/logs``, so both its message text AND its
+    ``extra=`` guid field must carry only ``<host-or-scheme>#<sha256-prefix>`` --
+    the label for diagnosability, the credential never emitted (north star #3)."""
     title = "Some.Movie.2020.1080p.WEB-DL.x264-BAD"
-    url_guid = "https://priv.tracker.org/dl/movie?passkey=SUPERSECRETKEY"
     await _seed_movie(sessionmaker_, tmdb_id=603)
-    # ``source_errors`` keys on the download_url, so the guid is free to be the URL
+    # ``source_errors`` keys on the download_url, so the guid is free to be the URI
     # under test while the qBittorrent source failure is still triggered.
-    prowlarr = FakeProwlarr([candidate(title, magnet=False, guid=url_guid)])
+    prowlarr = FakeProwlarr([candidate(title, magnet=False, guid=uri_guid)])
     qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
 
     with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
@@ -826,9 +842,10 @@ async def test_source_error_redacts_url_shaped_guid(
     # never a bare host-substring check, which CodeQL flags as
     # py/incomplete-url-substring-sanitization ("priv.tracker.org" could sit at
     # an arbitrary position inside an unredacted URL).
-    expected_guid = f"priv.tracker.org#{hashlib.sha256(url_guid.encode('utf-8')).hexdigest()[:12]}"
+    expected_hash = hashlib.sha256(uri_guid.encode("utf-8")).hexdigest()[:12]
+    expected_guid = f"{expected_label}#{expected_hash}"
 
-    # ``extra=`` guid: exactly host + hash, secret stripped.
+    # ``extra=`` guid: exactly label + hash, secret stripped.
     assert getattr(record, "guid", None) == expected_guid
     assert "SUPERSECRETKEY" not in expected_guid
     assert "passkey" not in expected_guid

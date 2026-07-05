@@ -729,13 +729,15 @@ async def run_grab_cycle(
                 # convention, #35): CodeQL's py/log-injection taints message args and
                 # ``extra=`` fields alike, and CR/LF must not be able to forge a
                 # second log record. ``guid`` gets the stronger ``safe_guid`` barrier
-                # (Codex P1): a Prowlarr private-indexer GUID is frequently a URL that
-                # embeds a tracker passkey/session token in its path/query, so it is
-                # NOT safe to log verbatim (north star #3). ``safe_guid`` emits only
-                # ``<host>#<sha256-prefix>`` for a URL-shaped GUID -- host kept for
-                # diagnosability, the credential-bearing remainder never persisted to
-                # ``log_events``/``/ops/logs``, and the stable hash still lets the
-                # beta-week analysis correlate repeated failures of the SAME release.
+                # (Codex P1): a Prowlarr private-indexer GUID is frequently a URI that
+                # embeds a tracker passkey/session token (http(s) path/query, or a
+                # magnet's percent-encoded ``tr=`` announce URLs), so it is NOT safe
+                # to log verbatim (north star #3). ``safe_guid`` emits only
+                # ``<host-or-scheme>#<sha256-prefix>`` for a URI-shaped GUID -- the
+                # label kept for diagnosability, the credential-bearing remainder
+                # never persisted to ``log_events``/``/ops/logs``, and the stable
+                # hash still lets the beta-week analysis correlate repeated failures
+                # of the SAME release.
                 await session.rollback()
                 source_failures += 1
                 release = scored.candidate
