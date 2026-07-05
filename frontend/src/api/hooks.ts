@@ -3,6 +3,7 @@
  * presentational and consistent. Built on the generated client, so a contract
  * change surfaces as a type error in these hooks.
  */
+import { useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
@@ -215,6 +216,30 @@ export function useRequests(options?: { poll?: boolean }) {
     queryFn: async (): Promise<RequestListResponse> => unwrap(await client.GET('/api/v1/requests')),
     refetchInterval: options?.poll ? REQUESTS_POLL_INTERVAL_MS : false,
   })
+}
+
+/**
+ * Whether the shared `/requests` query is currently INVALIDATED — the flag
+ * `invalidateQueries` sets the instant a mutation invalidates the cache and holds
+ * until the ensuing refetch settles. React Query keeps this on the query's cache
+ * STATE, not on the `useQuery` result, and the routine `refetchInterval` poll
+ * never sets it — so it is the one signal that tells "a just-created request
+ * hasn't been reflected yet" apart from an ordinary background poll (gating on
+ * `isFetching` instead would flicker on every poll). Subscribed via
+ * useSyncExternalStore so a consumer re-renders exactly when the flag flips; the
+ * primitive-boolean snapshot elides the cache's other notifications.
+ *
+ * Discover gates its one-click quick-request action on this: a tile whose derived
+ * state is `null` only because the post-request refetch is still in flight must
+ * NOT offer a Request button — a seasons-less tv POST in that window expands a
+ * just-created single-season request to the whole aired series (Codex P2).
+ */
+export function useRequestsInvalidated(): boolean {
+  const qc = useQueryClient()
+  return useSyncExternalStore(
+    (onStoreChange) => qc.getQueryCache().subscribe(onStoreChange),
+    () => qc.getQueryState(queryKeys.requests)?.isInvalidated ?? false,
+  )
 }
 
 export function useRequest(id: number, enabled = true) {
