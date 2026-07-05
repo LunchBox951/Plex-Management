@@ -16,6 +16,13 @@ import { clearApiKey, getApiKey, getSetupToken, isApiKeyAuthEnabled } from '../l
 export const SETUP_REQUIRED_EVENT = 'plexmgr:setup-required'
 /** Fired when any call returns 401 `invalid_api_key`; the shell re-runs setup. */
 export const AUTH_INVALID_EVENT = 'plexmgr:auth-invalid'
+/**
+ * Fired when a call is rejected 401 while relying on the browser SESSION cookie
+ * (no current api key was sent). The signed-in Plex session is missing, expired,
+ * or revoked; the shell refetches auth state and routes back to the Plex login
+ * instead of stranding stale "authenticated" UI on error states.
+ */
+export const AUTH_EXPIRED_EVENT = 'plexmgr:auth-expired'
 
 function emit(event: string): void {
   if (typeof window !== 'undefined') {
@@ -58,6 +65,11 @@ const authMiddleware: Middleware = {
       if (sentKey && sentKey === getApiKey()) {
         clearApiKey()
         emit(AUTH_INVALID_EVENT)
+      } else {
+        // No current api key rode this request, yet it was rejected: the request
+        // was relying on the browser session cookie, which is now missing/expired/
+        // revoked. Signal so the gate re-checks auth and shows the login again.
+        emit(AUTH_EXPIRED_EVENT)
       }
     }
     return response

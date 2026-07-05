@@ -6,7 +6,7 @@ import {
   isApiKeyAuthEnabled,
   setApiKey,
 } from '../lib/apiKey'
-import { AUTH_INVALID_EVENT } from './client'
+import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from './client'
 
 const h = vi.hoisted(() => ({
   middleware: null as null | {
@@ -88,6 +88,31 @@ describe('API auth middleware', () => {
 
     expect(listener).not.toHaveBeenCalled()
     window.removeEventListener(AUTH_INVALID_EVENT, listener)
+  })
+
+  it('signals an expired session when a keyless 401 comes back', () => {
+    const expired = vi.fn()
+    window.addEventListener(AUTH_EXPIRED_EVENT, expired)
+    const request = new Request('http://localhost/api/v1/settings')
+
+    middleware().onResponse({ request, response: new Response(null, { status: 401 }) })
+
+    expect(expired).toHaveBeenCalledTimes(1)
+    window.removeEventListener(AUTH_EXPIRED_EVENT, expired)
+  })
+
+  it('does not signal an expired session when the sent key was the one rejected', () => {
+    setApiKey('stored-key')
+    enableApiKeyAuth()
+    const expired = vi.fn()
+    window.addEventListener(AUTH_EXPIRED_EVENT, expired)
+    const request = new Request('http://localhost/api/v1/settings')
+    middleware().onRequest({ request })
+
+    middleware().onResponse({ request, response: new Response(null, { status: 401 }) })
+
+    expect(expired).not.toHaveBeenCalled()
+    window.removeEventListener(AUTH_EXPIRED_EVENT, expired)
   })
 
   it('clears and reports a rejected key only when that key was sent', () => {

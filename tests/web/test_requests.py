@@ -141,6 +141,36 @@ async def test_shared_user_requests_are_limited_to_their_own_records(
     assert pin.json()["detail"] == "admin_required"
 
 
+async def test_shared_user_dedup_claims_unowned_request_into_their_list(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb())
+    shared_cookies, shared_headers = await _shared_user_cookies(app)
+
+    # The api-key automation path creates a request with NO user identity.
+    admin = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 603, "media_type": "movie"}, headers=_HEADERS
+    )
+    assert admin.status_code == 201
+
+    # A shared user requesting the same title dedups onto that ownerless request.
+    shared = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    assert shared.status_code == 200
+    assert shared.json()["id"] == admin.json()["id"]
+
+    # It is now adopted by the requester, so it shows up in THEIR filtered list
+    # rather than succeeding yet vanishing behind the per-user filter.
+    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["requests"]] == [admin.json()["id"]]
+
+
 async def test_create_records_already_in_plex_as_available(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:

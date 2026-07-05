@@ -321,6 +321,18 @@ async def create_request_result(
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
     if existing is not None:
+        # The deduped active request may have no owner (e.g. it was created via the
+        # API-key automation path, which carries no user identity). Adopt it for the
+        # requesting user so the dedup result appears in THEIR request list instead
+        # of succeeding yet vanishing behind the per-user list filter. Never
+        # reassigns a request that already belongs to another user.
+        if (
+            user_id is not None
+            and existing.user_id is None
+            and await repo.claim_if_unowned(existing.id, user_id)
+        ):
+            await session.commit()
+            existing = await repo.get(existing.id) or existing
         if media_type == "tv":
             season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
             await season_request_service.ensure_seasons(

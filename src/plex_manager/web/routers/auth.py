@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.plex.oauth import PlexOAuthClient, PlexOAuthPending
@@ -58,6 +58,7 @@ async def plex_start_endpoint(
 ) -> PlexLoginStartResponse:
     """Create a plex.tv PIN challenge and return the hosted auth URL."""
 
+    await _purge_stale_login_states(session)
     client_identifier = await _get_or_create_client_identifier(session)
     state = secrets.token_urlsafe(32)
     browser_token = secrets.token_urlsafe(32)
@@ -212,6 +213,28 @@ async def _get_or_create_client_identifier(session: AsyncSession) -> str:
     return created
 
 
+async def _purge_stale_login_states(session: AsyncSession) -> None:
+    """Delete expired or already-consumed PIN challenge rows.
+
+    ``POST /plex/start`` is necessarily unauthenticated (the operator has no
+    session yet), so every call inserts a ``plex_login_states`` row. Nothing else
+    ever removes an expired or abandoned row, so without this sweep the table would
+    grow without bound under repeated (or hostile) login attempts. Purging the
+    settled rows on each start keeps the table bounded to roughly the logins still
+    in flight within a PIN's short TTL — a self-limiting, terminal-free cleanup
+    rather than a deferred maintenance chore.
+    """
+    now = datetime.now(UTC)
+    await session.execute(
+        delete(PlexLoginState).where(
+            or_(
+                PlexLoginState.expires_at <= now,
+                PlexLoginState.consumed_at.is_not(None),
+            )
+        )
+    )
+
+
 async def _load_pending_state(
     session: AsyncSession,
     state_value: str,
@@ -306,9 +329,23 @@ def _callback_url(request: Request, *, state: str) -> str:
 
 
 def _cookie_secure(request: Request) -> bool:
-    configured = get_settings().auth_cookie_secure
+    settings = get_settings()
+    configured = settings.auth_cookie_secure
     if configured is not None:
         return configured
+    # Behind a TLS-terminating reverse proxy the app-visible scheme is plain
+    # ``http`` (the proxy speaks https to the browser and forwards over http), so
+    # ``request.url.scheme`` under-reports https and would drop the Secure flag on
+    # the session/CSRF cookies. When the operator has declared the public origin,
+    # trust its scheme: an https ``public_base_url`` means the browser reaches us
+    # over TLS, so the cookies MUST be Secure. Falls back to the request scheme for
+    # a direct deployment with no declared origin — where plain http on the LAN is
+    # the correct, intended default (a Secure cookie there would never be sent).
+    base = settings.public_base_url
+    if base:
+        scheme = urlsplit(base).scheme
+        if scheme in {"http", "https"}:
+            return scheme == "https"
     return request.url.scheme == "https"
 
 

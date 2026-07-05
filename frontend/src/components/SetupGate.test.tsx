@@ -1,7 +1,9 @@
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { AUTH_EXPIRED_EVENT } from '../api/client'
+import { queryKeys } from '../lib/queryClient'
 import { SetupGate } from './SetupGate'
 
 const h = vi.hoisted(() => ({
@@ -10,6 +12,7 @@ const h = vi.hoisted(() => ({
     data: { authenticated: false, auth_method: null as string | null, user: null },
     isLoading: false,
   },
+  invalidateQueries: vi.fn(),
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -49,7 +52,7 @@ vi.mock('@tanstack/react-query', async () => {
     await vi.importActual<typeof import('@tanstack/react-query')>('@tanstack/react-query')
   return {
     ...actual,
-    useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+    useQueryClient: () => ({ invalidateQueries: h.invalidateQueries }),
   }
 })
 
@@ -57,6 +60,7 @@ describe('SetupGate auth routing', () => {
   beforeEach(() => {
     h.setup = { data: { initialized: true, app_api_key: null }, isLoading: false, isError: false }
     h.auth = { data: { authenticated: false, auth_method: null, user: null }, isLoading: false }
+    h.invalidateQueries.mockClear()
   })
 
   it('shows Plex login for an initialized install without an authenticated session', () => {
@@ -71,5 +75,16 @@ describe('SetupGate auth routing', () => {
     render(<SetupGate />, { wrapper: MemoryRouter })
 
     expect(screen.queryByText('Mock Plex Login')).not.toBeInTheDocument()
+  })
+
+  it('refetches auth state when a session-expired event fires', () => {
+    h.auth = { data: { authenticated: true, auth_method: 'plex_session', user: null }, isLoading: false }
+
+    render(<SetupGate />, { wrapper: MemoryRouter })
+    act(() => {
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
+    })
+
+    expect(h.invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.authMe })
   })
 })

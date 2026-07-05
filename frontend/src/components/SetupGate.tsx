@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Navigate, Outlet, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { AUTH_INVALID_EVENT, SETUP_REQUIRED_EVENT } from '../api/client'
+import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT, SETUP_REQUIRED_EVENT } from '../api/client'
 import { useAuthMe, useSetupStatus } from '../api/hooks'
 import { queryKeys } from '../lib/queryClient'
 import { Button } from './ui/Button'
@@ -30,11 +30,21 @@ export function SetupGate() {
       navigate('/setup', { replace: true })
     }
     const onAuthInvalid = () => setAuthMode('key')
+    // A session-cookie 401: the Plex sign-in lapsed. Drop the cached "authenticated"
+    // answer and refetch /auth/me so the gate re-derives state — an expired session
+    // resolves to `authenticated: false` and falls through to the Plex login, rather
+    // than leaving stale authenticated UI stranded on error states with no way back.
+    const onAuthExpired = () => {
+      setAuthMode('plex')
+      void queryClient.invalidateQueries({ queryKey: queryKeys.authMe })
+    }
     window.addEventListener(SETUP_REQUIRED_EVENT, onSetupRequired)
     window.addEventListener(AUTH_INVALID_EVENT, onAuthInvalid)
+    window.addEventListener(AUTH_EXPIRED_EVENT, onAuthExpired)
     return () => {
       window.removeEventListener(SETUP_REQUIRED_EVENT, onSetupRequired)
       window.removeEventListener(AUTH_INVALID_EVENT, onAuthInvalid)
+      window.removeEventListener(AUTH_EXPIRED_EVENT, onAuthExpired)
     }
   }, [navigate, queryClient])
 

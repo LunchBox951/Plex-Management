@@ -2601,6 +2601,11 @@
       }
     },
     "securitySchemes": {
+      "APIKeyCookie": {
+        "in": "cookie",
+        "name": "plexmgr.session",
+        "type": "apiKey"
+      },
       "APIKeyHeader": {
         "in": "header",
         "name": "X-Api-Key",
@@ -2626,6 +2631,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Logout Endpoint",
@@ -2784,6 +2792,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "List Blocklist",
@@ -2835,6 +2846,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Delete Blocklist",
@@ -2862,6 +2876,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Discover Home",
@@ -2927,6 +2944,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Discover Search",
@@ -2993,6 +3013,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Discover Category",
@@ -3020,6 +3043,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Disk Endpoint",
@@ -3047,6 +3073,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Evict Endpoint",
@@ -3074,6 +3103,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Health Endpoint",
@@ -3201,6 +3233,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "List Logs Endpoint",
@@ -3292,6 +3327,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Export Logs Endpoint",
@@ -3343,6 +3381,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Tail Logs Endpoint",
@@ -3370,6 +3411,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Get Quality Profile Endpoint",
@@ -3397,6 +3441,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Get Queue",
@@ -3471,6 +3518,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Grab Endpoint",
@@ -3539,6 +3589,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Import Endpoint",
@@ -3627,6 +3680,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Mark Failed Endpoint",
@@ -3654,6 +3710,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "List Requests Endpoint",
@@ -3719,6 +3778,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Create Request Endpoint",
@@ -3777,6 +3839,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Get Request Endpoint",
@@ -3825,6 +3890,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Cancel Request Endpoint",
@@ -3883,6 +3951,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Keep Forever Endpoint",
@@ -3941,6 +4012,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Report Issue Endpoint",
@@ -4005,6 +4079,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Search Preview Endpoint",
@@ -4032,6 +4109,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Get Settings Endpoint",
@@ -4077,6 +4157,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Put Settings Endpoint",
@@ -4104,6 +4187,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Reveal App Key Endpoint",
@@ -4131,6 +4217,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Rotate App Key Endpoint",
@@ -4162,6 +4251,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Plex Libraries Endpoint",

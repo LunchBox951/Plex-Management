@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Any, Literal, cast
 
 import httpx
 from fastapi import APIRouter, FastAPI
@@ -48,6 +48,7 @@ from plex_manager.services.health_service import (
 )
 from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
+    SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
     ensure_system_settings,
     get_anime_movie_root_optional,
@@ -720,6 +721,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         log_capture_service.stop_logging(log_handler)
 
 
+def _install_cookie_security_scheme(app: FastAPI) -> None:
+    """Advertise the ``plexmgr.session`` cookie as a first-class auth scheme.
+
+    Every protected route accepts EITHER the ``X-Api-Key`` header (the recovery/
+    automation credential) OR the browser session cookie (the normal path — see
+    ``deps.authenticate_request``), but FastAPI only emits the ``APIKeyHeader``
+    scheme it can see as an explicit dependency. That leaves the exported contract
+    dishonest: a client generated from it would believe cookie auth does not exist
+    and that ``/auth/logout`` needs an api key. This wraps ``app.openapi`` to add the
+    ``APIKeyCookie`` scheme and rewrite each api-key-secured operation's requirement
+    to the honest OR (``[{APIKeyHeader}, {APIKeyCookie}]``) — a *list* of
+    alternatives, not a single object (which OpenAPI reads as AND / both-required).
+    """
+    default_openapi = app.openapi
+    api_key_only: list[dict[str, list[str]]] = [{"APIKeyHeader": []}]
+    api_key_or_cookie: list[dict[str, list[str]]] = [
+        {"APIKeyHeader": []},
+        {"APIKeyCookie": []},
+    ]
+
+    def openapi_with_cookie() -> dict[str, Any]:
+        schema = default_openapi()
+        components: dict[str, Any] = schema.get("components", {})
+        schemes: dict[str, Any] | None = components.get("securitySchemes")
+        if schemes is None or "APIKeyCookie" in schemes:
+            return schema
+        schemes["APIKeyCookie"] = {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": SESSION_COOKIE_NAME,
+        }
+        paths: dict[str, Any] = schema.get("paths", {})
+        for path_item in paths.values():
+            operations: dict[str, Any] = path_item
+            for value in operations.values():
+                if not isinstance(value, dict):
+                    continue
+                operation = cast(dict[str, Any], value)
+                if operation.get("security") == api_key_only:
+                    operation["security"] = api_key_or_cookie
+        return schema
+
+    app.openapi = openapi_with_cookie
+
+
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
@@ -738,6 +784,7 @@ def create_app() -> FastAPI:
     app.include_router(blocklist_router.router)
     app.include_router(quality_profile_router.router)
     app.include_router(ops_router.router)
+    _install_cookie_security_scheme(app)
     # Mount the built SPA LAST so its catch-all fallback has the lowest match
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
     mount_spa(app)

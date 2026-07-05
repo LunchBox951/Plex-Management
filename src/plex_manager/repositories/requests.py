@@ -390,6 +390,29 @@ class SqlRequestRepository:
             row.completed_at = now
         await self._session.flush()
 
+    async def claim_if_unowned(self, request_id: int, user_id: int) -> bool:
+        """Assign ``user_id`` to a request that currently has NO owner.
+
+        A single ``UPDATE ... WHERE id = ? AND user_id IS NULL`` so the DATABASE
+        decides: an already-owned row is left untouched (an existing owner is never
+        reassigned). Returns whether a row was actually claimed.
+
+        Used on the create-dedup path so a signed-in user whose request collapses
+        onto a previously ownerless active request (e.g. one created via the
+        API-key automation path, which carries no user identity) has the request
+        show up in THEIR own list, rather than succeeding yet silently vanishing
+        behind the per-user list filter.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(MediaRequest.id == request_id, MediaRequest.user_id.is_(None))
+                .values(user_id=user_id)
+            ),
+        )
+        return result.rowcount == 1
+
     async def stamp_completed_at_if_unset(self, request_id: int) -> None:
         """Stamp ``completed_at`` = now, but ONLY if it is currently unset.
 
