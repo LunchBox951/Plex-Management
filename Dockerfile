@@ -5,7 +5,7 @@
 # bit-identical :edge -> :stable promotion (ADR-0004) is preserved. The committed
 # generated client (frontend/src/api/schema.d.ts) is used as-is — no openapi.json
 # needed here (docs/ is .dockerignore'd anyway).
-FROM node:22-slim AS web
+FROM node:26-slim AS web
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
