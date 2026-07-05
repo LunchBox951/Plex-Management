@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import LogEventRepository
 
 __all__ = [
+    "AUTO_GRAB_TELEMETRY_LOGGER_NAME",
+    "DECISION_TELEMETRY_LOGGER_NAME",
     "LOG_DRAIN_INTERVAL_SECONDS",
     "LOG_PRUNE_INTERVAL_SECONDS",
     "QUEUE_MAXSIZE",
@@ -100,9 +102,11 @@ LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
 #: is 7 days, which would otherwise prune day-1 telemetry before day 7 even
 #: arrives. Rather than bumping the general retention (which would also retain
 #: ordinary noisy INFO/WARNING/ERROR chatter far longer than needed, growing
-#: ``log_events`` for no benefit), :func:`prune_once` gives rows from THIS one
-#: logger their own cutoff — using the existing ``LogEvent.logger`` column as the
-#: marker, no schema change. This constant is a FLOOR, not a fixed window:
+#: ``log_events`` for no benefit), :func:`prune_once` gives rows from the
+#: telemetry loggers (:data:`_TELEMETRY_LOGGERS` — this one plus the decision/
+#: auto-grab emitters below) their own cutoff — using the existing
+#: ``LogEvent.logger`` column as the marker, no schema change. The
+#: retention-days constant is a FLOOR, not a fixed window:
 #: :func:`prune_once` retains telemetry for ``max(TELEMETRY_LOG_RETENTION_DAYS,
 #: log_retention_days)`` days, so it is never pruned earlier than 30 days AND
 #: never earlier than the operator's own general retention (an operator who sets
@@ -115,12 +119,59 @@ LOG_PRUNE_INTERVAL_SECONDS: Final = 300.0
 TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.retention_telemetry_service"
 TELEMETRY_LOG_RETENTION_DAYS: Final = 30
 
-#: The level the retention-telemetry logger is pinned to (in
+#: The level every beta-telemetry logger is pinned to (in
 #: :func:`configure_logging`), independent of the operator's ``config.log_level``.
-#: The telemetry sweep logs its beta dataset at INFO; without this pin, a WARNING/
+#: Telemetry modules log their beta datasets at INFO; without this pin, a WARNING/
 #: ERROR operator floor would filter those records at the ``_logger.info`` call
 #: BEFORE the durable-log handler ever saw them (see :func:`configure_logging`).
 _TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
+
+#: The other beta-week telemetry emitters, sharing the retention logger's exact
+#: hazard: ``decision_service`` logs the issue-#24 multi-season-pack aggregate at
+#: INFO, and ``auto_grab_service`` logs the issue-#43 records (the enriched
+#: per-release source-failure WARNING and the per-cycle summary INFO with its
+#: ``source_failures`` rollup) -- at an operator ``log_level`` of WARNING/ERROR
+#: the INFO records would otherwise silently never reach ``log_events``. The
+#: modules construct their telemetry logger FROM these constants (retention
+#: precedent) so the emitter and the treatment below can never drift apart
+#: under a rename. The SCOPE differs per module, deliberately:
+#:
+#: * ``decision_service`` uses its MODULE logger (the name equals the module's
+#:   dotted path): the #24 aggregate is that module's ONLY log record, so
+#:   module-logger scope IS telemetry-only scope -- a dedicated child would add
+#:   a second name for zero records separated.
+#: * ``auto_grab_service`` uses a dedicated ``.telemetry`` CHILD logger, because
+#:   its module logger also carries operational records (search-failure
+#:   cooldowns, "accepted release unusable", a park-race INFO). Scoping the
+#:   telemetry treatment to the module logger would let those operational rows
+#:   dodge the operator's ``log_retention_days`` and accumulate for 30 days on a
+#:   failing install (the wave-6 finding). Only the #43 records go through the
+#:   child; everything operational stays on the module logger with ordinary
+#:   level/retention semantics. Child records propagate to the root handlers
+#:   exactly like module records (levels gate only at the EMITTING logger), so
+#:   the durable sink sees them unchanged.
+DECISION_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.decision_service"
+AUTO_GRAB_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.auto_grab_service.telemetry"
+
+#: THE definition of "a telemetry logger" -- deliberately one tuple driving BOTH
+#: telemetry behaviors, so they can never drift apart:
+#:
+#: 1. :func:`configure_logging` pins each name to :data:`_TELEMETRY_LOGGER_LEVEL`
+#:    (INFO), so the dataset is CREATED at any operator ``log_level``; and
+#: 2. :func:`prune_once` gives each name's rows the longer
+#:    :data:`TELEMETRY_LOG_RETENTION_DAYS` floor, so the dataset SURVIVES the
+#:    operator's ``log_retention_days`` (default 7) for the whole beta window.
+#:
+#: Half-treatment is exactly the bug class this tuple exists to prevent: a pinned
+#: -but-not-retained logger emits data that the default prune deletes just as the
+#: beta week completes; a retained-but-not-pinned logger keeps rows it never
+#: creates under a WARNING floor. A logger belongs here iff its records ARE the
+#: beta dataset.
+_TELEMETRY_LOGGERS: Final = (
+    TELEMETRY_LOGGER_NAME,
+    DECISION_TELEMETRY_LOGGER_NAME,
+    AUTO_GRAB_TELEMETRY_LOGGER_NAME,
+)
 
 #: Third-party HTTP client loggers that MUST be kept quieter than whatever the
 #: operator sets ``config.log_level`` to. ``httpx`` logs ``"HTTP Request: %s %s
@@ -378,20 +429,22 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     way; a caller passing a non-root ``logger`` (tests, mainly) still gets the
     same quieting so no test path silently relies on the child not having it.
 
-    Symmetrically, pins the retention-telemetry logger
-    (:data:`TELEMETRY_LOGGER_NAME`) to :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so
-    its INFO records reach the durable ``log_events`` sink at ANY operator
-    ``level``. The handler is attached to the ROOT logger, and the telemetry
-    logger is a NON-propagation-broken descendant of root, so its records flow up
-    to that handler on the normal ``propagate=True`` path — but ONLY if they are
-    created in the first place. Left at the inherited effective level, an operator
-    running at WARNING/ERROR would drop every INFO telemetry record at the
-    ``_logger.info`` call site (``isEnabledFor`` short-circuits before any handler
-    runs), and the beta dataset would silently never persist. Pinning THIS one
-    logger to INFO (not the root, which would un-quiet ALL of the app's INFO
-    chatter and spam the operator's floor) lets exactly the telemetry records
-    through; the LogCaptureHandler itself has no level filter, so once created
-    they reach its DB queue regardless of the root logger's own level.
+    Symmetrically, pins every beta-telemetry logger
+    (:data:`_TELEMETRY_LOGGERS`: the retention sweep, the decision
+    multi-season aggregate, and the auto-grab per-cycle summary) to
+    :data:`_TELEMETRY_LOGGER_LEVEL` (INFO) so their INFO records reach the durable
+    ``log_events`` sink at ANY operator ``level``. The handler is attached to the
+    ROOT logger, and each telemetry logger is a NON-propagation-broken descendant
+    of root, so its records flow up to that handler on the normal
+    ``propagate=True`` path — but ONLY if they are created in the first place.
+    Left at the inherited effective level, an operator running at WARNING/ERROR
+    would drop every INFO telemetry record at the ``_logger.info`` call site
+    (``isEnabledFor`` short-circuits before any handler runs), and the beta
+    datasets would silently never persist. Pinning THESE loggers to INFO (not the
+    root, which would un-quiet ALL of the app's INFO chatter and spam the
+    operator's floor) lets exactly the telemetry records through; the
+    LogCaptureHandler itself has no level filter, so once created they reach its
+    DB queue regardless of the root logger's own level.
 
     Returns the handler so the caller (``web/app.py``'s ``lifespan``) can store it
     (e.g. on ``app.state.log_handler``) for the drain task and the future log
@@ -405,7 +458,8 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target.setLevel(_resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
-    logging.getLogger(TELEMETRY_LOGGER_NAME).setLevel(_TELEMETRY_LOGGER_LEVEL)
+    for name in _TELEMETRY_LOGGERS:
+        logging.getLogger(name).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler
 
 
@@ -470,21 +524,28 @@ async def drain_once(
 async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
     """Delete every stale ``log_events`` row -- TWO separate cutoffs, TWO deletes.
 
-    Every logger EXCEPT :data:`TELEMETRY_LOGGER_NAME` is pruned on the
-    operator-editable ``retention_days`` (the web-editable ``log_retention_days``
-    setting, default 7) exactly as before. Rows FROM that one logger are pruned on
-    their OWN, never-shorter cutoff: ``max(TELEMETRY_LOG_RETENTION_DAYS,
-    retention_days)`` days. That ``max`` is the whole point of the carve-out —
+    Every logger EXCEPT the telemetry loggers (:data:`_TELEMETRY_LOGGERS`: the
+    retention sweep, the decision multi-season aggregate, the auto-grab cycle
+    summary) is pruned on the operator-editable ``retention_days`` (the
+    web-editable ``log_retention_days`` setting, default 7) exactly as before.
+    Rows FROM those loggers are pruned on their OWN, never-shorter cutoff:
+    ``max(TELEMETRY_LOG_RETENTION_DAYS, retention_days)`` days. That ``max`` is
+    the whole point of the carve-out —
 
     * an operator on the default (or any ``retention_days`` below 30) still keeps
       the beta-week telemetry a full 30 days, so a short general retention can
-      never prune the dataset before the week is up; and
+      never prune any of the datasets before the week is up (with only the
+      original single-logger carve-out, the #24/#43 rows were deleted at the
+      operator window — day-1 data gone just as the week completed); and
     * an operator who deliberately RAISES ``log_retention_days`` to 60/90 keeps
       telemetry AT LEAST as long as everything else — the carve-out is a floor,
       never a ceiling, so telemetry is never pruned EARLIER than the operator's
       own window (the bug a fixed 30-day cutoff would introduce above 30).
 
-    See :data:`TELEMETRY_LOGGER_NAME`'s docstring for the full rationale.
+    Sharing :data:`_TELEMETRY_LOGGERS` with :func:`configure_logging`'s INFO pin
+    is deliberate — see that tuple's docstring: pinned-but-not-retained (or the
+    reverse) is the half-treatment bug class this coupling prevents. See
+    :data:`TELEMETRY_LOGGER_NAME`'s docstring for the retention-window rationale.
 
     Returns the total rows removed across both deletes. ``retention_days <= 0``
     is treated as "keep nothing older than now" rather than skipped for the
@@ -494,12 +555,10 @@ async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
     """
     now = datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
-    pruned = await repo.prune_older_than(
-        cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=True
-    )
+    pruned = await repo.prune_older_than(cutoff, loggers=_TELEMETRY_LOGGERS, exclude_loggers=True)
     telemetry_retention_days = max(TELEMETRY_LOG_RETENTION_DAYS, retention_days)
     telemetry_cutoff = now - timedelta(days=telemetry_retention_days)
     pruned += await repo.prune_older_than(
-        telemetry_cutoff, logger_equals=TELEMETRY_LOGGER_NAME, exclude_logger=False
+        telemetry_cutoff, loggers=_TELEMETRY_LOGGERS, exclude_loggers=False
     )
     return pruned

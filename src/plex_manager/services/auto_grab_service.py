@@ -48,6 +48,14 @@ Design decisions (see ADR-0013):
   scheduled from the ACTUAL park moment (a fresh clock read inside :func:`_park`),
   never a ``now`` captured at cycle start -- a slow cycle would otherwise schedule
   a late park from a stale base and make it due again on the very next tick.
+* **Source-unresolvable telemetry (beta-week, issue #43).** A ``QbittorrentSourceError``
+  per-release failure is logged with full release identity (source title, indexer,
+  guid/info_hash, season, attempt context) so "how often did the same source
+  persistently fail" is answerable from ``log_events`` after the beta week; a
+  per-cycle ``source_failures`` count is folded into the closing summary INFO. Its
+  sibling per-release failures ({``NoGrabSourceError``, ``DownloadScopeConflictError``,
+  ``TorrentAlreadyTrackedError``}) keep the lighter "type name only" logging -- there
+  is no beta-week data need for those.
 """
 
 from __future__ import annotations
@@ -58,6 +66,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
+from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -77,6 +86,7 @@ from plex_manager.services.grab_service import (
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
 )
+from plex_manager.services.log_capture_service import AUTO_GRAB_TELEMETRY_LOGGER_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -103,7 +113,21 @@ __all__ = [
     "run_grab_cycle",
 ]
 
+# TWO loggers, deliberately split (wave-6 finding). ``_logger`` is the ordinary
+# module logger for OPERATIONAL records (search-failure cooldowns, "accepted
+# release unusable", the park-race INFO): ordinary level semantics, ordinary
+# operator-controlled ``log_retention_days``. ``_telemetry_logger`` is a
+# dedicated ``.telemetry`` CHILD used by the issue-#43 records ONLY -- the
+# enriched source-failure WARNING and the per-cycle summary INFO -- constructed
+# FROM the shared constant (retention precedent) so the emitter can never drift
+# from the treatment ``log_capture_service`` keys on that exact name: the INFO
+# pin (an operator WARNING/ERROR floor must not stop the dataset being CREATED)
+# and the 30-day retention floor (the default 7-day prune must not delete it
+# mid-beta-week). Scoping that treatment to the module logger instead would let
+# every operational warning on a failing install dodge the operator's retention
+# window for 30 days -- exactly what the split prevents.
 _logger = logging.getLogger(__name__)
+_telemetry_logger = logging.getLogger(AUTO_GRAB_TELEMETRY_LOGGER_NAME)
 
 # Request/season statuses the worker re-searches. ``pending`` (never searched),
 # ``no_acceptable_release`` (searched, nothing acceptable -> retry on backoff), and
@@ -506,6 +530,12 @@ async def run_grab_cycle(
     scopes = await _collect_due_scopes(request_repo, season_repo, now, cooldowns)
 
     searched = grabbed = no_acceptable = skipped_active = grab_errors = 0
+    # Beta-week telemetry (issue #43): count of ``QbittorrentSourceError`` per-release
+    # failures this cycle -- folded into the closing summary INFO below. Each
+    # individual occurrence is ALSO logged with full release identity (see the
+    # dedicated except clause below); this is just the per-cycle rollup so an
+    # operator/analyst can see the trend without counting WARNINGs by hand.
+    source_failures = 0
     last_grab_error: GrabError | None = None
     for scope in scopes:
         if searched >= max_searches:
@@ -664,40 +694,116 @@ async def run_grab_cycle(
                 grab_errors += 1
                 last_grab_error = exc
                 break
+            except QbittorrentSourceError as exc:
+                # A release WAS accepted but its HTTP source was vetoed or resolved
+                # to neither a magnet nor a locally-hashable ``.torrent``.
+                # qBittorrent is HEALTHY -- the SOURCE is the problem; raised inside
+                # ``qbt.add`` BEFORE the add POST, so nothing was handed to the
+                # client and nothing is orphaned -- exactly a per-release "unusable
+                # source", the auto-grab twin of the manual grab's 422
+                # ``torrent_source_unresolvable``, NOT a client outage. Unlike the
+                # settling cases above, a LOWER-ranked accepted release may still be
+                # grabbable, so discard the partial write and fall through to the
+                # next candidate (do NOT ``break``). ``park_scope`` stays True, so an
+                # EXHAUSTED list (or the attempt cap) parks the scope on the SAME
+                # escalating backoff a nothing-acceptable search uses -- left
+                # un-parked with no grabbable alternative the worker would re-search
+                # Prowlarr and re-attempt every cycle FOREVER, defeating the
+                # single-Prowlarr load guard the backoff ladder exists for.
+                #
+                # Beta-week telemetry (issue #43): unlike the sibling per-release
+                # failures below, this is the one the beta needs source-failure DATA
+                # for -- "how often did the same source persistently fail" is
+                # otherwise unanswerable from a generic parked state. So this WARNING
+                # is deliberately enriched with release identity (source title,
+                # indexer, guid/info_hash, season, attempt context), plus a per-cycle
+                # ``source_failures`` count folded into the closing summary INFO.
+                #
+                # ``request_id``/``tmdb_id`` go in ``extra=`` only, matching every
+                # other handler in this module -- ``log_capture_service._extract_
+                # context`` picks exactly ``LOG_EVENT_CORRELATION_KEYS`` (request_id/
+                # download_id/tmdb_id) out of ``extra=`` into the durable row's
+                # structured, filterable ``context_json`` (``GET /ops/logs/export?
+                # correlation_id=``), so putting them in the TEXT too would be inert
+                # duplication. ``season``/the release identity fields are NOT
+                # correlation keys, though, and ``log_capture_service`` only persists
+                # a record's rendered ``message`` text (``record.getMessage()``) plus
+                # that restricted context -- an ``extra=``-only field never reaches
+                # ``log_events`` at all. So, unlike the sibling handlers' "type name
+                # only" text, THIS message deliberately interpolates them so the data
+                # this telemetry exists for actually survives the beta week, not just
+                # this process's lifetime. ``title``/``indexer``/``info_hash`` are
+                # external Prowlarr text run through ``safe_text`` (log-hygiene
+                # convention, #35): CodeQL's py/log-injection taints message args and
+                # ``extra=`` fields alike, and CR/LF must not be able to forge a
+                # second log record. ``guid`` gets the stronger ``safe_guid`` barrier
+                # (Codex P1): a Prowlarr private-indexer GUID can be a URI of ANY
+                # shape embedding a tracker passkey/session token (http(s) path/
+                # query, a magnet's percent-encoded ``tr=`` announce URLs, a
+                # schemeless ``host/path?passkey=``), so it is NOT safe to log
+                # verbatim (north star #3). ``safe_guid`` passes through ONLY a
+                # provably plain id (strict allowlist) and redacts everything else
+                # to ``<label>#<sha256-prefix>`` -- the label kept for
+                # diagnosability, the credential-bearing remainder never persisted
+                # to ``log_events``/``/ops/logs``, and the stable hash still lets
+                # the beta-week analysis correlate repeated failures of the SAME
+                # release.
+                await session.rollback()
+                source_failures += 1
+                release = scored.candidate
+                _telemetry_logger.warning(
+                    "auto-grab: accepted release source-unresolvable (%s): "
+                    "title=%r indexer=%r guid=%r info_hash=%s season=%s, "
+                    "attempt %d/%d; trying next accepted release",
+                    type(exc).__name__,
+                    safe_text(release.title),
+                    safe_text(release.indexer_name),
+                    safe_guid(release.guid),
+                    safe_text(release.info_hash) if release.info_hash else "-",
+                    scope.season if scope.season is not None else "-",
+                    attempt,
+                    len(candidates),
+                    extra={
+                        "request_id": scope.request_id,
+                        "tmdb_id": scope.tmdb_id,
+                        "season": scope.season,
+                        "source_title": safe_text(release.title),
+                        "indexer": safe_text(release.indexer_name),
+                        "guid": safe_guid(release.guid),
+                        "info_hash": safe_text(release.info_hash) if release.info_hash else None,
+                        "attempt": attempt,
+                        "attempts_total": len(candidates),
+                    },
+                )
             except (
                 NoGrabSourceError,
                 DownloadScopeConflictError,
-                QbittorrentSourceError,
                 TorrentAlreadyTrackedError,
             ) as exc:
                 # A release WAS accepted but cannot be grabbed right now, and NOTHING
                 # is left live to track: no usable source (``NoGrabSourceError`` --
-                # raised BEFORE anything is handed to the client); the HTTP source
-                # was vetoed or resolved to neither a magnet nor a locally-hashable
-                # ``.torrent`` (``QbittorrentSourceError`` -- qBittorrent is HEALTHY,
-                # the SOURCE is the problem; raised inside ``qbt.add`` BEFORE the add
-                # POST, so nothing was handed to the client and nothing is orphaned --
-                # exactly a per-release "unusable source", the auto-grab twin of the
-                # manual grab's 422 ``torrent_source_unresolvable``, NOT a client
-                # outage); the same physical torrent is already active for a DIFFERENT
-                # scope of THIS request (``DownloadScopeConflictError`` -- a
-                # multi-season pack; the re-add is a qBittorrent no-op, so nothing is
-                # orphaned); or the torrent's hash is already tracked by a DIFFERENT
-                # request entirely (``TorrentAlreadyTrackedError`` -- that request's
-                # download owns the physical torrent, so any add was an idempotent
-                # no-op on an already-present torrent and this scope owns nothing
-                # live; the manual endpoint's 409 ``torrent_already_tracked`` twin).
-                # Unlike the settling
-                # cases above, a LOWER-ranked accepted release may still be grabbable,
-                # so discard the partial write and fall through to the next candidate
-                # (do NOT ``break``). ``park_scope`` stays True, so an EXHAUSTED list
-                # (or the attempt cap) parks the scope on the SAME escalating backoff
-                # a nothing-acceptable search uses -- left un-parked with no grabbable
-                # alternative the worker would re-search Prowlarr and re-attempt every
-                # cycle FOREVER, defeating the single-Prowlarr load guard the backoff
-                # ladder exists for. Release titles are external Prowlarr text; the log
-                # deliberately carries only the exception TYPE + attempt counter (never
-                # the title), matching this module's other grab handlers.
+                # raised BEFORE anything is handed to the client); the same physical
+                # torrent is already active for a DIFFERENT scope of THIS request
+                # (``DownloadScopeConflictError`` -- a multi-season pack; the re-add
+                # is a qBittorrent no-op, so nothing is orphaned); or the torrent's
+                # hash is already tracked by a DIFFERENT request entirely
+                # (``TorrentAlreadyTrackedError`` -- that request's download owns the
+                # physical torrent, so any add was an idempotent no-op on an
+                # already-present torrent and this scope owns nothing live; the
+                # manual endpoint's 409 ``torrent_already_tracked`` twin). Unlike the
+                # settling cases above, a LOWER-ranked accepted release may still be
+                # grabbable, so discard the partial write and fall through to the
+                # next candidate (do NOT ``break``). ``park_scope`` stays True, so an
+                # EXHAUSTED list (or the attempt cap) parks the scope on the SAME
+                # escalating backoff a nothing-acceptable search uses -- left
+                # un-parked with no grabbable alternative the worker would re-search
+                # Prowlarr and re-attempt every cycle FOREVER, defeating the
+                # single-Prowlarr load guard the backoff ladder exists for. Release
+                # titles are external Prowlarr text; the log deliberately carries
+                # only the exception TYPE + attempt counter (never the title),
+                # matching this module's other grab handlers -- unlike the sibling
+                # ``QbittorrentSourceError`` branch above, there is no beta-week data
+                # need for these three, so the lighter-weight logging stays as-is.
                 await session.rollback()
                 _logger.warning(
                     "auto-grab: accepted release unusable (%s), attempt %d/%d; "
@@ -717,15 +823,17 @@ async def run_grab_cycle(
                 no_acceptable += 1
 
     cooled_down = sum(1 for cd in cooldowns.values() if cd.not_before > now)
-    _logger.info(
+    _telemetry_logger.info(
         "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d "
-        "grab_errors=%d cooled_down=%d",
+        "grab_errors=%d cooled_down=%d source_failures=%d",
         searched,
         grabbed,
         no_acceptable,
         skipped_active,
         grab_errors,
         cooled_down,
+        source_failures,
+        extra={"source_failures": source_failures},
     )
     return AutograbCycleResult(
         searched=searched,

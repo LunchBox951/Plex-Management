@@ -247,6 +247,97 @@ async def test_complete_rejects_blank_library_roots(client: httpx.AsyncClient) -
     assert response.status_code == 422
 
 
+# --------------------------------------------------------------------------- #
+# Service URL shape validation at write time (issue #44)
+# --------------------------------------------------------------------------- #
+_BAD_SERVICE_URLS = [
+    "http://[::1",  # unterminated IPv6 literal -- urlsplit() itself raises ValueError
+    "localhost:9696",  # scheme-less
+    "ftp://x",  # wrong scheme
+    "http://",  # empty host
+    "not a url at all",
+    "http://x:bad",  # non-numeric port -> would otherwise raise httpx.InvalidURL
+    "http://x:0",  # port 0 parses cleanly but is never connectable
+    "http://x:99999",  # out-of-range port
+    "http://\nx",  # embedded control char (CR/LF log-forging shape)
+    "http://x/\x01",  # control char in path
+    "http://plex local",  # whitespace in the authority -- urlsplit still yields a host
+    "http://x/base path",  # whitespace anywhere (here in the path) is rejected too
+    "http://x?y=1",  # query -- adapters append API paths, so a query is swallowed
+    "http://x#frag",  # fragment -- likewise swallows the appended API path
+    "http://x?",  # BARE query delimiter -- urlsplit yields an EMPTY query, raw '?' remains
+    "http://x#",  # bare fragment delimiter -- likewise
+    "http://999.999.999.999",  # IPv4-shaped host with out-of-range octets
+    "http://01.02.03.04",  # IPv4-shaped host with leading-zero octets
+    "http://[v7.abc]",  # IPvFuture -- urlsplit tolerates it, httpx raises InvalidURL
+    "http://[fe80::1%eth0]",  # IPv6 zone id -- rejected by policy for a base URL
+    "http://[fe80::1%25eth0]",  # RFC 6874 percent-encoded zone id -- likewise
+    "http://\N{PILE OF POO}.local",  # IDNA-unencodable label -- httpx.URL() ctor raises
+    "http://xn--zzzzzz",  # bogus punycode A-label -- raises only from httpx .host decode
+    "http://xn--ls8h.local",  # pre-encoded emoji label -- same class, punycode form
+]
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+@pytest.mark.parametrize("bad_url", _BAD_SERVICE_URLS)
+async def test_complete_rejects_malformed_service_url(
+    client: httpx.AsyncClient, field: str, bad_url: str
+) -> None:
+    # Same shape predicate the setup wizard's "Test connection" probes use
+    # (url_validation.url_shape_error), now ALSO enforced on /setup/complete so a
+    # direct-API caller can't post a url the wizard UI would never let through.
+    body = {**_COMPLETE_BODY, field: bad_url}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["plex_url", "prowlarr_url", "qbittorrent_url"])
+async def test_complete_rejects_empty_string_service_url(
+    client: httpx.AsyncClient, field: str
+) -> None:
+    # Unlike SettingsUpdate's partial-update '' (explicit clear-to-unset,
+    # allowed), SetupCompleteRequest's urls are REQUIRED -- there is no "leave
+    # unchanged" concept on a one-shot install, so an empty string is REJECTED,
+    # closing the direct-API-caller bypass of the wizard's connection probes.
+    body = {**_COMPLETE_BODY, field: ""}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "good_url",
+    [
+        "http://prowlarr.local:9696/prowlarr",  # path-prefix (reverse-proxy) base URL
+        "http://prowlarr.local:9696/",  # bare trailing slash
+        "http://192.168.1.10:9696",  # valid dotted-quad IPv4 host
+        "http://[::1]:9696",  # IPv6 literal host (untouched by the IPv4 check)
+        # VALID IPv6, despite looking suspicious: 9999 is a legal hex group. This
+        # was Codex PR #53 wave 4's claimed-broken example -- empirically urlsplit,
+        # ipaddress AND httpx all accept it, so it must stay accepted.
+        "http://[9999::1]:9696",
+        # VALID punycode (café.local) -- guards the wave-5 httpx gate's .host
+        # touch against over-tightening: only UNdecodable xn-- labels reject.
+        "http://xn--caf-dma.local:9696",
+    ],
+)
+async def test_complete_accepts_legitimate_base_url_shapes(
+    client: httpx.AsyncClient, good_url: str
+) -> None:
+    # Tightening the shared predicate (query/fragment, IPv4-shaped hosts) must NOT
+    # reject a legitimate base URL: a path prefix (reverse-proxy mount), a bare
+    # trailing slash, a valid dotted quad, and an IPv6 literal all complete setup
+    # and persist verbatim.
+    body = {**_COMPLETE_BODY, "prowlarr_url": good_url}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
+    assert response.status_code == 200
+    issued_key = response.json()["app_api_key"]
+
+    settings = await client.get("/api/v1/settings", headers={"X-Api-Key": issued_key})
+    assert settings.json()["prowlarr_url"] == good_url
+
+
 def test_complete_contract_documents_already_initialized(app: FastAPI) -> None:
     responses = app.openapi()["paths"]["/api/v1/setup/complete"]["post"]["responses"]
 

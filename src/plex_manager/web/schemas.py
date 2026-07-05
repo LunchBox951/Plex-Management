@@ -11,7 +11,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from plex_manager.web.url_validation import url_shape_error
 
 __all__ = [
     "AcceptedRelease",
@@ -228,7 +230,14 @@ _LIBRARY_ROOT_FIELDS: tuple[str, ...] = (
 
 
 class SetupCompleteRequest(BaseModel):
-    """The validated credential set written on ``POST /setup/complete``."""
+    """The validated credential set written on ``POST /setup/complete``.
+
+    ``plex_url``/``prowlarr_url``/``qbittorrent_url`` are REQUIRED and
+    shape-checked (issue #44): unlike ``SettingsUpdate``'s partial-update
+    semantics, an empty string is REJECTED here (there is no "leave unchanged"
+    concept on a one-shot install), closing the direct-API-caller bypass of the
+    wizard's live "Test connection" probes -- see ``_validate_service_url_shape``.
+    """
 
     model_config = ConfigDict(
         frozen=True,
@@ -266,6 +275,25 @@ class SetupCompleteRequest(BaseModel):
     # behavior before this feature existed. Written ONLY when non-empty.
     anime_movie_root: str | None = None
     anime_tv_root: str | None = None
+
+    @field_validator("plex_url", "prowlarr_url", "qbittorrent_url")
+    @classmethod
+    def _validate_service_url_shape(cls, value: str) -> str:
+        """Shape-check a REQUIRED service url (issue #44).
+
+        These fields are required strings with no "leave unchanged" concept, so
+        (unlike ``SettingsUpdate``'s partial-update version of this validator) an
+        empty string is REJECTED here -- ``url_shape_error("")`` already returns
+        the same message (an empty string has no scheme/hostname), so no special
+        case is needed to close the empty-string bypass. Shares the exact
+        predicate the setup wizard's live "Test connection" probes use
+        (:func:`~plex_manager.web.url_validation.url_shape_error`), so a
+        direct-API caller cannot post a url the wizard UI would never let through.
+        """
+        message = url_shape_error(value)
+        if message is not None:
+            raise ValueError(message)
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -375,6 +403,27 @@ class SettingsUpdate(BaseModel):
 
     Only fields present in the request body are written; secret fields are stored
     encrypted at rest. ``None`` / absent fields are left unchanged.
+
+    ``plex_url``/``prowlarr_url``/``qbittorrent_url`` are shape-validated at
+    write time (issue #44), with three-way wire semantics matching
+    ``movies_root``'s established partial-update convention:
+
+    * ``None`` (absent from the body, or an explicit JSON ``null``) means
+      "leave this field unchanged" -- ``put_settings_endpoint`` skips a
+      ``None`` field entirely, so it is never shape-checked and can never fail
+      here.
+    * ``""`` (empty string) is an explicit clear-to-unset -- ALLOWED, not
+      rejected: the adapters already treat a falsy stored url as unconfigured
+      and answer an honest 409 ``service_not_configured`` (see
+      ``web.deps.get_prowlarr`` / ``get_qbittorrent`` / ``get_plex``), so
+      clearing to blank is a valid, intentional write.
+    * Any other non-empty string is shape-checked against
+      :func:`~plex_manager.web.url_validation.url_shape_error` -- the SAME
+      predicate the setup wizard's live "Test connection" probes use, so a
+      malformed url (bad scheme, missing host, malformed port, control
+      characters, ...) is rejected here as a 422 -- before it is ever
+      persisted -- rather than only surfacing later as an opaque downstream
+      failure.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -409,6 +458,24 @@ class SettingsUpdate(BaseModel):
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)
+
+    @field_validator("plex_url", "prowlarr_url", "qbittorrent_url")
+    @classmethod
+    def _validate_service_url_shape(cls, value: str | None) -> str | None:
+        """Shape-check a non-blank service url at write time (issue #44).
+
+        See the class docstring for the full ``None``/``""``/non-empty wire
+        semantics. ``not value`` catches BOTH ``None`` (leave unchanged) and
+        ``""`` (explicit clear-to-unset) in one branch -- both are passed
+        through untouched, never rejected; only a genuinely non-empty string is
+        shape-checked.
+        """
+        if not value:
+            return value
+        message = url_shape_error(value)
+        if message is not None:
+            raise ValueError(message)
+        return value
 
     @model_validator(mode="after")
     def _target_at_or_below_threshold(self) -> SettingsUpdate:

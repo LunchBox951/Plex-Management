@@ -2097,7 +2097,7 @@
         "type": "object"
       },
       "SettingsUpdate": {
-        "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.",
+        "description": "Partial upsert of service config (``PUT /settings``).\n\nOnly fields present in the request body are written; secret fields are stored\nencrypted at rest. ``None`` / absent fields are left unchanged.\n\n``plex_url``/``prowlarr_url``/``qbittorrent_url`` are shape-validated at\nwrite time (issue #44), with three-way wire semantics matching\n``movies_root``'s established partial-update convention:\n\n* ``None`` (absent from the body, or an explicit JSON ``null``) means\n  \"leave this field unchanged\" -- ``put_settings_endpoint`` skips a\n  ``None`` field entirely, so it is never shape-checked and can never fail\n  here.\n* ``\"\"`` (empty string) is an explicit clear-to-unset -- ALLOWED, not\n  rejected: the adapters already treat a falsy stored url as unconfigured\n  and answer an honest 409 ``service_not_configured`` (see\n  ``web.deps.get_prowlarr`` / ``get_qbittorrent`` / ``get_plex``), so\n  clearing to blank is a valid, intentional write.\n* Any other non-empty string is shape-checked against\n  :func:`~plex_manager.web.url_validation.url_shape_error` -- the SAME\n  predicate the setup wizard's live \"Test connection\" probes use, so a\n  malformed url (bad scheme, missing host, malformed port, control\n  characters, ...) is rejected here as a 422 -- before it is ever\n  persisted -- rather than only surfacing later as an opaque downstream\n  failure.",
         "properties": {
           "anime_movie_root": {
             "anyOf": [
@@ -2381,7 +2381,7 @@
             ]
           }
         ],
-        "description": "The validated credential set written on ``POST /setup/complete``.",
+        "description": "The validated credential set written on ``POST /setup/complete``.\n\n``plex_url``/``prowlarr_url``/``qbittorrent_url`` are REQUIRED and\nshape-checked (issue #44): unlike ``SettingsUpdate``'s partial-update\nsemantics, an empty string is REJECTED here (there is no \"leave unchanged\"\nconcept on a one-shot install), closing the direct-API-caller bypass of the\nwizard's live \"Test connection\" probes -- see ``_validate_service_url_shape``.",
         "properties": {
           "anime_movie_root": {
             "anyOf": [
