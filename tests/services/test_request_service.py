@@ -863,3 +863,234 @@ async def test_owner_rededuping_onto_own_tv_request_grows_seasons(
         )
     assert result.id == owned.id
     assert await _season_numbers(sessionmaker_, owned.id) == {1, 2}
+
+
+# --------------------------------------------------------------------------- #
+# Ownership on the OTHER dedup paths (issue #58, wave 2) — the same decision    #
+# guards the terminal find_in_library short-circuits, the IntegrityError race   #
+# recovery, and the available-race collapse.                                    #
+# --------------------------------------------------------------------------- #
+
+
+async def test_non_admin_movie_in_library_dedup_onto_foreign_row_rejects(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TERMINAL-row bypass: the prior row is 'available' (outside find_active),
+    so the movie in-library short-circuit resolves it via find_in_library — a
+    non-admin must get the same honest 409 there, not another user's hidden row."""
+    owner_id = await _make_user(sessionmaker_, username="lib-owner")
+    intruder_id = await _make_user(sessionmaker_, username="lib-intruder")
+    tmdb = FakeTmdb(movies={7101: MovieMetadata(tmdb_id=7101, title="Owned", year=2020)})
+    library = FakeLibrary(available={7101})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7101, media_type="movie", user_id=owner_id, library=library
+        )
+    assert owned.status == RequestStatus.available.value
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7101,
+                media_type="movie",
+                user_id=intruder_id,
+                actor_is_admin=False,
+                library=library,
+            )
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7101)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # nothing new persisted; the owner's row untouched
+    assert rows[0].user_id == owner_id
+
+
+async def test_admin_movie_in_library_dedup_onto_foreign_row_unchanged(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Admin control for the terminal path: an admin deduping onto another user's
+    in-library row keeps the shared behavior (the row is returned, never a 409)."""
+    owner_id = await _make_user(sessionmaker_, username="lib-owner-a")
+    admin_id = await _make_user(sessionmaker_, username="lib-admin", permissions=1)
+    tmdb = FakeTmdb(movies={7102: MovieMetadata(tmdb_id=7102, title="Owned", year=2020)})
+    library = FakeLibrary(available={7102})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7102, media_type="movie", user_id=owner_id, library=library
+        )
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7102,
+            media_type="movie",
+            user_id=admin_id,
+            actor_is_admin=True,
+            library=library,
+        )
+    assert result.id == owned.id
+
+
+async def test_non_admin_tv_all_present_dedup_onto_foreign_row_rejects_unmutated(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV terminal-row bypass: every requested season is already in Plex and the
+    existing available request belongs to ANOTHER user — rejected BEFORE
+    ensure_seasons, so the owner's tracked season set is never grown."""
+    owner_id = await _make_user(sessionmaker_, username="tv-owner")
+    intruder_id = await _make_user(sessionmaker_, username="tv-intruder")
+    tmdb = FakeTmdb(
+        shows={7103: TvMetadata(tmdb_id=7103, title="Done Show", year=2020, season_count=3)}
+    )
+    library = FakeLibrary(available_tv_seasons={7103: frozenset({1, 2})})
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7103,
+            media_type="tv",
+            seasons=[1],
+            user_id=owner_id,
+            library=library,
+        )
+    assert await _season_numbers(sessionmaker_, owned.id) == {1}
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7103,
+                media_type="tv",
+                seasons=[2],
+                user_id=intruder_id,
+                actor_is_admin=False,
+                library=library,
+            )
+
+    assert await _season_numbers(sessionmaker_, owned.id) == {1}  # NOT grown with season 2
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7103)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].user_id == owner_id
+
+
+async def test_non_admin_integrity_race_recovery_onto_foreign_row_rejects_unmutated(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The IntegrityError-recovery bypass: a non-admin who LOSES the insert race to
+    another user's active request gets the honest 409 — never the other user's
+    winning row, and never adds their season to it."""
+    owner_id = await _make_user(sessionmaker_, username="race-owner")
+    intruder_id = await _make_user(sessionmaker_, username="race-intruder")
+    tmdb = FakeTmdb(
+        shows={7104: TvMetadata(tmdb_id=7104, title="Race Show", year=2020, season_count=5)}
+    )
+
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7104, media_type="tv", seasons=[1], user_id=owner_id
+        )
+    assert await _season_numbers(sessionmaker_, owned.id) == {1}
+
+    # Simulate the race exactly like the movie recovery test above: the intruder's
+    # first find_active misses (the owner's row invisible to its transaction), the
+    # insert loses to the partial UNIQUE index, and the recovery lookup finds the
+    # owner's committed winner.
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7104,
+                media_type="tv",
+                seasons=[2],
+                user_id=intruder_id,
+                actor_is_admin=False,
+            )
+
+    assert await _season_numbers(sessionmaker_, owned.id) == {1}  # winner unmutated
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7104)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # the loser's insert was rolled back — no orphan row
+
+
+async def test_non_admin_available_race_collapse_keeps_their_own_row(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The available-race collapse must NOT delete a non-admin's just-created row
+    in favor of ANOTHER user's earlier available row: their request would vanish
+    behind the per-user list filter. Both rows survive, each visible to its owner
+    (mirrors the accepted remove-then-reacquire duplicate-available state)."""
+    owner_id = await _make_user(sessionmaker_, username="col-owner")
+    intruder_id = await _make_user(sessionmaker_, username="col-second")
+    tmdb = FakeTmdb(movies={7105: MovieMetadata(tmdb_id=7105, title="Both Own", year=2020)})
+    library = FakeLibrary(available={7105})
+
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=7105, media_type="movie", user_id=owner_id, library=library
+        )
+
+    # Force find_in_library to MISS (the race window): the second, non-admin user
+    # inserts their own available row instead of hitting the terminal-row guard.
+    async def racing_find_in_library(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        return None
+
+    monkeypatch.setattr(SqlRequestRepository, "find_in_library", racing_find_in_library)
+
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7105,
+            media_type="movie",
+            user_id=intruder_id,
+            actor_is_admin=False,
+            library=library,
+        )
+
+    assert second.id != first.id  # the collapse was SKIPPED — their own row returned
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7105)))
+            .scalars()
+            .all()
+        )
+    by_id = {row.id: row for row in rows}
+    assert set(by_id) == {first.id, second.id}  # BOTH rows survive
+    assert by_id[second.id].user_id == intruder_id
+    assert all(row.status is RequestStatus.available for row in rows)

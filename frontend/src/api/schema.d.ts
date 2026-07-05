@@ -721,20 +721,26 @@ export interface paths {
          *     returned key immediately for future access-key recovery, but normal browser
          *     auth continues to use the Plex session cookie.
          *
-         *     Compare-and-swap against concurrent rotations: two rotate requests carrying
-         *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
-         *     value) before either commits. Without a guard the write that commits second
-         *     would silently overwrite the first's freshly minted key, so the client that
-         *     fired the first request would be left displaying an already-dead key. The
-         *     re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
-         *     is a true atomic read-modify-write rather than check-then-act: the compare and
-         *     the write cannot interleave with another rotation, so the loser's re-read runs
-         *     only AFTER the winner has committed. Inside THIS request's own transaction we
-         *     re-read the stored key and require it to still equal the key the request
-         *     authenticated with; if it has already changed, the race happened and we answer
-         *     409 (``app_key_changed``) rather than clobber the winner. The check is skipped
-         *     under ``dev_auth_bypass`` (there is no authenticated key to compare against),
-         *     exactly like ``require_api_key`` itself.
+         *     Compare-and-swap against concurrent rotations: two rotate requests can both
+         *     pass authentication against the OLD stored key (each request loads it before
+         *     either commits) regardless of HOW they authenticated — two api-key callers,
+         *     two Plex-SESSION admins, or a mix. Without a guard the write that commits
+         *     second would silently overwrite the first's freshly minted key, so the client
+         *     that fired the first request would be left displaying an already-dead key.
+         *     The re-read/compare/mint/commit is run under the module-level ``_rotate_lock``
+         *     so it is a true atomic read-modify-write rather than check-then-act: the
+         *     compare and the write cannot interleave with another rotation, so the loser's
+         *     re-read runs only AFTER the winner has committed. Inside THIS request's own
+         *     transaction we re-read the stored key and require it to still equal the key
+         *     this request OBSERVED — the presented ``X-Api-Key`` header for api-key auth,
+         *     else (session auth, which carries no key header) the stored value as loaded
+         *     at auth time. If it has already changed, the race happened and we answer 409
+         *     (``app_key_changed``) rather than clobber the winner. The CAS is deliberately
+         *     UNCONDITIONAL on auth method: gating it to api-key callers would let two
+         *     session-authenticated admins re-create the exact dead-key race it exists to
+         *     prevent. The check is skipped only under ``dev_auth_bypass`` (there is no
+         *     authenticated key to compare against), exactly like ``require_api_key``
+         *     itself.
          */
         post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
         delete?: never;

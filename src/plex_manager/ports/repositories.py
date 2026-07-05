@@ -235,7 +235,7 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]]
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
         """Batch the DISPLAY request status per ``(tmdb_id, media_type)`` for tiles.
 
@@ -248,6 +248,12 @@ class RequestRepository(Protocol):
         ``MediaRequest.status`` carries the persisted per-season rollup
         (``partially_available``/...), so no per-season fan-out is needed. Keys with
         no request row are simply ABSENT from the mapping (never a fabricated status).
+
+        ``for_user_id`` scopes the lookup to ONE user's own request rows -- the
+        per-user visibility rule for shared (non-admin) sessions, mirroring the
+        requests list/get filtering exactly (``user_id == for_user_id``; ownerless
+        rows are excluded too, just as the list hides them). ``None`` (the
+        default) is unscoped: admins and API-key automation see every row.
         """
         raise NotImplementedError
 

@@ -162,33 +162,47 @@ async def rotate_app_key_endpoint(
     returned key immediately for future access-key recovery, but normal browser
     auth continues to use the Plex session cookie.
 
-    Compare-and-swap against concurrent rotations: two rotate requests carrying
-    the SAME old key can both clear ``require_api_key`` (each reads the old stored
-    value) before either commits. Without a guard the write that commits second
-    would silently overwrite the first's freshly minted key, so the client that
-    fired the first request would be left displaying an already-dead key. The
-    re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
-    is a true atomic read-modify-write rather than check-then-act: the compare and
-    the write cannot interleave with another rotation, so the loser's re-read runs
-    only AFTER the winner has committed. Inside THIS request's own transaction we
-    re-read the stored key and require it to still equal the key the request
-    authenticated with; if it has already changed, the race happened and we answer
-    409 (``app_key_changed``) rather than clobber the winner. The check is skipped
-    under ``dev_auth_bypass`` (there is no authenticated key to compare against),
-    exactly like ``require_api_key`` itself.
+    Compare-and-swap against concurrent rotations: two rotate requests can both
+    pass authentication against the OLD stored key (each request loads it before
+    either commits) regardless of HOW they authenticated — two api-key callers,
+    two Plex-SESSION admins, or a mix. Without a guard the write that commits
+    second would silently overwrite the first's freshly minted key, so the client
+    that fired the first request would be left displaying an already-dead key.
+    The re-read/compare/mint/commit is run under the module-level ``_rotate_lock``
+    so it is a true atomic read-modify-write rather than check-then-act: the
+    compare and the write cannot interleave with another rotation, so the loser's
+    re-read runs only AFTER the winner has committed. Inside THIS request's own
+    transaction we re-read the stored key and require it to still equal the key
+    this request OBSERVED — the presented ``X-Api-Key`` header for api-key auth,
+    else (session auth, which carries no key header) the stored value as loaded
+    at auth time. If it has already changed, the race happened and we answer 409
+    (``app_key_changed``) rather than clobber the winner. The CAS is deliberately
+    UNCONDITIONAL on auth method: gating it to api-key callers would let two
+    session-authenticated admins re-create the exact dead-key race it exists to
+    prevent. The check is skipped only under ``dev_auth_bypass`` (there is no
+    authenticated key to compare against), exactly like ``require_api_key``
+    itself.
     """
     system = await ensure_system_settings(session)
     async with _rotate_lock:
-        if not get_settings().dev_auth_bypass and auth.method is AuthMethod.api_key:
-            # ``require_api_key`` already loaded this row into the shared request
-            # session, so its cached instance still shows the auth-time value; force
-            # a fresh read here (in the same transaction as the write below, and
+        if not get_settings().dev_auth_bypass:
+            # The key this request observed BEFORE the fresh read below: api-key
+            # callers presented it in the header; session callers observed the value
+            # their request session loaded at auth time (``authenticate_request``
+            # pulled this row into the identity map, and ``ensure_system_settings``
+            # returned that same cached instance — a concurrent commit does not
+            # update it).
+            observed = (
+                request.headers.get(API_KEY_HEADER_NAME)
+                if auth.method is AuthMethod.api_key
+                else system.app_api_key
+            )
+            # Force a fresh read (in the same transaction as the write below, and
             # under _rotate_lock so no other rotation can commit between this read
             # and our own commit) so the CAS reflects any rotation that committed
             # while this request was in flight.
             await session.refresh(system)
-            presented = request.headers.get(API_KEY_HEADER_NAME)
-            if not api_key_matches(presented, system.app_api_key):
+            if not api_key_matches(observed, system.app_api_key):
                 raise HTTPException(
                     status_code=409,
                     detail="app_key_changed",

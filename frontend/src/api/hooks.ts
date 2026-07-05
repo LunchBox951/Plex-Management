@@ -377,9 +377,15 @@ export function useSearchPreview() {
 
 /* ------------------------------------------------------------------ queue -- */
 
-export function useQueue(options?: { poll?: boolean }) {
+/**
+ * The download queue. `enabled: false` keeps the query entirely idle — the
+ * TitleDetailModal passes the caller's admin bit here, since `GET /queue` is
+ * admin-only (`require_admin`) and a shared session would just collect 403s.
+ */
+export function useQueue(options?: { poll?: boolean; enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.queue,
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<QueueResponse> => unwrap(await client.GET('/api/v1/queue')),
     refetchInterval: options?.poll ? POLL_INTERVAL_MS : false,
   })

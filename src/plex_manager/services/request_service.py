@@ -231,12 +231,38 @@ async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
         return False
 
 
+def _owned_by_another_user(
+    record: RequestRecord, user_id: int | None, actor_is_admin: bool
+) -> bool:
+    """Whether returning/mutating ``record`` for this actor crosses user ownership.
+
+    True only for a NON-ADMIN authenticated user (``user_id`` set,
+    ``actor_is_admin`` False) hitting a row owned by a DIFFERENT user. Admins and
+    API-key automation (``user_id`` None) are never blocked — they can already see
+    every request — and an ownerless row is claimable, not foreign. The ONE shared
+    predicate for every dedup path in this module (the initial ``find_active``
+    dedup, the terminal ``find_in_library`` short-circuits, the ``IntegrityError``
+    race recovery, and the available-race collapse), so no path can drift into
+    silently returning or mutating another user's request. Full shared-ownership
+    modeling is tracked in issue #58.
+    """
+    return (
+        user_id is not None
+        and not actor_is_admin
+        and record.user_id is not None
+        and record.user_id != user_id
+    )
+
+
 async def _collapse_available_race(
     session: AsyncSession,
     repo: SqlRequestRepository,
     record: RequestRecord,
     tmdb_id: int,
     media_type: str,
+    *,
+    user_id: int | None = None,
+    actor_is_admin: bool = False,
 ) -> RequestRecord:
     """Collapse a concurrent in-library create race, returning the surviving record.
 
@@ -247,9 +273,21 @@ async def _collapse_available_race(
     earlier one exists, THIS row is the race loser -> delete it and return the winner,
     so the list/modal shows ONE row. Movie and TV share this (TV reaches ``available``
     via the season rollup, the movie via the in-library short-circuit).
+
+    Ownership (issue #58): when the earlier winner belongs to a DIFFERENT user and
+    the caller is a non-admin, the collapse is SKIPPED and the caller's own row is
+    kept — deleting it would hand back a record the caller's per-user list/get
+    immediately hide (their just-created request would silently vanish). A 409 is
+    wrong here too: unlike the pre-insert guards, the caller's row is already
+    committed, so rejecting after the fact would report failure for a create that
+    happened. Two terminal ``available`` rows for the same media is already an
+    accepted state (see the remove-then-reacquire flow); each stays visible to its
+    own requester.
     """
     winner = await repo.find_earliest_available(tmdb_id, media_type)
     if winner is not None and winner.id != record.id:
+        if _owned_by_another_user(winner, user_id, actor_is_admin):
+            return record
         await repo.delete(record.id)
         await session.commit()
         return winner
@@ -341,10 +379,15 @@ async def create_request_result(
 
     Raises :class:`RequestOwnedByAnotherUserError` (surfaced as 409) when a
     non-admin authenticated caller (``user_id`` set, ``actor_is_admin`` False)
-    dedups onto an existing active request owned by a DIFFERENT user -- rejected
-    before any claim/season mutation, so another user's request is never silently
-    grown or returned behind the caller's per-user filter. Admins and API-key
-    automation (``user_id`` None) keep the shared dedup behavior (issue #58).
+    dedups onto a request owned by a DIFFERENT user -- on EVERY dedup path: the
+    initial ``find_active`` dedup, both terminal ``find_in_library``
+    short-circuits (movie in-library and tv all-seasons-present), and the
+    ``IntegrityError`` race recovery. Each rejects before any claim/season
+    mutation, so another user's request is never silently grown or returned
+    behind the caller's per-user filter; the post-commit available-race collapse
+    instead KEEPS the caller's own row (see :func:`_collapse_available_race`).
+    Admins and API-key automation (``user_id`` None) keep the shared dedup
+    behavior (issue #58).
     """
     if media_type not in {"movie", "tv"}:
         raise MediaTypeDeferredError(media_type)
@@ -357,15 +400,10 @@ async def create_request_result(
         # the other user's request by adding this caller's seasons via
         # ensure_seasons below, and (b) return a record the caller's own per-user
         # list/get immediately hide. Reject honestly (409) BEFORE any claim/mutation.
-        # Admins and API-key automation (user_id is None) keep the shared dedup
-        # behavior — they can already see every request. Full shared-ownership
-        # modeling is tracked in issue #58.
-        if (
-            user_id is not None
-            and not actor_is_admin
-            and existing.user_id is not None
-            and existing.user_id != user_id
-        ):
+        # The SAME decision guards the terminal find_in_library short-circuits and
+        # the IntegrityError race recovery below — every path that can hand back a
+        # dedup winner (see _owned_by_another_user).
+        if _owned_by_another_user(existing, user_id, actor_is_admin):
             raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
         # The deduped active request may have no owner (e.g. it was created via the
         # API-key automation path, which carries no user identity). Adopt it for the
@@ -424,6 +462,11 @@ async def create_request_result(
         await repo.acquire_media_lock(tmdb_id, media_type)
         in_library = await repo.find_in_library(tmdb_id, media_type)
         if in_library is not None:
+            # Issue #58: same ownership decision as the find_active dedup above —
+            # a terminal in-library row owned by ANOTHER user must not be handed to
+            # a non-admin (their list/get hide it: a success that instantly vanishes).
+            if _owned_by_another_user(in_library, user_id, actor_is_admin):
+                raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
             return CreateRequestResult(record=in_library, created=False)
         initial_status = RequestStatus.available.value
 
@@ -441,6 +484,11 @@ async def create_request_result(
         if present.issuperset(season_numbers):
             in_library = await repo.find_in_library(tmdb_id, media_type)
             if in_library is not None:
+                # Issue #58: same ownership decision as the movie short-circuit —
+                # rejected BEFORE ensure_seasons, so another user's terminal request
+                # is never grown with this caller's seasons nor returned to them.
+                if _owned_by_another_user(in_library, user_id, actor_is_admin):
+                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
                 await season_request_service.ensure_seasons(
                     session,
                     library,
@@ -495,7 +543,15 @@ async def create_request_result(
                 # (outside the active-dedup index), so two racing creates can each
                 # leave an available row. Collapse to the oldest, same as the movie
                 # path below (which never runs for tv: its initial_status is pending).
-                winner = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
+                winner = await _collapse_available_race(
+                    session,
+                    repo,
+                    record,
+                    tmdb_id,
+                    media_type,
+                    user_id=user_id,
+                    actor_is_admin=actor_is_admin,
+                )
                 if winner.id != record.id:
                     # THIS row (the loser) was deleted, cascading ITS SeasonRequests.
                     # The two racers may have named DIFFERENT seasons, so ensure the
@@ -513,7 +569,7 @@ async def create_request_result(
                     winner = await repo.get(winner.id) or winner
                     created = False
                 record = winner
-    except IntegrityError:
+    except IntegrityError as integrity_exc:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
         # race: the partial UNIQUE index over active statuses rejected this insert.
         # Resolve to the existing active request instead of crashing (idempotent
@@ -522,6 +578,12 @@ async def create_request_result(
         winner = await repo.find_active(tmdb_id, media_type)
         if winner is None:  # pragma: no cover - the conflicting active row must exist
             raise
+        # Issue #58: same ownership decision as the find_active dedup — a non-admin
+        # who LOST the insert race to another user's request gets the honest 409,
+        # not the other user's row (and never mutates its season set below). Our own
+        # insert was already rolled back, so nothing is left behind.
+        if _owned_by_another_user(winner, user_id, actor_is_admin):
+            raise RequestOwnedByAnotherUserError(tmdb_id, media_type) from integrity_exc
         if media_type == "tv":
             season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
             await season_request_service.ensure_seasons(
@@ -542,7 +604,15 @@ async def create_request_result(
         # Plex, _already_in_library() reads False and this branch is skipped, so the
         # legitimate SECOND available row from the normal pending -> download ->
         # mark_available path is never reconciled away.
-        collapsed = await _collapse_available_race(session, repo, record, tmdb_id, media_type)
+        collapsed = await _collapse_available_race(
+            session,
+            repo,
+            record,
+            tmdb_id,
+            media_type,
+            user_id=user_id,
+            actor_is_admin=actor_is_admin,
+        )
         return CreateRequestResult(record=collapsed, created=collapsed.id == record.id)
     return CreateRequestResult(record=record, created=created)
 

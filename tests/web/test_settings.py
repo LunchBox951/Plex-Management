@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.models import AuthSession, User
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
     AuthContext,
@@ -27,6 +29,7 @@ from plex_manager.web.deps import (
     get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
+    hash_session_token,
     load_system_settings,
     require_api_key,
 )
@@ -613,6 +616,86 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
     assert stale.status_code == 409
     assert stale.json()["detail"] == "app_key_changed"
 
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == new_key
+
+
+async def _admin_session_cookies(
+    app: FastAPI, *, plex_id: int, tag: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Mint a live ADMIN (owner) browser session; returns (cookies, csrf headers)."""
+    token = f"admin-session-{tag}"
+    csrf = f"csrf-{tag}"
+    async with app.state.sessionmaker() as session:
+        user = User(plex_id=plex_id, username=f"owner-{tag}", permissions=1)
+        session.add(user)
+        await session.flush()
+        session.add(
+            AuthSession(
+                user_id=user.id,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    return {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
+
+
+async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two Plex-SESSION admins rotating concurrently: exactly one wins, one 409s.
+
+    Session auth never presents an ``X-Api-Key`` header, so the CAS compares the
+    stored key against the value each request's session LOADED at auth time. Both
+    requests are forced into the handler (each having observed the OLD key)
+    before either commits — the same rendezvous as the api-key barrier test
+    above. Were the CAS still gated to ``AuthMethod.api_key`` (the wave-2
+    finding), both would 200 and the second would silently clobber the first's
+    freshly minted key — the exact dead-key race the CAS exists to prevent.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies_a, headers_a = await _admin_session_cookies(app, plex_id=9101, tag="a")
+    cookies_b, headers_b = await _admin_session_cookies(app, plex_id=9102, tag="b")
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    both_in_handler = asyncio.Barrier(2)
+
+    async def rendezvous_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        await asyncio.wait_for(both_in_handler.wait(), timeout=5.0)
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", rendezvous_ensure)
+    # A CONTENDED asyncio.Lock binds to the event loop of the test that first
+    # contended it (the api-key barrier test above); this test runs in its own
+    # loop, so give it a fresh, loop-local lock — same serialization semantics.
+    monkeypatch.setattr(settings_router, "_rotate_lock", asyncio.Lock())
+
+    first, second = await asyncio.gather(
+        client.post("/api/v1/settings/app-key/rotate", cookies=cookies_a, headers=headers_a),
+        client.post("/api/v1/settings/app-key/rotate", cookies=cookies_b, headers=headers_b),
+    )
+
+    # Exactly one 200 (the winner) and one honest 409 (the loser) — never two 200s.
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    winner, loser = (first, second) if first.status_code == 200 else (second, first)
+    assert loser.json()["detail"] == "app_key_changed"
+
+    # The stored key is the winner's minted key — the loser did not clobber it
+    # with a second, unreturned key (which would strand the winner's client on a
+    # dead key).
+    new_key = winner.json()["app_api_key"]
+    assert new_key != _API_KEY
     async with sessionmaker_() as session:
         system = await load_system_settings(session)
         assert system is not None

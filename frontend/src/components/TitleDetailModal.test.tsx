@@ -22,10 +22,23 @@ import type {
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
 
+// The caller's auth context, read by the modal to gate admin-only verbs. A
+// hoisted mutable holder (not mockReturnValue) so the per-role tests can flip it
+// and the top-level beforeEach below restores the admin default for every other
+// (admin-flow) describe block — vi.clearAllMocks clears calls, not return values.
+const authState = vi.hoisted(() => {
+  const admin = {
+    data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+    isLoading: false,
+  }
+  return { admin, current: admin as typeof admin | { data: unknown; isLoading: boolean } }
+})
+
 // No network and no Radix portals: the hooks and the Dialog/toast shells are replaced
 // with controllable stand-ins so the tests exercise only the modal's grab-gating (G3)
 // and report-gating (G6) logic.
 vi.mock('../api/hooks', () => ({
+  useAuthMe: vi.fn(() => authState.current),
   useCreateRequest: vi.fn(),
   useSearchPreview: vi.fn(),
   useGrab: vi.fn(),
@@ -39,6 +52,10 @@ vi.mock('../api/hooks', () => ({
   useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
+
+beforeEach(() => {
+  authState.current = authState.admin
+})
 
 vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
 
@@ -806,5 +823,103 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     })
     render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — shared (non-admin) users get a request-only modal', () => {
+  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'available',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  function baseMocks() {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  }
+
+  function asSharedUser() {
+    authState.current = {
+      data: {
+        authenticated: true,
+        auth_method: 'plex_session',
+        is_admin: false,
+        user: { is_admin: false },
+      },
+      isLoading: false,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    baseMocks()
+  })
+
+  it('shows Request but hides Preview releases for a shared user (admin keeps both)', () => {
+    asSharedUser()
+    const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    // Preview drives the admin-only /search-preview: hidden, not a 403 machine.
+    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
+    unmount()
+
+    // Same render as an admin: both verbs are offered.
+    authState.current = authState.admin
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /preview releases/i })).toBeInTheDocument()
+  })
+
+  it('keeps the admin-only queue query disabled for a shared user', () => {
+    asSharedUser()
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    // GET /queue is require_admin: the query must be idle, not a 403 loop.
+    expect(useQueue).toHaveBeenCalledWith({ poll: true, enabled: false })
+  })
+
+  it('hides keep-forever, report and cancel from a shared user across states', () => {
+    asSharedUser()
+    // An available request (would offer keep-forever + report-issue to an admin).
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'available' })] },
+    })
+    const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument() // honest status stays
+    expect(screen.queryByText(/keep forever/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
+    unmount()
+
+    // A searching request (would offer Re-search + Cancel to an admin).
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'searching' })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/searching/i)).toBeInTheDocument() // honest status stays
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+
+  it('still offers "Request again" for a settled title to a shared user', () => {
+    // POST /requests is NOT admin-only: re-requesting an evicted/failed title is
+    // exactly the shared-user flow (the auto-grab worker does the rest).
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'evicted' })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /request again/i })).toBeInTheDocument()
   })
 })

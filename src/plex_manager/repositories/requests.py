@@ -221,7 +221,7 @@ class SqlRequestRepository:
         await self._session.execute(stmt)
 
     async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]]
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
         """Batch the DISPLAY status per ``(tmdb_id, media_type)`` — see the port docstring.
 
@@ -231,14 +231,18 @@ class SqlRequestRepository:
         backend is a config swap). Rows come back ``id``-ascending, so per key the
         first non-settled row is the lowest-id ACTIVE one (matching ``find_active``)
         and ``group[-1]`` is the newest fallback when every row is settled.
+
+        ``for_user_id`` (when set) restricts the scan to that user's own rows —
+        the shared-session visibility scope; see the port docstring.
         """
         key_set = set(keys)
         if not key_set:
             return {}
         tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
-        stmt = (
-            select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids)).order_by(MediaRequest.id)
-        )
+        stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
+        if for_user_id is not None:
+            stmt = stmt.where(MediaRequest.user_id == for_user_id)
+        stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         grouped: dict[tuple[int, str], list[MediaRequest]] = {}
         for row in rows:
