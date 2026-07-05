@@ -10,12 +10,24 @@ row is ever written.
 
 from __future__ import annotations
 
+from ipaddress import AddressValueError, IPv4Address
 from urllib.parse import urlsplit
 
-__all__ = ["INVALID_URL_MESSAGE", "QUERY_FRAGMENT_MESSAGE", "url_shape_error"]
+__all__ = [
+    "INVALID_IPV4_MESSAGE",
+    "INVALID_URL_MESSAGE",
+    "QUERY_FRAGMENT_MESSAGE",
+    "url_shape_error",
+]
 
 INVALID_URL_MESSAGE = "Enter a valid http(s) URL."
 QUERY_FRAGMENT_MESSAGE = "Base URL must not contain a query or fragment."
+INVALID_IPV4_MESSAGE = "Invalid IPv4 address in host."
+
+# A hostname made of ONLY digits and dots is IPv4-shaped: it can never be a real
+# DNS name (a resolvable TLD is never all-numeric), so it must parse as a proper
+# dotted quad. DNS names and IPv6 literals contain other characters and skip this.
+_IPV4_SHAPED_CHARS = frozenset("0123456789.")
 
 
 def url_shape_error(url: str) -> str | None:
@@ -56,12 +68,25 @@ def url_shape_error(url: str) -> str | None:
     covers the ``\\t``/``\\r``/``\\n``-class chars; the whitespace guard extends it
     to the plain space and other Unicode whitespace those miss.)
 
-    A non-empty query or fragment is likewise rejected: these are BASE service URLs
-    onto which the adapters append their own API paths, so a ``?...`` or ``#...``
-    would swallow the appended path into the query/fragment and send requests to
-    the wrong endpoint. A base URL may carry a (path-prefix) path -- e.g. a
-    reverse-proxy ``http://host:9696/prowlarr`` or a bare trailing slash -- but
-    never a query or fragment.
+    A raw ``?`` or ``#`` ANYWHERE in the value is likewise rejected: these are
+    BASE service URLs onto which the adapters append their own API paths, so a
+    query/fragment would swallow the appended path and send requests to the wrong
+    endpoint. The check is on the raw characters, not ``parts.query`` /
+    ``parts.fragment``, because a BARE trailing delimiter (``http://x?``,
+    ``http://x#``) splits to an EMPTY query/fragment yet the raw string -- which
+    is what the adapters use -- still carries it and breaks path-appending
+    identically. Both characters are reserved delimiters in every URL component
+    (a legitimate base URL could only carry them percent-encoded), so one honest
+    rule covers every case. A base URL may still carry a (path-prefix) path --
+    e.g. a reverse-proxy ``http://host:9696/prowlarr`` or a bare trailing slash.
+
+    An IPv4-SHAPED hostname (digits and dots only) must parse as a real dotted
+    quad: ``urlsplit`` happily returns ``999.999.999.999`` or ``01.02.03.04`` as
+    a hostname, but httpx's own URL parser rejects them at request time -- so the
+    value would persist and then fail at runtime instead of 422ing here.
+    ``ipaddress.IPv4Address`` correctly rejects out-of-range octets AND
+    leading-zero octets. DNS names and IPv6 literals contain non-``[0-9.]``
+    characters and are deliberately NOT validated beyond the existing checks.
     """
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in url):
         return INVALID_URL_MESSAGE
@@ -77,8 +102,17 @@ def url_shape_error(url: str) -> str | None:
     # Port 0 parses cleanly but is never connectable -- reject it up front too.
     if parts.scheme not in {"http", "https"} or not hostname or port == 0:
         return INVALID_URL_MESSAGE
-    # A base URL keeps its (optional path-prefix) path, but a query or fragment
-    # would be silently swallowed when an adapter appends its API path -- reject.
-    if parts.query or parts.fragment:
+    # A base URL keeps its (optional path-prefix) path, but a '?' or '#' anywhere
+    # would swallow the adapter-appended API path -- checked on the RAW value, not
+    # parts.query/parts.fragment, so a bare trailing delimiter ("http://x?",
+    # which splits to an EMPTY query) is rejected too.
+    if "?" in url or "#" in url:
         return QUERY_FRAGMENT_MESSAGE
+    # An IPv4-shaped host must be a real dotted quad -- urlsplit accepts
+    # "999.999.999.999" / "01.02.03.04" but httpx rejects them at request time.
+    if set(hostname) <= _IPV4_SHAPED_CHARS:
+        try:
+            IPv4Address(hostname)
+        except AddressValueError:
+            return INVALID_IPV4_MESSAGE
     return None

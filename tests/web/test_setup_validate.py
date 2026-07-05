@@ -312,7 +312,19 @@ async def test_validate_prowlarr_rejects_non_http_url(
     assert body["message"] == "Enter a valid http(s) URL."
 
 
-@pytest.mark.parametrize("bad_url", ["http://prowlarr.local?x=1", "http://prowlarr.local#frag"])
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://prowlarr.local?x=1",
+        "http://prowlarr.local#frag",
+        # BARE delimiters (Codex PR #53 P2, wave 3): urlsplit returns an EMPTY
+        # query/fragment for these, but the raw string -- which the adapters use as
+        # the base URL -- still carries the delimiter, breaking path-appending
+        # identically. The check is on the raw '?'/'#' characters.
+        "http://prowlarr.local?",
+        "http://prowlarr.local#",
+    ],
+)
 async def test_validate_prowlarr_rejects_query_or_fragment(
     client: httpx.AsyncClient, app: FastAPI, bad_url: str
 ) -> None:
@@ -333,6 +345,48 @@ async def test_validate_prowlarr_rejects_query_or_fragment(
     body = response.json()
     assert body["ok"] is False
     assert body["message"] == "Base URL must not contain a query or fragment."
+
+
+@pytest.mark.parametrize("bad_url", ["http://999.999.999.999", "http://01.02.03.04"])
+async def test_validate_prowlarr_rejects_invalid_ipv4_shaped_host(
+    client: httpx.AsyncClient, app: FastAPI, bad_url: str
+) -> None:
+    # An IPv4-SHAPED host (digits and dots only) must be a real dotted quad
+    # (Codex PR #53 P2, wave 3): urlsplit happily returns these as a hostname, but
+    # httpx's own URL parser rejects them at request time -- so without this check
+    # the value validates, persists, and then fails at runtime. ipaddress.
+    # IPv4Address rejects out-of-range AND leading-zero octets; DNS names and IPv6
+    # literals are not IPv4-shaped and are untouched.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for a rejected url")
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": bad_url, "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Invalid IPv4 address in host."
+
+
+async def test_validate_prowlarr_accepts_dotted_quad_ipv4_host(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # The IPv4-shaped-host check must not reject a VALID dotted quad -- the probe
+    # proceeds to the real outbound request.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/system/status"
+        return httpx.Response(200, json={"version": "1.0"})
+
+    await _use_transport(app, handler)
+    response = await client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://192.168.1.10:9696", "api_key": "pk"},
+        headers=_SETUP_HEADERS,
+    )
+    assert response.json()["ok"] is True
 
 
 async def test_validate_plex_ok_returns_movie_and_tv_libraries(

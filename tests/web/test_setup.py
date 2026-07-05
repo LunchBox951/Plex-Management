@@ -265,6 +265,10 @@ _BAD_SERVICE_URLS = [
     "http://x/base path",  # whitespace anywhere (here in the path) is rejected too
     "http://x?y=1",  # query -- adapters append API paths, so a query is swallowed
     "http://x#frag",  # fragment -- likewise swallows the appended API path
+    "http://x?",  # BARE query delimiter -- urlsplit yields an EMPTY query, raw '?' remains
+    "http://x#",  # bare fragment delimiter -- likewise
+    "http://999.999.999.999",  # IPv4-shaped host with out-of-range octets
+    "http://01.02.03.04",  # IPv4-shaped host with leading-zero octets
 ]
 
 
@@ -301,14 +305,17 @@ async def test_complete_rejects_empty_string_service_url(
     [
         "http://prowlarr.local:9696/prowlarr",  # path-prefix (reverse-proxy) base URL
         "http://prowlarr.local:9696/",  # bare trailing slash
+        "http://192.168.1.10:9696",  # valid dotted-quad IPv4 host
+        "http://[::1]:9696",  # IPv6 literal host (untouched by the IPv4 check)
     ],
 )
-async def test_complete_accepts_path_prefix_and_trailing_slash_service_url(
+async def test_complete_accepts_legitimate_base_url_shapes(
     client: httpx.AsyncClient, good_url: str
 ) -> None:
-    # Tightening the shared predicate against query/fragment must NOT reject a
-    # legitimate base URL with a path prefix (a reverse-proxy mount) or a bare
-    # trailing slash -- setup completes and the URL persists verbatim.
+    # Tightening the shared predicate (query/fragment, IPv4-shaped hosts) must NOT
+    # reject a legitimate base URL: a path prefix (reverse-proxy mount), a bare
+    # trailing slash, a valid dotted quad, and an IPv6 literal all complete setup
+    # and persist verbatim.
     body = {**_COMPLETE_BODY, "prowlarr_url": good_url}
     response = await client.post("/api/v1/setup/complete", json=body, headers=_SETUP_HEADERS)
     assert response.status_code == 200
