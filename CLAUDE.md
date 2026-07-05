@@ -12,8 +12,8 @@ into a single app. It is a ground-up rewrite of the `prototype/` service. Read
 has an ADR under [`docs/adr/`](docs/adr/).
 
 Status: v1 beta, feature-complete — the request → watchable → correct loop for
-movies, TV, and anime is built and tested, and a 7-day live beta run is in
-progress. v1.x feature work is still gated on explicit tasking.
+movies, TV, and anime is built and tested, and a 7-day live beta run is set to
+begin. v1.x feature work is still gated on explicit tasking.
 
 ## North stars (don't violate these)
 
