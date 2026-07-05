@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
@@ -470,3 +472,88 @@ async def test_preview_rejects_mismatched_tmdb_id(sessionmaker_: SessionMaker) -
     assert result.accepted == []
     assert result.no_acceptable_release is True
     assert [reason for _, reason in result.rejected] == [RejectionReason.WRONG_MEDIA]
+
+
+async def test_preview_logs_multi_season_pack_rejection_telemetry(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Beta-week telemetry (issue #24): a preview that rejects a release
+    MULTI_SEASON_PACK emits exactly ONE aggregated INFO -- never per-release spam
+    -- carrying the count, up to 3 sample titles, tmdb_id, media_type, and season
+    via ``extra=`` (CONTRIBUTING.md's logging convention). ``tmdb_id`` is a
+    correlation key so it need not (and does not) appear in the message text;
+    ``season``/``media_type``/the sample titles are not, so they DO -- otherwise
+    this data would never reach ``log_events`` (see the docstring on
+    ``_log_multi_season_pack_rejections``)."""
+    multi = candidate(
+        "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP",
+        info_hash="e" * 40,
+        seeders=900,
+    )
+    single_season_pack = candidate(
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="f" * 40, seeders=10
+    )
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.decision_service"):
+        async with sessionmaker_() as session:
+            result = await decision_service.preview(
+                FakeProwlarr([multi, single_season_pack]),
+                GuessitParser(),
+                default_profile(),
+                SqlBlocklistRepository(session),
+                tmdb_id=82856,
+                title="The Mandalorian",
+                media_type="tv",
+                year=2019,
+                season=2,
+            )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP"
+    ]
+    infos = [r for r in caplog.records if r.levelname == "INFO"]
+    assert len(infos) == 1, "expected exactly one aggregated INFO, never per-release spam"
+    record = infos[0]
+    # ``extra=`` sets each key as a plain LogRecord ATTRIBUTE (not a stdlib-known
+    # one), so ``getattr`` -- never direct attribute access -- matches this
+    # codebase's other structured-logging tests (e.g. test_request_service.py).
+    assert getattr(record, "tmdb_id", None) == 82856
+    assert getattr(record, "season", None) == 2
+    assert getattr(record, "media_type", None) == "tv"
+    assert getattr(record, "multi_season_pack_rejections", None) == 1
+    assert getattr(record, "sample_titles", None) == [
+        "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"
+    ]
+    # The count/media_type/season/sample titles are NOT correlation keys, so they
+    # must be readable straight off the persisted message text too (see the
+    # docstring); tmdb_id is a correlation key and is deliberately NOT repeated.
+    message = record.getMessage()
+    assert "82856" not in message
+    assert "media_type=tv" in message
+    assert "season=2" in message
+    assert "The.Mandalorian.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP" in message
+
+
+async def test_preview_emits_no_telemetry_when_no_multi_season_pack_rejections(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No-regression: a preview with zero MULTI_SEASON_PACK rejections (CAM/TS
+    rejects for a different reason entirely) must emit NOTHING from the new
+    telemetry -- honesty over silence cuts both ways; an aggregate log firing on
+    every preview would be noise, not signal."""
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.decision_service"):
+        async with sessionmaker_() as session:
+            result = await decision_service.preview(
+                FakeProwlarr(good_and_cam_candidates()),
+                GuessitParser(),
+                default_profile(),
+                SqlBlocklistRepository(session),
+                tmdb_id=603,
+                title="Some Movie",
+                media_type="movie",
+                year=2020,
+            )
+
+    assert result.no_acceptable_release is False
+    assert caplog.records == []
