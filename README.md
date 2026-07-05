@@ -9,12 +9,15 @@ single app — with two differences that define the project:
    CAM/TS/telecast junk is *rejected outright* instead of slipping into your
    library.
 
-> **Status:** alpha. The request, search, grab, reconcile, import, Plex scan,
-> Plex availability dedupe, disk-pressure eviction, log/status, settings, and web
-> UI workflows are built and tested. Plex OAuth and the bundled host updater are
-> still deferred.
+> **Status:** v1 beta, feature-complete. The full request → watchable → correct
+> loop is built and tested for movies, TV, and anime — search, grab, reconcile,
+> import, Plex scan, Plex availability dedupe, disk-pressure eviction,
+> operability (health/logs/retention/eviction), auto-grab, and in-app correction
+> surfaces. A 7-day live beta run is set to begin gathering real-world data ahead
+> of a v1 stable promotion. Plex OAuth and the bundled host updater are still
+> deferred.
 
-## What works now (alpha)
+## What works now (beta)
 
 - **First-run setup wizard** (`/api/v1/setup/*`): validate and store
   Plex/Prowlarr/qBittorrent/TMDB credentials — encrypted at rest, never logged.
