@@ -198,12 +198,13 @@ def _log_multi_season_pack_rejections(
     ``extra=``-only field never reaches ``log_events`` at all. So they ARE
     interpolated into the text, or this telemetry's whole reason for existing
     (answerable from ``log_events`` after the beta week) would silently not hold.
-    ``season`` can trace from an HTTP request body (``/api/v1/search-preview``
-    accepts an explicit descriptor, not just a stored ``request_id``), so it goes
-    through ``logsafe.safe_int``; the sample release titles are external Prowlarr
-    text, so through ``safe_text`` -- the same log-hygiene barrier (#35) used at
-    every other request/indexer-derived log site, since CodeQL's py/log-injection
-    taints ``extra=`` fields exactly like message args. Caller identity (auto-grab
+    ``season`` and ``media_type`` can trace from an HTTP request body
+    (``/api/v1/search-preview`` accepts an explicit descriptor, not just a stored
+    ``request_id``), so ``season`` goes through ``logsafe.safe_int`` and
+    ``media_type`` through ``safe_text``; the sample release titles are external
+    Prowlarr text, so through ``safe_text`` too -- the same log-hygiene barrier
+    (#35) used at every other request/indexer-derived log site, since CodeQL's
+    py/log-injection taints ``extra=`` fields exactly like message args. Caller identity (auto-grab
     vs. manual preview/correction) is deliberately omitted: ``preview`` has no
     cheap way to distinguish its callers without a signature change, and this is
     log-only telemetry.
@@ -218,13 +219,13 @@ def _log_multi_season_pack_rejections(
     _logger.info(
         "decision preview: %d multi-season-pack rejection(s) (media_type=%s season=%s); samples=%s",
         len(samples),
-        media_type,
+        safe_text(media_type),
         season if season is None else safe_int(season),
         samples[:_MULTI_SEASON_PACK_SAMPLE_TITLES],
         extra={
             "tmdb_id": safe_int(tmdb_id),
             "season": season if season is None else safe_int(season),
-            "media_type": media_type,
+            "media_type": safe_text(media_type),
             "multi_season_pack_rejections": len(samples),
             "sample_titles": samples[:_MULTI_SEASON_PACK_SAMPLE_TITLES],
         },
