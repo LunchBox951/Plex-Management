@@ -121,21 +121,23 @@ async def test_put_round_trips_and_redacts(client: httpx.AsyncClient, seed: Seed
 
 
 # --------------------------------------------------------------------------- #
-# Repointing Plex invalidates the cached server identity (post-init sign-in     #
-# trusts PLEX_MACHINE_ID_SETTING; a changed plex_url/plex_token must re-derive) #
+# Repointing Plex is VERIFIED before commit (post-init sign-in trusts           #
+# PLEX_MACHINE_ID_SETTING; a changed plex_url/plex_token must probe the NEW     #
+# server's /identity first, then cache the freshly DERIVED id)                  #
 # --------------------------------------------------------------------------- #
 async def _seed_plex_identity(
     sessionmaker_: SessionMaker,
     *,
     plex_url: str,
     machine_id: str,
-    plex_token: str = _SEED_PLEX_TOKEN,
+    plex_token: str | None = _SEED_PLEX_TOKEN,
 ) -> None:
-    """Store a plex_url + plex_token + cached machine id, as setup-complete would."""
+    """Store a plex_url (+ optional plex_token) + cached machine id, as setup would."""
     async with sessionmaker_() as session:
         store = SettingsStore(session)
         await store.set("plex_url", plex_url)
-        await store.set("plex_token", plex_token)
+        if plex_token is not None:
+            await store.set("plex_token", plex_token)
         await store.set(PLEX_MACHINE_ID_SETTING, machine_id)
         await session.commit()
 
@@ -145,43 +147,131 @@ async def _stored_machine_id(sessionmaker_: SessionMaker) -> str | None:
         return await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING)
 
 
-async def test_put_changed_plex_url_clears_cached_machine_id(
-    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+async def _use_transport(app: FastAPI, transport: httpx.MockTransport) -> None:
+    """Swap the app's shared HTTP client for one backed by ``transport``."""
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=transport)
+
+
+def _identity_transport(
+    machine_id: str, *, probes: list[httpx.Request] | None = None
+) -> httpx.MockTransport:
+    """Answer any ``/identity`` probe with ``machine_id``; record probes seen."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if probes is not None:
+            probes.append(request)
+        if request.url.path == "/identity":
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": machine_id}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+def _no_probe_transport() -> httpx.MockTransport:
+    """Fail the test loudly if PUT /settings issues ANY live request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"PUT /settings must not probe here: {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+def _unreachable_transport() -> httpx.MockTransport:
+    """Simulate a syntactically-valid but unreachable/typo'd Plex url."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    return httpx.MockTransport(handler)
+
+
+async def test_put_changed_plex_url_stores_the_freshly_derived_machine_id(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
-    """Repointing plex_url drops the cached machine id so the next sign-in
-    re-derives it from /identity instead of admitting the OLD server's users."""
+    """Repointing plex_url probes the NEW server's /identity BEFORE committing and
+    caches the DERIVED id (better than the earlier clear-and-reprobe-per-sign-in:
+    the id was just derived, so sign-in keeps its no-re-probe fast path). The FE
+    round-trips the token as the '***' mask, so the probe must resolve the
+    EFFECTIVE token — the STORED real one — never the mask literal."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    probes: list[httpx.Request] = []
+    await _use_transport(app, _identity_transport("NEW-MID", probes=probes))
 
     put = await client.put(
-        "/api/v1/settings", json={"plex_url": "http://new:32400"}, headers={"X-Api-Key": _API_KEY}
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
     )
+
     assert put.status_code == 200
-    assert await _stored_machine_id(sessionmaker_) is None
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # derived, not cleared
+    # The probe hit the SUBMITTED url with the STORED real token, not the mask.
+    assert [str(p.url) for p in probes] == ["http://new:32400/identity"]
+    assert probes[0].headers.get("X-Plex-Token") == _SEED_PLEX_TOKEN
 
 
-async def test_put_changed_plex_token_clears_cached_machine_id(
-    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+async def test_put_changed_plex_token_probes_with_the_new_token(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
-    """A real (non-masked) plex_token change also invalidates the cached identity."""
+    """A real (non-masked) plex_token change is a repoint too: the stored url is
+    probed with the REPLACEMENT token and the derived id replaces the cache."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    probes: list[httpx.Request] = []
+    await _use_transport(app, _identity_transport("NEW-MID", probes=probes))
 
     put = await client.put(
         "/api/v1/settings", json={"plex_token": "new-token"}, headers={"X-Api-Key": _API_KEY}
     )
+
     assert put.status_code == 200
-    assert await _stored_machine_id(sessionmaker_) is None
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert [str(p.url) for p in probes] == ["http://old:32400/identity"]
+    assert probes[0].headers.get("X-Plex-Token") == "new-token"  # the effective NEW token
+
+
+async def test_put_unreachable_new_plex_url_is_502_and_commits_nothing(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """THE lockout guard: an admin typos plex_url (syntactically valid, but
+    unreachable / the wrong box). The PUT must fail with the same honest 502
+    envelope setup uses and commit NOTHING — old url intact, cached machine id
+    intact, every session intact. Committing + revoking here would leave a
+    keyless install with no working sign-in AND nobody signed in (DB surgery,
+    the never-locked-out violation)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9205, tag="typo")
+    await _use_transport(app, _unreachable_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://typo-wrong-host:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 502
+    assert put.json()["detail"] == "server_unreachable_from_backend"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    # The caller's session still works — they can immediately fix the typo.
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
 
 
 async def test_put_masked_and_unchanged_plex_values_keep_cached_machine_id(
-    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     """A round-tripped masked secret ('***') and a same-value plex_url are NOT
-    changes: neither may needlessly drop a still-valid cached machine id (which
-    would force a pointless /identity re-probe on the next sign-in)."""
+    changes: no /identity probe fires (the transport fails loudly on ANY request)
+    and the still-valid cached machine id is kept."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    await _use_transport(app, _no_probe_transport())
 
     # The FE round-trips the whole object: unchanged plex_url + masked plex_token.
     put = await client.put(
@@ -191,6 +281,35 @@ async def test_put_masked_and_unchanged_plex_values_keep_cached_machine_id(
     )
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # kept, not dropped
+
+
+async def test_put_url_change_with_no_stored_token_skips_probe_and_keeps_sessions(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A HALF-configured identity (url changes, but no token exists anywhere)
+    cannot be verified: the write proceeds without a probe, the STALE cached id
+    is dropped (nothing may keep anchoring sign-in to the old server), and
+    sessions are NOT revoked — revocation rides only a VERIFIED repoint (an
+    incomplete identity can't mint sign-ins, so revoking would be the lockout
+    trap again)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(
+        sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID", plex_token=None
+    )
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9206, tag="half")
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None  # stale anchor dropped
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
 
 
 async def _active_session_count(sessionmaker_: SessionMaker) -> int:
@@ -205,17 +324,19 @@ async def _active_session_count(sessionmaker_: SessionMaker) -> int:
 async def test_put_plex_repoint_revokes_every_active_session_including_the_callers(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
-    """Repointing Plex is an auth-domain change (ADR-0016): clearing the cached
+    """A VERIFIED repoint is an auth-domain change (ADR-0016): swapping the cached
     machine id only fixes FUTURE sign-ins, so every already-minted session — whose
     persisted ``User.permissions`` still encodes the OLD server's authority — must
     be revoked in the same transaction. That includes the admin performing the
     repoint (deliberate, honest self-lockout): their PUT still completes cleanly
-    (auth ran at dependency time), and their very NEXT request re-authenticates."""
+    (auth ran at dependency time), and their very NEXT request re-authenticates
+    against a server the probe just PROVED is answering."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9201, tag="repoint-adm")
     other_cookies, _ = await _admin_session_cookies(app, plex_id=9202, tag="repoint-other")
     assert await _active_session_count(sessionmaker_) == 2
+    await _use_transport(app, _identity_transport("NEW-MID"))
 
     put = await client.put(
         "/api/v1/settings",
@@ -226,6 +347,7 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
 
     # The write itself completes for the now-revoked caller — never a mid-request 401.
     assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the verified anchor
     assert await _active_session_count(sessionmaker_) == 0  # everyone, caller included
 
     # Both old-server sessions must re-sign-in against the NEW server.
@@ -241,10 +363,12 @@ async def test_put_non_plex_fields_keep_sessions_active(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     """A PUT that touches no Plex identity field is NOT a repoint: nobody is
-    signed out over a library-root or Prowlarr edit."""
+    signed out — and no live /identity probe fires — over a library-root or
+    Prowlarr edit (the transport fails loudly on ANY request)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     cookies, csrf = await _admin_session_cookies(app, plex_id=9203, tag="non-plex")
+    await _use_transport(app, _no_probe_transport())
 
     put = await client.put(
         "/api/v1/settings",
@@ -262,11 +386,12 @@ async def test_put_masked_and_unchanged_plex_values_keep_sessions_active(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     """The masked-secret round-trip ('***') and a same-value plex_url are NOT
-    repoints (the same non-changes that keep the cached machine id): the FE
-    saving an unrelated field must never sign the whole install out."""
+    repoints (the same non-changes that keep the cached machine id): no probe
+    fires and the FE saving an unrelated field never signs the install out."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     cookies, csrf = await _admin_session_cookies(app, plex_id=9204, tag="masked")
+    await _use_transport(app, _no_probe_transport())
 
     put = await client.put(
         "/api/v1/settings",

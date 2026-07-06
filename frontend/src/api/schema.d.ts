@@ -653,35 +653,53 @@ export interface paths {
          *     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
          *     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
          *
-         *     Repointing Plex invalidates the cached server identity: the
-         *     ``plex_machine_identifier`` snapshot cached at setup
-         *     (:data:`PLEX_MACHINE_ID_SETTING`) is the id post-init sign-in trusts to admit
-         *     users. If an admin changes ``plex_url`` or ``plex_token`` to aim at a
-         *     DIFFERENT server, that cached id would keep admitting the OLD server's users
-         *     and rejecting the new owner. So when the EFFECTIVE value of either actually
-         *     CHANGES here, the cached id is cleared in this SAME transaction and every
-         *     subsequent sign-in re-derives it live from ``/identity`` (nothing post-init
-         *     re-caches it — a per-sign-in probe of the operator's own server is the
-         *     deliberately-simple price of a rare repoint). A masked-secret round-trip
-         *     (``"***"``, skipped below) and a same-value re-PUT are NOT changes, so neither
-         *     needlessly drops a still-valid id.
+         *     Repointing Plex is VERIFIED before it is committed. The
+         *     ``plex_machine_identifier`` snapshot (:data:`PLEX_MACHINE_ID_SETTING`) is the
+         *     id post-init sign-in trusts to admit users, so when this PUT actually CHANGES
+         *     the effective ``plex_url``/``plex_token`` the REPLACEMENT server's
+         *     ``/identity`` is probed live FIRST (:func:`_verify_plex_repoint` — the same
+         *     code path ``/setup/complete`` and ``/setup/validate/plex`` use, resolving a
+         *     masked/omitted token to the stored real one). Only a server that answers
+         *     with a machine id gets committed: the settings are written, the freshly
+         *     DERIVED id replaces the cached one (better than clearing it — it was just
+         *     derived, so sign-in never needs a per-request re-probe), and every active
+         *     browser session is revoked. A probe failure is the same honest 502 envelope
+         *     as setup's, with NOTHING committed and every session intact — a typo'd
+         *     (syntactically valid but unreachable/wrong) url must not both break sign-in
+         *     AND sign everyone out, which would leave a keyless install recoverable only
+         *     by DB surgery (the exact never-locked-out violation ADR-0005 forbids).
          *
-         *     Repointing also revokes EVERY active browser session, in the SAME transaction
-         *     that clears the cached id. Clearing the id alone only changes how FUTURE
-         *     sign-ins resolve server access; an already-minted :class:`AuthSession` keeps
-         *     authorizing against its persisted ``User.permissions`` for up to 30 days, so
-         *     the OLD server's users (and admins) would silently survive the repoint —
-         *     exactly the stale-authority leak the id invalidation exists to close. A
-         *     repoint is an auth-domain change (ADR-0016 derives every session's authority
-         *     from access to THE configured server), so everyone — including the admin
-         *     performing the repoint — must re-sign-in and be re-evaluated against the NEW
-         *     server. The self-lockout is deliberate and honest, not collateral damage:
-         *     this request already passed auth at dependency time, so the response below
-         *     completes normally for the now-revoked session; the admin's very next request
-         *     re-authenticates (they still own a Plex account — one sign-in, no data loss).
+         *     Ownership is deliberately NOT asserted here, unlike ``/setup/complete``: a
+         *     PUT caller may be an ``X-Api-Key`` admin with no Plex account, so there is
+         *     no resource list to assert against — reachability + identity is the right
+         *     bar for a config write. Ownership continues to gate who can SIGN IN (and
+         *     who is admin), which the freshly derived machine id now anchors to the NEW
+         *     server (ADR-0016).
+         *
+         *     Why sessions are revoked on a verified repoint: clearing/replacing the id
+         *     alone only changes how FUTURE sign-ins resolve server access; an
+         *     already-minted :class:`AuthSession` keeps authorizing against its persisted
+         *     ``User.permissions`` for up to 30 days, so the OLD server's users (and
+         *     admins) would silently survive the repoint. A repoint is an auth-domain
+         *     change (ADR-0016 derives every session's authority from access to THE
+         *     configured server), so everyone — including the admin performing the
+         *     repoint — must re-sign-in and be re-evaluated against the NEW server. The
+         *     self-lockout is deliberate and honest, not collateral damage: this request
+         *     already passed auth at dependency time, so the response completes normally
+         *     for the now-revoked session, and the admin's very next request
+         *     re-authenticates against a server this PUT just PROVED is answering.
          *     Revocation stamps ``revoked_at`` on rows where it is NULL (the model's
-         *     auditable-revoke convention) rather than deleting; API-key auth is untouched,
-         *     so the ``X-Api-Key`` recovery path still works throughout.
+         *     auditable-revoke convention) rather than deleting; API-key auth is
+         *     untouched, so the ``X-Api-Key`` recovery path still works throughout.
+         *
+         *     An UNVERIFIABLE identity change — the effective pair is incomplete (a
+         *     half-configured install, or an explicit ``""`` clear) — cannot be probed:
+         *     the write proceeds, the STALE cached id is dropped (nothing may keep
+         *     anchoring sign-in to the old server), but sessions are NOT revoked. An
+         *     incomplete identity cannot mint new sign-ins anyway (an honest
+         *     ``service_not_configured``), and revoking on a half-configured install is
+         *     the same lockout trap the probe exists to prevent; the PUT that completes
+         *     the pair is a verified repoint and revokes then.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
@@ -3067,6 +3085,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The replacement Plex server did not answer the /identity probe */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

@@ -18,12 +18,14 @@ from __future__ import annotations
 import asyncio
 import secrets
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.adapters.plex.oauth import PlexTvClient
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession
@@ -40,6 +42,7 @@ from plex_manager.web.deps import (
     ensure_system_settings,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
+    get_http_client,
     get_library,
     load_system_settings,
     require_admin,
@@ -48,6 +51,7 @@ from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
     AppApiKeyResponse,
     AppApiKeyStatusResponse,
+    ErrorEnvelope,
     PlexLibraryOption,
     SettingsResponse,
     SettingsUpdate,
@@ -67,6 +71,21 @@ router = APIRouter(
 # rotate mint with this length, so a key is indistinguishable in shape/strength
 # regardless of when it was issued.
 _API_KEY_BYTES = 32
+
+# Mirrors ``web.routers.auth._CLIENT_ID_SETTING`` / ``web.routers.setup`` — the
+# plex.tv device identifier the sign-in flow persists. Read (never re-created)
+# here so the repoint verification probe uses the SAME device identity as every
+# other plex.tv/Plex-server call; the fallback only matters on a DB that never
+# saw a sign-in.
+_CLIENT_ID_SETTING = "plex_oauth_client_identifier"
+_FALLBACK_CLIENT_IDENTIFIER = "plex-manager"
+
+_PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
+    502: {
+        "model": ErrorEnvelope,
+        "description": "The replacement Plex server did not answer the /identity probe",
+    },
+}
 
 # Serialises app-key rotation so the compare-and-swap in ``rotate_app_key_endpoint``
 # is a genuine atomic read-modify-write, not check-then-act. Two rotations racing
@@ -320,10 +339,72 @@ async def revoke_app_key_endpoint(
         await session.commit()
 
 
-@router.put("")
+async def _verify_plex_repoint(
+    body: SettingsUpdate, store: SettingsStore, client: httpx.AsyncClient
+) -> tuple[bool, str | None]:
+    """Detect a Plex repoint and, when verifiable, derive the NEW server's identity.
+
+    Returns ``(identity_changed, derived_machine_id)``:
+
+    * ``(False, None)`` — this PUT does not change the effective ``plex_url`` /
+      ``plex_token`` pair (absent/``null`` fields, the masked-secret ``"***"``
+      round-trip, and a same-value re-PUT are all NON-changes). No probe is ever
+      issued — an ordinary settings save must not pay a live Plex round-trip.
+    * ``(True, machine_id)`` — the identity changes and the EFFECTIVE (post-PUT)
+      url+token pair is complete: the REPLACEMENT server's ``/identity`` was
+      probed live and answered. The effective value of each half is this PUT's
+      submitted value when it carries one, else the currently-stored value — so
+      a masked/omitted token still probes with the STORED real token when only
+      ``plex_url`` changed.
+    * ``(True, None)`` — the identity changes but the effective pair is
+      INCOMPLETE (a half-configured install, or an explicit clear-to-``""``).
+      There is nothing to probe; the caller keeps the settings write but treats
+      the repoint as UNVERIFIED (stale-id drop only, no session revocation —
+      see :func:`put_settings_endpoint`).
+
+    A probe failure raises the adapter's ``PlexVerifyError`` — rendered as the
+    SAME honest 502 envelope (``server_unreachable_from_backend`` /
+    ``server_identity_failed``) ``/setup/complete`` and ``/setup/validate/plex``
+    use — BEFORE anything is written, so a typo'd-but-parseable url can never
+    commit a broken identity (let alone revoke the sessions that could fix it).
+    """
+    submitted_url = (
+        body.plex_url if "plex_url" in body.model_fields_set and body.plex_url is not None else None
+    )
+    submitted_token = (
+        body.plex_token
+        if "plex_token" in body.model_fields_set
+        and body.plex_token is not None
+        and body.plex_token != SECRET_MASK
+        else None
+    )
+    if submitted_url is None and submitted_token is None:
+        return False, None
+    stored_url = await store.get("plex_url")
+    stored_token = await store.get("plex_token")
+    identity_changed = (submitted_url is not None and submitted_url != stored_url) or (
+        submitted_token is not None and submitted_token != stored_token
+    )
+    if not identity_changed:
+        return False, None
+    # EFFECTIVE post-PUT halves: the submitted value when this PUT carries one
+    # (including an explicit ``""`` clear), else what is currently stored.
+    effective_url = submitted_url if submitted_url is not None else stored_url
+    effective_token = submitted_token if submitted_token is not None else stored_token
+    if not effective_url or not effective_token:
+        return True, None
+    plex_tv = PlexTvClient(
+        client,
+        client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
+    )
+    return True, await plex_tv.fetch_server_identity(effective_url, effective_token)
+
+
+@router.put("", responses=_PUT_SETTINGS_RESPONSES)
 async def put_settings_endpoint(
     body: SettingsUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ) -> SettingsResponse:
     """Upsert the provided config and return the redacted result.
 
@@ -342,62 +423,82 @@ async def put_settings_endpoint(
     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
 
-    Repointing Plex invalidates the cached server identity: the
-    ``plex_machine_identifier`` snapshot cached at setup
-    (:data:`PLEX_MACHINE_ID_SETTING`) is the id post-init sign-in trusts to admit
-    users. If an admin changes ``plex_url`` or ``plex_token`` to aim at a
-    DIFFERENT server, that cached id would keep admitting the OLD server's users
-    and rejecting the new owner. So when the EFFECTIVE value of either actually
-    CHANGES here, the cached id is cleared in this SAME transaction and every
-    subsequent sign-in re-derives it live from ``/identity`` (nothing post-init
-    re-caches it — a per-sign-in probe of the operator's own server is the
-    deliberately-simple price of a rare repoint). A masked-secret round-trip
-    (``"***"``, skipped below) and a same-value re-PUT are NOT changes, so neither
-    needlessly drops a still-valid id.
+    Repointing Plex is VERIFIED before it is committed. The
+    ``plex_machine_identifier`` snapshot (:data:`PLEX_MACHINE_ID_SETTING`) is the
+    id post-init sign-in trusts to admit users, so when this PUT actually CHANGES
+    the effective ``plex_url``/``plex_token`` the REPLACEMENT server's
+    ``/identity`` is probed live FIRST (:func:`_verify_plex_repoint` — the same
+    code path ``/setup/complete`` and ``/setup/validate/plex`` use, resolving a
+    masked/omitted token to the stored real one). Only a server that answers
+    with a machine id gets committed: the settings are written, the freshly
+    DERIVED id replaces the cached one (better than clearing it — it was just
+    derived, so sign-in never needs a per-request re-probe), and every active
+    browser session is revoked. A probe failure is the same honest 502 envelope
+    as setup's, with NOTHING committed and every session intact — a typo'd
+    (syntactically valid but unreachable/wrong) url must not both break sign-in
+    AND sign everyone out, which would leave a keyless install recoverable only
+    by DB surgery (the exact never-locked-out violation ADR-0005 forbids).
 
-    Repointing also revokes EVERY active browser session, in the SAME transaction
-    that clears the cached id. Clearing the id alone only changes how FUTURE
-    sign-ins resolve server access; an already-minted :class:`AuthSession` keeps
-    authorizing against its persisted ``User.permissions`` for up to 30 days, so
-    the OLD server's users (and admins) would silently survive the repoint —
-    exactly the stale-authority leak the id invalidation exists to close. A
-    repoint is an auth-domain change (ADR-0016 derives every session's authority
-    from access to THE configured server), so everyone — including the admin
-    performing the repoint — must re-sign-in and be re-evaluated against the NEW
-    server. The self-lockout is deliberate and honest, not collateral damage:
-    this request already passed auth at dependency time, so the response below
-    completes normally for the now-revoked session; the admin's very next request
-    re-authenticates (they still own a Plex account — one sign-in, no data loss).
+    Ownership is deliberately NOT asserted here, unlike ``/setup/complete``: a
+    PUT caller may be an ``X-Api-Key`` admin with no Plex account, so there is
+    no resource list to assert against — reachability + identity is the right
+    bar for a config write. Ownership continues to gate who can SIGN IN (and
+    who is admin), which the freshly derived machine id now anchors to the NEW
+    server (ADR-0016).
+
+    Why sessions are revoked on a verified repoint: clearing/replacing the id
+    alone only changes how FUTURE sign-ins resolve server access; an
+    already-minted :class:`AuthSession` keeps authorizing against its persisted
+    ``User.permissions`` for up to 30 days, so the OLD server's users (and
+    admins) would silently survive the repoint. A repoint is an auth-domain
+    change (ADR-0016 derives every session's authority from access to THE
+    configured server), so everyone — including the admin performing the
+    repoint — must re-sign-in and be re-evaluated against the NEW server. The
+    self-lockout is deliberate and honest, not collateral damage: this request
+    already passed auth at dependency time, so the response completes normally
+    for the now-revoked session, and the admin's very next request
+    re-authenticates against a server this PUT just PROVED is answering.
     Revocation stamps ``revoked_at`` on rows where it is NULL (the model's
-    auditable-revoke convention) rather than deleting; API-key auth is untouched,
-    so the ``X-Api-Key`` recovery path still works throughout.
+    auditable-revoke convention) rather than deleting; API-key auth is
+    untouched, so the ``X-Api-Key`` recovery path still works throughout.
+
+    An UNVERIFIABLE identity change — the effective pair is incomplete (a
+    half-configured install, or an explicit ``""`` clear) — cannot be probed:
+    the write proceeds, the STALE cached id is dropped (nothing may keep
+    anchoring sign-in to the old server), but sessions are NOT revoked. An
+    incomplete identity cannot mint new sign-ins anyway (an honest
+    ``service_not_configured``), and revoking on a half-configured install is
+    the same lockout trap the probe exists to prevent; the PUT that completes
+    the pair is a verified repoint and revokes then.
     """
     await _validate_disk_pressure_pair(body, session)
 
     store = SettingsStore(session)
-    plex_identity_changed = False
+    # Probe BEFORE any write: a failed verification must leave nothing behind.
+    plex_identity_changed, machine_identifier = await _verify_plex_repoint(body, store, client)
+
     for field in body.model_fields_set:
         value = getattr(body, field)
         if value is None:
             continue
         if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
             continue
-        new_value = _to_stored_string(value)
-        if field in ("plex_url", "plex_token") and new_value != await store.get(field):
-            # Read the CURRENT stored value BEFORE overwriting it: only a genuine
-            # change (not a same-value re-PUT) invalidates the cached machine id.
-            plex_identity_changed = True
-        await store.set(field, new_value)
+        await store.set(field, _to_stored_string(value))
     if plex_identity_changed:
-        await store.delete(PLEX_MACHINE_ID_SETTING)
-        # Same transaction as the id invalidation: revoke every ACTIVE session so
-        # nobody's old-server authority outlives the repoint (see the docstring —
-        # this includes the caller's own session, deliberately).
-        await session.execute(
-            update(AuthSession)
-            .where(AuthSession.revoked_at.is_(None))
-            .values(revoked_at=datetime.now(UTC))
-        )
+        if machine_identifier is None:
+            # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
+            await store.delete(PLEX_MACHINE_ID_SETTING)
+        else:
+            # Verified repoint, all in this SAME transaction: cache the id just
+            # derived from the NEW server and revoke every ACTIVE session so
+            # nobody's old-server authority outlives the repoint (the caller's
+            # own session included, deliberately — see the docstring).
+            await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
+            await session.execute(
+                update(AuthSession)
+                .where(AuthSession.revoked_at.is_(None))
+                .values(revoked_at=datetime.now(UTC))
+            )
     await session.commit()
     return await _redacted(store)
 
