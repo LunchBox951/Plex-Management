@@ -58,6 +58,18 @@ class EventBus:
         handlers.append(cast("Handler[Event]", handler))
 
     def publish(self, event: Event) -> None:
-        """Invoke every handler registered for ``type(event)`` in order."""
-        for handler in self._subscribers.get(type(event), []):
+        """Invoke every handler registered for ``type(event)`` in order.
+
+        Iterates a SNAPSHOT (``list(...)``) of the subscriber list taken before
+        dispatch begins (issue #110), not the live list held in
+        ``self._subscribers``. A handler that itself calls :meth:`subscribe` for
+        the same event type while dispatch is in flight (registering a new
+        handler, e.g. from a test or a handler that self-registers a follow-up)
+        must never affect the CURRENT publish — it must be invoked starting only
+        from the NEXT publish. Without the snapshot, mutating the list mid-
+        iteration could skip an already-scheduled handler or double-invoke one,
+        depending on exactly where the mutation lands relative to the live
+        iterator.
+        """
+        for handler in list(self._subscribers.get(type(event), [])):
             handler(event)
