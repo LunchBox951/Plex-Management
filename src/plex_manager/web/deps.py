@@ -9,6 +9,13 @@ Wiring rules:
   decrypted value. The header is sourced via ``APIKeyHeader`` so the security
   scheme appears in the OpenAPI. It is skipped when ``settings.dev_auth_bypass``
   is set. Health, setup and docs routes do NOT depend on it.
+* ``require_setup_admin`` gates every setup endpoint except ``/status``: a
+  ``dev_auth_bypass`` short-circuit, then an OPTIONAL pre-init hardening token
+  (``PLEX_MANAGER_SETUP_TOKEN``, only enforced while uninitialized), then normal
+  session-cookie-or-``X-Api-Key`` auth, then an admin check — every rejection an
+  ``AppError`` envelope, never a bare detail. The legacy pre-init token
+  dependencies (``require_pre_init_or_api_key`` / ``require_setup_token_pre_init``)
+  remain until the setup router migrates.
 * ``SettingsStore`` is the typed access layer over the ``settings`` table: secret
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
@@ -59,6 +66,7 @@ from plex_manager.services.health_service import (
     SubsystemHealth,
     TtlCache,
 )
+from plex_manager.web.errors import AppError
 
 __all__ = [
     "API_KEY_HEADER_NAME",
@@ -120,6 +128,7 @@ __all__ = [
     "require_admin",
     "require_api_key",
     "require_pre_init_or_api_key",
+    "require_setup_admin",
     "require_setup_token_pre_init",
 ]
 
@@ -599,6 +608,60 @@ async def require_admin(
     """
     if not context.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
+    return context
+
+
+async def require_setup_admin(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AuthContext:
+    """Gate every setup endpoint except ``/status`` on an authenticated admin.
+
+    The order matters and each failure is an honest :class:`AppError` envelope
+    (north star #3), never a bare ``detail``:
+
+    1. ``dev_auth_bypass`` short-circuits to a dev admin context (dev only).
+    2. While the install is still uninitialized AND an operator configured a
+       hardening ``PLEX_MANAGER_SETUP_TOKEN`` (:func:`is_setup_token_required`),
+       the request must carry a matching ``X-Setup-Token`` — a valid token falls
+       THROUGH to the auth check below, it is not itself a credential. Post-init
+       the token is never consulted again.
+    3. Normal auth: a Plex session cookie (CSRF-checked on unsafe methods) or the
+       legacy ``X-Api-Key``. No credential ⇒ 401 ``session_required`` — the prose
+       nudges toward Plex sign-in while setup is unfinished, plain sign-in after.
+    4. A non-admin (a signed-in Plex account that does not own the server) ⇒ 403
+       ``admin_required``.
+    """
+    if get_settings().dev_auth_bypass:
+        return AuthContext(method=AuthMethod.dev_bypass, is_admin=True)
+    system = await load_system_settings(session)
+    initialized = system is not None and system.initialized
+    if not initialized and is_setup_token_required() and not _pre_init_setup_token_valid(request):
+        raise AppError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_setup_token",
+            message="The setup token is missing or wrong.",
+            hint="Check PLEX_MANAGER_SETUP_TOKEN on the server.",
+        )
+    context = await authenticate_request(
+        request,
+        session,
+        provided_api_key=request.headers.get(API_KEY_HEADER_NAME),
+    )
+    if context is None:
+        raise AppError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="session_required",
+            message=(
+                "Sign in to continue." if initialized else "Sign in with Plex to continue setup."
+            ),
+        )
+    if not context.is_admin:
+        raise AppError(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="admin_required",
+            message="This action needs an administrator.",
+        )
     return context
 
 
