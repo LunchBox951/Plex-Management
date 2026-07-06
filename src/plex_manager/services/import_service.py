@@ -51,6 +51,7 @@ from plex_manager.domain.naming import (
     plex_tv_season_relative_dir,
 )
 from plex_manager.domain.state_machine import DownloadState
+from plex_manager.logsafe import safe_int
 from plex_manager.models import (
     Download,
     DownloadHistory,
@@ -626,8 +627,8 @@ async def _import_download_locked(
         _logger.info(
             "deferring import of download %s: a purge is deleting this path; "
             "will retry next import cycle",
-            download_id,
-            extra={"request_id": request.id},
+            safe_int(download_id),
+            extra={"request_id": safe_int(request.id)},
         )
         return await download_repo.get_by_hash(torrent_hash)
     try:
@@ -998,8 +999,8 @@ async def _import_tv_locked(
         _logger.info(
             "deferring import of download %s: a purge is deleting this path; "
             "will retry next import cycle",
-            download_id,
-            extra={"request_id": request.id, "season": season},
+            safe_int(download_id),
+            extra={"request_id": safe_int(request.id), "season": safe_int(season)},
         )
         return await download_repo.get_by_hash(torrent_hash)
     try:
