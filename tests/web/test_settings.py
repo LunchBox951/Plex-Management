@@ -850,3 +850,131 @@ async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
         system = await load_system_settings(session)
         assert system is not None
         assert system.app_api_key == new_key
+
+
+# --------------------------------------------------------------------------- #
+# Opt-in recovery key — status / generate-from-null / revoke (keyless setup)
+# --------------------------------------------------------------------------- #
+async def test_app_key_status_false_on_fresh_keyless_init(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A fresh install mints no key (setup is keyless), so status reports absence.
+
+    ``GET /app-key/status`` answers the Settings→Access UI's Generate-vs-Rotate
+    question WITHOUT the break-glass reveal. With no key stored, the only way in
+    is a Plex-session admin, so authenticate that way.
+    """
+    await seed(initialized=True)
+    cookies, _ = await _admin_session_cookies(app, plex_id=7001, tag="status-empty")
+
+    response = await client.get("/api/v1/settings/app-key/status", cookies=cookies)
+    assert response.status_code == 200
+    assert response.json() == {"exists": False}
+
+
+async def test_app_key_status_true_when_a_key_exists_without_revealing_it(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key/status", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json() == {"exists": True}
+    # The status probe never discloses the plaintext key — only its existence.
+    assert _API_KEY not in response.text
+
+
+async def test_app_key_status_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key/status")
+    assert response.status_code == 401
+
+
+async def test_reveal_app_key_404s_when_no_key_exists(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Reveal on a keyless install is an honest 404 envelope, not a bare 409.
+
+    The structured ``app_key_not_set`` envelope carries an operator-facing hint so
+    the UI can nudge toward Generate rather than surface an opaque failure.
+    """
+    await seed(initialized=True)
+    cookies, _ = await _admin_session_cookies(app, plex_id=7002, tag="reveal-absent")
+
+    response = await client.get("/api/v1/settings/app-key", cookies=cookies)
+    assert response.status_code == 404
+    body = response.json()
+    assert body["detail"] == "app_key_not_set"
+    assert body["hint"]  # a non-empty nudge toward generating one
+
+
+async def test_generate_app_key_from_null_mints_and_flips_status_true(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Rotate IS the generate path when no key exists: it mints, returns once, and
+    flips status to present; the freshly minted key then authenticates + reveals."""
+    await seed(initialized=True)
+    cookies, csrf = await _admin_session_cookies(app, plex_id=7003, tag="generate")
+
+    generate = await client.post("/api/v1/settings/app-key/rotate", cookies=cookies, headers=csrf)
+    assert generate.status_code == 200
+    new_key = generate.json()["app_api_key"]
+    assert len(new_key) > 20  # matches setup's historical token_urlsafe(32) shape
+
+    # Status now reports a key exists, without disclosing it.
+    status_after = await client.get(
+        "/api/v1/settings/app-key/status", headers={"X-Api-Key": new_key}
+    )
+    assert status_after.status_code == 200
+    assert status_after.json() == {"exists": True}
+
+    # The freshly minted key authenticates and reveals its own plaintext.
+    reveal = await client.get("/api/v1/settings/app-key", headers={"X-Api-Key": new_key})
+    assert reveal.status_code == 200
+    assert reveal.json() == {"app_api_key": new_key}
+
+
+async def test_revoke_app_key_returns_204_and_old_key_401s(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Revoke clears the stored key: 204 no-content, the old key 401s everywhere,
+    and status flips back to absent (checked via a Plex-session admin, since the
+    revoked key can no longer authenticate)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    key_headers = {"X-Api-Key": _API_KEY}
+
+    revoke = await client.delete("/api/v1/settings/app-key", headers=key_headers)
+    assert revoke.status_code == 204
+    assert revoke.content == b""  # 204 carries no body
+
+    # The revoked key no longer authenticates anywhere.
+    dead = await client.get("/api/v1/settings", headers=key_headers)
+    assert dead.status_code == 401
+
+    # A Plex-session admin still gets in and sees the key is gone.
+    cookies, _ = await _admin_session_cookies(app, plex_id=7004, tag="revoked")
+    status_after = await client.get("/api/v1/settings/app-key/status", cookies=cookies)
+    assert status_after.status_code == 200
+    assert status_after.json() == {"exists": False}
+
+
+async def test_revoke_app_key_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.delete("/api/v1/settings/app-key")
+    assert response.status_code == 401
+
+
+async def test_revoke_app_key_is_idempotent_when_no_key_exists(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Revoking a keyless install is a no-op 204, not an error — the end state
+    (no key) is the same whether or not one was present."""
+    await seed(initialized=True)
+    cookies, csrf = await _admin_session_cookies(app, plex_id=7005, tag="revoke-noop")
+
+    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    assert revoke.status_code == 204
+    assert revoke.content == b""

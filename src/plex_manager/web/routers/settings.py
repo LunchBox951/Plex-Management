@@ -4,10 +4,13 @@
 the provided config, encrypting secret values at rest. Only fields present in the
 request body are written; absent fields are left unchanged.
 
-``GET /app-key`` and ``POST /app-key/rotate`` reveal / rotate the app's own
-``X-Api-Key`` (``SystemSettings.app_api_key``) -- the belt-and-braces recovery
-path for a lost key on a new device, or a full rotate if the key was ever
-exposed (issue #28's OAuth-deferral analysis).
+The ``/app-key`` endpoints manage the app's own ``X-Api-Key``
+(``SystemSettings.app_api_key``) -- an OPT-IN recovery/automation credential.
+Setup mints nothing, so the key starts absent: ``GET /app-key/status`` reports
+whether one exists (without revealing it), ``POST /app-key/rotate`` GENERATES the
+first key (when none exists) and ROTATES thereafter, ``GET /app-key`` reveals the
+current key for a new device, and ``DELETE /app-key`` revokes it (issue #28's
+OAuth-deferral analysis).
 """
 
 from __future__ import annotations
@@ -37,8 +40,10 @@ from plex_manager.web.deps import (
     load_system_settings,
     require_admin,
 )
+from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
     AppApiKeyResponse,
+    AppApiKeyStatusResponse,
     PlexLibraryOption,
     SettingsResponse,
     SettingsUpdate,
@@ -53,9 +58,10 @@ router = APIRouter(
     dependencies=[Depends(require_admin)],
 )
 
-# Same byte length setup.complete() mints the initial key with
-# (secrets.token_urlsafe(32) — a 43-char URL-safe token), so a rotated key is
-# indistinguishable in shape/strength from the one setup issued.
+# 32 bytes -> secrets.token_urlsafe(32) yields a 43-char URL-safe token. Setup
+# mints no key any more; BOTH the first generate (from no key) and every later
+# rotate mint with this length, so a key is indistinguishable in shape/strength
+# regardless of when it was issued.
 _API_KEY_BYTES = 32
 
 # Serialises app-key rotation so the compare-and-swap in ``rotate_app_key_endpoint``
@@ -141,11 +147,35 @@ async def reveal_app_key_endpoint(
     app key, so this is not an anonymous disclosure -- it is the break-glass
     recovery path for a NEW device/browser that needs to be paired without
     re-running setup.
+
+    Setup mints no key, so a fresh install has none to reveal: that is an honest
+    ``app_key_not_set`` envelope (404) whose hint points the operator at the
+    Generate control, never a bare/opaque failure (north star #3).
     """
     system = await load_system_settings(session)
     if system is None or system.app_api_key is None:
-        raise HTTPException(status_code=409, detail="not_initialized")
+        raise AppError(
+            status_code=404,
+            code="app_key_not_set",
+            message="No recovery key exists.",
+            hint="Generate one below.",
+        )
     return AppApiKeyResponse(app_api_key=system.app_api_key)
+
+
+@router.get("/app-key/status")
+async def app_key_status_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AppApiKeyStatusResponse:
+    """Whether a recovery key currently exists, WITHOUT revealing it.
+
+    Lets Settings → Access render Generate (no key yet) vs Rotate/Revoke (a key is
+    present) without invoking the break-glass reveal. Admin-gated like every route
+    on this router; the plaintext key is never part of this response.
+    """
+    system = await load_system_settings(session)
+    exists = system is not None and system.app_api_key is not None
+    return AppApiKeyStatusResponse(exists=exists)
 
 
 @router.post("/app-key/rotate")
@@ -154,7 +184,13 @@ async def rotate_app_key_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     auth: Annotated[AuthContext, Depends(require_admin)],
 ) -> AppApiKeyResponse:
-    """Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
+    """Mint an app ``X-Api-Key`` -- GENERATE the first one, or ROTATE an existing key.
+
+    This is the sole mint path now that setup is keyless: when no key exists
+    (``app_api_key IS NULL``) it GENERATES the first key (the CAS below has nothing
+    to compare against, so it simply mints); when a key exists it ROTATES,
+    invalidating the old one. Both run under ``_rotate_lock`` and return the
+    plaintext exactly once.
 
     Every OTHER device/browser with the OLD key saved (localStorage) is
     immediately locked out -- there is exactly one live key at a time, matching
@@ -202,7 +238,12 @@ async def rotate_app_key_endpoint(
             # and our own commit) so the CAS reflects any rotation that committed
             # while this request was in flight.
             await session.refresh(system)
-            if not api_key_matches(observed, system.app_api_key):
+            # Generate-from-null is the "generate" path: with no key stored there
+            # is nothing to compare against, so the first call simply MINTS. The
+            # CAS applies only once a key exists -- and if the stored key has become
+            # non-null while THIS request observed null, a concurrent generate/rotate
+            # already minted one, so honour the same 409 rather than clobber it.
+            if system.app_api_key is not None and not api_key_matches(observed, system.app_api_key):
                 raise HTTPException(
                     status_code=409,
                     detail="app_key_changed",
@@ -211,6 +252,25 @@ async def rotate_app_key_endpoint(
         system.app_api_key = new_key
         await session.commit()
     return AppApiKeyResponse(app_api_key=new_key)
+
+
+@router.delete("/app-key", status_code=204)
+async def revoke_app_key_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Revoke the app ``X-Api-Key``: clear the stored key so none authenticates.
+
+    Every device holding the old key is locked out at once (``X-Api-Key`` auth
+    401s until a new key is generated); browser Plex-session auth is unaffected.
+    Idempotent -- revoking a keyless install is a no-op 204, since the end state is
+    the same either way. Runs under ``_rotate_lock`` so the clear cannot interleave
+    with a concurrent generate/rotate; the write is unconditional (the target state
+    is always ``None``), so it needs no compare-and-swap.
+    """
+    system = await ensure_system_settings(session)
+    async with _rotate_lock:
+        system.app_api_key = None
+        await session.commit()
 
 
 @router.put("")

@@ -17,6 +17,8 @@ from plex_manager.web.url_validation import url_shape_error
 
 __all__ = [
     "AcceptedRelease",
+    "AppApiKeyResponse",
+    "AppApiKeyStatusResponse",
     "AuthMeResponse",
     "AuthUser",
     "BlocklistEntry",
@@ -458,19 +460,33 @@ class SettingsResponse(BaseModel):
 
 
 class AppApiKeyResponse(BaseModel):
-    """The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+    """The current (reveal) or freshly-minted (generate/rotate) app ``X-Api-Key``.
 
-    Authenticated-only (Plex session or currently-valid ``X-Api-Key``): reveal is
-    the belt-and-braces recovery path for a lost/forgotten key on a device that
-    still has it saved, and rotate mints and returns a brand-new key ONCE — the
-    plaintext is never retrievable again after this response, only the
-    Fernet-encrypted column at rest (matching the one-time disclosure setup's
-    ``/complete`` already gives the initial key).
+    Authenticated-only (Plex session or currently-valid ``X-Api-Key``). Setup mints
+    NO key — this is an OPT-IN recovery/automation credential the operator generates
+    on demand from Settings → Access. Reveal is the break-glass path for a key
+    lost/forgotten on a device that still has it saved; generate/rotate mints and
+    returns a brand-new key ONCE — the plaintext is never retrievable again after
+    this response, only the Fernet-encrypted column at rest.
     """
 
     model_config = ConfigDict(frozen=True)
 
     app_api_key: str
+
+
+class AppApiKeyStatusResponse(BaseModel):
+    """Whether an app ``X-Api-Key`` recovery key currently exists — never the key.
+
+    Powers the Settings → Access control's Generate-vs-Rotate/Revoke choice
+    WITHOUT the break-glass reveal: ``exists`` is ``True`` once a key has been
+    generated (and not since revoked), ``False`` on a fresh keyless install (setup
+    mints nothing) or after a revoke. The plaintext is never serialized here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    exists: bool
 
 
 class SettingsUpdate(BaseModel):
