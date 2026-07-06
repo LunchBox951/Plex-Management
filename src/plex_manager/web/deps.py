@@ -13,9 +13,8 @@ Wiring rules:
   ``dev_auth_bypass`` short-circuit, then an OPTIONAL pre-init hardening token
   (``PLEX_MANAGER_SETUP_TOKEN``, only enforced while uninitialized), then normal
   session-cookie-or-``X-Api-Key`` auth, then an admin check — every rejection an
-  ``AppError`` envelope, never a bare detail. The legacy pre-init token
-  dependencies (``require_pre_init_or_api_key`` / ``require_setup_token_pre_init``)
-  remain until the setup router migrates.
+  ``AppError`` envelope, never a bare detail. It is the SOLE setup gate: the legacy
+  pre-init token dependencies were removed when the setup router migrated onto it.
 * ``SettingsStore`` is the typed access layer over the ``settings`` table: secret
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
@@ -81,6 +80,7 @@ __all__ = [
     "EVICTION_PROACTIVE_ENABLED_DEFAULT",
     "KNOWN_SETTING_KEYS",
     "LOG_RETENTION_DAYS_DEFAULT",
+    "PLEX_MACHINE_ID_SETTING",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
     "SESSION_COOKIE_NAME",
@@ -127,9 +127,7 @@ __all__ = [
     "load_system_settings",
     "require_admin",
     "require_api_key",
-    "require_pre_init_or_api_key",
     "require_setup_admin",
-    "require_setup_token_pre_init",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -140,6 +138,13 @@ _logger = logging.getLogger(__name__)
 # the key.
 API_KEY_HEADER_NAME = "X-Api-Key"
 SETUP_TOKEN_HEADER_NAME = "X-Setup-Token"  # noqa: S105 — header name, not a token
+# The ``settings.key`` under which the configured server's Plex ``machineIdentifier``
+# is stored at setup-complete. The single source of truth shared by the setup router
+# (writes it) and the auth router (reads it post-init to resolve server access
+# without re-probing ``/identity``). Not a wire/``SettingsResponse`` field — an
+# internal identifier, so deliberately NOT in ``KNOWN_SETTING_KEYS`` (mirroring
+# ``plex_oauth_client_identifier``), read/written via ``SettingsStore`` by key.
+PLEX_MACHINE_ID_SETTING = "plex_machine_identifier"
 SESSION_COOKIE_NAME = "plexmgr.session"
 CSRF_COOKIE_NAME = "plexmgr.csrf"
 CSRF_HEADER_NAME = "X-CSRF-Token"
@@ -663,56 +668,6 @@ async def require_setup_admin(
             message="This action needs an administrator.",
         )
     return context
-
-
-async def require_pre_init_or_api_key(
-    request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
-) -> None:
-    """Require bootstrap token before first-run init; require ``X-Api-Key`` after.
-
-    The setup ``validate/*`` probes must be callable before an app key exists, but
-    each drives a server-side request to a caller-supplied URL. They therefore
-    require ``X-Setup-Token`` pre-init and fall under the same api-key gate as the
-    rest of the API once ``initialized`` is set (still skippable via
-    ``dev_auth_bypass``).
-
-    Unlike :func:`require_api_key`, the header is read imperatively from the
-    request (not via :class:`APIKeyHeader`): these setup routes are intentionally
-    NOT marked as secured in the OpenAPI, since they are open before init.
-    """
-    system = await load_system_settings(session)
-    if system is None or not system.initialized:
-        if get_settings().dev_auth_bypass:
-            return
-        if not _pre_init_setup_token_valid(request):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token"
-            )
-        return
-    context = await authenticate_request(
-        request,
-        session,
-        provided_api_key=request.headers.get(API_KEY_HEADER_NAME),
-    )
-    if context is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
-    if not context.is_admin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
-
-
-async def require_setup_token_pre_init(
-    request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
-) -> None:
-    """Require the bootstrap setup token only while the install is uninitialized."""
-    system = await load_system_settings(session)
-    if system is not None and system.initialized:
-        return
-    if get_settings().dev_auth_bypass:
-        return
-    if not _pre_init_setup_token_valid(request):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token")
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,7 @@ from plex_manager.web.url_validation import url_shape_error
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from plex_manager.adapters.plex.oauth import PlexTvClient
     from plex_manager.ports.library import LibrarySection
 
 __all__ = [
@@ -121,7 +122,13 @@ def library_options(
     ]
 
 
-async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
+async def validate_plex(
+    client: httpx.AsyncClient,
+    url: str,
+    token: str,
+    *,
+    identity_client: PlexTvClient | None = None,
+) -> ServiceValidateResponse:
     """Validate Plex + token AND return the movie/tv library folders to pick from.
 
     Uses the real adapter (``list_sections``): one call both proves connectivity +
@@ -133,10 +140,27 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
     (via ``health_service._check_plex``) the live health-card probe -- both must
     always reflect reality, never a section list cached from a previous healthy
     probe up to 300s stale.
+
+    ``identity_client`` opts into the ownership-verifying variant the setup wizard
+    needs: when supplied, the server's ``/identity`` is probed FIRST (before the
+    section list) and its ``machineIdentifier`` is returned on the response so the
+    caller can assert the signed-in admin OWNS this server and store the id. The
+    probe raises :class:`PlexVerifyError` on a transport failure (rendered as a 502
+    ``server_unreachable_from_backend`` envelope) rather than being swallowed into a
+    generic ``ok=False`` — an unreachable candidate is an honest, retryable upstream
+    state. Left ``None`` (the health-card path) skips the probe entirely, so that
+    path issues no extra request and ``machine_identifier`` stays ``None``.
     """
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
+    # Identity FIRST when asked: a transport failure here surfaces as the 502
+    # envelope (not the section-probe's ok=False), and Plex's /identity is
+    # unauthenticated, so a bad token still falls through to the honest "Plex
+    # rejected the token." from list_sections below.
+    machine_identifier = (
+        None if identity_client is None else await identity_client.fetch_server_identity(url, token)
+    )
     try:
         sections = await PlexLibrary(client, url, token).list_sections(use_cache=False)
     except PlexAuthError:
@@ -162,7 +186,12 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
             "add one in Plex, then test again.",
             libraries=[],
         )
-    return ServiceValidateResponse(ok=True, message="Connected to Plex.", libraries=libraries)
+    return ServiceValidateResponse(
+        ok=True,
+        message="Connected to Plex.",
+        libraries=libraries,
+        machine_identifier=machine_identifier,
+    )
 
 
 async def validate_prowlarr(

@@ -37,6 +37,7 @@ from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
+    PLEX_MACHINE_ID_SETTING,
     SESSION_COOKIE_NAME,
     AuthContext,
     AuthMethod,
@@ -56,7 +57,6 @@ __all__ = ["router"]
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 _CLIENT_ID_SETTING = "plex_oauth_client_identifier"
-_MACHINE_ID_SETTING = "plex_machine_identifier"
 _SESSION_DAYS = 30
 _COOKIE_PATH = "/"
 
@@ -235,7 +235,7 @@ async def _post_init_access(
     """
     _ = account  # identity is asserted by the fetched token; kept for a uniform signature
     store = SettingsStore(session)
-    machine_identifier = await store.get(_MACHINE_ID_SETTING)
+    machine_identifier = await store.get(PLEX_MACHINE_ID_SETTING)
     if not machine_identifier:
         plex_url = await store.get("plex_url")
         plex_token = await store.get("plex_token")
