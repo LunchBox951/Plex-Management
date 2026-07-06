@@ -3372,3 +3372,134 @@ async def test_finalize_flips_a_cancelled_rearm_to_evicted_and_the_guard_holds(
         )
     assert fresh.id != show_id
     assert fresh.status == RequestStatus.pending.value  # re-grabs, never 'available'
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-8 finding 1: recovery also covers breadcrumb-bearing CANCELLED
+# seasons (re-arm -> cancel -> crash before the finalize). 'cancelled' is
+# rightly invisible to evicted_seasons, so without this the stale Plex window
+# could mint 'available' over a deleted file -- or strand a live file behind a
+# cancelled row no sweep could ever reclaim.
+# --------------------------------------------------------------------------- #
+
+
+async def test_sweep_flips_a_cancelled_rearm_with_the_file_gone_to_evicted(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Cancelled + stale breadcrumb + file GONE (the purge completed, then the
+    crash ate the finalize): recovery applies the disk-truth flip -- the file is
+    genuinely gone, the cancel only aborted the re-grab intent -- so the row
+    lands 'evicted', the guard subtracts it again, and a re-request in the
+    stale-Plex window mints 'pending', never 'available'."""
+    missing_path = str(tmp_path / "tv" / "Cancelled Gone" / "Season 01")  # never created
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=690, title="Cancelled Gone", seasons={1: missing_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.cancelled  # re-arm -> cancel -> crash
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.cancelled
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,  # recovery never waits for pressure
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 690)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # disk truth over intent
+    assert season_row.library_path is None  # finalized
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+    assert (missing_path, "tv") in library.scan_calls
+
+    # The guard holds: a re-request while Plex still lists the season re-grabs.
+    tmdb = FakeTmdb(
+        shows={690: TvMetadata(tmdb_id=690, title="Cancelled Gone", year=2020, season_count=1)}
+    )
+    plex_stale = FakeLibrary(available_tv_seasons={690: frozenset({1})})
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=690, media_type="tv", seasons=[1], library=plex_stale
+        )
+    assert fresh.status == RequestStatus.pending.value  # never 'available'
+
+
+async def test_sweep_folds_a_cancelled_rearm_with_the_file_present_to_available(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Cancelled + breadcrumb + file PRESENT (the purge never actually deleted
+    anything before the crash): the aborted re-grab left a LIVE file, so disk
+    truth reads 'available' -- folded back, file intact, breadcrumb kept, and
+    the season is evictable/re-reportable again instead of stranded behind a
+    cancelled row no sweep could reclaim."""
+    s1_path = _movie_file(tmp_path, "Cancelled Alive S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=691, title="Cancelled Alive", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.cancelled
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.cancelled
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()  # the live file is untouched
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available  # folded: disk truth
+    assert season_row.library_path == s1_path  # handle kept for eviction/report
+    assert show is not None and show.status is RequestStatus.available

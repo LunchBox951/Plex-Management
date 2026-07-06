@@ -20,6 +20,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.ports.download_client import AddResult
 from plex_manager.services import grab_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
@@ -854,9 +855,9 @@ class _HashReturningQbt(FakeQbittorrent):
         super().__init__()
         self._info_hash = info_hash
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         self.added.append((magnet_or_url, save_path, category))
-        return self._info_hash
+        return AddResult(torrent_hash=self._info_hash, created=True)
 
 
 async def test_grab_rejects_same_active_hash_owned_by_another_request_after_add(
@@ -916,7 +917,7 @@ class _CompetingActiveDuringAddQbt(FakeQbittorrent):
         self._request_id = request_id
         self._info_hash = info_hash
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         self.added.append((magnet_or_url, save_path, category))
         async with self._sessionmaker() as session:
             session.add(
@@ -928,7 +929,7 @@ class _CompetingActiveDuringAddQbt(FakeQbittorrent):
                 )
             )
             await session.commit()
-        return self._info_hash
+        return AddResult(torrent_hash=self._info_hash, created=True)
 
 
 class _CompetingHashOwnerDuringAddQbt(FakeQbittorrent):
@@ -938,7 +939,7 @@ class _CompetingHashOwnerDuringAddQbt(FakeQbittorrent):
         self._owner_request_id = owner_request_id
         self._info_hash = info_hash
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         self.added.append((magnet_or_url, save_path, category))
         async with self._sessionmaker() as session:
             session.add(
@@ -950,7 +951,7 @@ class _CompetingHashOwnerDuringAddQbt(FakeQbittorrent):
                 )
             )
             await session.commit()
-        return self._info_hash
+        return AddResult(torrent_hash=self._info_hash, created=True)
 
 
 async def test_grab_insert_conflict_rejects_same_hash_owned_by_another_request(
@@ -1203,7 +1204,7 @@ class _CancelMovieDuringAddQbt(FakeQbittorrent):
         self._sm = sm
         self._request_id = request_id
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         async with self._sm() as session:
             row = await session.get(MediaRequest, self._request_id)
             assert row is not None
@@ -1220,7 +1221,7 @@ class _CancelSeasonDuringAddQbt(FakeQbittorrent):
         self._sm = sm
         self._season_request_id = season_request_id
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         async with self._sm() as session:
             row = await session.get(SeasonRequest, self._season_request_id)
             assert row is not None
@@ -1421,7 +1422,7 @@ class _FoldSeasonDuringAddQbt(FakeQbittorrent):
         self._sm = sm
         self._season_request_id = season_request_id
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         async with self._sm() as session:
             row = await session.get(SeasonRequest, self._season_request_id)
             assert row is not None
@@ -1522,3 +1523,96 @@ async def test_grab_refuses_an_already_cancelled_season_before_adding_anything(
                 qbt, session, scored=_scored(_HASH), request_id=show_id, tmdb_id=711, season=1
             )
     assert qbt.added == []  # refused BEFORE anything reached the client
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-8 finding 2: the lost-grab cleanup removes ONLY torrents this
+# grab genuinely created. qbt.add's 409-already-present branch resolves to a
+# PRE-EXISTING torrent (AddResult.created False) -- e.g. a still-seeding import
+# whose data may back a live library file via hardlink -- and the DB rollback
+# preserved whatever row tracked it, so removing it with delete_files would
+# destroy content the grab never owned.
+# --------------------------------------------------------------------------- #
+
+
+async def test_grab_loss_cleanup_leaves_a_pre_existing_torrent_untouched(
+    tmp_path: Any,
+) -> None:
+    """Terminal-row reuse of a torrent the client reported ALREADY PRESENT
+    (created=False), then the post-add CAS loses to a mid-add cancel: the
+    cleanup must NOT remove the pre-existing torrent (it predates this grab;
+    the rollback preserved the old terminal row that tracks it)."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "preexisting_cleanup.db")
+    try:
+        async with sm() as session:
+            req = MediaRequest(
+                tmdb_id=720,
+                media_type=MediaType.movie,
+                title="Preexisting",
+                status=RequestStatus.pending,
+            )
+            session.add(req)
+            await session.flush()
+            request_id = req.id
+            # The old terminal row that tracks the still-present torrent.
+            session.add(
+                Download(
+                    torrent_hash=_HASH,
+                    status="failed",
+                    media_request_id=request_id,
+                    tmdb_id=720,
+                    failed_reason="prior failure",
+                )
+            )
+            await session.commit()
+
+        qbt = _CancelMovieDuringAddQbt(sm, request_id)
+        qbt.pre_existing = {_HASH}  # add() reports 409-already-present
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt, session, scored=_scored(_HASH), request_id=request_id, tmdb_id=720
+                )
+
+        # The pre-existing torrent was left completely untouched.
+        assert qbt.removed == []
+        async with sm() as session:
+            row = (
+                await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+            ).scalar_one()
+            request_row = await session.get(MediaRequest, request_id)
+        assert row.status == "failed"  # the rollback preserved the old terminal row
+        assert request_row is not None
+        assert request_row.status is RequestStatus.cancelled  # the cancel stands
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_loss_cleanup_still_removes_a_genuinely_added_torrent(
+    tmp_path: Any,
+) -> None:
+    """The counterpart: a torrent this grab genuinely created (created=True)
+    IS removed with its data on a lost post-add CAS -- unchanged behavior."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "genuine_cleanup.db")
+    try:
+        async with sm() as session:
+            req = MediaRequest(
+                tmdb_id=721,
+                media_type=MediaType.movie,
+                title="Fresh Add",
+                status=RequestStatus.pending,
+            )
+            session.add(req)
+            await session.commit()
+            request_id = req.id
+
+        qbt = _CancelMovieDuringAddQbt(sm, request_id)  # created=True by default
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt, session, scored=_scored(_HASH), request_id=request_id, tmdb_id=721
+                )
+
+        assert (_HASH, True) in qbt.removed  # the orphan this grab created is cleaned up
+    finally:
+        await engine.dispose()

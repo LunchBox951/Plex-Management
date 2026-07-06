@@ -22,6 +22,7 @@ from plex_manager.adapters.qbittorrent import (
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.ports.download_client import AddResult
 from plex_manager.ports.library import LibrarySection
 from plex_manager.ports.metadata import MediaSearchResult, MovieMetadata
 from tests.web.fakes import (
@@ -70,17 +71,17 @@ class _RateLimitedProwlarr(FakeProwlarr):
 
 
 class _AuthFailQbt(FakeQbittorrent):
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         raise QbittorrentAuthError("qBittorrent rejected the login")
 
 
 class _OutageQbt(FakeQbittorrent):
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         raise QbittorrentError("qBittorrent request failed")
 
 
 class _UnresolvableSourceQbt(FakeQbittorrent):
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
 
 

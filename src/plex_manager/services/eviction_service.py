@@ -148,6 +148,22 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# The statuses the recovery pass's re-armed (breadcrumb-keyed) enumeration
+# scans: the pre-grab set PLUS ``cancelled``. A crash-window re-arm can be
+# CANCELLED before recovery runs (re-arm -> the same-release re-grab resurrects
+# the old imported download row, unblocking cancel's imported-row probe -> user
+# cancels -> crash before the finalize), leaving ``cancelled`` + a stale
+# breadcrumb -- a shape BOTH enumerations would otherwise miss and that
+# ``evicted_seasons`` (rightly cancelled-blind) cannot subtract, so stale Plex
+# presence could mint ``available`` over a deleted file. Season-only, like the
+# rest of the re-armed shape: a movie cannot reach ``cancelled`` + breadcrumb
+# through the eviction lifecycle (its re-grab is a SEPARATE row with no
+# breadcrumb, and the claimed ``evicted`` movie row is not cancellable at all);
+# the one movie shape that CAN carry it -- report-issue's failed-purge re-arm
+# later cancelled -- is a deliberately settled correction whose kept breadcrumb
+# is the orphan-reclaim handle, not an interrupted eviction, and is left alone.
+_REARMED_RECOVERY_STATUSES: frozenset[str] = _PRE_GRAB_STATUSES | {RequestStatus.cancelled.value}
+
 # In-PROCESS sweep serialization latch: :func:`run_eviction_sweep` no-ops (with
 # a log line) when another sweep is still running. Exactly two actors ever call
 # it -- the periodic tick and the manual ``POST /ops/evict`` button -- and
@@ -682,8 +698,8 @@ async def _resume_interrupted_evictions(
       the eviction fresh through the normal claim -> purge path). File gone ->
       finalize now (CAS-clear breadcrumb as the single-winner gate, history row,
       the Plex refresh the crash swallowed).
-    * PRE-GRAB + breadcrumb (TV only; every status in
-      :data:`_PRE_GRAB_STATUSES`) -- an in-window re-request re-armed the
+    * PRE-GRAB-or-CANCELLED + breadcrumb (TV only; every status in
+      :data:`_REARMED_RECOVERY_STATUSES`) -- an in-window re-request re-armed the
       claimed season row (``ensure_seasons``, ``evicted`` -> ``pending``) before
       recovery ran, so the ``evicted`` enumeration alone would MISS it and let
       the re-grab download a duplicate of a file that never left. The re-arm
@@ -697,10 +713,16 @@ async def _resume_interrupted_evictions(
       CAS from EXACTLY the status that was read, so an advance mid-recovery
       loses cleanly), or releases the stale breadcrumb (the re-grab/search is
       then legitimate) when it is gone -- see :func:`_recover_rearmed_season`,
-      including the one deliberate tradeoff this breadth buys. Movies have no
-      same-row re-arm (a movie re-request always creates a NEW row; a movie
-      ``searching`` + breadcrumb row is report-issue's failed-purge redo and
-      must never be touched), so this shape is season-only.
+      including the one deliberate tradeoff this breadth buys. A re-arm the
+      user then CANCELLED (crash before the finalize) is enumerated too: file
+      gone -> the disk-truth flip (``cancelled`` -> ``evicted``, so
+      ``evicted_seasons`` -- rightly cancelled-blind -- keeps subtracting);
+      file present -> the fold to ``available`` (the aborted re-grab left a
+      live file). Movies have no same-row re-arm (a movie re-request always
+      creates a NEW row; a movie ``searching``/``cancelled`` + breadcrumb row
+      is report-issue's failed-purge redo -- a deliberately settled correction
+      whose kept breadcrumb is the orphan-reclaim handle -- and must never be
+      touched), so this shape is season-only.
 
     Before restoring/folding ANY file-present row, :func:`_path_claimed_by_another_row`
     distinguishes interrupted from FINALIZED-BUT-SUPERSEDED: if another live row
@@ -749,14 +771,15 @@ async def _resume_interrupted_evictions(
                 size_bytes=None,
             )
             pairs.append((season.library_path, parent.title if parent else None, pending))
-        # The re-armed shape: PRE-GRAB + breadcrumb (see the docstring) -- the
-        # crash-window re-request already rewrote the status, so the 'evicted'
-        # enumeration above cannot see it; and auto-grab can have promoted the
-        # re-arm past 'pending' (searching, or parked no_acceptable_release)
-        # before this sweep ran, so every pre-grab status is enumerated. The
+        # The re-armed shape: PRE-GRAB-or-CANCELLED + breadcrumb (see the
+        # docstring) -- the crash-window re-request already rewrote the status,
+        # so the 'evicted' enumeration above cannot see it; auto-grab can have
+        # promoted the re-arm past 'pending' (searching, or parked
+        # no_acceptable_release) before this sweep ran; and the user can have
+        # CANCELLED the re-arm outright (see _REARMED_RECOVERY_STATUSES). The
         # status each row was READ at travels with it: the fold CAS compares
-        # against exactly that status, never the whole pre-grab set.
-        for pre_grab_status in sorted(_PRE_GRAB_STATUSES):
+        # against exactly that status, never the whole set.
+        for pre_grab_status in sorted(_REARMED_RECOVERY_STATUSES):
             for season in await season_repo.list_by_status(pre_grab_status):
                 if season.library_path is None or not _owned_by_root(
                     season.library_path, root_path, all_roots
@@ -828,16 +851,24 @@ async def _recover_rearmed_season(
     observed_status: str,
     pending: _SeasonPending,
 ) -> None:
-    """Recover ONE re-armed (pre-grab + breadcrumb) crash-window season --
-    the second enumeration shape of :func:`_resume_interrupted_evictions`.
+    """Recover ONE re-armed (pre-grab-or-cancelled + breadcrumb) crash-window
+    season -- the second enumeration shape of
+    :func:`_resume_interrupted_evictions`.
 
     File present and unclaimed elsewhere -> fold back to ``available``, CAS'd
     from EXACTLY ``observed_status`` (the status the enumeration read), never
-    the whole pre-grab set -- a row that advances mid-recovery (auto-grab
-    promoting ``pending`` -> ``searching``, or a grab landing ``downloading``)
-    loses the swap cleanly and is retried/left next sweep. The file never left,
-    so the re-grab's reason evaporated; a parked row in particular must not
-    keep showing "nothing found" over a playable file no sweep can reclaim.
+    the whole set -- a row that advances mid-recovery (auto-grab promoting
+    ``pending`` -> ``searching``, or a grab landing ``downloading``) loses the
+    swap cleanly and is retried/left next sweep. The file never left, so the
+    re-grab's reason evaporated; a parked row in particular must not keep
+    showing "nothing found" over a playable file no sweep can reclaim. For an
+    observed ``cancelled`` row this is DISK-TRUTH-OVER-INTENT again, in the
+    other direction from the file-gone flip: the cancellation aborted a re-grab
+    INTENT, but the interrupted purge never actually deleted anything -- the
+    file is live and watchable, so ``available`` is what disk truth reads, and
+    it returns the season to a state every subsystem can manage (evictable,
+    re-reportable) instead of a cancelled row over a playable file that no
+    sweep could ever reclaim.
 
     DELIBERATE TRADEOFF (stated, not hidden): ``searching``/parked + breadcrumb
     is ambiguous between (a) this crash-window re-arm promoted by auto-grab and

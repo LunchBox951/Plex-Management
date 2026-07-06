@@ -319,6 +319,54 @@ async def _reuse_terminal_row(
     return record, True
 
 
+async def _remove_torrent_if_added(
+    qbt: DownloadClientPort,
+    torrent_hash: str,
+    *,
+    actually_added: bool,
+    request_id: int | None,
+    reason: str,
+) -> None:
+    """Best-effort cleanup (WITH data) of the torrent THIS grab genuinely
+    created, after the grab lost a race/CAS and nothing tracks it.
+
+    Gated on ``actually_added`` (:class:`~plex_manager.ports.download_client.
+    AddResult` ``created``): a torrent the client reported ALREADY PRESENT
+    predates this grab and is NOT ours to destroy -- in the terminal-row-reuse
+    path it is typically a still-seeding imported torrent whose data may back a
+    live library file via hardlink, and the DB rollback preserved the old
+    terminal row that tracks it. Removing it with ``delete_files=True`` would
+    destroy content this grab never owned; it is left untouched, with the
+    distinction logged. ``reason`` is a static caller description (log-injection
+    convention, #35); request_id/torrent_hash go via ``extra=`` (they trace from
+    the /queue/grab body, crossing the same log-safe barriers as every other
+    request-derived value -- CodeQL taints extra= fields too).
+    """
+    log_extra = {
+        "request_id": safe_int(request_id) if request_id is not None else None,
+        "torrent_hash": safe_text(torrent_hash),
+    }
+    if not actually_added:
+        _logger.info(
+            "leaving a pre-existing torrent in place after %s: this grab did not "
+            "create it (the client reported it already present), so it is not "
+            "ours to remove",
+            reason,
+            extra=log_extra,
+        )
+        return
+    try:
+        await qbt.remove(torrent_hash, delete_files=True)
+    except Exception:
+        _logger.warning(
+            "failed to remove orphaned torrent after %s; it may keep seeding "
+            "until removed manually",
+            reason,
+            exc_info=True,
+            extra=log_extra,
+        )
+
+
 async def grab(
     qbt: DownloadClientPort,
     session: AsyncSession,
@@ -448,7 +496,15 @@ async def grab(
         if active is not None and active.torrent_hash != known_hash:
             raise AlreadyDownloadingError(request_id)
 
-    torrent_hash = (await qbt.add(source, save_path, category)).lower() or (known_hash or "")
+    add_result = await qbt.add(source, save_path, category)
+    torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
+    # Whether THIS call genuinely created the torrent. False = the client
+    # reported it already present (qBittorrent's 409) and resolved to the
+    # pre-existing one -- which the lost-grab cleanups below must then never
+    # remove: it predates this grab (e.g. a still-seeding import whose data may
+    # back a live library file via hardlink), and the DB rollback preserves
+    # whatever row tracked it. See _remove_torrent_if_added.
+    actually_added = add_result.created
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
         # opaque URL) and the indexer supplied none either. Tracking by the indexer
@@ -515,23 +571,13 @@ async def grab(
             if request_id is not None:
                 active = await download_repo.find_active_for_request(request_id, season=season)
                 if active is not None and active.torrent_hash != torrent_hash:
-                    try:
-                        await qbt.remove(torrent_hash, delete_files=True)
-                    except Exception:
-                        # Static message + ids in extra= (log-hygiene convention, #35):
-                        # request_id/torrent_hash both trace from the /queue/grab body,
-                        # so they cross the same log-safe barriers as every other
-                        # request-derived log value -- CodeQL taints extra= fields too.
-                        _logger.warning(
-                            "failed to remove orphaned torrent after losing a "
-                            "terminal-row reuse race; it may keep seeding until "
-                            "removed manually",
-                            exc_info=True,
-                            extra={
-                                "request_id": safe_int(request_id),
-                                "torrent_hash": safe_text(torrent_hash),
-                            },
-                        )
+                    await _remove_torrent_if_added(
+                        qbt,
+                        torrent_hash,
+                        actually_added=actually_added,
+                        request_id=request_id,
+                        reason="losing a terminal-row reuse race",
+                    )
                     raise AlreadyDownloadingError(request_id) from None
             raise
     else:
@@ -557,30 +603,19 @@ async def grab(
             if request_id is not None:
                 active = await download_repo.find_active_for_request(request_id, season=season)
                 if active is not None and active.torrent_hash != torrent_hash:
-                    # The other release won the request's single active slot. The
-                    # torrent we just added to qBittorrent is now orphaned — nothing
-                    # tracks it, so it would seed forever consuming bandwidth.
-                    # Best-effort remove it (deleting its files) before refusing the
-                    # parallel grab; if the remove fails we still raise, but log it
-                    # so the leak is visible (honesty over silence).
-                    try:
-                        await qbt.remove(torrent_hash, delete_files=True)
-                    except Exception:
-                        # request_id/torrent_hash trace from the /queue/grab body
-                        # (body.request_id -> the resolved request.id passed here),
-                        # so they go through the same log-safe barriers as every
-                        # other request-derived log value -- CodeQL taints ``extra``
-                        # fields like message args (log-hygiene convention, #35).
-                        _logger.warning(
-                            "failed to remove orphaned torrent after losing a "
-                            "parallel grab for this request; it may keep seeding "
-                            "until removed manually",
-                            exc_info=True,
-                            extra={
-                                "request_id": safe_int(request_id),
-                                "torrent_hash": safe_text(torrent_hash),
-                            },
-                        )
+                    # The other release won the request's single active slot. A
+                    # torrent this grab genuinely created is now orphaned --
+                    # nothing tracks it, so it would seed forever consuming
+                    # bandwidth. Best-effort remove it (deleting its files)
+                    # before refusing the parallel grab -- but ONLY one this
+                    # call actually added (see _remove_torrent_if_added).
+                    await _remove_torrent_if_added(
+                        qbt,
+                        torrent_hash,
+                        actually_added=actually_added,
+                        request_id=request_id,
+                        reason="losing a parallel grab for this request",
+                    )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)
             if winner is None:  # pragma: no cover - the conflicting row must exist
@@ -706,18 +741,13 @@ async def grab(
             # _GRAB_ERRORS park (whose never-un-terminate guard skips a
             # cancelled/available row).
             await session.rollback()
-            try:
-                await qbt.remove(torrent_hash, delete_files=True)
-            except Exception:
-                _logger.warning(
-                    "failed to remove orphaned torrent after the request was "
-                    "cancelled mid-grab; it may keep seeding until removed manually",
-                    exc_info=True,
-                    extra={
-                        "request_id": safe_int(request_id),
-                        "torrent_hash": safe_text(torrent_hash),
-                    },
-                )
+            await _remove_torrent_if_added(
+                qbt,
+                torrent_hash,
+                actually_added=actually_added,
+                request_id=request_id,
+                reason="the request was cancelled or moved on mid-grab",
+            )
             raise RequestNotActiveError(request_id)
     await session.commit()
     return record

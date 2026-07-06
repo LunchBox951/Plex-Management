@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.ports.download_client import (
+    AddResult,
     DownloadClientPort,
     DownloadedFile,
     DownloadStatus,
@@ -196,6 +197,7 @@ class FakeQbittorrent:
         *,
         files: dict[str, list[DownloadedFile]] | None = None,
         source_errors: set[str] | None = None,
+        pre_existing: set[str] | None = None,
     ) -> None:
         self.statuses = statuses or []
         self.files = files or {}
@@ -207,16 +209,21 @@ class FakeQbittorrent:
         # client is healthy, the SOURCE is unusable. The real adapter raises this
         # BEFORE the add POST, so a matched source is NEVER recorded in ``added``.
         self.source_errors = source_errors or set()
+        # Lowercased hashes ``add`` reports as ALREADY PRESENT (the real
+        # adapter's 409 branch): the AddResult comes back ``created=False``, so
+        # a lost-grab cleanup must leave the pre-existing torrent untouched.
+        self.pre_existing = pre_existing or set()
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         if magnet_or_url in self.source_errors:
             raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
         self.added.append((magnet_or_url, save_path, category))
         # Mirror the real adapter: derive the info-hash from the magnet's btih.
         marker = "urn:btih:"
+        torrent_hash = ""
         if marker in magnet_or_url:
-            return magnet_or_url.split(marker, 1)[1].split("&", 1)[0].lower()
-        return ""
+            torrent_hash = magnet_or_url.split(marker, 1)[1].split("&", 1)[0].lower()
+        return AddResult(torrent_hash=torrent_hash, created=torrent_hash not in self.pre_existing)
 
     async def get_status(self, info_hash: str) -> DownloadStatus | None:
         for status in self.statuses:
