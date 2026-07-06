@@ -62,7 +62,7 @@ from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import purge_service, season_request_service
+from plex_manager.services import path_visibility, purge_service, season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -151,6 +151,22 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
     if download_path:
         return download_path
     return None
+
+
+def _resolve_visible_content(content: str) -> str | None:
+    """Container-visible path for a download's resolved content, or ``None``.
+
+    qBittorrent runs on the HOST, so ``content`` (from :func:`_resolve_content`)
+    can be a HOST-namespace path this container cannot see (issue #133) -- e.g.
+    ``/home/lunchbox/Downloads/.plex_manager/...`` when the real, mounted
+    location is ``/downloads/...``. Returns ``content`` unchanged when it
+    already exists here; else suffix-remaps it under the known download mounts
+    (see :mod:`~plex_manager.services.path_visibility`). Pure ``exists()``
+    probes (sync); callers offload via ``asyncio.to_thread``.
+    """
+    return path_visibility.remap_to_visible(
+        content, path_visibility.KNOWN_CONTAINER_MOUNTS, predicate=os.path.exists
+    )
 
 
 def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, int, str]]:
@@ -561,6 +577,20 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
+    visible_content = await asyncio.to_thread(_resolve_visible_content, content)
+    if visible_content is None:
+        # qBittorrent runs on the host: an honest, retryable block instead of the
+        # misleading "no video file found" the empty _resolve_sources scan below
+        # would otherwise produce for a tree this container simply cannot see.
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"download path not visible inside the container (check volume mounts): {content}",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    content = visible_content
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
     if not sources:
         await _block(
@@ -614,6 +644,22 @@ async def _import_download_locked(
     ext = os.path.splitext(src)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
+
+    if not await asyncio.to_thread(os.path.isdir, effective_movies_root):
+        # A configured-but-invisible-in-this-container root (issue #132): never
+        # os.makedirs a phantom in-container tree (_place_file's mkdir below is
+        # unconditional) -- an honest, retryable block instead. Settings' write-time
+        # gate remaps a host-shaped root at save time; this catches a legacy stored
+        # root that predates that gate, and the operator's retry re-resolves fresh.
+        # Runs BEFORE begin_placement so a block here never registers a placement.
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"library root not visible inside the container: {effective_movies_root}",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
 
     # PURGE-vs-IMPORT ordering rule (round 9; stated identically at
     # purge_service's registry): FIRST-REGISTERED WINS, loser defers fast. If an
@@ -874,6 +920,18 @@ async def _import_tv_locked(
             season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
+    visible_content = await asyncio.to_thread(_resolve_visible_content, content)
+    if visible_content is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"download path not visible inside the container (check volume mounts): {content}",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    content = visible_content
 
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
     if not sources:
@@ -985,6 +1043,20 @@ async def _import_tv_locked(
                 relative,
                 current.video.relative_path,
             )
+
+    if not await asyncio.to_thread(os.path.isdir, tv_root):
+        # Mirrors the movie path's root-visibility guard: never os.makedirs a
+        # phantom in-container season tree -- an honest, retryable block instead.
+        # Runs BEFORE begin_placement so a block here never registers a placement.
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"library root not visible inside the container: {tv_root}",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
 
     season_dir = Path(tv_root) / plex_tv_season_relative_dir(request.title, request.year, season)
     # PURGE-vs-IMPORT ordering rule (round 9; stated identically at

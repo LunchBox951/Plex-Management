@@ -438,6 +438,38 @@ async def test_cancel_endpoint_409_service_not_configured_with_active_torrent(
     assert row is not None and row.status == RequestStatus.downloading
 
 
+async def test_report_issue_endpoint_409_media_root_unavailable_is_actionable(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # A configured-but-EMPTY movies_root reads as "not mounted" (_root_is_mounted) --
+    # the Radarr-style unmounted-drive failsafe. The 409 must be an actionable
+    # envelope (message + hint + diagnostics.root), never a bare code.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    root = tmp_path / "movies"
+    root.mkdir()  # configured, but EMPTY -- reads as "not mounted"
+    movie_file = root / "Some Movie (2020).mkv"
+    await _set_setting(sessionmaker_, "movies_root", str(root))
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    override_adapters(app, library=FakeLibrary(), qbt=FakeQbittorrent(), prowlarr=FakeProwlarr([]))
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/report-issue",
+        json={"reason": "bad_quality"},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["detail"] == "media_root_unavailable"
+    assert body["message"]  # non-empty, operator-facing
+    assert body["hint"]  # non-empty, actionable next step
+    assert body["diagnostics"]["root"] == str(root)
+
+
 async def test_report_issue_endpoint_409_when_an_active_sibling_exists(
     app: FastAPI,
     client: httpx.AsyncClient,

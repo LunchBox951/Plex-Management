@@ -187,6 +187,14 @@ class PlexLibraryOption(BaseModel):
     # is set only by the authenticated Settings picker, where the operator's own
     # stored creds make the probe legitimate.
     writable: bool | None = None
+    # A container-visible remap of ``path`` (see ``services.path_visibility``) when
+    # ``path`` is a HOST-namespace location this server can't see under its own
+    # mounts -- e.g. Plex reports ``/home/Media/Movies`` but this container only
+    # sees ``/media/Movies``. ``None`` when ``path`` already resolves here, or no
+    # remap exists. The picker UIs prefer this as the option's STORED value, so
+    # selecting it round-trips a path the write-time gate (setup/settings) accepts
+    # without a second remap.
+    suggested_path: str | None = None
 
 
 ProbeStatusField = Literal["ok", "unreachable"]

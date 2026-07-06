@@ -715,6 +715,13 @@ export interface paths {
          *     the same lockout trap the probe exists to prevent; the PUT that completes
          *     the pair is a verified repoint and revokes then.
          *
+         *     Submitted library roots are likewise gated BEFORE the write loop
+         *     (:func:`_resolve_root_writes`, issue #132): a non-empty root that isn't
+         *     visible to this container (a HOST-namespace path, e.g. from a stale client)
+         *     is 422 ``library_root_unreachable`` with nothing committed; one that IS
+         *     visible only via a container-mount remap is persisted as the REMAPPED path,
+         *     not the raw submitted one.
+         *
          *     After a successful commit, invalidates (issue #93) the cached ``GET /health``
          *     probe for every subsystem whose credential field(s) were ACTUALLY persisted
          *     this call (see :data:`_SUBSYSTEM_CREDENTIAL_FIELDS`) — tracked separately from
@@ -1664,6 +1671,8 @@ export interface components {
              * @enum {string}
              */
             section_type: "movie" | "tv";
+            /** Suggested Path */
+            suggested_path?: string | null;
             /** Title */
             title: string;
             /** Writable */
@@ -3303,13 +3312,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Validation Error */
+            /** @description A submitted library folder isn't visible to this server */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description The Plex server was unreachable */

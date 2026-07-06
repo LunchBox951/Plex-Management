@@ -603,10 +603,13 @@ export function Settings() {
                   {movieLibraries.map((lib) => (
                     <option
                       key={`${lib.section_key}:${lib.path}`}
-                      value={lib.path}
+                      value={lib.suggested_path ?? lib.path}
                       disabled={lib.writable === false}
                     >
                       {lib.title} — {lib.path}
+                      {lib.suggested_path && lib.suggested_path !== lib.path
+                        ? ` · in-container: ${lib.suggested_path}`
+                        : ''}
                       {lib.writable === false ? ' · not writable by the app' : ''}
                     </option>
                   ))}
@@ -666,10 +669,13 @@ export function Settings() {
                   {tvLibraries.map((lib) => (
                     <option
                       key={`${lib.section_key}:${lib.path}`}
-                      value={lib.path}
+                      value={lib.suggested_path ?? lib.path}
                       disabled={lib.writable === false}
                     >
                       {lib.title} — {lib.path}
+                      {lib.suggested_path && lib.suggested_path !== lib.path
+                        ? ` · in-container: ${lib.suggested_path}`
+                        : ''}
                       {lib.writable === false ? ' · not writable by the app' : ''}
                     </option>
                   ))}
@@ -738,10 +744,13 @@ export function Settings() {
                     {movieLibraries.map((lib) => (
                       <option
                         key={`${lib.section_key}:${lib.path}`}
-                        value={lib.path}
+                        value={lib.suggested_path ?? lib.path}
                         disabled={lib.writable === false}
                       >
                         {lib.title} — {lib.path}
+                        {lib.suggested_path && lib.suggested_path !== lib.path
+                          ? ` · in-container: ${lib.suggested_path}`
+                          : ''}
                         {lib.writable === false ? ' · not writable by the app' : ''}
                       </option>
                     ))}
@@ -792,10 +801,13 @@ export function Settings() {
                     {tvLibraries.map((lib) => (
                       <option
                         key={`${lib.section_key}:${lib.path}`}
-                        value={lib.path}
+                        value={lib.suggested_path ?? lib.path}
                         disabled={lib.writable === false}
                       >
                         {lib.title} — {lib.path}
+                        {lib.suggested_path && lib.suggested_path !== lib.path
+                          ? ` · in-container: ${lib.suggested_path}`
+                          : ''}
                         {lib.writable === false ? ' · not writable by the app' : ''}
                       </option>
                     ))}

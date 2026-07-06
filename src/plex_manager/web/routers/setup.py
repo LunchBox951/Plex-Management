@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Final, Literal, cast
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -48,6 +48,8 @@ from plex_manager.adapters.plex.oauth import (
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import SystemSettings, User
+from plex_manager.services import path_visibility
+from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.deps import (
     PLEX_MACHINE_ID_SETTING,
     AuthContext,
@@ -113,13 +115,61 @@ _PLEX_VALIDATE_RESPONSES: dict[int | str, dict[str, Any]] = {
 _COMPLETE_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_AUTH_RESPONSES,
     409: {"model": ErrorDetail, "description": "Setup already initialized"},
+    422: {
+        "model": ErrorEnvelope,
+        "description": "A submitted library folder isn't visible to this server",
+    },
     502: {"model": ErrorEnvelope, "description": "The Plex server was unreachable"},
 }
+
+
+# The library-root fields ``complete`` accepts -- mirrors ``schemas._LIBRARY_ROOT_FIELDS``
+# (kept as a separate tuple: that one is a schema-module private used by a
+# json_schema_extra/model_validator, this one drives the write-time visibility gate).
+_ROOT_FIELDS: Final[tuple[str, ...]] = (
+    "movies_root",
+    "tv_root",
+    "anime_movie_root",
+    "anime_tv_root",
+)
 
 
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
+async def _resolve_submitted_roots(body: SetupCompleteRequest) -> dict[str, str]:
+    """isdir-or-remap every submitted, non-empty library root; 422 on unreachable.
+
+    Returns ``{field: resolved_container_path}`` for the roots this request
+    actually set -- an unset (``None``/``""``) root is skipped entirely, matching
+    ``complete()``'s existing "write only when supplied" persistence. Each
+    resolved value is either the SUBMITTED path unchanged (already visible here)
+    or its container-visible remap (issue #132's Docker host/container split) --
+    never the raw host path, which would otherwise pass a probe-free write and
+    fail every later disk/import/purge probe against a tree this container can't
+    see.
+    """
+    resolved: dict[str, str] = {}
+    for field in _ROOT_FIELDS:
+        value = getattr(body, field)
+        if not value:
+            continue
+        visible = await asyncio.to_thread(
+            remap_to_visible, value, path_visibility.KNOWN_CONTAINER_MOUNTS
+        )
+        if visible is None:
+            raise AppError(
+                status_code=422,
+                code="library_root_unreachable",
+                message=f'The library folder "{value}" isn\'t visible to Plex Manager.',
+                hint="Pick a folder inside a mounted volume (usually under /media), or fix "
+                "the container's volume mounts, then try again.",
+                diagnostics={"root": value, "field": field},
+            )
+        resolved[field] = visible
+    return resolved
+
+
 async def _admin_plex_token(session: AsyncSession, context: AuthContext) -> str:
     """Return the signed-in admin's stored Plex OAuth token, or 409.
 
@@ -232,7 +282,11 @@ async def validate_plex_endpoint(
     admin_token = await _admin_plex_token(session, context)
     plex_tv = await _plex_tv_client(session, client)
     result = await validate_plex(
-        client, body.url, body.token or admin_token, identity_client=plex_tv
+        client,
+        body.url,
+        body.token or admin_token,
+        identity_client=plex_tv,
+        suggest_mounts=path_visibility.KNOWN_CONTAINER_MOUNTS,
     )
     if not result.ok or result.machine_identifier is None:
         return result
@@ -345,6 +399,11 @@ async def complete(
         resources = await plex_tv.fetch_resources(admin_token)
         assert_admin_owns_server(resources, machine_identifier)
 
+    # Every submitted library root must be visible to THIS container (issue #132)
+    # before anything is claimed -- an unreachable/host-shaped root 422s here,
+    # leaving the install fully unclaimed for a corrected retry.
+    resolved_roots = await _resolve_submitted_roots(body)
+
     # Ensure the singleton row (id=1) exists so the conditional update has a target.
     await ensure_system_settings(session)
     now = datetime.now(UTC)
@@ -387,14 +446,10 @@ async def complete(
     # Library roots are independently optional (movie-only, tv-only, mixed, or
     # anime-routed installs are all valid): write a root only when supplied, so an
     # unset root reads back as None from GET /settings rather than an empty string.
-    if body.movies_root:
-        await store.set("movies_root", body.movies_root)
-    if body.tv_root:
-        await store.set("tv_root", body.tv_root)
-    if body.anime_movie_root:
-        await store.set("anime_movie_root", body.anime_movie_root)
-    if body.anime_tv_root:
-        await store.set("anime_tv_root", body.anime_tv_root)
+    # Persist the RESOLVED (container-visible) path -- never the raw submitted one,
+    # which ``_resolve_submitted_roots`` already proved/remapped above.
+    for field, resolved in resolved_roots.items():
+        await store.set(field, resolved)
 
     await session.commit()
     return SetupStatusResponse(initialized=True)

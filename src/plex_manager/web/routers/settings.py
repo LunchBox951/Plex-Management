@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -31,7 +31,9 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, User
 from plex_manager.ports.library import LibraryPort
+from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
+from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     AUTO_GRAB_ENABLED_DEFAULT,
@@ -298,6 +300,49 @@ _SUBSYSTEM_CREDENTIAL_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
+# The library-root fields a PUT can write; mirrors ``routers.setup._ROOT_FIELDS``.
+_ROOT_FIELDS: Final[tuple[str, ...]] = (
+    "movies_root",
+    "tv_root",
+    "anime_movie_root",
+    "anime_tv_root",
+)
+
+
+async def _resolve_root_writes(body: SettingsUpdate) -> dict[str, str]:
+    """isdir-or-remap each root field THIS PUT actually sets to a non-empty value.
+
+    A field absent/``None`` (leave unchanged) or ``""`` (explicit clear --
+    ``SettingsUpdate._blank_root_clears_to_unset`` already maps whitespace to
+    ``""``) is skipped entirely: no probe, and the normal write loop persists it
+    untouched. Raises the same ``library_root_unreachable`` 422 as
+    ``routers.setup._resolve_submitted_roots`` when a non-empty root doesn't
+    resolve here (issue #132) -- checked BEFORE the write loop, so nothing is
+    committed on a rejected root.
+    """
+    resolved: dict[str, str] = {}
+    for field in _ROOT_FIELDS:
+        if field not in body.model_fields_set:
+            continue
+        value = getattr(body, field)
+        if value is None or value == "":
+            continue
+        visible = await asyncio.to_thread(
+            remap_to_visible, value, path_visibility.KNOWN_CONTAINER_MOUNTS
+        )
+        if visible is None:
+            raise AppError(
+                status_code=422,
+                code="library_root_unreachable",
+                message=f'The library folder "{value}" isn\'t visible to Plex Manager.',
+                hint="Pick a folder inside a mounted volume (usually under /media), or fix "
+                "the container's volume mounts, then try again.",
+                diagnostics={"root": value, "field": field},
+            )
+        resolved[field] = visible
+    return resolved
+
+
 def _to_stored_string(value: object) -> str:
     """Render an incoming ``SettingsUpdate`` field value as the plain-text string
     :meth:`SettingsStore.set` persists (``settings.value`` has no typed columns).
@@ -345,7 +390,11 @@ async def plex_libraries_endpoint(
     # to validate_plex (setup wizard + health dashboard) for the identical
     # reason. The warmed fast paths (is_available/scan/watch_state) are
     # untouched and stay on the cached default.
-    return library_options(await library.list_sections(use_cache=False), probe_writable=True)
+    return library_options(
+        await library.list_sections(use_cache=False),
+        probe_writable=True,
+        suggest_mounts=path_visibility.KNOWN_CONTAINER_MOUNTS,
+    )
 
 
 @router.get("/app-key")
@@ -714,6 +763,13 @@ async def put_settings_endpoint(
     the same lockout trap the probe exists to prevent; the PUT that completes
     the pair is a verified repoint and revokes then.
 
+    Submitted library roots are likewise gated BEFORE the write loop
+    (:func:`_resolve_root_writes`, issue #132): a non-empty root that isn't
+    visible to this container (a HOST-namespace path, e.g. from a stale client)
+    is 422 ``library_root_unreachable`` with nothing committed; one that IS
+    visible only via a container-mount remap is persisted as the REMAPPED path,
+    not the raw submitted one.
+
     After a successful commit, invalidates (issue #93) the cached ``GET /health``
     probe for every subsystem whose credential field(s) were ACTUALLY persisted
     this call (see :data:`_SUBSYSTEM_CREDENTIAL_FIELDS`) — tracked separately from
@@ -736,6 +792,9 @@ async def put_settings_endpoint(
     plex_identity_changed, machine_identifier = await _verify_plex_repoint(
         body, session, store, client, context
     )
+    # Likewise verify every submitted library root is visible to THIS container
+    # (issue #132) before anything is written.
+    resolved_roots = await _resolve_root_writes(body)
 
     written_fields: set[str] = set()
     for field in body.model_fields_set:
@@ -744,6 +803,8 @@ async def put_settings_endpoint(
             continue
         if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
             continue
+        if field in resolved_roots:
+            value = resolved_roots[field]
         await store.set(field, _to_stored_string(value))
         written_fields.add(field)
     if plex_identity_changed:

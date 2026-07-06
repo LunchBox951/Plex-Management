@@ -52,6 +52,7 @@ from plex_manager.web.deps import (
     require_admin,
     require_api_key,
 )
+from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
     CreateRequestBody,
     ErrorDetail,
@@ -329,8 +330,14 @@ async def report_issue_endpoint(
             status_code=status.HTTP_409_CONFLICT, detail="active_duplicate"
         ) from exc
     except MediaRootUnavailableError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="media_root_unavailable"
+        raise AppError(
+            status_code=status.HTTP_409_CONFLICT,
+            code="media_root_unavailable",
+            message="The library folder for this title isn't reachable, so it can't be "
+            "re-requested safely.",
+            hint="Check the folder is mounted and visible to Plex Manager "
+            "(Settings → Library), then try again.",
+            diagnostics=({"root": exc.root_path} if exc.root_path else None),
         ) from exc
     return await _to_response(session, updated)
 

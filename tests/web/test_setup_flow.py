@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
 from plex_manager.models import AuthSession, SystemSettings, User
+from plex_manager.services import path_visibility
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
     CSRF_HEADER_NAME,
@@ -171,7 +173,7 @@ def _authenticate(client: httpx.AsyncClient) -> None:
 _CSRF_HEADERS = {CSRF_HEADER_NAME: _CSRF_TOKEN}
 
 
-def _complete_body() -> dict[str, object]:
+def _complete_body(movies_root: str = "/library/movies") -> dict[str, object]:
     # ``plex_token`` deliberately omitted: complete defaults it to the admin's
     # stored OAuth token. ``plex_machine_identifier`` is the wizard's chosen server.
     return {
@@ -183,7 +185,7 @@ def _complete_body() -> dict[str, object]:
         "qbittorrent_username": "admin",
         "qbittorrent_password": "qb-pass-xyz",
         "tmdb_api_key": "tmdb-key-xyz",
-        "movies_root": "/library/movies",
+        "movies_root": movies_root,
     }
 
 
@@ -422,7 +424,7 @@ async def test_complete_requires_a_session(client: httpx.AsyncClient, seed: Seed
 
 
 async def test_complete_is_keyless_and_stores_the_machine_id(
-    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
@@ -433,7 +435,7 @@ async def test_complete_is_keyless_and_stores_the_machine_id(
     )
 
     response = await client.post(
-        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+        "/api/v1/setup/complete", json=_complete_body(str(tmp_path)), headers=_CSRF_HEADERS
     )
 
     assert response.status_code == 200
@@ -453,7 +455,7 @@ async def test_complete_is_keyless_and_stores_the_machine_id(
 
 
 async def test_complete_preserves_the_sign_in_claim_timestamp(
-    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
     # The pre-init sign-in stamped ``setup_started_at``; complete only sets
     # ``setup_completed_at`` and must never overwrite the claim.
@@ -465,7 +467,7 @@ async def test_complete_preserves_the_sign_in_claim_timestamp(
     )
 
     response = await client.post(
-        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+        "/api/v1/setup/complete", json=_complete_body(str(tmp_path)), headers=_CSRF_HEADERS
     )
     assert response.status_code == 200
 
@@ -480,7 +482,7 @@ async def test_complete_preserves_the_sign_in_claim_timestamp(
 
 
 async def test_complete_is_rejected_after_init(
-    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
@@ -489,11 +491,11 @@ async def test_complete_is_rejected_after_init(
     )
 
     first = await client.post(
-        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+        "/api/v1/setup/complete", json=_complete_body(str(tmp_path)), headers=_CSRF_HEADERS
     )
     assert first.status_code == 200
     second = await client.post(
-        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+        "/api/v1/setup/complete", json=_complete_body(str(tmp_path)), headers=_CSRF_HEADERS
     )
     assert second.status_code == 409
     assert second.json()["detail"] == "already_initialized"
@@ -503,7 +505,7 @@ async def test_complete_is_rejected_after_init(
 # POST /setup/complete never trusts the caller's machine id (it re-derives it)
 # --------------------------------------------------------------------------- #
 async def test_complete_ignores_a_forged_machine_id_and_stores_the_derived_one(
-    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
     """A direct API caller pairing server-X creds with server-Y's machine id must
     not poison the stored identity: /complete probes the SUBMITTED server's
@@ -514,7 +516,7 @@ async def test_complete_ignores_a_forged_machine_id_and_stores_the_derived_one(
         app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
     )
 
-    body = {**_complete_body(), "plex_machine_identifier": "forged-other-server-id"}
+    body = {**_complete_body(str(tmp_path)), "plex_machine_identifier": "forged-other-server-id"}
     response = await client.post("/api/v1/setup/complete", json=body, headers=_CSRF_HEADERS)
 
     assert response.status_code == 200
@@ -619,6 +621,61 @@ async def test_complete_unreachable_submitted_server_is_502_and_unclaimed(
 
 
 # --------------------------------------------------------------------------- #
+# POST /setup/complete — every submitted library root must be visible to THIS
+# container (issue #132), gated BEFORE the one-shot claim
+# --------------------------------------------------------------------------- #
+async def test_complete_422_when_a_root_is_not_visible(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
+
+    response = await client.post(
+        "/api/v1/setup/complete",
+        json=_complete_body("/nope/does/not/exist"),
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "library_root_unreachable"
+    async with sessionmaker_() as session:
+        row = await session.get(SystemSettings, 1)
+        assert row is not None
+        assert row.initialized is False  # the one-shot claim was never consumed
+        assert await SettingsStore(session).get("movies_root") is None
+
+
+async def test_complete_remaps_a_host_root_to_the_container_path(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    monkeypatch.setattr(path_visibility, "KNOWN_CONTAINER_MOUNTS", (str(mount),))
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
+
+    response = await client.post(
+        "/api/v1/setup/complete",
+        json=_complete_body("/definitely-not-a-real-host-path/Media/Movies"),
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == str(mount / "Movies")
+
+
+# --------------------------------------------------------------------------- #
 # GET /setup/status — install flag only, never an app key
 # --------------------------------------------------------------------------- #
 async def test_status_has_no_app_api_key_field(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -643,6 +700,7 @@ async def test_configured_setup_token_still_gates_pre_init(
     app: FastAPI,
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
     get_settings.cache_clear()
@@ -654,14 +712,14 @@ async def test_configured_setup_token_still_gates_pre_init(
 
     # A configured hardening token is required BEFORE the session check pre-init.
     missing = await client.post(
-        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+        "/api/v1/setup/complete", json=_complete_body(str(tmp_path)), headers=_CSRF_HEADERS
     )
     assert missing.status_code == 401
     assert missing.json()["detail"] == "invalid_setup_token"
 
     ok = await client.post(
         "/api/v1/setup/complete",
-        json=_complete_body(),
+        json=_complete_body(str(tmp_path)),
         headers={**_CSRF_HEADERS, "X-Setup-Token": "boot-token"},
     )
     assert ok.status_code == 200
@@ -671,7 +729,7 @@ async def test_configured_setup_token_still_gates_pre_init(
 # Post-init sign-in reads the stored machine id (no /identity re-probe)
 # --------------------------------------------------------------------------- #
 async def test_post_init_sign_in_uses_the_stored_machine_id(
-    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
@@ -682,7 +740,7 @@ async def test_post_init_sign_in_uses_the_stored_machine_id(
     )
 
     complete = await client.post(
-        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+        "/api/v1/setup/complete", json=_complete_body(str(tmp_path)), headers=_CSRF_HEADERS
     )
     assert complete.status_code == 200
 

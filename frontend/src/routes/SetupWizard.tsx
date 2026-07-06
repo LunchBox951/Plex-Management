@@ -407,6 +407,11 @@ export function SetupWizard() {
         })}
       </div>
 
+      <p className="mt-4 text-xs text-faint">
+        Folders must be visible to <strong>this</strong> Plex Manager server. If it runs in
+        Docker, pick a path under a mounted volume (usually <code>/media/…</code>).
+      </p>
+
       <LibrarySection
         title="Library"
         blurb="Where imported movies are placed — pick a folder Plex already watches."
@@ -543,8 +548,15 @@ function RootPicker({
         >
           <option value="">{chooseLabel ?? 'Choose a library folder…'}</option>
           {libraries.map((lib) => (
-            <option key={`${lib.section_key}:${lib.path}`} value={lib.path} disabled={lib.writable === false}>
+            <option
+              key={`${lib.section_key}:${lib.path}`}
+              value={lib.suggested_path ?? lib.path}
+              disabled={lib.writable === false}
+            >
               {lib.title} — {lib.path}
+              {lib.suggested_path && lib.suggested_path !== lib.path
+                ? ` · in-container: ${lib.suggested_path}`
+                : ''}
               {lib.writable === false ? ' · not writable by the app' : ''}
             </option>
           ))}

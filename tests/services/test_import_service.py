@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -35,7 +36,13 @@ from plex_manager.models import (
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import eviction_service, import_service, purge_service, queue_service
+from plex_manager.services import (
+    eviction_service,
+    import_service,
+    path_visibility,
+    purge_service,
+    queue_service,
+)
 from plex_manager.services.import_service import (
     import_download,
     run_availability_cycle,
@@ -774,6 +781,128 @@ async def test_import_movies_root_unset_is_an_honest_retryable_block(
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
     assert request is not None and request.status is RequestStatus.import_blocked
+
+
+# ---------------------------------------------------------------------------
+# Container path visibility (issues #131/#132/#133): a configured root or a
+# qbittorrent-reported content path that is a HOST-namespace location this
+# container can't see must block honestly -- NEVER os.makedirs a phantom
+# in-container tree, and NEVER the misleading "no video file found".
+# ---------------------------------------------------------------------------
+async def test_import_blocks_when_library_root_not_visible(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "gone"  # never created
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "library root not visible inside the container" in record.failed_reason
+    # The load-bearing assertion: never os.makedirs a phantom in-container tree.
+    assert not movies_root.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_blocks_when_download_path_not_visible(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    # A HOST-namespace content path (qbt runs on the host) with no match under the
+    # default KNOWN_CONTAINER_MOUNTS -- genuinely invisible from this container.
+    host_content = Path(
+        "/definitely-not-a-real-host-path/downloads/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    )
+    download_id, _ = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, _qbt(host_content), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    # The regression guard vs the misleading "no video file found": this reason
+    # names the REAL problem (a path this container cannot see).
+    assert "download path not visible inside the container" in record.failed_reason
+    assert "no video file" not in record.failed_reason
+
+
+async def test_import_remaps_download_path_under_the_downloads_mount(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    mount = tmp_path / "dl"
+    video = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    monkeypatch.setattr(path_visibility, "KNOWN_CONTAINER_MOUNTS", (str(mount),))
+    # qbt (host-side) reports a HOST path with the SAME basename -- the suffix
+    # that must remap onto the real file under the mount.
+    host_content = Path(
+        "/definitely-not-a-real-host-path/downloads/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    )
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(host_content), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status == RequestStatus.completed
+
+
+async def test_import_retry_after_creating_the_root_heals(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"  # not created yet
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _ = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _qbt(video)
+    library = FakeLibrary()
+
+    blocked = await _import(sessionmaker_, download_id, movies_root, qbt, library)
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+
+    movies_root.mkdir()
+    # The operator's retry re-invokes import_download from scratch, re-reading
+    # the row + roots fresh -- proving the fix, not merely asserting it.
+    healed = await _import(sessionmaker_, download_id, movies_root, qbt, library)
+
+    assert healed is not None
+    assert healed.status == DownloadState.Imported.value
+    assert (movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv").exists()
 
 
 async def test_import_rejects_content_path_outside_qbittorrent_save_path(
@@ -1764,6 +1893,51 @@ async def test_import_tv_root_unset_is_an_honest_retryable_block(
         request = await session.get(MediaRequest, request_id)
     assert season_row is not None and season_row.status.value == "import_blocked"
     assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_tv_blocks_when_tv_root_not_visible(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "gone"  # never created
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "library root not visible inside the container" in record.failed_reason
+    assert not tv_root.exists()  # never os.makedirs a phantom season tree
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_import_tv_blocks_when_download_path_not_visible(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    host_release_dir = Path(
+        "/definitely-not-a-real-host-path/downloads/Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    )
+    download_id, _request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(host_release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "download path not visible inside the container" in record.failed_reason
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None and season_row.status.value == "import_blocked"
 
 
 async def test_import_tv_scan_failure_never_leaves_a_lying_imported_history_row(

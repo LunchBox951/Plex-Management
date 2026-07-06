@@ -4,6 +4,7 @@ import type { DiskRootItem, HealthResponse, SubsystemHealthItem } from '../api/t
 import { Button } from '../components/ui/Button'
 import { Dot, type DotTone } from '../components/ui/Dot'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
+import { LinkButton } from '../components/ui/LinkButton'
 import { useToast } from '../components/ui/toast'
 import type { ApiError } from '../lib/errors'
 import { formatBytes, formatTimestamp } from '../lib/format'
@@ -178,7 +179,13 @@ function DiskRootCard({
       <p className="mt-0.5 truncate font-mono text-[11px] text-faint">{root.path}</p>
 
       {root.error ? (
-        <p className="mt-3 text-xs text-error">{root.error}</p>
+        <div className="mt-3 flex flex-col items-start gap-2">
+          <p className="text-xs text-error">This library folder isn't visible to Plex Manager.</p>
+          <p className="font-mono text-[11px] break-all text-faint">{root.error}</p>
+          <LinkButton variant="secondary" size="sm" to="/settings">
+            Fix in Settings
+          </LinkButton>
+        </div>
       ) : (
         <>
           <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">

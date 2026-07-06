@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibrarySection
+from plex_manager.services import path_visibility
 from plex_manager.web import setup_validation
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
@@ -119,6 +120,48 @@ def test_library_options_probe_flag(tmp_path: Path) -> None:
     # never a fabricated bool — even for a path that does not exist.
     unprobed = library_options([writable, missing], probe_writable=False)
     assert [o.writable for o in unprobed] == [None, None]
+
+
+def test_library_options_suggests_a_container_remap_for_a_host_path(tmp_path: Path) -> None:
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    host_section = LibrarySection(
+        key="1", title="Movies", type="movie", locations=("/host/Media/Movies",)
+    )
+    options = library_options([host_section], suggest_mounts=(str(mount),))
+    assert options[0].path == "/host/Media/Movies"  # the RAW Plex-reported path
+    assert options[0].suggested_path == str(mount / "Movies")
+
+
+def test_library_options_no_suggestion_when_the_path_already_resolves(tmp_path: Path) -> None:
+    already_visible = LibrarySection(
+        key="1", title="Movies", type="movie", locations=(str(tmp_path),)
+    )
+    options = library_options([already_visible], suggest_mounts=("/media",))
+    assert options[0].suggested_path is None
+
+
+def test_library_options_suggestion_probe_original_mirrors_probe_writable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-init (probe_writable=False) must never stat the RAW, caller-supplied
+    path even to compute a suggestion -- the same pre-auth-oracle guard
+    ``probe_writable`` already enforces for writability. Ties the wiring
+    (``probe_original=probe_writable``), not ``remap_to_visible``'s own
+    behavior (covered by ``tests/services/test_path_visibility.py``)."""
+    seen: list[bool] = []
+
+    def spy(path: str, mounts: object, *, predicate: object = None, probe_original: bool = True):  # type: ignore[no-untyped-def]
+        seen.append(probe_original)
+        return None
+
+    monkeypatch.setattr(setup_validation, "remap_to_visible", spy)
+    section = LibrarySection(key="1", title="Movies", type="movie", locations=("/some/path",))
+
+    library_options([section], probe_writable=False, suggest_mounts=("/media",))
+    library_options([section], probe_writable=True, suggest_mounts=("/media",))
+
+    assert seen == [False, True]
 
 
 # --------------------------------------------------------------------------- #
@@ -764,6 +807,43 @@ async def test_validate_plex_does_not_probe_filesystem(
     assert [lib["writable"] for lib in body["libraries"]] == [None, None]
 
 
+async def test_validate_plex_attaches_a_container_suggestion_for_a_host_location(
+    admin_client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Plex section reporting a HOST-namespace location gets a container-visible
+    ``suggested_path`` (issue #132), computed WITHOUT ever stat-ing the raw,
+    caller-supplied path -- pre-init stays a non-oracle (writable stays UNKNOWN)."""
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    monkeypatch.setattr(path_visibility, "KNOWN_CONTAINER_MOUNTS", (str(mount),))
+    probed: list[str] = []
+
+    def spy(path: str) -> bool:
+        probed.append(path)
+        return True
+
+    monkeypatch.setattr(setup_validation, "_is_writable", spy)
+    host_section = {**_MOVIE_SECTION, "Location": [{"path": "/home/Media/Movies"}]}
+    await _use_transport(app, _plex_probe_handler(sections=[host_section]))
+
+    response = await admin_client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400"},
+        headers=_CSRF_HEADERS,
+    )
+
+    body = response.json()
+    assert body["ok"] is True
+    library = body["libraries"][0]
+    assert library["path"] == "/home/Media/Movies"  # the raw Plex-reported path
+    assert library["suggested_path"] == str(mount / "Movies")
+    assert library["writable"] is None  # pre-init never probes writability
+    assert probed == []  # nor was the raw host path ever stat-ed for the option
+
+
 # --------------------------------------------------------------------------- #
 # Settings picker (authenticated) — probes writability, unlike the pre-init step
 # --------------------------------------------------------------------------- #
@@ -790,6 +870,7 @@ async def test_plex_libraries_picker_probes_writability(
             "path": str(tmp_path),
             "section_type": "movie",
             "writable": True,
+            "suggested_path": None,
         },
         {
             "section_key": "2",
@@ -797,5 +878,6 @@ async def test_plex_libraries_picker_probes_writability(
             "path": "/no/tv",
             "section_type": "tv",
             "writable": False,
+            "suggested_path": None,
         },
     ]
