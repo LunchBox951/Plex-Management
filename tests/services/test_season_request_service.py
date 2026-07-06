@@ -317,17 +317,20 @@ async def test_ensure_seasons_never_regresses_a_non_evicted_terminal_season(
     assert {(r.season_number, r.status) for r in records} == {(1, "failed")}
 
 
-async def test_ensure_seasons_re_arm_clears_library_path_and_backoff_on_evicted_reuse(
+async def test_ensure_seasons_re_arm_keeps_library_path_but_resets_backoff(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """#75 regression: re-requesting an EVICTED season must not just flip its
-    status back to pending/available -- it must ALSO clear the library_path
-    eviction breadcrumb and reset the search backoff ladder, exactly mirroring
-    ``reset_for_research``'s report-issue re-arm (ADR-0013/ADR-0014). Before the
-    fix, a re-requested evicted season inherited its stale library_path (a
-    later eviction sweep would misread it as still reclaimable) and its stale
-    search_attempts/next_search_at backoff (throttling the operator's brand-new
-    request exactly like a fresh row never would)."""
+    """#117 regression: re-requesting an EVICTED season resets the search backoff
+    ladder (so the operator's fresh request is not throttled by the evicted run's
+    exhausted attempts) but DELIBERATELY KEEPS the ``library_path`` eviction
+    breadcrumb. The re-arm can land while the eviction purge is still in flight
+    (the claim commits 'evicted' + breadcrumb BEFORE the delete), so the file may
+    still be on disk; the breadcrumb is owned end-to-end by the eviction lifecycle
+    (the finalize clears it after a successful delete, a failed-delete restore/fold
+    keeps it). Clearing it here -- as the earlier #75 re-arm did, mirroring
+    report-issue's already-purged ``reset_for_research`` -- would strand a season
+    folded back to 'available' over a still-present file with NO eviction/report
+    handle, so disk pressure could never reclaim it (the leak #117 closes)."""
     show_id = await _make_show(sessionmaker_, tmdb_id=730)
     async with sessionmaker_() as session:
         await season_request_service.ensure_seasons(
@@ -367,7 +370,10 @@ async def test_ensure_seasons_re_arm_clears_library_path_and_backoff_on_evicted_
             SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
         )
         season_row = (await session.execute(stmt)).scalars().one()
-    assert season_row.library_path is None
+    # The breadcrumb is PRESERVED (owned by the eviction lifecycle, not cleared by
+    # the re-arm) so a folded-back or finalized eviction still has a handle ...
+    assert season_row.library_path == "/media/tv/Some Show/Season 01"
+    # ... while the search backoff ladder IS reset for the operator's fresh request.
     assert season_row.search_attempts == 0
     assert season_row.next_search_at is None
 
@@ -1385,9 +1391,10 @@ async def test_evicted_re_arm_to_pending_does_not_resurrect_stamp_via_stale_down
 
     # Re-request S1 while Plex STILL reports it present: PR 117 deliberately
     # subtracts just-evicted seasons from trusted Plex presence, so this re-arms to
-    # 'pending' (breadcrumb/backoff cleared) instead of trusting a stale in-library
-    # reading. The stale pre-eviction download must NOT back the old stamp, so the
-    # heal clears it.
+    # 'pending' (backoff reset; the eviction breadcrumb is deliberately PRESERVED
+    # -- owned by the eviction lifecycle, #117) instead of trusting a stale
+    # in-library reading. The stale pre-eviction download must NOT back the old
+    # stamp, so the heal clears it.
     library = FakeLibrary(available_tv_seasons={736: frozenset({1})})
     async with sessionmaker_() as session:
         records = await season_request_service.ensure_seasons(
@@ -1411,7 +1418,10 @@ async def test_evicted_re_arm_to_pending_does_not_resurrect_stamp_via_stale_down
             .scalars()
             .one()
         )
-    assert season.library_path is None
+    # The breadcrumb is preserved through the re-arm (#117): this test's eviction
+    # never ran the finalize clear, so the row is still 'evicted' + breadcrumb, and
+    # the re-arm no longer strips it -- the eviction lifecycle owns that clear.
+    assert season.library_path == "/media/tv/Some Show/Season 01"
     assert season.search_attempts == 0
     assert season.next_search_at is None
 

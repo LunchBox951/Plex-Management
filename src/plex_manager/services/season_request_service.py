@@ -338,16 +338,28 @@ async def ensure_seasons(
     every other non-evicted status gets -- the re-request simply dedups onto the
     watchable season, exactly like an already-in-Plex one.
 
-    That re-arm (#75) does not stop at ``set_status``: it also clears the
-    ``library_path`` eviction breadcrumb and resets the search backoff ladder,
-    MIRRORING the existing report-issue re-arm path (:func:`reset_for_research`'s
-    ``clear_library_path``/``schedule_search(search_attempts=0,
-    next_search_at=None)`` pair, cited there as ADR-0013/ADR-0014). Without this
-    a re-requested evicted season could inherit a stale ``library_path`` still
-    pointing at the file the sweep already deleted (a later eviction sweep would
-    misread it as still reclaimable) and/or a stale ``search_attempts``/
-    ``next_search_at`` backoff from the run that led to eviction, throttling the
-    operator's brand-new request exactly like a fresh row never would.
+    That re-arm (#75) does not stop at ``set_status``: it also resets the search
+    backoff ladder (:func:`reset_for_research`'s
+    ``schedule_search(search_attempts=0, next_search_at=None)``, cited there as
+    ADR-0013/ADR-0014) so a stale ``search_attempts``/``next_search_at`` from the
+    run that led to eviction cannot throttle the operator's brand-new request the
+    way it never would a fresh row.
+
+    It deliberately does NOT clear the ``library_path`` eviction breadcrumb -- the
+    one place it diverges from report-issue's ``reset_for_research`` (whose file is
+    already purged by the time it re-arms). This re-arm runs while the eviction
+    purge outcome is still UNKNOWN: the claim commits ``evicted`` + breadcrumb
+    BEFORE the delete (ADR-0012 #67), so a same-row re-request landing in that
+    window finds the file still on disk. The breadcrumb is owned end-to-end by the
+    eviction lifecycle -- the finalize clears it ONLY after a successful delete
+    (``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` covers the re-armed pre-grab
+    statuses, so a successful purge still clears it exactly once); a failed-delete
+    ``_restore_after_failed_delete`` fold KEEPS it (upholding the invariant that an
+    ``available`` row over a live file ALWAYS carries its breadcrumb, or disk
+    pressure / report-issue could never reclaim it); crash recovery finalizes or
+    releases it. Clearing it here would fold a season back to ``available`` over a
+    still-present file with no eviction/report handle whenever the in-flight purge
+    then refuses/errors -- exactly the leak this keeps closed (#117).
 
     The re-arm ALSO heals the parent's ``completed_at``
     (:meth:`SqlRequestRepository.heal_completed_at` -- the same guarded verb
@@ -417,11 +429,18 @@ async def ensure_seasons(
                 record.id, initial_status, frozenset({RequestStatus.evicted.value})
             )
             if rearmed:
-                # Mirrors ``reset_for_research``'s re-arm exactly (see the docstring
-                # above): a fresh request must not inherit the evicted run's
-                # breadcrumb or backoff state.
+                # Reset ONLY the search backoff ladder so the operator's fresh
+                # request is not throttled by the evicted run's exhausted attempts.
+                # The ``library_path`` eviction breadcrumb is deliberately LEFT
+                # ALONE: this re-arm can land while the eviction purge is still
+                # in flight (the claim commits 'evicted' + breadcrumb BEFORE the
+                # delete), so the file may still be on disk. The breadcrumb is
+                # owned by the eviction lifecycle -- the finalize clears it after a
+                # successful delete, a failed-delete restore/fold keeps it, and
+                # crash recovery finalizes/releases it -- so clearing it here would
+                # strand a folded-back live season with no eviction/report handle
+                # (#117). See this function's docstring for the full rationale.
                 await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
-                await season_repo.clear_library_path(record.id)
                 re_armed_evicted = True
             record = await season_repo.get(record.id) or record
         records.append(record)

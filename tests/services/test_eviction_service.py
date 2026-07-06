@@ -2352,6 +2352,172 @@ async def test_failed_season_delete_restores_the_claimed_season_to_available(
         assert show.status is RequestStatus.available  # rollup restored too
 
 
+async def test_failed_season_delete_after_rearm_keeps_the_breadcrumb(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#117: a same-row TV re-request re-arms the claimed season (evicted ->
+    pending) WHILE the eviction purge is still in flight; the purge then errors.
+    The restore folds the season back to 'available' (its file never left disk),
+    and the ``library_path`` breadcrumb MUST survive the whole claim window -- an
+    'available' row over a live file has to keep its eviction/report handle, or
+    disk pressure could never reclaim it. Before the fix the re-arm cleared the
+    breadcrumb during the claim window, leaving a permanently unreclaimable live
+    file behind whenever the in-flight purge failed."""
+    season_dir = tmp_path / "tv" / "Rearm Restore" / "Season 01"
+    episode = season_dir / "Rearm Restore - S01E01.mkv"
+    episode.parent.mkdir(parents=True)
+    episode.write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=811, title="Rearm Restore", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_request_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        ).id
+
+    async def _rearm_then_error(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        # The concurrent re-request lands DURING the purge window: it re-arms the
+        # just-committed 'evicted' claim back to 'pending' (ensure_seasons, the
+        # exact path request_service drives) in its own session, then the purge
+        # errors.
+        async with sessionmaker_() as other:
+            await season_request_service.ensure_seasons(
+                other, None, media_request_id=show_id, tmdb_id=811, seasons=[1]
+            )
+            await other.commit()
+        return PurgeResult(PurgeOutcome.error, 0, "OSError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _rearm_then_error)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Rearm Restore",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(season_dir),
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=811,
+        size_bytes=1024,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert season_dir.exists()  # the purge errored; the file never left disk
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available  # folded back from the re-arm
+    # THE #117 invariant: an 'available' row over a live file always carries its
+    # breadcrumb, so a future eviction / report-issue purge can still reclaim it.
+    assert season_row.library_path == str(season_dir)
+
+
+async def test_successful_season_delete_after_rearm_clears_the_breadcrumb_once(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#117 counterpart: when the purge SUCCEEDS after a same-row re-request
+    re-armed the claimed season, the finalize still clears the (now-preserved)
+    breadcrumb exactly once -- the re-armed pre-grab status is in
+    ``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` -- so the re-grab proceeds over a
+    genuinely-deleted file with no stale handle left behind and a single eviction
+    history row."""
+    season_dir = tmp_path / "tv" / "Rearm Delete" / "Season 01"
+    episode = season_dir / "Rearm Delete - S01E01.mkv"
+    episode.parent.mkdir(parents=True)
+    episode.write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=812, title="Rearm Delete", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_request_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        ).id
+
+    async def _rearm_then_delete(
+        _fs: object, path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        async with sessionmaker_() as other:
+            await season_request_service.ensure_seasons(
+                other, None, media_request_id=show_id, tmdb_id=812, seasons=[1]
+            )
+            await other.commit()
+        shutil.rmtree(path)  # a real, successful delete
+        return PurgeResult(PurgeOutcome.deleted, 1024)
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _rearm_then_delete)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Rearm Delete",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(season_dir),
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=812,
+        size_bytes=1024,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is not None  # the eviction finalized
+    assert not season_dir.exists()  # genuinely deleted
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 812)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.pending  # the re-grab proceeds
+    # The finalize cleared the preserved breadcrumb (the file IS gone now), so a
+    # later sweep never misreads this re-grabbing row as still reclaimable.
+    assert season_row.library_path is None
+    assert len(history) == 1
+    assert history[0].event_type is DownloadHistoryEvent.evicted
+
+
 # --------------------------------------------------------------------------- #
 # Codex round-2 finding 1: crash resumability. The claim commits 'evicted'
 # BEFORE the purge and the finalize clears the breadcrumb AFTER it, so
