@@ -314,6 +314,20 @@ export function SetupWizard() {
     }
   }
 
+  // Returning to the server step clears the picked library roots: they were chosen
+  // from THIS server's reported libraries, so a different server's roots could be
+  // paths it doesn't own — submitting them would write against the wrong server.
+  // They must be re-picked from the NEW server's validate response, so also reset
+  // the manual-path toggles back to the pick-list (ADR-0015 roots).
+  const changeServer = () => {
+    setServer(null)
+    setRoots(EMPTY_ROOTS)
+    setManualPath(false)
+    setManualTvPath(false)
+    setManualAnimeMoviePath(false)
+    setManualAnimeTvPath(false)
+  }
+
   return (
     <Shell>
       {tokenCard}
@@ -324,7 +338,7 @@ export function SetupWizard() {
         <button
           type="button"
           className="shrink-0 text-xs text-gold hover:underline"
-          onClick={() => setServer(null)}
+          onClick={changeServer}
         >
           Change
         </button>

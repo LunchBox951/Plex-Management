@@ -303,6 +303,55 @@ describe('SetupWizard — services (library roots + completion)', () => {
     expect(screen.queryByText(/save your access key/i)).toBeNull()
     await waitFor(() => expect(h.navigate).toHaveBeenCalledWith('/', { replace: true }))
   })
+
+  it('clears picked library roots when the server is changed, forcing re-selection from the new server', async () => {
+    // Server B exposes a DIFFERENT movie library path than server A. A root picked
+    // against A must not survive a server change — it could be a path B doesn't own.
+    const serverBMovies: PlexLibraryOption = {
+      path: '/mnt/serverB/movies',
+      section_key: '9',
+      section_type: 'movie',
+      title: 'Movies B',
+      writable: true,
+    }
+    h.validatePlex.mockReset()
+    h.validatePlex
+      .mockResolvedValueOnce(plexVerifyOk([movieLibrary, tvLibrary])) // server A
+      .mockResolvedValueOnce(plexVerifyOk([serverBMovies])) // server B (after Change)
+
+    render(<SetupWizard />, { wrapper: Wrapper })
+    fireEvent.click(await screen.findByRole('button', { name: /verify server/i }))
+    await screen.findByText('Plex: http://127.0.0.1:32400 — verified ✓')
+
+    // Verify every service so completion gates ONLY on the library root below.
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      fireEvent.click(button)
+    }
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+
+    // Pick a root from server A's libraries — completion becomes enabled.
+    fireEvent.change(screen.getByLabelText('Movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled(),
+    )
+
+    // Change the server, then re-verify (now server B).
+    fireEvent.click(screen.getByRole('button', { name: /change/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /verify server/i }))
+    await screen.findByText('Plex: http://127.0.0.1:32400 — verified ✓')
+
+    // The previously-picked root is gone; it must be re-picked from server B's
+    // libraries, and completion is disabled until then.
+    expect((screen.getByLabelText('Movies library folder') as HTMLSelectElement).value).toBe('')
+    expect(screen.getByRole('button', { name: /complete setup/i })).toBeDisabled()
+
+    // The new root can only come from server B's library list.
+    expect(
+      within(screen.getByLabelText('Movies library folder')).getByText(/Movies B —/),
+    ).toBeInTheDocument()
+  })
 })
 
 describe('SetupWizard — service validation flow', () => {
