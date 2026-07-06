@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
@@ -1111,7 +1112,12 @@ async def test_mark_failed_exhaustion_residual_heals_with_operator_flags(
         download = await session.get(Download, download_id)
     assert download is not None
     assert download.status == "failed_pending"
-    assert download.failed_reason == "operator mark-failed in progress (blocklist=no, remove=no)"
+    # The documented nonce-marker: flags + the owning call's claim token.
+    assert download.failed_reason is not None
+    assert re.fullmatch(
+        r"operator mark-failed in progress \(blocklist=no, remove=no, nonce=\d+\)",
+        download.failed_reason,
+    )
 
     # Next-cycle heal: operator semantics survive the heal.
     qbt = FakeQbittorrent(statuses=[])
@@ -1221,7 +1227,8 @@ async def test_reconcile_strand_without_marker_heals_with_default_semantics(
     request_id, download_id = await _seed_movie_request_and_download(
         sessionmaker_,
         download_status="failed_pending",
-        failed_reason="operator mark-failed in progress (blocklist=maybe, remove=)",
+        # Nonce-less marker: malformed under the round-7 format -> no provenance.
+        failed_reason="operator mark-failed in progress (blocklist=no, remove=no)",
     )
 
     qbt = FakeQbittorrent(statuses=[])
@@ -1768,7 +1775,7 @@ async def test_heal_without_client_completes_only_remove_no_residuals(
             status="failed_pending",
             media_request_id=request_c.id,
             tmdb_id=703,
-            failed_reason="operator mark-failed in progress (blocklist=no, remove=yes)",
+            failed_reason="operator mark-failed in progress (blocklist=no, remove=yes, nonce=901)",
         )
         session.add(download_c)
         # Residual 3: a plain reconcile strand (no marker).
@@ -1888,3 +1895,279 @@ async def test_operator_claim_during_reconcile_delete_is_refused(
     )
     _release_operator_claim(download_id, token)
     assert not queue_service._operator_fail_claims  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# Round 7: durable, predicate-atomic ownership. Every side-effect CAS re-proves
+# ownership (status AND the exact observed/owned failed_reason) in its own
+# WHERE, so no check-then-act window survives an await.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_two_failed_movies(
+    sm: SessionMaker,
+) -> dict[str, tuple[int, int]]:
+    """Two movie requests, each with a beyond-grace downloading torrent.
+
+    Returns hash -> (request_id, download_id); the FIRST seeded row has the lower
+    id and is processed first by the cycle's Phase B/C loops."""
+    hash_x, hash_y = "a" * 40, "b" * 40
+    async with sm() as session:
+        ids: dict[str, tuple[int, int]] = {}
+        for tmdb_id, torrent_hash in ((701, hash_x), (702, hash_y)):
+            request = MediaRequest(
+                tmdb_id=tmdb_id,
+                media_type=MediaType.movie,
+                title=f"Movie {tmdb_id}",
+                status=RequestStatus.downloading,
+            )
+            session.add(request)
+            await session.flush()
+            download = Download(
+                torrent_hash=torrent_hash,
+                status="downloading",
+                media_request_id=request.id,
+                tmdb_id=tmdb_id,
+                first_seen_at=datetime.now(UTC) - timedelta(minutes=11),
+            )
+            session.add(download)
+            await session.flush()
+            ids[torrent_hash] = (request.id, download.id)
+        await session.commit()
+    return ids
+
+
+async def test_operator_claim_mid_phase_c_defers_the_later_completion(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 finding 1: a claim registered while reconcile is INSIDE Phase C
+    (mid ``_handle_failed`` await for an earlier row) still defers the later
+    row's completion -- the per-completion registry check runs immediately before
+    each completion, and the claimed row is left for the operator."""
+    ids = await _seed_two_failed_movies(sessionmaker_)
+    hash_a, hash_b = "a" * 40, "b" * 40
+    b_request_id, b_download_id = ids[hash_b]
+
+    claimed_token: list[int] = []
+    real_source_title_for = queue_service.blocklist_service.source_title_for
+
+    async def _claim_b_then_delegate(session: AsyncSession, torrent_hash: str) -> str | None:
+        # Fires during A's _handle_failed (mid Phase C). Registering B's claim is
+        # a synchronous registry op -- no DB write inside reconcile's open
+        # Phase-C transaction.
+        if not claimed_token:
+            claimed_token.append(
+                _register_operator_claim(
+                    b_download_id, _OperatorFailFlags(blocklist=False, remove_torrent=False)
+                )
+            )
+        return await real_source_title_for(session, torrent_hash)
+
+    monkeypatch.setattr(queue_service.blocklist_service, "source_title_for", _claim_b_then_delegate)
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download_b = await session.get(Download, b_download_id)
+        request_b = await session.get(MediaRequest, b_request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    # A completed; B was deferred to the claim holder mid-Phase-C.
+    assert download_b is not None and download_b.status == "failed_pending"
+    assert request_b is not None and request_b.status is RequestStatus.downloading
+    assert [row.torrent_hash for row in blocklist] == [hash_a]
+
+    # The claiming operator abandons: release; the next cycle heals B (its reason
+    # carries no marker, so reconcile-default semantics apply).
+    _release_operator_claim(b_download_id, claimed_token[0])
+    monkeypatch.setattr(queue_service.blocklist_service, "source_title_for", real_source_title_for)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        download_b = await session.get(Download, b_download_id)
+        request_b = await session.get(MediaRequest, b_request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download_b is not None and download_b.status == "failed"
+    assert request_b is not None and request_b.status is RequestStatus.searching
+    assert sorted(row.torrent_hash or "" for row in blocklist) == [hash_a, hash_b]
+
+
+async def test_newer_restamp_defeats_the_older_terminal_cas(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 finding 2: mark_failed's terminal CAS carries ITS nonce-marker in
+    the WHERE. A newer command that restamps (but does not finish -- its Phase C
+    exhausts) atomically defeats the older call's completion at the database: the
+    older call's blocklist=True must never land after the newer blocklist=False
+    restamp, with no post-CAS token re-check involved."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+
+    async with sessionmaker_() as session:
+        real_commit = session.commit
+        fired = {"done": False}
+
+        async def _commit_then_restamp() -> None:
+            # After the OLDER call's Phase-A commit (no open transaction), run a
+            # NEWER mark_failed whose Phase C exhausts: it restamps the marker
+            # (nonce2, blocklist=no) and leaves the row failed_pending.
+            await real_commit()
+            if not fired["done"]:
+                fired["done"] = True
+                async with sessionmaker_() as newer_session:
+                    _fail_commit_on(newer_session, monkeypatch, {2, 3, 4})
+                    with pytest.raises(OperationalError):
+                        await queue_service.mark_failed(
+                            newer_session,
+                            None,
+                            download_id=download_id,
+                            blocklist=False,  # conflicts with the older blocklist=True
+                            remove_torrent=False,
+                        )
+
+        monkeypatch.setattr(session, "commit", _commit_then_restamp)
+        record = await queue_service.mark_failed(
+            session, None, download_id=download_id, blocklist=True, remove_torrent=False
+        )
+
+    # The older call's terminal CAS missed (marker is now the newer call's): it
+    # yielded -- the row is STILL failed_pending under the newer marker, and the
+    # older call's blocklist=True never landed.
+    assert record.status == "failed_pending"
+    assert record.failed_reason is not None and "blocklist=no" in record.failed_reason
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert blocklist == []
+
+    # The heal completes the residual with the NEWER call's flags.
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None and download.status == "failed"
+    assert download.failed_reason == "marked failed by operator"
+    assert request is not None and request.status is RequestStatus.searching
+    assert blocklist == []  # the newer blocklist=False governed to the end
+
+
+async def test_older_restamp_predicate_misses_a_newer_marker(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-7 finding 3: a marker restamp is a CAS on the exact reason value the
+    caller observed. An older call that observed the PRE-marker reason can no
+    longer clobber a newer call's nonce-marker -- its WHERE misses at the DB and
+    the newer marker survives byte-identical."""
+    _, download_id = await _seed_movie_request_and_download(
+        sessionmaker_, download_status="failed_pending", failed_reason=None
+    )
+    newer_marker = "operator mark-failed in progress (blocklist=no, remove=no, nonce=777)"
+    older_marker = "operator mark-failed in progress (blocklist=yes, remove=yes, nonce=3)"
+
+    async with sessionmaker_() as session:
+        repo = SqlDownloadRepository(session)
+        # The newer call stamps over the observed None -- matches, lands.
+        assert await repo.update_status_if_in(
+            download_id,
+            "failed_pending",
+            frozenset({"failed_pending"}),
+            failed_reason=newer_marker,
+            require_failed_reason=None,
+        )
+        # The older call still believes the reason is None (its stale
+        # observation): the predicate misses; nothing is written.
+        assert not await repo.update_status_if_in(
+            download_id,
+            "failed_pending",
+            frozenset({"failed_pending"}),
+            failed_reason=older_marker,
+            require_failed_reason=None,
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None
+    assert download.failed_reason == newer_marker  # survived byte-identical
+    assert download.status == "failed_pending"
+
+
+class _StampAfterEarlierRemovalQbt(FakeQbittorrent):
+    """Round-7 finding 4's interleave: when the SECOND removal runs, the FIRST
+    row's torrent is already gone -- a nested (exhausting) mark_failed then stamps
+    the FIRST row's marker POST-removal, mid-cycle. The first row's already-built
+    completion must drop at its (predicate-atomic) terminal CAS."""
+
+    def __init__(
+        self,
+        sm: SessionMaker,
+        target_download_id: int,
+        trigger_hash: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._target_download_id = target_download_id
+        self._trigger_hash = trigger_hash
+        self._monkeypatch = monkeypatch
+        self.stamped = False
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        await super().remove(info_hash, delete_files=delete_files)
+        if info_hash == self._trigger_hash and not self.stamped:
+            self.stamped = True
+            async with self._sm() as session:
+                _fail_commit_on(session, self._monkeypatch, {2, 3, 4})
+                with pytest.raises(OperationalError):
+                    await queue_service.mark_failed(
+                        session,
+                        None,
+                        download_id=self._target_download_id,
+                        blocklist=False,
+                        remove_torrent=False,
+                    )
+
+
+async def test_marker_stamped_post_removal_drops_the_stale_completion(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 finding 4: an operator nonce-marker landing AFTER a row's Phase-B
+    removal already ran (but before Phase C) changes ``failed_reason``, so the
+    cycle's stale completion -- built pre-marker with reconcile-default flags --
+    matches 0 rows at its terminal CAS and drops. The residual heals next cycle
+    with the OPERATOR's flags (no blocklist)."""
+    ids = await _seed_two_failed_movies(sessionmaker_)
+    hash_x, hash_y = "a" * 40, "b" * 40  # X removed first, Y second
+    x_request_id, x_download_id = ids[hash_x]
+
+    qbt = _StampAfterEarlierRemovalQbt(sessionmaker_, x_download_id, hash_y, monkeypatch)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download_x = await session.get(Download, x_download_id)
+        request_x = await session.get(MediaRequest, x_request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert qbt.stamped is True
+    # Both removals ran (X's before the marker landed -- the point of the test)...
+    assert set(qbt.removed) == {(hash_x, True), (hash_y, True)}
+    # ...but X's stale completion dropped at the terminal CAS: still failed_pending
+    # under the operator marker; only Y was completed/blocklisted this cycle.
+    assert download_x is not None and download_x.status == "failed_pending"
+    assert download_x.failed_reason is not None
+    assert "blocklist=no" in download_x.failed_reason
+    assert request_x is not None and request_x.status is RequestStatus.downloading
+    assert [row.torrent_hash for row in blocklist] == [hash_y]
+
+    # Next cycle: the marker-carrying residual heals with the OPERATOR's flags.
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+    async with sessionmaker_() as session:
+        download_x = await session.get(Download, x_download_id)
+        request_x = await session.get(MediaRequest, x_request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download_x is not None and download_x.status == "failed"
+    assert download_x.failed_reason == "marked failed by operator"
+    assert request_x is not None and request_x.status is RequestStatus.searching
+    assert [row.torrent_hash for row in blocklist] == [hash_y]  # no X blocklist

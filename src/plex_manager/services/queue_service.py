@@ -50,85 +50,92 @@ reconcilable, above.
 
 Operator provenance — a ``failed_pending`` row carries WHOSE failure it is, so the
 reconcile heal can never override an operator's explicit ``mark_failed`` choices
-(``blocklist=False`` / ``remove_torrent=False``). Two mechanisms compose:
+(``blocklist=False`` / ``remove_torrent=False``). Ownership is DURABLE and
+PREDICATE-ATOMIC (the final protocol form):
 
-* **Single-owner claim tokens** (``_operator_fail_claims``): an in-process
-  ownership protocol over download ids. The contract, honored at EVERY phase
-  boundary:
+* **The nonce-marker is provenance AND durable ownership.** :func:`mark_failed`'s
+  Phase A stamps the exact string ``operator mark-failed in progress
+  (blocklist=yes|no, remove=yes|no, nonce=<token>)`` into the existing
+  ``failed_reason`` column (no schema change) — see ``_operator_fail_marker`` /
+  ``_parse_operator_fail_marker``. The nonce is the registering call's monotonic
+  claim token, so the marker value identifies exactly WHICH call owns the row,
+  durably (it survives crashes and Phase-C exhaustion, unlike the in-process
+  registry).
+* **Every decision-critical mutation is one predicate-atomic CAS.** WHY no
+  check-then-act window remains: each side-effect-committing UPDATE re-proves
+  BOTH the lifecycle position (``status``) AND the ownership (the exact
+  ``failed_reason`` value this actor observed or owns) in the SAME statement's
+  WHERE, so the decision and the write cannot be separated by an await — a
+  concurrent ownership change rewrites ``failed_reason`` and the stale statement
+  then matches 0 rows atomically at the database. Concretely:
 
-  1. ``_register_operator_claim(download_id, flags) -> token`` registers (or
-     REPLACES) the claim and returns a monotonic token — the NEWEST operator
-     command owns the row; an older in-flight call's token silently stops owning.
-     :func:`mark_failed` registers before any Phase-A write. If the operator's
-     own Phase-A CAS loses to a stale snapshot, it re-reads once and ADOPTS a row
-     that is currently at the uncompleted ``failed_pending`` (re-stamping the
-     marker with its flags) instead of 409ing; only a genuinely non-adoptable
-     current state raises.
-  2. :func:`reconcile_and_list` treats a claimed id as INVISIBLE, checked
-     synchronously immediately before each await so a claim registered mid-cycle
-     is still honored: **Phase A** skips the row's transition application
-     entirely (a claim registered before the operator's marker stamp can never
-     have its row moved to an unmarked ``failed_pending`` by reconcile — the
-     operator's own Phase A proceeds uncontested); **Phase B** re-checks per
-     completion immediately before EACH removal await (a claim registered while
-     an earlier hash's removal was awaited protects every later hash) and a
-     claimed completion is DROPPED from the whole cycle, not just its removal —
-     it was built before the operator's marker existed, so even a claim released
-     seconds later must not let this cycle's Phase C apply those stale pre-marker
-     semantics (the residual heals next cycle from the marker, the designed
-     path); **Phase C** re-checks per completion inside the bounded-retry
-     transaction (re-evaluated on every attempt).
-  3. :func:`mark_failed`'s own Phase B and Phase C are TOKEN-GATED: they apply
-     only while its token still owns the claim. A superseded call YIELDS — no
-     removal, no completion side effects; the newer owner completes with ITS
-     flags — and its ``finally`` runs ``_release_operator_claim(id, token)``,
-     which removes the entry ONLY on a token match, so a stale finisher can never
-     clear the newer command's live claim.
-  4. Every yield is backstopped by the marker below: the row is left either still
+  1. **Stamps/restamps are CAS UPDATEs.** The initial stamp rides the
+     status-changing CAS (``downloading`` etc. -> ``failed_pending``); an ADOPT
+     restamp CASes on ``status='failed_pending' AND failed_reason = <the exact
+     value this call observed>``. An older call cannot clobber a newer call's
+     marker — its WHERE misses; it then yields if it no longer owns the registry
+     claim, or (still-owner: only an OLDER stamp can have intervened) re-observes
+     and retries — each competitor's own predicate can never match again after
+     the newer stamp lands, so the loop converges. A stale-snapshot CAS loss
+     against a row that is currently at the uncompleted ``failed_pending``
+     ADOPTS it (re-reads once, restamps) instead of 409ing; only a genuinely
+     non-adoptable state raises.
+  2. **mark_failed's terminal CAS carries ITS marker in the WHERE**
+     (``failed_pending`` -> ``failed`` WHERE ``failed_reason = <my exact
+     nonce-marker>``): a newer restamp defeats the older call atomically at the
+     DB — no post-CAS token re-check exists or is needed. A miss yields, logged;
+     the newer owner (or the heal) completes with the owning flags.
+  3. **Reconcile's terminal CAS carries its OBSERVED reason in the WHERE**
+     (:func:`_handle_failed` via ``_FailureCompletion.observed_failed_reason``):
+     an operator nonce-marker landing during ANY of the cycle's awaits — before
+     Phase C, or even after a Phase-B removal already ran — changes
+     ``failed_reason``, so the stale completion's CAS matches 0 rows and drops,
+     explicitly logged; the marker-carrying residual heals on a later cycle with
+     the owning flags.
+  4. Every yield/drop is backstopped by the marker: the row is left either still
      active (nothing stamped — reconcile resumes normally once unclaimed) or as a
-     marker-carrying ``failed_pending`` residual the heal completes with the
-     owning flags. No yield path strands the row.
-  5. The ONE place later-wins yields to physics, covering BOTH removal actors:
-     once a delete I/O has started the remove decision is irreversible, so
-     ``_register_operator_claim`` REFUSES registration
-     (:class:`RemovalInProgressError` -> HTTP 409 ``removal_in_progress``) while
-     one is in flight — accepting a ``remove_torrent=False`` command then would
-     promise a file the in-flight delete is destroying. **Operator side**:
-     immediately before :func:`mark_failed`'s removal await its claim is flagged
-     removal-in-flight, held until the claim is released (the deletion has
-     happened either way). **Reconcile side**: each automatic Phase-B delete
-     registers its download id in ``_reconcile_removals_in_flight`` for exactly
-     the duration of the delete await; the window closes when the await returns,
-     and reconcile's Phase-C completion proceeds as today (a claim registered
-     after the window defers it as usual). Retry after the in-flight removal
-     resolves.
+     marker-carrying ``failed_pending`` residual whose next completion honors the
+     marker's flags. No yield path strands the row.
 
-  This is safe as in-process state because the deployment is single-process by
-  design (the same assumption ``web/routers/settings.py``'s ``_rotate_lock``
-  documents) and the registry is only ever touched by synchronous dict operations
-  on the one event loop — there is no await inside any read-modify-write, so no
-  lock is needed (a module-level ``asyncio.Lock`` would also bind to the first
-  event loop that acquires it, breaking per-test loops, for zero added safety
-  here).
-* **Persistent marker** (crash/exhaustion provenance): :func:`mark_failed`'s Phase
-  A stamps a structured marker into the existing ``failed_reason`` column (no
-  schema change), the exact string
-  ``operator mark-failed in progress (blocklist=yes|no, remove=yes|no)`` — see
-  ``_operator_fail_marker`` / ``_parse_operator_fail_marker``. A residual that
-  outlives the claim (Phase-C exhaustion, process crash) is re-derived by the
-  reconcile heal WITH the operator's original semantics: ``remove=no`` skips the
-  Phase-B removal, ``blocklist=no`` skips the blocklist row, and the blocklist
-  reason stays ``user_reported`` (the operator vocabulary) rather than ``failed``.
-  Completion replaces the marker with the final human-readable reason ("marked
-  failed by operator"), so the marker never survives on a terminal row. A
-  ``failed_pending`` row whose ``failed_reason`` is absent, unrelated free text, or
-  a malformed marker parses to ``None`` and heals with today's reconcile-default
-  semantics (blocklist + removal) — genuinely reconcile-derived rows are unchanged.
-  When qBittorrent is UNCONFIGURED the reconcile cycle cannot run at all, so the
-  loop instead calls :func:`heal_failed_pending_without_client`: a narrow DB-only
-  Phase C that completes exactly the ``remove=no`` marker residuals (no client
-  I/O needed, by the operator's own choice); every row that needs a removal first
-  waits — logged — for the client to return.
+* **The in-process registry remains ONLY for what the DB cannot express**
+  (``_operator_fail_claims`` + ``_reconcile_removals_in_flight``):
+
+  - **Removal physics (BOTH actors).** Removal is client I/O,
+    not a DB row mutation, so it cannot be predicate-gated: once a delete await
+    has started the remove decision is irreversible, and
+    ``_register_operator_claim`` REFUSES registration
+    (:class:`RemovalInProgressError` -> HTTP 409 ``removal_in_progress``) while
+    one is in flight. Operator side: the claim is flagged removal-in-flight
+    immediately before :func:`mark_failed`'s delete await, held until release.
+    Reconcile side: each automatic Phase-B delete registers its download id in
+    ``_reconcile_removals_in_flight`` for exactly the delete await's duration.
+  - **Pre-stamp invisibility fast-path.** A claim exists from BEFORE the marker
+    is stamped, so reconcile skips claimed ids at every phase boundary (Phase-A
+    transition application; Phase B, where a claimed completion is DROPPED from
+    the whole cycle — it was built pre-marker, so even a claim released seconds
+    later must not let this cycle apply stale semantics; Phase C per completion,
+    every retry attempt). These are fast-path courtesies for the window the
+    marker cannot yet cover — the terminal CAS predicates above remain the
+    authoritative guard.
+  - Registration REPLACES (the newest command owns; older tokens silently stop
+    owning); release and the removal-in-flight flag are token-gated, so a
+    superseded finisher can never clear the newer command's live claim. Safe as
+    in-process state: single-process deployment by design (the same assumption
+    ``web/routers/settings.py``'s ``_rotate_lock`` documents), and the registry
+    is only touched by synchronous dict/set operations on the one event loop —
+    no await inside any read-modify-write, so no lock is needed.
+
+* **Healing honors the marker.** A residual re-derived by
+  :func:`reconcile_and_list` (or, when qBittorrent is unconfigured OR the cycle
+  hits a client outage, by the narrow DB-only
+  :func:`heal_failed_pending_without_client`, which completes exactly the
+  ``remove=no`` marker residuals) runs with the operator's ORIGINAL semantics:
+  ``remove=no`` skips the removal, ``blocklist=no`` skips the blocklist row, and
+  a written blocklist keeps the ``user_reported`` reason. Completion replaces the
+  marker with the final human-readable reason ("marked failed by operator"), so
+  the marker never survives on a terminal row. An absent / free-text / malformed
+  ``failed_reason`` parses to no-provenance and heals with the reconcile-default
+  semantics (blocklist + removal) — genuinely reconcile-derived rows unchanged.
 """
 
 from __future__ import annotations
@@ -232,7 +239,7 @@ class _OperatorFailFlags:
 class _OperatorClaim:
     """One live ownership claim: the monotonic token + the owner's flags.
 
-    ``removal_in_flight`` (protocol step 5): set immediately before the owner's
+    ``removal_in_flight`` (the removal-physics rule): set immediately before the owner's
     torrent-removal await. From that moment the remove decision is PHYSICALLY
     irreversible, so :func:`_register_operator_claim` refuses a replacement while
     it is set — the one place later-wins yields to physics.
@@ -253,7 +260,7 @@ _operator_fail_claims: dict[int, _OperatorClaim] = {}
 
 _claim_tokens = count(1)
 
-# Reconcile-side removal window (protocol step 5 covers BOTH removal actors):
+# Reconcile-side removal window (the removal-physics rule covers BOTH actors):
 # download ids whose AUTOMATIC reconcile-driven Phase-B delete is mid-await.
 # ``_register_operator_claim`` refuses registration during this window for the
 # same physics reason as the operator flag above — an operator
@@ -269,7 +276,7 @@ def _register_operator_claim(download_id: int, flags: _OperatorFailFlags) -> int
 
     REPLACES any existing claim: the newest operator command owns the row (protocol
     step 1) — the superseded call's token silently stops owning, so its later
-    token-gated phases yield. The ONE exception (protocol step 5): while a
+    token-gated phases yield. The ONE exception (the removal-physics rule): while a
     torrent-removal I/O for this download is in flight — EITHER the current
     operator owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
     Phase-B delete (``_reconcile_removals_in_flight``) — the remove decision is
@@ -288,7 +295,7 @@ def _register_operator_claim(download_id: int, flags: _OperatorFailFlags) -> int
 
 
 def _mark_removal_in_flight(download_id: int, token: int) -> None:
-    """Flag the owner's claim as removal-in-flight (protocol step 5), token-gated.
+    """Flag the owner's claim as removal-in-flight (removal-physics rule), token-gated.
 
     Called immediately before the owning mark_failed's ``qbt`` delete await; from
     then until the claim is released, :func:`_register_operator_claim` refuses
@@ -313,12 +320,13 @@ def _owns_operator_claim(download_id: int, token: int) -> bool:
 
 def _is_operator_claimed(download_id: int) -> bool:
     """Whether ANY live operator claim exists for ``download_id`` (reconcile's view:
-    a claimed id is invisible at every phase boundary — protocol step 2)."""
+    a claimed id is invisible at every phase boundary — the pre-stamp
+    invisibility fast-path)."""
     return download_id in _operator_fail_claims
 
 
 def _release_operator_claim(download_id: int, token: int) -> None:
-    """Release the claim, but ONLY if ``token`` still owns it (protocol step 3).
+    """Release the claim, but ONLY if ``token`` still owns it (token-gated release).
 
     A stale finisher (an older superseded call reaching its ``finally``) must never
     clear the NEWER command's live claim — a token mismatch is a silent no-op.
@@ -328,29 +336,42 @@ def _release_operator_claim(download_id: int, token: int) -> None:
         del _operator_fail_claims[download_id]
 
 
-# The persisted provenance marker (module docstring): the EXACT ``failed_reason``
-# string mark_failed's Phase A stamps, and the ONLY form the heal parses. Anything
-# else (absent / free text / malformed) parses to ``None`` -> reconcile-default
-# semantics. Human-readable on purpose: ``failed_reason`` surfaces in the queue UI
-# during the (normally brief) ``failed_pending`` window.
+# The persisted provenance-AND-ownership marker (module docstring): the EXACT
+# ``failed_reason`` string mark_failed's Phase A stamps, and the ONLY form the heal
+# parses. The ``nonce`` is the registering call's monotonic claim token, making the
+# marker a DURABLE ownership record: every side-effect CAS includes the exact
+# marker value in its WHERE, so a newer call's restamp (a different nonce) defeats
+# a stale mutation atomically at the database. Anything else (absent / free text /
+# malformed) parses to ``None`` -> reconcile-default semantics. Human-readable on
+# purpose: ``failed_reason`` surfaces in the queue UI during the (normally brief)
+# ``failed_pending`` window.
 _OPERATOR_FAIL_MARKER_RE: Final = re.compile(
-    r"^operator mark-failed in progress \(blocklist=(yes|no), remove=(yes|no)\)$"
+    r"^operator mark-failed in progress \(blocklist=(yes|no), remove=(yes|no), nonce=(\d+)\)$"
 )
 
 _OPERATOR_FAIL_FINAL_REASON: Final = "marked failed by operator"
 
 
-def _operator_fail_marker(flags: _OperatorFailFlags) -> str:
-    """Render the Phase-A ``failed_reason`` provenance marker for ``flags``."""
+def _operator_fail_marker(flags: _OperatorFailFlags, nonce: int) -> str:
+    """Render the Phase-A ``failed_reason`` marker: provenance flags + owner nonce."""
     return (
         "operator mark-failed in progress "
         f"(blocklist={'yes' if flags.blocklist else 'no'}, "
-        f"remove={'yes' if flags.remove_torrent else 'no'})"
+        f"remove={'yes' if flags.remove_torrent else 'no'}, "
+        f"nonce={nonce})"
     )
 
 
-def _parse_operator_fail_marker(failed_reason: str | None) -> _OperatorFailFlags | None:
-    """Parse a ``failed_reason`` back into operator flags, or ``None``.
+@dataclass(frozen=True)
+class _ParsedOperatorMarker:
+    """A parsed marker: the operator's flags + the owning call's nonce."""
+
+    flags: _OperatorFailFlags
+    nonce: int
+
+
+def _parse_operator_fail_marker(failed_reason: str | None) -> _ParsedOperatorMarker | None:
+    """Parse a ``failed_reason`` back into operator flags + owner nonce, or ``None``.
 
     ``None`` means "no operator provenance" — the row is healed with the
     reconcile-default semantics. Deliberately tolerant: an absent reason, unrelated
@@ -363,9 +384,12 @@ def _parse_operator_fail_marker(failed_reason: str | None) -> _OperatorFailFlags
     match = _OPERATOR_FAIL_MARKER_RE.match(failed_reason)
     if match is None:
         return None
-    return _OperatorFailFlags(
-        blocklist=match.group(1) == "yes",
-        remove_torrent=match.group(2) == "yes",
+    return _ParsedOperatorMarker(
+        flags=_OperatorFailFlags(
+            blocklist=match.group(1) == "yes",
+            remove_torrent=match.group(2) == "yes",
+        ),
+        nonce=int(match.group(3)),
     )
 
 
@@ -382,7 +406,8 @@ class RemovalInProgressError(Exception):
     """A torrent removal is already in flight for this download (HTTP 409,
     ``removal_in_progress``).
 
-    Ownership protocol step 5 — the one place later-wins yields to physics,
+    The ownership protocol's removal-physics rule — the one place later-wins
+    yields to physics,
     covering BOTH removal actors: once a ``qbt`` delete await has started —
     whether an operator mark-failed's Phase B or reconcile's automatic Phase-B
     delete — the remove decision is irreversible, so a mark_failed (whose flags
@@ -549,6 +574,14 @@ class _FailureCompletion:
     an operator decision the heal is finishing. ``download_id`` is what the claim
     registry is checked against at every phase boundary (the pre-B filter, per hash
     immediately before each Phase-B removal await, per completion inside Phase C).
+
+    ``observed_failed_reason`` is the EXACT ``failed_reason`` this completion's
+    provenance was derived from (the row's snapshot value — ``None``, free text, or
+    an operator nonce-marker). The terminal CAS includes it in its WHERE
+    (``require_failed_reason``), making the completion PREDICATE-ATOMIC: if any
+    actor restamped the row after this completion was built (a fresher ownership
+    record), the CAS matches 0 rows and the stale completion drops — the ownership
+    re-proof and the terminal write are one statement.
     """
 
     download_id: int
@@ -556,6 +589,7 @@ class _FailureCompletion:
     blocklist: bool
     remove_torrent: bool
     blocklist_reason: str
+    observed_failed_reason: str | None
 
 
 def _media_type_for_blocklist(
@@ -581,9 +615,10 @@ async def _handle_failed(
     ``None`` if the row has no owning request or the row was already completed by a
     concurrent writer).
 
-    The terminal advance is a CAS (``failed_pending`` -> ``Failed`` only if still
-    ``failed_pending``), and the blocklist + re-arm are GATED on winning it, for two
-    reasons:
+    The terminal advance is a PREDICATE-ATOMIC CAS: ``failed_pending`` -> ``Failed``
+    only while the row is still ``failed_pending`` AND its ``failed_reason`` still
+    equals the exact value this completion's provenance was derived from
+    (``observed_failed_reason``). The blocklist + re-arm are GATED on winning it:
 
     * **Idempotent self-heal.** :func:`reconcile_and_list` re-derives a failed event
       for a row already at ``failed_pending`` (a stranded prior Phase C). Gating on
@@ -593,6 +628,11 @@ async def _handle_failed(
       (external I/O). An operator ``mark_failed`` and the reconcile loop could both
       pick up the same ``failed_pending`` row; only the one that wins the CAS writes
       the blocklist / re-arm -- the loser no-ops.
+    * **No check-then-act window.** An operator nonce-marker landing during ANY of
+      this cycle's awaits changes ``failed_reason``, so this stale completion's CAS
+      matches 0 rows atomically at the database -- the ownership re-proof and the
+      terminal write are the same statement. The drop is logged (below), and the
+      fresher marker's residual heals with ITS flags on a later cycle.
 
     The winning CAS writes ``completion.event.reason`` as the FINAL ``failed_reason``
     -- for an operator-marker residual that is the human-readable
@@ -611,19 +651,29 @@ async def _handle_failed(
         # rather than fail on a row we cannot advance.
         return None
 
-    # Complete the FailedPending -> Failed transition (CAS). The reconciler only
-    # moves the row as far as ``failed_pending``; without this advance the row would
-    # be stranded there -- neither terminal (so it lingers in ``list_active`` and
-    # the queue shows a zombie torrent) nor active (the reconciler skips
-    # ``failed_pending``, only revisiting it via THIS Phase C). A losing CAS means a
-    # concurrent writer already completed it: honor that, write nothing more.
+    # Complete the FailedPending -> Failed transition (predicate-atomic CAS; see
+    # the docstring). The reconciler only moves the row as far as
+    # ``failed_pending``; without this advance the row would be stranded there --
+    # neither terminal (so it lingers in ``list_active`` and the queue shows a
+    # zombie torrent) nor active (the reconciler skips ``failed_pending``, only
+    # revisiting it via THIS Phase C). A losing CAS means a concurrent writer
+    # completed the row OR restamped fresher ownership onto it: honor that, write
+    # nothing more.
     won = await SqlDownloadRepository(session).update_status_if_in(
         record.id,
         DownloadState.Failed.value,
         frozenset({DownloadState.FailedPending.value}),
         failed_reason=event.reason,
+        require_failed_reason=completion.observed_failed_reason,
     )
     if not won:
+        _logger.info(
+            "dropping stale completion of download %s: its terminal CAS matched no "
+            "row (completed by a concurrent writer, or a fresher ownership marker "
+            "was stamped); any marker-carrying residual heals on a later cycle "
+            "with the owning flags",
+            safe_int(completion.download_id),
+        )
         return None
 
     request_repo = SqlRequestRepository(session)
@@ -718,7 +768,7 @@ async def reconcile_and_list(
     transitions_by_id = {transition.download_id: transition for transition in transitions}
     applied_transitions: list[StateTransition] = []
     for row in rows:
-        # Ownership protocol step 2, Phase A: a claimed row is INVISIBLE — apply no
+        # Pre-stamp invisibility fast-path, Phase A: a claimed row is INVISIBLE — apply no
         # transition (and no progress write) to it. Without this, a mark_failed that
         # registered its claim but had not yet stamped the provenance marker could
         # have reconcile move the same row to an UNMARKED ``failed_pending`` first:
@@ -779,25 +829,31 @@ async def reconcile_and_list(
     #      row heals with the operator's ORIGINAL flags (skip removal / skip
     #      blocklist as chosen, ``user_reported`` reason, operator final reason);
     #      anything else heals with reconcile defaults.
-    row_id_by_hash = {r.torrent_hash.lower(): r.id for r in rows}
+    rows_by_hash = {r.torrent_hash.lower(): r for r in rows}
     completions: list[_FailureCompletion] = []
     for event in failed_download_events(applied_transitions, rows, occurred_at=now):
-        event_row_id = row_id_by_hash.get(event.torrent_hash.lower())
-        if event_row_id is None:  # pragma: no cover - events derive from ``rows``
+        event_row = rows_by_hash.get(event.torrent_hash.lower())
+        if event_row is None:  # pragma: no cover - events derive from ``rows``
             continue
         completions.append(
             _FailureCompletion(
-                download_id=event_row_id,
+                download_id=event_row.id,
                 event=event,
                 blocklist=True,
                 remove_torrent=True,
                 blocklist_reason=BlocklistReason.failed.value,
+                # The Phase-A transition CAS never writes ``failed_reason``, so the
+                # cycle-start snapshot value is still the row's current reason; the
+                # terminal CAS re-proves that atomically (an operator marker landing
+                # mid-cycle changes it and defeats this completion at the DB).
+                observed_failed_reason=event_row.failed_reason,
             )
         )
     for row in rows:
         if row.status != DownloadState.FailedPending.value:
             continue
-        operator_flags = _parse_operator_fail_marker(row.failed_reason)
+        marker = _parse_operator_fail_marker(row.failed_reason)
+        operator_flags = marker.flags if marker is not None else None
         completions.append(
             _FailureCompletion(
                 download_id=row.id,
@@ -821,10 +877,14 @@ async def reconcile_and_list(
                     if operator_flags is not None
                     else BlocklistReason.failed.value
                 ),
+                # The exact marker (or free text / None) this provenance came from:
+                # a NEWER nonce-marker restamped after this snapshot defeats this
+                # completion's terminal CAS atomically.
+                observed_failed_reason=row.failed_reason,
             )
         )
 
-    # Live-claim filter (ownership protocol step 2): a row an operator mark_failed
+    # Live-claim filter (pre-stamp invisibility fast-path): a row an operator mark_failed
     # currently has in flight is THAT call's to complete -- skipping it here keeps
     # this cycle's Phase B from removing a torrent the operator said to keep, and
     # its Phase C from stealing the failed_pending -> Failed CAS with the wrong
@@ -857,7 +917,7 @@ async def reconcile_and_list(
     # the Phase C completion below (the row still lands Failed + re-armed). An
     # operator residual whose marker says remove=no is honored: no removal. The
     # claim registry is RE-CHECKED per completion IMMEDIATELY before its removal
-    # await (ownership protocol step 2, Phase B): a claim registered while an
+    # await (pre-stamp invisibility fast-path, Phase B): a claim registered while an
     # EARLIER hash's removal was in flight must protect every later hash -- the
     # pre-loop filter alone is a stale snapshot by the second iteration. A claimed
     # completion is dropped from the WHOLE cycle, not just its removal: it was
@@ -903,7 +963,7 @@ async def reconcile_and_list(
     # in ONE bounded-retry transaction. On exhaustion the rows stay at the reconcilable
     # ``failed_pending`` for a later cycle's strand re-derivation to heal. The claim
     # registry is RE-CHECKED per completion, on EVERY retry attempt (ownership
-    # protocol step 2, Phase C): an operator mark_failed that claimed a row after
+    # invisibility fast-path, Phase C): an operator mark_failed that claimed a row after
     # the Phase-B checks above must not have its completion stolen with the wrong
     # semantics -- skip it; the operator call (or, if it fails, the next cycle's
     # heal) completes it.
@@ -944,7 +1004,7 @@ async def heal_failed_pending_without_client(session: AsyncSession) -> None:
     ``remove=yes`` marker) genuinely needs the client's removal first, so it is
     left for the full reconcile cycle once qBittorrent returns — counted and
     logged, never silently dropped (honesty over silence). Claimed rows are
-    skipped exactly as in :func:`reconcile_and_list` (ownership protocol step 2).
+    skipped exactly as in :func:`reconcile_and_list` (pre-stamp invisibility).
     """
     download_repo = SqlDownloadRepository(session)
     rows = await download_repo.list_active()
@@ -954,8 +1014,8 @@ async def heal_failed_pending_without_client(session: AsyncSession) -> None:
     for row in rows:
         if row.status != DownloadState.FailedPending.value:
             continue
-        flags = _parse_operator_fail_marker(row.failed_reason)
-        if flags is None or flags.remove_torrent:
+        marker = _parse_operator_fail_marker(row.failed_reason)
+        if marker is None or marker.flags.remove_torrent:
             awaiting_client += 1
             continue
         if _is_operator_claimed(row.id):
@@ -970,9 +1030,12 @@ async def heal_failed_pending_without_client(session: AsyncSession) -> None:
                     tmdb_id=row.tmdb_id,
                     occurred_at=now,
                 ),
-                blocklist=flags.blocklist,
+                blocklist=marker.flags.blocklist,
                 remove_torrent=False,
                 blocklist_reason=BlocklistReason.user_reported.value,
+                # The exact nonce-marker this heal is finishing: a fresher restamp
+                # defeats the terminal CAS atomically (see _FailureCompletion).
+                observed_failed_reason=row.failed_reason,
             )
         )
     if awaiting_client:
@@ -1037,14 +1100,20 @@ async def mark_failed(
     The operator's explicit ``blocklist`` / ``remove_torrent`` choices are carried
     as provenance so neither a concurrent reconcile tick nor the later heal can
     override them (module docstring, "Operator provenance"): a single-owner claim
-    TOKEN is registered BEFORE any Phase-A write, so reconcile treats this row as
-    invisible at every one of its phase boundaries while this call is in flight;
-    this call's own Phase B and Phase C apply only while its token still owns the
-    claim (a newer mark_failed on the same row supersedes this one, which then
-    yields), and the ``finally`` release is token-gated so a superseded finisher
-    never clears the newer command's claim. Phase A stamps the structured
-    ``failed_reason`` marker, so a residual that outlives the claim (Phase-C
-    exhaustion, crash) heals with the owning flags.
+    TOKEN is registered BEFORE any Phase-A write (reconcile treats the row as
+    invisible at every one of its phase boundaries while this call is in flight),
+    and the SAME token becomes the nonce inside the ``failed_reason`` marker Phase
+    A stamps — durable ownership. Every mutation of the row is then
+    PREDICATE-ATOMIC: the Phase-A stamp/restamp CASes on the exact reason value
+    this call observed, and the Phase-C terminal CAS advances the row only while
+    ``failed_reason`` still equals this call's own nonce-marker — so a newer
+    command's restamp defeats a stale call at the database itself; the stale call
+    yields (the newer owner completes with ITS flags). Phase B (removal I/O — not
+    expressible as a DB predicate) stays arbitrated by the registry, including the
+    removal-in-flight physics rule. The ``finally`` release is token-gated so a
+    superseded finisher never clears the newer command's claim, and a residual
+    that outlives the claim (Phase-C exhaustion, crash) heals with the owning
+    flags read back from the marker.
     """
     if remove_torrent and qbt is None:
         raise ValueError("mark_failed(remove_torrent=True) requires a qBittorrent client")
@@ -1080,32 +1149,25 @@ async def mark_failed(
             ),
         )
 
-    async def _raise_current_transition() -> None:
-        await session.rollback()
-        latest = await session.get(Download, download_id, populate_existing=True)
-        actual = latest.status if latest is not None else current.value
-        raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
-
     # Ownership protocol (module docstring): register the single-owner claim BEFORE
     # any Phase-A write -- from this point reconcile treats the row as invisible at
-    # all of its phase boundaries -- and hold the returned token; this call's Phase
-    # B/C and its ``finally`` release are gated on the token still owning the claim
-    # (a newer mark_failed on the same row replaces the claim and supersedes this
-    # call). The marker persists the same flags for a residual that outlives the
-    # claim (Phase-C exhaustion / crash).
+    # all of its phase boundaries -- and hold the returned token. The token doubles
+    # as the marker NONCE, making ownership DURABLE: every later mutation re-proves
+    # ownership by including the exact marker in its WHERE, so no check-then-act
+    # window separates the ownership decision from the write.
     flags = _OperatorFailFlags(blocklist=blocklist, remove_torrent=remove_torrent)
-    marker = _operator_fail_marker(flags)
     token = _register_operator_claim(download_id, flags)
+    marker = _operator_fail_marker(flags, token)
+    superseded = False
     try:
         # Route to the pre-terminal ``failed_pending`` pause. The legal graph reaches
         # ``Failed`` only from ``failed_pending``, so an actively Downloading torrent
         # (etc.) must pass through it first. A row ALREADY at ``failed_pending`` (a
         # reconcile detection or a stranded prior attempt) is re-stamped with THIS
-        # call's marker via a same-state CAS instead: the operator's flags now own
-        # the residual (they are the most recent explicit instruction), and a losing
-        # CAS means the row was just completed under us -- surfaced as the same 409
-        # as any other lost race.
+        # call's nonce-marker instead: the operator's flags now own the residual
+        # (they are the most recent explicit instruction).
         adopt = current is DownloadState.FailedPending
+        observed_reason = row.failed_reason
         if not adopt:
             if not is_legal_transition(current, DownloadState.FailedPending):
                 raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
@@ -1120,117 +1182,145 @@ async def mark_failed(
                 # reconcile cycle may have moved the row to ``failed_pending``
                 # (detected, not yet completed) during this call's snapshot -- that
                 # state is ADOPTABLE, exactly like arriving to find it there (the
-                # same-state branch below), so raising a 409 from the stale
-                # ``current`` would refuse a command the operator is fully entitled
-                # to. Adopt it; raise only when the re-read shows a genuinely
-                # non-adoptable state (importing, terminal, ...).
+                # adopt branch below), so raising a 409 from the stale ``current``
+                # would refuse a command the operator is fully entitled to. Adopt
+                # it; raise only when the re-read shows a genuinely non-adoptable
+                # state (importing, terminal, ...).
                 await session.rollback()
                 latest = await session.get(Download, download_id, populate_existing=True)
                 if latest is None or latest.status != DownloadState.FailedPending.value:
                     actual = latest.status if latest is not None else current.value
                     raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
                 adopt = True
+                observed_reason = latest.failed_reason
         if adopt:
-            stamped = await download_repo.update_status_if_in(
-                download_id,
-                DownloadState.FailedPending.value,
-                frozenset({DownloadState.FailedPending.value}),
-                failed_reason=marker,
+            # Predicate-atomic restamp (finding: an older call must not clobber a
+            # newer call's marker): stamp MY nonce-marker over EXACTLY the reason
+            # value this call observed. A miss means another writer got between the
+            # observation and this statement -- the DB, not in-memory state,
+            # decided. Then: (a) no longer the registry owner -> a NEWER command
+            # superseded this one; YIELD (it completes with its flags). (b) still
+            # the owner -> only an OLDER concurrent stamp (or a status move) can
+            # have intervened; re-observe and retry -- an older call's own
+            # predicate can never match again after MY stamp lands, so each
+            # competitor defeats this loop at most once and it converges. A row
+            # that left ``failed_pending`` raises honestly.
+            while True:
+                stamped = await download_repo.update_status_if_in(
+                    download_id,
+                    DownloadState.FailedPending.value,
+                    frozenset({DownloadState.FailedPending.value}),
+                    failed_reason=marker,
+                    require_failed_reason=observed_reason,
+                )
+                if stamped:
+                    break
+                if not _owns_operator_claim(download_id, token):
+                    superseded = True
+                    await session.rollback()
+                    break
+                await session.rollback()
+                latest = await session.get(Download, download_id, populate_existing=True)
+                if latest is None or latest.status != DownloadState.FailedPending.value:
+                    actual = latest.status if latest is not None else current.value
+                    raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
+                observed_reason = latest.failed_reason
+
+        if not superseded:
+            # Phase A commit: the row is at ``failed_pending`` (reconcilable),
+            # carrying THIS call's nonce-marker. The blocklist, the terminal
+            # ``Failed`` advance, and the re-arm are NOT yet written.
+            await session.commit()
+
+            # Phase B: close the seeding leak (ADR-0014) and, per issue #68, remove
+            # the old torrent BEFORE re-arming. Best-effort +
+            # already-gone-is-a-no-op (see ``purge_service.remove_torrent``): a
+            # client hiccup never undoes the committed Phase A, and -- because
+            # removal is logged-not-raised -- never blocks Phase C. ``qbt is not
+            # None`` is guaranteed by the top-of-function guard whenever
+            # ``remove_torrent`` is True; the explicit check narrows the optional
+            # type. The registry fast-path check covers the not-yet-restamped
+            # window of a newer command (removal is I/O -- it cannot be
+            # predicate-gated at the DB, so the registry arbitrates it).
+            # Immediately before the delete await the claim is flagged
+            # removal-in-flight (removal-physics rule): from that point the remove
+            # decision is PHYSICALLY irreversible, so supersession is refused for
+            # the remainder of this call -- the one place later-wins yields to
+            # physics.
+            if remove_torrent and qbt is not None and _owns_operator_claim(download_id, token):
+                _mark_removal_in_flight(download_id, token)
+                await purge_service.remove_torrent(
+                    qbt,
+                    torrent_hash,
+                    context="an operator mark-failed",
+                    extra={"torrent_hash": torrent_hash, "download_id": safe_int(download_id)},
+                )
+
+            # Phase C: complete ``failed_pending`` -> ``Failed`` + optional
+            # blocklist + re-arm, in one bounded-retry transaction. The terminal
+            # CAS is PREDICATE-ATOMIC on this call's own nonce-marker: it advances
+            # the row ONLY while ``failed_reason`` still equals the exact marker
+            # this call stamped, so a newer command's restamp defeats it at the
+            # database itself -- the ownership re-proof and the terminal write are
+            # one statement, with no post-CAS token re-check needed. The winning
+            # CAS replaces the marker with the final human-readable reason. A miss
+            # means a concurrent completer finished the row or a newer command
+            # restamped it: yield, logged. On retry exhaustion the row stays at
+            # the reconcilable ``failed_pending`` WITH the marker, so the
+            # reconcile loop heals it under these same flags.
+            async def _complete_mark_failed() -> None:
+                won = await download_repo.update_status_if_in(
+                    download_id,
+                    DownloadState.Failed.value,
+                    frozenset({DownloadState.FailedPending.value}),
+                    failed_reason=_OPERATOR_FAIL_FINAL_REASON,
+                    require_failed_reason=marker,
+                )
+                if not won:
+                    _logger.info(
+                        "yielding mark-failed completion of download %s: the row was "
+                        "completed by a concurrent writer or restamped by a newer "
+                        "operator command (which completes it with its own flags)",
+                        safe_int(download_id),
+                    )
+                    return
+                if blocklist:
+                    source_title = (
+                        await blocklist_service.source_title_for(session, torrent_hash)
+                        or torrent_hash
+                    )
+                    indexer = await blocklist_service.indexer_for(session, torrent_hash)
+                    request = (
+                        await SqlRequestRepository(session).get(request_id)
+                        if request_id is not None
+                        else None
+                    )
+                    await SqlBlocklistRepository(session).create(
+                        source_title=source_title,
+                        reason=BlocklistReason.user_reported.value,
+                        tmdb_id=request.tmdb_id if request is not None else download_tmdb_id,
+                        torrent_hash=torrent_hash,
+                        indexer=indexer,
+                        # Scope by media namespace (see _handle_failed). Prefer the
+                        # owning request; fall back to metadata or season scope.
+                        media_type=_media_type_for_blocklist(
+                            await download_repo.get_by_hash(torrent_hash),
+                            request.media_type if request is not None else None,
+                        ),
+                    )
+                if rearm is not None:
+                    await _rearm_failed_request(session, rearm)
+
+            await _commit_phase_c_with_retry(
+                session,
+                _complete_mark_failed,
+                context="operator mark-failed",
+                identity=safe_int(download_id),
             )
-            if not stamped:
-                await _raise_current_transition()
-
-        # Phase A commit: the row is at ``failed_pending`` (reconcilable), carrying
-        # the provenance marker. The blocklist, the terminal ``Failed`` advance, and
-        # the re-arm are NOT yet written.
-        await session.commit()
-
-        # Phase B: close the seeding leak (ADR-0014) and, per issue #68, remove the
-        # old torrent BEFORE re-arming. Best-effort + already-gone-is-a-no-op (see
-        # ``purge_service.remove_torrent``): a client hiccup never undoes the
-        # committed Phase A, and -- because removal is logged-not-raised -- never
-        # blocks Phase C. ``qbt is not None`` is guaranteed by the top-of-function
-        # guard whenever ``remove_torrent`` is True; the explicit check narrows the
-        # optional type. TOKEN-GATED (ownership protocol step 3): a newer
-        # mark_failed on this row (registered during the Phase-A awaits) now owns
-        # it, and ITS ``remove_torrent`` choice governs -- a superseded call must
-        # not remove a torrent the newer command said to keep. Immediately before
-        # the delete await the claim is flagged removal-in-flight (protocol step
-        # 5): from that point the remove decision is PHYSICALLY irreversible, so
-        # supersession is refused for the remainder of this call -- the one place
-        # later-wins yields to physics.
-        if remove_torrent and qbt is not None and _owns_operator_claim(download_id, token):
-            _mark_removal_in_flight(download_id, token)
-            await purge_service.remove_torrent(
-                qbt,
-                torrent_hash,
-                context="an operator mark-failed",
-                extra={"torrent_hash": torrent_hash, "download_id": safe_int(download_id)},
-            )
-
-        # Phase C: complete ``failed_pending`` -> ``Failed`` (CAS) + optional
-        # blocklist + re-arm, in one bounded-retry transaction. The winning CAS
-        # replaces the Phase-A marker with the final human-readable reason. A losing
-        # terminal CAS means a concurrent completer already finished this row: honor
-        # it (the operator's intent -- fail the download -- is satisfied) and skip
-        # the duplicate blocklist/re-arm. On retry exhaustion the row stays at the
-        # reconcilable ``failed_pending`` WITH the marker, so the reconcile loop
-        # heals it under these same flags. TOKEN-GATED on every attempt (ownership
-        # protocol step 3): if a newer mark_failed superseded this call, YIELD
-        # without completing -- otherwise this call could win the failed_pending ->
-        # Failed CAS and apply its now-STALE flags over the newer command's.
-        async def _complete_mark_failed() -> None:
-            if not _owns_operator_claim(download_id, token):
-                _logger.info(
-                    "yielding mark-failed completion of download %s: a newer operator "
-                    "mark-failed superseded this call and will complete it",
-                    safe_int(download_id),
-                )
-                return
-            won = await download_repo.update_status_if_in(
-                download_id,
-                DownloadState.Failed.value,
-                frozenset({DownloadState.FailedPending.value}),
-                failed_reason=_OPERATOR_FAIL_FINAL_REASON,
-            )
-            if not won:
-                return
-            if blocklist:
-                source_title = (
-                    await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
-                )
-                indexer = await blocklist_service.indexer_for(session, torrent_hash)
-                request = (
-                    await SqlRequestRepository(session).get(request_id)
-                    if request_id is not None
-                    else None
-                )
-                await SqlBlocklistRepository(session).create(
-                    source_title=source_title,
-                    reason=BlocklistReason.user_reported.value,
-                    tmdb_id=request.tmdb_id if request is not None else download_tmdb_id,
-                    torrent_hash=torrent_hash,
-                    indexer=indexer,
-                    # Scope by media namespace (see _handle_failed). Prefer the owning
-                    # request; fall back to the persisted metadata or season scope.
-                    media_type=_media_type_for_blocklist(
-                        await download_repo.get_by_hash(torrent_hash),
-                        request.media_type if request is not None else None,
-                    ),
-                )
-            if rearm is not None:
-                await _rearm_failed_request(session, rearm)
-
-        await _commit_phase_c_with_retry(
-            session,
-            _complete_mark_failed,
-            context="operator mark-failed",
-            identity=safe_int(download_id),
-        )
     finally:
         # Release the live claim on EVERY exit -- success, a 409'd lost race, or a
         # Phase-C exhaustion -- but ONLY while this call's token still owns it
-        # (ownership protocol step 3): a superseded call's finally must never clear
+        # (token-gated release): a superseded call's finally must never clear
         # the NEWER command's live claim out from under it. After an exhaustion the
         # persisted marker (not the claim) carries the flags to the reconcile heal.
         _release_operator_claim(download_id, token)

@@ -223,7 +223,7 @@ async def test_reconcile_once_heals_db_only_strand_when_qbt_unconfigured(
             media_request_id=request.id,
             tmdb_id=_TMDB_ID,
             year=1999,
-            failed_reason="operator mark-failed in progress (blocklist=no, remove=no)",
+            failed_reason="operator mark-failed in progress (blocklist=no, remove=no, nonce=902)",
         )
         session.add(download)
         await session.commit()
@@ -284,7 +284,7 @@ async def test_reconcile_outage_tick_still_heals_db_only_strand(
             media_request_id=request.id,
             tmdb_id=_TMDB_ID,
             year=1999,
-            failed_reason="operator mark-failed in progress (blocklist=no, remove=no)",
+            failed_reason="operator mark-failed in progress (blocklist=no, remove=no, nonce=902)",
         )
         session.add(download)
         await session.commit()
