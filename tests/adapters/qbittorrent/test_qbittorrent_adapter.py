@@ -1055,6 +1055,20 @@ async def test_add_hex_btih_magnet_is_lowercased_as_is() -> None:
     assert info_hash == MAGNET_HASH
 
 
+async def test_add_invalid_base32_btih_magnet_raises_source_error() -> None:
+    """Issue #90: a 32-char ``btih`` that is NOT valid base32 (``0``/``1``/``8``/``9``
+    are outside the base32 alphabet) is a MALFORMED source, not a hash. It must raise
+    the typed ``QbittorrentSourceError`` -- flowing into the existing source-failure
+    taxonomy -- rather than passing the garbage through as a bogus 'hash' that could
+    never match the client snapshot (ClientMissing forever). No secret leak either."""
+    bad_b32 = "0" * 32  # 32 chars, but '0' is not a base32 digit -> binascii.Error
+    bad_magnet = f"magnet:?xt=urn:btih:{bad_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
 async def test_transport_outage_raises_qbittorrent_error() -> None:
     """qBittorrent unreachable (connection error) surfaces a wrapped, retryable
     QbittorrentError — never an opaque httpx error -> 500."""

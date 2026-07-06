@@ -31,6 +31,7 @@ HTTP->magnet redirect walker, and the 409-as-success behaviour.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -213,15 +214,23 @@ def _normalize_btih(value: str) -> str:
     32-char base32 encoding of the same 20-byte hash. qBittorrent always reports
     the hex form, so a base32 magnet must be decoded to hex — otherwise the stored
     hash never matches the client snapshot and the reconciler treats the torrent as
-    ``ClientMissing`` forever. A 40-char hex value is returned lowercased; any other
-    shape is passed through lowercased (best effort — nothing is swallowed).
+    ``ClientMissing`` forever. A valid 40-char hex value is returned lowercased; a
+    valid 32-char base32 value is decoded to its hex form.
+
+    A 32-char value that is NOT valid base32 is a MALFORMED source, not a hash:
+    raising :class:`QbittorrentSourceError` routes it through the existing typed
+    source-error taxonomy (the manual grab's ``torrent_source_unresolvable`` /
+    auto-grab's per-release source-failure path) rather than passing the garbage
+    through as if it were a real hash — a value that could never match the client
+    snapshot, stranding the download as ``ClientMissing`` forever (north star #3:
+    surface the malformed source, don't swallow it).
     """
     if len(value) == 32:
         try:
             # b32decode raises binascii.Error (a ValueError subclass) on bad input.
             return base64.b32decode(value.upper()).hex()
-        except ValueError:
-            return value.lower()
+        except binascii.Error as exc:
+            raise QbittorrentSourceError("invalid base32 btih in magnet source") from exc
     return value.lower()
 
 
@@ -231,7 +240,10 @@ def _info_hash_from_magnet(magnet: str) -> str | None:
     Total: an UNPARSABLE magnet (an attacker-controlled redirect can supply e.g.
     ``magnet://[::1x/…`` whose bogus netloc makes ``urlparse`` raise ValueError)
     returns ``None`` — no hash derivable — instead of escaping the source-error
-    taxonomy with a raw ValueError.
+    taxonomy with a raw ValueError. A present-but-MALFORMED ``btih`` (invalid
+    base32) instead raises :class:`QbittorrentSourceError` via
+    :func:`_normalize_btih` — a typed source error IN the taxonomy, never garbage
+    passed through as a hash (see that function's docstring).
     """
     try:
         parsed = urlparse(magnet)
