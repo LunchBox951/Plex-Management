@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import { Navigate, Outlet, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { AUTH_INVALID_EVENT, SETUP_REQUIRED_EVENT } from '../api/client'
-import { useSetupStatus } from '../api/hooks'
+import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT, SETUP_REQUIRED_EVENT } from '../api/client'
+import { useAuthMe, useSetupStatus } from '../api/hooks'
 import { queryKeys } from '../lib/queryClient'
 import { Button } from './ui/Button'
 import { CenteredSpinner, StateMessage } from './ui/feedback'
 import { KeyEntry } from './KeyEntry'
+import { PlexLogin } from './PlexLogin'
 
 /**
  * Gate for every authenticated screen. Reads install state and routes:
@@ -20,19 +21,41 @@ export function SetupGate() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { data, isLoading, isError, refetch } = useSetupStatus()
-  const [authFailed, setAuthFailed] = useState(false)
+  const auth = useAuthMe(data?.initialized === true)
+  const [authMode, setAuthMode] = useState<'plex' | 'key'>('plex')
 
   useEffect(() => {
     const onSetupRequired = () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.setupStatus })
       navigate('/setup', { replace: true })
     }
-    const onAuthInvalid = () => setAuthFailed(true)
+    // An access-key 401: the stored key was rejected (the client already cleared
+    // it). Show KeyEntry AND drop the cached "authenticated" answer from that key
+    // — otherwise a stale ``authenticated: true`` from the prior successful key
+    // login keeps rendering <Outlet/> (below) on protected screens that 401 on
+    // every call. Refetching /auth/me (which never 401s — it returns
+    // ``authenticated: false`` for a key-only session) re-derives honest state;
+    // ``authMode === 'key'`` also takes precedence in the render so KeyEntry shows
+    // immediately, before that refetch resolves.
+    const onAuthInvalid = () => {
+      setAuthMode('key')
+      void queryClient.invalidateQueries({ queryKey: queryKeys.authMe })
+    }
+    // A session-cookie 401: the Plex sign-in lapsed. Drop the cached "authenticated"
+    // answer and refetch /auth/me so the gate re-derives state — an expired session
+    // resolves to `authenticated: false` and falls through to the Plex login, rather
+    // than leaving stale authenticated UI stranded on error states with no way back.
+    const onAuthExpired = () => {
+      setAuthMode('plex')
+      void queryClient.invalidateQueries({ queryKey: queryKeys.authMe })
+    }
     window.addEventListener(SETUP_REQUIRED_EVENT, onSetupRequired)
     window.addEventListener(AUTH_INVALID_EVENT, onAuthInvalid)
+    window.addEventListener(AUTH_EXPIRED_EVENT, onAuthExpired)
     return () => {
       window.removeEventListener(SETUP_REQUIRED_EVENT, onSetupRequired)
       window.removeEventListener(AUTH_INVALID_EVENT, onAuthInvalid)
+      window.removeEventListener(AUTH_EXPIRED_EVENT, onAuthExpired)
     }
   }, [navigate, queryClient])
 
@@ -59,9 +82,32 @@ export function SetupGate() {
     return <Navigate to="/setup" replace />
   }
 
-  if (authFailed) {
-    return <KeyEntry onAuthenticated={() => setAuthFailed(false)} />
+  if (auth.isLoading) return <CenteredSpinner label="Checking sign-in…" />
+
+  // KeyEntry takes precedence over a cached ``authenticated: true``: after an
+  // access-key 401 the stored key is gone, so that cached answer is stale and
+  // must not strand the operator on <Outlet/> (see ``onAuthInvalid``).
+  if (authMode === 'key') {
+    return (
+      <KeyEntry
+        onAuthenticated={() => {
+          setAuthMode('plex')
+          void auth.refetch()
+        }}
+        onUsePlex={() => setAuthMode('plex')}
+      />
+    )
   }
 
-  return <Outlet />
+  if (auth.data?.authenticated) {
+    return <Outlet />
+  }
+
+  // usePlexSignIn already seeds /auth/me and invalidates queries on success; the
+  // refetch here re-derives gate state so the newly-authenticated session lands
+  // on <Outlet/> without a reload. onUseAccessKey drops to the KeyEntry recovery
+  // path for a browser locked out of Plex.
+  return (
+    <PlexLogin onSignedIn={() => void auth.refetch()} onUseAccessKey={() => setAuthMode('key')} />
+  )
 }

@@ -7,9 +7,11 @@ import { useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
-import { setApiKey } from '../lib/apiKey'
+import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
 import type {
   AppApiKeyResponse,
+  AppApiKeyStatusResponse,
+  AuthMeResponse,
   BlocklistResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
@@ -21,6 +23,8 @@ import type {
   LogsResponse,
   LogsTailResponse,
   PlexLibraryOption,
+  PlexServersResponse,
+  PlexSignInRequest,
   QualityProfileResponse,
   QueueItem,
   QueueResponse,
@@ -42,6 +46,48 @@ import {
   queryKeys,
 } from '../lib/queryClient'
 
+/* ------------------------------------------------------------------- auth -- */
+
+export function useAuthMe(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.authMe,
+    enabled,
+    retry: false,
+    queryFn: async (): Promise<AuthMeResponse> => unwrap(await client.GET('/api/v1/auth/me')),
+  })
+}
+
+/**
+ * Verify a browser-obtained plex.tv token and mint a session. The browser ran
+ * the plex.tv PIN flow itself (see `lib/plexOAuth`); this posts the resulting
+ * `auth_token` for the backend to re-derive identity + ownership and set the
+ * session cookie. On success the api-key path is dropped and the fresh
+ * `/auth/me` answer is seeded so the gate re-renders authenticated at once.
+ */
+export function usePlexSignIn() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (body: PlexSignInRequest): Promise<AuthMeResponse> =>
+      unwrap(await client.POST('/api/v1/auth/plex', { body })),
+    onSuccess: (data) => {
+      disableApiKeyAuth()
+      qc.setQueryData(queryKeys.authMe, data)
+      void qc.invalidateQueries()
+    },
+  })
+}
+
+export function useLogout() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<void> => ensureOk(await client.POST('/api/v1/auth/logout')),
+    onSuccess: () => {
+      disableApiKeyAuth()
+      void qc.invalidateQueries()
+    },
+  })
+}
+
 /* ------------------------------------------------------------------ setup -- */
 
 export function useSetupStatus() {
@@ -52,7 +98,55 @@ export function useSetupStatus() {
   })
 }
 
-export type SetupService = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb'
+/**
+ * The signed-in admin's OWNED Plex servers, each connection probed by the
+ * backend (`GET /setup/plex/servers`). `enabled` gates the fetch on the wizard
+ * having reached the server-pick step (authenticated) — a pre-auth call would
+ * just 401/409. `retry: false`: a 409 `plex_account_required` (no Plex session
+ * yet) is a normal, honest state the picker surfaces, not a transient worth
+ * retrying.
+ *
+ * `setupToken` makes the query REACT to the per-tab `PLEX_MANAGER_SETUP_TOKEN`.
+ * When the token is required, this endpoint needs `X-Setup-Token` (injected by
+ * the client from sessionStorage); a fresh tab starts with none, so the caller
+ * gates `enabled` on token readiness to avoid firing — and `retry: false` would
+ * otherwise cache that first 401 forever. Folding the token value into the query
+ * key means entering (or correcting) it re-keys the query and triggers a fresh
+ * fetch instead of leaving the operator stranded on a cached error until reload.
+ */
+export function useSetupPlexServers(enabled: boolean, setupToken = '') {
+  return useQuery({
+    queryKey: [...queryKeys.setupPlexServers, setupToken],
+    enabled,
+    retry: false,
+    queryFn: async (): Promise<PlexServersResponse> =>
+      unwrap(await client.GET('/api/v1/setup/plex/servers')),
+  })
+}
+
+/**
+ * Test a candidate Plex server AND assert the signed-in admin owns it
+ * (`POST /setup/validate/plex`). `token` is OPTIONAL: omitted, the backend probes
+ * with the admin's stored Plex OAuth token (the wizard's happy path — a picked
+ * owned server never re-types a token); a supplied `token` is the explicit
+ * custom-credential override. On success the response carries the server's
+ * `machine_identifier` (for `plex_machine_identifier` on complete) and its
+ * `libraries` (to drive the library-root pickers).
+ */
+export function useValidatePlex() {
+  return useMutation({
+    mutationFn: async (body: {
+      url: string
+      token?: string
+    }): Promise<ServiceValidateResponse> =>
+      unwrap(await client.POST('/api/v1/setup/validate/plex', { body })),
+  })
+}
+
+// Plex is NOT here: its connection is verified on the wizard's server step via
+// `useValidatePlex` (owned-server ownership + optional token), never as a typed
+// service card. These are the three card-driven services only.
+export type SetupService = 'prowlarr' | 'qbittorrent' | 'tmdb'
 
 export function useValidateService() {
   return useMutation({
@@ -61,12 +155,6 @@ export function useValidateService() {
       body: Record<string, string>
     }): Promise<ServiceValidateResponse> => {
       switch (args.service) {
-        case 'plex':
-          return unwrap(
-            await client.POST('/api/v1/setup/validate/plex', {
-              body: args.body as { url: string; token: string },
-            }),
-          )
         case 'prowlarr':
           return unwrap(
             await client.POST('/api/v1/setup/validate/prowlarr', {
@@ -144,31 +232,50 @@ export function useUpdateSettings() {
 }
 
 /**
- * Reveal the CURRENT app X-Api-Key in plaintext — the break-glass recovery
- * path for a new device/browser, without re-running setup. On-demand
- * (mutation, not a query) so the key is only ever fetched on an explicit
- * "Reveal" click, never pre-fetched/cached.
+ * Whether an opt-in recovery key currently exists — WITHOUT revealing it (the
+ * status endpoint never carries the plaintext). Drives Settings → Access:
+ * `Generate` when none exists, `Rotate` + `Revoke` once one does.
  */
-export function useRevealAppKey() {
-  return useMutation({
-    mutationFn: async (): Promise<AppApiKeyResponse> =>
-      unwrap(await client.GET('/api/v1/settings/app-key')),
+export function useAppKeyStatus() {
+  return useQuery({
+    queryKey: queryKeys.appKeyStatus,
+    queryFn: async (): Promise<AppApiKeyStatusResponse> =>
+      unwrap(await client.GET('/api/v1/settings/app-key/status')),
   })
 }
 
 /**
- * Mint a brand-new app X-Api-Key, invalidating the old one everywhere. The
- * CALLER'S own stored key must be updated immediately (via setApiKey) or the
- * current session's very next request would 401 with no saved key to fall
- * back to — every OTHER device/browser holding the old key is, correctly,
- * locked out until it's re-paired with the new one.
+ * Mint the app X-Api-Key — GENERATE the first one, or ROTATE an existing key
+ * (the single POST does both; setup mints nothing, ADR-0016). The plaintext is
+ * returned exactly once. The CALLER'S own stored key is updated immediately
+ * (via setApiKey) so the current session survives its own rotation — every
+ * OTHER device holding the old key is, correctly, locked out until re-paired.
+ * The status query is invalidated so the Access card flips to Rotate/Revoke.
  */
 export function useRotateAppKey() {
+  const qc = useQueryClient()
   return useMutation({
     mutationFn: async (): Promise<AppApiKeyResponse> =>
       unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
     onSuccess: (data) => {
       setApiKey(data.app_api_key)
+      void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
+    },
+  })
+}
+
+/**
+ * Revoke the app X-Api-Key: the shared key is cleared server-side, locking out
+ * every device holding it (browser Plex-session auth is unaffected). Nothing is
+ * written into THIS browser's own key store — there is no new key. Invalidates
+ * the status query so the Access card flips back to Generate.
+ */
+export function useRevokeAppKey() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<void> => ensureOk(await client.DELETE('/api/v1/settings/app-key')),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
     },
   })
 }
@@ -357,9 +464,15 @@ export function useSearchPreview() {
 
 /* ------------------------------------------------------------------ queue -- */
 
-export function useQueue(options?: { poll?: boolean }) {
+/**
+ * The download queue. `enabled: false` keeps the query entirely idle — the
+ * TitleDetailModal passes the caller's admin bit here, since `GET /queue` is
+ * admin-only (`require_admin`) and a shared session would just collect 403s.
+ */
+export function useQueue(options?: { poll?: boolean; enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.queue,
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<QueueResponse> => unwrap(await client.GET('/api/v1/queue')),
     refetchInterval: options?.poll ? POLL_INTERVAL_MS : false,
   })

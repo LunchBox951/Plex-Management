@@ -108,10 +108,21 @@ def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -
       multi-season pack is ultimately un-grabbable -- they only agree on WHICH
       gate surfaces WHY.
     - ``"single_episode"`` -> ``True`` iff the file's own episode number(s)
-      (normalized via :func:`episode_numbers`) overlap ``requested`` at all — a
-      multi-episode file with even partial overlap is kept, mirroring
-      :func:`plex_manager.domain.import_validation.validate_season_import`'s
-      ``skipped_not_requested`` posture at import time.
+      (normalized via :func:`episode_numbers`) COVER the WHOLE requested set —
+      ``set(requested).issubset(...)`` (issue #70). ANY-overlap (the old posture)
+      let an ``S02E04`` single-episode release pass an ``episodes=[4, 5]`` request,
+      so the engine could grab a partial release and then block import because
+      import validation requires EVERY requested episode. Requiring full coverage
+      here means a partial single-episode release is rejected at preview, and a
+      complete multi-episode release / pack wins instead. A multi-episode file may
+      still carry MORE episodes than requested (its extras ride along, a file
+      cannot be split) — only the requested episodes must all be present.
+
+      *Accepted gap (not handled here):* anime absolute numbering and specials
+      (season-0/E00) are NOT normalized against the requested set — an absolute-
+      numbered anime release whose parsed episode(s) don't line up with the
+      canonical requested numbers can still be under-covered. Building an
+      absolute<->canonical numbering table is out of scope for this fix.
     - ``"unknown"`` (no season at all) -> ``False``. Conservative: mirrors the
       posture already used by the missing-season identity gate and the
       importer's ``NO_EPISODE_NUMBER`` rule -- an unparseable release is never
@@ -121,6 +132,10 @@ def covers_requested_episodes(parsed: ParsedRelease, requested: Sequence[int]) -
     if scope in ("season_pack", "multi_season_pack"):
         return True
     if scope == "single_episode":
-        requested_set = set(requested)
-        return not requested_set.isdisjoint(episode_numbers(parsed.episode))
+        # Full-coverage (superset) gate, NOT any-overlap (issue #70): the release's
+        # own episode set must contain EVERY requested episode. A multi-episode file
+        # may carry more than requested (extras ride along), but a partial single-
+        # episode release (S02E04 for a requested {4, 5}) is rejected here rather
+        # than grabbed and later blocked at import for the missing episode.
+        return set(requested).issubset(episode_numbers(parsed.episode))
     return False

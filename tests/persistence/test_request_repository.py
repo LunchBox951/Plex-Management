@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.models import User
 from plex_manager.repositories import SqlRequestRepository
 
 # The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
@@ -162,6 +163,64 @@ async def test_partial_unique_index_scoped_by_media_type(session: AsyncSession) 
     await repo.create(tmdb_id=700, media_type="movie", title="M", status="pending")
     tv = await repo.create(tmdb_id=700, media_type="tv", title="T", status="pending")
     assert tv.id > 0
+
+
+async def test_find_in_library_prefers_own_then_ownerless_then_newest_foreign(
+    session: AsyncSession,
+) -> None:
+    """``prefer_user_id`` reorders WHICH terminal row wins when several exist:
+    the caller's OWN row first (even when it is the oldest), then an ownerless
+    claimable one, then anyone else's — while the unscoped default keeps the
+    pre-preference newest-row-wins behavior for admins/API-key automation."""
+    repo = SqlRequestRepository(session)
+    mine = User(username="mine")
+    other = User(username="other")
+    stranger = User(username="stranger")
+    session.add_all([mine, other, stranger])
+    await session.flush()
+
+    own_oldest = await repo.create(
+        tmdb_id=64, media_type="movie", title="Own", status="available", user_id=mine.id
+    )
+    ownerless_mid = await repo.create(
+        tmdb_id=64, media_type="movie", title="Ownerless", status="available"
+    )
+    foreign_newest = await repo.create(
+        tmdb_id=64, media_type="movie", title="Foreign", status="available", user_id=other.id
+    )
+
+    # Unscoped (admins / API-key automation): the newest row wins, as before.
+    unscoped = await repo.find_in_library(64, "movie")
+    assert unscoped is not None and unscoped.id == foreign_newest.id
+
+    # The caller's own row outranks BOTH newer rows.
+    preferred = await repo.find_in_library(64, "movie", prefer_user_id=mine.id)
+    assert preferred is not None and preferred.id == own_oldest.id
+
+    # A caller with NO row of their own: the ownerless row beats the foreign one.
+    claimable = await repo.find_in_library(64, "movie", prefer_user_id=stranger.id)
+    assert claimable is not None and claimable.id == ownerless_mid.id
+
+
+async def test_find_in_library_preference_picks_newest_within_a_rank(
+    session: AsyncSession,
+) -> None:
+    """Ties inside one ownership rank keep the newest-by-id order — the
+    preference only reorders BETWEEN ranks, matching the unscoped behavior."""
+    repo = SqlRequestRepository(session)
+    mine = User(username="rank-mine")
+    session.add(mine)
+    await session.flush()
+
+    await repo.create(
+        tmdb_id=65, media_type="movie", title="Older own", status="available", user_id=mine.id
+    )
+    newer_own = await repo.create(
+        tmdb_id=65, media_type="movie", title="Newer own", status="available", user_id=mine.id
+    )
+
+    preferred = await repo.find_in_library(65, "movie", prefer_user_id=mine.id)
+    assert preferred is not None and preferred.id == newer_own.id
 
 
 async def test_set_status_updates(session: AsyncSession) -> None:

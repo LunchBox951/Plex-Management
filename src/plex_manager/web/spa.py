@@ -26,10 +26,15 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ASSETS_DIR = _STATIC_DIR / "assets"
 _INDEX_FILE = _STATIC_DIR / "index.html"
 
-# Paths the SPA fallback must NOT answer — they belong to the API/docs surface and
-# should 404 honestly when unmatched instead of silently returning the shell.
-_NON_SPA_PREFIXES = ("api/",)
-_NON_SPA_EXACT = frozenset({"health", "docs", "redoc", "openapi.json"})
+# Paths the SPA fallback must NOT answer — they belong to the API/docs/assets
+# surface and should 404 honestly when unmatched instead of silently returning
+# the shell. Prefixes cover any subpath under a reserved mount (e.g. a mistyped
+# ``/docs/nope`` or a missing ``/assets/foo.js`` when the assets dir isn't
+# mounted); the exact set covers the bare mount path itself (e.g. ``/api`` with
+# no trailing segment, which is never a real route since every API route lives
+# under ``/api/v1/...``).
+_NON_SPA_PREFIXES = ("api/", "docs/", "redoc/", "assets/")
+_NON_SPA_EXACT = frozenset({"health", "docs", "redoc", "openapi.json", "api", "assets"})
 
 
 def spa_is_built() -> bool:

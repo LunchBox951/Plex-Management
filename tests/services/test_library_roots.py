@@ -50,6 +50,25 @@ def test_trailing_slash_and_dot_segments_are_normalized() -> None:
     )
 
 
+def test_filesystem_root_contains_absolute_children() -> None:
+    # "/" as a configured root must not build the never-matching "//" prefix
+    # (root_norm + os.sep) that fails closed for every child.
+    assert deepest_containing_root("/media/x.mkv", ["/"]) == "/"
+    assert deepest_containing_root("/media/x.mkv", []) is None  # sanity: no roots -> None
+
+
+def test_filesystem_root_is_shallower_than_any_nested_root() -> None:
+    # A more specific configured root alongside "/" must still win as "deepest",
+    # matching the ordinary nested-root semantics.
+    path = "/media/movies/Film.mkv"
+    assert deepest_containing_root(path, ["/", "/media/movies"]) == "/media/movies"
+    assert deepest_containing_root(path, ["/media/movies", "/"]) == "/media/movies"
+
+
+def test_filesystem_root_itself_is_owned_by_it() -> None:
+    assert deepest_containing_root("/", ["/"]) == "/"
+
+
 def test_configured_lists_only_set_roots_in_declaration_order() -> None:
     roots = LibraryRoots(movies="/m", anime_tv="/at")
     assert roots.configured() == ("/m", "/at")

@@ -166,7 +166,7 @@ async def remove_torrent(
     *,
     context: str,
     extra: dict[str, object] | None = None,
-) -> None:
+) -> bool:
     """Best-effort ``qbt.remove(delete_files=True)`` — closes the seeding leak.
 
     A blocklisted / cancelled / reported download must not keep seeding and
@@ -175,6 +175,13 @@ async def remove_torrent(
     (honesty over silence) but never raised: the caller's blocklist/status writes
     have already committed and must not be undone by a client hiccup — the leak is
     made VISIBLE in the log rather than aborting the correction.
+
+    Returns whether the client call SUCCEEDED (an already-gone hash counts as
+    success). ``queue_service`` uses this to persist the removal outcome into its
+    provenance marker (``remove=done``): a durable "already removed" record must
+    only be written for a removal that actually happened, so a client hiccup
+    returns ``False`` and the marker keeps saying the removal is still owed.
+    Callers that only need the best-effort behaviour may ignore the result.
 
     ``context`` is a static caller description, logged verbatim (never an
     interpolated request-derived string — log-injection convention); the
@@ -194,3 +201,5 @@ async def remove_torrent(
             exc_info=True,
             extra=extra,
         )
+        return False
+    return True

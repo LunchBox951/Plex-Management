@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Any, Literal, cast
 
 import httpx
 from fastapi import APIRouter, FastAPI
@@ -29,7 +29,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings, validate_startup_exposure
+from plex_manager.config import get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -48,6 +48,7 @@ from plex_manager.services.health_service import (
 )
 from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
+    SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
     ensure_system_settings,
     get_anime_movie_root_optional,
@@ -70,7 +71,9 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_tv_root_optional,
 )
+from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.middleware import SetupGuardMiddleware
+from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
 from plex_manager.web.routers import ops as ops_router
@@ -229,6 +232,22 @@ async def _reconcile_once(app: FastAPI) -> None:
                     "running availability pass anyway",
                     type(exc).__name__,
                 )
+                # A remove=no operator residual needs NO client I/O, so an OUTAGE
+                # must not strand it for the outage's whole duration any more than
+                # an unconfigured client may (the branch below) -- run the same
+                # narrow DB-only heal on the rolled-back session; rows that need a
+                # removal keep waiting for the client to recover (counted + logged
+                # inside the heal, never silently dropped).
+                await queue_service.heal_failed_pending_without_client(session)
+        else:
+            # DB-only strand heal (queue_service module docstring, "Operator
+            # provenance"): with qBittorrent UNCONFIGURED the reconcile cycle above
+            # never runs, so a remove=no operator residual (mark_failed with
+            # remove_torrent=False -- which by the operator's own choice needs NO
+            # client I/O) would otherwise sit at failed_pending forever on exactly
+            # the installs that path exists for. Rows needing a removal still wait
+            # for the client (logged inside the heal, never silently dropped).
+            await queue_service.heal_failed_pending_without_client(session)
 
         # Availability promotion (completed -> available) needs ONLY Plex, so it runs
         # even when qBittorrent is down or the Movies root was cleared after an
@@ -672,19 +691,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         system = await ensure_system_settings(session)
         initialized = system.initialized
         await session.commit()
-    # Uniform launch-path guard (Codex PR #21): every launch path — the console
-    # entry point / Docker entrypoint AND anything serving
-    # ``plex_manager.web.app:app`` directly — passes through this lifespan, so
-    # enforcing here (and ONLY here) means advertisement and enforcement cannot
-    # diverge. Tokenless + bypass-off would otherwise deadlock first-run setup
-    # (the pre-init gate 401s every call while /setup/status honestly advertises
-    # no token) — and loosening pre-init auth instead would expose the
-    # validate/* SSRF probes and let anyone who can reach the port claim the
-    # install. Enforced AFTER the ``initialized`` read because only a
-    # FIRST-RUN-CAPABLE server is refused: an initialized install is API-key
-    # gated everywhere and never consults the setup token again, so it must
-    # keep restarting/upgrading tokenless.
-    validate_startup_exposure(get_settings(), initialized=initialized)
     prepare_encryption(initialized=initialized)
 
     app.state.http_client = create_upstream_http_client()
@@ -719,6 +725,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         log_capture_service.stop_logging(log_handler)
 
 
+def _install_cookie_security_scheme(app: FastAPI) -> None:
+    """Advertise the ``plexmgr.session`` cookie as a first-class auth scheme.
+
+    Every protected route accepts EITHER the ``X-Api-Key`` header (the recovery/
+    automation credential) OR the browser session cookie (the normal path — see
+    ``deps.authenticate_request``), but FastAPI only emits the ``APIKeyHeader``
+    scheme it can see as an explicit dependency. That leaves the exported contract
+    dishonest: a client generated from it would believe cookie auth does not exist
+    and that ``/auth/logout`` needs an api key. This wraps ``app.openapi`` to add the
+    ``APIKeyCookie`` scheme and rewrite each api-key-secured operation's requirement
+    to the honest OR (``[{APIKeyHeader}, {APIKeyCookie}]``) — a *list* of
+    alternatives, not a single object (which OpenAPI reads as AND / both-required).
+    """
+    default_openapi = app.openapi
+    api_key_only: list[dict[str, list[str]]] = [{"APIKeyHeader": []}]
+    api_key_or_cookie: list[dict[str, list[str]]] = [
+        {"APIKeyHeader": []},
+        {"APIKeyCookie": []},
+    ]
+
+    def openapi_with_cookie() -> dict[str, Any]:
+        schema = default_openapi()
+        components: dict[str, Any] = schema.get("components", {})
+        schemes: dict[str, Any] | None = components.get("securitySchemes")
+        if schemes is None or "APIKeyCookie" in schemes:
+            return schema
+        schemes["APIKeyCookie"] = {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": SESSION_COOKIE_NAME,
+        }
+        paths: dict[str, Any] = schema.get("paths", {})
+        for path_item in paths.values():
+            operations: dict[str, Any] = path_item
+            for value in operations.values():
+                if not isinstance(value, dict):
+                    continue
+                operation = cast(dict[str, Any], value)
+                if operation.get("security") == api_key_only:
+                    operation["security"] = api_key_or_cookie
+        return schema
+
+    app.openapi = openapi_with_cookie
+
+
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
@@ -726,8 +777,12 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:
         app.add_exception_handler(adapter_error, _adapter_error_handler)
+    # Structured auth/setup failures (north star #3): AppError + the plex.tv
+    # verification error render the code+message+hint+diagnostics envelope.
+    install_error_handlers(app)
     app.include_router(router)
     app.include_router(setup_router.router)
+    app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
     app.include_router(requests_router.router)
@@ -736,6 +791,7 @@ def create_app() -> FastAPI:
     app.include_router(blocklist_router.router)
     app.include_router(quality_profile_router.router)
     app.include_router(ops_router.router)
+    _install_cookie_security_scheme(app)
     # Mount the built SPA LAST so its catch-all fallback has the lowest match
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
     mount_spa(app)
