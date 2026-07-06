@@ -65,8 +65,8 @@ const SHOW: DiscoverResult = {
   library_state: 'none',
 }
 
-// Exact-string matches: the enclosing PosterCard role="button" folds this aria-label
-// into its own name-from-content, so a loose /request/ regex would be ambiguous.
+// Exact-string matches select the quick-request action, not the card details
+// button that includes the same title in its accessible name.
 const REQUEST_MOVIE = 'Request Fresh Movie'
 const REQUEST_SHOW = 'Request Fresh Show'
 
