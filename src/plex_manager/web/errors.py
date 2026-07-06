@@ -141,8 +141,14 @@ async def _request_validation_error_handler(request: Request, exc: Exception) ->
 
     FastAPI's DEFAULT handler for this exception echoes the REJECTED raw value
     back in each error item's ``"input"`` key (so the operator can see exactly
-    what was rejected) via ``JSONResponse(content=jsonable_encoder(exc.errors()))``.
-    That is fine for almost every rejected value -- except a non-finite float
+    what was rejected) via
+    ``JSONResponse(content={"detail": jsonable_encoder(exc.errors())})`` -- the
+    standard ``HTTPValidationError`` envelope (``{"detail": [...]}``) that
+    ``docs/api/openapi.json`` documents and the generated frontend client is
+    typed against; ``frontend/src/lib/errors.ts``'s ``extractDetail`` also keys
+    on a top-level ``detail``. This override MUST preserve that envelope -- it
+    only changes what goes *inside* it. That is fine for almost every rejected
+    value -- except a non-finite float
     (``inf``/``nan``): Starlette's ``JSONResponse`` renders with
     ``json.dumps(..., allow_nan=False)`` (strict RFC-8259 JSON), which RAISES
     on a non-finite float.
@@ -163,8 +169,8 @@ async def _request_validation_error_handler(request: Request, exc: Exception) ->
     """
     if not isinstance(exc, RequestValidationError):  # pragma: no cover - registered per exact type
         raise exc
-    content = _sanitize_validation_error_value(jsonable_encoder(exc.errors()))
-    return JSONResponse(status_code=422, content=content)
+    errors = _sanitize_validation_error_value(jsonable_encoder(exc.errors()))
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 def install_error_handlers(app: FastAPI) -> None:
