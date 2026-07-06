@@ -68,6 +68,7 @@ __all__ = [
     "configure_logging",
     "drain_once",
     "prune_once",
+    "resolve_log_level",
     "stop_logging",
 ]
 
@@ -201,7 +202,7 @@ _EXC_FORMATTER: Final = logging.Formatter()
 _logger = logging.getLogger(__name__)
 
 #: Fallback effective level when ``config.log_level`` cannot be resolved to a
-#: real stdlib level (see :func:`_resolve_log_level`) — INFO, the same default
+#: real stdlib level (see :func:`resolve_log_level`) — INFO, the same default
 #: ``config.py`` ships, so an unrecognized override degrades to "as if unset"
 #: rather than to something surprising.
 _DEFAULT_LOG_LEVEL: Final = logging.INFO
@@ -378,7 +379,7 @@ class LogCaptureHandler(logging.Handler):
             self.dropped_count += 1
 
 
-def _resolve_log_level(level: str) -> int:
+def resolve_log_level(level: str) -> int:
     """Normalize a configured level string to a valid stdlib numeric level.
 
     ``logging``'s level-name table is keyed by UPPERCASE names ('DEBUG',
@@ -397,6 +398,18 @@ def _resolve_log_level(level: str) -> int:
     warning, through this module's own logger) rather than either dying or
     quietly pretending the value was fine — it falls back to
     :data:`_DEFAULT_LOG_LEVEL`.
+
+    Public (not module-private) so the console entry point
+    (:func:`plex_manager.__main__.main`) can normalize ``config.log_level``
+    into a real numeric level BEFORE handing it to ``uvicorn.run`` — see that
+    module's docstring for why: ``uvicorn.Config`` looks a ``str`` level up in
+    its OWN name table and raises ``KeyError`` on anything it doesn't
+    recognize, which would crash the process before the FastAPI ``lifespan``
+    (and this exact tolerant resolver, wired in via :func:`configure_logging`)
+    ever runs. Reusing this one resolver for both call sites means "what counts
+    as a valid log level" can never drift between the two -- an int level
+    always passes ``uvicorn.Config`` straight through with no lookup at all,
+    sidestepping its ``KeyError`` path entirely.
     """
     candidate = level.strip()
     by_name = logging.getLevelNamesMapping().get(candidate.upper())
@@ -418,7 +431,7 @@ def _resolve_log_level(level: str) -> int:
 def configure_logging(level: str, *, logger: logging.Logger | None = None) -> LogCaptureHandler:
     """Attach a fresh :class:`LogCaptureHandler` to ``logger`` (default: the root
     logger) and set its effective level from ``level`` (``config.log_level``),
-    normalized by :func:`_resolve_log_level` so a case mismatch or unrecognized
+    normalized by :func:`resolve_log_level` so a case mismatch or unrecognized
     value never raises out of here (see that function's docstring).
 
     Also pins :data:`_THIRD_PARTY_LOGGERS_TO_QUIET` (``httpx``/``httpcore``) to
@@ -455,7 +468,7 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target = logger if logger is not None else logging.getLogger()
     handler = LogCaptureHandler()
     target.addHandler(handler)
-    target.setLevel(_resolve_log_level(level))
+    target.setLevel(resolve_log_level(level))
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
         logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
     for name in _TELEMETRY_LOGGERS:

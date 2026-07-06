@@ -8,9 +8,10 @@ from collections.abc import Awaitable, Callable
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.models import Setting
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
     SettingsStore,
@@ -760,3 +761,106 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
         system = await load_system_settings(session)
         assert system is not None
         assert system.app_api_key == new_key
+
+
+async def test_settings_store_set_recovers_from_concurrent_first_write(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #91: two concurrent first writes to a brand-new key must not 500.
+
+    ``SettingsStore.set()`` used to be a plain read-then-insert with no conflict
+    recovery: two sessions racing to set the SAME never-before-seen key (e.g.
+    two concurrent setup submissions both writing ``movies_root`` for the first
+    time) could both pass the "row not found" check and both attempt an INSERT,
+    and the loser's flush would raise an uncaught ``IntegrityError``.
+
+    Simulated deterministically exactly like
+    ``test_create_request_recovers_from_active_dedup_conflict``: a "winner"
+    session commits the first row for the key, then this session's OWN initial
+    ``_row`` lookup is stubbed to report "not found" once (as if it ran before
+    the winner's insert became visible), forcing it down the insert path so its
+    flush collides on the real unique index.
+    """
+    async with sessionmaker_() as winner_session:
+        await SettingsStore(winner_session).set("movies_root", "/winner")
+        await winner_session.commit()
+
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_row(self, key)
+
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
+
+    async with sessionmaker_() as loser_session:
+        # Must not raise IntegrityError (or anything else) out of set().
+        await SettingsStore(loser_session).set("movies_root", "/loser")
+        await loser_session.commit()
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Setting).where(Setting.key == "movies_root")))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # never two rows for the same key
+    # The recovered row was updated with THIS call's value, not silently
+    # discarded in favor of the winner's -- an upsert, not a "first write wins".
+    assert rows[0].value == "/loser"
+
+
+async def test_settings_store_set_collision_recovery_does_not_lose_earlier_writes(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-transaction collision on a LATER key must not roll back an EARLIER
+    key's already-flushed write in the same request.
+
+    Both ``PUT /settings`` (looping over ``body.model_fields_set``) and
+    ``POST /setup/complete`` (writing ~12 keys) call ``set()`` repeatedly inside
+    ONE transaction, committing once at the end. The first-write-collision
+    recovery used to call a full ``session.rollback()``, which discards the
+    ENTIRE transaction, not just the failed INSERT -- so a collision on a LATER
+    key in the loop silently dropped every EARLIER key this same request had
+    already written, returning 200 with quietly missing data. That directly
+    violates "honesty over silence": the original loud, retryable 500 got traded
+    for a silent partial write. The recovery must instead be scoped to a
+    SAVEPOINT around just the failing INSERT, leaving prior flushes in the same
+    transaction intact.
+    """
+    async with sessionmaker_() as winner_session:
+        await SettingsStore(winner_session).set("tv_root", "/winner")
+        await winner_session.commit()
+
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
+        if key == "tv_root" and calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_row(self, key)
+
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
+
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        # Earlier key in the SAME transaction: a brand-new key, flushed
+        # successfully and still only pending (not yet committed).
+        await store.set("movies_root", "/same-txn")
+        # Later key in the SAME transaction collides with the winner's
+        # already-committed row and must recover without nuking the above.
+        await store.set("tv_root", "/loser")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # The earlier write must have survived the later key's collision
+        # recovery -- not silently discarded despite the 200/commit.
+        assert await SettingsStore(session).get("movies_root") == "/same-txn"
+        # The upsert semantics for the colliding key itself are unaffected.
+        assert await SettingsStore(session).get("tv_root") == "/loser"

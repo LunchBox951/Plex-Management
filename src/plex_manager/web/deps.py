@@ -262,12 +262,67 @@ class SettingsStore:
 
         The secret/plaintext routing is derived from :data:`SECRET_SETTING_KEYS`,
         so a secret can never accidentally be persisted in the plaintext column.
+
+        Concurrency-safe for the first write of a brand-new key: ``settings.key``
+        is UNIQUE, so two requests racing to set the SAME never-before-seen key
+        (e.g. two concurrent ``PUT /settings`` submissions from two admin tabs,
+        both writing ``movies_root`` for the first time) can both pass the
+        ``_row`` "not found yet" check and both attempt an INSERT. Recovery
+        follows the same insert-then-recover shape as :func:`ensure_system_settings`
+        -- catch the loser's ``IntegrityError``, roll back, and resolve by
+        re-reading the now-existing (winner's) row -- but scoped to a SAVEPOINT
+        (``begin_nested``) around just this INSERT, not a full-transaction
+        rollback. ``set`` is called repeatedly inside ONE caller transaction
+        (``PUT /settings`` loops over every submitted field; ``POST
+        /setup/complete`` writes ~12 keys) that commits once at the end; a
+        full ``session.rollback()`` here would discard every EARLIER key this
+        same request already flushed successfully in this loop, silently
+        dropping their writes even though the request still returns 200 --
+        trading a loud, retryable 500 for silent partial data loss, which is
+        exactly what "honesty over silence" forbids. The SAVEPOINT confines the
+        rollback to this one failed INSERT, leaving prior flushes in the same
+        transaction intact. Unlike ``ensure_system_settings`` (where either
+        side's freshly-created row is equivalent, so conceding to the winner is
+        enough), a ``set`` caller is asking for a SPECIFIC value; simply
+        returning the winner's row would silently drop this call's write. So the
+        recovered row is then updated with THIS call's value exactly like the
+        ordinary update path below -- the net effect is a true upsert: the last
+        write to actually commit always wins, and exactly one row exists either
+        way.
         """
         is_secret = key in SECRET_SETTING_KEYS
         row = await self._row(key)
         if row is None:
+            # The SAVEPOINT must be opened BEFORE the new ``Setting`` is added:
+            # ``begin_nested()`` takes an internal snapshot by flushing whatever
+            # is already pending, so adding the row first would let its INSERT
+            # -- and a possible collision -- happen during that snapshot, before
+            # any SAVEPOINT exists to roll back to.
+            nested = await self._session.begin_nested()
             row = Setting(key=key, is_secret=is_secret)
             self._session.add(row)
+            try:
+                await self._session.flush()
+            except IntegrityError:
+                # Roll back via the SAVEPOINT object itself, NOT ``self._session.
+                # rollback()``: a bare session-level rollback here would discard
+                # the WHOLE outer transaction (every key this same request has
+                # already ``set()`` earlier in the loop), not just this failed
+                # INSERT -- silently dropping prior writes behind an eventual 200,
+                # exactly the "honesty over silence" violation this exists to
+                # avoid. Rolling back the SAVEPOINT undoes only this INSERT and
+                # leaves everything flushed before it intact.
+                await nested.rollback()
+                existing = await self._row(key)
+                if existing is None:  # pragma: no cover - the conflicting row must exist
+                    raise
+                row = existing
+            else:
+                # Release the SAVEPOINT on success so it doesn't linger open
+                # for the rest of this session -- ``set()`` is called repeatedly
+                # in a loop (``PUT /settings``, ``POST /setup/complete``) and each
+                # call must leave the transaction exactly as it found it.
+                await nested.commit()
         row.is_secret = is_secret
         if is_secret:
             row.encrypted_value = value

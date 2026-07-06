@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import plex_manager.__main__ as main_module
 import plex_manager.db as db_module
 from plex_manager.adapters import encryption
 from plex_manager.config import Settings, get_settings, validate_startup_exposure
@@ -117,3 +120,45 @@ async def test_asgi_direct_lifespan_boots_initialized_install_tokenless(
     app = create_app()
     async with app.router.lifespan_context(app):
         pass  # started (and shut down) cleanly — no SystemExit
+
+
+@pytest.mark.parametrize(
+    ("configured_log_level", "expected_uvicorn_level"),
+    [
+        ("10", logging.DEBUG),  # numeric override
+        ("not-a-real-level", logging.INFO),  # typo -- must degrade, not crash
+    ],
+)
+def test_main_normalizes_log_level_before_uvicorn_run(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_log_level: str,
+    expected_uvicorn_level: int,
+) -> None:
+    """Issue #100: a typo'd or numeric ``PLEX_MANAGER_LOG_LEVEL`` used to reach
+    ``uvicorn.run`` as a raw ``str.lower()`` value. ``uvicorn.Config`` looks a
+    string level up in its OWN name table and raises ``KeyError`` on anything
+    unrecognized -- a full startup crash, before the app's tolerant lifespan
+    (or ``configure_logging``) ever runs. ``main()`` must instead pass an
+    already-normalized INT level (via the shared
+    ``log_capture_service.resolve_log_level``), so ``uvicorn.Config`` takes the
+    int branch and never performs that lookup at all.
+    """
+    monkeypatch.setenv("PLEX_MANAGER_LOG_LEVEL", configured_log_level)
+    get_settings.cache_clear()
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(app: str, **kwargs: Any) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main_module.uvicorn, "run", fake_run)
+
+    try:
+        main_module.main()  # must not raise
+    finally:
+        get_settings.cache_clear()
+
+    assert captured["app"] == "plex_manager.web.app:app"
+    assert isinstance(captured["log_level"], int)
+    assert captured["log_level"] == expected_uvicorn_level
