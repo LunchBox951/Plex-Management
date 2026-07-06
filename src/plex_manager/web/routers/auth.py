@@ -312,33 +312,28 @@ def reset_sign_in_throttle() -> None:
 async def _get_or_create_client_identifier(session: AsyncSession) -> str:
     """Return the app's stable plex.tv device identifier, creating it once.
 
-    Concurrency-safe at THIS call site, mirroring :func:`ensure_system_settings`'
-    pattern: two simultaneous first-ever sign-ins on a clean DB can both observe
-    no stored identifier and both attempt the INSERT; ``settings.key`` is UNIQUE,
-    so the loser's flush raises ``IntegrityError``. That loser must not 500 (an
-    honest sign-in racing an identical sign-in is not an error): roll the failed
-    transaction back and re-read the WINNER's committed identifier, so both
-    requests proceed under the SAME device identity — which is the whole point of
-    persisting one. The rollback is safe here because nothing else is pending in
-    the session yet: this runs before any claim/user write in the sign-in flow.
-    (A store-level retry belongs to the resilience track — see PR #121; this
-    call-site guard is deliberately scoped and stays harmless alongside it.)
+    CREATE-ONCE, never rotate: this is the ``X-Plex-Client-Identifier`` the app
+    presents on every plex.tv call it ever makes (sign-in verification here,
+    server discovery in the setup router, repoint validation in the settings
+    router). plex.tv registers each DISTINCT identifier as a new device on the
+    operator's account, so an identifier that rotated after minting would sprout
+    a trail of phantom devices and desync requests that already loaded the old
+    one — which is the whole point of persisting exactly one.
+
+    All race handling lives in :meth:`SettingsStore.set_if_absent`: two
+    simultaneous first-ever sign-ins on a clean DB may both mint a candidate,
+    but exactly one value persists and BOTH requests proceed under it — the
+    loser adopts the winner's identifier rather than 500ing (an unhandled
+    ``IntegrityError``) or, worse, overwriting it (what the last-write-wins
+    :meth:`SettingsStore.set` upsert would do — the composition bug a call-site
+    ``IntegrityError`` guard here used to invite once the store grew its own
+    conflict recovery). A candidate is minted unconditionally; when an
+    identifier already exists, ``set_if_absent`` returns it and the unused
+    candidate is simply discarded — cheap, and it keeps this call site a single
+    race-free operation.
     """
-    store = SettingsStore(session)
-    existing = await store.get(_CLIENT_ID_SETTING)
-    if existing:
-        return existing
-    created = f"plex-manager-{secrets.token_urlsafe(18)}"
-    try:
-        await store.set(_CLIENT_ID_SETTING, created)
-        await session.flush()
-    except IntegrityError:
-        await session.rollback()
-        winner = await store.get(_CLIENT_ID_SETTING)
-        if winner is None:  # pragma: no cover - the conflicting row must exist
-            raise
-        return winner
-    return created
+    minted = f"plex-manager-{secrets.token_urlsafe(18)}"
+    return await SettingsStore(session).set_if_absent(_CLIENT_ID_SETTING, minted)
 
 
 async def find_user_by_plex_id(session: AsyncSession, plex_id: int) -> User | None:

@@ -75,6 +75,30 @@ def test_parse_never_raises_on_garbage() -> None:
     assert parsed.source is QualitySource.UNKNOWN
 
 
+def test_parse_never_raises_when_guessit_itself_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #86: the port contract says ``parse()`` never raises, but the
+    adapter used to call ``guessit()`` bare -- any internal guessit exception on
+    a pathological release name would abort preview/grab/import instead of
+    degrading to an ``UNKNOWN`` parsed release. A monkeypatched ``guessit`` that
+    raises proves the adapter's own try/except, not guessit's actual behavior on
+    any particular string (guessit itself is well-behaved on ordinary input)."""
+    import plex_manager.adapters.parser.guessit_adapter as guessit_adapter_module
+
+    def _boom(_release_name: str) -> dict[str, object]:
+        raise RuntimeError("guessit internal parser error")
+
+    monkeypatch.setattr(guessit_adapter_module, "guessit", _boom)
+
+    parsed = GuessitParser().parse("The Movie 2023 1080p WEB-DL DD5.1 H264-GROUP")
+
+    assert parsed.source is QualitySource.UNKNOWN
+    # The raw title survives even though guessit never got to classify it -- the
+    # degraded parse is still identifiable, not a blank record.
+    assert parsed.raw_title == "The Movie 2023 1080p WEB-DL DD5.1 H264-GROUP"
+
+
 def test_parser_satisfies_port_protocol() -> None:
     from plex_manager.ports.parser import ParserPort
 
