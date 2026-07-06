@@ -184,10 +184,14 @@ _TELEMETRY_LOGGERS: Final = (
 #: verbatim into the durable, EXPORTABLE ``log_events`` store (the store the
 #: blueprint designs to be pasted straight into an LLM). ``httpcore`` (the
 #: transport httpx is built on) has its own noisy INFO/DEBUG connection-pool
-#: logging with the same risk. Both are pinned to WARNING regardless of the
-#: configured root level: no adapter call site can opt back into leaking a URL
-#: by raising ``log_level`` to DEBUG for troubleshooting -- "secrets are never
-#: logged" is a hard invariant, not a verbosity trade-off. Every adapter's own
+#: logging with the same risk. Both are pinned to ``max(resolved_level, WARNING)``
+#: (see :func:`configure_logging`), so WARNING is a hard FLOOR: no adapter call
+#: site can opt back into leaking a URL by raising ``log_level`` to DEBUG for
+#: troubleshooting -- "secrets are never logged" is a hard invariant, not a
+#: verbosity trade-off -- while an operator who raises the floor to ERROR quiets
+#: these loggers to ERROR too, never receiving WARNING chatter below their floor.
+#: The pin only ever QUIETS relative to the operator level, never loosens it.
+#: Every adapter's own
 #: error messages already name a status code or exception type, never a raw
 #: URL/token (see e.g. ``adapters/tmdb/adapter.py``); this only closes the gap
 #: the underlying HTTP library itself opened around that discipline.
@@ -422,9 +426,13 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     value never raises out of here (see that function's docstring).
 
     Also pins :data:`_THIRD_PARTY_LOGGERS_TO_QUIET` (``httpx``/``httpcore``) to
-    :data:`_THIRD_PARTY_LOGGER_LEVEL` — see that constant's docstring for why this
-    is a hard secret-safety invariant, not merely reducing noise, and why it is
-    unconditional regardless of ``level``. This happens EVERY call (not just when
+    ``max(resolved_level, _THIRD_PARTY_LOGGER_LEVEL)`` — see that constant's
+    docstring for why WARNING is a hard secret-safety FLOOR, not merely reducing
+    noise. The pin only ever QUIETS relative to the operator's own resolved
+    ``level``, never loosens below it: a DEBUG/INFO floor still yields WARNING (so
+    URL-bearing INFO records can never leak), while an ERROR floor yields ERROR on
+    these loggers too rather than spilling WARNING chatter below the operator's
+    chosen floor. This happens EVERY call (not just when
     ``logger`` is the root) since these loggers propagate up to the root either
     way; a caller passing a non-root ``logger`` (tests, mainly) still gets the
     same quieting so no test path silently relies on the child not having it.
@@ -455,9 +463,18 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target = logger if logger is not None else logging.getLogger()
     handler = LogCaptureHandler()
     target.addHandler(handler)
-    target.setLevel(_resolve_log_level(level))
+    resolved = _resolve_log_level(level)
+    target.setLevel(resolved)
+    # Pin the third-party HTTP client loggers to ``max(resolved, WARNING)``: the
+    # pin only ever QUIETS relative to the operator's floor, never loosens below
+    # it. WARNING is the secret-safety FLOOR (see _THIRD_PARTY_LOGGER_LEVEL) -- a
+    # DEBUG/INFO operator level still yields WARNING here, so the URL-bearing INFO
+    # records can never leak -- but an ERROR operator floor now yields ERROR on
+    # httpx/httpcore too, honouring the operator's chosen floor instead of
+    # spilling WARNING chatter below it.
+    third_party_level = max(resolved, _THIRD_PARTY_LOGGER_LEVEL)
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
-        logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
+        logging.getLogger(name).setLevel(third_party_level)
     for name in _TELEMETRY_LOGGERS:
         logging.getLogger(name).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler

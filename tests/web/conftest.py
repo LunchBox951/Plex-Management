@@ -27,7 +27,6 @@ from plex_manager.adapters import encryption
 from plex_manager.config import get_settings
 from plex_manager.db import Base, enable_sqlite_fk_enforcement, get_session
 from plex_manager.models import SystemSettings
-from plex_manager.web.app import create_app
 
 SessionMaker = async_sessionmaker[AsyncSession]
 SeedFn = Callable[..., Awaitable[None]]
@@ -90,6 +89,12 @@ def _ok_transport() -> httpx.MockTransport:
 @pytest.fixture
 async def app(sessionmaker_: SessionMaker) -> AsyncIterator[FastAPI]:
     """The wired FastAPI app pointed at the in-memory DB + a mock HTTP client."""
+    # Imported lazily (not at module scope) so collecting a web test that supplies
+    # its OWN app fixture never imports ``web.app`` -- which is transitionally
+    # unimportable while the auth router is mid-rewrite. Only a test that actually
+    # requests this fixture pays the (currently broken) create_app import.
+    from plex_manager.web.app import create_app
+
     application = create_app()
     application.state.sessionmaker = sessionmaker_
     application.state.http_client = httpx.AsyncClient(transport=_ok_transport())

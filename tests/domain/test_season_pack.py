@@ -78,10 +78,29 @@ def test_covers_requested_episodes_multi_season_pack_passes_here_engine_rejects(
     assert covers_requested_episodes(_parsed(season=[1, 2, 3], episode=None), requested=[4]) is True
 
 
-def test_covers_requested_episodes_multi_episode_file_partial_overlap_kept() -> None:
-    # A multi-episode file overlapping even partially with the requested set is
-    # kept -- a file cannot be split, mirroring validate_season_import's posture.
+def test_covers_requested_episodes_multi_episode_file_superset_kept() -> None:
+    # A multi-episode file whose episodes are a SUPERSET of the request is kept --
+    # the requested episode(s) are all present; the extras ride along (a file
+    # cannot be split), mirroring validate_season_import's ``skipped_not_requested``.
     assert covers_requested_episodes(_parsed(season=2, episode=[4, 5]), requested=[4]) is True
+
+
+def test_covers_requested_episodes_multi_episode_file_exact_cover_kept() -> None:
+    # A multi-episode file that covers the WHOLE multi-episode request passes.
+    assert covers_requested_episodes(_parsed(season=2, episode=[4, 5]), requested=[4, 5]) is True
+
+
+def test_covers_requested_episodes_partial_single_episode_rejected_is_the_70_bug() -> None:
+    # issue #70: a single-episode S02E04 release must NOT satisfy a request for
+    # BOTH episodes {4, 5}. Any-overlap accepted it (E04 overlaps {4, 5}), so the
+    # engine grabbed a partial release and import later blocked on the missing E05.
+    # Full coverage (superset) is now required, so this is rejected at preview.
+    assert covers_requested_episodes(_parsed(season=2, episode=4), requested=[4, 5]) is False
+
+
+def test_covers_requested_episodes_multi_episode_file_partial_cover_rejected() -> None:
+    # A file carrying {4, 6} does not COVER a request for {4, 5} -- E5 is missing.
+    assert covers_requested_episodes(_parsed(season=2, episode=[4, 6]), requested=[4, 5]) is False
 
 
 def test_covers_requested_episodes_multi_episode_file_no_overlap_rejected() -> None:

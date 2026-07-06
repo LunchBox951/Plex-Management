@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  useAuthMe,
   useCancelRequest,
   useCreateRequest,
   useGrab,
@@ -198,6 +199,13 @@ const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'e
  */
 export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModalProps) {
   const { toast } = useToast()
+  // Shared (non-admin) sessions get a REQUEST-ONLY modal: the preview / grab /
+  // correction / keep-forever verbs all sit behind `require_admin` server-side,
+  // so exposing them would only manufacture 403 `admin_required` failures.
+  // Defaults to the restricted view until /auth/me resolves (fail closed) —
+  // mirrors AdminGate's read of the same cached query.
+  const auth = useAuthMe()
+  const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
   const createRequest = useCreateRequest()
   const searchPreview = useSearchPreview()
   const grab = useGrab()
@@ -209,8 +217,9 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
 
   // Live correlation sources — poll while a title is open so the action zone
   // tracks the backend through search -> download -> import without a refresh.
+  // GET /queue is admin-only: keep it entirely idle for shared sessions.
   const requestsQuery = useRequests({ poll: open })
-  const queueQuery = useQueue({ poll: open })
+  const queueQuery = useQueue({ poll: open, enabled: isAdmin })
 
   const [requestId, setRequestId] = useState<number | null>(null)
   // Whether the just-created `requestId` is still grabbable. Tracked separately from
@@ -462,7 +471,9 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       const grabbable = isSeasonGrabbable(created, resolvedSeason)
       setCreatedGrabbable(grabbable)
       toast({ title: `Requested ${titleName}`, intent: 'success' })
-      if (grabbable) {
+      // Search-preview is admin-only server-side: a shared user's request ends
+      // here (the auto-grab worker takes it from request to download unattended).
+      if (grabbable && isAdmin) {
         await runPreview(created.id, resolvedSeason)
       } else {
         setPreview(null)
@@ -471,7 +482,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons])
+  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin])
 
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
@@ -672,7 +683,10 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // ImportBlocked, so a mark-failed there always 409s (invalid_state_transition).
   // Don't offer an action that can't succeed — once the import lands the title
   // re-renders as completed or import_blocked, where the correction paths reappear.
-  const canReport = queueItem !== null && queueItem.status !== 'importing'
+  // Every correction verb below is admin-only server-side (`require_admin`), so
+  // each button is built only for admins — a shared user gets the request-only
+  // experience (Request / Request again + honest status), never a 403 machine.
+  const canReport = isAdmin && queueItem !== null && queueItem.status !== 'importing'
   const reportButton =
     canReport && queueItem ? (
       <Button variant="danger" onClick={() => setReportFor({ downloadId: queueItem.id })}>
@@ -680,17 +694,18 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       </Button>
     ) : null
 
-  const retryImportButton = queueItem ? (
-    <Button onClick={() => void onRetryImport()} loading={importDownload.isPending}>
-      Retry import
-    </Button>
-  ) : null
+  const retryImportButton =
+    isAdmin && queueItem ? (
+      <Button onClick={() => void onRetryImport()} loading={importDownload.isPending}>
+        Retry import
+      </Button>
+    ) : null
 
   // Report an IMPORTED/available title (ADR-0014). Distinct from `reportButton`
   // (queue mark-failed): there is no active download here, so it acts on the
   // request + selected season via the report-issue endpoint. Needs a known request.
   const reportIssueButton =
-    effectiveRequestId !== null ? (
+    isAdmin && effectiveRequestId !== null ? (
       <Button
         variant="danger"
         onClick={() =>
@@ -714,14 +729,18 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     (s) => s.status === 'available' || s.status === 'completed',
   )
   const canCancel =
-    liveRequest != null && CANCELLABLE_STATUSES.has(liveRequest.status) && !anySeasonImported
-  const cancelButton = canCancel ? (
-    <Button variant="secondary" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
-      Cancel request
-    </Button>
-  ) : null
+    isAdmin &&
+    liveRequest != null &&
+    CANCELLABLE_STATUSES.has(liveRequest.status) &&
+    !anySeasonImported
+  const cancelButton =
+    canCancel && liveRequest ? (
+      <Button variant="secondary" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
+        Cancel request
+      </Button>
+    ) : null
 
-  const reSearchButton = (
+  const reSearchButton = isAdmin ? (
     <Button
       variant="secondary"
       onClick={() => void runPreview(effectiveRequestId)}
@@ -729,17 +748,20 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     >
       Re-search
     </Button>
-  )
+  ) : null
 
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
+  // Admin-only: search-preview and grab are `require_admin` routes, so shared
+  // users never see the release browser at all.
   const showReleases =
-    state.kind === 'none' ||
-    state.kind === 'pending' ||
-    state.kind === 'searching' ||
-    state.kind === 'no_acceptable_release' ||
-    state.kind === 'failed' ||
-    state.kind === 'unknown'
+    isAdmin &&
+    (state.kind === 'none' ||
+      state.kind === 'pending' ||
+      state.kind === 'searching' ||
+      state.kind === 'no_acceptable_release' ||
+      state.kind === 'failed' ||
+      state.kind === 'unknown')
 
   let actionZone: ReactNode
   switch (state.kind) {
@@ -749,13 +771,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
             Request
           </Button>
-          <Button
-            variant="secondary"
-            onClick={() => void runPreview(null)}
-            loading={searchPreview.isPending}
-          >
-            Preview releases
-          </Button>
+          {/* Preview drives admin-only /search-preview: request-only for shared users. */}
+          {isAdmin ? (
+            <Button
+              variant="secondary"
+              onClick={() => void runPreview(null)}
+              loading={searchPreview.isPending}
+            >
+              Preview releases
+            </Button>
+          ) : null}
         </div>
       )
       break
@@ -777,12 +802,17 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         <div className="flex flex-col gap-3">
           <div className="flex items-center gap-3">
             <StatusBadge status={requestStatus('downloading')} />
-            <div className="flex flex-1 items-center gap-3">
-              <ProgressBar value={queueItem?.progress ?? 0} label="Download progress" />
-              <span className="font-mono text-xs text-muted tabular-nums">
-                {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
-              </span>
-            </div>
+            {/* Progress comes from admin-only GET /queue (disabled for shared
+                sessions), so a shared user gets the honest badge, never a
+                fabricated stuck-at-0% bar. */}
+            {isAdmin ? (
+              <div className="flex flex-1 items-center gap-3">
+                <ProgressBar value={queueItem?.progress ?? 0} label="Download progress" />
+                <span className="font-mono text-xs text-muted tabular-nums">
+                  {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
+                </span>
+              </div>
+            ) : null}
           </div>
           {reportButton || cancelButton ? (
             <div className="flex flex-wrap gap-2">
@@ -930,7 +960,8 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
               </p>
             ) : null}
             {seasonSelector}
-            {pinRequestId != null ? (
+            {/* Keep-forever is an admin-only endpoint: hidden for shared users. */}
+            {isAdmin && pinRequestId != null ? (
               <label className="mt-3 flex items-center gap-2 text-xs text-muted">
                 <input
                   type="checkbox"

@@ -9,6 +9,12 @@ Wiring rules:
   decrypted value. The header is sourced via ``APIKeyHeader`` so the security
   scheme appears in the OpenAPI. It is skipped when ``settings.dev_auth_bypass``
   is set. Health, setup and docs routes do NOT depend on it.
+* ``require_setup_admin`` gates every setup endpoint except ``/status``: a
+  ``dev_auth_bypass`` short-circuit, then an OPTIONAL pre-init hardening token
+  (``PLEX_MANAGER_SETUP_TOKEN``, only enforced while uninitialized), then normal
+  session-cookie-or-``X-Api-Key`` auth, then an admin check — every rejection an
+  ``AppError`` envelope, never a bare detail. It is the SOLE setup gate: the legacy
+  pre-init token dependencies were removed when the setup router migrated onto it.
 * ``SettingsStore`` is the typed access layer over the ``settings`` table: secret
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
@@ -21,8 +27,12 @@ Wiring rules:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Annotated, cast
 
 import httpx
@@ -41,7 +51,7 @@ from plex_manager.adapters.tmdb.adapter import TmdbMetadata
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.domain.quality_profile import QualityProfile, default_profile
-from plex_manager.models import Setting, SystemSettings
+from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
@@ -55,10 +65,13 @@ from plex_manager.services.health_service import (
     SubsystemHealth,
     TtlCache,
 )
+from plex_manager.web.errors import AppError
 
 __all__ = [
     "API_KEY_HEADER_NAME",
     "AUTO_GRAB_ENABLED_DEFAULT",
+    "CSRF_COOKIE_NAME",
+    "CSRF_HEADER_NAME",
     "DISK_PRESSURE_TARGET_PERCENT_DEFAULT",
     "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
     "EVICTION_ENABLED_DEFAULT",
@@ -67,12 +80,18 @@ __all__ = [
     "EVICTION_PROACTIVE_ENABLED_DEFAULT",
     "KNOWN_SETTING_KEYS",
     "LOG_RETENTION_DAYS_DEFAULT",
+    "PLEX_MACHINE_ID_SETTING",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
+    "SESSION_COOKIE_NAME",
     "SETUP_TOKEN_HEADER_NAME",
+    "AuthContext",
+    "AuthMethod",
     "ServiceNotConfiguredError",
     "SettingsStore",
     "api_key_matches",
+    "authenticate_request",
+    "enforce_pre_init_setup_token",
     "ensure_system_settings",
     "get_anime_movie_root_optional",
     "get_anime_tv_root_optional",
@@ -104,11 +123,12 @@ __all__ = [
     "get_tmdb",
     "get_tv_root",
     "get_tv_root_optional",
+    "hash_session_token",
     "is_setup_token_required",
     "load_system_settings",
+    "require_admin",
     "require_api_key",
-    "require_pre_init_or_api_key",
-    "require_setup_token_pre_init",
+    "require_setup_admin",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -119,9 +139,44 @@ _logger = logging.getLogger(__name__)
 # the key.
 API_KEY_HEADER_NAME = "X-Api-Key"
 SETUP_TOKEN_HEADER_NAME = "X-Setup-Token"  # noqa: S105 — header name, not a token
+# The ``settings.key`` under which the configured server's Plex ``machineIdentifier``
+# is stored at setup-complete. The single source of truth shared by the setup router
+# (writes it) and the auth router (reads it post-init to resolve server access
+# without re-probing ``/identity``). Not a wire/``SettingsResponse`` field — an
+# internal identifier, so deliberately NOT in ``KNOWN_SETTING_KEYS`` (mirroring
+# ``plex_oauth_client_identifier``), read/written via ``SettingsStore`` by key.
+PLEX_MACHINE_ID_SETTING = "plex_machine_identifier"
+SESSION_COOKIE_NAME = "plexmgr.session"
+CSRF_COOKIE_NAME = "plexmgr.csrf"
+CSRF_HEADER_NAME = "X-CSRF-Token"
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+
+
+class AuthMethod(StrEnum):
+    """How the current request authenticated."""
+
+    api_key = "api_key"
+    plex_session = "plex_session"
+    dev_bypass = "dev_bypass"
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    """Authenticated request identity.
+
+    ``user_*`` is populated only for Plex session auth. The legacy app API key has
+    no user identity and remains a recovery/automation credential.
+    """
+
+    method: AuthMethod
+    user_id: int | None = None
+    plex_id: int | None = None
+    username: str | None = None
+    email: str | None = None
+    avatar_url: str | None = None
+    is_admin: bool = False
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -276,6 +331,22 @@ class SettingsStore:
             row.value = value
             row.encrypted_value = None
         await self._session.flush()
+
+    async def delete(self, key: str) -> None:
+        """Remove ``key`` if present; a no-op when it was never set.
+
+        Used to invalidate a DERIVED/cached setting whose source of truth just
+        changed -- e.g. the Plex ``machineIdentifier`` snapshot
+        (:data:`PLEX_MACHINE_ID_SETTING`) cached at setup, which must be dropped
+        when an admin repoints the app at a different server (new ``plex_url`` /
+        ``plex_token``) so the next sign-in re-derives it from ``/identity``
+        rather than trusting the OLD server's id. Idempotent: deleting an unset
+        key does nothing (never a crash), matching :meth:`set`'s upsert symmetry.
+        """
+        row = await self._row(key)
+        if row is not None:
+            await self._session.delete(row)
+            await self._session.flush()
 
     async def redacted(self) -> dict[str, str | None]:
         """Return ``{key: value}`` with secret values masked to ``"***"``.
@@ -443,70 +514,201 @@ def _pre_init_setup_token_valid(request: Request) -> bool:
     return api_key_matches(provided_setup_token, expected_setup_token)
 
 
+def enforce_pre_init_setup_token(request: Request, *, initialized: bool) -> None:
+    """Enforce the OPTIONAL pre-init hardening token (``PLEX_MANAGER_SETUP_TOKEN``).
+
+    A no-op post-init, when no token is configured, or under ``dev_auth_bypass``
+    (:func:`is_setup_token_required` already folds the bypass in). While the install
+    is still uninitialized AND a token is configured, the request MUST carry a
+    matching ``X-Setup-Token`` — else an honest 401 ``invalid_setup_token``.
+
+    This is the SINGLE pre-init token gate, shared by :func:`require_setup_admin`
+    (the setup sub-API) and the sign-in endpoint (``POST /api/v1/auth/plex``). The
+    sign-in claim is the FIRST step of first-run setup, so gating it here is what
+    makes the token actually harden the exclusive first-owner claim — not merely
+    ``/complete``. Without it an attacker owning any Plex server could win the claim
+    and lock out the true owner (recoverable only by DB surgery, a north-star-#1
+    violation).
+    """
+    if not initialized and is_setup_token_required() and not _pre_init_setup_token_valid(request):
+        raise AppError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_setup_token",
+            message="The setup token is missing or wrong.",
+            hint="Check PLEX_MANAGER_SETUP_TOKEN on the server.",
+        )
+
+
+def hash_session_token(token: str) -> str:
+    """Return the stored digest for a random browser-session token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_unsafe_method(method: str) -> bool:
+    return method.upper() not in {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+def _require_csrf_for_session(request: Request) -> None:
+    if not _is_unsafe_method(request.method):
+        return
+    header = request.headers.get(CSRF_HEADER_NAME)
+    cookie = request.cookies.get(CSRF_COOKIE_NAME)
+    if (
+        not header
+        or not cookie
+        or not hmac.compare_digest(header.encode("utf-8"), cookie.encode("utf-8"))
+    ):
+        raise AppError(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="csrf_token_required",
+            message="The request was blocked by CSRF protection.",
+            hint="Refresh the page and try again.",
+        )
+
+
+def _normalize_dt(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+async def _session_auth_context(
+    request: Request,
+    session: AsyncSession,
+    *,
+    enforce_csrf: bool,
+) -> AuthContext | None:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    token_hash = hash_session_token(token)
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(AuthSession, User)
+        .join(User, User.id == AuthSession.user_id)
+        .where(
+            AuthSession.token_hash == token_hash,
+            AuthSession.revoked_at.is_(None),
+        )
+    )
+    row = result.first()
+    if row is None:
+        return None
+    auth_session, user = row
+    if _normalize_dt(auth_session.expires_at) <= now:
+        return None
+    if enforce_csrf:
+        _require_csrf_for_session(request)
+    return AuthContext(
+        method=AuthMethod.plex_session,
+        user_id=user.id,
+        plex_id=user.plex_id,
+        username=user.username,
+        email=user.email,
+        avatar_url=user.avatar_url,
+        is_admin=user.permissions > 0,
+    )
+
+
+async def authenticate_request(
+    request: Request,
+    session: AsyncSession,
+    *,
+    provided_api_key: str | None = None,
+    enforce_csrf: bool = True,
+) -> AuthContext | None:
+    """Return request auth context, accepting API key or Plex session cookie.
+
+    The legacy app API key remains a valid recovery/automation credential. Browser
+    sessions are checked only after the key path fails, so API-key callers are not
+    subject to CSRF enforcement.
+    """
+    if get_settings().dev_auth_bypass:
+        return AuthContext(method=AuthMethod.dev_bypass, is_admin=True)
+    system = await load_system_settings(session)
+    expected = system.app_api_key if system is not None else None
+    if api_key_matches(provided_api_key, expected):
+        return AuthContext(method=AuthMethod.api_key, is_admin=True)
+    return await _session_auth_context(request, session, enforce_csrf=enforce_csrf)
+
+
 async def require_api_key(
     provided: Annotated[str | None, Depends(_api_key_header)],
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> None:
-    """Enforce the ``X-Api-Key`` header against ``SystemSettings.app_api_key``.
+    request: Request,
+) -> AuthContext:
+    """Enforce app authentication.
 
     The header source is :class:`APIKeyHeader`, so the security scheme + per-route
     requirement appear in the exported OpenAPI (generated clients then send the
     key). The stored key is Fernet-encrypted at rest; the incoming value is
     constant-time-compared (``hmac.compare_digest``) against the decrypted value.
+    A valid Plex session cookie is accepted as the normal browser auth path.
     Skipped entirely when ``settings.dev_auth_bypass`` is set (dev only).
     """
-    if get_settings().dev_auth_bypass:
-        return
-    system = await load_system_settings(session)
-    expected = system.app_api_key if system is not None else None
-    if not api_key_matches(provided, expected):
+    context = await authenticate_request(request, session, provided_api_key=provided)
+    if context is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    return context
 
 
-async def require_pre_init_or_api_key(
-    request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
-) -> None:
-    """Require bootstrap token before first-run init; require ``X-Api-Key`` after.
+async def require_admin(
+    context: Annotated[AuthContext, Depends(require_api_key)],
+) -> AuthContext:
+    """Require an app administrator.
 
-    The setup ``validate/*`` probes must be callable before an app key exists, but
-    each drives a server-side request to a caller-supplied URL. They therefore
-    require ``X-Setup-Token`` pre-init and fall under the same api-key gate as the
-    rest of the API once ``initialized`` is set (still skippable via
-    ``dev_auth_bypass``).
-
-    Unlike :func:`require_api_key`, the header is read imperatively from the
-    request (not via :class:`APIKeyHeader`): these setup routes are intentionally
-    NOT marked as secured in the OpenAPI, since they are open before init.
+    API-key and dev-bypass auth are administrator contexts. Plex session auth is
+    administrator-only when the signed-in Plex account owns the configured server.
     """
-    system = await load_system_settings(session)
-    if system is None or not system.initialized:
-        if get_settings().dev_auth_bypass:
-            return
-        if not _pre_init_setup_token_valid(request):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token"
-            )
-        return
-    if get_settings().dev_auth_bypass:
-        return
-    provided = request.headers.get(API_KEY_HEADER_NAME)
-    if not api_key_matches(provided, system.app_api_key):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    if not context.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
+    return context
 
 
-async def require_setup_token_pre_init(
+async def require_setup_admin(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> None:
-    """Require the bootstrap setup token only while the install is uninitialized."""
-    system = await load_system_settings(session)
-    if system is not None and system.initialized:
-        return
+) -> AuthContext:
+    """Gate every setup endpoint except ``/status`` on an authenticated admin.
+
+    The order matters and each failure is an honest :class:`AppError` envelope
+    (north star #3), never a bare ``detail``:
+
+    1. ``dev_auth_bypass`` short-circuits to a dev admin context (dev only).
+    2. While the install is still uninitialized AND an operator configured a
+       hardening ``PLEX_MANAGER_SETUP_TOKEN`` (:func:`is_setup_token_required`),
+       the request must carry a matching ``X-Setup-Token`` — a valid token falls
+       THROUGH to the auth check below, it is not itself a credential. Post-init
+       the token is never consulted again.
+    3. Normal auth: a Plex session cookie (CSRF-checked on unsafe methods) or the
+       legacy ``X-Api-Key``. No credential ⇒ 401 ``session_required`` — the prose
+       nudges toward Plex sign-in while setup is unfinished, plain sign-in after.
+    4. A non-admin (a signed-in Plex account that does not own the server) ⇒ 403
+       ``admin_required``.
+    """
     if get_settings().dev_auth_bypass:
-        return
-    if not _pre_init_setup_token_valid(request):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_setup_token")
+        return AuthContext(method=AuthMethod.dev_bypass, is_admin=True)
+    system = await load_system_settings(session)
+    initialized = system is not None and system.initialized
+    enforce_pre_init_setup_token(request, initialized=initialized)
+    context = await authenticate_request(
+        request,
+        session,
+        provided_api_key=request.headers.get(API_KEY_HEADER_NAME),
+    )
+    if context is None:
+        raise AppError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="session_required",
+            message=(
+                "Sign in to continue." if initialized else "Sign in with Plex to continue setup."
+            ),
+        )
+    if not context.is_admin:
+        raise AppError(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="admin_required",
+            message="This action needs an administrator.",
+        )
+    return context
 
 
 # --------------------------------------------------------------------------- #
@@ -650,12 +852,42 @@ async def get_library_optional(
         return None
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Normalize an unset OR whitespace-only stored root value to ``None`` (issue #83).
+
+    A root setting is free-text and may be present-but-whitespace (e.g. an
+    operator submitting a stray space through ``PUT /settings``, which has no
+    validator stripping it, unlike ``POST /setup/complete``'s
+    ``SetupCompleteRequest``). Such a value is truthy in Python, so a plain
+    ``or None``/``if not root`` check -- as every ``get_*_root*`` function below
+    used to do -- lets it sail through as if it were a real, configured root:
+    downstream code would then resolve a relative whitespace path against the
+    process CWD instead of tripping the honest "unset" refusal it's meant to.
+    This is the ONE place every root read goes through, so the strip lives here
+    rather than scattered across each of the six getters below.
+
+    WHITESPACE-ONLY DETECTION ONLY: a stripped-empty value becomes ``None``,
+    but any non-blank value is returned byte-identical to what was stored --
+    NEVER ``.strip()``-ed. A previous version returned the stripped value for
+    the non-blank case too, which silently retargeted import/scan/evict to a
+    different path than the one ``GET /settings`` displays whenever a stored
+    root carried incidental leading/trailing padding (e.g. ``"  /media/x  "``):
+    the operator sees one path, but every filesystem operation resolves
+    another. Settings display and filesystem behavior must always agree.
+    """
+    if value is None:
+        return None
+    if not value.strip():
+        return None
+    return value
+
+
 async def get_movies_root(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> str:
     """Return the configured Movies library root, or 409 if unset."""
-    root = await SettingsStore(session).get("movies_root")
-    if not root:
+    root = _blank_to_none(await SettingsStore(session).get("movies_root"))
+    if root is None:
         raise ServiceNotConfiguredError("movies_root")
     return root
 
@@ -665,13 +897,14 @@ async def get_movies_root_optional(
 ) -> str | None:
     """Return the Movies root, or ``None`` when unset (the importer waits, no crash).
 
-    Normalizes a falsy stored value (``""``) to ``None`` so callers can use a
-    single ``is None`` check, matching :func:`get_movies_root`'s ``if not root``
-    treatment of "unset". Without this, an empty-string root would sail past an
-    ``is None`` guard downstream and silently resolve relative paths against the
-    process CWD instead of tripping the honest ``ImportBlocked`` it's meant to.
+    Normalizes a falsy OR whitespace-only stored value to ``None`` (see
+    :func:`_blank_to_none`) so callers can use a single ``is None`` check,
+    matching :func:`get_movies_root`'s treatment of "unset". Without this, an
+    empty-string or whitespace-only root would sail past an ``is None`` guard
+    downstream and silently resolve relative paths against the process CWD
+    instead of tripping the honest ``ImportBlocked`` it's meant to.
     """
-    return await SettingsStore(session).get("movies_root") or None
+    return _blank_to_none(await SettingsStore(session).get("movies_root"))
 
 
 async def get_tv_root(
@@ -685,8 +918,8 @@ async def get_tv_root(
     replaces an upfront 409 -- but this is kept as the required counterpart for
     symmetry with the movies-side dependency and any future all-or-nothing route).
     """
-    root = await SettingsStore(session).get("tv_root")
-    if not root:
+    root = _blank_to_none(await SettingsStore(session).get("tv_root"))
+    if root is None:
         raise ServiceNotConfiguredError("tv_root")
     return root
 
@@ -698,11 +931,11 @@ async def get_tv_root_optional(
     per-row ``ImportBlocked`` for a tv download instead of a crash or an upfront
     409 that would also block importing movies on an install with no TV root).
 
-    Mirrors :func:`get_movies_root_optional`'s falsy-to-``None`` normalization: an
-    empty-string setting is "unset", not a valid root, so downstream ``is None``
-    guards must see it as such.
+    Mirrors :func:`get_movies_root_optional`'s falsy-or-whitespace-to-``None``
+    normalization: an empty-string OR whitespace-only setting is "unset", not a
+    valid root, so downstream ``is None`` guards must see it as such.
     """
-    return await SettingsStore(session).get("tv_root") or None
+    return _blank_to_none(await SettingsStore(session).get("tv_root"))
 
 
 async def get_anime_movie_root_optional(
@@ -710,11 +943,11 @@ async def get_anime_movie_root_optional(
 ) -> str | None:
     """Return the anime-movies library root, or ``None`` when unset (ADR-0015).
 
-    Mirrors :func:`get_movies_root_optional`'s falsy-to-``None`` normalization.
-    Unset is the common case — importing then routes an anime movie to the
-    normal ``movies_root`` exactly as before this setting existed.
+    Mirrors :func:`get_movies_root_optional`'s falsy-or-whitespace-to-``None``
+    normalization. Unset is the common case — importing then routes an anime
+    movie to the normal ``movies_root`` exactly as before this setting existed.
     """
-    return await SettingsStore(session).get("anime_movie_root") or None
+    return _blank_to_none(await SettingsStore(session).get("anime_movie_root"))
 
 
 async def get_anime_tv_root_optional(
@@ -722,11 +955,11 @@ async def get_anime_tv_root_optional(
 ) -> str | None:
     """Return the anime-TV library root, or ``None`` when unset (ADR-0015).
 
-    Mirrors :func:`get_tv_root_optional`'s falsy-to-``None`` normalization.
-    Unset is the common case — importing then routes an anime episode to the
-    normal ``tv_root`` exactly as before this setting existed.
+    Mirrors :func:`get_tv_root_optional`'s falsy-or-whitespace-to-``None``
+    normalization. Unset is the common case — importing then routes an anime
+    episode to the normal ``tv_root`` exactly as before this setting existed.
     """
-    return await SettingsStore(session).get("anime_tv_root") or None
+    return _blank_to_none(await SettingsStore(session).get("anime_tv_root"))
 
 
 # --------------------------------------------------------------------------- #

@@ -46,10 +46,24 @@ class FileSystemPort(Protocol):
         raise NotImplementedError
 
     def move(self, src: Path, dst: Path) -> None:
-        """Move ``src`` to ``dst`` (atomic rename when on the same device)."""
+        """Move ``src`` to ``dst`` (atomic rename when on the same device).
+
+        Raises ``NotImplementedError`` by default (issue #80): this is a
+        mutating operation the import pipeline depends on to actually place a
+        file, so a subclass or fake that forgets to override it must fail
+        loudly at call time rather than silently no-op — a quiet no-op here
+        would let an import report success while never having moved anything.
+        """
+        raise NotImplementedError
 
     def hardlink_or_copy(self, src: Path, dst: Path) -> None:
-        """Hardlink ``src`` to ``dst``, falling back to a copy across devices."""
+        """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        Raises ``NotImplementedError`` by default (issue #80): same rationale
+        as :meth:`move` — a silent no-op default would let an import pipeline
+        report a file as placed without writing or linking anything.
+        """
+        raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.

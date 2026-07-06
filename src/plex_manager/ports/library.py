@@ -114,7 +114,13 @@ class LibraryPort(Protocol):
         ``path``-prefix match (movie sections for movies, show sections for TV),
         so a TV season folder is never matched against a movie section (or vice
         versa) and the full-refresh fallback stays scoped to the relevant kind.
+
+        Raises ``NotImplementedError`` by default (issue #81): a silent no-op
+        default would let a future adapter or fake falsely report a completed
+        Plex scan after an import or purge, so a missing override must fail
+        loudly at call time instead.
         """
+        raise NotImplementedError
 
     async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
         """Return the configured library sections.
