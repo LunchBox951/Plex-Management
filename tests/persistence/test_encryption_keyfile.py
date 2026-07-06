@@ -7,7 +7,9 @@ temp directory, so the file-based code paths are actually exercised.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -92,6 +94,61 @@ def test_fernet_key_is_a_secret_and_never_leaks_in_repr() -> None:
     assert key not in str(settings)
     # The raw value is still recoverable for the encryption layer.
     assert settings.fernet_key.get_secret_value() == key
+
+
+def test_generate_key_file_never_overwrites_existing_key(file_backed_key: Path) -> None:
+    """GHSA-7fhf: the atomic-publish rewrite uses ``os.link`` (not ``os.rename``),
+    which refuses to clobber an existing ``key_path`` -- calling
+    ``_generate_key_file`` again against an already-present key must leave it
+    byte-identical and hand back the EXISTING key, never a fresh one."""
+    original = Fernet.generate_key()
+    file_backed_key.write_bytes(original)
+
+    result = encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+        file_backed_key
+    )
+
+    assert file_backed_key.read_bytes() == original
+    assert result == original
+
+
+def test_concurrent_first_run_agrees_on_one_complete_key(file_backed_key: Path) -> None:
+    """The barrier race GHSA-7fhf fixes: N workers all observe a fresh install
+    and race to mint the key. Every worker must agree on the SAME complete key
+    (no reader ever observes a partial/truncated write), and the published file
+    keeps the private 0600 mode."""
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def _worker() -> bytes:
+        barrier.wait()
+        return encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+            file_backed_key
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker) for _ in range(workers)]
+        results = [future.result() for future in futures]
+
+    assert len(set(results)) == 1  # every worker agrees on ONE key
+    (winner,) = set(results)
+    assert encryption._is_valid_fernet_key(  # pyright: ignore[reportPrivateUsage]
+        winner
+    )
+    assert file_backed_key.read_bytes() == winner
+    assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+
+
+def test_get_fernet_rejects_truncated_key(file_backed_key: Path) -> None:
+    """A present-but-truncated key file must fail loudly (never silently mint a
+    replacement, which would orphan data encrypted under the original) and must
+    never be overwritten by the failed load attempt."""
+    file_backed_key.write_bytes(b"tooshort")
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption.get_fernet()
+
+    assert file_backed_key.read_bytes() == b"tooshort"
 
 
 def test_secret_override_still_drives_encryption(monkeypatch: pytest.MonkeyPatch) -> None:

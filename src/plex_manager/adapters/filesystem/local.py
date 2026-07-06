@@ -111,7 +111,10 @@ def _publish_lock(dst: Path):
         try:
             lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            if dst.exists():
+            # lexists, not exists: a DANGLING symlink at dst must still refuse (GHSA-8fj8)
+            # -- exists() follows the link and reads a dangling one as absent, which
+            # would let a stale/planted symlink fall through as if dst were free.
+            if os.path.lexists(os.fspath(dst)):
                 raise FileExistsError(os.fspath(dst)) from None
             if _lock_is_stale(lock_path):
                 with contextlib.suppress(FileNotFoundError):
@@ -142,11 +145,16 @@ def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
     ~2x the title's size transiently and failing with a spurious ENOSPC on a
     barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
     PUBLISHER is preserved by the per-destination ``_publish_lock`` plus the
-    ``dst.exists()`` check made under it — every publisher in this module takes
-    that same lock before touching ``dst``.
+    ``os.path.lexists(dst)`` check made under it — every publisher in this
+    module takes that same lock before touching ``dst``.
     """
     with _publish_lock(dst):
-        if dst.exists():
+        # lexists, not exists: on a hardlink-refusing filesystem the copy fallback
+        # below is os.rename, which WOULD silently replace a dangling symlink's
+        # entry (exists() reads a dangling link as absent) -- GHSA-8fj8. This is
+        # the critical backstop, immediately before the link/rename attempt, under
+        # the lock every publisher in this module takes before touching dst.
+        if os.path.lexists(os.fspath(dst)):
             raise FileExistsError(os.fspath(dst))
         try:
             os.link(tmp_path, os.fspath(dst))

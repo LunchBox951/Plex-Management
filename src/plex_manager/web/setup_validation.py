@@ -30,6 +30,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
+from plex_manager.headersafe import header_value_error
 from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
@@ -93,6 +94,24 @@ def _require_http_url(url: str) -> ServiceValidateResponse | None:
     if message is None:
         return None
     return ServiceValidateResponse(ok=False, message=message)
+
+
+def _require_header_safe_credential(value: str, noun: str) -> ServiceValidateResponse | None:
+    """Reject a credential that cannot ride an HTTP header BEFORE any outbound
+    probe (mirrors :func:`_require_http_url`). ``noun`` names the credential in
+    the message (e.g. "Prowlarr API key"). Returns ``None`` when ``value`` is
+    acceptable.
+
+    The predicate itself lives in :mod:`plex_manager.headersafe` — see
+    :func:`~plex_manager.headersafe.header_value_error` for the two failure
+    modes this closes (a CR/LF credential leak via ``str(exc)``; an uncaught
+    ``UnicodeEncodeError``/500 on non-ASCII).
+    """
+    if header_value_error(value) is None:
+        return None
+    return ServiceValidateResponse(
+        ok=False, message=f"The {noun} contains characters that are not valid in an HTTP header."
+    )
 
 
 def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
@@ -209,7 +228,21 @@ async def assert_plex_token_authorized(client: httpx.AsyncClient, url: str, toke
     own failure mode. ``use_cache=False`` for the same reason as
     :func:`validate_plex`: a verification must reflect the server as it is NOW,
     never a section list cached from a previous healthy probe.
+
+    A header-unsafe token is rejected HERE, before ``PlexLibrary`` ever sends it
+    (reuses the SAME ``plex_token_invalid`` code a Plex-rejected token already
+    raises — no new envelope code): this is defense-in-depth for the callers
+    that persist a Plex identity (``POST /setup/complete``, ``PUT /settings``'
+    repoint) reaching this function directly, on top of :func:`validate_plex`'s
+    own pre-check on the wizard path.
     """
+    if header_value_error(token) is not None:
+        raise AppError(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            code="plex_token_invalid",
+            message="The Plex token contains characters that are not valid in an HTTP header.",
+            hint="Re-copy the token from Plex; it must be a plain ASCII value.",
+        )
     try:
         await PlexLibrary(client, url, token).list_sections(use_cache=False)
     except PlexAuthError as exc:
@@ -268,6 +301,9 @@ async def validate_plex(
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
+    token_rejection = _require_header_safe_credential(token, "Plex token")
+    if token_rejection is not None:
+        return token_rejection
     # Identity FIRST when asked: a transport failure here surfaces as the 502
     # envelope (not the section-probe's ok=False), and Plex's /identity is
     # unauthenticated, so a bad token still falls through to the honest "Plex
@@ -315,15 +351,21 @@ async def validate_prowlarr(
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
+    key_rejection = _require_header_safe_credential(api_key, "Prowlarr API key")
+    if key_rejection is not None:
+        return key_rejection
     try:
         response = await client.get(
             f"{url.rstrip('/')}/api/v1/system/status",
             headers={"X-Api-Key": api_key},
         )
     except httpx.HTTPError as exc:
-        # The api key travels in a header, not the URL, so str(exc) cannot leak it.
+        # The api key travels in a header, so an unsafe value (CR/LF, non-ASCII)
+        # would make httpx echo it raw in str(exc) or crash uncaught — the
+        # _require_header_safe_credential check above stops both before this
+        # request is ever sent. Only the exception *type* is surfaced here.
         return ServiceValidateResponse(
-            ok=False, message="Could not reach Prowlarr.", detail=str(exc)
+            ok=False, message="Could not reach Prowlarr.", detail=type(exc).__name__
         )
     if response.status_code == _HTTP_OK:
         try:

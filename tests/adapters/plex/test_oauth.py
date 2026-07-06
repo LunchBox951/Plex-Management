@@ -333,6 +333,54 @@ async def test_fetch_server_identity_non_json_is_identity_failed() -> None:
     assert excinfo.value.code == "server_identity_failed"
 
 
+@pytest.mark.parametrize("bad_token", ["tok\r\nx", "tök"])
+async def test_fetch_account_rejects_unsafe_token(bad_token: str) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be sent for a header-unsafe token")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_account(bad_token)
+
+    exc = excinfo.value
+    assert exc.code == "plex_token_invalid"
+    assert bad_token not in str(exc)
+    assert all(bad_token not in value for value in exc.diagnostics.values())
+
+
+@pytest.mark.parametrize("bad_token", ["tok\r\nx", "tök"])
+async def test_fetch_resources_rejects_unsafe_token(bad_token: str) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be sent for a header-unsafe token")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_resources(bad_token)
+
+    exc = excinfo.value
+    assert exc.code == "plex_token_invalid"
+    assert bad_token not in str(exc)
+    assert all(bad_token not in value for value in exc.diagnostics.values())
+
+
+@pytest.mark.parametrize("bad_token", ["tok\r\nx", "tök"])
+async def test_fetch_server_identity_rejects_unsafe_token(bad_token: str) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be sent for a header-unsafe token")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_server_identity("http://plex", bad_token)
+
+    exc = excinfo.value
+    assert exc.code == "plex_token_invalid"
+    assert bad_token not in str(exc)
+    assert all(bad_token not in value for value in exc.diagnostics.values())
+
+
 async def test_diagnostics_never_contain_token() -> None:
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": "unauthorized"})

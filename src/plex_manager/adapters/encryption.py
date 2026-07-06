@@ -20,10 +20,15 @@ are never logged.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import contextlib
 import logging
 import os
+import tempfile
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import String
@@ -47,6 +52,50 @@ logger = logging.getLogger(__name__)
 
 # Module-level sentinel (deliberately not lru_cache) so tests can reset it.
 _fernet: Fernet | None = None
+
+_FERNET_KEY_LENGTH: Final = 44  # urlsafe-b64 of 32 bytes (Fernet.generate_key())
+_FERNET_KEY_RAW_LENGTH: Final = 32
+_KEY_READ_ATTEMPTS: Final = 50
+_KEY_READ_DELAY_SECONDS: Final = 0.02  # ~1s max, rides out an in-flight atomic publish
+
+
+def _is_valid_fernet_key(raw: bytes) -> bool:
+    """Whether ``raw`` is a complete, well-shaped Fernet key. Total: never raises."""
+    if len(raw) != _FERNET_KEY_LENGTH:
+        return False
+    try:
+        return len(base64.urlsafe_b64decode(raw)) == _FERNET_KEY_RAW_LENGTH
+    except (binascii.Error, ValueError):
+        return False
+
+
+def _read_valid_key(key_path: Path) -> bytes | None:
+    """Read a COMPLETE, shape-valid key, retrying briefly to ride out a racing
+    writer's atomic publish (GHSA-7fhf). Returns the key bytes, or ``None`` if
+    none materialized within the bound (absent, or present-but-never-valid).
+    """
+    for attempt in range(_KEY_READ_ATTEMPTS):
+        try:
+            raw = key_path.read_bytes()
+        except FileNotFoundError:
+            raw = b""
+        if _is_valid_fernet_key(raw):
+            return raw
+        if attempt + 1 < _KEY_READ_ATTEMPTS:
+            time.sleep(_KEY_READ_DELAY_SECONDS)
+    return None
+
+
+def _corrupt_key_error(key_path: Path) -> RuntimeError:
+    """Build the actionable error raised when the key file exists but is not a
+    valid Fernet key (truncated / corrupt) — never auto-replaced (see
+    :func:`_missing_key_error`'s rationale: minting a replacement would orphan
+    data encrypted under the original)."""
+    return RuntimeError(
+        f"Encryption key at {key_path} is present but is not a valid Fernet key "
+        "(it may be truncated or corrupt). A replacement is NOT minted automatically, to "
+        "avoid orphaning data encrypted under the original key; restore the original key file."
+    )
 
 
 def _fernet_override(settings: Settings) -> str | None:
@@ -85,26 +134,38 @@ def _missing_key_error(key_path: Path) -> RuntimeError:
 def _generate_key_file(key_path: Path) -> bytes:
     """Atomically mint the first-run key, or re-read an existing one on a lost race.
 
-    ``os.open`` with ``O_CREAT | O_EXCL | O_WRONLY`` (mode ``0o600``) is the race
-    guard: two workers starting on a fresh install can both observe the file as
-    absent, but only ONE wins the exclusive create. The loser catches
-    ``FileExistsError`` and re-reads the winner's key rather than truncating it —
-    truncating would orphan the winner's already-cached key and render any data it
-    encrypted permanently undecryptable. An existing key is therefore NEVER
-    overwritten. ``O_EXCL`` also closes the window where the file is world-readable
-    (the mode is applied at create time).
+    A private (mode ``0o600``) tempfile in ``key_path``'s own directory holds the
+    key; it is written, flushed, and fsynced BEFORE it is ever named ``key_path``,
+    so the inode holds a COMPLETE key at the moment it becomes visible. Publishing
+    via ``os.link`` (not ``os.rename``) makes that visibility change atomic AND
+    refuses to clobber an existing ``key_path`` — a racing loser's
+    ``FileExistsError`` re-reads the winner's key (bounded retry, in case the
+    winner's own link is still in flight) rather than truncating it, which would
+    orphan the winner's already-cached key and render any data it encrypted
+    permanently undecryptable. An existing key is therefore NEVER overwritten.
+    The linked file inherits the tempfile's ``0o600`` mode.
     """
     key = Fernet.generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=key_path.parent, prefix=".secret.", suffix=".tmp")
     try:
-        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # Lost the create race: another worker already wrote the canonical key.
-        return key_path.read_bytes()
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(key)
-    logger.info("generated new encryption key at %s", key_path)
-    return key
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp_name, os.fspath(key_path))
+        except FileExistsError:
+            # Lost the race: another worker already published the canonical key.
+            existing = _read_valid_key(key_path)
+            if existing is None:
+                raise _corrupt_key_error(key_path) from None
+            return existing
+        logger.info("generated new encryption key at %s", key_path)
+        return key
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)  # drop the temp in every branch -- os.link doesn't consume it
 
 
 def get_fernet() -> Fernet:
@@ -127,7 +188,10 @@ def get_fernet() -> Fernet:
     key_path = secret_key_path(settings)
     if not key_path.exists():
         raise _missing_key_error(key_path)
-    _fernet = Fernet(key_path.read_bytes())
+    raw = _read_valid_key(key_path)
+    if raw is None:
+        raise _corrupt_key_error(key_path)
+    _fernet = Fernet(raw)
     return _fernet
 
 
@@ -148,7 +212,10 @@ def ensure_secret_key() -> Fernet:
         return _fernet
     key_path = secret_key_path(settings)
     if key_path.exists():
-        _fernet = Fernet(key_path.read_bytes())
+        raw = _read_valid_key(key_path)
+        if raw is None:
+            raise _corrupt_key_error(key_path)
+        _fernet = Fernet(raw)
     else:
         _fernet = Fernet(_generate_key_file(key_path))
     return _fernet
