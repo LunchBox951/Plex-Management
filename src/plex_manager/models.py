@@ -1,9 +1,9 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Twelve tables back the alpha + beta pipeline: ``users``, ``settings``,
-``system_settings``, ``audit_log``, ``media_requests``, ``request_dedup_locks``,
-``season_requests``, ``downloads``, ``download_history``, ``blocklist``,
-``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
+Thirteen tables back the alpha + beta pipeline: ``users``, ``settings``,
+``system_settings``, ``auth_sessions``, ``audit_log``, ``media_requests``,
+``request_dedup_locks``, ``season_requests``, ``downloads``, ``download_history``,
+``blocklist``, ``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
 behaviour follow the persistence design (see the analysis extract's
 "Persistence + Schema Migrations" section, ADR-0007, and — for
 ``log_events``/``library_path``/``keep_forever``/the ``evicted`` status —
@@ -47,7 +47,6 @@ __all__ = [
     "LogEvent",
     "MediaRequest",
     "MediaType",
-    "PlexLoginState",
     "RequestDedupLock",
     "RequestStatus",
     "SeasonRequest",
@@ -228,27 +227,6 @@ class SystemSettings(Base):
     app_api_key: Mapped[str | None] = mapped_column(EncryptedStr)
     setup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     setup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
-class PlexLoginState(Base):
-    """Pending plex.tv PIN login challenge.
-
-    The state value is the local CSRF-style nonce the SPA sends back to
-    ``/auth/plex/complete``. It is single-use and short-lived; the row contains no
-    Plex user token.
-    """
-
-    __tablename__ = "plex_login_states"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    state: Mapped[str] = mapped_column(String, unique=True, index=True)
-    pin_id: Mapped[int] = mapped_column(index=True)
-    code: Mapped[str] = mapped_column(String)
-    client_identifier: Mapped[str] = mapped_column(String)
-    browser_token_hash: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuthSession(Base):
