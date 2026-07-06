@@ -845,14 +845,28 @@ async def report_issue(
 async def _park_no_acceptable(
     session: AsyncSession, request_id: int, season: int | None, *, is_tv: bool
 ) -> None:
-    """Land the request/season on the honest ``no_acceptable_release`` dead-end."""
+    """Land the request/season on the honest ``no_acceptable_release`` dead-end.
+
+    Both branches now go through a genuine compare-and-swap (issue #72) --
+    ``request_service`` / ``season_request_service.mark_no_acceptable_release``
+    -- so a concurrent writer that already moved the row out of the parkable set
+    (e.g. a racing grab landed it on ``downloading``) is left alone rather than
+    silently regressed: the CAS's boolean return decides whether to commit this
+    write, never whether to raise or retry. This function's own caller
+    (``report_issue``) always re-reads the request's ACTUAL row afterward, so the
+    response reflects the true state regardless of whether this particular write
+    landed.
+    """
     if is_tv and season is not None:
-        await season_request_service.mark_no_acceptable_release(
+        parked = await season_request_service.mark_no_acceptable_release(
             session, media_request_id=request_id, season_number=season
         )
+    else:
+        parked = await request_service.mark_no_acceptable_release(session, request_id)
+    if parked:
         await session.commit()
     else:
-        await request_service.mark_no_acceptable_release(session, request_id)
+        await session.rollback()
 
 
 async def cancel_request(

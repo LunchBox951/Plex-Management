@@ -473,6 +473,47 @@ async def test_mark_no_acceptable_release_never_unterminates_a_finished_season(
         assert show.status is RequestStatus.available
 
 
+async def test_mark_no_acceptable_release_does_not_overwrite_a_concurrent_downloading_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #72: the old read-then-write shape read the season's current status,
+    checked it was non-TERMINAL, then wrote unconditionally -- a concurrent grab (a
+    lower-ranked auto-grab candidate, a manual re-grab) moving the season to
+    ``downloading`` in that gap would be silently regressed back to the
+    ``no_acceptable_release`` dead-end even though a real download was now live.
+    The genuine compare-and-swap closes the gap regardless of WHEN the concurrent
+    write lands relative to this call -- seeding the season already at
+    ``downloading`` exercises the exact postcondition of that race. A lost CAS
+    must also never recompute (and persist) the parent rollup off a row it did
+    not actually get to move."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=708)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=708, seasons=[1]
+        )
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=1, status="downloading"
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        parked = await season_request_service.mark_no_acceptable_release(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.rollback()
+    assert parked is False  # the CAS lost the race -- never silently claims a win
+
+    async with sessionmaker_() as session:
+        stmt = select(SeasonRequest).where(
+            SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
+        )
+        season_row = (await session.execute(stmt)).scalars().one()
+        show = await session.get(MediaRequest, show_id)
+    assert season_row.status is RequestStatus.downloading  # never regressed
+    assert show is not None
+    assert show.status is RequestStatus.downloading  # parent rollup left untouched too
+
+
 async def test_mark_completed_stamps_parent_completed_at_on_first_season_only(
     sessionmaker_: SessionMaker,
 ) -> None:

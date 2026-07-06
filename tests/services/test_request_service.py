@@ -107,6 +107,69 @@ async def test_mark_no_acceptable_release_never_unterminates_finished_request(
     assert row.status is terminal_status  # untouched, not no_acceptable_release
 
 
+async def test_mark_no_acceptable_release_does_not_overwrite_a_concurrent_downloading_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #72: the old read-then-write shape read the current status, checked
+    it was non-TERMINAL, then wrote unconditionally -- a concurrent writer (a
+    lower-ranked auto-grab candidate, a manual re-grab) moving the row to
+    ``downloading`` in that gap would be silently regressed back to the
+    ``no_acceptable_release`` dead-end even though a real download was now live.
+    The genuine compare-and-swap closes the gap regardless of WHEN the
+    concurrent write lands relative to this call -- seeding the row already at
+    ``downloading`` exercises the exact postcondition of that race: the CAS's
+    ``WHERE status IN (...)`` is evaluated by the database, sees ``downloading``
+    is not in the parkable set, and updates zero rows."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=889,
+            media_type=MediaType.movie,
+            title="Arrival",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        parked = await request_service.mark_no_acceptable_release(session, request_id)
+        await session.rollback()
+    assert parked is False  # the CAS lost the race -- never silently claims a win
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.downloading  # never regressed
+
+
+async def test_mark_no_acceptable_release_parks_and_persists_on_a_won_cas(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The success path of the CAS: a request in a parkable status (``searching``)
+    is moved to ``no_acceptable_release`` and, since the function is FLUSH-ONLY,
+    the caller's own commit is what makes it durable for a later session to see."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=890,
+            media_type=MediaType.movie,
+            title="Arrival",
+            status=RequestStatus.searching,
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        parked = await request_service.mark_no_acceptable_release(session, request_id)
+        await session.commit()
+    assert parked is True
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.no_acceptable_release
+
+
 async def test_movie_availability_check_failure_logs_tmdb_id_via_extra(
     sessionmaker_: SessionMaker,
     caplog: pytest.LogCaptureFixture,

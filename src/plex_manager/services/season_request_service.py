@@ -104,6 +104,36 @@ _REAL_DONE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     s.value for s in (RequestStatus.completed, RequestStatus.available)
 )
 
+# Season statuses from which a park to ``no_acceptable_release`` is a SAFE,
+# honest search-exhausted verdict -- the CAS's ``allowed_from`` for
+# :func:`mark_no_acceptable_release` below (issue #72). Mirrors
+# ``request_service._PARKABLE_REQUEST_STATUS_VALUES`` at season granularity
+# (duplicated, not imported, for the SAME circular-import reason as
+# ``_TERMINAL_SEASON_STATUS_VALUES`` above). Excludes every TERMINAL season
+# status (the never-un-terminate guard: writing ``no_acceptable_release`` --
+# itself non-terminal and dedup-blocking -- over a finished season would
+# resurrect it as a ghost) PLUS two additional non-terminal statuses a parking
+# transition must never stomp:
+#   - ``downloading`` -- closes issue #72's race: before this CAS existed,
+#     ``mark_no_acceptable_release`` read the season's current status, checked
+#     it was non-terminal, then wrote unconditionally; a concurrent grab (a
+#     lower-ranked auto-grab candidate, a manual re-grab) moving the season to
+#     ``downloading`` in that gap would be silently regressed back to a
+#     dead-end. The CAS's ``WHERE status IN (...)`` is evaluated by the
+#     DATABASE at write time, never against a stale read.
+#   - ``import_blocked`` -- a season CAN reach this directly
+#     (``import_service._import_tv_locked``'s failure path): a DIFFERENT
+#     needs-attention dead-end that a stale nothing-acceptable signal must
+#     never paper over.
+_PARKABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value
+    for s in (
+        RequestStatus.pending,
+        RequestStatus.searching,
+        RequestStatus.no_acceptable_release,
+    )
+)
+
 
 async def _recompute_parent(
     session: AsyncSession,
@@ -598,21 +628,38 @@ async def reset_for_research(
 
 async def mark_no_acceptable_release(
     session: AsyncSession, *, media_request_id: int, season_number: int
-) -> None:
+) -> bool:
     """Persist ``no_acceptable_release`` on one season when a grab finds nothing.
 
     The season-level analogue of ``request_service.mark_no_acceptable_release``:
     honesty over silence (a visible, retryable status, never a silent
-    ``downloading``/``searching`` left lying), and the SAME never-un-terminate
-    guard -- a season already FINISHED (``completed`` / ``available`` / ``failed``)
-    is left untouched, so a stale search-exhausted signal can never resurrect a
-    finished season as a dedup-blocking ghost.
+    ``downloading``/``searching`` left lying), and now the SAME genuine
+    compare-and-swap (issue #72) -- see that function's docstring for the full
+    TOCTOU this closes (a concurrent grab winning the race between an old
+    read-then-write's read and its write, and being silently regressed back to
+    this dead-end). Delegates to :func:`set_status_if_in` (this module's CAS
+    wrapper, which also recomputes the parent rollup, but ONLY when the swap
+    actually happened) with ``_PARKABLE_SEASON_STATUS_VALUES`` as
+    ``allowed_from`` -- see that constant's comment for exactly which statuses
+    (every TERMINAL one, plus ``downloading`` / ``import_blocked``) a parking
+    transition must never stomp.
+
+    FLUSH-ONLY (module convention): the caller commits.
+
+    Returns ``True`` if this call actually parked the season, ``False`` if a
+    concurrent writer already moved it out of the parkable set -- the caller
+    must treat ``False`` as "leave it alone, do not also write backoff
+    metadata for a park that did not happen" (see
+    ``auto_grab_service._park``).
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
-    if row.status in _TERMINAL_SEASON_STATUS_VALUES:
-        return
-    await season_repo.set_status(row.id, RequestStatus.no_acceptable_release.value)
-    await _recompute_parent(session, media_request_id)
+    return await set_status_if_in(
+        session,
+        media_request_id=media_request_id,
+        season_request_id=row.id,
+        status=RequestStatus.no_acceptable_release.value,
+        allowed_from=_PARKABLE_SEASON_STATUS_VALUES,
+    )
