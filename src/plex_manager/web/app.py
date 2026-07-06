@@ -229,6 +229,13 @@ async def _reconcile_once(app: FastAPI) -> None:
                     "running availability pass anyway",
                     type(exc).__name__,
                 )
+                # A remove=no operator residual needs NO client I/O, so an OUTAGE
+                # must not strand it for the outage's whole duration any more than
+                # an unconfigured client may (the branch below) -- run the same
+                # narrow DB-only heal on the rolled-back session; rows that need a
+                # removal keep waiting for the client to recover (counted + logged
+                # inside the heal, never silently dropped).
+                await queue_service.heal_failed_pending_without_client(session)
         else:
             # DB-only strand heal (queue_service module docstring, "Operator
             # provenance"): with qBittorrent UNCONFIGURED the reconcile cycle above

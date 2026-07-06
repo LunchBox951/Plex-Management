@@ -44,10 +44,12 @@ _INDEXER = "FakeIndexer"
 
 @pytest.fixture(autouse=True)
 def clear_operator_claims() -> Iterator[None]:
-    """Isolate the module-level claim registry between tests: a claim a failing
-    test left registered must never leak into (and cascade through) later tests."""
+    """Isolate the module-level claim registry between tests: a claim (or a
+    reconcile removal window) a failing test left registered must never leak into
+    (and cascade through) later tests."""
     yield
     queue_service._operator_fail_claims.clear()  # pyright: ignore[reportPrivateUsage]
+    queue_service._reconcile_removals_in_flight.clear()  # pyright: ignore[reportPrivateUsage]
 
 
 async def _seed_request_with_download(
@@ -1810,3 +1812,79 @@ async def test_heal_without_client_completes_only_remove_no_residuals(
     assert request_c_row is not None and request_c_row.status is RequestStatus.downloading
     assert download_d_row is not None and download_d_row.status == "failed_pending"
     assert request_d_row is not None and request_d_row.status is RequestStatus.downloading
+
+
+# ---------------------------------------------------------------------------
+# Round 6: protocol step 5 covers BOTH removal actors, and the DB-only heal
+# runs on outage ticks too (web wiring tested in test_reconcile_loop.py).
+# ---------------------------------------------------------------------------
+
+
+class _MarkFailedDuringReconcileRemovalQbt(FakeQbittorrent):
+    """A client whose ``remove`` (reconcile's AUTOMATIC Phase-B delete) attempts an
+    operator mark_failed(remove_torrent=False) on the same download mid-await --
+    the reconcile-side supersession that must now be refused (round 6, finding 2):
+    the delete I/O has started, so completing with remove=no semantics would
+    promise data this very await is destroying."""
+
+    def __init__(self, sm: SessionMaker, download_id: int) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._download_id = download_id
+        self.nested_error: Exception | None = None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        async with self._sm() as session:
+            try:
+                await queue_service.mark_failed(
+                    session,
+                    None,
+                    download_id=self._download_id,
+                    blocklist=False,
+                    remove_torrent=False,
+                )
+            except RemovalInProgressError as exc:
+                self.nested_error = exc
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_operator_claim_during_reconcile_delete_is_refused(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round 6, finding 2: an operator mark_failed arriving while reconcile's
+    automatic Phase-B delete is mid-await gets the same physics refusal (409
+    removal_in_progress) as during an operator removal; reconcile's own completion
+    proceeds exactly as today; and the refusal window closes with the await --
+    registration succeeds again afterwards."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+    async with sessionmaker_() as session:
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        download_id = download.id
+
+    qbt = _MarkFailedDuringReconcileRemovalQbt(sessionmaker_, download_id)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The mid-delete operator command was refused with the physics error...
+    assert isinstance(qbt.nested_error, RemovalInProgressError)
+    # ...and reconcile's completion proceeded exactly as today.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None and download.status == "failed"
+    assert request is not None and request.status is RequestStatus.searching
+    assert len(blocklist) == 1
+    assert qbt.removed == [(_HASH, True)]
+
+    # The refusal window closed with the delete await: a fresh registration for
+    # this download is accepted again (released immediately -- registry hygiene).
+    token = _register_operator_claim(
+        download_id, _OperatorFailFlags(blocklist=False, remove_torrent=False)
+    )
+    _release_operator_claim(download_id, token)
+    assert not queue_service._operator_fail_claims  # pyright: ignore[reportPrivateUsage]

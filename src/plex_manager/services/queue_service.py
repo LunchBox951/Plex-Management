@@ -88,14 +88,20 @@ reconcile heal can never override an operator's explicit ``mark_failed`` choices
      active (nothing stamped — reconcile resumes normally once unclaimed) or as a
      marker-carrying ``failed_pending`` residual the heal completes with the
      owning flags. No yield path strands the row.
-  5. The ONE place later-wins yields to physics: immediately before the owning
-     call's torrent-removal await the claim is flagged removal-in-flight, and
-     from then until the claim is released ``_register_operator_claim`` REFUSES a
-     replacement (:class:`RemovalInProgressError` -> HTTP 409
-     ``removal_in_progress``). Once the delete I/O has started the remove
-     decision is irreversible — accepting a later ``remove_torrent=False``
-     command would promise a file the in-flight delete is destroying. Retry after
-     the in-flight call resolves.
+  5. The ONE place later-wins yields to physics, covering BOTH removal actors:
+     once a delete I/O has started the remove decision is irreversible, so
+     ``_register_operator_claim`` REFUSES registration
+     (:class:`RemovalInProgressError` -> HTTP 409 ``removal_in_progress``) while
+     one is in flight — accepting a ``remove_torrent=False`` command then would
+     promise a file the in-flight delete is destroying. **Operator side**:
+     immediately before :func:`mark_failed`'s removal await its claim is flagged
+     removal-in-flight, held until the claim is released (the deletion has
+     happened either way). **Reconcile side**: each automatic Phase-B delete
+     registers its download id in ``_reconcile_removals_in_flight`` for exactly
+     the duration of the delete await; the window closes when the await returns,
+     and reconcile's Phase-C completion proceeds as today (a claim registered
+     after the window defers it as usual). Retry after the in-flight removal
+     resolves.
 
   This is safe as in-process state because the deployment is single-process by
   design (the same assumption ``web/routers/settings.py``'s ``_rotate_lock``
@@ -247,18 +253,32 @@ _operator_fail_claims: dict[int, _OperatorClaim] = {}
 
 _claim_tokens = count(1)
 
+# Reconcile-side removal window (protocol step 5 covers BOTH removal actors):
+# download ids whose AUTOMATIC reconcile-driven Phase-B delete is mid-await.
+# ``_register_operator_claim`` refuses registration during this window for the
+# same physics reason as the operator flag above — an operator
+# ``remove_torrent=False`` claim registered mid-delete would complete promising a
+# file the delete is destroying. Unlike the operator flag, the entry is discarded
+# as soon as the await returns (reconcile's completion then proceeds as today; a
+# claim registered AFTER the window defers that completion as usual).
+_reconcile_removals_in_flight: set[int] = set()
+
 
 def _register_operator_claim(download_id: int, flags: _OperatorFailFlags) -> int:
     """Claim ``download_id`` for an operator mark_failed; return the owner token.
 
     REPLACES any existing claim: the newest operator command owns the row (protocol
     step 1) — the superseded call's token silently stops owning, so its later
-    token-gated phases yield. The ONE exception (protocol step 5): while the
-    current owner's torrent-removal I/O is in flight the remove decision is
-    already irreversible, so a replacement is REFUSED with
-    :class:`RemovalInProgressError` — accepting a ``remove_torrent=False``
-    supersession then would promise a file the in-flight delete is destroying.
+    token-gated phases yield. The ONE exception (protocol step 5): while a
+    torrent-removal I/O for this download is in flight — EITHER the current
+    operator owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
+    Phase-B delete (``_reconcile_removals_in_flight``) — the remove decision is
+    already irreversible, so registration is REFUSED with
+    :class:`RemovalInProgressError` — accepting a ``remove_torrent=False`` command
+    then would promise a file the in-flight delete is destroying.
     """
+    if download_id in _reconcile_removals_in_flight:
+        raise RemovalInProgressError(download_id)
     existing = _operator_fail_claims.get(download_id)
     if existing is not None and existing.removal_in_flight:
         raise RemovalInProgressError(download_id)
@@ -359,14 +379,15 @@ class InvalidStateTransitionError(Exception):
 
 
 class RemovalInProgressError(Exception):
-    """A mark-failed's torrent removal is already in flight for this download
-    (HTTP 409, ``removal_in_progress``).
+    """A torrent removal is already in flight for this download (HTTP 409,
+    ``removal_in_progress``).
 
-    Ownership protocol step 5 — the one place later-wins yields to physics: once
-    the owning call's ``qbt`` delete await has started, the remove decision is
-    irreversible, so a superseding mark_failed (whose flags could promise the
-    opposite) is refused instead of replacing the claim. Retry once the in-flight
-    call resolves.
+    Ownership protocol step 5 — the one place later-wins yields to physics,
+    covering BOTH removal actors: once a ``qbt`` delete await has started —
+    whether an operator mark-failed's Phase B or reconcile's automatic Phase-B
+    delete — the remove decision is irreversible, so a mark_failed (whose flags
+    could promise the opposite) is refused instead of registering a claim. Retry
+    once the in-flight removal resolves.
     """
 
     def __init__(self, download_id: int) -> None:
@@ -856,15 +877,26 @@ async def reconcile_and_list(
         unclaimed.append(completion)
         if not completion.remove_torrent:
             continue
-        await purge_service.remove_torrent(
-            qbt,
-            completion.event.torrent_hash,
-            context="a reconcile-driven download failure",
-            extra={
-                "torrent_hash": completion.event.torrent_hash,
-                "tmdb_id": completion.event.tmdb_id,
-            },
-        )
+        # Protocol step 5, reconcile side: for the duration of this delete await
+        # the download is registered removal-in-flight, so an operator
+        # mark_failed(remove_torrent=False) arriving mid-delete is refused (409
+        # removal_in_progress) instead of completing with remove=no semantics
+        # while this very await destroys the data. Discarded as soon as the await
+        # returns: a claim registered after the window defers the Phase-C
+        # completion below as usual.
+        _reconcile_removals_in_flight.add(completion.download_id)
+        try:
+            await purge_service.remove_torrent(
+                qbt,
+                completion.event.torrent_hash,
+                context="a reconcile-driven download failure",
+                extra={
+                    "torrent_hash": completion.event.torrent_hash,
+                    "tmdb_id": completion.event.tmdb_id,
+                },
+            )
+        finally:
+            _reconcile_removals_in_flight.discard(completion.download_id)
     completions = unclaimed
 
     # Phase C: complete each failure (failed_pending -> Failed + blocklist + re-arm)
