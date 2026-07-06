@@ -77,6 +77,43 @@ TERMINAL_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     )
 )
 
+# Statuses from which a park to ``no_acceptable_release`` is a SAFE, honest
+# search-exhausted verdict -- the CAS's ``allowed_from`` for
+# :func:`mark_no_acceptable_release` below (issue #72). This is deliberately
+# NARROWER than "every non-terminal status": every TERMINAL status above is
+# excluded (the never-un-terminate guard: writing ``no_acceptable_release`` --
+# itself non-terminal and dedup-blocking -- over a finished request would
+# resurrect it as a ghost that re-blocks a fresh request for the same media),
+# PLUS two additional non-terminal statuses a parking transition must never
+# stomp:
+#   - ``downloading`` -- a grab genuinely landed on this request. Before this
+#     CAS existed, ``mark_no_acceptable_release`` read the current status,
+#     checked it was non-terminal, and then wrote unconditionally; a
+#     concurrent writer (a lower-ranked auto-grab candidate, a manual
+#     re-grab) moving the row to ``downloading`` in the gap between that read
+#     and the write would be silently regressed back to a dead-end, even
+#     though a real download was now live. The CAS closes this exact TOCTOU:
+#     the UPDATE's ``WHERE status IN (...)`` is evaluated by the DATABASE at
+#     write time, never against a stale in-memory read.
+#   - ``import_blocked`` -- a DIFFERENT needs-attention dead-end (the download
+#     finished but import failed). Parking over it would hide a real,
+#     already-failed import behind the honest-but-now-WRONG "nothing found"
+#     verdict.
+# ``partially_available`` never occurs on a MOVIE's own row (it is the
+# TV-only parent rollup -- see its member comment on ``RequestStatus``), so
+# its absence here is moot for this module;
+# ``season_request_service._PARKABLE_SEASON_STATUS_VALUES`` is the
+# season-granularity analogue, whose row CAN reach ``import_blocked``
+# directly.
+_PARKABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value
+    for s in (
+        RequestStatus.pending,
+        RequestStatus.searching,
+        RequestStatus.no_acceptable_release,
+    )
+)
+
 
 class MediaNotFoundError(Exception):
     """The metadata port could not resolve the requested ``(tmdb_id, media_type)``.
@@ -502,7 +539,7 @@ async def get_request(session: AsyncSession, request_id: int) -> RequestRecord |
     return await SqlRequestRepository(session).get(request_id)
 
 
-async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> None:
+async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> bool:
     """Persist ``no_acceptable_release`` on the request when a grab finds nothing.
 
     Honesty over silence: a live grab that finds no acceptable candidate returns
@@ -511,18 +548,37 @@ async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> 
     ``no_acceptable_release`` is a visible, retryable state (the operator can
     re-search later), not a silent ``failed``.
 
-    A request that is already TERMINAL (``completed`` / ``available`` / ``failed``)
-    is left untouched: ``no_acceptable_release`` is itself non-terminal and
-    dedup-blocking, so writing it over a finished request would resurrect it as a
-    ghost that re-blocks a fresh request for the same media. Never un-terminate a
-    finished request.
+    A genuine compare-and-swap (issue #72), not read-then-write: this used to read
+    the current status, check it was non-TERMINAL, then write unconditionally --
+    a TOCTOU gap a concurrent writer (a lower-ranked auto-grab candidate, a manual
+    re-grab) could win in, moving the row to ``downloading`` between the read and
+    the write, only to be silently regressed back to this dead-end. ``set_status_
+    if_in`` closes the gap: its ``WHERE status IN (...)`` is evaluated by the
+    DATABASE at write time, not against this function's (possibly stale) view, so
+    the row only ever moves to ``no_acceptable_release`` from
+    ``_PARKABLE_REQUEST_STATUS_VALUES`` -- see that constant's comment for exactly
+    which statuses (every TERMINAL one, plus ``downloading`` / ``import_blocked``)
+    a parking transition must never stomp.
+
+    FLUSH-ONLY (mirrors ``season_request_service``'s module-wide convention): never
+    commits or rolls back. The caller owns the commit boundary -- on a WON CAS
+    (``True``) so it can commit this write atomically alongside anything else it
+    means to land together (e.g. ``auto_grab_service._park``'s backoff write, which
+    must NOT be persisted for a park that did not happen); on a LOST CAS
+    (``False``) the caller should roll back rather than commit (mirrors
+    ``eviction_service``'s double-count guard) -- there is nothing of substance to
+    lose (the UPDATE affected zero rows), but rolling back cleanly closes out the
+    statement's implicit transaction instead of leaving it dangling.
+
+    Returns ``True`` if this call actually parked the request, ``False`` if a
+    concurrent writer already moved it out of the parkable set -- the caller MUST
+    treat ``False`` as "leave it alone", never retry the write.
     """
-    repo = SqlRequestRepository(session)
-    current = await repo.get(request_id)
-    if current is not None and current.status in TERMINAL_REQUEST_STATUS_VALUES:
-        return
-    await repo.set_status(request_id, RequestStatus.no_acceptable_release.value)
-    await session.commit()
+    return await SqlRequestRepository(session).set_status_if_in(
+        request_id,
+        RequestStatus.no_acceptable_release.value,
+        _PARKABLE_REQUEST_STATUS_VALUES,
+    )
 
 
 async def mark_completed(session: AsyncSession, request_id: int) -> None:

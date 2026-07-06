@@ -1183,6 +1183,62 @@ async def test_active_download_before_park_skips_the_park(
         assert row.next_search_at is None
 
 
+async def test_park_cas_loses_to_a_concurrent_downloading_write_skips_backoff_too(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #72: the round-3 #1 ``find_active_for_request`` re-check above only
+    guards against a racing DOWNLOAD row -- it cannot see a status write landing
+    directly on ``MediaRequest.status`` (e.g. a concurrent ``/correction``
+    re-grab, or any writer whose ``Download`` row is not yet visible to this
+    check). Simulate exactly that: the re-check itself sees nothing (so ``_park``
+    proceeds past it), but a genuinely CONCURRENT session flips the request to
+    ``downloading`` in the gap immediately after, before ``_park`` reaches the
+    actual CAS write. ``mark_no_acceptable_release``'s ``set_status_if_in`` must
+    lose that race cleanly -- no status regression -- AND ``_park`` must not have
+    already written the backoff (``search_attempts`` / ``next_search_at``) for a
+    park that did not happen."""
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=605)
+    prowlarr = FakeProwlarr(prerelease_only_candidates())  # nothing acceptable -> would park
+
+    calls = {"n": 0}
+
+    async def _find_active_then_race(
+        _self: object, media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The park's own re-check (round-3 #1) sees nothing -- but a
+            # genuinely concurrent writer (a SEPARATE session/commit, exactly
+            # like the correction-service / eviction-sweep racing tests) lands
+            # its status change in the window immediately after this read,
+            # before the caller (``_park``) reaches the actual CAS write.
+            async with sessionmaker_() as competitor:
+                row = await competitor.get(MediaRequest, media_request_id)
+                assert row is not None
+                row.status = RequestStatus.downloading
+                await competitor.commit()
+        return None
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository,
+        "find_active_for_request",
+        _find_active_then_race,
+    )
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert calls["n"] == 2  # pre-search active check + the round-3 park re-check
+    assert result.no_acceptable == 0  # the CAS lost the race -- never counted as parked
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status == RequestStatus.downloading  # never regressed
+        # The acceptance criterion this closes: backoff metadata is not mutated
+        # when the scope was not actually parked.
+        assert row.search_attempts == 0
+        assert row.next_search_at is None
+
+
 # --------------------------------------------------------------------------- #
 # Fresh park clock — each park schedules from its OWN moment (round-3 #3)
 # --------------------------------------------------------------------------- #
