@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import errno
 import logging
 import os
 import tempfile
@@ -57,6 +58,17 @@ _FERNET_KEY_LENGTH: Final = 44  # urlsafe-b64 of 32 bytes (Fernet.generate_key()
 _FERNET_KEY_RAW_LENGTH: Final = 32
 _KEY_READ_ATTEMPTS: Final = 50
 _KEY_READ_DELAY_SECONDS: Final = 0.02  # ~1s max, rides out an in-flight atomic publish
+
+# os.link failures that mean "this filesystem does not support hardlinks at
+# all" (exFAT/FAT/SMB mounts are the common self-hosted case: a Pi with
+# data_dir on a USB exFAT drive) rather than "the destination already exists"
+# (FileExistsError, handled separately). Mirrors
+# adapters/filesystem/local.py's _COPY_FALLBACK_ERRNOS (EXDEV is omitted here:
+# the tempfile is always created in key_path's own directory, so a
+# cross-device error can never occur for this link).
+_KEY_LINK_FALLBACK_ERRNOS: Final = frozenset(
+    {errno.EPERM, errno.EOPNOTSUPP, errno.EMLINK, errno.EACCES}
+)
 
 
 def _is_valid_fernet_key(raw: bytes) -> bool:
@@ -131,6 +143,24 @@ def _missing_key_error(key_path: Path) -> RuntimeError:
     )
 
 
+def _publish_key_exclusive(key_path: Path, key: bytes) -> None:
+    """Create ``key_path`` and write ``key`` to it via an exclusive
+    (``O_CREAT | O_EXCL``) open, flushed and fsynced before the fd closes.
+
+    This is the fallback publish route for a filesystem that rejects
+    ``os.link`` outright (see ``_KEY_LINK_FALLBACK_ERRNOS``). Like the
+    ``os.link`` publish it is NEVER overwrite: ``O_EXCL`` raises
+    ``FileExistsError`` if a concurrent winner already published a key, so the
+    caller can fall back to re-reading the winner's key exactly as it does for
+    the ``os.link`` race-loss case.
+    """
+    fd = os.open(os.fspath(key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(key)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _generate_key_file(key_path: Path) -> bytes:
     """Atomically mint the first-run key, or re-read an existing one on a lost race.
 
@@ -144,6 +174,14 @@ def _generate_key_file(key_path: Path) -> bytes:
     orphan the winner's already-cached key and render any data it encrypted
     permanently undecryptable. An existing key is therefore NEVER overwritten.
     The linked file inherits the tempfile's ``0o600`` mode.
+
+    On a filesystem that does not support hardlinks at all (exFAT/FAT/SMB —
+    ``os.link`` raises ``OSError`` with an errno in ``_KEY_LINK_FALLBACK_ERRNOS``,
+    NOT ``FileExistsError``), fall back to the pre-hardlink atomic-exclusive
+    create (:func:`_publish_key_exclusive`): still a same-no-overwrite,
+    complete-bytes-before-visible publish, just without the hardlink. Any other
+    ``OSError`` (e.g. disk full) is a genuine failure and propagates uncaught —
+    it must not be papered over as a race loss.
     """
     key = Fernet.generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +199,17 @@ def _generate_key_file(key_path: Path) -> bytes:
             if existing is None:
                 raise _corrupt_key_error(key_path) from None
             return existing
+        except OSError as exc:
+            if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
+                raise
+            try:
+                _publish_key_exclusive(key_path, key)
+            except FileExistsError:
+                # Lost the race under the fallback route too.
+                existing = _read_valid_key(key_path)
+                if existing is None:
+                    raise _corrupt_key_error(key_path) from None
+                return existing
         logger.info("generated new encryption key at %s", key_path)
         return key
     finally:

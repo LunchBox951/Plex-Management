@@ -7,6 +7,8 @@ temp directory, so the file-based code paths are actually exercised.
 
 from __future__ import annotations
 
+import errno
+import os
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -110,6 +112,79 @@ def test_generate_key_file_never_overwrites_existing_key(file_backed_key: Path) 
 
     assert file_backed_key.read_bytes() == original
     assert result == original
+
+
+def test_generate_key_file_falls_back_on_hardlink_refusing_filesystem(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filesystem that rejects ``os.link`` outright (e.g. an exFAT/FAT mount
+    -- a common self-hosted ``data_dir``, such as a Pi with a USB drive) must
+    still complete first-run key creation instead of crashing with an
+    uncaught ``OSError``. ``os.link`` raises ``OSError`` with an errno like
+    ``EPERM``/``EOPNOTSUPP``/``EMLINK`` here, NOT ``FileExistsError`` -- the
+    two must be handled differently."""
+    assert not file_backed_key.exists()
+    real_link = os.link
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    result = encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+        file_backed_key
+    )
+
+    monkeypatch.setattr(os, "link", real_link)
+    assert encryption._is_valid_fernet_key(  # pyright: ignore[reportPrivateUsage]
+        result
+    )
+    assert file_backed_key.read_bytes() == result
+    assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+
+
+def test_generate_key_file_hardlink_refusing_fallback_never_overwrites(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the hardlink-refusing fallback route, a key that already exists
+    (another worker won the race) must still never be clobbered -- the
+    fallback uses the same ``O_EXCL`` no-overwrite guarantee as the
+    pre-hardlink code path."""
+    original = Fernet.generate_key()
+    file_backed_key.write_bytes(original)
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    result = encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+        file_backed_key
+    )
+
+    assert file_backed_key.read_bytes() == original
+    assert result == original
+
+
+def test_generate_key_file_reraises_non_fallback_oserror(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``os.link`` failure that is NOT a known hardlink-unsupported errno
+    (e.g. ``ENOSPC``) is a genuine failure and must propagate, never be
+    silently swallowed as if it were a race loss."""
+
+    def _failing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(os, "link", _failing_link)
+
+    with pytest.raises(OSError) as exc_info:
+        encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+            file_backed_key
+        )
+
+    assert exc_info.value.errno == errno.ENOSPC
+    assert not file_backed_key.exists()
 
 
 def test_concurrent_first_run_agrees_on_one_complete_key(file_backed_key: Path) -> None:
