@@ -9,9 +9,13 @@ from __future__ import annotations
 
 from plex_manager.domain.quality import (
     BLURAY480P,
+    BLURAY720P,
     BLURAY1080P,
+    DVDR,
     DVDSCR,
+    HDTV1080P,
     REGIONAL,
+    REMUX1080P,
     REMUX2160P,
     SDTV,
     TELESYNC,
@@ -31,6 +35,7 @@ from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.source_mapping import (
     _coerce_episode,  # pyright: ignore[reportPrivateUsage]
+    _strip_release_group,  # pyright: ignore[reportPrivateUsage]
     map_modifier,
     map_source,
     resolve_quality,
@@ -278,6 +283,163 @@ def test_map_modifier_does_not_fire_on_clean_titles() -> None:
         assert map_modifier({}, title) is Modifier.NONE, title
     # Remux is still recognised and is NOT overridden by the reject net.
     assert map_modifier({"other": "Remux"}, "Movie.2024.2160p.BluRay.REMUX.x265") is Modifier.REMUX
+
+
+# -- resolve_quality REMUX gating by source (#107) ------------------------------
+
+
+def test_resolve_quality_remux_gated_by_source() -> None:
+    # BluRay: remux tier only at 1080p/2160p; below that, no remux tier exists
+    # so the token is ignored and the source+resolution lookup wins.
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R720P, Modifier.REMUX) is BLURAY720P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R480P, Modifier.REMUX) is BLURAY480P
+    # Unknown source: the Radarr no-source-remux fallback at 1080p/2160p; below
+    # that it falls through to the conservative UNKNOWN-source guard.
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
+    assert (
+        resolve_quality(QualitySource.UNKNOWN, Resolution.R720P, Modifier.REMUX) is UNKNOWN_QUALITY
+    )
+    # DVD: conservative in-tier choice, regardless of resolution.
+    assert resolve_quality(QualitySource.DVD, Resolution.R480P, Modifier.REMUX) is DVDR
+    assert resolve_quality(QualitySource.DVD, Resolution.R1080P, Modifier.REMUX) is DVDR
+    # WEBDL/WEBRIP/TV: the modifier is ignored; source+resolution lookup wins.
+    assert resolve_quality(QualitySource.WEBDL, Resolution.R1080P, Modifier.REMUX) is WEBDL1080P
+    assert resolve_quality(QualitySource.WEBRIP, Resolution.R1080P, Modifier.REMUX) is WEBRIP1080P
+    assert resolve_quality(QualitySource.TV, Resolution.R1080P, Modifier.REMUX) is HDTV1080P
+
+
+# (raw_title, recorded guessit 4.1.0 field mapping, expected quality) for the
+# source-gated REMUX table above, fed through the full to_parsed_release ->
+# resolve_quality pipeline.
+_REMUX_TABLE: list[tuple[str, dict[str, object], Quality]] = [
+    (
+        "Movie.2024.1080p.WEB-DL.REMUX-GRP",
+        {"source": "Web", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        WEBDL1080P,
+    ),
+    (
+        "Movie.2024.1080p.WEBRip.REMUX-GRP",
+        {
+            "source": "Web",
+            "screen_size": "1080p",
+            "other": ["Rip", "Remux"],
+            "release_group": "GRP",
+        },
+        WEBRIP1080P,
+    ),
+    (
+        "Movie.2024.1080p.HDTV.REMUX-GRP",
+        {"source": "HDTV", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        HDTV1080P,
+    ),
+    (
+        "Movie.2024.1080p.DVD.REMUX-GRP",
+        {"source": "DVD", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        DVDR,
+    ),
+    (
+        "Movie.2024.1080p.REMUX-GRP",  # no source
+        {"screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        REMUX1080P,
+    ),
+    (
+        "Movie.2024.1080p.BluRay.REMUX-GRP",  # unchanged
+        {"source": "Blu-ray", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        REMUX1080P,
+    ),
+    (
+        "Movie.2024.720p.BluRay.REMUX-GRP",  # remux ignored below 1080p
+        {"source": "Blu-ray", "screen_size": "720p", "other": "Remux", "release_group": "GRP"},
+        BLURAY720P,
+    ),
+    (
+        "Movie.2024.2160p.REMUX-GRP",  # no-source 2160p
+        {"screen_size": "2160p", "other": "Remux", "release_group": "GRP"},
+        REMUX2160P,
+    ),
+]
+
+
+def test_remux_classification_by_source_end_to_end() -> None:
+    profile = default_profile()
+    for raw_title, fields, expected in _REMUX_TABLE:
+        parsed = to_parsed_release(fields, raw_title)
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        assert quality is expected, f"{raw_title} -> {quality.name}, expected {expected.name}"
+        assert check_quality(quality, profile).accepted is True, raw_title
+
+
+# -- reject nets ignore the release-group suffix (#108) -------------------------
+
+# (raw_title, recorded guessit 4.1.0 fields) for release-group names that
+# collide with a reject-net token. Pre-#108 these all false-rejected; post-#108
+# they must resolve to the clean WEBDL1080P classification the title implies.
+_GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object]]] = [
+    (
+        "Movie.2024.1080p.WEB-DL.x264-SCR",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+    ),
+    (
+        "Movie.2024.1080p.WEB-DL.x264-R5",
+        {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
+    ),
+    (
+        "Movie.2024.1080p.WEB-DL.x264-R6",
+        {"source": "Web", "screen_size": "1080p", "release_group": "R6"},
+    ),
+    (
+        "Movie.2024.1080p.WEB-DL.x264-HQCAM",
+        {"source": "Web", "screen_size": "1080p", "release_group": "HQCAM"},
+    ),
+]
+
+
+def test_reject_nets_ignore_release_group_suffix() -> None:
+    profile = default_profile()
+    for raw_title, fields in _GROUP_COLLISION_TABLE:
+        parsed = to_parsed_release(fields, raw_title)
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        assert quality is WEBDL1080P, f"{raw_title} -> {quality.name}"
+        assert check_quality(quality, profile).accepted is True, raw_title
+
+
+def test_real_reject_token_survives_release_group_strip() -> None:
+    # The group happens to collide with a reject token too (or share a real
+    # reject source): the guessit-native source classification still wins, so
+    # stripping the group must not launder a genuine CAM release.
+    profile = default_profile()
+    for raw_title, fields in (
+        ("Movie.2024.HDCAM.x264-RARBG", {"source": "HD Camera", "release_group": "RARBG"}),
+        ("Movie.2024.HDCAM.x264-CAM", {"source": "HD Camera", "release_group": "CAM"}),
+    ):
+        parsed = to_parsed_release(fields, raw_title)
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        assert quality.name == "CAM", f"{raw_title} -> {quality.name}"
+        assert check_quality(quality, profile).accepted is False, raw_title
+
+
+def test_strip_release_group_noop_without_group() -> None:
+    title = "Movie.2024.1080p.WEB-DL.x264-SCR"
+    assert _strip_release_group(title, {}) == title
+    assert _strip_release_group(title, {"release_group": None}) == title
+    assert _strip_release_group(title, {"release_group": ""}) == title
+
+
+def test_strip_release_group_removes_span_case_insensitive() -> None:
+    assert _strip_release_group("Movie-scr", {"release_group": "SCR"}) == "Movie-"
+    # Regex-special characters in the group name are matched literally.
+    assert _strip_release_group("Movie-R5+X-GRP", {"release_group": "R5+X"}) == "Movie--GRP"
+
+
+def test_strip_release_group_leaves_guessit_native_other_intact() -> None:
+    # The guessit-native `other` path is untouched by the strip.
+    assert (
+        map_modifier({"other": "Screener", "release_group": "GRP"}, "Movie.DVDSCR-GRP")
+        is Modifier.SCREENER
+    )
 
 
 # -- resolve_quality conservative source-only fallback (no over-promotion) ------

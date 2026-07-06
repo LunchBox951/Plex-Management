@@ -34,6 +34,7 @@ from plex_manager.domain.quality import (
     ALL_QUALITIES,
     BRDISK,
     CAM,
+    DVDR,
     DVDSCR,
     RAWHD,
     REGIONAL,
@@ -172,6 +173,25 @@ def _as_str_list(value: object) -> list[str]:
     return [str(value)]
 
 
+def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
+    """Remove the guessit-identified release-group span from ``raw_title`` once.
+
+    Feeds only the two raw-title reject nets (:func:`_reject_net`,
+    :func:`_reject_modifier_net`); the guessit-native ``other`` checks in
+    :func:`map_source`/:func:`map_modifier` are untouched. A group named e.g.
+    ``SCR``/``R5``/``HQCAM`` would otherwise false-trip a reject net meant to
+    catch those tokens in the *release description*, not in an arbitrary
+    group tag. Absent/empty/non-str ``release_group`` -> unchanged behavior.
+    This is a first-occurrence removal, not a full scan for every mention of
+    the group name; the guessit-native checks remain the primary defense for
+    real reject tokens.
+    """
+    group = fields.get("release_group")
+    if not isinstance(group, str) or not group:
+        return raw_title
+    return re.sub(re.escape(group), "", raw_title, count=1, flags=re.IGNORECASE)
+
+
 def _reject_net(raw_title: str) -> QualitySource | None:
     """Return a reject-tier source if a pirate-cam keyword is present, else None.
 
@@ -211,7 +231,7 @@ def map_source(fields: Mapping[str, object], raw_title: str) -> QualitySource:
         else:
             base = _SOURCE_MAP.get(raw_source, QualitySource.UNKNOWN)
 
-    forced = _reject_net(raw_title)
+    forced = _reject_net(_strip_release_group(raw_title, fields))
     if forced is not None:
         return forced
     return base
@@ -245,7 +265,7 @@ def map_modifier(fields: Mapping[str, object], raw_title: str) -> Modifier:
         return Modifier.SCREENER
     if any("region" in other for other in others):
         return Modifier.REGIONAL
-    forced = _reject_modifier_net(raw_title)
+    forced = _reject_modifier_net(_strip_release_group(raw_title, fields))
     if forced is not None:
         return forced
     if "remux" in others:
@@ -381,7 +401,20 @@ def resolve_quality(source: QualitySource, resolution: Resolution, modifier: Mod
     if modifier == Modifier.REGIONAL:
         return REGIONAL
     if modifier == Modifier.REMUX:
-        return REMUX2160P if resolution == Resolution.R2160P else REMUX1080P
+        if source in (QualitySource.BLURAY, QualitySource.UNKNOWN):
+            if resolution == Resolution.R2160P:
+                return REMUX2160P
+            if resolution == Resolution.R1080P:
+                return REMUX1080P
+            # No remux tier below 1080p: fall through to the source+resolution
+            # lookup (BluRay -> BLURAY720P/480P; UNKNOWN -> UNKNOWN below).
+        elif source == QualitySource.DVD:
+            # Conservative in-tier choice (documented divergence from Radarr,
+            # which yields plain DVD for a remux word and reserves DVD-R for
+            # disc tokens): a DVD source with a remux word never resolves to a
+            # BluRay-Remux tier.
+            return DVDR
+        # WEBDL/WEBRIP/TV ignore the modifier and fall through unchanged.
     if modifier == Modifier.BRDISK:
         return BRDISK
     if modifier == Modifier.RAWHD:
