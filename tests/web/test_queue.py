@@ -1226,3 +1226,37 @@ async def test_grab_movie_with_season_rejected_422_and_adds_nothing(
         assert downloads == []
         seasons = (await session.execute(select(SeasonRequest))).scalars().all()
         assert seasons == []
+
+
+async def test_mark_failed_409s_removal_in_progress_when_claim_flagged(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Ownership protocol step 5 (queue_service docstring): while another
+    # mark-failed's torrent removal is in flight for this download, a superseding
+    # command is refused with an honest 409 ``removal_in_progress`` -- the delete
+    # is already irreversible, so promising remove_torrent=false would lie.
+    from plex_manager.services.queue_service import (
+        _mark_removal_in_flight,  # pyright: ignore[reportPrivateUsage]
+        _OperatorFailFlags,  # pyright: ignore[reportPrivateUsage]
+        _register_operator_claim,  # pyright: ignore[reportPrivateUsage]
+        _release_operator_claim,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(sessionmaker_, torrent_hash="e" * 40, status="downloading")
+
+    token = _register_operator_claim(
+        download_id, _OperatorFailFlags(blocklist=True, remove_torrent=True)
+    )
+    _mark_removal_in_flight(download_id, token)
+    try:
+        response = await client.post(
+            f"/api/v1/queue/{download_id}/mark-failed",
+            params={"remove_torrent": "false"},
+            headers=_HEADERS,
+        )
+    finally:
+        _release_operator_claim(download_id, token)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "removal_in_progress"

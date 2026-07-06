@@ -29,6 +29,8 @@ const DETAIL_MESSAGES: Record<string, string> = {
   grab_hash_unresolved: 'The download client took the grab but returned no hash.',
   download_not_found: 'That download no longer exists.',
   invalid_state_transition: 'That action is not allowed from the current state.',
+  removal_in_progress:
+    'A removal for this download is already in progress — retry after it completes.',
   blocklist_entry_not_found: 'That blocklist entry no longer exists.',
   app_key_changed:
     'The app key changed while this request was in flight — refresh and retry.',
