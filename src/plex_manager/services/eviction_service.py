@@ -158,12 +158,14 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 # claim CAS in :func:`_evict_one` remains the database-enforced backstop for
 # anything outside this process. A plain module bool, not an ``asyncio.Lock``:
 # the check-and-set below has no ``await`` between them, so it is atomic on the
-# single event loop; a bool has no loop binding (asyncio primitives cache their
-# first loop, which breaks under per-test event loops); and queueing a second
-# sweep would only make it re-scan what the first is already relieving. The
-# deployment is one app process over single-writer SQLite, so in-process is the
-# honest scope -- stated here rather than assumed silently.
-_sweep_in_progress = False
+# single event loop; a plain mutable holder has no loop binding (asyncio
+# primitives cache their first loop, which breaks under per-test event loops);
+# and queueing a second sweep would only make it re-scan what the first is
+# already relieving. The deployment is one app process over single-writer
+# SQLite, so in-process is the honest scope -- stated here rather than assumed
+# silently. (A one-slot dict instead of a module bool: mutation needs no
+# ``global`` statement, which static scanners misread as an unused global.)
+_sweep_latch: dict[str, bool] = {"busy": False}
 
 
 def _size_bytes(path: str) -> int | None:
@@ -697,7 +699,7 @@ async def _resume_interrupted_evictions(
     Runs at the START of every sweep, BEFORE the pressure pre-check (recovery
     must not wait for pressure) and only after the root's disk stat succeeded
     (an unmounted root must never make its files read as "gone"). Sweeps are
-    serialized in-process (:data:`_sweep_in_progress`), so no eviction can be
+    serialized in-process (:data:`_sweep_latch`), so no eviction can be
     mid-purge in a concurrent sweep while this runs -- every matched row really
     is a leftover. A transient stat error skips the row (never guess "gone" off
     an I/O error); one row's failure never aborts the rest.
@@ -1044,7 +1046,7 @@ async def _evict_one(
        file -- ``_restore_after_failed_delete`` compare-and-swaps the row back
        ``evicted`` -> ``available`` (recomputing the TV parent rollup).
     3. Concurrent sweep ticks NEVER double-process -- sweeps are serialized
-       in-process (:data:`_sweep_in_progress`: a second invocation no-ops with a
+       in-process (:data:`_sweep_latch`: a second invocation no-ops with a
        log), and the claim CAS (only the winning ``rowcount == 1`` proceeds to
        delete/history) remains the database-enforced backstop for anything
        outside this process.
@@ -1452,7 +1454,7 @@ async def run_eviction_sweep(
     :func:`_resume_interrupted_evictions` pass (step 0.5), which runs before the
     pressure pre-check so recovery never waits for disk pressure.
 
-    SERIALIZED in-process (:data:`_sweep_in_progress`): only one sweep runs at a
+    SERIALIZED in-process (:data:`_sweep_latch`): only one sweep runs at a
     time. A second invocation while one is in flight — the manual
     ``POST /ops/evict`` button landing mid-tick, or vice versa — no-ops with a
     log line and returns ``[]``: overlapping sweeps would only re-select from
@@ -1461,8 +1463,7 @@ async def run_eviction_sweep(
     they overlap. The skipped invocation's work is not lost — the in-flight
     sweep is already doing it, and the periodic tick retries every interval.
     """
-    global _sweep_in_progress
-    if _sweep_in_progress:
+    if _sweep_latch["busy"]:
         _logger.info(
             "eviction sweep skipped for %s root %s: another sweep is already in "
             "progress (sweeps are serialized; the running one is doing this work)",
@@ -1470,7 +1471,7 @@ async def run_eviction_sweep(
             root_path,
         )
         return []
-    _sweep_in_progress = True
+    _sweep_latch["busy"] = True
     try:
         return await _run_sweep(
             session=session,
@@ -1485,7 +1486,7 @@ async def run_eviction_sweep(
             all_roots=all_roots,
         )
     finally:
-        _sweep_in_progress = False
+        _sweep_latch["busy"] = False
 
 
 async def _run_sweep(
