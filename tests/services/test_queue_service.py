@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import (
@@ -763,3 +764,246 @@ async def test_reconcile_batch_fails_removes_and_rearms_multiple_rows(
             assert request.status is RequestStatus.searching
             assert download.status == "failed"
     assert set(qbt.removed) == {(hash_a, True), (hash_b, True)}
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 (P2): the movie re-arm is a compare-and-swap, not an unconditional
+# write. A ``cancel_request`` committed between Phase A (terminal flip) and Phase C
+# (re-arm) must survive -- the cancelled request must NOT be dragged back to
+# 'searching' and auto-grabbed again.
+# ---------------------------------------------------------------------------
+
+
+class _CancelDuringRemoveQbt(FakeQbittorrent):
+    """A client whose ``remove`` (Phase B, AFTER Phase A commit and BEFORE the
+    Phase C re-arm) commits a concurrent ``cancelled`` on the owning request -- the
+    exact interleaving Finding 1 flags."""
+
+    def __init__(self, sm: SessionMaker, request_id: int) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._request_id = request_id
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        async with self._sm() as session:
+            request = await session.get(MediaRequest, self._request_id)
+            assert request is not None
+            request.status = RequestStatus.cancelled
+            await session.commit()
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_reconcile_cancel_committed_between_phase_a_and_c_stays_cancelled(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 1: a cancel committed between Phase A and Phase C wins. The movie
+    re-arm CASes 'searching' only from a still-re-armable status, so the terminal
+    'cancelled' is left intact -- the item is NOT re-queued/auto-grabbed. The
+    download's OWN failure still records (Failed + blocklist) -- fully visible."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    qbt = _CancelDuringRemoveQbt(sessionmaker_, request_id)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None
+    assert request.status is RequestStatus.cancelled  # NOT dragged back to 'searching'
+    assert download.status == "failed"  # the failure itself still recorded
+    assert len(blocklist) == 1  # and the bad release still blocklisted
+
+
+class _CancelSeasonDuringRemoveQbt(FakeQbittorrent):
+    """The TV analogue of :class:`_CancelDuringRemoveQbt`: cancels the SEASON."""
+
+    def __init__(self, sm: SessionMaker, season_id: int) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._season_id = season_id
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        async with self._sm() as session:
+            season = await session.get(SeasonRequest, self._season_id)
+            assert season is not None
+            season.status = RequestStatus.cancelled
+            await session.commit()
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_reconcile_tv_cancel_between_phase_a_and_c_stays_cancelled(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 1 (consistency): the TV re-arm is ALSO a compare-and-swap, so a
+    season cancelled between Phase A and Phase C is left settled -- never re-armed."""
+    _, season_id = await _seed_tv_request_with_download(
+        sessionmaker_, season=2, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    qbt = _CancelSeasonDuringRemoveQbt(sessionmaker_, season_id)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert season is not None
+    assert season.status is RequestStatus.cancelled  # season stays cancelled
+    assert download.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 (P2): a Phase-C commit failure must not strand the owner. The re-arm
+# commit is retried; if it still fails, the download is left at the reconcilable
+# ``failed_pending`` (NOT terminal Failed), so a later reconcile cycle heals it.
+# ---------------------------------------------------------------------------
+
+
+def _fail_commit_on(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, fail_calls: set[int]
+) -> None:
+    """Monkeypatch ``session.commit`` to raise a transient ``OperationalError`` on the
+    Nth commit calls in ``fail_calls`` (1-indexed), delegating to the real commit
+    otherwise. Commit #1 is Phase A; commit #2+ are Phase C attempts."""
+    real_commit = session.commit
+    counter = {"n": 0}
+
+    async def _counting_commit() -> None:
+        counter["n"] += 1
+        if counter["n"] in fail_calls:
+            raise OperationalError("simulated", {}, Exception("database is locked"))
+        await real_commit()
+
+    monkeypatch.setattr(session, "commit", _counting_commit)
+
+
+async def test_reconcile_phase_c_commit_failure_recovers_via_retry(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2: a TRANSIENT Phase-C commit failure is retried and recovers -- the
+    concrete recovery path. The re-arm lands 'searching' after the retry; the request
+    is never left 'downloading'."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    async with sessionmaker_() as session:
+        # Fail the FIRST Phase C commit (#2 overall); the retry (#3) succeeds.
+        _fail_commit_on(session, monkeypatch, {2})
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert request is not None
+    assert request.status is RequestStatus.searching  # re-armed after the retry
+    assert download.status == "failed"
+
+
+async def test_reconcile_phase_c_exhaustion_leaves_reconcilable_state_next_cycle_heals(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2: when EVERY Phase-C attempt fails, the failure is surfaced (raised)
+    and the download is left at the NON-terminal ``failed_pending`` -- NOT stranded at
+    terminal Failed with a 'downloading' request. A later reconcile cycle re-derives
+    the ``failed_pending`` row and heals it (Failed + blocklist + 'searching')."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    # Every Phase C commit (#2, #3, #4 -- the 3 bounded attempts) fails.
+    async with sessionmaker_() as session:
+        _fail_commit_on(session, monkeypatch, {2, 3, 4})
+        with pytest.raises(OperationalError):
+            await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    # Reconcilable residual: Phase A committed the failed_pending transition, but the
+    # blocklist / terminal Failed / re-arm never landed.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None
+    assert request.status is RequestStatus.downloading  # not yet re-armed
+    assert download.status == "failed_pending"  # reconcilable, NOT terminal Failed
+    assert blocklist == []  # deferred to Phase C, never written on the strand
+
+    # A later cycle heals it via the strand re-derivation (commit works now).
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None
+    assert request.status is RequestStatus.searching  # healed
+    assert download.status == "failed"  # advanced to terminal
+    assert len(blocklist) == 1  # blocklisted exactly once (no duplication)
+
+
+async def test_mark_failed_phase_c_exhaustion_leaves_reconcilable_state(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2 (consistency): mark_failed applies the SAME guard. An exhausted
+    Phase C surfaces the failure and leaves the download at ``failed_pending`` (not
+    terminal Failed + 'downloading'), which the reconcile loop then heals."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=603,
+        )
+        session.add(download)
+        await session.commit()
+        request_id, download_id = request.id, download.id
+
+    async with sessionmaker_() as session:
+        _fail_commit_on(session, monkeypatch, {2, 3, 4})  # every Phase C attempt
+        with pytest.raises(OperationalError):
+            await queue_service.mark_failed(
+                session, FakeQbittorrent(statuses=[]), download_id=download_id, blocklist=False
+            )
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+    assert request is not None
+    assert request.status is RequestStatus.downloading  # not stranded terminal
+    assert download is not None
+    assert download.status == "failed_pending"  # reconcilable
+
+    # The reconcile loop heals the operator's stranded mark-failed.
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+    assert request is not None
+    assert request.status is RequestStatus.searching  # healed
+    assert download is not None
+    assert download.status == "failed"
