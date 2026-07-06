@@ -15,7 +15,8 @@ Conventions:
   from whether the ``Mapped`` type includes ``None``.
 * ``created_at``-style columns get ``server_default=func.now()`` so bulk inserts
   are timestamped by the database.
-* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)``
+* Enum-like columns use named
+  ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)`` constraints
   (a portable VARCHAR + CHECK on SQLite/PostgreSQL). ``downloads.status`` is a
   plain indexed ``String``: the canonical ``DownloadState`` StrEnum is owned by
   the P4 state machine and writes its values here, and the ``DownloadRecord`` DTO
@@ -145,9 +146,15 @@ class DownloadHistoryEvent(StrEnum):
     cancelled = "cancelled"
 
 
-def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
+def _enum(enum_cls: type[StrEnum], *, name: str) -> sa.Enum:
     """Build a portable, non-native ``Enum`` column type for ``enum_cls``."""
-    return sa.Enum(enum_cls, native_enum=False, create_constraint=True, validate_strings=True)
+    return sa.Enum(
+        enum_cls,
+        name=name,
+        native_enum=False,
+        create_constraint=True,
+        validate_strings=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -310,10 +317,14 @@ class MediaRequest(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     tmdb_id: Mapped[int] = mapped_column(index=True)
-    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType))
+    media_type: Mapped[MediaType] = mapped_column(
+        _enum(MediaType, name="ck_media_requests_media_type_enum")
+    )
     title: Mapped[str] = mapped_column(String)
     year: Mapped[int | None] = mapped_column()
-    status: Mapped[RequestStatus] = mapped_column(_enum(RequestStatus), index=True)
+    status: Mapped[RequestStatus] = mapped_column(
+        _enum(RequestStatus, name="ck_media_requests_status_enum"), index=True
+    )
     is_anime: Mapped[bool | None] = mapped_column()
     # TMDB art persisted at request time so Requests / Queue rows can render a
     # poster (and the detail backdrop) without a per-row TMDB re-fetch.
@@ -362,7 +373,9 @@ class RequestDedupLock(Base):
     __tablename__ = "request_dedup_locks"
 
     tmdb_id: Mapped[int] = mapped_column(primary_key=True)
-    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType), primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(
+        _enum(MediaType, name="ck_request_dedup_locks_media_type_enum"), primary_key=True
+    )
 
 
 class SeasonRequest(Base):
@@ -389,7 +402,9 @@ class SeasonRequest(Base):
         ForeignKey("media_requests.id", ondelete="CASCADE"), index=True
     )
     season_number: Mapped[int] = mapped_column()
-    status: Mapped[RequestStatus] = mapped_column(_enum(RequestStatus), index=True)
+    status: Mapped[RequestStatus] = mapped_column(
+        _enum(RequestStatus, name="ck_season_requests_status_enum"), index=True
+    )
     # The final placed path this season's import wrote into — the per-season
     # mirror of ``MediaRequest.library_path`` (ADR-0012): same "store, never
     # reconstruct" rule, same eviction target. ``None`` for seasons imported
@@ -456,7 +471,9 @@ class Download(Base):
     progress: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))
     seed_ratio: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))
     target_seed_ratio: Mapped[float] = mapped_column(default=1.0, server_default=sa.text("1"))
-    media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))
+    media_type: Mapped[MediaType | None] = mapped_column(
+        _enum(MediaType, name="ck_downloads_media_type_enum")
+    )
     tmdb_id: Mapped[int | None] = mapped_column()
     year: Mapped[int | None] = mapped_column()
     season: Mapped[int | None] = mapped_column()
@@ -481,7 +498,9 @@ class DownloadHistory(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     tmdb_id: Mapped[int | None] = mapped_column()
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
-    event_type: Mapped[DownloadHistoryEvent] = mapped_column(_enum(DownloadHistoryEvent))
+    event_type: Mapped[DownloadHistoryEvent] = mapped_column(
+        _enum(DownloadHistoryEvent, name="ck_download_history_event_type_enum")
+    )
     source_title: Mapped[str | None] = mapped_column(Text)
     quality_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
     indexer: Mapped[str | None] = mapped_column(String)
@@ -499,9 +518,13 @@ class Blocklist(Base):
     source_title: Mapped[str] = mapped_column(Text)
     indexer: Mapped[str | None] = mapped_column(String)
     protocol: Mapped[str | None] = mapped_column(String)
-    media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))
+    media_type: Mapped[MediaType | None] = mapped_column(
+        _enum(MediaType, name="ck_blocklist_media_type_enum")
+    )
     tmdb_id: Mapped[int | None] = mapped_column()
-    reason: Mapped[BlocklistReason] = mapped_column(_enum(BlocklistReason))
+    reason: Mapped[BlocklistReason] = mapped_column(
+        _enum(BlocklistReason, name="ck_blocklist_reason_enum")
+    )
     added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
