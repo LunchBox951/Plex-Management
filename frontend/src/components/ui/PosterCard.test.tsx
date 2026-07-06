@@ -73,3 +73,30 @@ describe('PosterCard action slot', () => {
     expect(onClick).not.toHaveBeenCalled()
   })
 })
+
+/**
+ * The details trigger's accessible name must disambiguate remakes/duplicate
+ * titles (e.g. "Dune" 1984 vs. 2021) the same way the rendered title/year
+ * caption already does visually.
+ *
+ * Note: the trigger's focus ring is deliberately not pinned here via a
+ * `className` assertion. jsdom doesn't lay out or clip box-shadows, so a
+ * string match on Tailwind classes wouldn't verify the actual fix (the ring
+ * no longer being clipped by the card's `overflow-hidden` wrapper) — it
+ * would only assert today's class spelling, which is brittle theater that
+ * breaks on any unrelated Tailwind refactor without catching a regression.
+ */
+describe('PosterCard details trigger label', () => {
+  it('includes the year in the aria-label when provided', () => {
+    render(<PosterCard title="Dune" year={2021} onClick={() => {}} />)
+
+    expect(screen.getByRole('button', { name: 'View details for Dune (2021)' })).toBeInTheDocument()
+  })
+
+  it('omits the year from the aria-label when absent', () => {
+    render(<PosterCard title="Dune" onClick={() => {}} />)
+
+    expect(screen.getByRole('button', { name: 'View details for Dune' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /\(/ })).not.toBeInTheDocument()
+  })
+})

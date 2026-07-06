@@ -132,7 +132,9 @@ describe('Row quick-request action (issue #42)', () => {
     })
     // Focus was handed to the card's details trigger so a keyboard user isn't
     // dumped to <body> when the action unmounts.
-    expect(screen.getByRole('button', { name: 'View details for Unbadged Movie' })).toHaveFocus()
+    expect(
+      screen.getByRole('button', { name: 'View details for Unbadged Movie (2020)' }),
+    ).toHaveFocus()
     expect(toastSpy).toHaveBeenCalledWith(
       expect.objectContaining({ intent: 'success', title: expect.stringContaining('Requested') }),
     )

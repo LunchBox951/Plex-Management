@@ -59,9 +59,9 @@ export function PosterCard({
         <button
           type="button"
           data-poster-card-trigger
-          aria-label={`View details for ${title}`}
+          aria-label={year ? `View details for ${title} (${year})` : `View details for ${title}`}
           onClick={onClick}
-          className="absolute inset-0 z-10 cursor-pointer rounded-[7px] border-0 bg-transparent p-0 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-gold/60"
+          className="absolute inset-0 z-10 cursor-pointer rounded-[7px] border-0 bg-transparent p-0 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-gold/60"
         />
       ) : null}
 
