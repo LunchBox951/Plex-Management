@@ -27,7 +27,7 @@ from plex_manager.web.deps import (
     get_prowlarr,
     get_quality_profile,
     get_session,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.schemas import (
     AcceptedRelease,
@@ -42,7 +42,7 @@ __all__ = ["router", "run_preview"]
 router = APIRouter(
     prefix="/api/v1",
     tags=["search-preview"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 _SEARCH_PREVIEW_RESPONSES: dict[int | str, dict[str, Any]] = {
