@@ -43,6 +43,8 @@ _BACKDROP_BASE_URL: Final = "https://image.tmdb.org/t/p/w780"
 _ANIME_KEYWORD_ID: Final = 210024
 _DEFAULT_TTL_SECONDS: Final = 3600.0
 _APPEND: Final = "external_ids,keywords"
+_HTTP_OK: Final = 200
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_NOT_FOUND: Final = 404
 _HTTP_UNAUTHORIZED: Final = 401
 _MIN_PAGE: Final = 1
@@ -171,14 +173,26 @@ class TmdbMetadata:
         self._search_cache: _TtlCache[list[MediaSearchResult]] = _TtlCache(cache_ttl_seconds)
         self._page_cache: _TtlCache[MediaPage] = _TtlCache(cache_ttl_seconds)
 
-    async def _get(self, path: str, params: Mapping[str, str]) -> Mapping[str, object] | None:
-        """GET ``path`` with the api key; ``None`` on 404, raise on 401/other errors.
+    async def _get(
+        self, path: str, params: Mapping[str, str], *, not_found_returns_none: bool = True
+    ) -> Mapping[str, object] | None:
+        """GET ``path`` with the api key; raise on 401/other errors.
 
         Returns the decoded JSON object on success. The api key is added here and
         is never logged. Crucially, any other error status raises ``TmdbApiError``
         built from ``path`` only — we never let httpx's ``HTTPStatusError`` escape,
         because its message embeds the full URL (and thus the ``api_key`` query
         param).
+
+        ``not_found_returns_none`` governs 404 handling and is deliberately NOT a
+        blanket behaviour (issue #89): a 404 on a *detail* lookup (``/movie/{id}``,
+        ``/tv/{id}``) genuinely means "no such title" — a real, cacheable answer —
+        so those callers pass the default ``True`` and get ``None`` back. A 404 on
+        a *search or list* endpoint (``/search/multi``, the trending/popular/
+        upcoming lists) means the route itself is wrong (a config or TMDB API
+        mismatch), and silently mapping that to an empty result would look
+        identical to a legitimate "nothing matched" — so those callers pass
+        ``False`` and get a surfaced ``TmdbApiError`` instead.
         """
         query = {"api_key": self._api_key, **params}
         try:
@@ -190,12 +204,14 @@ class TmdbMetadata:
             # message names the path only — never the url (which embeds api_key).
             raise TmdbApiError(f"tmdb request to {path} failed") from exc
         if response.status_code == _HTTP_NOT_FOUND:
-            return None
+            if not_found_returns_none:
+                return None
+            raise TmdbApiError(f"TMDB request to {path} failed (HTTP 404)")
         if response.status_code == _HTTP_UNAUTHORIZED:
             raise TmdbAuthError(
                 f"TMDB rejected the request to {path} (HTTP 401): the api key is missing or invalid"
             )
-        if response.is_error:
+        if not (_HTTP_OK <= response.status_code < _HTTP_MULTIPLE_CHOICES):
             raise TmdbApiError(f"TMDB request to {path} failed (HTTP {response.status_code})")
         try:
             payload = response.json()
@@ -217,7 +233,9 @@ class TmdbMetadata:
         params = {"query": query, "include_adult": "false"}
         if year is not None:
             params["year"] = str(year)
-        payload = await self._get("/search/multi", params)
+        # A 404 here means the search route itself is wrong (not "no results") —
+        # raise rather than silently mapping it to an empty result (issue #89).
+        payload = await self._get("/search/multi", params, not_found_returns_none=False)
         results: list[MediaSearchResult] = []
         if payload is not None:
             for row in _as_sequence(payload.get("results")):
@@ -352,7 +370,9 @@ class TmdbMetadata:
         if cached is not None:
             return cached
 
-        payload = await self._get(path, {"page": str(clamped)})
+        # A 404 here means the list route itself is wrong (not "no results") —
+        # raise rather than silently mapping it to an empty page (issue #89).
+        payload = await self._get(path, {"page": str(clamped)}, not_found_returns_none=False)
         fields: Mapping[str, object] = payload if payload is not None else {}
         results: list[MediaSearchResult] = []
         for row in _as_sequence(fields.get("results")):

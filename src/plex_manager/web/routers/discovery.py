@@ -18,7 +18,13 @@ from plex_manager.services.discovery_service import (
     LibraryState,
     derive_library_state,
 )
-from plex_manager.web.deps import get_library_optional, get_session, get_tmdb, require_api_key
+from plex_manager.web.deps import (
+    AuthContext,
+    get_library_optional,
+    get_session,
+    get_tmdb,
+    require_api_key,
+)
 from plex_manager.web.schemas import (
     DiscoverHomeResponse,
     DiscoverHomeRow,
@@ -63,6 +69,7 @@ async def _resolve_states(
     session: AsyncSession,
     library: LibraryPort | None,
     items: Iterable[MediaSearchResult],
+    auth: AuthContext,
 ) -> dict[tuple[int, str], LibraryState]:
     """Compute the base library-state for a whole page's tiles in ONE query + ONE crawl.
 
@@ -73,11 +80,28 @@ async def _resolve_states(
     the crawl fails, presence degrades to empty and the tiles fall back to the
     request-derived state -- an honest missing badge, NEVER a fabricated "not present"
     (the prototype's swallowed-False bug, see ``request_service._already_in_library``).
+
+    Visibility scoping (issue #58): the REQUEST-derived states (Requested /
+    Processing / a request-backed available) are scoped for shared sessions
+    exactly like ``GET /requests`` — a non-admin only sees badges from their OWN
+    request rows, never another user's activity. The Plex PRESENCE bit stays
+    GLOBAL for everyone: in-library is physical reality already visible to any
+    account browsing Plex itself, not private request activity, so hiding it
+    would fabricate a "not owned" (dishonest) while revealing nothing new.
     """
     keys: list[tuple[int, MediaKind]] = [(item.tmdb_id, item.media_type) for item in items]
     if not keys:
         return {}
-    statuses = await SqlRequestRepository(session).display_statuses_by_tmdb_ids(keys)
+    repo = SqlRequestRepository(session)
+    if auth.is_admin:
+        statuses = await repo.display_statuses_by_tmdb_ids(keys)
+    elif auth.user_id is not None:
+        statuses = await repo.display_statuses_by_tmdb_ids(keys, for_user_id=auth.user_id)
+    else:
+        # Non-admin with no user identity: unreachable via any current auth method
+        # (only Plex sessions yield non-admin contexts, and they always carry a
+        # user). Fail CLOSED — no request-derived badges — rather than leak all.
+        statuses = {}
     present: frozenset[tuple[int, str]] = frozenset()
     if library is not None:
         try:
@@ -100,12 +124,13 @@ async def discover_search(
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     query: Annotated[str, Query(min_length=1)],
     year: Annotated[int | None, Query()] = None,
 ) -> DiscoverSearchResponse:
     """Search TMDB for movies / shows matching ``query`` (optional ``year``)."""
     results = await discovery_service.search(tmdb, query, year)
-    states = await _resolve_states(session, library, results)
+    states = await _resolve_states(session, library, results, auth)
     return DiscoverSearchResponse(
         results=[_to_result(item, _state_for(states, item)) for item in results]
     )
@@ -116,6 +141,7 @@ async def discover_home(
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
+    auth: Annotated[AuthContext, Depends(require_api_key)],
 ) -> DiscoverHomeResponse:
     """Return the server-composed Discover home (spotlight + ordered rows)."""
     feed = await discovery_service.home(tmdb)
@@ -123,7 +149,7 @@ async def discover_home(
         *([feed.spotlight] if feed.spotlight is not None else []),
         *(item for row in feed.rows for item in row.items),
     ]
-    states = await _resolve_states(session, library, all_items)
+    states = await _resolve_states(session, library, all_items, auth)
     return DiscoverHomeResponse(
         spotlight=(
             _to_result(feed.spotlight, _state_for(states, feed.spotlight))
@@ -147,11 +173,12 @@ async def discover_category(
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     page: Annotated[int, Query(ge=1)] = 1,
 ) -> DiscoverListResponse:
     """Return a paginated movie category (``trending`` / ``popular`` / ``upcoming``)."""
     media_page = await discovery_service.list_category(tmdb, category, page)
-    states = await _resolve_states(session, library, media_page.results)
+    states = await _resolve_states(session, library, media_page.results, auth)
     return DiscoverListResponse(
         page=media_page.page,
         total_pages=media_page.total_pages,

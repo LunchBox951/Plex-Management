@@ -275,6 +275,31 @@ async def test_list_files_error_status_raises_typed_error() -> None:
         await _client(handler).list_files(MAGNET_HASH)
 
 
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_list_files_redirect_status_raises_typed_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of qBittorrent) must be rejected
+    like any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes 3xx,
+    so the prior check would have read a redirect as a successful operation even
+    though the requested torrent-files listing never actually happened."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            # A valid JSON body on the redirect ensures this test only passes via
+            # the explicit 2xx-range check in _raise_for_status (issue #87): if
+            # that check were reverted to ``response.is_error``, the 3xx would
+            # sail past it and _decode_json would happily parse the empty-list
+            # body, silently reading the redirect as a successful (empty) files
+            # listing — the exact regression this test must catch.
+            return httpx.Response(status, json=[], headers={"Location": "/login"})
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).list_files(MAGNET_HASH)
+    assert str(status) in str(exc_info.value)
+
+
 async def test_relogin_on_403() -> None:
     calls = {"login": 0, "info": 0}
 
@@ -1053,6 +1078,47 @@ async def test_add_hex_btih_magnet_is_lowercased_as_is() -> None:
     upper_magnet = f"magnet:?xt=urn:btih:{MAGNET_HASH.upper()}&dn=Test"
     info_hash = await _client().add(upper_magnet, "/downloads/movies", "plex-manager")
     assert info_hash == MAGNET_HASH
+
+
+async def test_add_invalid_base32_btih_magnet_raises_source_error() -> None:
+    """Issue #90: a 32-char ``btih`` that is NOT valid base32 (``0``/``1``/``8``/``9``
+    are outside the base32 alphabet) is a MALFORMED source, not a hash. It must raise
+    the typed ``QbittorrentSourceError`` -- flowing into the existing source-failure
+    taxonomy -- rather than passing the garbage through as a bogus 'hash' that could
+    never match the client snapshot (ClientMissing forever). No secret leak either."""
+    bad_b32 = "0" * 32  # 32 chars, but '0' is not a base32 digit -> binascii.Error
+    bad_magnet = f"magnet:?xt=urn:btih:{bad_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_non_ascii_btih_magnet_raises_source_error() -> None:
+    """A 32-char ``btih`` containing NON-ASCII text (e.g. percent-decoded invalid
+    bytes from an indexer magnet) makes ``b32decode`` raise a PLAIN ``ValueError``
+    ("string argument should contain only ASCII characters"), not
+    ``binascii.Error`` — it must land in the same typed taxonomy, never escape as
+    an unhandled 500 / out-of-taxonomy failure."""
+    bad_b32 = "é" * 32  # non-ASCII: plain ValueError before the alphabet check
+    bad_magnet = f"magnet:?xt=urn:btih:{bad_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_short_decoding_padded_btih_magnet_raises_source_error() -> None:
+    """Padding tricks ("A"*31 + "=") b32decode "successfully" — to 19 bytes. The
+    resulting 38-char "hex hash" could never match qBittorrent's 40-char snapshot
+    (ClientMissing forever), so a decode that is not exactly 20 bytes is the same
+    malformed source and must raise the typed error, not return a bogus hash."""
+    padded_b32 = "A" * 31 + "="  # decodes to 19 bytes, not a 20-byte info-hash
+    bad_magnet = f"magnet:?xt=urn:btih:{padded_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
 
 
 async def test_transport_outage_raises_qbittorrent_error() -> None:

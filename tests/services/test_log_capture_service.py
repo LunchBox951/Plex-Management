@@ -284,6 +284,44 @@ async def test_configure_logging_quiets_httpx_and_httpcore_even_at_debug(
         httpcore_logger.setLevel(saved_levels[1])
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        # A floor at/above WARNING is HONOURED (the pin quiets to the operator level):
+        # an ERROR operator can no longer receive lower-severity third-party WARNINGs.
+        ("ERROR", logging.ERROR),
+        ("CRITICAL", logging.CRITICAL),
+        # A floor below WARNING is CLAMPED UP to WARNING (the secret-safety floor):
+        # the pin only ever quiets relative to the operator level, never loosens it,
+        # so URL-bearing INFO records can never leak even at DEBUG.
+        ("WARNING", logging.WARNING),
+        ("INFO", logging.WARNING),
+        ("DEBUG", logging.WARNING),
+    ],
+)
+async def test_configure_logging_pins_third_party_to_max_of_floor_and_warning(
+    test_logger: logging.Logger, configured: str, expected: int
+) -> None:
+    # Issue #94: the httpx/httpcore pin is ``max(resolved_level, WARNING)`` -- it QUIETS
+    # relative to the operator's floor but NEVER loosens below WARNING. An operator who
+    # sets an ERROR floor must not still receive third-party WARNINGs in live/durable
+    # logs (the pre-fix defect), yet a DEBUG/INFO floor must still yield WARNING so the
+    # secret-safety guard holds.
+    httpx_logger = logging.getLogger("httpx")
+    httpcore_logger = logging.getLogger("httpcore")
+    saved_levels = (httpx_logger.level, httpcore_logger.level)
+    try:
+        attached = configure_logging(configured, logger=test_logger)
+        try:
+            assert httpx_logger.getEffectiveLevel() == expected
+            assert httpcore_logger.getEffectiveLevel() == expected
+        finally:
+            stop_logging(attached, logger=test_logger)
+    finally:
+        httpx_logger.setLevel(saved_levels[0])
+        httpcore_logger.setLevel(saved_levels[1])
+
+
 # --------------------------------------------------------------------------- #
 # drain_once / prune_once
 # --------------------------------------------------------------------------- #

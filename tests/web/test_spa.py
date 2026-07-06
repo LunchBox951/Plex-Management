@@ -84,6 +84,51 @@ async def test_mount_spa_is_noop_when_not_built(
         assert (await client.get("/")).status_code == 404
 
 
+async def test_reserved_prefixes_404_instead_of_spa_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Reserved API/docs/assets paths must 404 honestly -- both the bare mount
+    # path and any unmatched subpath under it -- rather than masking a bad URL
+    # or a broken build behind a 200 SPA shell.
+    _point_spa_at(monkeypatch, _build_static(tmp_path / "static"))
+
+    app = FastAPI()
+    spa.mount_spa(app)
+
+    async with await _drive(app) as client:
+        for path in ("/api", "/docs/nope", "/redoc/nope", "/assets/missing.js"):
+            response = await client.get(path)
+            assert response.status_code == 404, path
+            assert "SPA SHELL" not in response.text, path
+
+
+async def test_assets_prefix_404s_when_assets_dir_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # When the build has an index.html but no assets/ dir, mount_spa never adds
+    # the /assets StaticFiles mount -- so any /assets/* request falls through to
+    # the catch-all. It must still 404 via the reserved-prefix guard rather than
+    # serving the SPA shell.
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "index.html").write_text(
+        "<!doctype html><title>SPA SHELL</title>", encoding="utf-8"
+    )
+    _point_spa_at(monkeypatch, static_root)
+
+    app = FastAPI()
+    spa.mount_spa(app)
+    # Sanity: no assets/ dir was built, so mount_spa never added the /assets
+    # StaticFiles mount -- the request below can only be answered by the
+    # catch-all's reserved-prefix guard, not by a real static-file 404.
+    assert not (static_root / "assets").is_dir()
+
+    async with await _drive(app) as client:
+        response = await client.get("/assets/missing.js")
+        assert response.status_code == 404
+        assert "SPA SHELL" not in response.text
+
+
 async def test_ui_path_not_guarded_pre_init(client: httpx.AsyncClient) -> None:
     # The guard must let the SPA shell / client routes through pre-init so the
     # wizard can render; only the protected API gets the 409.

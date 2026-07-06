@@ -47,7 +47,7 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_session,
     get_tv_root_optional,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.routers.search_preview import run_preview
 from plex_manager.web.schemas import (
@@ -63,7 +63,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/queue",
     tags=["queue"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 _QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {

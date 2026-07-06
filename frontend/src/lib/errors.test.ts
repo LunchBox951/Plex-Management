@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { toApiError } from './errors'
+import { humanize, toApiError } from './errors'
+
+describe('humanize', () => {
+  it('turns a snake_case code into a readable sentence-case phrase', () => {
+    expect(humanize('no_acceptable_release')).toBe('No acceptable release')
+  })
+})
 
 describe('toApiError', () => {
   it('maps a known detail code to a friendly, honest message', () => {
@@ -9,17 +15,23 @@ describe('toApiError', () => {
     expect(err.message).toMatch(/no acceptable release/i)
   })
 
-  it('humanizes an unknown detail code instead of swallowing it', () => {
-    const err = toApiError({ detail: 'some_unmapped_code' }, 500)
-    expect(err.code).toBe('some_unmapped_code')
-    expect(err.message).toBe('Some unmapped code')
+  it('humanizes an unmapped detail code instead of surfacing raw snake_case', () => {
+    // A pipeline code absent from DETAIL_MESSAGES (e.g. a correction/request verb)
+    // must still read as a phrase — regression guard for the dropped fallback.
+    const err = toApiError({ detail: 'active_duplicate' }, 409)
+    // The raw code stays available for technical display...
+    expect(err.code).toBe('active_duplicate')
+    // ...while the message is the readable, humanized rendering.
+    expect(err.message).toBe('Active duplicate')
   })
 
-  it('maps the app-key rotation 409 to an honest refresh-and-retry message', () => {
+  it('maps the recovery-key rotation 409 to the honest refresh-and-retry copy', () => {
     const err = toApiError({ detail: 'app_key_changed' }, 409)
     expect(err.code).toBe('app_key_changed')
     expect(err.status).toBe(409)
-    expect(err.message).toMatch(/changed while this request was in flight/i)
+    expect(err.message).toBe(
+      'The recovery key changed while you were rotating it. Refresh and try again.',
+    )
   })
 
   it('reads the first message from a FastAPI validation error list', () => {
@@ -27,9 +39,28 @@ describe('toApiError', () => {
     expect(err.message).toBe('field required')
   })
 
-  it('returns a safe default when there is no detail', () => {
-    const err = toApiError({}, 0)
+  it('reads the envelope message, hint, and diagnostics alongside detail', () => {
+    const err = toApiError(
+      {
+        detail: 'server_unreachable_from_backend',
+        message: 'The server could not reach 10.0.0.5:32400.',
+        hint: 'Use the host IP, not localhost.',
+        diagnostics: { host: '10.0.0.5:32400', reason: 'timeout' },
+      },
+      502,
+    )
+    expect(err.code).toBe('server_unreachable_from_backend')
+    // An explicit envelope message wins over the built-in copy for that code.
+    expect(err.message).toBe('The server could not reach 10.0.0.5:32400.')
+    expect(err.hint).toBe('Use the host IP, not localhost.')
+    expect(err.diagnostics).toEqual({ host: '10.0.0.5:32400', reason: 'timeout' })
+  })
+
+  it('returns an honest HTTP-status fallback (no bare catch-all) with no detail', () => {
+    const err = toApiError({}, 503)
     expect(err.code).toBe('unknown_error')
-    expect(err.message).toMatch(/something went wrong/i)
+    // Pinning the exact new fallback proves the old generic sentence is gone —
+    // a positive assertion, so the banned phrase never re-enters the source.
+    expect(err.message).toBe('The server returned an unexpected error (HTTP 503).')
   })
 })

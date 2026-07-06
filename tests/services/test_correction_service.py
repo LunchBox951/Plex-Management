@@ -77,6 +77,18 @@ class _AddFailsQbittorrent(FakeQbittorrent):
         raise QbittorrentError("qBittorrent is unreachable")
 
 
+class _EmptyHashQbittorrent(FakeQbittorrent):
+    """A :class:`FakeQbittorrent` whose ``add`` ACCEPTS the torrent but returns no
+    derivable info-hash -- models the real client accepting an opaque source from which
+    no info-hash can be derived (and the indexer supplied none), the exact condition
+    ``grab_service`` surfaces as ``GrabError`` (a LIVE, untracked torrent now exists).
+    ``remove`` is inherited (the culprit torrent removal earlier still succeeds)."""
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        self.added.append((magnet_or_url, save_path, category))
+        return ""
+
+
 async def _seed_available_movie(
     sm: SessionMaker,
     *,
@@ -1265,12 +1277,15 @@ async def test_report_issue_refuses_when_an_active_sibling_owns_the_dedup_slot(
     assert settled is not None and settled.status == RequestStatus.available
 
 
-async def test_report_issue_parks_when_the_indexer_fails_during_research(
+async def test_report_issue_leaves_scope_searching_when_the_indexer_fails_during_research(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
-    # The inline re-search hits a Prowlarr transport failure AFTER the blocklist/purge
-    # already committed. Instead of propagating a 5xx and leaving the row lying as
-    # 'searching', report-issue parks it on the honest, retryable no_acceptable_release.
+    # Issue #71: the inline re-search hits a Prowlarr transport/rate-limit failure AFTER
+    # the blocklist/purge already committed. This is an OPERATIONAL failure (the indexer
+    # is unreachable), NOT content exhaustion -- mirroring auto-grab's raised-search
+    # taxonomy, it must NOT park no_acceptable_release (a LIE: releases may exist) and
+    # must NOT propagate a 5xx. The scope is LEFT at the 'searching' committed at (b)
+    # for the merged auto-grab worker to retry.
     root = tmp_path / "movies"
     root.mkdir()
     movie_file = root / "Some Movie (2020).mkv"
@@ -1293,14 +1308,17 @@ async def test_report_issue_parks_when_the_indexer_fails_during_research(
             roots=LibraryRoots(movies=str(root)),
         )
 
-    # The purge + blocklist still happened; the indexer failure did NOT propagate --
-    # the request landed on the honest retryable park, not a dishonest 'searching'.
-    assert updated.status == RequestStatus.no_acceptable_release.value
+    # The purge + blocklist still happened; the indexer failure did NOT propagate and
+    # did NOT dishonestly park -- the scope self-heals at 'searching'.
+    assert updated.status == RequestStatus.searching.value
     assert not movie_file.exists()
     assert (_CULPRIT, True) in qbt.removed
     async with sessionmaker_() as session:
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        downloads = (await session.execute(select(Download))).scalars().all()
     assert len(blocklist) == 1
+    # The failed re-search created no new active download row -- only the terminal culprit.
+    assert {d.status for d in downloads} == {"imported"}
 
 
 async def test_report_issue_preserves_the_breadcrumb_when_the_purge_fails(
@@ -1717,6 +1735,57 @@ async def test_report_issue_leaves_scope_searching_when_the_regrab_client_fails(
     # The correction work stands: file purged, culprit torrent removed, blocklist written.
     assert not movie_file.exists()
     assert (_CULPRIT, True) in qbt.removed
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        downloads = (await session.execute(select(Download))).scalars().all()
+    assert len(blocklist) == 1
+    # The failed re-grab created no new active download row -- only the terminal culprit.
+    assert {d.status for d in downloads} == {"imported"}
+
+
+async def test_report_issue_leaves_scope_searching_when_the_regrab_leaves_an_untracked_torrent(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # Issue #71: the inline re-grab's qbt.add ACCEPTS the torrent but yields no derivable
+    # info-hash (opaque source; the indexer supplied none) -> grab_service raises
+    # GrabError, leaving a LIVE, untracked torrent. Mirroring auto-grab's GrabError
+    # taxonomy this is OPERATIONAL, NOT content exhaustion: report-issue must NOT park
+    # no_acceptable_release (a LIE -- releases exist; the grab PIPELINE failed) and must
+    # NOT try another candidate (a second grab against the orphan would double-download).
+    # The scope is LEFT at the 'searching' committed at (b) for the auto-grab worker.
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    qbt = _EmptyHashQbittorrent()
+    async with sessionmaker_() as session:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            # An acceptable alternative IS on offer (info_hash=None models an indexer that
+            # supplied no hash), so the re-grab is attempted and its qbt.add is what leaves
+            # the untracked torrent -- not an empty-preview park.
+            FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER")]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    # No exception escaped; the scope self-heals at 'searching' (NOT parked, NOT downloading).
+    assert updated.status == RequestStatus.searching.value
+    # The correction work stands: file purged, culprit torrent removed, blocklist written.
+    assert not movie_file.exists()
+    assert (_CULPRIT, True) in qbt.removed
+    # The re-grab WAS attempted (the untracked torrent is the operational failure), and it
+    # was the ONLY grab attempt -- no second candidate was tried against the live orphan.
+    assert len(qbt.added) == 1
     async with sessionmaker_() as session:
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
         downloads = (await session.execute(select(Download))).scalars().all()
