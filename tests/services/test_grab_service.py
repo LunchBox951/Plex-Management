@@ -1616,3 +1616,97 @@ async def test_grab_loss_cleanup_still_removes_a_genuinely_added_torrent(
         assert (_HASH, True) in qbt.removed  # the orphan this grab created is cleaned up
     finally:
         await engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-9 (PR #117): the caller's premise rides with the action.
+# Auto-grab selects a scope because the season read as DUE; if the eviction
+# recovery folds it to 'available' before grab()'s own fresh read, the fresh
+# observation would mistake the fold for an intentional reopen (the round-5
+# observed-status CAS cannot help: the observation post-dates the fold).
+# expected_season_status lets grab refuse up front, before anything reaches
+# the client; the manual reopen flow states no premise and keeps working.
+# --------------------------------------------------------------------------- #
+
+
+async def test_grab_refuses_when_the_callers_premise_no_longer_holds(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Auto-grab's premise ('this season is due: pending') no longer holds --
+    the recovery fold landed first and the season is 'available'. The grab is
+    refused BEFORE anything reaches the client: no add, no cleanup churn, no
+    duplicate download of on-disk content."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=730,
+            media_type=MediaType.tv,
+            title="Folded Before Grab",
+            status=RequestStatus.pending,
+        )
+        session.add(show)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=show.id,
+            season_number=1,
+            status=RequestStatus.available,  # the recovery fold landed first
+        )
+        session.add(season_row)
+        await session.commit()
+        show_id, season_id = show.id, season_row.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(RequestNotActiveError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored(_HASH),
+                request_id=show_id,
+                tmdb_id=730,
+                season=1,
+                expected_season_status=RequestStatus.pending.value,  # the due premise
+            )
+
+    assert qbt.added == []  # refused up front -- nothing reached the client
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available  # the fold stands
+
+
+async def test_grab_proceeds_when_the_callers_premise_holds(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The premise check is a no-op when the premise still holds: a due season
+    grabbed with its selection-time status proceeds exactly as before."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=731,
+            media_type=MediaType.tv,
+            title="Still Due",
+            status=RequestStatus.pending,
+        )
+        session.add(show)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.pending
+        )
+        session.add(season_row)
+        await session.commit()
+        show_id, season_id = show.id, season_row.id
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=show_id,
+            tmdb_id=731,
+            season=1,
+            expected_season_status=RequestStatus.pending.value,
+        )
+    assert record.status == "downloading"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.downloading

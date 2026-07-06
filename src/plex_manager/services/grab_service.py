@@ -379,6 +379,7 @@ async def grab(
     episodes: list[int] | None = None,
     save_path: str = "",
     category: str = DEFAULT_CATEGORY,
+    expected_season_status: str | None = None,
 ) -> DownloadRecord:
     """Grab ``scored``: add it to the client and persist a tracked download.
 
@@ -400,6 +401,22 @@ async def grab(
     ``episodes`` forced back to ``None`` regardless of what the caller passed, so
     a movie can never spawn a ``SeasonRequest`` row or scope its active-download
     guard to a fake season.
+
+    ``expected_season_status`` lets the CALLER state its premise -- the
+    decision's premise rides with the action, all the way to the write, exactly
+    like the observed-status CAS this function already threads to the post-add
+    move. Auto-grab selects a scope because it read the season as due
+    (``pending``/``searching``/``no_acceptable_release``); if the eviction
+    recovery FOLDS that season to ``available`` (its file never left disk)
+    before this function's own fresh read, the fresh observation would read
+    ``available`` and mistake it for an intentional reopen -- the round-5
+    observed-status CAS cannot help because the observation itself post-dates
+    the fold. When the fresh read differs from the caller's stated premise, the
+    grab is refused UP FRONT (``RequestNotActiveError``, before anything reaches
+    the client). ``None`` (the default) states no premise: the manual reopen
+    flow keeps observing the live status -- its premise IS "whatever the season
+    reads right now", and a decision made on ``available``/``completed``
+    continues to reopen exactly as before.
     """
     download_repo = SqlDownloadRepository(session)
     candidate = scored.candidate
@@ -453,6 +470,17 @@ async def grab(
                     else RequestStatus.pending.value
                 )
                 if observed_season_status == RequestStatus.cancelled.value:
+                    raise RequestNotActiveError(request_id)
+                if (
+                    expected_season_status is not None
+                    and observed_season_status != expected_season_status
+                ):
+                    # The caller's premise no longer holds (e.g. auto-grab
+                    # selected this scope as due, and the eviction recovery
+                    # folded the season back to 'available' before we read it).
+                    # Refuse BEFORE anything reaches the client -- grabbing
+                    # would download a duplicate of on-disk content the caller
+                    # never decided to re-fetch.
                     raise RequestNotActiveError(request_id)
             else:
                 # Non-tv (movie): season/episodes are meaningless -- coerce

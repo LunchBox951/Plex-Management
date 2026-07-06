@@ -612,6 +612,15 @@ async def run_grab_cycle(
                     year=year,
                     season=scope.season,
                     episodes=None,
+                    # The decision's premise rides with the action: this scope
+                    # was selected because the season read as DUE at selection
+                    # time. If the eviction recovery folds it to 'available'
+                    # (file never left disk) before grab()'s own fresh read,
+                    # grab refuses up front instead of mistaking the fold for
+                    # an intentional reopen (see grab()'s docstring). Movies
+                    # need no premise: every non-due movie status is terminal,
+                    # so grab's up-front gate already refuses it.
+                    expected_season_status=scope.status if scope.season is not None else None,
                 )
                 grabbed += 1
                 park_scope = False

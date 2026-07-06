@@ -61,7 +61,7 @@ from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import season_request_service
+from plex_manager.services import purge_service, season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -607,154 +607,173 @@ async def _import_download_locked(
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
 
-    # Claim ``Importing`` with a compare-and-swap BEFORE the (possibly long) copy: the
-    # queue shows progress and no DB transaction is held open across the copy. A crash
-    # mid-copy leaves the row resumable as ``Importing``; the re-run is idempotent.
-    #
-    # The claim is CONDITIONAL on the row still being resumable. The validation above
-    # (qbt status, source resolve, parse) is a long async gap; an operator can call
-    # ``mark_failed`` in a separate session during it, committing ``failed`` +
-    # blocklist + re-search. An unconditional update would overwrite that committed
-    # decision AND go on to copy and complete the rejected release. If the CAS fails
-    # (the row left ``_RESUMABLE`` underneath us), abort honestly and return the row's
-    # current state without importing. (The per-download lock already excludes a second
-    # concurrent import; this CAS handles the separate mark_failed path.)
-    claimed = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.Importing.value,
-        _RESUMABLE,
-        clear_failed_reason=True,
-    )
-    if not claimed:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash)
-    session.add(
-        DownloadHistory(
-            tmdb_id=request.tmdb_id,
-            torrent_hash=torrent_hash,
-            event_type=DownloadHistoryEvent.import_started,
-            # NULL on purpose: queue_service._source_title_for returns the latest
-            # non-null history source_title for the blocklist, and the import file
-            # basename must NOT shadow the grabbed RELEASE title. Keep the basename in
-            # ``message`` only.
-            source_title=None,
-            message=f"importing {os.path.basename(src)} to {relative}",
-        )
-    )
-    await session.commit()
-
-    try:
-        placed = await asyncio.to_thread(_place_file, fs, src, dst)
-    except FileExistsError as exc:
-        # A pre-existing, differently-sized file at the destination (a user's file,
-        # or a stale partial) — surfaced as a conflict, never overwritten.
-        await _block(session, download_repo, download_id, str(exc), request_id=request.id)
-        return await download_repo.get_by_hash(torrent_hash)
-    except OSError as exc:
-        await _block(
-            session,
-            download_repo,
+    # PURGE-vs-IMPORT ordering rule (round 9; stated identically at
+    # purge_service's registry): FIRST-REGISTERED WINS, loser defers fast. If an
+    # eviction/correction purge is mid-delete on this movie's directory, SKIP
+    # this attempt -- the row stays ImportPending and the next import cycle
+    # retries honestly -- rather than placing files into a tree an rmtree is
+    # walking. Registered here (before the Importing claim) and released only
+    # after the finalize commit, so a purge arriving anywhere in that window
+    # defers instead of deleting freshly placed-and-committed files.
+    if not purge_service.begin_placement(str(dst)):
+        _logger.info(
+            "deferring import of download %s: a purge is deleting this path; "
+            "will retry next import cycle",
             download_id,
-            f"import copy failed: {type(exc).__name__}",
-            request_id=request.id,
+            extra={"request_id": request.id},
         )
         return await download_repo.get_by_hash(torrent_hash)
-
-    # Record the placed library file on the still-``Importing`` row BEFORE the scan,
-    # so a crash between placement and the ``Imported`` write leaves a durable
-    # breadcrumb: a resumed run finds ``download_path == dst`` (the file still on disk)
-    # and can roll that orphan back on a repeat scan failure (F8). Written ONLY when
-    # THIS attempt placed dst — a lost-race loser (placed is False) never stamps the
-    # winner's file (F3). The per-download lock means no other import races this write.
-    if placed:
-        await download_repo.update_status(
-            download_id, DownloadState.Importing.value, download_path=str(dst)
+    try:
+        # Claim ``Importing`` with a compare-and-swap BEFORE the (possibly long) copy: the
+        # queue shows progress and no DB transaction is held open across the copy. A crash
+        # mid-copy leaves the row resumable as ``Importing``; the re-run is idempotent.
+        #
+        # The claim is CONDITIONAL on the row still being resumable. The validation above
+        # (qbt status, source resolve, parse) is a long async gap; an operator can call
+        # ``mark_failed`` in a separate session during it, committing ``failed`` +
+        # blocklist + re-search. An unconditional update would overwrite that committed
+        # decision AND go on to copy and complete the rejected release. If the CAS fails
+        # (the row left ``_RESUMABLE`` underneath us), abort honestly and return the row's
+        # current state without importing. (The per-download lock already excludes a second
+        # concurrent import; this CAS handles the separate mark_failed path.)
+        claimed = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Importing.value,
+            _RESUMABLE,
+            clear_failed_reason=True,
+        )
+        if not claimed:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.import_started,
+                # NULL on purpose: queue_service._source_title_for returns the latest
+                # non-null history source_title for the blocklist, and the import file
+                # basename must NOT shadow the grabbed RELEASE title. Keep the basename in
+                # ``message`` only.
+                source_title=None,
+                message=f"importing {os.path.basename(src)} to {relative}",
+            )
         )
         await session.commit()
 
-    # Targeted Plex scan of the movie folder — the partial scan the prototype never
-    # did. movies_root is a Plex library location (the picker guarantees the path↔
-    # section match), so a scan failure here is a transient Plex error, not a wrong
-    # path. Roll the file back before blocking so a later reject / re-search can't
-    # orphan it (the retry re-places it).
-    #
-    # OWNERSHIP RULE (Codex PR #21): a file at dst may be rolled back ONLY on proof
-    # it is ours — THIS invocation placed it (``placed``), or a prior attempt of
-    # this row durably recorded placing it (the ``download_path == dst`` breadcrumb
-    # committed above / by the finalize). NEVER by content-match alone: a
-    # same-content file that we did NOT place (a lost placement race, a
-    # user's manually-supplied copy, a prior retry's winner) is byte-for-byte
-    # indistinguishable from our own crashed-before-breadcrumb placement, so an
-    # inference like "resumed Importing + no breadcrumb -> the orphan is ours"
-    # deletes an unowned library file on a transient scan failure. The honest cost
-    # of refusing to guess: a genuinely-ours orphan from a crash INSIDE the
-    # place→breadcrumb window is not rolled back on a repeat scan failure — it
-    # stays on disk, is re-adopted by the next successful retry (idempotent
-    # placement + the finalize stamps ``download_path``), and at worst surfaces
-    # later as an explicit FileExistsError conflict for the operator; deleting
-    # nothing beats maybe-deleting someone else's file. Clear the breadcrumb on
-    # rollback so the deleted path can't shadow the torrent's content on a later
-    # retry.
-    try:
-        await library.trigger_scan(str(dst.parent), "movie")
-    except (PlexLibraryError, PlexAuthError) as exc:
-        # ``row.download_path`` is read live here (the breadcrumb commit set it for a
-        # placed=True attempt; a crash-resume loaded it as dst). Safe only because the
-        # sessionmaker uses ``expire_on_commit=False`` and the claim CAS's
-        # ``synchronize_session="fetch"`` refreshes only ``status`` — changing either
-        # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
-        owns_placement = placed or row.download_path == str(dst)
-        if owns_placement:
-            await asyncio.to_thread(_remove_quietly, dst)
-        await _block(
-            session,
-            download_repo,
-            download_id,
-            f"plex scan failed: {type(exc).__name__}",
-            request_id=request.id,
-            clear_download_path=owns_placement,
-        )
-        return await download_repo.get_by_hash(torrent_hash)
+        try:
+            placed = await asyncio.to_thread(_place_file, fs, src, dst)
+        except FileExistsError as exc:
+            # A pre-existing, differently-sized file at the destination (a user's file,
+            # or a stale partial) — surfaced as a conflict, never overwritten.
+            await _block(session, download_repo, download_id, str(exc), request_id=request.id)
+            return await download_repo.get_by_hash(torrent_hash)
+        except OSError as exc:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"import copy failed: {type(exc).__name__}",
+                request_id=request.id,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
 
-    # Imported. The download is terminal; the request is 'completed' ("Finalizing")
-    # until a reconcile cycle confirms availability via is_available (phase 2).
-    # Finalize with a compare-and-swap, conditional on STILL holding the ``Importing``
-    # claim. The per-download lock + the legal graph (a mark_failed on an ``Importing``
-    # row 409s) mean the row should not have moved during the copy/scan; the CAS is
-    # defense-in-depth. If it did move, abandon the finalize rather than overwrite
-    # whatever moved it — and do NOT remove dst (the deterministic path a retry
-    # re-adopts), so a successfully-placed file is never deleted.
-    finalized = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.Imported.value,
-        frozenset({DownloadState.Importing.value}),
-        download_path=str(dst),
-        clear_failed_reason=True,
-    )
-    if not finalized:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash)
-    session.add(
-        DownloadHistory(
-            tmdb_id=request.tmdb_id,
-            torrent_hash=torrent_hash,
-            event_type=DownloadHistoryEvent.imported,
-            source_title=None,  # never shadow the grabbed title (see import_started above)
-            message=f"imported {os.path.basename(src)} to {relative}",
+        # Record the placed library file on the still-``Importing`` row BEFORE the scan,
+        # so a crash between placement and the ``Imported`` write leaves a durable
+        # breadcrumb: a resumed run finds ``download_path == dst`` (the file still on disk)
+        # and can roll that orphan back on a repeat scan failure (F8). Written ONLY when
+        # THIS attempt placed dst — a lost-race loser (placed is False) never stamps the
+        # winner's file (F3). The per-download lock means no other import races this write.
+        if placed:
+            await download_repo.update_status(
+                download_id, DownloadState.Importing.value, download_path=str(dst)
+            )
+            await session.commit()
+
+        # Targeted Plex scan of the movie folder — the partial scan the prototype never
+        # did. movies_root is a Plex library location (the picker guarantees the path↔
+        # section match), so a scan failure here is a transient Plex error, not a wrong
+        # path. Roll the file back before blocking so a later reject / re-search can't
+        # orphan it (the retry re-places it).
+        #
+        # OWNERSHIP RULE (Codex PR #21): a file at dst may be rolled back ONLY on proof
+        # it is ours — THIS invocation placed it (``placed``), or a prior attempt of
+        # this row durably recorded placing it (the ``download_path == dst`` breadcrumb
+        # committed above / by the finalize). NEVER by content-match alone: a
+        # same-content file that we did NOT place (a lost placement race, a
+        # user's manually-supplied copy, a prior retry's winner) is byte-for-byte
+        # indistinguishable from our own crashed-before-breadcrumb placement, so an
+        # inference like "resumed Importing + no breadcrumb -> the orphan is ours"
+        # deletes an unowned library file on a transient scan failure. The honest cost
+        # of refusing to guess: a genuinely-ours orphan from a crash INSIDE the
+        # place→breadcrumb window is not rolled back on a repeat scan failure — it
+        # stays on disk, is re-adopted by the next successful retry (idempotent
+        # placement + the finalize stamps ``download_path``), and at worst surfaces
+        # later as an explicit FileExistsError conflict for the operator; deleting
+        # nothing beats maybe-deleting someone else's file. Clear the breadcrumb on
+        # rollback so the deleted path can't shadow the torrent's content on a later
+        # retry.
+        try:
+            await library.trigger_scan(str(dst.parent), "movie")
+        except (PlexLibraryError, PlexAuthError) as exc:
+            # ``row.download_path`` is read live here (the breadcrumb commit set it for a
+            # placed=True attempt; a crash-resume loaded it as dst). Safe only because the
+            # sessionmaker uses ``expire_on_commit=False`` and the claim CAS's
+            # ``synchronize_session="fetch"`` refreshes only ``status`` — changing either
+            # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
+            owns_placement = placed or row.download_path == str(dst)
+            if owns_placement:
+                await asyncio.to_thread(_remove_quietly, dst)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"plex scan failed: {type(exc).__name__}",
+                request_id=request.id,
+                clear_download_path=owns_placement,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        # Imported. The download is terminal; the request is 'completed' ("Finalizing")
+        # until a reconcile cycle confirms availability via is_available (phase 2).
+        # Finalize with a compare-and-swap, conditional on STILL holding the ``Importing``
+        # claim. The per-download lock + the legal graph (a mark_failed on an ``Importing``
+        # row 409s) mean the row should not have moved during the copy/scan; the CAS is
+        # defense-in-depth. If it did move, abandon the finalize rather than overwrite
+        # whatever moved it — and do NOT remove dst (the deterministic path a retry
+        # re-adopts), so a successfully-placed file is never deleted.
+        finalized = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Imported.value,
+            frozenset({DownloadState.Importing.value}),
+            download_path=str(dst),
+            clear_failed_reason=True,
         )
-    )
-    # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
-    # the finalize -- ``dst.parent`` is the movie's own folder (Plex's
-    # ``Title (Year)/`` dir the file was placed into), the exact directory a
-    # later disk-pressure sweep's ``fs.delete()`` must remove. Without this,
-    # ``MediaRequest.library_path`` stays ``None`` forever and
-    # ``eviction_service._movie_candidates`` has no deletion target for this
-    # request (see that module's docstring on skipping a candidate with no
-    # stored breadcrumb).
-    await request_repo.set_library_path(request.id, str(dst.parent))
-    await request_repo.mark_completed(request.id)
-    await session.commit()
-    return await download_repo.get_by_hash(torrent_hash)
+        if not finalized:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,  # never shadow the grabbed title (see import_started above)
+                message=f"imported {os.path.basename(src)} to {relative}",
+            )
+        )
+        # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
+        # the finalize -- ``dst.parent`` is the movie's own folder (Plex's
+        # ``Title (Year)/`` dir the file was placed into), the exact directory a
+        # later disk-pressure sweep's ``fs.delete()`` must remove. Without this,
+        # ``MediaRequest.library_path`` stays ``None`` forever and
+        # ``eviction_service._movie_candidates`` has no deletion target for this
+        # request (see that module's docstring on skipping a candidate with no
+        # stored breadcrumb).
+        await request_repo.set_library_path(request.id, str(dst.parent))
+        await request_repo.mark_completed(request.id)
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    finally:
+        purge_service.end_placement(str(dst))
 
 
 async def _import_tv_locked(
@@ -959,121 +978,145 @@ async def _import_tv_locked(
                 current.video.relative_path,
             )
 
-    # Claim Importing BEFORE the (possibly long) copy -- same CAS discipline as
-    # the movie path, conditional on the row still being resumable (an operator's
-    # mark_failed during the validation gap above must not be overwritten).
-    claimed = await download_repo.update_status_if_in(
-        download_id, DownloadState.Importing.value, _RESUMABLE
-    )
-    if not claimed:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash)
-
     season_dir = Path(tv_root) / plex_tv_season_relative_dir(request.title, request.year, season)
-    session.add(
-        DownloadHistory(
-            tmdb_id=request.tmdb_id,
-            torrent_hash=torrent_hash,
-            event_type=DownloadHistoryEvent.import_started,
-            source_title=None,  # never shadow the grabbed release title
-            message=f"importing {len(by_relative)} episode(s) to {season_dir}",
-        )
-    )
-    await session.commit()
-
-    # ``imported`` history rows are staged (basename, relative) here rather than
-    # written immediately: they are committed to ``session`` ONLY after the scan
-    # AND the finalize CAS below have both succeeded (mirrors the movie path,
-    # which likewise writes its ``imported`` row only once the scan succeeds). A
-    # later file's copy failure OR a scan failure both roll placed files back via
-    # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
-    # the audit trail claim an episode was imported when it was in fact deleted
-    # moments later (honesty over silence: history must never lie about a rollback).
-    placed_paths: list[Path] = []
-    imported: list[tuple[str, PurePosixPath]] = []
-    for relative, result in by_relative.items():
-        src = abs_by_rel[result.video.relative_path]
-        dst = Path(tv_root) / relative
-        try:
-            placed = await asyncio.to_thread(_place_file, fs, src, dst)
-        except (FileExistsError, OSError) as exc:
-            await asyncio.to_thread(_remove_quietly_many, placed_paths)
-            reason = (
-                str(exc)
-                if isinstance(exc, FileExistsError)
-                else f"import copy failed: {type(exc).__name__}"
-            )
-            await _block(
-                session, download_repo, download_id, reason, request_id=request.id, season=season
-            )
-            return await download_repo.get_by_hash(torrent_hash)
-        if placed:
-            placed_paths.append(dst)
-        imported.append((os.path.basename(src), relative))
-
-    # download_path is stamped with the SEASON folder (not one file) purely for
-    # queue-display observability -- unlike the movie path, it is never consulted
-    # to decide scan-failure rollback ownership (see the docstring above).
-    await download_repo.update_status(
-        download_id, DownloadState.Importing.value, download_path=str(season_dir)
-    )
-    await session.commit()
-
-    # ONE targeted scan of the whole season directory, never one per episode.
-    try:
-        await library.trigger_scan(str(season_dir), "tv")
-    except (PlexLibraryError, PlexAuthError) as exc:
-        await asyncio.to_thread(_remove_quietly_many, placed_paths)
-        await _block(
-            session,
-            download_repo,
+    # PURGE-vs-IMPORT ordering rule (round 9; stated identically at
+    # purge_service's registry): FIRST-REGISTERED WINS, loser defers fast. If an
+    # eviction/correction purge is mid-delete on this season directory, SKIP
+    # this attempt -- the row stays ImportPending and the next import cycle
+    # retries honestly -- rather than placing episodes into a tree an rmtree is
+    # walking. Registered here (before the Importing claim) and released only
+    # after the finalize commit, so a purge arriving anywhere in that window
+    # defers instead of deleting freshly placed-and-committed files.
+    if not purge_service.begin_placement(str(season_dir)):
+        _logger.info(
+            "deferring import of download %s: a purge is deleting this path; "
+            "will retry next import cycle",
             download_id,
-            f"plex scan failed: {type(exc).__name__}",
-            request_id=request.id,
-            season=season,
-            clear_download_path=True,
+            extra={"request_id": request.id, "season": season},
         )
         return await download_repo.get_by_hash(torrent_hash)
+    try:
+        # Claim Importing BEFORE the (possibly long) copy -- same CAS discipline as
+        # the movie path, conditional on the row still being resumable (an operator's
+        # mark_failed during the validation gap above must not be overwritten).
+        claimed = await download_repo.update_status_if_in(
+            download_id, DownloadState.Importing.value, _RESUMABLE
+        )
+        if not claimed:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
 
-    # Imported. The season is 'completed' ("Finalizing") until a reconcile cycle
-    # confirms availability via is_available (phase 2). Finalize with a
-    # compare-and-swap, conditional on STILL holding the Importing claim.
-    finalized = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.Imported.value,
-        frozenset({DownloadState.Importing.value}),
-        download_path=str(season_dir),
-    )
-    if not finalized:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash)
-    # Only now -- after the scan AND the finalize CAS have both succeeded -- is the
-    # per-episode ``imported`` history durably recorded. See the staging comment
-    # above the loop for why this cannot happen any earlier.
-    for basename, relative in imported:
         session.add(
             DownloadHistory(
                 tmdb_id=request.tmdb_id,
                 torrent_hash=torrent_hash,
-                event_type=DownloadHistoryEvent.imported,
-                source_title=None,
-                message=f"imported {basename} to {relative}",
+                event_type=DownloadHistoryEvent.import_started,
+                source_title=None,  # never shadow the grabbed release title
+                message=f"importing {len(by_relative)} episode(s) to {season_dir}",
             )
         )
-    # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
-    # mark_completed -- ``season_dir`` is the season's own directory (the one
-    # this call just scanned), the exact directory a later disk-pressure sweep's
-    # ``fs.delete()`` must remove. Without this, ``SeasonRequest.library_path``
-    # stays ``None`` forever and ``eviction_service._season_candidates`` has no
-    # deletion target for this season.
-    await season_request_service.set_library_path(
-        session, media_request_id=request.id, season_number=season, library_path=str(season_dir)
-    )
-    await season_request_service.mark_completed(
-        session, media_request_id=request.id, season_number=season
-    )
-    await session.commit()
-    return await download_repo.get_by_hash(torrent_hash)
+        await session.commit()
+
+        # ``imported`` history rows are staged (basename, relative) here rather than
+        # written immediately: they are committed to ``session`` ONLY after the scan
+        # AND the finalize CAS below have both succeeded (mirrors the movie path,
+        # which likewise writes its ``imported`` row only once the scan succeeds). A
+        # later file's copy failure OR a scan failure both roll placed files back via
+        # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
+        # the audit trail claim an episode was imported when it was in fact deleted
+        # moments later (honesty over silence: history must never lie about a rollback).
+        placed_paths: list[Path] = []
+        imported: list[tuple[str, PurePosixPath]] = []
+        for relative, result in by_relative.items():
+            src = abs_by_rel[result.video.relative_path]
+            dst = Path(tv_root) / relative
+            try:
+                placed = await asyncio.to_thread(_place_file, fs, src, dst)
+            except (FileExistsError, OSError) as exc:
+                await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                reason = (
+                    str(exc)
+                    if isinstance(exc, FileExistsError)
+                    else f"import copy failed: {type(exc).__name__}"
+                )
+                await _block(
+                    session,
+                    download_repo,
+                    download_id,
+                    reason,
+                    request_id=request.id,
+                    season=season,
+                )
+                return await download_repo.get_by_hash(torrent_hash)
+            if placed:
+                placed_paths.append(dst)
+            imported.append((os.path.basename(src), relative))
+
+        # download_path is stamped with the SEASON folder (not one file) purely for
+        # queue-display observability -- unlike the movie path, it is never consulted
+        # to decide scan-failure rollback ownership (see the docstring above).
+        await download_repo.update_status(
+            download_id, DownloadState.Importing.value, download_path=str(season_dir)
+        )
+        await session.commit()
+
+        # ONE targeted scan of the whole season directory, never one per episode.
+        try:
+            await library.trigger_scan(str(season_dir), "tv")
+        except (PlexLibraryError, PlexAuthError) as exc:
+            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"plex scan failed: {type(exc).__name__}",
+                request_id=request.id,
+                season=season,
+                clear_download_path=True,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        # Imported. The season is 'completed' ("Finalizing") until a reconcile cycle
+        # confirms availability via is_available (phase 2). Finalize with a
+        # compare-and-swap, conditional on STILL holding the Importing claim.
+        finalized = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Imported.value,
+            frozenset({DownloadState.Importing.value}),
+            download_path=str(season_dir),
+        )
+        if not finalized:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        # Only now -- after the scan AND the finalize CAS have both succeeded -- is the
+        # per-episode ``imported`` history durably recorded. See the staging comment
+        # above the loop for why this cannot happen any earlier.
+        for basename, relative in imported:
+            session.add(
+                DownloadHistory(
+                    tmdb_id=request.tmdb_id,
+                    torrent_hash=torrent_hash,
+                    event_type=DownloadHistoryEvent.imported,
+                    source_title=None,
+                    message=f"imported {basename} to {relative}",
+                )
+            )
+        # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
+        # mark_completed -- ``season_dir`` is the season's own directory (the one
+        # this call just scanned), the exact directory a later disk-pressure sweep's
+        # ``fs.delete()`` must remove. Without this, ``SeasonRequest.library_path``
+        # stays ``None`` forever and ``eviction_service._season_candidates`` has no
+        # deletion target for this season.
+        await season_request_service.set_library_path(
+            session, media_request_id=request.id, season_number=season, library_path=str(season_dir)
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=request.id, season_number=season
+        )
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    finally:
+        purge_service.end_placement(str(season_dir))
 
 
 async def run_import_cycle(

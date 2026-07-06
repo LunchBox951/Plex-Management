@@ -35,7 +35,7 @@ from plex_manager.models import (
 from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import eviction_service, import_service, queue_service
+from plex_manager.services import eviction_service, import_service, purge_service, queue_service
 from plex_manager.services.import_service import (
     import_download,
     run_availability_cycle,
@@ -2086,3 +2086,116 @@ async def test_import_anime_movie_persists_anime_library_path_for_eviction(
         request = await session.get(MediaRequest, request_id)
         assert request is not None
         assert request.library_path == str(dst.parent)
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-9 (PR #117): purge-vs-import path serialization. During an
+# eviction's committed-claim window a fast re-request can be importing the
+# replacement into the SAME deterministic directory the purge's rmtree is
+# walking. The in-process path-guard registry serializes them, both orders:
+# first-registered wins, the loser defers fast and retries honestly.
+# --------------------------------------------------------------------------- #
+
+
+async def test_import_defers_while_a_purge_is_deleting_the_destination(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """Import side of the ordering rule: with a purge mid-delete on the movie's
+    directory, the import attempt is SKIPPED (no claim, no placement, row stays
+    ImportPending -- the shape every import cycle re-picks) and succeeds
+    normally on the next attempt once the purge has released the path."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+    dst_dir = movies_root / "The Matrix (1999)"
+
+    # A purge is mid-delete on the destination directory (as an eviction's slow
+    # rmtree would be, off-thread, during its committed-claim window).
+    purge_service._register(  # pyright: ignore[reportPrivateUsage]
+        str(dst_dir),
+        purge_service._ACTIVE_PURGE_PATHS,  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+    finally:
+        purge_service._unregister(  # pyright: ignore[reportPrivateUsage]
+            str(dst_dir),
+            purge_service._ACTIVE_PURGE_PATHS,  # pyright: ignore[reportPrivateUsage]
+        )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportPending.value  # untouched: retried next cycle
+    assert not (dst_dir / "The Matrix (1999).mkv").exists()  # nothing placed under the rmtree
+    assert library.scanned == []  # and nothing scanned
+
+    # The purge released the path: the next cycle's attempt imports normally.
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert (dst_dir / "The Matrix (1999).mkv").exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.completed
+
+
+async def test_purge_defers_while_an_import_is_placing_into_the_path(
+    tmp_path: Path,
+) -> None:
+    """Purge side of the ordering rule: with an import mid-placement into the
+    path (or any path it contains), purge_library_path defers with the honest
+    retryable ``error`` outcome -- eviction restores its claim to 'available'
+    and re-decides next sweep; report-issue keeps the breadcrumb -- and deletes
+    NOTHING. Once the placement releases, the purge proceeds normally."""
+    movie_dir = tmp_path / "library" / "The Matrix (1999)"
+    movie_file = movie_dir / "The Matrix (1999).mkv"
+    _make_video(movie_file, size_bytes=1024)
+    fs = LocalFileSystem(library_roots=[str(tmp_path / "library")])
+
+    # The import registered its placement (a FILE inside the directory a purge
+    # would delete -- containment must conflict, not just equality).
+    assert purge_service.begin_placement(str(movie_file)) is True
+    try:
+        result = await purge_service.purge_library_path(fs, str(movie_dir))
+    finally:
+        purge_service.end_placement(str(movie_file))
+
+    assert result.outcome is purge_service.PurgeOutcome.error  # honest, retryable
+    assert result.detail is not None and "deferred" in result.detail
+    assert movie_file.exists()  # nothing deleted under the placement
+
+    # Placement released: the purge now proceeds.
+    result = await purge_service.purge_library_path(fs, str(movie_dir))
+    assert result.outcome is purge_service.PurgeOutcome.deleted
+    assert not movie_dir.exists()
+
+
+async def test_begin_placement_refuses_while_a_purge_holds_the_path(
+    tmp_path: Path,
+) -> None:
+    """The reverse registration order: a placement beginning while a purge holds
+    a conflicting path is refused up front (the import defers), and allowed
+    again once the purge releases."""
+    season_dir = tmp_path / "library" / "Show (2020)" / "Season 01"
+    purge_service._register(  # pyright: ignore[reportPrivateUsage]
+        str(season_dir),
+        purge_service._ACTIVE_PURGE_PATHS,  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        # Equality AND containment both conflict.
+        assert purge_service.begin_placement(str(season_dir)) is False
+        assert purge_service.begin_placement(str(season_dir / "ep01.mkv")) is False
+    finally:
+        purge_service._unregister(  # pyright: ignore[reportPrivateUsage]
+            str(season_dir),
+            purge_service._ACTIVE_PURGE_PATHS,  # pyright: ignore[reportPrivateUsage]
+        )
+    assert purge_service.begin_placement(str(season_dir)) is True
+    purge_service.end_placement(str(season_dir))
