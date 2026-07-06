@@ -293,12 +293,49 @@ async def ensure_seasons(
     ``searching``/``downloading``/``import_blocked``/``no_acceptable_release``/
     ``pending``) is left completely untouched -- an in-flight or already-finished
     season is never regressed by a re-request.
+
+    That re-arm (#75) does not stop at ``set_status``: it also clears the
+    ``library_path`` eviction breadcrumb and resets the search backoff ladder,
+    MIRRORING the existing report-issue re-arm path (:func:`reset_for_research`'s
+    ``clear_library_path``/``schedule_search(search_attempts=0,
+    next_search_at=None)`` pair, cited there as ADR-0013/ADR-0014). Without this
+    a re-requested evicted season could inherit a stale ``library_path`` still
+    pointing at the file the sweep already deleted (a later eviction sweep would
+    misread it as still reclaimable) and/or a stale ``search_attempts``/
+    ``next_search_at`` backoff from the run that led to eviction, throttling the
+    operator's brand-new request exactly like a fresh row never would.
+
+    The re-arm ALSO heals the parent's ``completed_at``
+    (:meth:`SqlRequestRepository.heal_completed_at` -- the same guarded verb
+    :func:`reset_for_research` uses, sharing its invariant): an evicted season's
+    OLD completion may be the only thing the parent's stamp records, and eviction
+    itself deliberately never clears it (a reclaimed file is not an un-completion
+    -- the show's first completion remains a historical fact while the show sits
+    settled). But the moment the operator RE-REQUESTS that season, a stale stamp
+    becomes a trap: ``stamp_completed_at_if_unset``'s ``IS NULL`` guard means the
+    re-import could never re-stamp, exactly the #76 gap at the eviction re-arm
+    entrance. The heal clears the stamp ONLY when no genuinely-imported
+    ``completed``/``available`` sibling still backs it (e.g. S1 evicted + S2
+    pending -> cleared, so S1's re-import re-stamps; S2 imported-and-done ->
+    preserved, the first-completion fact is still true). Gated to the re-arm case
+    -- plain creations never touch the stamp, keeping the R5 rule that request
+    time NEVER records a completion.
+
+    The evicted -> ``available`` re-arm (Plex still reports the season present)
+    clears the stamp too (Codex round-3): the season's PRE-EVICTION ``imported``
+    ``Download`` row survives eviction (eviction never mutates the downloads
+    aggregate), but the heal's download-evidence arm discounts any import with a
+    LATER ``evicted`` history event for the show -- so the re-armed season's
+    presence-derived ``available`` cannot resurrect a ``completed_at`` that no
+    current import supports, exactly matching how a Plex-present-only creation
+    never stamps.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
     )
     season_repo = SqlSeasonRequestRepository(session)
     records: list[SeasonRequestRecord] = []
+    re_armed_evicted = False
     for season_number in seasons:
         initial_status = (
             RequestStatus.available.value
@@ -308,8 +345,18 @@ async def ensure_seasons(
         record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
         if record.status == RequestStatus.evicted.value:
             await season_repo.set_status(record.id, initial_status)
+            # Mirrors ``reset_for_research``'s re-arm exactly (see the docstring
+            # above): a fresh request must not inherit the evicted run's
+            # breadcrumb or backoff state.
+            await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
+            await season_repo.clear_library_path(record.id)
             record = await season_repo.get(record.id) or record
+            re_armed_evicted = True
         records.append(record)
+    if re_armed_evicted:
+        # After the loop (not per season) so the heal sees every re-armed season's
+        # new status; see the docstring for why only a re-arm triggers it.
+        await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
     return records
 
@@ -500,6 +547,40 @@ async def reset_for_research(
     ``False`` when the purge failed/was refused (the season directory may still be on
     disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
     reclaim the orphan, never stranded with no handle (honesty over silence).
+
+    Also HEALS the PARENT'S ``completed_at`` (#76) against its remaining seasons.
+    Read against the movie path's own ``SqlRequestRepository.reset_for_research``,
+    which unconditionally nulls ``completed_at`` because a movie is a single row:
+    its completion claim is entirely invalidated the instant it is re-armed. A TV
+    parent's ``completed_at`` is a DIFFERENT thing -- not "this row's own
+    completion" but "the show's FIRST tracked season to complete" (a documented,
+    known approximation; see ``retention_telemetry_service._candidate_context``
+    and ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally
+    clearing it here would make the honest case (another season is STILL
+    genuinely complete/available, unaffected by this reset) regress to "unknown"
+    for no reason. So the stamp goes through
+    :meth:`SqlRequestRepository.heal_completed_at` (see its docstring for the
+    full contract), whose INVARIANT this function shares: after the reset,
+    ``completed_at`` is non-``NULL`` iff some tracked season GENUINELY completed
+    an import AND is still ``completed``/``available``. "Genuinely imported"
+    means the season has the ``library_path`` breadcrumb (written by
+    ``import_service._import_tv_locked`` in the SAME transaction as
+    ``mark_completed``) OR an ``imported`` ``Download`` row for its
+    ``(media_request_id, season)`` -- the latter covering LEGACY seasons imported
+    before the breadcrumb column existed (``models.SeasonRequest.library_path``),
+    and invalidated by any LATER ``evicted`` history event for the show (a
+    pre-eviction import is not current backing evidence -- see the heal's
+    docstring for the ``download_history`` ordering, Codex round-3).
+    A Plex-present-only season (``ensure_seasons``'s already-in-Plex creation:
+    ``available``, NO breadcrumb, no grab ever ran) matches neither and never
+    preserves a re-armed season's stale stamp (Codex P2 #1), so a redone season's
+    re-import can always re-stamp via ``stamp_completed_at_if_unset``'s ``IS
+    NULL`` guard. The predicate lives ONLY in the heal's own UPDATE ``WHERE``
+    clauses -- re-asserted at UPDATE time, never read here into a Python snapshot
+    (Codex P2 #2) -- and the heal's second (re-stamp) statement repairs the
+    masked-sibling aftermath where a concurrently-committed sibling completion
+    would otherwise be left stampless. The just-reset season is already flushed
+    to ``searching`` above, so the heal correctly sees it as no longer done.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
@@ -511,6 +592,7 @@ async def reset_for_research(
     await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
+    await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
 
 
