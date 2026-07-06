@@ -144,8 +144,9 @@ describe('Row quick-request action (issue #42)', () => {
     render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
 
     const action = screen.getByRole('button', { name: REQUEST_MOVIE })
-    // QuickRequestButton still stops Enter/Space from reaching neighboring card
-    // handlers; activating the action by keyboard must not open details.
+    // The action is a DOM sibling of the card's details trigger, not nested inside
+    // it, so there's no shared handler for a keyboard activation to reach —
+    // activating the action must not open details.
     fireEvent.keyDown(action, { key: 'Enter' })
     fireEvent.keyDown(action, { key: ' ' })
 
@@ -169,8 +170,9 @@ describe('Row quick-request action (issue #42)', () => {
         }),
       )
     })
-    // The button survives a failed request (no local "just requested" flip) and the
-    // click never bubbled to the card's own onSelect.
+    // The button survives a failed request (no local "just requested" flip), and
+    // clicking it — a DOM sibling of the card's details trigger, not nested inside
+    // it — never fires the card's own onSelect.
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
     expect(onSelect).not.toHaveBeenCalled()
   })

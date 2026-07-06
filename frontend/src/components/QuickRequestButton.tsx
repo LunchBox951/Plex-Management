@@ -33,11 +33,12 @@ function asApiError(error: unknown): ApiError {
  * deliberately narrows to the selected season — so every tv retry/re-request
  * stays a modal action.
  *
- * Sits in `PosterCard`'s action layer beside the card's own native details
- * button. Both the mouse `onClick` and the `onKeyDown` here stop propagation so
- * activating this button never also opens the modal underneath it. On success it
- * hands keyboard focus back to the card details button before unmounting, so a
- * keyboard user keeps their place in the grid.
+ * Sits in `PosterCard`'s action layer as a DOM SIBLING of the card's own native
+ * details trigger — not nested inside it — and stacks above it (`z-30` vs.
+ * `z-10`), so activating this button can never also open the modal underneath
+ * (see `PosterCard.tsx`; `PosterCard.test.tsx` pins that contract). On success
+ * it hands keyboard focus back to the card details button before unmounting,
+ * so a keyboard user keeps their place in the grid.
  */
 export function QuickRequestButton({ item }: QuickRequestButtonProps) {
   const { toast } = useToast()
@@ -76,17 +77,11 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
       aria-label={`Request ${item.title}`}
       loading={createRequest.isPending}
       onClick={(e) => {
-        e.stopPropagation()
         // Resolve the sibling PosterCard details trigger synchronously (before the
         // async mutation unmounts this button) so `onRequest` can restore focus.
         const card = e.currentTarget.closest<HTMLElement>('[data-poster-card]')
         const trigger = card?.querySelector<HTMLElement>('[data-poster-card-trigger]') ?? null
         void onRequest(trigger)
-      }}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.stopPropagation()
-        }
       }}
     >
       Request
