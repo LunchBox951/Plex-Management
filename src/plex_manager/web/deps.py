@@ -91,6 +91,7 @@ __all__ = [
     "SettingsStore",
     "api_key_matches",
     "authenticate_request",
+    "enforce_pre_init_setup_token",
     "ensure_system_settings",
     "get_anime_movie_root_optional",
     "get_anime_tv_root_optional",
@@ -497,6 +498,31 @@ def _pre_init_setup_token_valid(request: Request) -> bool:
     return api_key_matches(provided_setup_token, expected_setup_token)
 
 
+def enforce_pre_init_setup_token(request: Request, *, initialized: bool) -> None:
+    """Enforce the OPTIONAL pre-init hardening token (``PLEX_MANAGER_SETUP_TOKEN``).
+
+    A no-op post-init, when no token is configured, or under ``dev_auth_bypass``
+    (:func:`is_setup_token_required` already folds the bypass in). While the install
+    is still uninitialized AND a token is configured, the request MUST carry a
+    matching ``X-Setup-Token`` — else an honest 401 ``invalid_setup_token``.
+
+    This is the SINGLE pre-init token gate, shared by :func:`require_setup_admin`
+    (the setup sub-API) and the sign-in endpoint (``POST /api/v1/auth/plex``). The
+    sign-in claim is the FIRST step of first-run setup, so gating it here is what
+    makes the token actually harden the exclusive first-owner claim — not merely
+    ``/complete``. Without it an attacker owning any Plex server could win the claim
+    and lock out the true owner (recoverable only by DB surgery, a north-star-#1
+    violation).
+    """
+    if not initialized and is_setup_token_required() and not _pre_init_setup_token_valid(request):
+        raise AppError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_setup_token",
+            message="The setup token is missing or wrong.",
+            hint="Check PLEX_MANAGER_SETUP_TOKEN on the server.",
+        )
+
+
 def hash_session_token(token: str) -> str:
     """Return the stored digest for a random browser-session token."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -641,13 +667,7 @@ async def require_setup_admin(
         return AuthContext(method=AuthMethod.dev_bypass, is_admin=True)
     system = await load_system_settings(session)
     initialized = system is not None and system.initialized
-    if not initialized and is_setup_token_required() and not _pre_init_setup_token_valid(request):
-        raise AppError(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            code="invalid_setup_token",
-            message="The setup token is missing or wrong.",
-            hint="Check PLEX_MANAGER_SETUP_TOKEN on the server.",
-        )
+    enforce_pre_init_setup_token(request, initialized=initialized)
     context = await authenticate_request(
         request,
         session,

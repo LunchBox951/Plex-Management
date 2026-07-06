@@ -25,8 +25,9 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.config import get_settings
 from plex_manager.models import SystemSettings, User
-from plex_manager.web.deps import SettingsStore
+from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
 from plex_manager.web.routers import auth as auth_module
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -251,6 +252,97 @@ async def test_pre_init_concurrent_claim_loser_rejected(
 
     assert response.status_code == 403
     assert response.json()["detail"] == "setup_already_claimed"
+
+
+# --------------------------------------------------------------------------- #
+# Pre-init: the optional PLEX_MANAGER_SETUP_TOKEN gates the FIRST-OWNER CLAIM
+# --------------------------------------------------------------------------- #
+async def test_pre_init_setup_token_gates_the_claim(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured setup token must be required BEFORE the exclusive claim.
+
+    Without this, any owner of any Plex server could win the pre-init claim and
+    permanently lock out the true owner. The token gates completion AND the claim.
+    """
+    await seed(initialized=False)
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+    # A legitimate-looking owner token: the claim would succeed if the gate were
+    # absent. The plex.tv transport must never be reached — the token check fires
+    # before any account/resource fetch — so a hit here fails the test.
+    seen: list[str] = []
+    await _use_transport(
+        app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()], seen=seen)
+    )
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_setup_token"
+    assert response.cookies.get("plexmgr.session") is None
+    # The gate short-circuits before any plex.tv call: no proxying for a caller
+    # who cannot prove the setup token.
+    assert seen == []
+    # The claim never happened: no owner row, setup_started_at still unstamped.
+    async with sessionmaker_() as db:
+        assert (await db.execute(select(User).where(User.plex_id == 42))).scalars().first() is None
+        system = (await db.execute(select(SystemSettings))).scalars().one()
+    assert system.setup_started_at is None
+
+
+async def test_pre_init_setup_token_valid_allows_the_claim(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the matching X-Setup-Token, the owner claims setup as normal."""
+    await seed(initialized=False)
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    response = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={SETUP_TOKEN_HEADER_NAME: "boot-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["is_admin"] is True
+    async with sessionmaker_() as db:
+        system = (await db.execute(select(SystemSettings))).scalars().one()
+    assert system.setup_started_at is not None
+
+
+async def test_post_init_ignores_setup_token(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-init the token is never consulted: sign-in works without it.
+
+    The token hardens ONLY the pre-init window; a configured token must not brick
+    ordinary post-init sign-in (which carries no X-Setup-Token).
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+    get_settings.cache_clear()
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+
+    assert response.status_code == 200
+    assert response.json()["user"]["is_admin"] is True
 
 
 # --------------------------------------------------------------------------- #

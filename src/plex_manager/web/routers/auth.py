@@ -43,6 +43,7 @@ from plex_manager.web.deps import (
     AuthMethod,
     SettingsStore,
     authenticate_request,
+    enforce_pre_init_setup_token,
     ensure_system_settings,
     get_http_client,
     hash_session_token,
@@ -84,13 +85,23 @@ async def plex_sign_in_endpoint(
     plex.tv's v2 API before any user or session row is written.
     """
     _throttle_sign_in(request)
+
+    system = await load_system_settings(session)
+    initialized = system is not None and system.initialized
+    # The OPTIONAL pre-init hardening token (PLEX_MANAGER_SETUP_TOKEN) must gate the
+    # EXCLUSIVE first-owner claim, not merely /complete: the sign-in claim IS the
+    # first step of first-run setup. Without this, any account owning any Plex
+    # server could win the pre-init claim and permanently lock out the true owner
+    # (recoverable only by DB surgery — a north-star-#1 violation). Enforced BEFORE
+    # any plex.tv call so a caller lacking the token cannot even drive the flow; a
+    # no-op post-init and when no token is configured.
+    enforce_pre_init_setup_token(request, initialized=initialized)
+
     client_identifier = await _get_or_create_client_identifier(session)
     plex_tv = PlexTvClient(client, client_identifier=client_identifier)
     account = await plex_tv.fetch_account(body.auth_token)
     resources = await plex_tv.fetch_resources(body.auth_token)
 
-    system = await load_system_settings(session)
-    initialized = system is not None and system.initialized
     if not initialized:
         is_admin = await _claim_or_resume_setup(session, account, resources)
     else:
