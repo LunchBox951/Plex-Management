@@ -30,6 +30,7 @@ export const queryClient = new QueryClient({
 export const queryKeys = {
   authMe: ['auth', 'me'] as const,
   setupStatus: ['setup', 'status'] as const,
+  setupPlexServers: ['setup', 'plex-servers'] as const,
   settings: ['settings'] as const,
   plexLibraries: ['settings', 'plex-libraries'] as const,
   requests: ['requests'] as const,

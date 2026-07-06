@@ -23,15 +23,18 @@ function toDisplayError(err: unknown): ApiError | PlexPinError {
  * SYNCHRONOUSLY from the click (before any `await`, or popup blockers null it),
  * then the browser polls plex.tv for the token and hands it to the backend to
  * verify. `onSignedIn` lets the caller (SetupGate today; the wizard later)
- * decide what happens once a session exists; `onUseAccessKey` is the recovery
- * fallback for a browser without a working popup / Plex session.
+ * decide what happens once a session exists; `onUseAccessKey` is the OPTIONAL
+ * recovery fallback for a browser without a working popup / Plex session — its
+ * secondary button renders only when a handler is supplied. The setup wizard's
+ * sign-in step omits it (there is no key to recover before setup mints one);
+ * SetupGate passes it so an operator locked out of Plex can fall back to a key.
  */
 export function PlexLogin({
   onSignedIn,
   onUseAccessKey,
 }: {
   onSignedIn: () => void
-  onUseAccessKey: () => void
+  onUseAccessKey?: () => void
 }) {
   const signIn = usePlexSignIn()
   const [busy, setBusy] = useState(false)
@@ -67,9 +70,11 @@ export function PlexLogin({
           <Button onClick={startSignIn} loading={busy}>
             Sign in with Plex
           </Button>
-          <Button type="button" variant="secondary" onClick={onUseAccessKey}>
-            Use access key
-          </Button>
+          {onUseAccessKey ? (
+            <Button type="button" variant="secondary" onClick={onUseAccessKey}>
+              Use access key
+            </Button>
+          ) : null}
         </div>
         {error ? (
           <div className="mt-4">

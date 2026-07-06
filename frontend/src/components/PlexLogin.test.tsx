@@ -86,4 +86,13 @@ describe('PlexLogin', () => {
 
     expect(onUseAccessKey).toHaveBeenCalledTimes(1)
   })
+
+  it('omits the access-key button entirely when no onUseAccessKey handler is given', () => {
+    // The setup wizard's sign-in step has no access-key path pre-init (there is no
+    // key to recover before setup mints anything), so it passes only onSignedIn.
+    render(<PlexLogin onSignedIn={vi.fn()} />)
+
+    expect(screen.getByRole('button', { name: /sign in with plex/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /use access key/i })).not.toBeInTheDocument()
+  })
 })

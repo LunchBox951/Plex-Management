@@ -66,9 +66,14 @@ export function plexClientId(): string {
  * Pre-open the auth popup. MUST be called synchronously from the click handler,
  * before any `await`, or popup blockers will null it. Returns `null` when
  * blocked; {@link runPlexPinFlow} maps that to `plex_popup_blocked`.
+ *
+ * The popup is pointed at the app's own `/login/plex/loading` route — a branded
+ * centered spinner — so the operator sees "Opening plex.tv…" rather than a blank
+ * frame during the (typically sub-second) gap before {@link runPlexPinFlow}
+ * navigates it to plex.tv's hosted login.
  */
 export function openPlexPopup(): Window | null {
-  return window.open('about:blank', 'plex-auth', 'width=600,height=700')
+  return window.open('/login/plex/loading', 'plex-auth', 'width=600,height=700')
 }
 
 interface PlexPinResponse {

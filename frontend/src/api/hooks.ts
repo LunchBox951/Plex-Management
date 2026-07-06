@@ -22,6 +22,7 @@ import type {
   LogsResponse,
   LogsTailResponse,
   PlexLibraryOption,
+  PlexServersResponse,
   PlexSignInRequest,
   QualityProfileResponse,
   QueueItem,
@@ -93,6 +94,43 @@ export function useSetupStatus() {
     queryKey: queryKeys.setupStatus,
     queryFn: async (): Promise<SetupStatusResponse> =>
       unwrap(await client.GET('/api/v1/setup/status')),
+  })
+}
+
+/**
+ * The signed-in admin's OWNED Plex servers, each connection probed by the
+ * backend (`GET /setup/plex/servers`). `enabled` gates the fetch on the wizard
+ * having reached the server-pick step (authenticated) — a pre-auth call would
+ * just 401/409. `retry: false`: a 409 `plex_account_required` (no Plex session
+ * yet) is a normal, honest state the picker surfaces, not a transient worth
+ * retrying.
+ */
+export function useSetupPlexServers(enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.setupPlexServers,
+    enabled,
+    retry: false,
+    queryFn: async (): Promise<PlexServersResponse> =>
+      unwrap(await client.GET('/api/v1/setup/plex/servers')),
+  })
+}
+
+/**
+ * Test a candidate Plex server AND assert the signed-in admin owns it
+ * (`POST /setup/validate/plex`). `token` is OPTIONAL: omitted, the backend probes
+ * with the admin's stored Plex OAuth token (the wizard's happy path — a picked
+ * owned server never re-types a token); a supplied `token` is the explicit
+ * custom-credential override. On success the response carries the server's
+ * `machine_identifier` (for `plex_machine_identifier` on complete) and its
+ * `libraries` (to drive the library-root pickers).
+ */
+export function useValidatePlex() {
+  return useMutation({
+    mutationFn: async (body: {
+      url: string
+      token?: string
+    }): Promise<ServiceValidateResponse> =>
+      unwrap(await client.POST('/api/v1/setup/validate/plex', { body })),
   })
 }
 

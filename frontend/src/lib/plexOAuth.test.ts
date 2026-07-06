@@ -54,12 +54,14 @@ describe('plexClientId', () => {
 })
 
 describe('openPlexPopup', () => {
-  it('opens a blank popup synchronously and returns the window handle', () => {
+  it('opens the branded loading route synchronously and returns the window handle', () => {
     const popup = makePopup()
     const open = vi.spyOn(window, 'open').mockReturnValue(popup)
     expect(openPlexPopup()).toBe(popup)
     expect(open).toHaveBeenCalledTimes(1)
-    expect(open.mock.calls[0]?.[0]).toBe('about:blank')
+    // The popup shows the in-app branded spinner (`/login/plex/loading`) until
+    // runPlexPinFlow navigates it to plex.tv — never a blank `about:blank` frame.
+    expect(open.mock.calls[0]?.[0]).toBe('/login/plex/loading')
   })
 
   it('returns null when the browser blocks the popup', () => {
