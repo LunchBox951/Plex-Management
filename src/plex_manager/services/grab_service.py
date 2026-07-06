@@ -64,24 +64,28 @@ DEFAULT_CATEGORY: Final = "plex-manager"
 # finished, so an identical hash may be grabbed afresh.
 _TERMINAL_STATUS_VALUES: Final[frozenset[str]] = frozenset(s.value for s in TERMINAL_STATES)
 
-# Post-add status-move CAS predicates. ``grab`` awaits ``qbt.add(...)`` BEFORE it
-# moves the request/season to ``downloading``, and a cancel — the operator's
-# cancel verb, or the eviction restore's redundant-re-grab reconciliation — can
-# commit ``cancelled`` during that await. The up-front terminal gate ran before
-# the add, so the post-add move must be a compare-and-swap, not an unconditional
-# write: flipping a just-cancelled row back to ``downloading`` would resurrect a
-# request against the user's explicit stop (and, for a movie, re-enter
-# ``uq_media_requests_active`` — potentially colliding with a newer active row
-# AFTER the torrent was already added). A losing CAS is handled like the other
-# post-add losses (see the lost-parallel-grab branches): roll back, best-effort
-# remove the just-added torrent, raise the honest ``RequestNotActiveError``.
+# Post-add status-move CAS fallbacks. ``grab`` awaits ``qbt.add(...)`` BEFORE it
+# moves the request/season to ``downloading``, and a concurrent writer -- the
+# operator's cancel verb, the eviction restore's redundant-re-grab
+# reconciliation, or the eviction recovery's failed-purge FOLD (``pending`` ->
+# ``available``: the file never left disk) -- can commit a new status during
+# that await. The up-front gate ran before the add, so the post-add move must be
+# a compare-and-swap against EXACTLY the status the grab decision OBSERVED
+# (``observed_request_status`` / ``observed_season_status`` in :func:`grab`),
+# never a broader set: a row that read ``pending`` at decision time and was
+# folded to ``available`` mid-add must LOSE (grabbing it would download a
+# duplicate of on-disk content), while an INTENTIONAL reopen -- where the
+# decision itself observed ``available``/``completed`` (a season re-grab chasing
+# one more missing episode) -- still wins, because ``available`` is exactly what
+# it compares. A losing CAS is handled like the other post-add losses (see the
+# lost-parallel-grab branches): roll back, best-effort remove the just-added
+# torrent, raise the honest ``RequestNotActiveError``.
 #
-# The MOVIE predicate excludes the full terminal set (mirror of the up-front
-# gate: never un-terminate a finished request). The SEASON predicate excludes
-# ONLY ``cancelled``: a grab deliberately reopens an ``available``/``completed``
-# season to chase one more missing episode (see ``season_request_service.
-# set_status``'s docstring), so the pre-existing reopen semantics must survive —
-# ``cancelled`` is the one status meaning "the user just said stop".
+# These two sets are only the DEGENERATE fallbacks for when no status could be
+# observed (the request row did not exist at decision time): the CAS then
+# matches zero rows for a still-missing row regardless of the set, and a row
+# minted mid-add is honored, never clobbered. The movie fallback mirrors the
+# up-front terminal gate; the season fallback excludes only ``cancelled``.
 _GRABBABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = (
     frozenset(s.value for s in RequestStatus) - TERMINAL_REQUEST_STATUS_VALUES
 )
@@ -357,6 +361,15 @@ async def grab(
         raise NoGrabSourceError(candidate.guid)
 
     request_media_type: str | None = None
+    # The statuses the GRAB DECISION observed, threaded into the post-add
+    # status-move CAS (see _GRABBABLE_*_STATUS_VALUES): the move compares against
+    # EXACTLY these, so any status a concurrent writer commits while qbt.add is
+    # in flight -- a cancel, or the eviction recovery folding a re-armed
+    # ``pending`` season back to ``available`` because its file never left disk
+    # -- makes the move lose and the grab clean up, while a decision that itself
+    # observed ``available`` (the deliberate reopen of a done season) still wins.
+    observed_request_status: str | None = None
+    observed_season_status: str | None = None
     # Reject a stale/terminal request id BEFORE handing anything to the client. If
     # this request is already terminal, a newer ACTIVE request for the same media
     # owns the ``uq_media_requests_active`` slot, so re-arming this row to
@@ -367,6 +380,7 @@ async def grab(
         if request is not None:
             if request.status in TERMINAL_REQUEST_STATUS_VALUES:
                 raise RequestNotActiveError(request_id)
+            observed_request_status = request.status
             request_media_type = request.media_type
             # Domain-boundary backstop: branch on the request's ACTUAL media
             # type, never on whether the caller merely passed a ``season``. The
@@ -375,6 +389,23 @@ async def grab(
             if request.media_type == "tv":
                 if season is None:
                     raise SeasonRequiredError(request_id)
+                # Observe the SEASON's decision-time status too -- a plain READ,
+                # never ``ensure()`` here: lazily creating the row would open the
+                # write transaction before the ``qbt.add`` network call. A season
+                # not yet tracked is observed as ``pending``, exactly what the
+                # post-add ensure will create it as. A season already
+                # ``cancelled`` is refused up front like a terminal request
+                # (nothing handed to the client for content the user explicitly
+                # stopped) -- the season-level mirror of the request gate above.
+                season_rows = await SqlSeasonRequestRepository(session).list_for_request(request_id)
+                season_row_now = next((s for s in season_rows if s.season_number == season), None)
+                observed_season_status = (
+                    season_row_now.status
+                    if season_row_now is not None
+                    else RequestStatus.pending.value
+                )
+                if observed_season_status == RequestStatus.cancelled.value:
+                    raise RequestNotActiveError(request_id)
             else:
                 # Non-tv (movie): season/episodes are meaningless -- coerce
                 # rather than trust the caller, so a movie can never spawn a
@@ -623,10 +654,14 @@ async def grab(
         # branches on a caller-supplied season alone, only on the media type it
         # was already validated against.
         #
-        # POST-ADD CAS (see _GRABBABLE_*_STATUS_VALUES): the up-front terminal
-        # gate ran BEFORE qbt.add, so a cancel that committed while the add was
-        # in flight must make this move match zero rows -- never be overwritten
-        # back to 'downloading'.
+        # POST-ADD CAS: compare against EXACTLY the status the grab decision
+        # observed (see _GRABBABLE_*_STATUS_VALUES' comment). Any status a
+        # concurrent writer committed while qbt.add was in flight -- a cancel,
+        # or the eviction recovery's fold of a re-armed 'pending' season back to
+        # 'available' (its file never left disk; grabbing it now would download
+        # a duplicate) -- makes this move match zero rows, while a decision that
+        # itself observed 'available' (the deliberate reopen of a done season)
+        # compares 'available' and still wins.
         if season is not None:
             # TV: the request's status is a COMPUTED rollup of its seasons, never a
             # direct target -- resolve the season row (created lazily here, like
@@ -641,25 +676,35 @@ async def grab(
                 media_request_id=request_id,
                 season_request_id=season_row.id,
                 status=RequestStatus.downloading.value,
-                allowed_from=_GRABBABLE_SEASON_STATUS_VALUES,
+                allowed_from=(
+                    frozenset({observed_season_status})
+                    if observed_season_status is not None
+                    else _GRABBABLE_SEASON_STATUS_VALUES
+                ),
             )
         else:
             moved = await SqlRequestRepository(session).set_status_if_in(
                 request_id,
                 RequestStatus.downloading.value,
-                _GRABBABLE_REQUEST_STATUS_VALUES,
+                (
+                    frozenset({observed_request_status})
+                    if observed_request_status is not None
+                    else _GRABBABLE_REQUEST_STATUS_VALUES
+                ),
             )
         if not moved:
-            # The request/season was cancelled (or, for a movie, went terminal)
-            # while qbt.add was in flight. The torrent is already in the client
-            # and the Download row + 'grabbed' history are pending in this
-            # transaction -- discard them, then best-effort remove the just-added
-            # torrent WITH data (the same orphan cleanup the lost-parallel-grab
-            # branches above perform; leaving it would seed forever for content
-            # nobody wants), and refuse honestly. Every caller already handles
-            # RequestNotActiveError: the endpoint as 409, auto-grab by leaving
-            # the scope as-is, report-issue via its _GRAB_ERRORS park (whose
-            # never-un-terminate guard skips a cancelled row).
+            # The request/season moved off its decision-time status while
+            # qbt.add was in flight (cancelled, folded back to 'available' by
+            # the eviction recovery, or otherwise advanced). The torrent is
+            # already in the client and the Download row + 'grabbed' history are
+            # pending in this transaction -- discard them, then best-effort
+            # remove the just-added torrent WITH data (the same orphan cleanup
+            # the lost-parallel-grab branches above perform; leaving it would
+            # seed forever for content nobody wants), and refuse honestly. Every
+            # caller already handles RequestNotActiveError: the endpoint as 409,
+            # auto-grab by leaving the scope as-is, report-issue via its
+            # _GRAB_ERRORS park (whose never-un-terminate guard skips a
+            # cancelled/available row).
             await session.rollback()
             try:
                 await qbt.remove(torrent_hash, delete_files=True)

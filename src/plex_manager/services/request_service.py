@@ -463,6 +463,16 @@ async def create_request_result(
         if present.issuperset(season_numbers):
             in_library = await repo.find_in_library(tmdb_id, media_type)
             if in_library is not None:
+                # Release the media lock BEFORE ensure_seasons -- the same
+                # discipline as the existing_active branch above: ensure_seasons
+                # crawls Plex, and the lock's write transaction (SQLite:
+                # single-writer) must never stay open across a network call,
+                # stalling every unrelated writer for the duration of a slow
+                # Plex response. Only the lock acquisition is pending in this
+                # session here, so the rollback discards nothing else;
+                # ensure_seasons itself is race-safe without the lock (the
+                # unconditional season unique index + IntegrityError re-read).
+                await session.rollback()
                 await season_request_service.ensure_seasons(
                     session,
                     library,
