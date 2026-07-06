@@ -284,11 +284,16 @@ class SqlRequestRepository:
         return [_to_record(row) for row in rows]
 
     async def clear_library_path_if_set(
-        self, request_id: int, *, expected_path: str | None = None
+        self,
+        request_id: int,
+        *,
+        expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
     ) -> bool:
         """Null the eviction breadcrumb ONLY if it is currently set (and, with
-        ``expected_path``, only if it still holds EXACTLY that value); return
-        whether this call actually cleared it.
+        ``expected_path``, only if it still holds EXACTLY that value; with
+        ``expected_statuses``, only if it is still in one of those statuses);
+        return whether this call actually cleared it.
 
         The guarded (``WHERE library_path IS NOT NULL``) variant of
         :meth:`clear_library_path`, for the eviction finalize (ADR-0012 #67):
@@ -308,6 +313,10 @@ class SqlRequestRepository:
         predicates = [MediaRequest.id == request_id, MediaRequest.library_path.is_not(None)]
         if expected_path is not None:
             predicates.append(MediaRequest.library_path == expected_path)
+        if expected_statuses is not None:
+            predicates.append(
+                MediaRequest.status.in_([RequestStatus(status) for status in expected_statuses])
+            )
         result = cast(
             CursorResult[Any],
             await self._session.execute(

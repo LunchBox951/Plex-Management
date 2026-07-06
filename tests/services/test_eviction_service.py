@@ -2232,13 +2232,19 @@ async def test_tv_purge_registration_stays_held_until_eviction_finalizes(
         season_request_id: int,
         *,
         expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
     ) -> bool:
         attempted_placement_allowed.append(
             eviction_service.purge_service.begin_placement(str(season_dir))
         )
         if attempted_placement_allowed[-1]:
             eviction_service.purge_service.end_placement(str(season_dir))
-        return await original_clear(self, season_request_id, expected_path=expected_path)
+        return await original_clear(
+            self,
+            season_request_id,
+            expected_path=expected_path,
+            expected_statuses=expected_statuses,
+        )
 
     monkeypatch.setattr(
         SqlSeasonRequestRepository,
@@ -2596,6 +2602,97 @@ async def test_sweep_finalizes_an_interrupted_season_eviction_whose_file_is_gone
     assert season_row.library_path is None  # finalized
     assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
     assert (missing_path, "tv") in library.scan_calls
+
+
+async def test_interrupted_season_finalize_does_not_clear_same_path_replacement_import(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovered evicted-season finalize must not erase a same-row replacement
+    import that committed the same deterministic season directory between the
+    file-gone stat and breadcrumb clear."""
+    missing_path = str(tmp_path / "tv" / "Same Path Finalize Race" / "Season 01")
+    show_id = await _show_with_seasons(
+        sessionmaker_,
+        tmdb_id=612,
+        title="Same Path Finalize Race",
+        seasons={1: missing_path},
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.evicted
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.evicted
+        await session.commit()
+        season_id = season_row.id
+
+    original_clear = SqlSeasonRequestRepository.clear_library_path_if_set
+
+    async def _complete_same_path_import_before_clear(
+        self: SqlSeasonRequestRepository,
+        season_request_id: int,
+        *,
+        expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
+    ) -> bool:
+        assert expected_statuses is not None
+        assert RequestStatus.completed.value not in expected_statuses
+        async with sessionmaker_() as race_session:
+            row = await race_session.get(SeasonRequest, season_request_id)
+            assert row is not None
+            row.status = RequestStatus.completed
+            row.library_path = expected_path
+            parent = await race_session.get(MediaRequest, show_id)
+            assert parent is not None
+            parent.status = RequestStatus.completed
+            await race_session.commit()
+        return await original_clear(
+            self,
+            season_request_id,
+            expected_path=expected_path,
+            expected_statuses=expected_statuses,
+        )
+
+    monkeypatch.setattr(
+        SqlSeasonRequestRepository,
+        "clear_library_path_if_set",
+        _complete_same_path_import_before_clear,
+    )
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 612)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.completed
+    assert season_row.library_path == missing_path
+    assert history == []
+    assert library.scan_calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -3610,6 +3707,94 @@ async def test_sweep_flips_a_cancelled_rearm_with_the_file_gone_to_evicted(
             session, tmdb, tmdb_id=690, media_type="tv", seasons=[1], library=plex_stale
         )
     assert fresh.status == RequestStatus.pending.value  # never 'available'
+
+
+async def test_rearmed_file_gone_recovery_does_not_clear_same_path_replacement_import(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-armed pending-season recovery must not erase a replacement import's
+    fresh breadcrumb when that import commits the same deterministic season path
+    between the file-gone stat and breadcrumb clear."""
+    missing_path = str(tmp_path / "tv" / "Rearmed Same Path Race" / "Season 01")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=692, title="Rearmed Same Path Race", seasons={1: missing_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.pending
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.pending
+        await session.commit()
+        season_id = season_row.id
+
+    original_clear = SqlSeasonRequestRepository.clear_library_path_if_set
+
+    async def _complete_same_path_import_before_clear(
+        self: SqlSeasonRequestRepository,
+        season_request_id: int,
+        *,
+        expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
+    ) -> bool:
+        assert expected_statuses is not None
+        assert RequestStatus.completed.value not in expected_statuses
+        async with sessionmaker_() as race_session:
+            row = await race_session.get(SeasonRequest, season_request_id)
+            assert row is not None
+            row.status = RequestStatus.completed
+            row.library_path = expected_path
+            parent = await race_session.get(MediaRequest, show_id)
+            assert parent is not None
+            parent.status = RequestStatus.completed
+            await race_session.commit()
+        return await original_clear(
+            self,
+            season_request_id,
+            expected_path=expected_path,
+            expected_statuses=expected_statuses,
+        )
+
+    monkeypatch.setattr(
+        SqlSeasonRequestRepository,
+        "clear_library_path_if_set",
+        _complete_same_path_import_before_clear,
+    )
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 692)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.completed
+    assert season_row.library_path == missing_path
+    assert history == []
+    assert library.scan_calls == []
 
 
 async def test_sweep_folds_a_cancelled_rearm_with_the_file_present_to_available(

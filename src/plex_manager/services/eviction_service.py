@@ -164,6 +164,20 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 # is the orphan-reclaim handle, not an interrupted eviction, and is left alone.
 _REARMED_RECOVERY_STATUSES: frozenset[str] = _PRE_GRAB_STATUSES | {RequestStatus.cancelled.value}
 
+# Statuses in which a season breadcrumb is still the stale eviction/recovery
+# breadcrumb and can be cleared after the file is gone. Imported-content states
+# (``completed``/``available``) are deliberately absent: a same-row TV import
+# stamps the same deterministic season directory, so path equality alone cannot
+# distinguish a stale breadcrumb from a fresh replacement-import breadcrumb.
+_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = _REARMED_RECOVERY_STATUSES | {
+    RequestStatus.evicted.value,
+    RequestStatus.downloading.value,
+    RequestStatus.import_blocked.value,
+    RequestStatus.failed.value,
+}
+
+_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = frozenset({RequestStatus.evicted.value})
+
 # In-PROCESS sweep serialization latch: :func:`run_eviction_sweep` no-ops (with
 # a log line) when another sweep is still running. Exactly two actors ever call
 # it -- the periodic tick and the manual ``POST /ops/evict`` button -- and
@@ -647,7 +661,11 @@ async def _path_claimed_by_another_row(
 
 
 async def _release_stale_breadcrumb(
-    session: AsyncSession, pending: _Pending, *, expected_path: str
+    session: AsyncSession,
+    pending: _Pending,
+    *,
+    expected_path: str,
+    expected_statuses: frozenset[str],
 ) -> bool:
     """CAS-clear ``pending``'s breadcrumb and commit; ``False`` (rolled back) when
     a concurrent pass already cleared it -- or when the breadcrumb no longer
@@ -660,11 +678,15 @@ async def _release_stale_breadcrumb(
     simply replaced in place by the re-grab's import)."""
     if isinstance(pending, _SeasonPending):
         cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
-            pending.season_request_id, expected_path=expected_path
+            pending.season_request_id,
+            expected_path=expected_path,
+            expected_statuses=expected_statuses,
         )
     else:
         cleared = await SqlRequestRepository(session).clear_library_path_if_set(
-            pending.media_request_id, expected_path=expected_path
+            pending.media_request_id,
+            expected_path=expected_path,
+            expected_statuses=expected_statuses,
         )
     if not cleared:
         await session.rollback()
@@ -908,7 +930,12 @@ async def _recover_rearmed_season(
 
     if file_present:
         if await _path_claimed_by_another_row(session, library_path, pending):
-            if await _release_stale_breadcrumb(session, pending, expected_path=library_path):
+            if await _release_stale_breadcrumb(
+                session,
+                pending,
+                expected_path=library_path,
+                expected_statuses=_REARMED_RECOVERY_STATUSES,
+            ):
                 _logger.info(
                     "released a stale eviction breadcrumb of %r season %s: a newer "
                     "row owns the same path; the re-request proceeds normally",
@@ -954,7 +981,9 @@ async def _recover_rearmed_season(
     # playing season with no eviction/report handle. A mismatch means the
     # import owns the row now: leave everything, log, done.
     cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
-        pending.season_request_id, expected_path=library_path
+        pending.season_request_id,
+        expected_path=library_path,
+        expected_statuses=_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES,
     )
     if not cleared:
         await session.rollback()
@@ -1052,7 +1081,16 @@ async def _resume_one(
             # 'available' would put two rows over one file, and a later sweep
             # evicting either would delete the path out from under the actual
             # owner. Release the stale breadcrumb and leave the row 'evicted'.
-            if await _release_stale_breadcrumb(session, pending, expected_path=library_path):
+            if await _release_stale_breadcrumb(
+                session,
+                pending,
+                expected_path=library_path,
+                expected_statuses=(
+                    _STALE_SEASON_BREADCRUMB_CLEAR_STATUSES
+                    if isinstance(pending, _SeasonPending)
+                    else _STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES
+                ),
+            ):
                 _logger.info(
                     "released a stale eviction breadcrumb of %r%s: a newer row "
                     "owns the same path (finalized, not interrupted); nothing restored",
@@ -1085,11 +1123,15 @@ async def _resume_one(
     # import re-stamping this row mid-recovery keeps its fresh breadcrumb.
     if isinstance(pending, _SeasonPending):
         cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
-            pending.season_request_id, expected_path=library_path
+            pending.season_request_id,
+            expected_path=library_path,
+            expected_statuses=_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES,
         )
     else:
         cleared = await SqlRequestRepository(session).clear_library_path_if_set(
-            pending.media_request_id, expected_path=library_path
+            pending.media_request_id,
+            expected_path=library_path,
+            expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
         )
     if not cleared:
         # A concurrent pass finalized first, or a replacement import owns the
@@ -1431,7 +1473,9 @@ async def _evict_one(
             # replacement import somehow re-stamped a FRESH breadcrumb mid-purge,
             # that import owns the row and its breadcrumb survives.
             await SqlSeasonRequestRepository(session).clear_library_path_if_set(
-                pending.season_request_id, expected_path=library_path
+                pending.season_request_id,
+                expected_path=library_path,
+                expected_statuses=_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES,
             )
             # DISK-TRUTH-OVER-INTENT: the claim committed 'evicted', but an
             # in-window re-request can re-arm this SAME row to 'pending' and the
@@ -1460,7 +1504,9 @@ async def _evict_one(
             )
         else:
             await SqlRequestRepository(session).clear_library_path_if_set(
-                pending.media_request_id, expected_path=library_path
+                pending.media_request_id,
+                expected_path=library_path,
+                expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
             )
         await session.commit()
     finally:

@@ -203,11 +203,16 @@ class SqlSeasonRequestRepository:
         ]
 
     async def clear_library_path_if_set(
-        self, season_request_id: int, *, expected_path: str | None = None
+        self,
+        season_request_id: int,
+        *,
+        expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
     ) -> bool:
         """Null the season's eviction breadcrumb ONLY if currently set (and, with
-        ``expected_path``, only if it still holds EXACTLY that value); return
-        whether this call actually cleared it.
+        ``expected_path``, only if it still holds EXACTLY that value; with
+        ``expected_statuses``, only if it is still in one of those statuses);
+        return whether this call actually cleared it.
 
         The season-granularity mirror of ``SqlRequestRepository.
         clear_library_path_if_set`` (see there, including the ``expected_path``
@@ -223,6 +228,10 @@ class SqlSeasonRequestRepository:
         ]
         if expected_path is not None:
             predicates.append(SeasonRequest.library_path == expected_path)
+        if expected_statuses is not None:
+            predicates.append(
+                SeasonRequest.status.in_([RequestStatus(status) for status in expected_statuses])
+            )
         result = cast(
             CursorResult[Any],
             await self._session.execute(

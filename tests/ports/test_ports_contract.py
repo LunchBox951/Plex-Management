@@ -19,6 +19,7 @@ from plex_manager.domain.release import (
     ParsedRelease,
 )
 from plex_manager.ports.download_client import (
+    AddResult,
     DownloadClientPort,
     DownloadedFile,
     DownloadStatus,
@@ -95,8 +96,8 @@ class _FakeIndexer:
 
 
 class _FakeDownloadClient:
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
-        return "hash"
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        return AddResult(torrent_hash="hash", created=True)
 
     async def get_status(self, info_hash: str) -> DownloadStatus | None:
         return None
