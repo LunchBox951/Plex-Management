@@ -27,6 +27,7 @@ from plex_manager.services.log_capture_service import (
     configure_logging,
     drain_once,
     prune_once,
+    resolve_log_level,
     stop_logging,
 )
 
@@ -257,6 +258,88 @@ async def test_configure_logging_falls_back_to_info_on_an_unrecognized_level(
         assert "not-a-real-level" in caplog.text
     finally:
         stop_logging(attached, logger=test_logger)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_log_level (issue #100)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected_level"),
+    [
+        ("debug", logging.DEBUG),
+        ("DEBUG", logging.DEBUG),
+        ("Info", logging.INFO),
+        ("WARNING", logging.WARNING),
+        ("10", logging.DEBUG),  # already-numeric level string
+        ("  warning  ", logging.WARNING),  # surrounding whitespace (env var hygiene)
+    ],
+)
+def test_resolve_log_level_normalizes_valid_inputs(configured: str, expected_level: int) -> None:
+    """Public entry point (exported for ``plex_manager.__main__`` -- issue #100)
+    for the exact normalization ``configure_logging`` already relies on: any
+    case of a standard level name, an already-numeric level string, and
+    incidental leading/trailing whitespace (an env var, not a Python literal,
+    so nothing strips it upstream) all resolve to the real stdlib int level."""
+    assert resolve_log_level(configured) == expected_level
+
+
+def test_resolve_log_level_falls_back_to_info_on_a_typo(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo'd or otherwise unrecognized level (e.g. a mistyped
+    ``PLEX_MANAGER_LOG_LEVEL``) must never raise -- it degrades to INFO with a
+    warning surfaced through this module's own logger, never a silent guess and
+    never a ``KeyError``/``ValueError`` that could crash a caller (uvicorn's
+    ``Config``, in ``__main__.main``) before the app's own tolerant lifespan
+    ever runs."""
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.log_capture_service"):
+        level = resolve_log_level("verbose")
+    assert level == logging.INFO
+    assert "verbose" in caplog.text
+
+
+def test_resolve_log_level_falls_back_to_info_on_a_negative_number_string() -> None:
+    # int() happily parses "-5"; resolve_log_level does not special-case a
+    # nonsensical numeric level -- unlike a typo it is a VALID stdlib int, so it
+    # passes straight through (mirrors int()'s own permissive behavior; the
+    # honesty invariant here is "never raise", not "reject every odd value").
+    assert resolve_log_level("-5") == -5
+
+
+@pytest.mark.parametrize("configured", ["trace", "TRACE", "  Trace  "])
+def test_resolve_log_level_maps_trace_to_debug_for_the_app_logger(configured: str) -> None:
+    """``trace`` is a REAL uvicorn ``--log-level`` name (see
+    ``uvicorn.config.LOG_LEVELS``) one rung below ``debug``, but stdlib
+    ``logging`` has no such level -- ``logging.getLevelNamesMapping()`` has no
+    ``'TRACE'`` entry unless some uvicorn ``Config`` has already registered it
+    as a process-wide side effect, which this resolver must not depend on (it
+    is exercised directly here with no uvicorn involved at all). For the
+    app's OWN stdlib logger -- the only consumer of this int, wired in via
+    ``configure_logging`` -- DEBUG is the honest analogue: the next real level
+    down from INFO. This must NOT go through the generic
+    unrecognized-name-warns-and-falls-back-to-INFO path: 'trace' is a
+    genuinely valid setting, not a typo, and downgrading it all the way to
+    INFO (skipping DEBUG entirely) would be a worse misrepresentation than
+    mapping it to DEBUG outright. Uvicorn's own, separately-normalized launch
+    argument (``plex_manager.__main__._uvicorn_log_level``) is what actually
+    preserves full uvicorn-native TRACE behavior for the ASGI server itself.
+    """
+    assert resolve_log_level(configured) == logging.DEBUG
+
+
+async def test_configure_logging_does_not_raise_on_trace(test_logger: logging.Logger) -> None:
+    """End-to-end sanity check for the app-side consumer: a 'trace'
+    ``config.log_level`` must reach ``configure_logging`` (called from the
+    real ASGI lifespan) exactly like any other value -- no crash, and the
+    logger ends up at DEBUG (see
+    ``test_resolve_log_level_maps_trace_to_debug_for_the_app_logger``)."""
+    handler = configure_logging("trace", logger=test_logger)
+    try:
+        assert test_logger.level == logging.DEBUG
+    finally:
+        stop_logging(handler, logger=test_logger)
 
 
 async def test_configure_logging_quiets_httpx_and_httpcore_even_at_debug(

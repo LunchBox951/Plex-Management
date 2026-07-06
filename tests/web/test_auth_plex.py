@@ -23,11 +23,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
-from plex_manager.models import AuthSession, SystemSettings, User
+from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
 from plex_manager.web.routers import auth as auth_module
 
@@ -601,37 +600,30 @@ async def test_concurrent_client_id_create_race_loser_reuses_winner_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two simultaneous first-ever POST /auth/plex on a clean DB both observe no
-    ``plex_oauth_client_identifier``; ``settings.key`` is UNIQUE, so the loser's
-    INSERT flush raises ``IntegrityError``. The loser must roll back, re-read the
-    winner's committed identifier, and complete the sign-in under THAT device
-    identity — never a 500, never a second identifier. Simulated exactly like the
-    request-dedup race tests: the loser's first read MISSES (the winner's row was
-    not yet visible when it looked) while the winner's identifier is already
-    committed, and the losing write raises the ``IntegrityError`` its INSERT
-    would."""
+    ``plex_oauth_client_identifier`` and both mint a candidate; ``settings.key``
+    is UNIQUE, so only one can persist. The loser must complete its sign-in under
+    the WINNER's device identity — never a 500, never a second identifier, and
+    (the store-retry x create-once composition hazard) never an OVERWRITE that
+    rotates the winner's committed identifier out from under it. This pins the
+    BEHAVIOR, not the recovery mechanism (which lives in
+    ``SettingsStore.set_if_absent``): the loser's initial row lookup is stubbed
+    to MISS once — as it genuinely would mid-race, before the winner's commit
+    became visible — so its INSERT collides on the real unique index."""
     await seed(initialized=False)
     # The WINNER's identifier is committed (its request got there first).
     await _store_setting(sessionmaker_, "plex_oauth_client_identifier", "winner-client-id")
 
-    real_get = SettingsStore.get
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
     missed = {"n": 0}
 
-    async def racing_get(self: SettingsStore, key: str) -> str | None:
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
         # The loser's FIRST lookup ran before the winner committed: miss once.
         if key == "plex_oauth_client_identifier" and missed["n"] == 0:
             missed["n"] = 1
             return None
-        return await real_get(self, key)
+        return await real_row(self, key)
 
-    async def losing_set(self: SettingsStore, key: str, value: str) -> None:
-        # The loser's INSERT collides with the winner's committed unique key.
-        assert key == "plex_oauth_client_identifier"
-        raise IntegrityError(
-            "INSERT INTO settings", None, Exception("UNIQUE constraint failed: settings.key")
-        )
-
-    monkeypatch.setattr(SettingsStore, "get", racing_get)
-    monkeypatch.setattr(SettingsStore, "set", losing_set)
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
 
     # Capture the device identifier every plex.tv call actually carried.
     used_identifiers: list[str | None] = []
