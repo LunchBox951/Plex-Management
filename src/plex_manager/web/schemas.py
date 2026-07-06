@@ -30,6 +30,7 @@ __all__ = [
     "DiskResponse",
     "DiskRootItem",
     "ErrorDetail",
+    "ErrorEnvelope",
     "EvictErrorItem",
     "EvictResponse",
     "EvictionCandidateItem",
@@ -85,6 +86,25 @@ class ErrorDetail(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     detail: str
+
+
+class ErrorEnvelope(BaseModel):
+    """Structured error body for auth/setup failures (north star #3).
+
+    The richer sibling of :class:`ErrorDetail`, rendered by
+    ``web.errors.install_error_handlers``. ``detail`` stays the stable machine
+    code the SPA's humanizer keys on; ``message``/``hint`` are operator-facing
+    prose; ``diagnostics`` carries only NON-secret context (host, status, ...) —
+    a secret NEVER appears here. ``hint``/``diagnostics`` are omitted from the
+    wire when absent, so a client reads their absence, not an empty value.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
+    message: str
+    hint: str | None = None
+    diagnostics: dict[str, str] | None = None
 
 
 # --------------------------------------------------------------------------- #

@@ -22,7 +22,6 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
-from plex_manager.adapters.plex.oauth import PlexOAuthError
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
@@ -72,6 +71,7 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_tv_root_optional,
 )
+from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
@@ -644,13 +644,6 @@ _ADAPTER_ERROR_RESPONSES: dict[type[Exception], tuple[int, str]] = {
     QbittorrentError: (502, "qbittorrent_unavailable"),
     PlexAuthError: (502, "plex_auth_failed"),
     PlexLibraryError: (502, "plex_unavailable"),
-    # The hosted Plex sign-in adapter (plex.tv PIN flow + configured-server
-    # identity probe). The very first login step (create_pin) reaches plex.tv, so
-    # any plex.tv/server hiccup during login MUST surface as an honest, retryable
-    # upstream state rather than an opaque 500 (north-star #3). PlexOAuthPending is
-    # a subclass but is always caught and mapped to 409 in the login endpoint
-    # before it can reach this handler.
-    PlexOAuthError: (502, "plex_login_unavailable"),
 }
 
 
@@ -781,6 +774,9 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:
         app.add_exception_handler(adapter_error, _adapter_error_handler)
+    # Structured auth/setup failures (north star #3): AppError + the plex.tv
+    # verification error render the code+message+hint+diagnostics envelope.
+    install_error_handlers(app)
     app.include_router(router)
     app.include_router(setup_router.router)
     app.include_router(auth_router.router)
