@@ -10,12 +10,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.library import WatchState
+from plex_manager.services import eviction_service
 from plex_manager.web.deps import SettingsStore
 from tests.web.fakes import FakeLibrary, override_adapters
 
@@ -362,3 +365,62 @@ async def test_evict_one_roots_failure_does_not_hide_another_roots_evictions(
     assert after.status_code == 200
     movies_after = next(r for r in after.json()["roots"] if r["root"] == "movies_root")
     assert movies_after["candidates"] == []
+
+
+async def test_evict_one_roots_db_failure_is_rolled_back_so_the_next_root_runs(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#95: every root shares this request's single session. A DB/SQLAlchemy
+    failure sweeping one root poisons that transaction; without the guarded
+    ``session.rollback()`` in the per-root except, the NEXT root's sweep would
+    raise ``PendingRollbackError`` too, cascading one root's failure into every
+    later root. Proves the movies root's DB failure is rolled back so the tv root
+    still runs on the same, now-clean session."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    await _seed(
+        sessionmaker_,
+        movies_root=str(movies_root),
+        library_path=str(movies_root / "Stale Movie.mkv"),
+    )
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("tv_root", str(tv_root))
+        await session.commit()
+
+    override_adapters(app, library=FakeLibrary())
+
+    swept: list[str] = []
+
+    async def _fake_sweep(**kwargs: object) -> list[object]:
+        session = kwargs["session"]
+        assert isinstance(session, AsyncSession)
+        root = kwargs["root_path"]
+        if kwargs["media_type"] == "movie" and root == str(movies_root):
+            # A DB error mid-sweep poisons the shared transaction, then propagates.
+            await session.execute(text("SELECT * FROM __ops_evict_no_such_table__"))
+            return []  # pragma: no cover - the statement above always raises
+        # A later root: the shared session must be usable again (rolled back).
+        await session.execute(text("SELECT 1"))
+        assert isinstance(root, str)
+        swept.append(root)
+        return []
+
+    monkeypatch.setattr(eviction_service, "run_eviction_sweep", _fake_sweep)
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    # Partial completion is a first-class 200, never a bare 500 that hides it.
+    assert response.status_code == 200
+    body = response.json()
+    # The movies root's DB failure is surfaced, not swallowed...
+    assert body["errors"] == [{"root": "movies_root", "detail": "sweep failed (OperationalError)"}]
+    # ...and the tv root still ran on the rolled-back, clean session.
+    assert swept == [str(tv_root)]

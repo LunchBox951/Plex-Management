@@ -217,6 +217,140 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
+    async def latest_request_evicted(self, tmdb_id: int, media_type: str) -> bool:
+        """Whether the NEWEST request row for this media is ``evicted`` (ADR-0012).
+
+        The in-library short-circuit (``request_service.create_request``) consults
+        this AFTER :meth:`find_in_library` finds no ``available``/``completed`` row.
+        A fresh ``LibraryPort.is_available`` reading is eventually-consistent and
+        STALE during the eviction delete window: the sweep commits the row
+        ``evicted`` BEFORE it unlinks the file and BEFORE the post-delete Plex
+        refresh (``eviction_service._evict_one``, ADR-0012 #67), so for that whole
+        window Plex still reports the (doomed / just-removed) file present. Minting
+        a fresh ``available`` row off that stale reading would leave a request
+        marked available with nothing on disk to watch and nothing queued to grab
+        -- the exact race this guards. When this returns ``True`` the caller
+        re-grabs (``pending``) instead of trusting Plex.
+
+        Keyed on the NEWEST NON-``cancelled`` row (``ORDER BY id DESC``) so a
+        movie legitimately re-downloaded after an earlier eviction (whose newest
+        row is ``available`` / active, already resolved by ``find_in_library`` /
+        ``find_active`` before this is ever reached) is never falsely suppressed
+        -- only a media whose most recent history really is an eviction is
+        treated as stale-in-Plex. ``cancelled`` rows are IGNORED outright rather
+        than counted as "newest": a cancellation says nothing about on-disk
+        truth, so an in-window re-grab the user then cancelled (evicted ->
+        pending -> cancelled) must not reset this guard and let the NEXT
+        re-request mint ``available`` off the same stale Plex reading while the
+        sweep is still deleting the file.
+        """
+        stmt = (
+            select(MediaRequest.status)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.status != RequestStatus.cancelled,
+            )
+            .order_by(MediaRequest.id.desc())
+            .limit(1)
+        )
+        status = (await self._session.execute(stmt)).scalars().first()
+        return status == RequestStatus.evicted
+
+    async def list_for_media(
+        self, tmdb_id: int, media_type: str, statuses: frozenset[str]
+    ) -> list[RequestRecord]:
+        """Every request row for ``(tmdb_id, media_type)`` whose status is in
+        ``statuses``, oldest first.
+
+        Backs the eviction restore's re-grab reconciliation (ADR-0012 #67):
+        after a failed/interrupted delete restores the claimed row to
+        ``available``, any in-window re-request for the SAME media that has not
+        yet grabbed anything (``pending``/``searching``/``no_acceptable_release``)
+        is redundant -- the file never left -- and the restore cancels it via a
+        per-row :meth:`set_status_if_in` CAS. A plain read, not itself a CAS: the
+        caller must re-compare on write.
+        """
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.status.in_([RequestStatus(s) for s in statuses]),
+            )
+            .order_by(MediaRequest.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def clear_library_path_if_set(
+        self,
+        request_id: int,
+        *,
+        expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
+    ) -> bool:
+        """Null the eviction breadcrumb ONLY if it is currently set (and, with
+        ``expected_path``, only if it still holds EXACTLY that value; with
+        ``expected_statuses``, only if it is still in one of those statuses);
+        return whether this call actually cleared it.
+
+        The guarded (``WHERE library_path IS NOT NULL``) variant of
+        :meth:`clear_library_path`, for the eviction finalize (ADR-0012 #67):
+        clearing the breadcrumb is what marks a claimed ``evicted`` row as
+        FINALIZED (file gone), and two resume passes racing over the same
+        interrupted eviction use this as their single-winner gate -- only the
+        caller that actually cleared it (``True``) writes the history row, so a
+        concurrent finalize never double-records the same eviction.
+
+        ``expected_path`` makes the clear VALUE-predicated (``AND library_path =
+        expected_path``): the eviction finalize/recovery observes a specific
+        stale path, and must never wipe a FRESH breadcrumb a replacement import
+        stamped onto the row between recovery's stat and this write -- a
+        mismatch means that newer import owns the row now, so the caller leaves
+        it (logged), keeping the row's eviction/report handle intact.
+        """
+        predicates = [MediaRequest.id == request_id, MediaRequest.library_path.is_not(None)]
+        if expected_path is not None:
+            predicates.append(MediaRequest.library_path == expected_path)
+        if expected_statuses is not None:
+            predicates.append(
+                MediaRequest.status.in_([RequestStatus(status) for status in expected_statuses])
+            )
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(*predicates)
+                .values(library_path=None)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def other_row_claims_path(
+        self, library_path: str, *, exclude_request_id: int | None = None
+    ) -> bool:
+        """Whether any (other) request row currently claims ``library_path``.
+
+        The eviction recovery pass's finalized-vs-interrupted discriminator
+        (ADR-0012 #67): a breadcrumb whose exact path another LIVE row also
+        carries belongs to a media that was re-imported in place under a newer
+        request -- restoring the stale row would put two rows over one file, and
+        a later sweep evicting either would delete the path out from under the
+        actual owner. ``evicted``/``cancelled`` rows do not count as claims
+        (their content claim is dead by definition). ``exclude_request_id`` is
+        the row being recovered itself.
+        """
+        predicates = [
+            MediaRequest.library_path == library_path,
+            MediaRequest.status.notin_([RequestStatus.evicted, RequestStatus.cancelled]),
+        ]
+        if exclude_request_id is not None:
+            predicates.append(MediaRequest.id != exclude_request_id)
+        stmt = select(MediaRequest.id).where(*predicates).limit(1)
+        return (await self._session.execute(stmt)).scalars().first() is not None
+
     async def acquire_media_lock(self, tmdb_id: int, media_type: str) -> None:
         """Serialize create-request decisions for one ``(tmdb_id, media_type)``.
 
@@ -356,10 +490,17 @@ class SqlRequestRepository:
         await self._session.flush()
 
     async def set_status_if_in(
-        self, request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_unpinned: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
-        status is in ``allowed_from``. Returns whether a row was actually updated.
+        status is in ``allowed_from`` (and, with ``require_unpinned``, only if the
+        row is not ``keep_forever``-pinned). Returns whether a row was actually
+        updated.
 
         Mirrors ``SqlDownloadRepository.update_status_if_in`` (see its docstring): a
         single ``UPDATE ... WHERE id = ? AND status IN (...)`` lets the DATABASE --
@@ -380,18 +521,31 @@ class SqlRequestRepository:
         (the row already left ``available`` once the winner committed) and must
         skip rather than double-count.
 
+        ``require_unpinned`` (opt-in for the eviction CLAIM, ADR-0012 #67) folds the
+        pin into the compared predicate: ``... AND keep_forever = false``. Because
+        the eviction claim now runs this CAS BEFORE any filesystem delete, a
+        ``keep_forever`` pin that commits after candidate assembly but before the
+        claim makes the UPDATE match zero rows -- the DATABASE, not a read-then-act
+        check, is what refuses to delete a freshly-pinned title. ``keep_forever``
+        lives on the same row as ``status``, so a single UPDATE can compare both
+        atomically (the TV pin lives on the PARENT row and needs a subquery -- see
+        ``SqlSeasonRequestRepository.set_status_if_in``'s ``require_parent_unpinned``).
+
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map
         instance (e.g. from this session's own ``get_fresh`` re-check moments
         earlier) consistent with the DB result, so anything read afterwards in
         THIS session (an eviction sweep never re-reads the row again, but mirrors
         ``update_status_if_in`` for consistency) sees the honest post-CAS status.
         """
+        predicates = [
+            MediaRequest.id == request_id,
+            MediaRequest.status.in_([RequestStatus(s) for s in allowed_from]),
+        ]
+        if require_unpinned:
+            predicates.append(MediaRequest.keep_forever.is_(False))
         stmt = (
             update(MediaRequest)
-            .where(
-                MediaRequest.id == request_id,
-                MediaRequest.status.in_([RequestStatus(s) for s in allowed_from]),
-            )
+            .where(*predicates)
             .values(status=RequestStatus(status))
             .execution_options(synchronize_session="fetch")
         )

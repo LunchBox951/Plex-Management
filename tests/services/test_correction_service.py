@@ -32,6 +32,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.ports.download_client import AddResult
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import correction_service, season_request_service
@@ -73,7 +74,7 @@ class _AddFailsQbittorrent(FakeQbittorrent):
     hands it the replacement release. ``remove`` is inherited (the culprit torrent
     removal earlier in the verb still succeeds)."""
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         raise QbittorrentError("qBittorrent is unreachable")
 
 
@@ -84,9 +85,9 @@ class _EmptyHashQbittorrent(FakeQbittorrent):
     ``grab_service`` surfaces as ``GrabError`` (a LIVE, untracked torrent now exists).
     ``remove`` is inherited (the culprit torrent removal earlier still succeeds)."""
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         self.added.append((magnet_or_url, save_path, category))
-        return ""
+        return AddResult(torrent_hash="", created=True)
 
 
 async def _seed_available_movie(

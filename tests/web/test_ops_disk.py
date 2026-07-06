@@ -119,6 +119,36 @@ async def test_disk_keys_preview_cache_by_media_type_not_just_path(
     assert labels == ["movies_root", "tv_root"]
 
 
+async def test_disk_keys_preview_cache_by_label_so_same_media_type_roots_stay_distinct(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """#97: movies_root and anime_movie_root configured to the SAME directory --
+    the SAME ``media_type`` ("movie"), so a ``media_type:path`` cache key would
+    collide. The cached ``DiskRootItem`` carries the role ``label``, so the second
+    role would be served the FIRST's cached entry -> two 'movies_root' rows and
+    the anime root hidden. Keying by ``label:path`` keeps every configured root's
+    row distinct even when two share a path."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _set_movies_root(sessionmaker_, str(tmp_path))
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("anime_movie_root", str(tmp_path))
+        await session.commit()
+    override_adapters(app, library=FakeLibrary())
+
+    response = await client.get("/api/v1/ops/disk", headers=_HEADERS)
+    rows = [(r["root"], r["path"]) for r in response.json()["roots"]]
+    # Both same-path, same-media_type roles come back as their OWN labeled row --
+    # never one duplicated and the other hidden.
+    assert rows == [
+        ("movies_root", str(tmp_path)),
+        ("anime_movie_root", str(tmp_path)),
+    ]
+
+
 async def test_disk_candidates_empty_when_plex_unconfigured(
     client: httpx.AsyncClient,
     seed: SeedFn,

@@ -26,7 +26,9 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.ports.repositories import SeasonRequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 from tests.web.fakes import FakeLibrary
 
@@ -190,12 +192,18 @@ async def test_ensure_seasons_re_arms_an_evicted_season_to_pending(
     assert show.status is RequestStatus.partially_available
 
 
-async def test_ensure_seasons_re_arms_an_evicted_season_straight_to_available_when_present(
+async def test_ensure_seasons_re_grabs_an_evicted_season_even_when_plex_reports_present(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """The re-arm mirrors a FRESH row's already-in-library short-circuit: if Plex
-    already has the evicted season again, re-requesting goes straight to
-    'available', not 'pending'."""
+    """P1 (ADR-0012 #67): the eviction sweep commits a season 'evicted' BEFORE it
+    unlinks the file and before the post-delete Plex refresh, so Plex's fresh
+    'present' reading is STALE for that whole window. Re-requesting the evicted
+    season must therefore re-grab it ('pending') rather than trust that stale
+    reading and re-arm straight to 'available' over a file the sweep is about to
+    (or just did) delete -- ``ensure_seasons`` subtracts just-evicted seasons
+    (``evicted_seasons``) from the trusted present set. (This deliberately
+    supersedes the old "straight to available when present" fast path, which
+    trusted Plex presence during the exact window this closes.)"""
     show_id = await _make_show(sessionmaker_, tmdb_id=711)
     async with sessionmaker_() as session:
         await season_request_service.ensure_seasons(
@@ -213,9 +221,73 @@ async def test_ensure_seasons_re_arms_an_evicted_season_straight_to_available_wh
         )
         await session.commit()
 
-    assert {(r.season_number, r.status) for r in records} == {(1, "available")}
+    # Re-grabbed, NOT minted 'available' off the stale in-Plex reading.
+    assert {(r.season_number, r.status) for r in records} == {(1, "pending")}
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
+    assert show is not None
+    assert show.status is RequestStatus.pending
+
+
+async def test_ensure_seasons_rearm_loses_cleanly_to_a_concurrent_recovery_restore(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round-6: the evicted-season re-arm is a CAS from exactly the status
+    ``ensure()`` read, never an unconditional write. The eviction recovery can
+    RESTORE the row to 'available' (its file is present -- the interrupted purge
+    never actually deleted anything) between that read and the re-arm write;
+    clobbering the restored row back to 'pending' would queue a duplicate
+    download of on-disk content that recovery (already past) couldn't catch
+    until a whole sweep later. Simulated by making the read stale: the DB row is
+    already 'available' (the committed restore) while ``ensure()`` hands back
+    the pre-restore 'evicted' snapshot. The lost CAS must honor the restore --
+    the row stays 'available', no pending duplicate, and the re-request dedups
+    onto the watchable season exactly like an already-in-Plex one."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=730)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
+        )
+        # The recovery restore's end state: 'available' over a live file.
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        stmt = select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+        season_id = (await session.execute(stmt)).scalars().one().id
+
+    real_ensure = SqlSeasonRequestRepository.ensure
+
+    async def stale_ensure(
+        self: SqlSeasonRequestRepository,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+    ) -> SeasonRequestRecord:
+        record = await real_ensure(self, media_request_id, season_number, status=status)
+        # The stale pre-restore snapshot: this caller read the row as 'evicted'
+        # a moment before the recovery restore committed 'available'.
+        return record.model_copy(update={"status": RequestStatus.evicted.value})
+
+    monkeypatch.setattr(SqlSeasonRequestRepository, "ensure", stale_ensure)
+
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
+        )
+        await session.commit()
+
+    # The lost CAS honored the restore: returned AND persisted 'available',
+    # never clobbered back to a duplicate-downloading 'pending'.
+    assert {(r.season_number, r.status) for r in records} == {(1, "available")}
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available
     assert show is not None
     assert show.status is RequestStatus.available
 
@@ -245,17 +317,20 @@ async def test_ensure_seasons_never_regresses_a_non_evicted_terminal_season(
     assert {(r.season_number, r.status) for r in records} == {(1, "failed")}
 
 
-async def test_ensure_seasons_re_arm_clears_library_path_and_backoff_on_evicted_reuse(
+async def test_ensure_seasons_re_arm_keeps_library_path_but_resets_backoff(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """#75 regression: re-requesting an EVICTED season must not just flip its
-    status back to pending/available -- it must ALSO clear the library_path
-    eviction breadcrumb and reset the search backoff ladder, exactly mirroring
-    ``reset_for_research``'s report-issue re-arm (ADR-0013/ADR-0014). Before the
-    fix, a re-requested evicted season inherited its stale library_path (a
-    later eviction sweep would misread it as still reclaimable) and its stale
-    search_attempts/next_search_at backoff (throttling the operator's brand-new
-    request exactly like a fresh row never would)."""
+    """#117 regression: re-requesting an EVICTED season resets the search backoff
+    ladder (so the operator's fresh request is not throttled by the evicted run's
+    exhausted attempts) but DELIBERATELY KEEPS the ``library_path`` eviction
+    breadcrumb. The re-arm can land while the eviction purge is still in flight
+    (the claim commits 'evicted' + breadcrumb BEFORE the delete), so the file may
+    still be on disk; the breadcrumb is owned end-to-end by the eviction lifecycle
+    (the finalize clears it after a successful delete, a failed-delete restore/fold
+    keeps it). Clearing it here -- as the earlier #75 re-arm did, mirroring
+    report-issue's already-purged ``reset_for_research`` -- would strand a season
+    folded back to 'available' over a still-present file with NO eviction/report
+    handle, so disk pressure could never reclaim it (the leak #117 closes)."""
     show_id = await _make_show(sessionmaker_, tmdb_id=730)
     async with sessionmaker_() as session:
         await season_request_service.ensure_seasons(
@@ -295,7 +370,10 @@ async def test_ensure_seasons_re_arm_clears_library_path_and_backoff_on_evicted_
             SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
         )
         season_row = (await session.execute(stmt)).scalars().one()
-    assert season_row.library_path is None
+    # The breadcrumb is PRESERVED (owned by the eviction lifecycle, not cleared by
+    # the re-arm) so a folded-back or finalized eviction still has a handle ...
+    assert season_row.library_path == "/media/tv/Some Show/Season 01"
+    # ... while the search backoff ladder IS reset for the operator's fresh request.
     assert season_row.search_attempts == 0
     assert season_row.next_search_at is None
 
@@ -1216,7 +1294,7 @@ async def test_ensure_seasons_evicted_re_arm_preserves_stamp_backed_by_done_sibl
         assert show.completed_at == first_stamp
 
 
-async def test_evicted_re_arm_to_available_does_not_resurrect_stamp_via_stale_download(
+async def test_evicted_re_arm_to_pending_does_not_resurrect_stamp_via_stale_download(
     sessionmaker_: SessionMaker,
 ) -> None:
     """Codex round-3: eviction never touches the old ``Download`` row, so its
@@ -1311,20 +1389,41 @@ async def test_evicted_re_arm_to_available_does_not_resurrect_stamp_via_stale_do
         await session.commit()
     assert changed is True
 
-    # Re-request S1 while Plex STILL reports it present: re-armed straight to
-    # 'available' (breadcrumb cleared) -- yet the stale pre-eviction download must
-    # NOT back the old stamp, so the heal clears it.
+    # Re-request S1 while Plex STILL reports it present: PR 117 deliberately
+    # subtracts just-evicted seasons from trusted Plex presence, so this re-arms to
+    # 'pending' (backoff reset; the eviction breadcrumb is deliberately PRESERVED
+    # -- owned by the eviction lifecycle, #117) instead of trusting a stale
+    # in-library reading. The stale pre-eviction download must NOT back the old
+    # stamp, so the heal clears it.
     library = FakeLibrary(available_tv_seasons={736: frozenset({1})})
     async with sessionmaker_() as session:
         records = await season_request_service.ensure_seasons(
             session, library, media_request_id=show_id, tmdb_id=736, seasons=[1]
         )
         await session.commit()
-    assert [(r.season_number, r.status) for r in records] == [(1, "available")]
+    assert [(r.season_number, r.status) for r in records] == [(1, "pending")]
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
         assert show is not None
         assert show.completed_at is None  # nothing current supports the old stamp
+        season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == show_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+    # The breadcrumb is preserved through the re-arm (#117): this test's eviction
+    # never ran the finalize clear, so the row is still 'evicted' + breadcrumb, and
+    # the re-arm no longer strips it -- the eviction lifecycle owns that clear.
+    assert season.library_path == "/media/tv/Some Show/Season 01"
+    assert season.search_attempts == 0
+    assert season.next_search_at is None
 
 
 async def test_reimport_after_eviction_restores_download_evidence(

@@ -2748,6 +2748,11 @@
         "in": "header",
         "name": "X-Api-Key",
         "type": "apiKey"
+      },
+      "CSRFHeader": {
+        "in": "header",
+        "name": "X-CSRF-Token",
+        "type": "apiKey"
       }
     }
   },
@@ -2771,7 +2776,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Logout Endpoint",
@@ -2964,7 +2970,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Delete Blocklist",
@@ -3191,7 +3198,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Evict Endpoint",
@@ -3636,7 +3644,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Grab Endpoint",
@@ -3707,7 +3716,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Import Endpoint",
@@ -3798,7 +3808,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Mark Failed Endpoint",
@@ -3906,7 +3917,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Create Request Endpoint",
@@ -4018,7 +4030,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Cancel Request Endpoint",
@@ -4079,7 +4092,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Keep Forever Endpoint",
@@ -4140,7 +4154,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Report Issue Endpoint",
@@ -4207,7 +4222,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Search Preview Endpoint",
@@ -4325,7 +4341,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Put Settings Endpoint",
@@ -4348,7 +4365,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Revoke App Key Endpoint",
@@ -4406,7 +4424,8 @@
             "APIKeyHeader": []
           },
           {
-            "APIKeyCookie": []
+            "APIKeyCookie": [],
+            "CSRFHeader": []
           }
         ],
         "summary": "Rotate App Key Endpoint",

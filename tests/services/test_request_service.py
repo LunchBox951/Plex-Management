@@ -17,7 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex import PlexLibrary
 from plex_manager.adapters.plex.library import PlexLibraryError, reset_caches
-from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest, User
+from plex_manager.models import (
+    MediaRequest,
+    MediaType,
+    RequestDedupLock,
+    RequestStatus,
+    SeasonRequest,
+    User,
+)
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -425,6 +432,414 @@ async def test_create_request_after_eviction_creates_a_fresh_request(
     assert statuses == ["evicted", "pending"]  # both rows survive, independently
 
 
+async def test_create_request_after_eviction_re_grabs_when_plex_still_reports_present(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 (ADR-0012 #67): the eviction sweep commits a movie 'evicted' BEFORE it
+    unlinks the file and BEFORE the post-delete Plex refresh, so for that whole
+    window Plex still reports the (doomed) file present. A re-request in that
+    window must NOT trust the stale in-library reading and mint a fresh 'available'
+    row -- the sweep is about to delete the file, leaving it marked available with
+    nothing to download. It must re-grab ('pending') instead."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=602,
+            media_type=MediaType.movie,
+            title="Evicted Movie",
+            status=RequestStatus.evicted,
+        )
+        session.add(evicted)
+        await session.commit()
+        evicted_id = evicted.id
+
+    tmdb = FakeTmdb(movies={602: MovieMetadata(tmdb_id=602, title="Evicted Movie", year=2019)})
+    # Plex STILL reports the file present -- exactly the eviction delete window.
+    library = FakeLibrary(available={602})
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=602, media_type="movie", library=library
+        )
+
+    assert fresh.id != evicted_id
+    # Re-grabbed, NOT minted 'available' over the file the sweep is deleting.
+    assert fresh.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 602)))
+            .scalars()
+            .all()
+        )
+    statuses = sorted(r.status.value for r in rows)
+    assert statuses == ["evicted", "pending"]  # never a second 'available' row
+
+
+async def test_create_request_after_whole_show_eviction_re_grabs_when_plex_stale(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV analogue of the movie P1: a wholly-evicted show (rollup 'evicted', so
+    ``find_active`` misses it) re-requested while Plex still lists its seasons must
+    create a FRESH request whose seasons re-grab ('pending'), never seasons minted
+    'available' over files the sweep is deleting -- ``ensure_seasons`` subtracts the
+    just-evicted seasons from the trusted Plex-present set."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=615,
+            media_type=MediaType.tv,
+            title="Evicted Show",
+            status=RequestStatus.evicted,
+        )
+        session.add(show)
+        await session.flush()
+        session.add_all(
+            [
+                SeasonRequest(
+                    media_request_id=show.id, season_number=n, status=RequestStatus.evicted
+                )
+                for n in (1, 2)
+            ]
+        )
+        await session.commit()
+        old_id = show.id
+
+    tmdb = FakeTmdb(
+        shows={615: TvMetadata(tmdb_id=615, title="Evicted Show", year=2020, season_count=2)}
+    )
+    # Plex STILL lists both seasons -- the eviction delete window.
+    library = FakeLibrary(available_tv_seasons={615: frozenset({1, 2})})
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=615, media_type="tv", seasons=[1, 2], library=library
+        )
+
+    assert fresh.id != old_id
+    # The fresh show's seasons re-grab, so its rollup is 'pending' -- never a
+    # dishonest 'available'/'partially_available' over the doomed files.
+    assert fresh.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == fresh.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert {r.season_number: r.status.value for r in rows} == {1: "pending", 2: "pending"}
+
+
+async def test_create_request_never_returns_a_stale_leftover_available_row_in_the_window(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-3 finding 4 (guard ordering): a media can carry an OLDER stale
+    'available' row alongside the just-evicted one (the removed-then-reacquired
+    pattern keeps BOTH available rows; the sweep claims only the one it evicts).
+    find_in_library would return that leftover BEFORE the evicted-guard ran,
+    handing back an in-library answer for content the sweep is deleting. The
+    guard must gate every path that answers 'available' off Plex presence: the
+    re-request must land as a fresh 'pending' re-grab, not the stale row."""
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=660,
+            media_type=MediaType.movie,
+            title="Leftover",
+            status=RequestStatus.available,  # the old remove-then-reacquire leftover
+        )
+        session.add(stale)
+        await session.flush()  # stale gets the lower id
+        evicted = MediaRequest(
+            tmdb_id=660,
+            media_type=MediaType.movie,
+            title="Leftover",
+            status=RequestStatus.evicted,  # the just-claimed eviction (newest row)
+        )
+        session.add(evicted)
+        await session.commit()
+        stale_id = stale.id
+
+    tmdb = FakeTmdb(movies={660: MovieMetadata(tmdb_id=660, title="Leftover", year=2018)})
+    library = FakeLibrary(available={660})  # Plex STILL lists the doomed file
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=660, media_type="movie", library=library
+        )
+
+    assert fresh.id != stale_id  # the stale leftover row is NOT handed back
+    assert fresh.status == RequestStatus.pending.value  # a real re-grab
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 660)))
+            .scalars()
+            .all()
+        )
+    assert sorted(r.status.value for r in rows) == ["available", "evicted", "pending"]
+
+
+async def test_create_request_tv_skips_in_library_dedup_for_just_evicted_seasons(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV analogue of the guard-ordering fix: an older stale 'available' show
+    row exists while the newest row's season was just claimed 'evicted' (the
+    delete window). The in-library dedup's Plex-present superset check must
+    subtract just-evicted seasons FIRST -- otherwise it dedups onto the stale row
+    and answers in-library for a season the sweep is deleting. The re-request
+    must instead create a fresh tracked request whose season re-grabs."""
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=661,
+            media_type=MediaType.tv,
+            title="Leftover Show",
+            status=RequestStatus.available,  # the stale leftover
+        )
+        session.add(stale)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=stale.id, season_number=1, status=RequestStatus.available
+            )
+        )
+        evicted = MediaRequest(
+            tmdb_id=661,
+            media_type=MediaType.tv,
+            title="Leftover Show",
+            status=RequestStatus.evicted,  # the just-claimed eviction (newest)
+        )
+        session.add(evicted)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=evicted.id, season_number=1, status=RequestStatus.evicted
+            )
+        )
+        await session.commit()
+        stale_id = stale.id
+
+    tmdb = FakeTmdb(
+        shows={661: TvMetadata(tmdb_id=661, title="Leftover Show", year=2019, season_count=1)}
+    )
+    library = FakeLibrary(available_tv_seasons={661: frozenset({1})})  # Plex still lists it
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=661, media_type="tv", seasons=[1], library=library
+        )
+
+    assert fresh.id != stale_id  # never deduped onto the stale leftover
+    assert fresh.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == fresh.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert {r.season_number: r.status.value for r in rows} == {1: "pending"}  # re-grabs
+
+
+async def test_create_request_tv_dedups_onto_concurrent_regrab_under_the_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-4 finding 3: the TV twin of the movie under-lock re-read. A second
+    TV re-request commits an active 'pending' re-grab between this caller's
+    top-of-function find_active and the in-library dedup; evicted_seasons (newest
+    non-cancelled row per season) then sees that PENDING row, subtracts nothing,
+    and -- without the under-lock re-read -- the superset check dedups onto an
+    OLDER stale 'available' row for the season the sweep is deleting. The racing
+    request must dedup onto the pending re-grab instead."""
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=670,
+            media_type=MediaType.tv,
+            title="Raced Show",
+            status=RequestStatus.available,  # the stale leftover
+        )
+        session.add(stale)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=stale.id, season_number=1, status=RequestStatus.available
+            )
+        )
+        evicted = MediaRequest(
+            tmdb_id=670,
+            media_type=MediaType.tv,
+            title="Raced Show",
+            status=RequestStatus.evicted,  # the claim window
+        )
+        session.add(evicted)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=evicted.id, season_number=1, status=RequestStatus.evicted
+            )
+        )
+        # The CONCURRENT re-request's already-committed pending re-grab (newest).
+        regrab = MediaRequest(
+            tmdb_id=670,
+            media_type=MediaType.tv,
+            title="Raced Show",
+            status=RequestStatus.pending,
+        )
+        session.add(regrab)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=regrab.id, season_number=1, status=RequestStatus.pending)
+        )
+        await session.commit()
+        stale_id, regrab_id = stale.id, regrab.id
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        # The top-of-function check misses the concurrent re-grab (not yet
+        # visible to this transaction); the UNDER-LOCK re-read sees it.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(
+        shows={670: TvMetadata(tmdb_id=670, title="Raced Show", year=2020, season_count=1)}
+    )
+    library = FakeLibrary(available_tv_seasons={670: frozenset({1})})  # Plex still lists it
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session, tmdb, tmdb_id=670, media_type="tv", seasons=[1], library=library
+        )
+
+    assert result.id == regrab_id  # deduped onto the concurrent re-grab...
+    assert result.id != stale_id  # ...never the stale leftover 'available' row
+    assert result.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 670)))
+            .scalars()
+            .all()
+        )
+    # No fourth row minted -- and no 'available' answer for the doomed season.
+    assert sorted(r.status.value for r in rows) == ["available", "evicted", "pending"]
+
+
+async def test_create_request_after_cancelled_in_window_regrab_still_re_grabs(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 finding 2: evicted -> in-window re-grab ('pending', per the
+    guard) -> user CANCELS the re-grab -> newest row is now 'cancelled'. The next
+    re-request in the still-open delete window must STILL re-grab ('pending') --
+    the guard keys on the newest NON-cancelled row (still the eviction), because
+    a cancellation says nothing about on-disk truth. Before the fix, the
+    cancelled row reset the guard and this request minted 'available' over the
+    file the sweep was deleting."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=640,
+            media_type=MediaType.movie,
+            title="Doomed Twice",
+            status=RequestStatus.evicted,
+        )
+        cancelled = MediaRequest(
+            tmdb_id=640,
+            media_type=MediaType.movie,
+            title="Doomed Twice",
+            status=RequestStatus.cancelled,
+        )
+        session.add(evicted)
+        await session.flush()  # evicted gets the lower id
+        session.add(cancelled)
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={640: MovieMetadata(tmdb_id=640, title="Doomed Twice", year=2021)})
+    library = FakeLibrary(available={640})  # Plex STILL lists the doomed file
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=640, media_type="movie", library=library
+        )
+
+    assert fresh.status == RequestStatus.pending.value  # re-grabbed, never 'available'
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 640)))
+            .scalars()
+            .all()
+        )
+    assert sorted(r.status.value for r in rows) == ["cancelled", "evicted", "pending"]
+
+
+async def test_create_request_dedups_onto_concurrent_regrab_in_eviction_window(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adversarial concurrency for the movie eviction re-request guard: two
+    re-requests race in the delete window. The first mints a 'pending' re-grab; the
+    second's top-level find_active (before it wins the media lock) misses it, so it
+    reaches the in-library branch. It must dedup onto the concurrent re-grab via the
+    UNDER-LOCK find_active re-read -- NOT mint 'available' over the doomed file just
+    because the newest row is now that 'pending' one (which find_in_library, which
+    matches only available/completed, would not catch)."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=630,
+            media_type=MediaType.movie,
+            title="Doomed",
+            status=RequestStatus.evicted,
+        )
+        session.add(evicted)
+        await session.flush()
+        # A concurrent re-request's already-committed 'pending' re-grab (newest row).
+        regrab = MediaRequest(
+            tmdb_id=630,
+            media_type=MediaType.movie,
+            title="Doomed",
+            status=RequestStatus.pending,
+        )
+        session.add(regrab)
+        await session.commit()
+        regrab_id = regrab.id
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        # The top-level check (call 1) misses the concurrent 'pending' row, as it
+        # would when that row is not yet visible to this transaction; the under-lock
+        # re-read (call 2) sees the committed re-grab and dedups onto it.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(movies={630: MovieMetadata(tmdb_id=630, title="Doomed", year=2020)})
+    library = FakeLibrary(available={630})  # Plex STILL lists the doomed file
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session, tmdb, tmdb_id=630, media_type="movie", library=library
+        )
+
+    assert result.id == regrab_id  # deduped onto the concurrent re-grab
+    assert result.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 630)))
+            .scalars()
+            .all()
+        )
+    # No third row -- and crucially no 'available' row minted over the doomed file.
+    assert sorted(r.status.value for r in rows) == ["evicted", "pending"]
+
+
 async def _season_numbers(sm: SessionMaker, media_request_id: int) -> set[int]:
     async with sm() as session:
         rows = (
@@ -757,6 +1172,51 @@ async def test_set_keep_forever_missing_request_returns_none(
             session=session, request_id=999999, keep_forever=True
         )
     assert result is None
+
+
+async def test_create_request_tv_mixed_fall_through_releases_the_media_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-7 finding 1: the mixed present/missing-season fall-through (the
+    superset check fails) must release the media lock BEFORE proceeding to the
+    create path, whose ensure_seasons performs its own Plex crawl -- the same
+    discipline as the two dedup branches. Observable through the lock row
+    itself: the release rolls back the RequestDedupLock insert, so the create's
+    later commit persists NO lock row; without the release, the lock
+    acquisition would ride along into that commit (after having held the write
+    transaction across the crawl)."""
+    tmdb = FakeTmdb(
+        shows={690: TvMetadata(tmdb_id=690, title="Mixed Show", year=2021, season_count=2)}
+    )
+    # Season 1 present in Plex, season 2 missing -> present={1} acquires the
+    # lock, superset([1, 2]) fails -> the fall-through creates a fresh request.
+    library = FakeLibrary(available_tv_seasons={690: frozenset({1})})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=690, media_type="tv", seasons=[1, 2], library=library
+        )
+
+    # The fall-through create still works exactly as before...
+    assert record.status == RequestStatus.partially_available.value
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        locks = (
+            (await session.execute(select(RequestDedupLock).where(RequestDedupLock.tmdb_id == 690)))
+            .scalars()
+            .all()
+        )
+    assert {s.season_number: s.status.value for s in seasons} == {1: "available", 2: "pending"}
+    # ...and the lock acquisition was rolled back before the create, so it never
+    # rode into the final commit (the write transaction did not span the crawl).
+    assert locks == []
 
 
 # --------------------------------------------------------------------------- #

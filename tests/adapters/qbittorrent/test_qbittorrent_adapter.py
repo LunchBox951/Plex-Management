@@ -130,14 +130,18 @@ def _client(
 
 async def test_add_magnet_returns_derived_hash() -> None:
     client = _client()
-    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
-    assert info_hash == MAGNET_HASH
+    result = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert result.torrent_hash == MAGNET_HASH
+    assert result.created is True  # a genuine new add -- the grab owns it
 
 
 async def test_add_409_already_present_is_success() -> None:
     client = _client(_router(add_status=409))
-    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
-    assert info_hash == MAGNET_HASH
+    result = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert result.torrent_hash == MAGNET_HASH
+    # The honest already-present signal: the torrent PREDATES this call, so a
+    # lost-grab cleanup must never remove it with delete_files (round 8).
+    assert result.created is False
 
 
 async def test_login_failure_raises_auth_error() -> None:
@@ -343,7 +347,9 @@ async def test_add_torrent_file_url_computes_bencode_hash() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    info_hash = (
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    ).torrent_hash
     assert info_hash == _TORRENT_HASH
 
 
@@ -359,7 +365,9 @@ async def test_add_torrent_file_hashes_top_level_info_dict() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    info_hash = (
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    ).torrent_hash
     assert info_hash == _TORRENT_HASH
     assert info_hash != hashlib.sha1(_FAKE_INFO_DICT).hexdigest()  # noqa: S324
 
@@ -374,7 +382,9 @@ async def test_add_http_redirect_to_magnet_is_followed() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    info_hash = await _client(handler).add(REDIRECT_URL, "/downloads", "plex-manager")
+    info_hash = (
+        await _client(handler).add(REDIRECT_URL, "/downloads", "plex-manager")
+    ).torrent_hash
     assert info_hash == REDIRECT_HASH
 
 
@@ -606,7 +616,7 @@ async def test_add_torrent_from_configured_prowlarr_private_origin_is_allowed() 
         return httpx.Response(404)
 
     client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
-    info_hash = await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")
+    info_hash = (await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")).torrent_hash
 
     assert info_hash == _TORRENT_HASH
     assert any(url.endswith("/api/v2/torrents/add") for url in seen)
@@ -723,7 +733,7 @@ async def test_malformed_trusted_origin_degrades_to_closed_veto(
     assert any("not a usable trusted source origin" in record.message for record in caplog.records)
 
     # Client healthy: a normal magnet add works.
-    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    info_hash = (await client.add(MAGNET, "/downloads/movies", "plex-manager")).torrent_hash
     assert info_hash == MAGNET_HASH
 
     # Veto fully closed: private source URLs are still rejected (no accidental
@@ -1069,14 +1079,18 @@ async def test_add_base32_btih_magnet_normalizes_to_hex() -> None:
     assert len(b32) == 32  # base32 of 20 bytes is 32 chars
     base32_magnet = f"magnet:?xt=urn:btih:{b32}&dn=Test"
 
-    info_hash = await _client().add(base32_magnet, "/downloads/movies", "plex-manager")
+    info_hash = (
+        await _client().add(base32_magnet, "/downloads/movies", "plex-manager")
+    ).torrent_hash
     assert info_hash == MAGNET_HASH  # decoded to lowercase hex
 
 
 async def test_add_hex_btih_magnet_is_lowercased_as_is() -> None:
     """The 40-char hex form is left as-is (lowercased), not mangled."""
     upper_magnet = f"magnet:?xt=urn:btih:{MAGNET_HASH.upper()}&dn=Test"
-    info_hash = await _client().add(upper_magnet, "/downloads/movies", "plex-manager")
+    info_hash = (
+        await _client().add(upper_magnet, "/downloads/movies", "plex-manager")
+    ).torrent_hash
     assert info_hash == MAGNET_HASH
 
 

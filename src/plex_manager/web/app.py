@@ -47,6 +47,7 @@ from plex_manager.services.health_service import (
     read_disk_usage,
 )
 from plex_manager.web.deps import (
+    CSRF_HEADER_NAME,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
@@ -545,30 +546,17 @@ async def _eviction_tick(app: FastAPI) -> float:
                             root,
                         )
 
-            evicted = await eviction_service.run_eviction_sweep(
-                session=session,
-                library=library,
-                fs=fs,
-                media_type=media_type,
-                root_path=root,
-                all_roots=all_roots,
-                threshold_pct=threshold_pct,
-                target_pct=target_pct,
-                grace_days=grace_days,
-            )
-            if evicted:
-                _logger.info(
-                    "evicted %d %s title(s) from %s under disk pressure",
-                    len(evicted),
-                    media_type,
-                    root,
-                )
-            if proactive_enabled:
-                # A SEPARATE pass, never gated on the pressure sweep above having
-                # fired: opting in means "also clear past-grace watched content
-                # regardless of usage". Candidates the pressure sweep already
-                # evicted are naturally absent here (no longer `available`).
-                proactive_evicted = await eviction_service.run_eviction_sweep(
+            # Wrapped in its OWN try/except + guarded rollback, exactly like the
+            # telemetry sweep above (and for the same reason): every root shares
+            # THIS tick's single session, so a SQLAlchemy failure mid-sweep leaves
+            # that session in a poisoned (aborted) transaction. Without the
+            # rollback the NEXT root's sweep -- and the proactive pass just below
+            # -- would then raise too, so ONE root's failure would silently skip
+            # every remaining root this tick. Roll back to a clean state before
+            # continuing; the rollback is itself guarded so even a broken session
+            # is logged, never masked.
+            try:
+                evicted = await eviction_service.run_eviction_sweep(
                     session=session,
                     library=library,
                     fs=fs,
@@ -578,15 +566,75 @@ async def _eviction_tick(app: FastAPI) -> float:
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,
-                    proactive=True,
                 )
-                if proactive_evicted:
-                    _logger.info(
-                        "proactively evicted %d %s title(s) from %s (past grace)",
-                        len(proactive_evicted),
+            except Exception:
+                _logger.exception(
+                    "eviction sweep failed for %s root %s; continuing with remaining roots",
+                    media_type,
+                    root,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    _logger.exception(
+                        "rollback after a failed eviction sweep for %s root %s "
+                        "also failed; continuing",
                         media_type,
                         root,
                     )
+            else:
+                if evicted:
+                    _logger.info(
+                        "evicted %d %s title(s) from %s under disk pressure",
+                        len(evicted),
+                        media_type,
+                        root,
+                    )
+            if proactive_enabled:
+                # A SEPARATE pass, never gated on the pressure sweep above having
+                # fired: opting in means "also clear past-grace watched content
+                # regardless of usage". Candidates the pressure sweep already
+                # evicted are naturally absent here (no longer `available`). Same
+                # guarded-rollback wrapper as the pressure sweep above -- a
+                # proactive-pass failure on one root must not poison the shared
+                # session for the next root either.
+                try:
+                    proactive_evicted = await eviction_service.run_eviction_sweep(
+                        session=session,
+                        library=library,
+                        fs=fs,
+                        media_type=media_type,
+                        root_path=root,
+                        all_roots=all_roots,
+                        threshold_pct=threshold_pct,
+                        target_pct=target_pct,
+                        grace_days=grace_days,
+                        proactive=True,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "proactive eviction sweep failed for %s root %s; "
+                        "continuing with remaining roots",
+                        media_type,
+                        root,
+                    )
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        _logger.exception(
+                            "rollback after a failed proactive eviction sweep for "
+                            "%s root %s also failed; continuing",
+                            media_type,
+                            root,
+                        )
+                else:
+                    if proactive_evicted:
+                        _logger.info(
+                            "proactively evicted %d %s title(s) from %s (past grace)",
+                            len(proactive_evicted),
+                            media_type,
+                            root,
+                        )
     return interval_minutes * 60.0
 
 
@@ -735,8 +783,10 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
     dishonest: a client generated from it would believe cookie auth does not exist
     and that ``/auth/logout`` needs an api key. This wraps ``app.openapi`` to add the
     ``APIKeyCookie`` scheme and rewrite each api-key-secured operation's requirement
-    to the honest OR (``[{APIKeyHeader}, {APIKeyCookie}]``) — a *list* of
-    alternatives, not a single object (which OpenAPI reads as AND / both-required).
+    to the honest OR. Safe methods accept either credential. Unsafe methods accept
+    either the ``X-Api-Key`` header OR the browser session cookie together with the
+    double-submit ``X-CSRF-Token`` header; a single security requirement object is
+    OpenAPI's AND, while the list is OR.
     """
     default_openapi = app.openapi
     api_key_only: list[dict[str, list[str]]] = [{"APIKeyHeader": []}]
@@ -744,27 +794,47 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
         {"APIKeyHeader": []},
         {"APIKeyCookie": []},
     ]
+    api_key_or_cookie_with_csrf: list[dict[str, list[str]]] = [
+        {"APIKeyHeader": []},
+        {"APIKeyCookie": [], "CSRFHeader": []},
+    ]
+    unsafe_methods = {"post", "put", "patch", "delete"}
 
     def openapi_with_cookie() -> dict[str, Any]:
         schema = default_openapi()
         components: dict[str, Any] = schema.get("components", {})
         schemes: dict[str, Any] | None = components.get("securitySchemes")
-        if schemes is None or "APIKeyCookie" in schemes:
+        if schemes is None:
             return schema
-        schemes["APIKeyCookie"] = {
-            "type": "apiKey",
-            "in": "cookie",
-            "name": SESSION_COOKIE_NAME,
-        }
+        schemes.setdefault(
+            "APIKeyCookie",
+            {
+                "type": "apiKey",
+                "in": "cookie",
+                "name": SESSION_COOKIE_NAME,
+            },
+        )
+        schemes.setdefault(
+            "CSRFHeader",
+            {
+                "type": "apiKey",
+                "in": "header",
+                "name": CSRF_HEADER_NAME,
+            },
+        )
         paths: dict[str, Any] = schema.get("paths", {})
         for path_item in paths.values():
             operations: dict[str, Any] = path_item
-            for value in operations.values():
+            for method, value in operations.items():
                 if not isinstance(value, dict):
                     continue
                 operation = cast(dict[str, Any], value)
                 if operation.get("security") == api_key_only:
-                    operation["security"] = api_key_or_cookie
+                    operation["security"] = (
+                        api_key_or_cookie_with_csrf
+                        if method in unsafe_methods
+                        else api_key_or_cookie
+                    )
         return schema
 
     app.openapi = openapi_with_cookie

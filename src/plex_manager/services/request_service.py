@@ -18,6 +18,7 @@ from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.logsafe import safe_int
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
@@ -587,27 +588,69 @@ async def create_request_result(
         # terminal row. A movie REMOVED from Plex reads not-available above and falls
         # through to a normal pending request, so re-requests still work.
         await repo.acquire_media_lock(tmdb_id, media_type)
-        in_library = await repo.find_in_library(
-            tmdb_id, media_type, prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin)
-        )
-        if in_library is not None:
-            # Issue #58: same ownership decision as the find_active dedup above —
-            # a terminal in-library row owned by ANOTHER user must not be handed to
-            # a non-admin (their list/get hide it: a success that instantly vanishes).
-            # The owner-preference lookup already picked the caller's OWN row (or an
-            # ownerless claimable one) over a foreign row when several terminal rows
-            # exist, so this rejection now fires only when EVERY candidate is foreign.
-            if _owned_by_another_user(in_library, user_id, actor_is_admin):
+        # Re-read the ACTIVE row UNDER the lock: our find_active at the top ran
+        # before the lock, so a concurrent re-request for the same just-evicted
+        # movie may have committed an active 'pending' re-grab in the meantime (the
+        # evicted-guard branch below mints exactly that, which find_in_library --
+        # available/completed only -- would NOT catch). Dedup onto it so two racing
+        # re-requests in the eviction delete window never leave a second row, and in
+        # particular never let the LATER one mint 'available' over the doomed file
+        # just because the newest row is now that concurrent 'pending' one.
+        existing_active = await repo.find_active(tmdb_id, media_type)
+        if existing_active is not None:
+            if _owned_by_another_user(existing_active, user_id, actor_is_admin):
                 raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
-            # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
-            # must be adopted for this requester, exactly like the active-dedup path
-            # above — else the shared user gets a success for a row their own
-            # per-user list/get then hide (issue #58's silent-vanish).
-            in_library = await _claim_dedup_winner_if_unowned(
-                session, repo, in_library, user_id, actor_is_admin
+            existing_active = await _claim_dedup_winner_if_unowned(
+                session, repo, existing_active, user_id, actor_is_admin
             )
-            return CreateRequestResult(record=in_library, created=False)
-        initial_status = RequestStatus.available.value
+            return CreateRequestResult(record=existing_active, created=False)
+        if await repo.latest_request_evicted(tmdb_id, media_type):
+            # The disk-pressure sweep (ADR-0012) most recently reclaimed this
+            # movie's file: the row is 'evicted' and either mid-delete or awaiting
+            # the post-delete Plex refresh, so Plex's fresh 'present' reading is
+            # STALE. Trusting it would mint an 'available' row over a file the sweep
+            # is about to (or just did) delete -- leaving a fresh request marked
+            # available with nothing on disk and nothing queued to grab (the P1 this
+            # closes). Checked BEFORE the find_in_library return below, not after:
+            # a media can carry an OLDER stale 'available' row alongside the
+            # just-evicted one (the removed-then-reacquired leftover keeps BOTH
+            # available rows; the sweep claims only the one it evicts), and
+            # returning that leftover here would hand back an in-library answer
+            # for content the sweep is deleting -- bypassing this guard entirely.
+            # The guard must gate EVERY path that can answer 'available' off Plex
+            # presence. Fall through to a normal 'pending' re-grab instead:
+            # honesty over silence, and symmetric with the eviction crash-recovery
+            # self-heal (``eviction_service``: "a re-request re-grabs it fresh").
+            _logger.info(
+                "movie reads in-Plex but its most-recent request is 'evicted'; "
+                "re-grabbing rather than trusting a stale in-library reading during "
+                "the eviction delete window",
+                extra={"tmdb_id": safe_int(tmdb_id)},
+            )
+        else:
+            in_library = await repo.find_in_library(
+                tmdb_id,
+                media_type,
+                prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin),
+            )
+            if in_library is not None:
+                # Issue #58: same ownership decision as the find_active dedup above -
+                # a terminal in-library row owned by ANOTHER user must not be handed to
+                # a non-admin (their list/get hide it: a success that instantly vanishes).
+                # The owner-preference lookup already picked the caller's OWN row (or an
+                # ownerless claimable one) over a foreign row when several terminal rows
+                # exist, so this rejection now fires only when EVERY candidate is foreign.
+                if _owned_by_another_user(in_library, user_id, actor_is_admin):
+                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
+                # must be adopted for this requester, exactly like the active-dedup path
+                # above - else the shared user gets a success for a row their own
+                # per-user list/get then hide (issue #58's silent-vanish).
+                in_library = await _claim_dedup_winner_if_unowned(
+                    session, repo, in_library, user_id, actor_is_admin
+                )
+                return CreateRequestResult(record=in_library, created=False)
+            initial_status = RequestStatus.available.value
 
     if media_type == "tv" and library is not None and season_numbers:
         # TV in-library dedup — the per-season analogue of the movie short-circuit
@@ -619,7 +662,57 @@ async def create_request_result(
         # the movie collapse below is movie-only, so nothing else would catch the
         # duplicate. A show with a NEW (not-yet-present) season falls through to a
         # normal tracked request so the missing season is still searched/grabbed.
+        #
+        # The Plex-present set is TRUSTED only after subtracting just-evicted
+        # seasons (the TV twin of the movie guard ordering above): during the
+        # eviction delete window Plex still lists a season the sweep is deleting,
+        # and an OLDER stale available request row can exist for this show -- the
+        # unsubtracted superset check would dedup onto it and answer in-library
+        # for content that is being removed. A season named here that was just
+        # evicted therefore falls through to a normal tracked request instead
+        # (mirrors ``ensure_seasons``'s own subtraction, which then also steers
+        # the season to 'pending').
         present = await _present_seasons_or_empty(library, tmdb_id)
+        media_locked = bool(present)
+        if present:
+            # Serialize + RE-READ the active row under the per-media lock -- the
+            # TV twin of the movie path's under-lock re-read above. A second TV
+            # re-request can commit an active 'pending' re-grab between the
+            # top-of-function find_active and here; ``evicted_seasons`` (keyed on
+            # the newest non-cancelled row per season) then sees that newer
+            # PENDING row, subtracts nothing, and the superset check below would
+            # dedup onto an OLDER stale 'available' row -- answering in-library
+            # for a season the sweep is deleting. The lock is taken only AFTER
+            # the Plex crawl above (never hold the write transaction open across
+            # network I/O; the movie path orders its Plex check the same way).
+            await repo.acquire_media_lock(tmdb_id, media_type)
+            existing_active = await repo.find_active(tmdb_id, media_type)
+            if existing_active is not None:
+                if _owned_by_another_user(existing_active, user_id, actor_is_admin):
+                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                existing_active = await _claim_dedup_winner_if_unowned(
+                    session, repo, existing_active, user_id, actor_is_admin
+                )
+                # Dedup onto the concurrent re-grab, mirroring the top-of-function
+                # dedup path (grow its tracked season set, re-read past the
+                # rollup). Release the media lock FIRST: ensure_seasons crawls
+                # Plex, and the lock's write transaction must not stay open
+                # across that network call (the rollback discards only the lock
+                # acquisition -- nothing else is pending in this session here).
+                await session.rollback()
+                await season_request_service.ensure_seasons(
+                    session,
+                    library,
+                    media_request_id=existing_active.id,
+                    tmdb_id=tmdb_id,
+                    seasons=season_numbers,
+                )
+                await session.commit()
+                return CreateRequestResult(
+                    record=await repo.get(existing_active.id) or existing_active,
+                    created=False,
+                )
+            present = present - await SqlSeasonRequestRepository(session).evicted_seasons(tmdb_id)
         if present.issuperset(season_numbers):
             in_library = await repo.find_in_library(
                 tmdb_id,
@@ -627,7 +720,7 @@ async def create_request_result(
                 prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin),
             )
             if in_library is not None:
-                # Issue #58: same ownership decision as the movie short-circuit —
+                # Issue #58: same ownership decision as the movie short-circuit -
                 # rejected BEFORE ensure_seasons, so another user's terminal request
                 # is never grown with this caller's seasons nor returned to them.
                 # As in the movie path, the owner-preference lookup means a foreign
@@ -636,11 +729,21 @@ async def create_request_result(
                     raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
                 # Adopt an OWNERLESS in-library row for this requester before growing
                 # + returning it, mirroring the movie short-circuit and the active
-                # dedup path — else the shared user's own per-user filter hides the
+                # dedup path - else the shared user's own per-user filter hides the
                 # very row this returns (issue #58's silent-vanish).
                 in_library = await _claim_dedup_winner_if_unowned(
                     session, repo, in_library, user_id, actor_is_admin
                 )
+                # Release the media lock BEFORE ensure_seasons -- the same
+                # discipline as the existing_active branch above: ensure_seasons
+                # crawls Plex, and the lock's write transaction (SQLite:
+                # single-writer) must never stay open across a network call,
+                # stalling every unrelated writer for the duration of a slow
+                # Plex response. Only the lock acquisition is pending in this
+                # session here, so the rollback discards nothing else;
+                # ensure_seasons itself is race-safe without the lock (the
+                # unconditional season unique index + IntegrityError re-read).
+                await session.rollback()
                 await season_request_service.ensure_seasons(
                     session,
                     library,
@@ -653,6 +756,22 @@ async def create_request_result(
                     record=await repo.get(in_library.id) or in_library,
                     created=False,
                 )
+        if media_locked:
+            # FALL-THROUGH release (the third branch): a mixed present/missing
+            # season set (superset failed) or no in-library row to dedup onto
+            # proceeds to the fresh-create path below, whose ensure_seasons
+            # performs its own Plex crawl -- release the media lock FIRST, the
+            # same discipline as the two dedup branches above (never hold the
+            # lock's write transaction across network I/O). Nothing read under
+            # the lock needs re-reading after the release: ``existing_active``'s
+            # ABSENCE only justified proceeding, and a concurrent active row
+            # committing after the release makes the create below collide on
+            # ``uq_media_requests_active`` -- resolved by the IntegrityError
+            # catch (the DB backstop) exactly like any other create race; and
+            # the ``evicted_seasons`` subtraction only fed the superset DECISION
+            # (a TV create always starts 'pending', and ensure_seasons re-derives
+            # presence + the evicted subtraction FRESH on its own crawl).
+            await session.rollback()
     created = True
     try:
         record = await repo.create(

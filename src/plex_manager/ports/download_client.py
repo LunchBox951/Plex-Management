@@ -15,7 +15,28 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["DownloadClientPort", "DownloadStatus", "DownloadedFile"]
+__all__ = ["AddResult", "DownloadClientPort", "DownloadStatus", "DownloadedFile"]
+
+
+class AddResult(BaseModel):
+    """The outcome of :meth:`DownloadClientPort.add`.
+
+    ``torrent_hash`` is the lowercased info-hash (``""`` when no hash could be
+    derived locally -- rare, an opaque ``.torrent`` URL the client fetched
+    itself). ``created`` is whether this call GENUINELY added a new torrent:
+    ``False`` means the client reported it ALREADY PRESENT (qBittorrent's 409
+    add response) and merely resolved to the existing torrent. The distinction
+    is load-bearing for failure cleanup: a grab that loses a race/CAS after the
+    add may remove (with data) only a torrent it actually created -- a reused
+    pre-existing torrent predates the grab (e.g. a still-seeding import whose
+    data can back a live library file via hardlink) and is never the grab's to
+    destroy.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    torrent_hash: str
+    created: bool
 
 
 class DownloadStatus(BaseModel):
@@ -61,10 +82,13 @@ class DownloadedFile(BaseModel):
 class DownloadClientPort(Protocol):
     """Add, monitor, and control torrents in the download client."""
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
-        """Add a torrent; return its lowercased info-hash.
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        """Add a torrent; return its lowercased info-hash + whether it was created.
 
-        A 409 (already present) resolves to the existing hash, never an error.
+        A 409 (already present) resolves to the existing hash, never an error --
+        reported honestly as ``created=False`` so a caller cleaning up after a
+        lost grab never removes a pre-existing torrent it did not create (see
+        :class:`AddResult`).
         """
         raise NotImplementedError
 

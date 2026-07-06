@@ -246,6 +246,17 @@ class RequestRepository(Protocol):
         """
         raise NotImplementedError
 
+    async def latest_request_evicted(self, tmdb_id: int, media_type: str) -> bool:
+        """Whether the NEWEST request row for this media is ``evicted`` (ADR-0012).
+
+        Lets the in-library short-circuit refuse to trust a STALE Plex 'present'
+        reading during the eviction delete window (the sweep commits ``evicted``
+        before it unlinks the file and before the post-delete Plex refresh), so a
+        re-request re-grabs instead of minting an ``available`` row over a doomed
+        file. See ``SqlRequestRepository.latest_request_evicted``'s docstring.
+        """
+        raise NotImplementedError
+
     async def display_statuses_by_tmdb_ids(
         self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
@@ -289,13 +300,20 @@ class RequestRepository(Protocol):
         """Update a request's status."""
 
     async def set_status_if_in(
-        self, request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_unpinned: bool = False,
     ) -> bool:
-        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
+        (and, with ``require_unpinned``, only if not ``keep_forever``-pinned).
 
         Returns whether the row was actually updated -- ``False`` means a
-        genuinely concurrent writer already moved it elsewhere. The eviction
-        sweep's authoritative double-count guard (ADR-0012, C6): see
+        genuinely concurrent writer already moved it elsewhere (or pinned it). The
+        eviction sweep's authoritative double-count guard (ADR-0012, C6) and, with
+        ``require_unpinned``, its pre-delete pin-safe CLAIM (#67): see
         ``SqlRequestRepository.set_status_if_in``'s docstring.
         """
         raise NotImplementedError
@@ -478,6 +496,18 @@ class SeasonRequestRepository(Protocol):
         """List season requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Season numbers whose NEWEST row (across this ``tmdb_id``'s ``tv``
+        requests) is ``evicted`` (ADR-0012).
+
+        ``ensure_seasons`` subtracts these from Plex's ``present_seasons`` snapshot
+        so a season the disk-pressure sweep is mid-deleting is never created or
+        re-armed straight to ``available`` off a STALE 'present' reading -- the
+        season-level twin of :meth:`RequestRepository.latest_request_evicted`. See
+        ``SqlSeasonRequestRepository.evicted_seasons``'s docstring.
+        """
+        raise NotImplementedError
+
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[SeasonRequestRecord]:
@@ -523,9 +553,16 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def set_status_if_in(
-        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        season_request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_parent_unpinned: bool = False,
     ) -> bool:
-        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
+        (and, with ``require_parent_unpinned``, only if the PARENT show is not
+        ``keep_forever``-pinned).
 
         The season-granularity mirror of ``RequestRepository.set_status_if_in``;
         see ``SqlSeasonRequestRepository.set_status_if_in``'s docstring.

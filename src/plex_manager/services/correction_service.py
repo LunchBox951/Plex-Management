@@ -635,7 +635,7 @@ async def report_issue(
                 purge.detail,
                 extra=log_extra,
             )
-        elif purge.outcome is PurgeOutcome.error:
+        elif purge.outcome in {PurgeOutcome.error, PurgeOutcome.deferred}:
             purge_ok = False
             _logger.warning(
                 "report-issue purge of %r failed (%s); re-searching anyway but keeping "

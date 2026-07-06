@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.library import LibraryPort, WatchState
-from plex_manager.services import log_capture_service, retention_telemetry_service
+from plex_manager.services import eviction_service, log_capture_service, retention_telemetry_service
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import EVICTION_INTERVAL_MINUTES_DEFAULT, SettingsStore
 from tests.web.fakes import FakeLibrary
@@ -436,3 +436,77 @@ async def test_eviction_loop_survives_a_tick_and_fallback_read_that_both_raise(
     # safe hardcoded default interval, since even the fallback's own settings
     # read was made to fail.
     assert sleep_calls == [EVICTION_INTERVAL_MINUTES_DEFAULT * 60.0] * 3
+
+
+# --------------------------------------------------------------------------- #
+# #95 -- per-root failure isolation on the SHARED tick session: a DB/SQLAlchemy
+# failure sweeping one root must be rolled back so the remaining roots still run
+# in the SAME tick, rather than the poisoned transaction cascading into them.
+# --------------------------------------------------------------------------- #
+
+
+async def test_eviction_tick_one_roots_db_failure_still_sweeps_the_next_root(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#95: every configured root shares THIS tick's single session. A
+    DB/SQLAlchemy failure sweeping one root leaves that transaction poisoned;
+    without the guarded ``session.rollback()`` the NEXT root's sweep would then
+    raise too (``PendingRollbackError``), silently skipping every remaining root.
+    Proves root A's failure is caught + rolled back so root B still runs on the
+    same, now-clean session in the same tick."""
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("movies_root", str(movies_root))
+        await store.set("tv_root", str(tv_root))
+        await store.set("eviction_enabled", "true")
+        # threshold=0 always trips, so the pressure sweep runs for every root and
+        # the delete-nothing telemetry sweep is skipped (keeping this focused on
+        # the eviction sweep's own per-root session hygiene).
+        await store.set("disk_pressure_threshold_percent", "0")
+        await store.set("disk_pressure_target_percent", "0")
+        await store.set("eviction_grace_days", "30")
+        await store.set("eviction_interval_minutes", "5")
+        await session.commit()
+
+    library = FakeLibrary()
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    swept: list[str] = []
+
+    async def _fake_sweep(**kwargs: object) -> list[object]:
+        session = kwargs["session"]
+        assert isinstance(session, AsyncSession)
+        root = kwargs["root_path"]
+        if kwargs["media_type"] == "movie" and root == str(movies_root):
+            # A DB error mid-sweep poisons the shared transaction, then propagates
+            # exactly as a real SQLAlchemy failure would.
+            await session.execute(text("SELECT * FROM __eviction_no_such_table__"))
+            return []  # pragma: no cover - the statement above always raises
+        # Any later root: the shared session must be USABLE again (rolled back
+        # clean). If it were still poisoned this SELECT would raise
+        # PendingRollbackError and this root would never be recorded.
+        await session.execute(text("SELECT 1"))
+        assert isinstance(root, str)
+        swept.append(root)
+        return []
+
+    monkeypatch.setattr(eviction_service, "run_eviction_sweep", _fake_sweep)
+
+    app = _app(sessionmaker_)
+    try:
+        sleep_seconds = await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    # The tick completed (never re-raised root A's DB failure) and root B (tv)
+    # still ran on the rolled-back, clean session.
+    assert sleep_seconds == 5 * 60.0
+    assert swept == [str(tv_root)]

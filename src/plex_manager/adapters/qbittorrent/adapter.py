@@ -46,7 +46,7 @@ import anyio.to_thread
 import httpcore
 import httpx
 
-from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
+from plex_manager.ports.download_client import AddResult, DownloadedFile, DownloadStatus
 
 __all__ = [
     "QbittorrentAuthError",
@@ -886,10 +886,15 @@ class QbittorrentClient:
         ) as client:
             return await self._resolve_http_source_with_client(client, url)
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
-        """Add a torrent; return its lowercased info-hash.
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        """Add a torrent; return its lowercased info-hash + whether it was created.
 
-        A 409 (already present) resolves to the computed hash rather than erroring.
+        A 409 (already present) resolves to the computed hash rather than
+        erroring, reported honestly as ``created=False``: qBittorrent's 409 is
+        the one signal that the torrent PREDATES this call, and the caller's
+        lost-grab cleanup must never destroy (``delete_files=True``) a torrent
+        it merely reused -- its data can back a live library file via hardlink
+        (see :class:`~plex_manager.ports.download_client.AddResult`).
         """
         urls_value: str | None = None
         torrent_bytes: bytes | None = None
@@ -940,13 +945,17 @@ class QbittorrentClient:
             raise QbittorrentError(
                 f"qBittorrent rejected the torrent (HTTP {response.status_code})"
             )
+        # The 409 branch of _is_add_success is "already present, resolved to the
+        # existing torrent" -- the honest created=False signal (every other
+        # success shape means the client actually accepted a new add).
+        created = response.status_code != _HTTP_CONFLICT
 
         if info_hash is not None:
-            return info_hash.lower()
+            return AddResult(torrent_hash=info_hash.lower(), created=created)
         # No locally-derivable hash (rare: opaque .torrent URL qBit fetched). Best
         # effort: the caller can reconcile by category on the next poll.
         _logger.warning("added torrent but could not derive its info-hash locally")
-        return ""
+        return AddResult(torrent_hash="", created=created)
 
     # ---- status --------------------------------------------------------- #
     async def get_status(self, info_hash: str) -> DownloadStatus | None:

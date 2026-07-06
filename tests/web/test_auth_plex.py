@@ -708,8 +708,17 @@ async def test_openapi_advertises_both_cookie_and_apikey_auth(app: FastAPI) -> N
         "in": "cookie",
         "name": "plexmgr.session",
     }
+    assert schemes["CSRFHeader"] == {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-CSRF-Token",
+    }
     # A protected route advertises EITHER credential — a LIST of requirement
     # objects is OpenAPI's OR; a single object would mean both are required.
     logout_security = schema["paths"]["/api/v1/auth/logout"]["post"]["security"]
     assert {"APIKeyHeader": []} in logout_security
-    assert {"APIKeyCookie": []} in logout_security
+    assert {"APIKeyCookie": [], "CSRFHeader": []} in logout_security
+
+    # Safe cookie-auth operations do not need CSRF.
+    queue_security = schema["paths"]["/api/v1/queue"]["get"]["security"]
+    assert {"APIKeyCookie": []} in queue_security
