@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.services import health_service
 from plex_manager.services.health_service import (
+    SUBSYSTEM_CACHE_KEYS,
     AutograbStatus,
     HealthCredentials,
     ReconcileStatus,
@@ -211,8 +212,10 @@ async def test_probe_result_is_refreshed_once_the_ttl_expires() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Codex P2: a probe that straddles a concurrent invalidate() must not
-# resurrect its stale, pre-invalidation result (the generation guard).
+# Codex P2 (rounds 2+3): a probe running on credentials read BEFORE a
+# concurrent invalidate() must not resurrect its stale result (the generation
+# guard) — whether the invalidate lands mid-probe (round 2) or in the gap
+# between the credential read and the probe's start (round 3).
 # --------------------------------------------------------------------------- #
 
 
@@ -297,6 +300,62 @@ async def test_health_probe_straddling_a_settings_invalidate_is_not_resurrected(
         results = await check_subsystems(client, new_creds, cache)
     assert next(r for r in results if r.name == "prowlarr").status == "ok"
     assert cache.get("prowlarr") is not None
+
+
+async def test_invalidate_between_cred_read_and_probe_start_is_still_fenced() -> None:
+    """Codex round 3: the race window opens at the CREDENTIAL READ, not at
+    probe start. The health endpoint reads OLD creds from the DB, a settings
+    PUT commits + invalidates, and only THEN do the probes begin -- a snapshot
+    taken at probe start (round 2 took it inside the ``_check_*`` helpers)
+    post-dates the invalidation, matches the bumped generation, and lets the
+    stale write through. The endpoint's pre-read snapshot, threaded in via
+    ``generations``, must fence this exact interleave."""
+    cache = TtlCache[SubsystemHealth](ttl_seconds=60.0)
+
+    # The endpoint's flow, step 1: generation snapshot FIRST...
+    generations = cache.generation_snapshot(SUBSYSTEM_CACHE_KEYS)
+    # ...step 2: the credential read returns the soon-to-be-OLD key (simulated
+    # here as the values already being in hand).
+    old_creds = HealthCredentials(prowlarr_url="http://prowlarr.local", prowlarr_api_key="old-key")
+
+    # The settings PUT lands AFTER the credential read but BEFORE any probe
+    # has started -- exactly the gap the round-2 (probe-start) snapshot missed.
+    cache.invalidate("prowlarr")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"version": "1.0"})
+
+    async with _client(handler) as client:
+        results = await check_subsystems(client, old_creds, cache, generations=generations)
+
+    # The probe still answers its own caller...
+    assert next(r for r in results if r.name == "prowlarr").status == "ok"
+    # ...but its stale, pre-invalidation result must NOT have been cached: the
+    # next poll re-probes with the fresh credentials instead of serving the
+    # old-key result for another full TTL.
+    assert cache.get("prowlarr") is None
+
+    # Sanity: subsystems whose generations did NOT move cached normally -- the
+    # fence is per-key, never a blanket write suppression.
+    assert cache.get("plex") is not None
+    assert cache.get("tmdb") is not None
+
+
+def test_ttl_cache_clear_also_fences_generation_guarded_writes() -> None:
+    """``clear()`` is an invalidation of EVERY key -- including keys the cache
+    has never seen (no entry, no per-key counter) -- so a generation-guarded
+    ``set()`` whose snapshot predates a ``clear()`` must be dropped exactly
+    like one that predates a targeted ``invalidate()``. Guarded by the global
+    epoch, since per-key counters cannot cover never-seen keys."""
+    cache = TtlCache[str](ttl_seconds=60.0)
+    generation = cache.current_generation("never-seen-key")
+    cache.clear()
+    cache.set("never-seen-key", "stale", generation=generation)
+    assert cache.get("never-seen-key") is None
+
+    # Unconditional (generation-less) writes are unaffected by the epoch bump.
+    cache.set("never-seen-key", "fresh")
+    assert cache.get("never-seen-key") == "fresh"
 
 
 # --------------------------------------------------------------------------- #
