@@ -42,6 +42,7 @@ from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service
 from plex_manager.services.eviction_service import EvictionOutcome
 from plex_manager.services.health_service import (
+    SUBSYSTEM_CACHE_KEYS,
     AutograbStatus,
     HealthCredentials,
     ReconcileStatus,
@@ -125,6 +126,15 @@ async def health_endpoint(
     auto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so
     polling this every few seconds never hammers an upstream or burns the TMDB
     rate limit."""
+    # Generation snapshot FIRST, strictly before the credential reads below
+    # (Codex round 3): the moment a credential leaves the store it can be
+    # superseded by a concurrent ``PUT /settings`` (whose commit bumps these
+    # generations via ``TtlCache.invalidate``), and only a snapshot that
+    # PRECEDES the read can prove no invalidation happened since -- see
+    # ``TtlCache``'s invariant. Taken any later, a save landing between the
+    # read and the snapshot would go unnoticed and the probe's stale result
+    # would be cached for another full TTL.
+    generations = cache.generation_snapshot(SUBSYSTEM_CACHE_KEYS)
     store = SettingsStore(session)
     creds = HealthCredentials(
         plex_url=await store.get("plex_url"),
@@ -147,6 +157,7 @@ async def health_endpoint(
         creds=creds,
         reconcile_status=reconcile_status,
         autograb_status=autograb_status,
+        generations=generations,
         library_roots={
             "movies_root": movies_root,
             "tv_root": tv_root,

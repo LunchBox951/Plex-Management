@@ -571,6 +571,28 @@ class SettingsUpdate(BaseModel):
             raise ValueError(message)
         return value
 
+    @field_validator(*_LIBRARY_ROOT_FIELDS)
+    @classmethod
+    def _blank_root_clears_to_unset(cls, value: str | None) -> str | None:
+        """Normalize a whitespace-only root to ``""`` (explicit clear-to-unset).
+
+        Unlike ``SetupCompleteRequest``'s ``require_at_least_one_library_root``
+        (a ``model_validator`` that runs on the one-shot wizard body), this
+        partial-update model has no equivalent pass -- so an operator submitting
+        a stray space via ``PUT /settings`` would otherwise sail straight through
+        (a non-empty string is not ``None``, so it is never treated as "leave
+        unchanged") and get persisted verbatim as the stored root. Mapping it to
+        ``""`` instead reuses this class's OWN already-established "empty string
+        = explicit clear" wire semantics (see the class docstring), so a
+        whitespace-only submission behaves exactly like an intentional clear
+        rather than silently configuring a bogus, effectively-blank root. A
+        genuinely non-empty value (however it's padded) is returned unchanged --
+        this validator only ever touches the all-whitespace case.
+        """
+        if value is not None and not value.strip():
+            return ""
+        return value
+
     @model_validator(mode="after")
     def _target_at_or_below_threshold(self) -> SettingsUpdate:
         """Reject a target ABOVE the trigger threshold when both are set together.
