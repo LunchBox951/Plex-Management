@@ -6,11 +6,21 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, case, insert, or_, select, update
+from sqlalchemy import CursorResult, case, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import aliased
 
-from plex_manager.models import MediaRequest, MediaType, RequestDedupLock, RequestStatus
+from plex_manager.models import (
+    Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
+    MediaRequest,
+    MediaType,
+    RequestDedupLock,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.ports.repositories import RequestRecord
 
 if TYPE_CHECKING:
@@ -174,17 +184,36 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
-    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
-        stmt = (
-            select(MediaRequest)
-            .where(
-                MediaRequest.tmdb_id == tmdb_id,
-                MediaRequest.media_type == MediaType(media_type),
-                MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
-            )
-            .order_by(MediaRequest.id.desc())
-            .limit(1)
+    async def find_in_library(
+        self, tmdb_id: int, media_type: str, *, prefer_user_id: int | None = None
+    ) -> RequestRecord | None:
+        """Return an already-in-library (available/completed) request, or ``None``.
+
+        ``prefer_user_id`` (the per-user visibility scope — see the port
+        docstring) reorders WHICH terminal row wins when several exist for the
+        same media: (a) a row OWNED by that user first, then (b) an OWNERLESS
+        (claimable) row, then (c) anyone else's — newest-by-id within each rank.
+        Without the preference, the newest GLOBAL row wins unconditionally, so a
+        user whose own older ``available`` row is shadowed by another user's
+        newer one would be handed the foreign row — which the service can only
+        honestly reject (409) even though a perfectly returnable row of their own
+        exists. ``None`` (admins / API-key automation) keeps the plain
+        newest-row-wins behavior unchanged.
+        """
+        stmt = select(MediaRequest).where(
+            MediaRequest.tmdb_id == tmdb_id,
+            MediaRequest.media_type == MediaType(media_type),
+            MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
         )
+        if prefer_user_id is not None:
+            ownership_rank = case(
+                (MediaRequest.user_id == prefer_user_id, 0),
+                (MediaRequest.user_id.is_(None), 1),
+                else_=2,
+            )
+            stmt = stmt.order_by(ownership_rank, MediaRequest.id.desc()).limit(1)
+        else:
+            stmt = stmt.order_by(MediaRequest.id.desc()).limit(1)
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
@@ -221,7 +250,7 @@ class SqlRequestRepository:
         await self._session.execute(stmt)
 
     async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]]
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
         """Batch the DISPLAY status per ``(tmdb_id, media_type)`` — see the port docstring.
 
@@ -231,14 +260,18 @@ class SqlRequestRepository:
         backend is a config swap). Rows come back ``id``-ascending, so per key the
         first non-settled row is the lowest-id ACTIVE one (matching ``find_active``)
         and ``group[-1]`` is the newest fallback when every row is settled.
+
+        ``for_user_id`` (when set) restricts the scan to that user's own rows —
+        the shared-session visibility scope; see the port docstring.
         """
         key_set = set(keys)
         if not key_set:
             return {}
         tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
-        stmt = (
-            select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids)).order_by(MediaRequest.id)
-        )
+        stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
+        if for_user_id is not None:
+            stmt = stmt.where(MediaRequest.user_id == for_user_id)
+        stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         grouped: dict[tuple[int, str], list[MediaRequest]] = {}
         for row in rows:
@@ -390,6 +423,29 @@ class SqlRequestRepository:
             row.completed_at = now
         await self._session.flush()
 
+    async def claim_if_unowned(self, request_id: int, user_id: int) -> bool:
+        """Assign ``user_id`` to a request that currently has NO owner.
+
+        A single ``UPDATE ... WHERE id = ? AND user_id IS NULL`` so the DATABASE
+        decides: an already-owned row is left untouched (an existing owner is never
+        reassigned). Returns whether a row was actually claimed.
+
+        Used on the create-dedup path so a signed-in user whose request collapses
+        onto a previously ownerless active request (e.g. one created via the
+        API-key automation path, which carries no user identity) has the request
+        show up in THEIR own list, rather than succeeding yet silently vanishing
+        behind the per-user list filter.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(MediaRequest.id == request_id, MediaRequest.user_id.is_(None))
+                .values(user_id=user_id)
+            ),
+        )
+        return result.rowcount == 1
+
     async def stamp_completed_at_if_unset(self, request_id: int) -> None:
         """Stamp ``completed_at`` = now, but ONLY if it is currently unset.
 
@@ -463,6 +519,196 @@ class SqlRequestRepository:
         row.search_attempts = 0
         row.next_search_at = None
         await self._session.flush()
+
+    async def heal_completed_at(self, request_id: int) -> None:
+        """Re-align a TV parent's ``completed_at`` with its committed done seasons.
+
+        INVARIANT (shared with ``season_request_service.reset_for_research`` /
+        ``ensure_seasons``, agreeing with ``_recompute_parent``'s stamp and
+        :meth:`stamp_completed_at_if_unset`): after this heal, ``completed_at`` is
+        non-``NULL`` iff some tracked season GENUINELY completed an import and is
+        still ``completed``/``available`` -- keeping the FIRST stamp untouched when
+        one is already set (the never-moves rule), clearing it when nothing backs
+        it (so the next genuine re-completion can re-stamp through the ``IS NULL``
+        guard, #76), and re-stamping when a backing season exists but the stamp was
+        lost. Idempotent and self-correcting: re-running it never changes a
+        consistent row. A TV-parent verb only -- a movie request has no season
+        rows, so this would always read "unbacked" for one; movies keep using
+        :meth:`reset_for_research`'s direct clear.
+
+        "GENUINELY imported" discriminator -- breadcrumb OR imported-download
+        linkage, per season:
+
+        * ``SeasonRequest.library_path IS NOT NULL``: ``import_service.
+          _import_tv_locked`` writes the breadcrumb in the SAME transaction as
+          ``mark_completed`` for every current-version import; ``ensure_seasons``'s
+          already-in-Plex creation leaves it ``NULL`` (no import ever ran).
+        * OR an ``imported`` ``Download`` row for the same ``(media_request_id,
+          season)`` NOT invalidated by a LATER eviction (see below): the import
+          finalize CAS moves the placing download to ``imported`` in that same
+          transaction, and this linkage is exactly how report-issue resolves its
+          culprit ("the download that OWNS the placed library file" --
+          ``SqlDownloadRepository.find_latest_imported_for_request``). This arm
+          covers LEGACY seasons imported before the breadcrumb column existed
+          (``models.SeasonRequest.library_path``: "``None`` for seasons imported
+          before this breadcrumb existed") -- their genuinely-backed stamp must
+          not be erased just because the breadcrumb predates them. A
+          Plex-present-only season (the ``ensure_seasons`` short-circuit) has
+          NEITHER marker -- no grab ever ran for that season under this request,
+          so no ``imported`` download row can exist for the pair -- and stays
+          excluded. Known best-effort edge: a terminal download row can later be
+          re-owned by a fresh grab of the same torrent (``update_status``'s
+          ``replace_grab_metadata`` path rewrites its request/season scope),
+          which could drop legacy evidence; that failure degrades to the
+          conservative clear-and-restamp-on-reimport behavior, never to counting
+          a Plex-present-only season.
+
+        Eviction invalidates the download arm (Codex round-3): eviction flips the
+        season row and writes history but NEVER touches the old ``Download`` row
+        (cross-aggregate mutation would be worse than the bug), so its
+        ``imported`` status survives the file's deletion. Without an ordering
+        clause, an evicted season re-armed straight to ``available`` (Plex still
+        reports it present; ``ensure_seasons`` clears the breadcrumb) would make
+        its PRE-EVICTION download look like current backing evidence, preserving
+        or re-stamping a ``completed_at`` nothing current supports. The honest
+        committed markers that order "import happened" vs "eviction happened
+        since" are both in the append-only ``download_history`` log: the import
+        finalize writes hash-tied ``imported`` events (``import_service.
+        _import_tv_locked``), and ``eviction_service._evict_one`` writes an
+        ``evicted`` event -- ``torrent_hash=None`` by design (see
+        ``DownloadHistoryEvent.evicted``) with only ``tmdb_id`` queryable (the
+        season number lives in prose ``message`` text, which is not a schema). So
+        the arm requires: NO ``evicted`` event for the parent's ``tmdb_id`` with
+        an ``id`` greater than the download's latest ``imported`` event id
+        (``download_history.id`` is the append-only order; a download with no
+        recorded import event is invalidated by ANY eviction of the show). Two
+        documented coarseness edges, both failing CONSERVATIVE (an over-eager
+        clear that the next genuine re-import re-stamps, never a wrongly
+        preserved stamp, never counting a Plex-present row): (a) the show-scoped
+        ``tmdb_id`` means a SIBLING season's later eviction also discounts this
+        season's pre-eviction download evidence; (b) ``download_history.tmdb_id``
+        is not media-type-namespaced, so a movie sharing the show's tmdb id that
+        was evicted later does too. A genuine re-import after an eviction writes
+        a NEWER ``imported`` event for its hash, so its evidence validly counts
+        again.
+
+        Shape -- two atomic conditional ``UPDATE``s whose predicate lives in their
+        OWN ``WHERE`` (DB-authoritative at statement time, never a prior Python
+        snapshot; the same discipline as :meth:`set_status_if_in`):
+
+        1. clear-if-unbacked: ``SET completed_at = NULL`` only while NO qualifying
+           season exists.
+        2. re-stamp-if-backed-but-``NULL``: stamp now() when a qualifying season
+           exists but the stamp is missing. This is the recovery arm for the
+           masked-sibling TOCTOU on MVCC (the Postgres-ready posture): a sibling
+           import finalizing concurrently while MASKED by a higher-precedence
+           season (e.g. a third season ``downloading``) never touches the parent
+           row -- its rollup write is a no-change and its
+           ``stamp_completed_at_if_unset`` no-ops against the still-non-``NULL``
+           stale stamp -- so a clear whose statement snapshot predates that commit
+           erases the stamp with nobody left to re-stamp. Statement 2 runs with a
+           FRESH statement snapshot (READ COMMITTED) and repairs exactly that
+           aftermath. The re-stamp value is ``now()`` because the schema records
+           NO per-season completion timestamp to recompute the true import time
+           from (``Download.completed_at`` is never written by any code path;
+           ``retention_telemetry_service`` documents the deliberately-deferred
+           per-season ``completed_at`` column) -- in the race aftermath now() is
+           within moments of the sibling's actual import commit, and in the legacy
+           never-stamped case it restores a backed, re-clearable stamp rather than
+           a permanently-unknown one.
+
+        RESIDUAL WINDOW, stated honestly: SQLite's single writer serializes the
+        whole heal. On Postgres READ COMMITTED, a sibling whose season write AND
+        commit both land between statement 1's snapshot and statement 2's
+        snapshot -- while its own conditional stamp evaluated against our
+        not-yet-committed clear -- can still end un-stamped. The heal is
+        idempotent, so the NEXT invocation (any later report-issue or evicted
+        re-arm on this show) repairs it; closing the window entirely would require
+        the import hot path and this heal to serialize on a parent-row lock
+        (``SELECT FOR UPDATE``), which the import path deliberately does not take.
+        """
+        # Aliased so the imported-event lookup nested inside the eviction-event
+        # subquery below does NOT auto-correlate to that enclosing
+        # ``download_history`` SELECT -- they are two independent scans of the
+        # same append-only log.
+        imported_event = aliased(DownloadHistory)
+        latest_import_event_id = (
+            select(func.max(imported_event.id))
+            .where(
+                imported_event.torrent_hash == Download.torrent_hash,
+                imported_event.event_type == DownloadHistoryEvent.imported,
+            )
+            # EXPLICIT: auto-correlation only reaches the nearest enclosing
+            # SELECT; two levels deep it would re-introduce ``downloads`` as a
+            # cartesian FROM entry instead (verified via compiled SQL).
+            .correlate(Download)
+            .scalar_subquery()
+        )
+        # "The show was evicted SINCE this download's import" -- the round-3
+        # invalidation clause (see the docstring): an ``evicted`` history row for
+        # this show appended after the download's latest ``imported`` event. A
+        # download with NO recorded import event compares as -1, so any eviction
+        # of the show invalidates it (conservative by design).
+        evicted_since_import = (
+            select(DownloadHistory.id)
+            .where(
+                DownloadHistory.tmdb_id == MediaRequest.tmdb_id,
+                DownloadHistory.event_type == DownloadHistoryEvent.evicted,
+                DownloadHistory.id > func.coalesce(latest_import_event_id, -1),
+            )
+            # EXPLICIT for the same reason: ``media_requests`` (the UPDATE
+            # target) and ``downloads`` (the enclosing evidence SELECT) must
+            # correlate outward, never join in locally.
+            .correlate(MediaRequest, Download)
+            .exists()
+        )
+        season_genuinely_imported = (
+            select(Download.id)
+            .where(
+                Download.media_request_id == SeasonRequest.media_request_id,
+                Download.season == SeasonRequest.season_number,
+                # Literal (not the P4 ``DownloadState`` enum) -- mirrors
+                # ``repositories.downloads``' deliberately-decoupled string
+                # vocabulary; ``imported`` is that enum's value.
+                Download.status == "imported",
+                ~evicted_since_import,
+            )
+            .exists()
+        )
+        qualifying = (
+            select(SeasonRequest.id)
+            .where(
+                # Correlate to the outer ``media_requests`` row so the guard is
+                # re-evaluated against live DB state at UPDATE time, not a snapshot.
+                SeasonRequest.media_request_id == MediaRequest.id,
+                SeasonRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
+                or_(
+                    SeasonRequest.library_path.is_not(None),
+                    season_genuinely_imported,
+                ),
+            )
+            .exists()
+        )
+        await self._session.execute(
+            update(MediaRequest)
+            .where(
+                MediaRequest.id == request_id,
+                MediaRequest.completed_at.is_not(None),
+                ~qualifying,
+            )
+            .values(completed_at=None)
+            .execution_options(synchronize_session="fetch")
+        )
+        await self._session.execute(
+            update(MediaRequest)
+            .where(
+                MediaRequest.id == request_id,
+                MediaRequest.completed_at.is_(None),
+                qualifying,
+            )
+            .values(completed_at=datetime.now(UTC))
+            .execution_options(synchronize_session="fetch")
+        )
 
     async def clear_library_path(self, request_id: int) -> None:
         """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).

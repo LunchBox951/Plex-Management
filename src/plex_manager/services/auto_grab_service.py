@@ -395,9 +395,10 @@ async def _park(
     scope: _PendingScope,
     clock: Callable[[], datetime],
 ) -> bool:
-    """Record a nothing-acceptable result: schedule the backoff + mark the honest
-    ``no_acceptable_release`` park state, then commit. Returns ``True`` if it parked,
-    ``False`` if a racing active download made parking wrong (see below).
+    """Record a nothing-acceptable result: mark the honest ``no_acceptable_release``
+    park state via a compare-and-swap FIRST, then -- ONLY if it actually won --
+    schedule the backoff and commit both together. Returns ``True`` if it parked,
+    ``False`` if a racing writer made parking wrong (see below).
 
     The SAME honest dead-end the manual ``/queue/grab`` endpoint uses
     (``request_service`` / ``season_request_service.mark_no_acceptable_release``,
@@ -413,6 +414,18 @@ async def _park(
     same way, so mirror it: re-check ``find_active_for_request`` immediately before
     the write and, if a download appeared, skip the park entirely (no status write,
     no backoff bump) and report it un-parked.
+
+    Issue #72 -- the CAS itself, not just the pre-check above: that re-check only
+    closes the gap up to THIS instant -- a concurrent writer can still win the race
+    in the (tiny) window between it and the actual status write below.
+    ``mark_no_acceptable_release`` now performs a genuine ``set_status_if_in``
+    compare-and-swap (the database's ``WHERE status IN (...)`` decides at write
+    time, never this function's stale read), so that window is closed too, and its
+    boolean return lets this function tell a real park apart from a lost race. The
+    backoff write (``schedule_search``) only happens -- and only gets committed --
+    AFTER a WON CAS: a lost race is rolled back and reported un-parked WITHOUT
+    ever touching ``search_attempts`` / ``next_search_at``, so a park that did not
+    happen can never advance the backoff ladder either.
 
     Codex round-3 #3 -- stale park base: the backoff is scheduled from a FRESH clock
     read at the actual park moment, never a ``now`` captured at cycle start. A slow
@@ -434,23 +447,38 @@ async def _park(
     if scope.season is not None:  # TV season
         if scope.season_request_id is None:  # pragma: no cover - a tv scope always has one
             return False
+        parked = await season_request_service.mark_no_acceptable_release(
+            session, media_request_id=scope.request_id, season_number=scope.season
+        )
+        if not parked:
+            await session.rollback()
+            _logger.info(
+                "auto-grab: lost the park race to a concurrent writer; leaving scope "
+                "as-is (no backoff written)",
+                extra={"request_id": scope.request_id, "season": scope.season},
+            )
+            return False
         await season_repo.schedule_search(
             scope.season_request_id,
             search_attempts=scheduled_attempts,
             next_search_at=scheduled_at,
         )
         # Flush-only; this function owns the commit boundary.
-        await season_request_service.mark_no_acceptable_release(
-            session, media_request_id=scope.request_id, season_number=scope.season
-        )
     else:  # movie
+        parked = await request_service.mark_no_acceptable_release(session, scope.request_id)
+        if not parked:
+            await session.rollback()
+            _logger.info(
+                "auto-grab: lost the park race to a concurrent writer; leaving scope "
+                "as-is (no backoff written)",
+                extra={"request_id": scope.request_id},
+            )
+            return False
         await request_repo.schedule_search(
             scope.request_id,
             search_attempts=scheduled_attempts,
             next_search_at=scheduled_at,
         )
-        # Commits internally (movie path); the extra commit below is then a no-op.
-        await request_service.mark_no_acceptable_release(session, scope.request_id)
     await session.commit()
     return True
 

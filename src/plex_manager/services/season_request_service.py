@@ -104,6 +104,36 @@ _REAL_DONE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     s.value for s in (RequestStatus.completed, RequestStatus.available)
 )
 
+# Season statuses from which a park to ``no_acceptable_release`` is a SAFE,
+# honest search-exhausted verdict -- the CAS's ``allowed_from`` for
+# :func:`mark_no_acceptable_release` below (issue #72). Mirrors
+# ``request_service._PARKABLE_REQUEST_STATUS_VALUES`` at season granularity
+# (duplicated, not imported, for the SAME circular-import reason as
+# ``_TERMINAL_SEASON_STATUS_VALUES`` above). Excludes every TERMINAL season
+# status (the never-un-terminate guard: writing ``no_acceptable_release`` --
+# itself non-terminal and dedup-blocking -- over a finished season would
+# resurrect it as a ghost) PLUS two additional non-terminal statuses a parking
+# transition must never stomp:
+#   - ``downloading`` -- closes issue #72's race: before this CAS existed,
+#     ``mark_no_acceptable_release`` read the season's current status, checked
+#     it was non-terminal, then wrote unconditionally; a concurrent grab (a
+#     lower-ranked auto-grab candidate, a manual re-grab) moving the season to
+#     ``downloading`` in that gap would be silently regressed back to a
+#     dead-end. The CAS's ``WHERE status IN (...)`` is evaluated by the
+#     DATABASE at write time, never against a stale read.
+#   - ``import_blocked`` -- a season CAN reach this directly
+#     (``import_service._import_tv_locked``'s failure path): a DIFFERENT
+#     needs-attention dead-end that a stale nothing-acceptable signal must
+#     never paper over.
+_PARKABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value
+    for s in (
+        RequestStatus.pending,
+        RequestStatus.searching,
+        RequestStatus.no_acceptable_release,
+    )
+)
+
 
 async def _recompute_parent(
     session: AsyncSession,
@@ -293,12 +323,49 @@ async def ensure_seasons(
     ``searching``/``downloading``/``import_blocked``/``no_acceptable_release``/
     ``pending``) is left completely untouched -- an in-flight or already-finished
     season is never regressed by a re-request.
+
+    That re-arm (#75) does not stop at ``set_status``: it also clears the
+    ``library_path`` eviction breadcrumb and resets the search backoff ladder,
+    MIRRORING the existing report-issue re-arm path (:func:`reset_for_research`'s
+    ``clear_library_path``/``schedule_search(search_attempts=0,
+    next_search_at=None)`` pair, cited there as ADR-0013/ADR-0014). Without this
+    a re-requested evicted season could inherit a stale ``library_path`` still
+    pointing at the file the sweep already deleted (a later eviction sweep would
+    misread it as still reclaimable) and/or a stale ``search_attempts``/
+    ``next_search_at`` backoff from the run that led to eviction, throttling the
+    operator's brand-new request exactly like a fresh row never would.
+
+    The re-arm ALSO heals the parent's ``completed_at``
+    (:meth:`SqlRequestRepository.heal_completed_at` -- the same guarded verb
+    :func:`reset_for_research` uses, sharing its invariant): an evicted season's
+    OLD completion may be the only thing the parent's stamp records, and eviction
+    itself deliberately never clears it (a reclaimed file is not an un-completion
+    -- the show's first completion remains a historical fact while the show sits
+    settled). But the moment the operator RE-REQUESTS that season, a stale stamp
+    becomes a trap: ``stamp_completed_at_if_unset``'s ``IS NULL`` guard means the
+    re-import could never re-stamp, exactly the #76 gap at the eviction re-arm
+    entrance. The heal clears the stamp ONLY when no genuinely-imported
+    ``completed``/``available`` sibling still backs it (e.g. S1 evicted + S2
+    pending -> cleared, so S1's re-import re-stamps; S2 imported-and-done ->
+    preserved, the first-completion fact is still true). Gated to the re-arm case
+    -- plain creations never touch the stamp, keeping the R5 rule that request
+    time NEVER records a completion.
+
+    The evicted -> ``available`` re-arm (Plex still reports the season present)
+    clears the stamp too (Codex round-3): the season's PRE-EVICTION ``imported``
+    ``Download`` row survives eviction (eviction never mutates the downloads
+    aggregate), but the heal's download-evidence arm discounts any import with a
+    LATER ``evicted`` history event for the show -- so the re-armed season's
+    presence-derived ``available`` cannot resurrect a ``completed_at`` that no
+    current import supports, exactly matching how a Plex-present-only creation
+    never stamps.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
     )
     season_repo = SqlSeasonRequestRepository(session)
     records: list[SeasonRequestRecord] = []
+    re_armed_evicted = False
     for season_number in seasons:
         initial_status = (
             RequestStatus.available.value
@@ -308,8 +375,18 @@ async def ensure_seasons(
         record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
         if record.status == RequestStatus.evicted.value:
             await season_repo.set_status(record.id, initial_status)
+            # Mirrors ``reset_for_research``'s re-arm exactly (see the docstring
+            # above): a fresh request must not inherit the evicted run's
+            # breadcrumb or backoff state.
+            await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
+            await season_repo.clear_library_path(record.id)
             record = await season_repo.get(record.id) or record
+            re_armed_evicted = True
         records.append(record)
+    if re_armed_evicted:
+        # After the loop (not per season) so the heal sees every re-armed season's
+        # new status; see the docstring for why only a re-arm triggers it.
+        await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
     return records
 
@@ -500,6 +577,40 @@ async def reset_for_research(
     ``False`` when the purge failed/was refused (the season directory may still be on
     disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
     reclaim the orphan, never stranded with no handle (honesty over silence).
+
+    Also HEALS the PARENT'S ``completed_at`` (#76) against its remaining seasons.
+    Read against the movie path's own ``SqlRequestRepository.reset_for_research``,
+    which unconditionally nulls ``completed_at`` because a movie is a single row:
+    its completion claim is entirely invalidated the instant it is re-armed. A TV
+    parent's ``completed_at`` is a DIFFERENT thing -- not "this row's own
+    completion" but "the show's FIRST tracked season to complete" (a documented,
+    known approximation; see ``retention_telemetry_service._candidate_context``
+    and ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally
+    clearing it here would make the honest case (another season is STILL
+    genuinely complete/available, unaffected by this reset) regress to "unknown"
+    for no reason. So the stamp goes through
+    :meth:`SqlRequestRepository.heal_completed_at` (see its docstring for the
+    full contract), whose INVARIANT this function shares: after the reset,
+    ``completed_at`` is non-``NULL`` iff some tracked season GENUINELY completed
+    an import AND is still ``completed``/``available``. "Genuinely imported"
+    means the season has the ``library_path`` breadcrumb (written by
+    ``import_service._import_tv_locked`` in the SAME transaction as
+    ``mark_completed``) OR an ``imported`` ``Download`` row for its
+    ``(media_request_id, season)`` -- the latter covering LEGACY seasons imported
+    before the breadcrumb column existed (``models.SeasonRequest.library_path``),
+    and invalidated by any LATER ``evicted`` history event for the show (a
+    pre-eviction import is not current backing evidence -- see the heal's
+    docstring for the ``download_history`` ordering, Codex round-3).
+    A Plex-present-only season (``ensure_seasons``'s already-in-Plex creation:
+    ``available``, NO breadcrumb, no grab ever ran) matches neither and never
+    preserves a re-armed season's stale stamp (Codex P2 #1), so a redone season's
+    re-import can always re-stamp via ``stamp_completed_at_if_unset``'s ``IS
+    NULL`` guard. The predicate lives ONLY in the heal's own UPDATE ``WHERE``
+    clauses -- re-asserted at UPDATE time, never read here into a Python snapshot
+    (Codex P2 #2) -- and the heal's second (re-stamp) statement repairs the
+    masked-sibling aftermath where a concurrently-committed sibling completion
+    would otherwise be left stampless. The just-reset season is already flushed
+    to ``searching`` above, so the heal correctly sees it as no longer done.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
@@ -511,26 +622,44 @@ async def reset_for_research(
     await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
+    await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
 
 
 async def mark_no_acceptable_release(
     session: AsyncSession, *, media_request_id: int, season_number: int
-) -> None:
+) -> bool:
     """Persist ``no_acceptable_release`` on one season when a grab finds nothing.
 
     The season-level analogue of ``request_service.mark_no_acceptable_release``:
     honesty over silence (a visible, retryable status, never a silent
-    ``downloading``/``searching`` left lying), and the SAME never-un-terminate
-    guard -- a season already FINISHED (``completed`` / ``available`` / ``failed``)
-    is left untouched, so a stale search-exhausted signal can never resurrect a
-    finished season as a dedup-blocking ghost.
+    ``downloading``/``searching`` left lying), and now the SAME genuine
+    compare-and-swap (issue #72) -- see that function's docstring for the full
+    TOCTOU this closes (a concurrent grab winning the race between an old
+    read-then-write's read and its write, and being silently regressed back to
+    this dead-end). Delegates to :func:`set_status_if_in` (this module's CAS
+    wrapper, which also recomputes the parent rollup, but ONLY when the swap
+    actually happened) with ``_PARKABLE_SEASON_STATUS_VALUES`` as
+    ``allowed_from`` -- see that constant's comment for exactly which statuses
+    (every TERMINAL one, plus ``downloading`` / ``import_blocked``) a parking
+    transition must never stomp.
+
+    FLUSH-ONLY (module convention): the caller commits.
+
+    Returns ``True`` if this call actually parked the season, ``False`` if a
+    concurrent writer already moved it out of the parkable set -- the caller
+    must treat ``False`` as "leave it alone, do not also write backoff
+    metadata for a park that did not happen" (see
+    ``auto_grab_service._park``).
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
-    if row.status in _TERMINAL_SEASON_STATUS_VALUES:
-        return
-    await season_repo.set_status(row.id, RequestStatus.no_acceptable_release.value)
-    await _recompute_parent(session, media_request_id)
+    return await set_status_if_in(
+        session,
+        media_request_id=media_request_id,
+        season_request_id=row.id,
+        status=RequestStatus.no_acceptable_release.value,
+        allowed_from=_PARKABLE_SEASON_STATUS_VALUES,
+    )

@@ -1,8 +1,11 @@
 """SetupGuardMiddleware — block the API until first-run setup completes.
 
 Until ``SystemSettings.initialized`` is True, only a small allowlist of paths is
-reachable (health, the setup endpoints, the docs, and ``/``). Every other path
-gets an API-appropriate ``409`` with ``{"detail": "setup_required",
+reachable: health, the setup sub-API, the AUTH sub-API (``/api/v1/auth``), the
+docs, and ``/``. Sign-in must work before init — it IS the first setup step: a
+fresh install is claimed by the first Plex server owner to sign in, so
+``/api/v1/auth`` cannot be gated behind the very init it establishes. Every other
+path gets an API-appropriate ``409`` with ``{"detail": "setup_required",
 "setup_path": "/setup"}`` — a machine-readable guard for the SPA, not a browser
 redirect.
 
@@ -36,8 +39,11 @@ __all__ = ["SETUP_ALLOWLIST_PATHS", "SETUP_ALLOWLIST_PREFIXES", "SetupGuardMiddl
 SETUP_ALLOWLIST_PATHS: frozenset[str] = frozenset(
     {"/", "/health", "/docs", "/redoc", "/openapi.json"}
 )
-# Path prefixes always reachable pre-init (the whole setup sub-API).
-SETUP_ALLOWLIST_PREFIXES: tuple[str, ...] = ("/api/v1/setup",)
+# Path prefixes always reachable pre-init: the whole setup sub-API AND the auth
+# sub-API. Sign-in must work before init — it IS the first setup step (the first
+# Plex server owner to sign in claims the install), so it can't sit behind the
+# 409 the way the rest of ``/api/`` does.
+SETUP_ALLOWLIST_PREFIXES: tuple[str, ...] = ("/api/v1/setup", "/api/v1/auth")
 
 
 def _is_allowed(path: str) -> bool:
@@ -49,7 +55,8 @@ def _is_allowed(path: str) -> bool:
     # The SPA shell, its hashed assets, and client-side routes (e.g. ``/setup``,
     # ``/queue``) carry no secrets and must render before first-run setup so the
     # wizard is reachable. Only the protected API is gated pre-init: everything
-    # under ``/api/`` except the setup sub-API (allowed above) still gets the 409.
+    # under ``/api/`` except the setup and auth sub-APIs (allowed above) still
+    # gets the 409.
     return not path.startswith("/api/")
 
 

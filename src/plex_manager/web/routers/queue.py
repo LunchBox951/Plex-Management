@@ -47,7 +47,7 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_session,
     get_tv_root_optional,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.routers.search_preview import run_preview
 from plex_manager.web.schemas import (
@@ -63,7 +63,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/queue",
     tags=["queue"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 _QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -213,19 +213,26 @@ async def grab_endpoint(
             request.id, season=body.season
         )
         if active is None:
+            # Both services are FLUSH-ONLY -- a genuine compare-and-swap (issue
+            # #72), not read-then-write -- so this caller owns the commit boundary
+            # for both branches uniformly, and commits ONLY when the CAS actually
+            # won: a concurrent writer that already moved the row out of the
+            # parkable set (e.g. a racing grab landed it on ``downloading``
+            # between the ``find_active_for_request`` re-check above and this
+            # write) is left alone rather than silently regressed.
             if body.season is not None:
                 # TV: record the dead-end on the SEASON so it is visible + retryable
                 # per season, and let the parent MediaRequest.status stay a computed
-                # rollup (never a direct write _recompute_parent would clobber). The
-                # season service is FLUSH-ONLY by contract, so this caller owns the
-                # commit boundary (request_service.mark_no_acceptable_release, the
-                # movie path, commits internally instead).
-                await season_request_service.mark_no_acceptable_release(
+                # rollup (never a direct write _recompute_parent would clobber).
+                parked = await season_request_service.mark_no_acceptable_release(
                     session, media_request_id=request.id, season_number=body.season
                 )
+            else:
+                parked = await request_service.mark_no_acceptable_release(session, request.id)
+            if parked:
                 await session.commit()
             else:
-                await request_service.mark_no_acceptable_release(session, request.id)
+                await session.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)
