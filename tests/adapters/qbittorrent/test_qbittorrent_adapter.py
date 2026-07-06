@@ -1069,6 +1069,33 @@ async def test_add_invalid_base32_btih_magnet_raises_source_error() -> None:
     assert PASSWORD not in str(exc_info.value)
 
 
+async def test_add_non_ascii_btih_magnet_raises_source_error() -> None:
+    """A 32-char ``btih`` containing NON-ASCII text (e.g. percent-decoded invalid
+    bytes from an indexer magnet) makes ``b32decode`` raise a PLAIN ``ValueError``
+    ("string argument should contain only ASCII characters"), not
+    ``binascii.Error`` — it must land in the same typed taxonomy, never escape as
+    an unhandled 500 / out-of-taxonomy failure."""
+    bad_b32 = "é" * 32  # non-ASCII: plain ValueError before the alphabet check
+    bad_magnet = f"magnet:?xt=urn:btih:{bad_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_short_decoding_padded_btih_magnet_raises_source_error() -> None:
+    """Padding tricks ("A"*31 + "=") b32decode "successfully" — to 19 bytes. The
+    resulting 38-char "hex hash" could never match qBittorrent's 40-char snapshot
+    (ClientMissing forever), so a decode that is not exactly 20 bytes is the same
+    malformed source and must raise the typed error, not return a bogus hash."""
+    padded_b32 = "A" * 31 + "="  # decodes to 19 bytes, not a 20-byte info-hash
+    bad_magnet = f"magnet:?xt=urn:btih:{padded_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
 async def test_transport_outage_raises_qbittorrent_error() -> None:
     """qBittorrent unreachable (connection error) surfaces a wrapped, retryable
     QbittorrentError — never an opaque httpx error -> 500."""

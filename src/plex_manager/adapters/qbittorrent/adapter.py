@@ -31,7 +31,6 @@ HTTP->magnet redirect walker, and the 409-as-success behaviour.
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import ipaddress
 import json
@@ -227,10 +226,20 @@ def _normalize_btih(value: str) -> str:
     """
     if len(value) == 32:
         try:
-            # b32decode raises binascii.Error (a ValueError subclass) on bad input.
-            return base64.b32decode(value.upper()).hex()
-        except binascii.Error as exc:
+            # b32decode raises binascii.Error (a ValueError subclass) on
+            # non-alphabet input, but a non-ASCII value raises a PLAIN
+            # ValueError before the alphabet is even checked — catch the
+            # base class so both malformed shapes stay in the taxonomy.
+            decoded = base64.b32decode(value.upper())
+        except ValueError as exc:
             raise QbittorrentSourceError("invalid base32 btih in magnet source") from exc
+        # Padding tricks ("A"*31 + "=") decode "successfully" to fewer than the
+        # 20 bytes a real info-hash has; the resulting short hex could never
+        # match qBittorrent's 40-char snapshot, so it is the same malformed
+        # source, not a hash.
+        if len(decoded) != 20:
+            raise QbittorrentSourceError("base32 btih decodes to a non-20-byte hash")
+        return decoded.hex()
     return value.lower()
 
 
