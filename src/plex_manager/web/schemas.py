@@ -43,8 +43,7 @@ __all__ = [
     "LogsResponse",
     "LogsTailResponse",
     "PlexLibraryOption",
-    "PlexLoginCompleteRequest",
-    "PlexLoginStartResponse",
+    "PlexSignInRequest",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -190,24 +189,19 @@ class ServiceValidateResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Browser authentication — Plex hosted sign-in
+# Browser authentication — Plex sign-in
 # --------------------------------------------------------------------------- #
-class PlexLoginStartResponse(BaseModel):
-    """A pending Plex PIN login challenge."""
+class PlexSignInRequest(BaseModel):
+    """A browser-obtained plex.tv token to verify server-side (``POST /auth/plex``).
+
+    The browser ran the plex.tv PIN flow itself; the backend re-derives identity
+    and server ownership from this token before writing any user or session, so
+    the token is never trusted for its claims — only used to call plex.tv.
+    """
 
     model_config = ConfigDict(frozen=True)
 
-    state: str
-    auth_url: str
-    expires_at: datetime
-
-
-class PlexLoginCompleteRequest(BaseModel):
-    """Complete a pending Plex PIN login challenge."""
-
-    model_config = ConfigDict(frozen=True)
-
-    state: str
+    auth_token: str
 
 
 class AuthUser(BaseModel):
