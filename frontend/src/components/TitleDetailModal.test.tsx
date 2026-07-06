@@ -923,3 +923,148 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     expect(screen.getByRole('button', { name: /request again/i })).toBeInTheDocument()
   })
 })
+
+describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
+  const EMPTY_PREVIEW: SearchPreviewResponse = {
+    accepted: [],
+    rejected: [],
+    no_acceptable_release: true,
+  }
+
+  function created(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 31,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'pending',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  function baseMocks() {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(mutation(EMPTY_PREVIEW))
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  }
+
+  // Click through the confirm dialog: the opener and the dialog's confirm button
+  // share the "Re-acquire" name (same pattern as the cancel-request test above),
+  // so the LAST one is the dialog's.
+  async function confirmReacquire() {
+    fireEvent.click(screen.getByRole('button', { name: /^re-acquire$/i }))
+    expect(screen.getByText('Re-acquire this title?')).toBeInTheDocument()
+    const buttons = screen.getAllByRole('button', { name: /^re-acquire$/i })
+    fireEvent.click(buttons[buttons.length - 1]!)
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    baseMocks()
+  })
+
+  it('replaces Request with Re-acquire on a presence-only owned movie and force-creates', async () => {
+    // Owned per the Plex projection (library_state 'available') but NO tracked
+    // request row at all: "Request" would short-circuit straight back to a
+    // terminal available row with no grab, so the honest verb is Re-acquire.
+    const createMutation = mutation(created())
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, library_state: 'available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: /^re-acquire$/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
+
+    await confirmReacquire()
+    await waitFor(() =>
+      expect(createMutation.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 42,
+        media_type: 'movie',
+        force: true,
+      }),
+    )
+  })
+
+  it('offers Re-acquire beside report-issue on an available movie request and force-creates', async () => {
+    // A tracked request already sits terminal `available` — the stale phantom row.
+    // Re-acquire never re-arms it: the force-create makes a FRESH pending row.
+    const createMutation = mutation(created())
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [created({ id: 7, status: 'available' })] },
+    })
+
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, library_state: 'available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    // The available zone shows both verbs for an admin.
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+
+    await confirmReacquire()
+    await waitFor(() =>
+      expect(createMutation.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 42,
+        media_type: 'movie',
+        force: true,
+      }),
+    )
+  })
+
+  it('never offers Re-acquire for a TV title (movie-only; report-issue covers tv)', () => {
+    // An available tv season: report-issue is the per-season re-acquisition verb,
+    // so the movie-only Re-acquire button must NOT appear.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          {
+            id: 20,
+            tmdb_id: 100,
+            media_type: 'tv',
+            title: 'Test Show',
+            status: 'available',
+            is_anime: false,
+            keep_forever: false,
+            seasons: [{ season_number: 1, status: 'available' }],
+          } satisfies RequestResponse,
+        ],
+      },
+    })
+
+    render(
+      <TitleDetailModal
+        title={{
+          media_type: 'tv',
+          tmdb_id: 100,
+          title: 'Test Show',
+          year: 2022,
+          library_state: 'available',
+        }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^re-acquire$/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+  })
+})

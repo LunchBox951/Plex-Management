@@ -2115,3 +2115,203 @@ async def test_available_race_collapse_claims_ownerless_winner(
     assert len(rows) == 1  # the user's duplicate was collapsed away
     assert rows[0].user_id == claimer_id  # winner ADOPTED, not left ownerless-and-hidden
     assert rows[0].status is RequestStatus.available
+
+
+# --------------------------------------------------------------------------- #
+# Re-acquire (issue #131): force=True bypasses the movie in-library short-       #
+# circuit while every OTHER dedup/ownership guard runs unchanged.               #
+# --------------------------------------------------------------------------- #
+
+
+async def test_force_create_bypasses_in_library_short_circuit_creates_pending(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The headline case: Plex still reports the movie present (its file was
+    deleted out-of-band), but ``force=True`` skips the already-in-library
+    short-circuit entirely -- a real 'pending' request is created, not a terminal
+    'available' one. Contrast with the SAME inputs minus ``force`` (a different
+    tmdb id, same library), which still takes the normal short-circuit."""
+    tmdb = FakeTmdb(
+        movies={
+            999: MovieMetadata(tmdb_id=999, title="Ghost Movie", year=2019),
+            998: MovieMetadata(tmdb_id=998, title="Normal Movie", year=2019),
+        }
+    )
+    library = FakeLibrary(available={999, 998})
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request_result(
+            session, tmdb, tmdb_id=999, media_type="movie", library=library, force=True
+        )
+    assert result.created is True
+    assert result.record.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 999)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].status is RequestStatus.pending
+
+    # Contrast: identical library presence, but no ``force`` -- the normal
+    # already-in-library short-circuit still fires.
+    async with sessionmaker_() as session:
+        contrast = await request_service.create_request_result(
+            session, tmdb, tmdb_id=998, media_type="movie", library=library, force=False
+        )
+    assert contrast.record.status == RequestStatus.available.value
+
+
+async def test_force_create_alongside_stale_available_row_keeps_both(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A force-create never re-arms or replaces a stale terminal 'available' row --
+    it inserts a NEW 'pending' row alongside it (mirrors
+    ``test_removed_then_reacquired_yields_a_second_available_row``). The old row
+    survives untouched, and ``find_active`` now resolves to the new pending one."""
+    tmdb = FakeTmdb(movies={997: MovieMetadata(tmdb_id=997, title="Phantom", year=2018)})
+    library = FakeLibrary(available={997})
+
+    async with sessionmaker_() as session:
+        stale = await request_service.create_request(
+            session, tmdb, tmdb_id=997, media_type="movie", library=library
+        )
+    assert stale.status == RequestStatus.available.value
+
+    # Plex still hasn't rescanned -- library still reports it present -- but the
+    # operator asserts it's gone and force-reacquires.
+    async with sessionmaker_() as session:
+        result = await request_service.create_request_result(
+            session, tmdb, tmdb_id=997, media_type="movie", library=library, force=True
+        )
+    assert result.created is True
+    assert result.record.id != stale.id
+    assert result.record.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 997)))
+            .scalars()
+            .all()
+        )
+    statuses = sorted((r.id, r.status) for r in rows)
+    assert statuses == sorted(
+        [(stale.id, RequestStatus.available), (result.record.id, RequestStatus.pending)]
+    )
+
+    async with sessionmaker_() as session:
+        active = await SqlRequestRepository(session).find_active(997, "movie")
+    assert active is not None and active.id == result.record.id
+
+
+async def test_force_create_rejects_foreign_owned_active_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The ownerless-claim/ownership invariant (#58) holds on the force path too:
+    ``force`` only skips the movie in-library short-circuit -- the UNCHANGED
+    ``find_active`` dedup (and its ownership decision) still runs first, so a
+    non-admin force-creating onto another user's active request still gets the
+    honest 409, never the foreign row."""
+    owner_id = await _make_user(sessionmaker_, username="force-owner")
+    intruder_id = await _make_user(sessionmaker_, username="force-intruder")
+    tmdb = FakeTmdb(movies={996: MovieMetadata(tmdb_id=996, title="Owned", year=2021)})
+    library = FakeLibrary(available={996})
+
+    async with sessionmaker_() as session:
+        await request_service.create_request(
+            session, tmdb, tmdb_id=996, media_type="movie", user_id=owner_id
+        )
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request_result(
+                session,
+                tmdb,
+                tmdb_id=996,
+                media_type="movie",
+                user_id=intruder_id,
+                actor_is_admin=False,
+                force=True,
+                library=library,
+            )
+
+
+async def test_force_create_dedups_onto_own_active_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Active-slot uniqueness holds on the force path: a second ``force=True`` call
+    for the SAME user's already-active request returns the existing row
+    (``created is False``), never a duplicate active row for the same media."""
+    owner_id = await _make_user(sessionmaker_, username="force-self")
+    tmdb = FakeTmdb(movies={995: MovieMetadata(tmdb_id=995, title="Mine", year=2021)})
+    library = FakeLibrary(available={995})
+
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=995, media_type="movie", user_id=owner_id
+        )
+    assert first.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request_result(
+            session,
+            tmdb,
+            tmdb_id=995,
+            media_type="movie",
+            user_id=owner_id,
+            actor_is_admin=False,
+            force=True,
+            library=library,
+        )
+    assert result.created is False
+    assert result.record.id == first.id
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 995)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # no duplicate active row fabricated
+
+
+async def test_force_create_claims_ownerless_active_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The ownerless-claim invariant holds on the force path: a non-admin
+    ``force=True`` create dedups onto (and ADOPTS) an existing OWNERLESS active
+    request rather than 409-ing or fabricating a duplicate."""
+    claimer_id = await _make_user(sessionmaker_, username="force-claimer")
+    tmdb = FakeTmdb(movies={994: MovieMetadata(tmdb_id=994, title="Nobody's", year=2021)})
+    library = FakeLibrary(available={994})
+
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=994, media_type="movie", user_id=None
+        )
+    assert ownerless.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request_result(
+            session,
+            tmdb,
+            tmdb_id=994,
+            media_type="movie",
+            user_id=claimer_id,
+            actor_is_admin=False,
+            force=True,
+            library=library,
+        )
+    assert result.created is False
+    assert result.record.id == ownerless.id
+    assert result.record.user_id == claimer_id  # claimed, not rejected
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 994)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1

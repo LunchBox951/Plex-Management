@@ -451,6 +451,7 @@ async def create_request(
     actor_is_admin: bool = False,
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
+    force: bool = False,
 ) -> RequestRecord:
     """Create a request and return only the request read model."""
     result = await create_request_result(
@@ -462,6 +463,7 @@ async def create_request(
         actor_is_admin=actor_is_admin,
         library=library,
         seasons=seasons,
+        force=force,
     )
     return result.record
 
@@ -476,6 +478,7 @@ async def create_request_result(
     actor_is_admin: bool = False,
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
+    force: bool = False,
 ) -> CreateRequestResult:
     """Create (or return the existing active) media request for this media.
 
@@ -489,6 +492,18 @@ async def create_request_result(
     short-circuiting the search/grab — a visible "already in your library" record,
     not a wasted grab. An unconfigured/unreachable Plex skips the check (see
     :func:`_already_in_library`).
+
+    Re-acquire (issue #131): when ``force`` is True the movie already-in-library
+    short-circuit above is SKIPPED, so a title Plex still reports present (its
+    file was deleted/replaced out-of-band) yields a fresh ``pending`` request that
+    searches/grabs, rather than a terminal ``available`` row with no grab. Every
+    OTHER guard is preserved: the ``find_active`` active-request dedup (and its
+    ownership / ownerless-claim decisions) runs unchanged before ``force`` is even
+    consulted, so a foreign active request is still 409'd and a duplicate active
+    row for this media is impossible (``uq_media_requests_active`` still applies
+    to the inserted ``pending`` row). ``force`` is **movie-only**; it is ignored
+    for a ``tv`` request -- per-season re-acquisition of a presence-only season is
+    the report-issue verb's job (see ``correction_service.report_issue``).
 
     For a tv ``media_type``, ``season_request_service.ensure_seasons`` runs on
     EVERY call -- including the dedup (early-return) path -- for ``seasons``
@@ -578,6 +593,7 @@ async def create_request_result(
     if (
         library is not None
         and media_type == "movie"
+        and not force
         and await _already_in_library(library, tmdb_id)
     ):
         # Dedup the available short-circuit: if this movie is already recorded as
@@ -587,6 +603,11 @@ async def create_request_result(
         # cannot let two concurrent transactions both miss each other's uncommitted
         # terminal row. A movie REMOVED from Plex reads not-available above and falls
         # through to a normal pending request, so re-requests still work.
+        #
+        # ``force`` (issue #131, re-acquire): skips this ENTIRE short-circuit,
+        # including the Plex round-trip in ``_already_in_library`` -- an operator
+        # who already knows the file is gone shouldn't pay for (or risk racing) a
+        # presence check whose answer they are about to override anyway.
         await repo.acquire_media_lock(tmdb_id, media_type)
         # Re-read the ACTIVE row UNDER the lock: our find_active at the top ran
         # before the lock, so a concurrent re-request for the same just-evicted

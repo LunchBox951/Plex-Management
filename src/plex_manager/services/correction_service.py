@@ -312,9 +312,15 @@ class MediaRootUnavailableError(Exception):
     existed lives under ``movies_root``/``tv_root``. Raised when that owning root
     is unmounted/empty, when the breadcrumb sits under NONE of the configured
     roots (an honest, correctable refusal rather than a silent blocklist+re-grab
-    against a file we cannot locate to purge), and when a NO-breadcrumb row's
-    media-type-appropriate fallback root is unset/unmounted (see the failsafe
-    comment in :func:`report_issue`).
+    against a file we cannot locate to purge), and when a NO-breadcrumb row that
+    HAS a culprit download's media-type-appropriate fallback root is unset/
+    unmounted (see the failsafe comment in :func:`report_issue`).
+
+    Issue #131: a row with NEITHER a breadcrumb NOR a culprit download is purely
+    presence-derived (recorded available straight from Plex) -- there is nothing
+    of ours to protect, so the fallback check is SKIPPED for it and this error is
+    never raised on its account; see the reacquire relaxation in
+    :func:`report_issue`.
     """
 
     def __init__(self, request_id: int, root_path: str | None) -> None:
@@ -510,6 +516,18 @@ async def report_issue(
     if active_sibling is not None and active_sibling.id != request_id:
         raise ActiveDuplicateError(request_id, active_sibling.id)
 
+    # Resolve the culprit release from the IMPORTED download for (request, season) --
+    # the row that actually placed the file being reported (and whose torrent still
+    # hardlink-seeds it), never merely the newest attempt: a season already available
+    # can carry a NEWER supplementary/failed row over the older imported one, and
+    # blocklisting/removing that would leave the real seed untouched so the purge frees
+    # nothing (ADR-0014). ``None`` when the title was recorded available straight from
+    # Plex (no download of ours) -- the blocklist/remove steps below are then skipped.
+    # Resolved here, BEFORE the Foot-gun failsafe below, because the failsafe's
+    # no-breadcrumb fallback needs to know whether there is a culprit to protect.
+    download_repo = SqlDownloadRepository(session)
+    culprit = await download_repo.find_latest_imported_for_request(request_id, season=target.season)
+
     # Foot-gun failsafe (ADR-0015 fix): refuse if the breadcrumb's own root is
     # unmounted/empty (see MediaRootUnavailableError). The root to verify is DERIVED
     # from the stored ``library_path`` -- the DEEPEST configured root containing it
@@ -522,18 +540,27 @@ async def report_issue(
     # Checked BEFORE any blocklist/remove/flip so a missing drive aborts the whole
     # verb rather than firing against content that is not really gone.
     #
-    # A row with NO breadcrumb (a title recorded available straight from Plex, or one
-    # predating the library_path column) has no path to derive an owner from, so the
-    # failsafe falls back to the media-type-appropriate root (the anime root for an
-    # is_anime row when configured, else the normal root -- the pre-fix pick, and the
-    # same root the file most plausibly lives under). Skipping the check entirely
-    # would let a report against an unmounted library blocklist + re-grab a duplicate
-    # of a file that is still really there once the drive returns.
+    # A row with NO breadcrumb but a CULPRIT download (a legacy row predating the
+    # library_path column, whose torrent may still hardlink-seed the file) has no
+    # path to derive an owner from, so the failsafe falls back to the media-type-
+    # appropriate root (the anime root for an is_anime row when configured, else the
+    # normal root -- the pre-fix pick, and the same root the file most plausibly
+    # lives under). Skipping the check entirely would let a report against an
+    # unmounted library blocklist the good release and re-grab a duplicate of a file
+    # that is still really there once the drive returns.
+    #
+    # Issue #131 relaxation: a row with NEITHER a breadcrumb NOR a culprit is
+    # PURELY presence-derived (recorded available straight from Plex; nothing of
+    # ours ever placed it). There is nothing to blocklist (culprit is None) and
+    # nothing to purge (no breadcrumb), so an unmounted fallback root protects no
+    # file of ours -- the mount check is SKIPPED and the verb proceeds straight to
+    # the honest re-arm + re-search reacquire semantics instead of a confusing 409
+    # dead-end (the operator has no file of ours to lose either way).
     if target.library_path is not None:
         check_root = deepest_containing_root(target.library_path, roots.configured())
         if check_root is None or not await asyncio.to_thread(_root_is_mounted, check_root):
             raise MediaRootUnavailableError(request_id, check_root or target.library_path)
-    else:
+    elif culprit is not None:
         fallback_root = roots.fallback_for(request.media_type, is_anime=request.is_anime)
         if not await asyncio.to_thread(_root_is_mounted, fallback_root):
             raise MediaRootUnavailableError(request_id, fallback_root)
@@ -542,16 +569,6 @@ async def report_issue(
     media_type = "tv" if is_tv else "movie"
     season_note = f" season {target.season}" if target.season is not None else ""
     log_extra: dict[str, object] = {"request_id": safe_int(request_id), "tmdb_id": request.tmdb_id}
-
-    # Resolve the culprit release from the IMPORTED download for (request, season) --
-    # the row that actually placed the file being reported (and whose torrent still
-    # hardlink-seeds it), never merely the newest attempt: a season already available
-    # can carry a NEWER supplementary/failed row over the older imported one, and
-    # blocklisting/removing that would leave the real seed untouched so the purge frees
-    # nothing (ADR-0014). ``None`` when the title was recorded available straight from
-    # Plex (no download of ours) -- the blocklist/remove steps below are then skipped.
-    download_repo = SqlDownloadRepository(session)
-    culprit = await download_repo.find_latest_imported_for_request(request_id, season=target.season)
 
     # (a) blocklist the culprit release (nothing to blocklist if the title was
     # recorded available straight from Plex, with no download of ours). A REVERSIBLE
