@@ -70,7 +70,7 @@ from plex_manager.web.deps import (
     get_reconcile_status,
     get_session,
     get_tv_root_optional,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.schemas import (
     AutograbStatusItem,
@@ -97,7 +97,7 @@ _logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/v1/ops",
     tags=["ops"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 # Internal safety bounds — NOT web-editable settings: these guard the export

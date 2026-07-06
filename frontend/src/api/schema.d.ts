@@ -4,6 +4,70 @@
  */
 
 export interface paths {
+    "/api/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout Endpoint
+         * @description Revoke the current Plex browser session and clear auth cookies.
+         */
+        post: operations["logout_endpoint_api_v1_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Me Endpoint
+         * @description Return current auth state without requiring auth.
+         */
+        get: operations["me_endpoint_api_v1_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/plex": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Plex Sign In Endpoint
+         * @description Verify a browser-obtained plex.tv token and mint a session.
+         *
+         *     The browser ran the plex.tv PIN flow itself; this endpoint never trusts its
+         *     claims — identity and server ownership are re-derived server-side from
+         *     plex.tv's v2 API before any user or session row is written.
+         */
+        post: operations["plex_sign_in_endpoint_api_v1_auth_plex_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/blocklist": {
         parameters: {
             query?: never;
@@ -589,6 +653,66 @@ export interface paths {
          *     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
          *     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
          *
+         *     Repointing Plex is VERIFIED before it is committed. The
+         *     ``plex_machine_identifier`` snapshot (:data:`PLEX_MACHINE_ID_SETTING`) is the
+         *     id post-init sign-in trusts to admit users, so when this PUT actually CHANGES
+         *     the effective ``plex_url``/``plex_token`` the full verification ladder in
+         *     :func:`_verify_plex_repoint` runs FIRST: the REPLACEMENT server's
+         *     ``/identity`` derive, then an AUTHENTICATED ``list_sections`` check with the
+         *     effective token (``/identity`` is unauthenticated, so reachability alone
+         *     would bless a wrong/revoked token), then — for Plex-SESSION callers — the
+         *     wizard's ownership assertion. The same code paths ``/setup/complete`` and
+         *     ``/setup/validate/plex`` use, resolving a masked/omitted token to the stored
+         *     real one. Only a server that passes gets committed: the settings are
+         *     written, the freshly DERIVED id replaces the cached one (better than
+         *     clearing it — it was just derived, so sign-in never needs a per-request
+         *     re-probe), and every active browser session is revoked. Any verification
+         *     failure is its honest envelope (502 unreachable, 422 ``plex_token_invalid``,
+         *     403 ``server_not_owned``) with NOTHING committed and every session intact —
+         *     a typo'd url or wrong credential must not both break sign-in AND sign
+         *     everyone out, which would leave a keyless install recoverable only by DB
+         *     surgery (the exact never-locked-out violation ADR-0005 forbids).
+         *
+         *     OWNERSHIP asymmetry — honestly documented: a Plex-SESSION admin has a Plex
+         *     account with a stored OAuth token, so the derived id is asserted against
+         *     their OWN plex.tv resources (403 ``server_not_owned`` otherwise) BEFORE
+         *     committing/revoking — without it, repointing to a valid but NON-owned server
+         *     would revoke everyone and the admin's next sign-in resolves NON-admin
+         *     against the new id: a keyless install locked out of Settings. An
+         *     ``X-Api-Key`` (or dev-bypass) caller has NO Plex account to assert with, so
+         *     its bar is reachability + the authenticated-token check ONLY: an api-key
+         *     repoint to a reachable, token-accepting but non-owned server remains
+         *     possible. That residual is accepted and recoverable BY CONSTRUCTION — the
+         *     api key that made the change keeps working (session revocation never touches
+         *     api-key auth), so the same key can always repoint back. Ownership continues
+         *     to gate who can SIGN IN (and who is admin), which the freshly derived
+         *     machine id anchors to the NEW server (ADR-0016).
+         *
+         *     Why sessions are revoked on a verified repoint: clearing/replacing the id
+         *     alone only changes how FUTURE sign-ins resolve server access; an
+         *     already-minted :class:`AuthSession` keeps authorizing against its persisted
+         *     ``User.permissions`` for up to 30 days, so the OLD server's users (and
+         *     admins) would silently survive the repoint. A repoint is an auth-domain
+         *     change (ADR-0016 derives every session's authority from access to THE
+         *     configured server), so everyone — including the admin performing the
+         *     repoint — must re-sign-in and be re-evaluated against the NEW server. The
+         *     self-lockout is deliberate and honest, not collateral damage: this request
+         *     already passed auth at dependency time, so the response completes normally
+         *     for the now-revoked session, and the admin's very next request
+         *     re-authenticates against a server this PUT just PROVED is answering.
+         *     Revocation stamps ``revoked_at`` on rows where it is NULL (the model's
+         *     auditable-revoke convention) rather than deleting; API-key auth is
+         *     untouched, so the ``X-Api-Key`` recovery path still works throughout.
+         *
+         *     An UNVERIFIABLE identity change — the effective pair is incomplete (a
+         *     half-configured install, or an explicit ``""`` clear) — cannot be probed:
+         *     the write proceeds, the STALE cached id is dropped (nothing may keep
+         *     anchoring sign-in to the old server), but sessions are NOT revoked. An
+         *     incomplete identity cannot mint new sign-ins anyway (an honest
+         *     ``service_not_configured``), and revoking on a half-configured install is
+         *     the same lockout trap the probe exists to prevent; the PUT that completes
+         *     the pair is a verified repoint and revokes then.
+         *
          *     After a successful commit, invalidates (issue #93) the cached ``GET /health``
          *     probe for every subsystem whose credential field(s) were ACTUALLY persisted
          *     this call (see :data:`_SUBSYSTEM_CREDENTIAL_FIELDS`) — tracked separately from
@@ -596,9 +720,13 @@ export interface paths {
          *     unchanged) or a secret sent back as the ``"***"`` mask (also a no-op); neither
          *     should invalidate anything, since nothing about that subsystem's config
          *     actually changed. Runs strictly AFTER ``session.commit()`` so a failed save
-         *     (a raised validation error above, or a DB error during the write loop/commit)
-         *     never touches the cache — a failed write must leave any still-valid cached
-         *     probe exactly as it was.
+         *     (a raised validation error above, a failed verification, or a DB error during
+         *     the write loop/commit) never touches the cache — a failed write must leave any
+         *     still-valid cached probe exactly as it was. This covers the Plex repoint path
+         *     too, with no special-casing: a verified (or unverifiable-but-written) repoint's
+         *     ``plex_url``/``plex_token`` land in ``written_fields`` exactly like any other
+         *     field, so the very next ``GET /health`` re-probes the NEW server instead of
+         *     serving a stale pre-repoint ``ok``/``down`` card.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
@@ -619,18 +747,40 @@ export interface paths {
          * Reveal App Key Endpoint
          * @description Return the current app ``X-Api-Key`` in plaintext.
          *
-         *     Authenticated: the caller already proved they hold a currently-valid key
-         *     (``require_api_key`` on the whole router), so this is not a privilege
-         *     escalation -- it is the break-glass recovery path for a NEW device/browser
-         *     that needs to be paired without re-running setup, and the belt-and-braces
-         *     answer to "I'm about to lose my only saved copy" (issue #28's OAuth-deferral
-         *     analysis: total key loss is the one genuine gap in keeping a static key for
-         *     the beta).
+         *     Authenticated: the caller already proved they have a valid Plex session or
+         *     app key, so this is not an anonymous disclosure -- it is the break-glass
+         *     recovery path for a NEW device/browser that needs to be paired without
+         *     re-running setup.
+         *
+         *     Setup mints no key, so a fresh install has none to reveal: that is an honest
+         *     ``app_key_not_set`` envelope (404) whose hint points the operator at the
+         *     Generate control, never a bare/opaque failure (north star #3).
          */
         get: operations["reveal_app_key_endpoint_api_v1_settings_app_key_get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Revoke App Key Endpoint
+         * @description Revoke the app ``X-Api-Key``: clear the stored key so none authenticates.
+         *
+         *     Every device holding the old key is locked out at once (``X-Api-Key`` auth
+         *     401s until a new key is generated); browser Plex-session auth is unaffected.
+         *     Idempotent -- revoking a keyless install is a no-op 204, since the end state is
+         *     the same either way.
+         *
+         *     Compare-and-swap, mirroring :func:`rotate_app_key_endpoint`: an EARLIER draft
+         *     loaded ``system`` then wrote ``None`` unconditionally, which lost the update
+         *     when a rotate committed a fresh key in between — a stale revoke (authenticated
+         *     against a now-superseded key) would wipe a key the operator had just rotated
+         *     to. Under ``_rotate_lock`` we re-read the stored key and, if it is non-null
+         *     and no longer the value THIS request observed (the presented ``X-Api-Key``
+         *     header for api-key auth, else the session-loaded value at auth time), 409
+         *     ``app_key_changed`` rather than clobber that rotation. A currently-null stored
+         *     key stays the idempotent 204 no-op (nothing to lose). The check is skipped
+         *     only under ``dev_auth_bypass`` (no authenticated key to compare against),
+         *     exactly like the rotate CAS and ``require_api_key`` itself.
+         */
+        delete: operations["revoke_app_key_endpoint_api_v1_settings_app_key_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -647,30 +797,73 @@ export interface paths {
         put?: never;
         /**
          * Rotate App Key Endpoint
-         * @description Mint a brand-new app ``X-Api-Key``, invalidating the old one, and return it once.
+         * @description Mint an app ``X-Api-Key`` -- GENERATE the first one, or ROTATE an existing key.
+         *
+         *     This is the sole mint path now that setup is keyless: when no key exists
+         *     (``app_api_key IS NULL``) it GENERATES the first key (the CAS below has nothing
+         *     to compare against, so it simply mints); when a key exists it ROTATES,
+         *     invalidating the old one. Both run under ``_rotate_lock`` and return the
+         *     plaintext exactly once.
          *
          *     Every OTHER device/browser with the OLD key saved (localStorage) is
          *     immediately locked out -- there is exactly one live key at a time, matching
-         *     ``require_api_key``'s single-key comparison. The frontend caller of this
-         *     endpoint MUST persist the returned key immediately so the session that just
-         *     rotated it survives (the new key is never shown again after this response).
+         *     ``require_api_key``'s single-key comparison. The frontend persists the
+         *     returned key immediately for future access-key recovery, but normal browser
+         *     auth continues to use the Plex session cookie.
          *
-         *     Compare-and-swap against concurrent rotations: two rotate requests carrying
-         *     the SAME old key can both clear ``require_api_key`` (each reads the old stored
-         *     value) before either commits. Without a guard the write that commits second
-         *     would silently overwrite the first's freshly minted key, so the client that
-         *     fired the first request would be left displaying an already-dead key. The
-         *     re-read/compare/mint/commit is run under the module-level ``_rotate_lock`` so it
-         *     is a true atomic read-modify-write rather than check-then-act: the compare and
-         *     the write cannot interleave with another rotation, so the loser's re-read runs
-         *     only AFTER the winner has committed. Inside THIS request's own transaction we
-         *     re-read the stored key and require it to still equal the key the request
-         *     authenticated with; if it has already changed, the race happened and we answer
-         *     409 (``app_key_changed``) rather than clobber the winner. The check is skipped
-         *     under ``dev_auth_bypass`` (there is no authenticated key to compare against),
-         *     exactly like ``require_api_key`` itself.
+         *     Compare-and-swap against concurrent rotations: two rotate requests can both
+         *     pass authentication against the OLD stored key (each request loads it before
+         *     either commits) regardless of HOW they authenticated — two api-key callers,
+         *     two Plex-SESSION admins, or a mix. Without a guard the write that commits
+         *     second would silently overwrite the first's freshly minted key, so the client
+         *     that fired the first request would be left displaying an already-dead key.
+         *     The re-read/compare/mint/commit is run under the module-level ``_rotate_lock``
+         *     so it is a true atomic read-modify-write rather than check-then-act: the
+         *     compare and the write cannot interleave with another rotation, so the loser's
+         *     re-read runs only AFTER the winner has committed. Inside THIS request's own
+         *     transaction we re-read the stored key and require it to still equal the key
+         *     this request OBSERVED — the presented ``X-Api-Key`` header for api-key auth,
+         *     else (session auth, which carries no key header) the stored value as loaded
+         *     at auth time. If it has already changed, the race happened and we answer 409
+         *     (``app_key_changed``) rather than clobber the winner. The CAS is deliberately
+         *     UNCONDITIONAL on auth method: gating it to api-key callers would let two
+         *     session-authenticated admins re-create the exact dead-key race it exists to
+         *     prevent. The check is skipped only under ``dev_auth_bypass`` (there is no
+         *     authenticated key to compare against), exactly like ``require_api_key``
+         *     itself.
+         *
+         *     The CAS also closes the revoke null-hole: a stored key that has become NULL
+         *     is the genuine first-key GENERATE only when this request ALSO observed null.
+         *     If this request observed a NON-null key that a concurrent REVOKE cleared
+         *     mid-flight, minting again would silently resurrect the revoked key, so it
+         *     409s too — a null stored value is not a blanket "nothing to compare, just
+         *     mint".
          */
         post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/app-key/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * App Key Status Endpoint
+         * @description Whether a recovery key currently exists, WITHOUT revealing it.
+         *
+         *     Lets Settings → Access render Generate (no key yet) vs Rotate/Revoke (a key is
+         *     present) without invoking the break-glass reveal. Admin-gated like every route
+         *     on this router; the plaintext key is never part of this response.
+         */
+        get: operations["app_key_status_endpoint_api_v1_settings_app_key_status_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -712,20 +905,69 @@ export interface paths {
         put?: never;
         /**
          * Complete
-         * @description Persist the validated creds, mint the app api key, mark initialized.
+         * @description Persist the validated creds + chosen server and mark the install initialized.
          *
-         *     One-shot AND concurrency-safe: rejected with 409 once initialized. Two
-         *     concurrent ``/complete`` calls can both pass an in-memory ``initialized`` check
-         *     and double-write (a ``settings.key`` unique-constraint 500, or one overwriting
-         *     the other's just-issued ``app_api_key``). To prevent that, initialization is
-         *     claimed with a CONDITIONAL update (``... WHERE id = 1 AND initialized = false``):
-         *     exactly one request flips the row, and the loser sees ``rowcount == 0`` and is
-         *     rejected 409 — so only the winner mints the key and writes the creds. Re-running
-         *     setup post-init would also let an unauthenticated caller overwrite every stored
-         *     credential and re-disclose the app key, so post-init changes must go through the
-         *     authenticated ``PUT /settings``.
+         *     Keyless: Plex sign-in is the only credential model, so nothing is minted or
+         *     disclosed here. One-shot AND concurrency-safe via a CONDITIONAL update
+         *     (``... WHERE id = 1 AND initialized = false``): exactly one caller flips the row;
+         *     a concurrent second sees ``rowcount == 0`` and is rejected 409, so it can neither
+         *     overwrite the stored creds nor re-claim the install. The claim sets ONLY
+         *     ``initialized``/``setup_completed_at`` — the pre-init sign-in already stamped
+         *     ``setup_started_at`` (deliberately never overwritten here).
+         *
+         *     The persisted machine identifier is RE-DERIVED here, never trusted from the
+         *     body. ``validate/plex`` asserts ownership of the server it probes, but that
+         *     proves nothing about what a direct API caller later POSTs to THIS endpoint:
+         *     pairing server-X's ``plex_url``/``plex_token`` with server-Y's machine id
+         *     would make post-init sign-in admit (and grant admin to) server-Y's audience
+         *     while the app actually operates server-X. So, in the same request that
+         *     persists it, the id is probed live from the SUBMITTED ``plex_url`` +
+         *     resolved token via the exact ``/identity`` code path ``validate/plex`` uses
+         *     (:meth:`PlexTvClient.fetch_server_identity`; an unreachable server is the
+         *     same honest 502 envelope), and the SAME ownership assertion
+         *     (:func:`assert_admin_owns_server`, 403 ``server_not_owned``) is re-checked
+         *     against the signed-in admin's own plex.tv resources. Only the re-derived id
+         *     is stored; ``body.plex_machine_identifier`` is advisory at most (the wizard
+         *     sends the matching one — a mismatch means the caller bypassed the wizard,
+         *     and the derived truth simply wins). Like the token resolution, all of this
+         *     runs BEFORE the claim, so a failed probe / foreign server can never leave a
+         *     half-claimed, credential-less row. Under ``dev_auth_bypass`` (dev only, no
+         *     Plex account exists to assert ownership with — the whole credential model is
+         *     already bypassed) the body id is stored as-is, exactly as the bypass skips
+         *     ``require_setup_admin`` itself.
+         *
+         *     The RESOLVED token is verified with an AUTHENTICATED call too
+         *     (:func:`assert_plex_token_authorized`): ``/identity`` is deliberately
+         *     unauthenticated, so the derivation alone would bless a reachable server
+         *     paired with a wrong/revoked ``plex_token`` — the install would flip
+         *     ``initialized`` yet every subsequent library call would fail. The wizard's
+         *     validate-first flow already proves its token via ``validate/plex``'s
+         *     ``list_sections``; this runs the SAME check inline so a direct API caller
+         *     (especially one supplying an explicit token override) meets an equally
+         *     strong bar. A rejected token is the 422 ``plex_token_invalid`` envelope,
+         *     before the claim — never a half-initialized install.
          */
         post: operations["complete_api_v1_setup_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/setup/plex/servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Plex Servers Endpoint
+         * @description List the signed-in admin's OWNED Plex servers with each connection probed.
+         */
+        get: operations["plex_servers_endpoint_api_v1_setup_plex_servers_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -741,12 +983,10 @@ export interface paths {
         };
         /**
          * Status
-         * @description Report install state only — never the app api key.
+         * @description Report install state + whether the optional pre-init hardening token applies.
          *
-         *     The key is revealed exactly once, in the ``/complete`` response (the SPA
-         *     persists it then). Re-serving it from this unauthenticated GET would hand any
-         *     anonymous caller the master ``X-Api-Key`` post-init, nullifying the entire
-         *     auth model, so ``app_api_key`` is always ``None`` here.
+         *     Unauthenticated so the SPA can decide whether to show the setup wizard and a
+         *     setup-token field. No app key is ever served (Plex sign-in is the credential).
          */
         get: operations["status_api_v1_setup_status_get"];
         put?: never;
@@ -768,7 +1008,12 @@ export interface paths {
         put?: never;
         /**
          * Validate Plex Endpoint
-         * @description Test candidate Plex credentials.
+         * @description Test a candidate Plex server AND assert the signed-in admin owns it.
+         *
+         *     The server is probed with the body's token override, or (the wizard's happy
+         *     path) the admin's stored OAuth token. Ownership is asserted against the SIGNED-IN
+         *     admin's plex.tv resources (always their own account), so a custom token can
+         *     never configure a server they do not own.
          */
         post: operations["validate_plex_endpoint_api_v1_setup_validate_plex_post"];
         delete?: never;
@@ -887,18 +1132,68 @@ export interface components {
         };
         /**
          * AppApiKeyResponse
-         * @description The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+         * @description The current (reveal) or freshly-minted (generate/rotate) app ``X-Api-Key``.
          *
-         *     Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
-         *     reveal is the belt-and-braces recovery path for a lost/forgotten key on a
-         *     device that still has it saved, and rotate mints and returns a brand-new key
-         *     ONCE — the plaintext is never retrievable again after this response, only the
-         *     Fernet-encrypted column at rest (matching the one-time disclosure setup's
-         *     ``/complete`` already gives the initial key).
+         *     Authenticated-only (Plex session or currently-valid ``X-Api-Key``). Setup mints
+         *     NO key — this is an OPT-IN recovery/automation credential the operator generates
+         *     on demand from Settings → Access. Reveal is the break-glass path for a key
+         *     lost/forgotten on a device that still has it saved; generate/rotate mints and
+         *     returns a brand-new key ONCE — the plaintext is never retrievable again after
+         *     this response, only the Fernet-encrypted column at rest.
          */
         AppApiKeyResponse: {
             /** App Api Key */
             app_api_key: string;
+        };
+        /**
+         * AppApiKeyStatusResponse
+         * @description Whether an app ``X-Api-Key`` recovery key currently exists — never the key.
+         *
+         *     Powers the Settings → Access control's Generate-vs-Rotate/Revoke choice
+         *     WITHOUT the break-glass reveal: ``exists`` is ``True`` once a key has been
+         *     generated (and not since revoked), ``False`` on a fresh keyless install (setup
+         *     mints nothing) or after a revoke. The plaintext is never serialized here.
+         */
+        AppApiKeyStatusResponse: {
+            /** Exists */
+            exists: boolean;
+        };
+        /**
+         * AuthMeResponse
+         * @description Current app authentication state.
+         */
+        AuthMeResponse: {
+            /** Auth Method */
+            auth_method?: ("api_key" | "plex_session" | "dev_bypass") | null;
+            /** Authenticated */
+            authenticated: boolean;
+            /**
+             * Is Admin
+             * @default false
+             */
+            is_admin: boolean;
+            user?: components["schemas"]["AuthUser"] | null;
+        };
+        /**
+         * AuthUser
+         * @description Current signed-in Plex user.
+         */
+        AuthUser: {
+            /** Avatar Url */
+            avatar_url?: string | null;
+            /** Email */
+            email?: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Is Admin
+             * @default false
+             */
+            is_admin: boolean;
+            /** Plex Id */
+            plex_id: number | null;
+            /** Username */
+            username: string;
         };
         /**
          * AutograbStatusItem
@@ -1110,6 +1405,29 @@ export interface components {
         ErrorDetail: {
             /** Detail */
             detail: string;
+        };
+        /**
+         * ErrorEnvelope
+         * @description Structured error body for auth/setup failures (north star #3).
+         *
+         *     The richer sibling of :class:`ErrorDetail`, rendered by
+         *     ``web.errors.install_error_handlers``. ``detail`` stays the stable machine
+         *     code the SPA's humanizer keys on; ``message``/``hint`` are operator-facing
+         *     prose; ``diagnostics`` carries only NON-secret context (host, status, ...) —
+         *     a secret NEVER appears here. ``hint``/``diagnostics`` are omitted from the
+         *     wire when absent, so a client reads their absence, not an empty value.
+         */
+        ErrorEnvelope: {
+            /** Detail */
+            detail: string;
+            /** Diagnostics */
+            diagnostics?: {
+                [key: string]: string;
+            } | null;
+            /** Hint */
+            hint?: string | null;
+            /** Message */
+            message: string;
         };
         /**
          * EvictErrorItem
@@ -1350,12 +1668,75 @@ export interface components {
             writable?: boolean | null;
         };
         /**
+         * PlexServerConnection
+         * @description One advertised address for an owned Plex server, with its probe verdict.
+         *
+         *     ``uri`` is the exact connection plex.tv reports (``local`` marks a LAN address;
+         *     ``relay`` a plex.tv relay). ``status`` is this backend's OWN reachability probe
+         *     of ``{uri}/identity`` — ``"ok"`` when it answered, ``"unreachable"`` when the
+         *     backend could not reach it (with ``error_code`` naming why). A dead connection
+         *     is surfaced honestly, never dropped, so the operator can pick a reachable one.
+         */
+        PlexServerConnection: {
+            /** Error Code */
+            error_code?: string | null;
+            /** Local */
+            local: boolean;
+            /** Relay */
+            relay: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "unreachable";
+            /** Uri */
+            uri: string;
+        };
+        /**
+         * PlexServerOption
+         * @description One of the signed-in admin's OWNED Plex servers, offered by the wizard.
+         */
+        PlexServerOption: {
+            /** Connections */
+            connections: components["schemas"]["PlexServerConnection"][];
+            /** Machine Identifier */
+            machine_identifier: string;
+            /** Name */
+            name: string;
+        };
+        /**
+         * PlexServersResponse
+         * @description The admin's owned Plex servers with each connection probed
+         *     (``GET /setup/plex/servers``).
+         */
+        PlexServersResponse: {
+            /** Servers */
+            servers: components["schemas"]["PlexServerOption"][];
+        };
+        /**
+         * PlexSignInRequest
+         * @description A browser-obtained plex.tv token to verify server-side (``POST /auth/plex``).
+         *
+         *     The browser ran the plex.tv PIN flow itself; the backend re-derives identity
+         *     and server ownership from this token before writing any user or session, so
+         *     the token is never trusted for its claims — only used to call plex.tv.
+         */
+        PlexSignInRequest: {
+            /** Auth Token */
+            auth_token: string;
+        };
+        /**
          * PlexValidateRequest
-         * @description Candidate Plex credentials to test (``POST /setup/validate/plex``).
+         * @description Candidate Plex server to test (``POST /setup/validate/plex``).
+         *
+         *     ``token`` is OPTIONAL: omitted (``None``) means "use the signed-in admin's
+         *     stored Plex OAuth token" — the wizard's happy path never re-types a token, it
+         *     only supplies ``url`` for a chosen (or custom) server. A non-null ``token`` is
+         *     the explicit custom-credential override.
          */
         PlexValidateRequest: {
             /** Token */
-            token: string;
+            token?: string | null;
             /** Url */
             url: string;
         };
@@ -1602,13 +1983,18 @@ export interface components {
          *     For Plex, ``libraries`` carries the movie AND tv library folders (each tagged
          *     by ``section_type``) so the UI can offer pick-lists for ``movies_root`` /
          *     ``tv_root`` instead of a typed path. ``None`` for every other service (and for
-         *     a failed Plex check).
+         *     a failed Plex check). ``machine_identifier`` is the probed Plex server's
+         *     ``machineIdentifier`` (from its ``/identity``) — set only when the caller asked
+         *     for the ownership-verifying variant of the Plex probe, so setup can assert
+         *     ownership and store the id; ``None`` otherwise.
          */
         ServiceValidateResponse: {
             /** Detail */
             detail?: string | null;
             /** Libraries */
             libraries?: components["schemas"]["PlexLibraryOption"][] | null;
+            /** Machine Identifier */
+            machine_identifier?: string | null;
             /** Message */
             message: string;
             /** Ok */
@@ -1751,8 +2137,10 @@ export interface components {
             anime_tv_root?: string | null;
             /** Movies Root */
             movies_root?: string | null;
+            /** Plex Machine Identifier */
+            plex_machine_identifier: string;
             /** Plex Token */
-            plex_token: string;
+            plex_token?: string | null;
             /** Plex Url */
             plex_url: string;
             /** Prowlarr Api Key */
@@ -1780,11 +2168,11 @@ export interface components {
         });
         /**
          * SetupStatusResponse
-         * @description Install state. ``app_api_key`` is populated only once initialized.
+         * @description Install state: whether setup is finished, and whether the optional pre-init
+         *     hardening token is required. No app key is ever minted or served — Plex sign-in
+         *     is the sole credential model (there is no one-time key to disclose).
          */
         SetupStatusResponse: {
-            /** App Api Key */
-            app_api_key?: string | null;
             /** Initialized */
             initialized: boolean;
             /**
@@ -1844,6 +2232,77 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    logout_endpoint_api_v1_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    me_endpoint_api_v1_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+        };
+    };
+    plex_sign_in_endpoint_api_v1_auth_plex_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexSignInRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_blocklist_api_v1_blocklist_get: {
         parameters: {
             query?: {
@@ -2412,6 +2871,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
+            /** @description Already requested by another user */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -2648,6 +3116,15 @@ export interface operations {
                     "application/json": components["schemas"]["SettingsResponse"];
                 };
             };
+            /** @description The signed-in admin does not own the replacement Plex server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -2655,6 +3132,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The replacement Plex server did not answer the /identity probe */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -2679,6 +3165,24 @@ export interface operations {
             };
         };
     };
+    revoke_app_key_endpoint_api_v1_settings_app_key_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post: {
         parameters: {
             query?: never;
@@ -2695,6 +3199,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AppApiKeyResponse"];
+                };
+            };
+        };
+    };
+    app_key_status_endpoint_api_v1_settings_app_key_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppApiKeyStatusResponse"];
                 };
             };
         };
@@ -2722,10 +3246,7 @@ export interface operations {
     complete_api_v1_setup_complete_post: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
-                "X-Setup-Token"?: string | null;
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
@@ -2744,13 +3265,22 @@ export interface operations {
                     "application/json": components["schemas"]["SetupStatusResponse"];
                 };
             };
-            /** @description Invalid setup token or API key */
+            /** @description Sign in to continue setup */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Administrator required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Setup already initialized */
@@ -2769,6 +3299,62 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The Plex server was unreachable */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    plex_servers_endpoint_api_v1_setup_plex_servers_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexServersResponse"];
+                };
+            };
+            /** @description Sign in to continue setup */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Administrator required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A Plex-signed-in admin is required */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
@@ -2796,12 +3382,7 @@ export interface operations {
     validate_plex_endpoint_api_v1_setup_validate_plex_post: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
-                "X-Setup-Token"?: string | null;
-                /** @description Required after setup is initialized. */
-                "X-Api-Key"?: string | null;
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
@@ -2820,13 +3401,31 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token or API key */
+            /** @description Sign in to continue setup */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Administrator required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description A Plex-signed-in admin is required */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -2838,17 +3437,21 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            /** @description The Plex server was unreachable */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     validate_prowlarr_endpoint_api_v1_setup_validate_prowlarr_post: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
-                "X-Setup-Token"?: string | null;
-                /** @description Required after setup is initialized. */
-                "X-Api-Key"?: string | null;
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
@@ -2867,13 +3470,22 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token or API key */
+            /** @description Sign in to continue setup */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Administrator required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -2890,12 +3502,7 @@ export interface operations {
     validate_qbittorrent_endpoint_api_v1_setup_validate_qbittorrent_post: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
-                "X-Setup-Token"?: string | null;
-                /** @description Required after setup is initialized. */
-                "X-Api-Key"?: string | null;
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
@@ -2914,13 +3521,22 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token or API key */
+            /** @description Sign in to continue setup */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Administrator required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -2937,12 +3553,7 @@ export interface operations {
     validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Required before setup only when /api/v1/setup/status reports setup_token_required=true. */
-                "X-Setup-Token"?: string | null;
-                /** @description Required after setup is initialized. */
-                "X-Api-Key"?: string | null;
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
@@ -2961,13 +3572,22 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceValidateResponse"];
                 };
             };
-            /** @description Invalid setup token or API key */
+            /** @description Sign in to continue setup */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Administrator required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */

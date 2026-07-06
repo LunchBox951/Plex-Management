@@ -17,6 +17,10 @@ from plex_manager.web.url_validation import url_shape_error
 
 __all__ = [
     "AcceptedRelease",
+    "AppApiKeyResponse",
+    "AppApiKeyStatusResponse",
+    "AuthMeResponse",
+    "AuthUser",
     "BlocklistEntry",
     "BlocklistResponse",
     "CreateRequestBody",
@@ -28,6 +32,7 @@ __all__ = [
     "DiskResponse",
     "DiskRootItem",
     "ErrorDetail",
+    "ErrorEnvelope",
     "EvictErrorItem",
     "EvictResponse",
     "EvictionCandidateItem",
@@ -40,6 +45,10 @@ __all__ = [
     "LogsResponse",
     "LogsTailResponse",
     "PlexLibraryOption",
+    "PlexServerConnection",
+    "PlexServerOption",
+    "PlexServersResponse",
+    "PlexSignInRequest",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -83,16 +92,41 @@ class ErrorDetail(BaseModel):
     detail: str
 
 
+class ErrorEnvelope(BaseModel):
+    """Structured error body for auth/setup failures (north star #3).
+
+    The richer sibling of :class:`ErrorDetail`, rendered by
+    ``web.errors.install_error_handlers``. ``detail`` stays the stable machine
+    code the SPA's humanizer keys on; ``message``/``hint`` are operator-facing
+    prose; ``diagnostics`` carries only NON-secret context (host, status, ...) —
+    a secret NEVER appears here. ``hint``/``diagnostics`` are omitted from the
+    wire when absent, so a client reads their absence, not an empty value.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
+    message: str
+    hint: str | None = None
+    diagnostics: dict[str, str] | None = None
+
+
 # --------------------------------------------------------------------------- #
 # Setup wizard — connection validation (unauthenticated, pre-init)
 # --------------------------------------------------------------------------- #
 class PlexValidateRequest(BaseModel):
-    """Candidate Plex credentials to test (``POST /setup/validate/plex``)."""
+    """Candidate Plex server to test (``POST /setup/validate/plex``).
+
+    ``token`` is OPTIONAL: omitted (``None``) means "use the signed-in admin's
+    stored Plex OAuth token" — the wizard's happy path never re-types a token, it
+    only supplies ``url`` for a chosen (or custom) server. A non-null ``token`` is
+    the explicit custom-credential override.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     url: str
-    token: str
+    token: str | None = None
 
 
 class ProwlarrValidateRequest(BaseModel):
@@ -148,6 +182,47 @@ class PlexLibraryOption(BaseModel):
     writable: bool | None = None
 
 
+ProbeStatusField = Literal["ok", "unreachable"]
+
+
+class PlexServerConnection(BaseModel):
+    """One advertised address for an owned Plex server, with its probe verdict.
+
+    ``uri`` is the exact connection plex.tv reports (``local`` marks a LAN address;
+    ``relay`` a plex.tv relay). ``status`` is this backend's OWN reachability probe
+    of ``{uri}/identity`` — ``"ok"`` when it answered, ``"unreachable"`` when the
+    backend could not reach it (with ``error_code`` naming why). A dead connection
+    is surfaced honestly, never dropped, so the operator can pick a reachable one.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    uri: str
+    local: bool
+    relay: bool
+    status: ProbeStatusField
+    error_code: str | None = None
+
+
+class PlexServerOption(BaseModel):
+    """One of the signed-in admin's OWNED Plex servers, offered by the wizard."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    machine_identifier: str
+    connections: list[PlexServerConnection]
+
+
+class PlexServersResponse(BaseModel):
+    """The admin's owned Plex servers with each connection probed
+    (``GET /setup/plex/servers``)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    servers: list[PlexServerOption]
+
+
 class ServiceValidateResponse(BaseModel):
     """Result of a connection check. ``message`` is operator-facing; ``detail``
     is an optional diagnostic. Neither ever contains a secret value.
@@ -155,7 +230,10 @@ class ServiceValidateResponse(BaseModel):
     For Plex, ``libraries`` carries the movie AND tv library folders (each tagged
     by ``section_type``) so the UI can offer pick-lists for ``movies_root`` /
     ``tv_root`` instead of a typed path. ``None`` for every other service (and for
-    a failed Plex check)."""
+    a failed Plex check). ``machine_identifier`` is the probed Plex server's
+    ``machineIdentifier`` (from its ``/identity``) — set only when the caller asked
+    for the ownership-verifying variant of the Plex probe, so setup can assert
+    ownership and store the id; ``None`` otherwise."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -163,6 +241,47 @@ class ServiceValidateResponse(BaseModel):
     message: str
     detail: str | None = None
     libraries: list[PlexLibraryOption] | None = None
+    machine_identifier: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Browser authentication — Plex sign-in
+# --------------------------------------------------------------------------- #
+class PlexSignInRequest(BaseModel):
+    """A browser-obtained plex.tv token to verify server-side (``POST /auth/plex``).
+
+    The browser ran the plex.tv PIN flow itself; the backend re-derives identity
+    and server ownership from this token before writing any user or session, so
+    the token is never trusted for its claims — only used to call plex.tv.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    auth_token: str
+
+
+class AuthUser(BaseModel):
+    """Current signed-in Plex user."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    plex_id: int | None
+    username: str
+    email: str | None = None
+    avatar_url: str | None = None
+    is_admin: bool = False
+
+
+class AuthMeResponse(BaseModel):
+    """Current app authentication state."""
+
+    model_config = ConfigDict(frozen=True)
+
+    authenticated: bool
+    auth_method: Literal["api_key", "plex_session", "dev_bypass"] | None = None
+    is_admin: bool = False
+    user: AuthUser | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +327,16 @@ class SetupCompleteRequest(BaseModel):
     )
 
     plex_url: str
-    plex_token: str
+    # The wizard's chosen server — ADVISORY only: ``/setup/complete`` re-derives the
+    # persisted id live from the submitted server's ``/identity`` and re-asserts
+    # ownership, so a direct API caller cannot pair server-X creds with server-Y's
+    # id (see ``web.routers.setup.complete``). Post-init sign-in then resolves
+    # server access from the STORED (derived) id without re-probing /identity.
+    plex_machine_identifier: str
+    # OPTIONAL: ``None`` (omitted) means "persist the signed-in admin's stored Plex
+    # OAuth token" — the keyless wizard never re-types the token. A non-null value is
+    # an explicit custom-credential override.
+    plex_token: str | None = None
     prowlarr_url: str
     prowlarr_api_key: str
     qbittorrent_url: str
@@ -275,12 +403,13 @@ class SetupCompleteRequest(BaseModel):
 
 
 class SetupStatusResponse(BaseModel):
-    """Install state. ``app_api_key`` is populated only once initialized."""
+    """Install state: whether setup is finished, and whether the optional pre-init
+    hardening token is required. No app key is ever minted or served — Plex sign-in
+    is the sole credential model (there is no one-time key to disclose)."""
 
     model_config = ConfigDict(frozen=True)
 
     initialized: bool
-    app_api_key: str | None = None
     setup_token_required: bool = False
 
 
@@ -334,19 +463,33 @@ class SettingsResponse(BaseModel):
 
 
 class AppApiKeyResponse(BaseModel):
-    """The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+    """The current (reveal) or freshly-minted (generate/rotate) app ``X-Api-Key``.
 
-    Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
-    reveal is the belt-and-braces recovery path for a lost/forgotten key on a
-    device that still has it saved, and rotate mints and returns a brand-new key
-    ONCE — the plaintext is never retrievable again after this response, only the
-    Fernet-encrypted column at rest (matching the one-time disclosure setup's
-    ``/complete`` already gives the initial key).
+    Authenticated-only (Plex session or currently-valid ``X-Api-Key``). Setup mints
+    NO key — this is an OPT-IN recovery/automation credential the operator generates
+    on demand from Settings → Access. Reveal is the break-glass path for a key
+    lost/forgotten on a device that still has it saved; generate/rotate mints and
+    returns a brand-new key ONCE — the plaintext is never retrievable again after
+    this response, only the Fernet-encrypted column at rest.
     """
 
     model_config = ConfigDict(frozen=True)
 
     app_api_key: str
+
+
+class AppApiKeyStatusResponse(BaseModel):
+    """Whether an app ``X-Api-Key`` recovery key currently exists — never the key.
+
+    Powers the Settings → Access control's Generate-vs-Rotate/Revoke choice
+    WITHOUT the break-glass reveal: ``exists`` is ``True`` once a key has been
+    generated (and not since revoked), ``False`` on a fresh keyless install (setup
+    mints nothing) or after a revoke. The plaintext is never serialized here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    exists: bool
 
 
 class SettingsUpdate(BaseModel):

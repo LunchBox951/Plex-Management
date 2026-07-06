@@ -13,6 +13,11 @@ import { Requests } from './Requests'
 // before the read-only cases below even get a chance to NOT mount it.
 vi.mock('../api/hooks', () => ({
   useRequests: vi.fn(),
+  // Admin context: these route tests exercise the full (admin) modal surface.
+  useAuthMe: vi.fn(() => ({
+    data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+    isLoading: false,
+  })),
   useQueue: vi.fn(() => ({ data: { queue: [] } })),
   useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useSearchPreview: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),

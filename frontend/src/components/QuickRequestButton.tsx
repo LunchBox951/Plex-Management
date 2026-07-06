@@ -33,12 +33,12 @@ function asApiError(error: unknown): ApiError {
  * deliberately narrows to the selected season — so every tv retry/re-request
  * stays a modal action.
  *
- * Sits inside `PosterCard`'s clickable card, whose outer div both opens the
- * detail modal on click AND re-fires that same `onClick` for a keyboard
- * Enter/Space (see `PosterCard.tsx`). Both the mouse `onClick` and the
- * `onKeyDown` here stop propagation so activating this button never also
- * opens the modal underneath it. On success it hands keyboard focus back to
- * that card before unmounting, so a keyboard user keeps their place in the grid.
+ * Sits in `PosterCard`'s action layer as a DOM SIBLING of the card's own native
+ * details trigger — not nested inside it — and stacks above it (`z-30` vs.
+ * `z-10`), so activating this button can never also open the modal underneath
+ * (see `PosterCard.tsx`; `PosterCard.test.tsx` pins that contract). On success
+ * it hands keyboard focus back to the card details button before unmounting,
+ * so a keyboard user keeps their place in the grid.
  */
 export function QuickRequestButton({ item }: QuickRequestButtonProps) {
   const { toast } = useToast()
@@ -56,9 +56,9 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
       await createRequest.mutateAsync(body)
       // This button is about to unmount (`justRequested` -> `return null`). Left
       // alone that drops keyboard focus to <body>, losing the user's place in the
-      // poster grid. Hand focus back to the enclosing card (still mounted, now
-      // heading toward its "Requested" badge) so keyboard nav stays put. A no-op
-      // for mouse users and when there's no focusable card ancestor.
+      // poster grid. Hand focus back to the card details trigger (still mounted,
+      // now heading toward its "Requested" badge) so keyboard nav stays put. A
+      // no-op for mouse users and when there's no focusable card ancestor.
       returnFocusTo?.focus()
       setJustRequested(true)
       toast({ title: `Requested ${item.title}`, intent: 'success' })
@@ -77,16 +77,11 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
       aria-label={`Request ${item.title}`}
       loading={createRequest.isPending}
       onClick={(e) => {
-        e.stopPropagation()
-        // Resolve the enclosing PosterCard synchronously (before the async
-        // mutation unmounts this button) so `onRequest` can restore focus to it.
-        const card = e.currentTarget.closest<HTMLElement>('[role="button"]')
-        void onRequest(card)
-      }}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.stopPropagation()
-        }
+        // Resolve the sibling PosterCard details trigger synchronously (before the
+        // async mutation unmounts this button) so `onRequest` can restore focus.
+        const card = e.currentTarget.closest<HTMLElement>('[data-poster-card]')
+        const trigger = card?.querySelector<HTMLElement>('[data-poster-card-trigger]') ?? null
+        void onRequest(trigger)
       }}
     >
       Request
