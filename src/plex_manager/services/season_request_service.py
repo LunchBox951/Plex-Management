@@ -320,6 +320,15 @@ async def ensure_seasons(
     preserved, the first-completion fact is still true). Gated to the re-arm case
     -- plain creations never touch the stamp, keeping the R5 rule that request
     time NEVER records a completion.
+
+    The evicted -> ``available`` re-arm (Plex still reports the season present)
+    clears the stamp too (Codex round-3): the season's PRE-EVICTION ``imported``
+    ``Download`` row survives eviction (eviction never mutates the downloads
+    aggregate), but the heal's download-evidence arm discounts any import with a
+    LATER ``evicted`` history event for the show -- so the re-armed season's
+    presence-derived ``available`` cannot resurrect a ``completed_at`` that no
+    current import supports, exactly matching how a Plex-present-only creation
+    never stamps.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
@@ -558,7 +567,10 @@ async def reset_for_research(
     ``import_service._import_tv_locked`` in the SAME transaction as
     ``mark_completed``) OR an ``imported`` ``Download`` row for its
     ``(media_request_id, season)`` -- the latter covering LEGACY seasons imported
-    before the breadcrumb column existed (``models.SeasonRequest.library_path``).
+    before the breadcrumb column existed (``models.SeasonRequest.library_path``),
+    and invalidated by any LATER ``evicted`` history event for the show (a
+    pre-eviction import is not current backing evidence -- see the heal's
+    docstring for the ``download_history`` ordering, Codex round-3).
     A Plex-present-only season (``ensure_seasons``'s already-in-Plex creation:
     ``available``, NO breadcrumb, no grab ever ran) matches neither and never
     preserves a re-armed season's stale stamp (Codex P2 #1), so a redone season's

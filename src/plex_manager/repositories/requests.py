@@ -6,12 +6,15 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, case, insert, or_, select, update
+from sqlalchemy import CursorResult, case, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import aliased
 
 from plex_manager.models import (
     Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
     MediaRequest,
     MediaType,
     RequestDedupLock,
@@ -495,23 +498,53 @@ class SqlRequestRepository:
           ``mark_completed`` for every current-version import; ``ensure_seasons``'s
           already-in-Plex creation leaves it ``NULL`` (no import ever ran).
         * OR an ``imported`` ``Download`` row for the same ``(media_request_id,
-          season)``: the import finalize CAS moves the placing download to
-          ``imported`` in that same transaction, and this linkage is exactly how
-          report-issue resolves its culprit ("the download that OWNS the placed
-          library file" -- ``SqlDownloadRepository.find_latest_imported_for_
-          request``). This arm covers LEGACY seasons imported before the
-          breadcrumb column existed (``models.SeasonRequest.library_path``:
-          "``None`` for seasons imported before this breadcrumb existed") -- their
-          genuinely-backed stamp must not be erased just because the breadcrumb
-          predates them. A Plex-present-only season (the ``ensure_seasons``
-          short-circuit) has NEITHER marker -- no grab ever ran for that season
-          under this request, so no ``imported`` download row can exist for the
-          pair -- and stays excluded. Known best-effort edge: a terminal download
-          row can later be re-owned by a fresh grab of the same torrent
-          (``update_status``'s ``replace_grab_metadata`` path rewrites its
-          request/season scope), which could drop legacy evidence; that failure
-          degrades to the conservative clear-and-restamp-on-reimport behavior,
-          never to counting a Plex-present-only season.
+          season)`` NOT invalidated by a LATER eviction (see below): the import
+          finalize CAS moves the placing download to ``imported`` in that same
+          transaction, and this linkage is exactly how report-issue resolves its
+          culprit ("the download that OWNS the placed library file" --
+          ``SqlDownloadRepository.find_latest_imported_for_request``). This arm
+          covers LEGACY seasons imported before the breadcrumb column existed
+          (``models.SeasonRequest.library_path``: "``None`` for seasons imported
+          before this breadcrumb existed") -- their genuinely-backed stamp must
+          not be erased just because the breadcrumb predates them. A
+          Plex-present-only season (the ``ensure_seasons`` short-circuit) has
+          NEITHER marker -- no grab ever ran for that season under this request,
+          so no ``imported`` download row can exist for the pair -- and stays
+          excluded. Known best-effort edge: a terminal download row can later be
+          re-owned by a fresh grab of the same torrent (``update_status``'s
+          ``replace_grab_metadata`` path rewrites its request/season scope),
+          which could drop legacy evidence; that failure degrades to the
+          conservative clear-and-restamp-on-reimport behavior, never to counting
+          a Plex-present-only season.
+
+        Eviction invalidates the download arm (Codex round-3): eviction flips the
+        season row and writes history but NEVER touches the old ``Download`` row
+        (cross-aggregate mutation would be worse than the bug), so its
+        ``imported`` status survives the file's deletion. Without an ordering
+        clause, an evicted season re-armed straight to ``available`` (Plex still
+        reports it present; ``ensure_seasons`` clears the breadcrumb) would make
+        its PRE-EVICTION download look like current backing evidence, preserving
+        or re-stamping a ``completed_at`` nothing current supports. The honest
+        committed markers that order "import happened" vs "eviction happened
+        since" are both in the append-only ``download_history`` log: the import
+        finalize writes hash-tied ``imported`` events (``import_service.
+        _import_tv_locked``), and ``eviction_service._evict_one`` writes an
+        ``evicted`` event -- ``torrent_hash=None`` by design (see
+        ``DownloadHistoryEvent.evicted``) with only ``tmdb_id`` queryable (the
+        season number lives in prose ``message`` text, which is not a schema). So
+        the arm requires: NO ``evicted`` event for the parent's ``tmdb_id`` with
+        an ``id`` greater than the download's latest ``imported`` event id
+        (``download_history.id`` is the append-only order; a download with no
+        recorded import event is invalidated by ANY eviction of the show). Two
+        documented coarseness edges, both failing CONSERVATIVE (an over-eager
+        clear that the next genuine re-import re-stamps, never a wrongly
+        preserved stamp, never counting a Plex-present row): (a) the show-scoped
+        ``tmdb_id`` means a SIBLING season's later eviction also discounts this
+        season's pre-eviction download evidence; (b) ``download_history.tmdb_id``
+        is not media-type-namespaced, so a movie sharing the show's tmdb id that
+        was evicted later does too. A genuine re-import after an eviction writes
+        a NEWER ``imported`` event for its hash, so its evidence validly counts
+        again.
 
         Shape -- two atomic conditional ``UPDATE``s whose predicate lives in their
         OWN ``WHERE`` (DB-authoritative at statement time, never a prior Python
@@ -548,6 +581,41 @@ class SqlRequestRepository:
         the import hot path and this heal to serialize on a parent-row lock
         (``SELECT FOR UPDATE``), which the import path deliberately does not take.
         """
+        # Aliased so the imported-event lookup nested inside the eviction-event
+        # subquery below does NOT auto-correlate to that enclosing
+        # ``download_history`` SELECT -- they are two independent scans of the
+        # same append-only log.
+        imported_event = aliased(DownloadHistory)
+        latest_import_event_id = (
+            select(func.max(imported_event.id))
+            .where(
+                imported_event.torrent_hash == Download.torrent_hash,
+                imported_event.event_type == DownloadHistoryEvent.imported,
+            )
+            # EXPLICIT: auto-correlation only reaches the nearest enclosing
+            # SELECT; two levels deep it would re-introduce ``downloads`` as a
+            # cartesian FROM entry instead (verified via compiled SQL).
+            .correlate(Download)
+            .scalar_subquery()
+        )
+        # "The show was evicted SINCE this download's import" -- the round-3
+        # invalidation clause (see the docstring): an ``evicted`` history row for
+        # this show appended after the download's latest ``imported`` event. A
+        # download with NO recorded import event compares as -1, so any eviction
+        # of the show invalidates it (conservative by design).
+        evicted_since_import = (
+            select(DownloadHistory.id)
+            .where(
+                DownloadHistory.tmdb_id == MediaRequest.tmdb_id,
+                DownloadHistory.event_type == DownloadHistoryEvent.evicted,
+                DownloadHistory.id > func.coalesce(latest_import_event_id, -1),
+            )
+            # EXPLICIT for the same reason: ``media_requests`` (the UPDATE
+            # target) and ``downloads`` (the enclosing evidence SELECT) must
+            # correlate outward, never join in locally.
+            .correlate(MediaRequest, Download)
+            .exists()
+        )
         season_genuinely_imported = (
             select(Download.id)
             .where(
@@ -557,6 +625,7 @@ class SqlRequestRepository:
                 # ``repositories.downloads``' deliberately-decoupled string
                 # vocabulary; ``imported`` is that enum's value.
                 Download.status == "imported",
+                ~evicted_since_import,
             )
             .exists()
         )

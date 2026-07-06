@@ -17,7 +17,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import PlexLibraryError
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import (
+    Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import season_request_service
 from tests.web.fakes import FakeLibrary
@@ -1165,3 +1173,237 @@ async def test_ensure_seasons_evicted_re_arm_preserves_stamp_backed_by_done_sibl
         show = await session.get(MediaRequest, show_id)
         assert show is not None
         assert show.completed_at == first_stamp
+
+
+async def test_evicted_re_arm_to_available_does_not_resurrect_stamp_via_stale_download(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-3: eviction never touches the old ``Download`` row, so its
+    ``imported`` status survives the file's deletion. When the evicted season is
+    re-requested while Plex STILL reports it present, ``ensure_seasons`` re-arms
+    it evicted -> ``available`` and clears the breadcrumb -- and without the
+    eviction-ordering clause the stale pre-eviction download would make the
+    parent's old ``completed_at`` look backed. The heal's download arm now
+    requires no ``evicted`` history event for the show newer than the download's
+    latest ``imported`` event (both committed, append-only ``download_history``
+    rows -- the eviction row is exactly what ``_evict_one`` writes:
+    ``torrent_hash=None``, ``tmdb_id`` set), so the presence-derived ``available``
+    cannot resurrect a stamp no current import supports."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=736)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=736, seasons=[1, 2]
+        )
+        # S1's full modern import: the placing download, its hash-tied 'imported'
+        # history event (import_service._import_tv_locked), the breadcrumb, and
+        # Plex confirmation -> the parent stamps.
+        session.add(
+            Download(
+                torrent_hash="round3-s1-import",
+                status="imported",
+                media_request_id=show_id,
+                media_type=MediaType.tv,
+                tmdb_id=736,
+                season=1,
+            )
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=736,
+                torrent_hash="round3-s1-import",
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,
+                message="imported Some.Show.S01.mkv to Some Show/Season 01",
+            )
+        )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None
+        season1_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == show_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .one()
+            .id
+        )
+
+    # The sweep evicts S1 exactly as _evict_one does: the season CAS plus the
+    # 'evicted' history row (torrent_hash=None -- not tied to any download).
+    async with sessionmaker_() as session:
+        changed = await season_request_service.set_status_if_in(
+            session,
+            media_request_id=show_id,
+            season_request_id=season1_id,
+            status=RequestStatus.evicted.value,
+            allowed_from=frozenset({RequestStatus.available.value}),
+            tolerate_active_conflict=True,
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=736,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.evicted,
+                source_title="Some Show",
+                message=(
+                    "evicted season 1: watched, past grace period, "
+                    "disk-pressure relief (/media/tv/Some Show/Season 01)"
+                ),
+            )
+        )
+        await session.commit()
+    assert changed is True
+
+    # Re-request S1 while Plex STILL reports it present: re-armed straight to
+    # 'available' (breadcrumb cleared) -- yet the stale pre-eviction download must
+    # NOT back the old stamp, so the heal clears it.
+    library = FakeLibrary(available_tv_seasons={736: frozenset({1})})
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, library, media_request_id=show_id, tmdb_id=736, seasons=[1]
+        )
+        await session.commit()
+    assert [(r.season_number, r.status) for r in records] == [(1, "available")]
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None  # nothing current supports the old stamp
+
+
+async def test_reimport_after_eviction_restores_download_evidence(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The round-3 ordering is directional, not a blanket kill: a season
+    RE-IMPORTED after its eviction appends a NEWER hash-tied 'imported' history
+    event than the show's last 'evicted' event, so its download evidence validly
+    counts again -- pinned through the RESET path (report-issue on a sibling),
+    which shares the heal's predicate with the re-arm path. Modeled without the
+    breadcrumb (like a legacy import) to isolate the download-evidence arm."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=737)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=737, seasons=[1, 2]
+        )
+        # S1's first import (download + hash-tied imported event, no breadcrumb).
+        session.add(
+            Download(
+                torrent_hash="round3-s1-cycle",
+                status="imported",
+                media_request_id=show_id,
+                media_type=MediaType.tv,
+                tmdb_id=737,
+                season=1,
+            )
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=737,
+                torrent_hash="round3-s1-cycle",
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,
+                message="imported Some.Show.S01.mkv to Some Show/Season 01",
+            )
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        season1_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == show_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .one()
+            .id
+        )
+
+    # Evicted (CAS + history row), then re-requested -> pending re-arm clears the
+    # stale stamp (nothing genuinely done remains).
+    async with sessionmaker_() as session:
+        changed = await season_request_service.set_status_if_in(
+            session,
+            media_request_id=show_id,
+            season_request_id=season1_id,
+            status=RequestStatus.evicted.value,
+            allowed_from=frozenset({RequestStatus.available.value}),
+            tolerate_active_conflict=True,
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=737,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.evicted,
+                source_title="Some Show",
+                message=(
+                    "evicted season 1: watched, past grace period, "
+                    "disk-pressure relief (/media/tv/Some Show/Season 01)"
+                ),
+            )
+        )
+        await session.commit()
+    assert changed is True
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=737, seasons=[1]
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None
+
+    # S1 re-imports through the SAME reused torrent row: a NEW hash-tied
+    # 'imported' event lands AFTER the eviction event, and Plex re-confirms.
+    async with sessionmaker_() as session:
+        session.add(
+            DownloadHistory(
+                tmdb_id=737,
+                torrent_hash="round3-s1-cycle",
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,
+                message="imported Some.Show.S01.mkv to Some Show/Season 01",
+            )
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        restamp = show.completed_at
+        assert restamp is not None
+
+    # RESET path: report-issue the sibling S2. S1's re-import is NEWER than the
+    # show's last eviction, so its download evidence backs the stamp -> preserved.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at == restamp
