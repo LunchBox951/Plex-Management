@@ -108,7 +108,12 @@ PREDICATE-ATOMIC (the final protocol form):
     one is in flight. Operator side: the claim is flagged removal-in-flight
     immediately before :func:`mark_failed`'s delete await, held until release.
     Reconcile side: each automatic Phase-B delete registers its download id in
-    ``_reconcile_removals_in_flight`` for exactly the delete await's duration.
+    ``_reconcile_removals_in_flight`` from just before the delete await until
+    that row's removal CONSEQUENCE settles — its completion commits the
+    terminal CAS, or is dropped/deferred in Phase C, or the cycle's Phase C
+    exhausts — released at cycle scope, so the returned-but-unsettled gap
+    between a delete and its completion cannot admit a ``remove_torrent=False``
+    command for data this cycle already destroyed.
   - **Pre-stamp invisibility fast-path.** A claim exists from BEFORE the marker
     is stamped, so reconcile skips claimed ids at every phase boundary (Phase-A
     transition application; Phase B, where a claimed completion is DROPPED from
@@ -136,6 +141,20 @@ PREDICATE-ATOMIC (the final protocol form):
   the marker never survives on a terminal row. An absent / free-text / malformed
   ``failed_reason`` parses to no-provenance and heals with the reconcile-default
   semantics (blocklist + removal) — genuinely reconcile-derived rows unchanged.
+
+* **Residual: the pre-stamp window** (accepted, tracked in issue #127). Between
+  a mark_failed's claim registration and its marker becoming DURABLE (the Phase-A
+  stamp committing), ownership exists only in the in-process registry — a
+  concurrent actor already past its registry checks can race exactly the one
+  in-flight statement in that sub-second window. The outcomes stay honest: the
+  losing side's predicate CAS misses (it yields, or surfaces the already-terminal
+  409 ``invalid_state_transition``), the row always lands terminal-and-consistent
+  (never stranded, never double-completed), and the only possible divergence is a
+  SIDE EFFECT the operator did not choose (e.g. a reconcile-default blocklist row
+  an operator ``blocklist=False`` would have skipped) — operator-visible and
+  reversible via the blocklist management UI, with the request re-armed either
+  way. Closing it fully would need the claim itself to be a DB row; #127 tracks
+  that trade-off.
 """
 
 from __future__ import annotations
@@ -261,13 +280,16 @@ _operator_fail_claims: dict[int, _OperatorClaim] = {}
 _claim_tokens = count(1)
 
 # Reconcile-side removal window (the removal-physics rule covers BOTH actors):
-# download ids whose AUTOMATIC reconcile-driven Phase-B delete is mid-await.
-# ``_register_operator_claim`` refuses registration during this window for the
-# same physics reason as the operator flag above — an operator
-# ``remove_torrent=False`` claim registered mid-delete would complete promising a
-# file the delete is destroying. Unlike the operator flag, the entry is discarded
-# as soon as the await returns (reconcile's completion then proceeds as today; a
-# claim registered AFTER the window defers that completion as usual).
+# download ids whose AUTOMATIC reconcile-driven Phase-B delete has started and
+# whose CONSEQUENCE has not yet settled. ``_register_operator_claim`` refuses
+# registration during this window for the same physics reason as the operator
+# flag above — an operator ``remove_torrent=False`` claim registered mid-delete,
+# OR in the gap between the delete's return and the row's Phase-C settlement,
+# would complete promising a file this cycle already destroyed. An id enters just
+# before its delete await and leaves at the CYCLE-SCOPE finally, once that row's
+# completion committed its terminal CAS, was dropped/deferred in Phase C, or the
+# cycle's Phase C exhausted (the residual is then settled-but-unhealed — plain,
+# claimable, reconcilable).
 _reconcile_removals_in_flight: set[int] = set()
 
 
@@ -925,27 +947,37 @@ async def reconcile_and_list(
     # released seconds later (the operator call failing fast), this cycle's Phase C
     # must never complete the row with those stale pre-marker semantics -- the
     # residual instead heals NEXT cycle from the marker, the designed path.
-    unclaimed: list[_FailureCompletion] = []
-    for completion in completions:
-        if _is_operator_claimed(completion.download_id):
-            _logger.info(
-                "dropping download %s from this reconcile cycle: an operator "
-                "mark-failed claimed it mid-cycle; its residual heals next cycle",
-                safe_int(completion.download_id),
-            )
-            continue
-        unclaimed.append(completion)
-        if not completion.remove_torrent:
-            continue
-        # Protocol step 5, reconcile side: for the duration of this delete await
-        # the download is registered removal-in-flight, so an operator
-        # mark_failed(remove_torrent=False) arriving mid-delete is refused (409
-        # removal_in_progress) instead of completing with remove=no semantics
-        # while this very await destroys the data. Discarded as soon as the await
-        # returns: a claim registered after the window defers the Phase-C
-        # completion below as usual.
-        _reconcile_removals_in_flight.add(completion.download_id)
-        try:
+    # Removal-physics guard lifetime (reconcile side): a removed row's id enters
+    # ``_reconcile_removals_in_flight`` just before its delete await and is HELD
+    # until the CONSEQUENCE of that removal settles -- this cycle's Phase C either
+    # commits the row's terminal completion, drops it, or exhausts (the
+    # cycle-scope ``finally`` below). Releasing at the delete's return would leave
+    # a returned-but-unsettled gap: an operator mark_failed(remove_torrent=False)
+    # registering there is refused nothing, stamps its marker, drops the stale
+    # completion via the CAS predicate, and later completes promising remove=no
+    # semantics for data this cycle already destroyed -- a physics lie. Only ids
+    # THIS cycle added are released (``settling``), never another actor's.
+    settling: set[int] = set()
+    try:
+        unclaimed: list[_FailureCompletion] = []
+        for completion in completions:
+            if _is_operator_claimed(completion.download_id):
+                _logger.info(
+                    "dropping download %s from this reconcile cycle: an operator "
+                    "mark-failed claimed it mid-cycle; its residual heals next cycle",
+                    safe_int(completion.download_id),
+                )
+                continue
+            unclaimed.append(completion)
+            if not completion.remove_torrent:
+                continue
+            # Removal-physics rule, reconcile side: from just before this delete
+            # await, an operator mark_failed(remove_torrent=False) is refused (409
+            # removal_in_progress) instead of completing with remove=no semantics
+            # while (or right after) this await destroys the data. Held until the
+            # cycle-scope finally -- see the lifetime note above.
+            _reconcile_removals_in_flight.add(completion.download_id)
+            settling.add(completion.download_id)
             await purge_service.remove_torrent(
                 qbt,
                 completion.event.torrent_hash,
@@ -955,36 +987,43 @@ async def reconcile_and_list(
                     "tmdb_id": completion.event.tmdb_id,
                 },
             )
-        finally:
-            _reconcile_removals_in_flight.discard(completion.download_id)
-    completions = unclaimed
+        completions = unclaimed
 
-    # Phase C: complete each failure (failed_pending -> Failed + blocklist + re-arm)
-    # in ONE bounded-retry transaction. On exhaustion the rows stay at the reconcilable
-    # ``failed_pending`` for a later cycle's strand re-derivation to heal. The claim
-    # registry is RE-CHECKED per completion, on EVERY retry attempt (ownership
-    # invisibility fast-path, Phase C): an operator mark_failed that claimed a row after
-    # the Phase-B checks above must not have its completion stolen with the wrong
-    # semantics -- skip it; the operator call (or, if it fails, the next cycle's
-    # heal) completes it.
-    async def _complete_reconcile_failures() -> None:
-        rearms: list[_FailedReArm] = []
-        for completion in completions:
-            if _is_operator_claimed(completion.download_id):
-                continue
-            rearm = await _handle_failed(session, completion, rows)
-            if rearm is not None:
-                rearms.append(rearm)
-        for rearm in rearms:
-            await _rearm_failed_request(session, rearm)
+        # Phase C: complete each failure (failed_pending -> Failed + blocklist +
+        # re-arm) in ONE bounded-retry transaction. On exhaustion the rows stay at
+        # the reconcilable ``failed_pending`` for a later cycle's strand
+        # re-derivation to heal (the finally below releases their removal guard,
+        # so an operator command CAN claim them between cycles -- the residual is
+        # settled-but-unhealed at that point, not mid-consequence). The claim
+        # registry is RE-CHECKED per completion, on EVERY retry attempt (pre-stamp
+        # invisibility fast-path, Phase C): an operator mark_failed that claimed a
+        # row after the Phase-B checks above must not have its completion stolen
+        # with the wrong semantics -- skip it; the operator call (or, if it fails,
+        # the next cycle's heal) completes it.
+        async def _complete_reconcile_failures() -> None:
+            rearms: list[_FailedReArm] = []
+            for completion in completions:
+                if _is_operator_claimed(completion.download_id):
+                    continue
+                rearm = await _handle_failed(session, completion, rows)
+                if rearm is not None:
+                    rearms.append(rearm)
+            for rearm in rearms:
+                await _rearm_failed_request(session, rearm)
 
-    if completions:
-        await _commit_phase_c_with_retry(
-            session,
-            _complete_reconcile_failures,
-            context="reconcile-driven failures",
-            identity=[completion.event.torrent_hash for completion in completions],
-        )
+        if completions:
+            await _commit_phase_c_with_retry(
+                session,
+                _complete_reconcile_failures,
+                context="reconcile-driven failures",
+                identity=[completion.event.torrent_hash for completion in completions],
+            )
+    finally:
+        # Every removal this cycle performed has now SETTLED: its completion
+        # committed, was dropped/deferred in Phase C, or Phase C exhausted
+        # (leaving a plain reconcilable residual). Release the physics guard for
+        # exactly the ids this cycle added.
+        _reconcile_removals_in_flight.difference_update(settling)
 
     # ``populate_existing`` refreshes the returned rows from the DB (issue #77): see
     # the same note in the no-failures early return above.
