@@ -2318,3 +2318,121 @@ async def test_operator_mark_failed_refused_until_removal_consequence_settles(
             await queue_service.mark_failed(
                 session, None, download_id=x_download_id, blocklist=False, remove_torrent=False
             )
+
+
+# ---------------------------------------------------------------------------
+# Round 9: the durability story completes. Phase B re-proves durably before
+# each delete, and a performed removal is persisted as remove=done.
+# ---------------------------------------------------------------------------
+
+
+class _CompleteOtherRowDuringRemovalQbt(FakeQbittorrent):
+    """Round-9 finding 1's interleave: while the FIRST row's delete is in flight,
+    a nested mark_failed on the SECOND row runs to FULL completion (stamp,
+    terminal CAS, release). By the time reconcile's Phase B reaches the second
+    row there is no live claim -- only the DURABLE record (terminal status /
+    final reason). The pre-delete re-proof must see it and skip the deletion."""
+
+    def __init__(self, sm: SessionMaker, target_download_id: int, trigger_hash: str) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._target_download_id = target_download_id
+        self._trigger_hash = trigger_hash
+        self.nested_status: str | None = None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        await super().remove(info_hash, delete_files=delete_files)
+        if info_hash == self._trigger_hash and self.nested_status is None:
+            async with self._sm() as session:
+                nested = await queue_service.mark_failed(
+                    session,
+                    None,
+                    download_id=self._target_download_id,
+                    blocklist=False,
+                    remove_torrent=False,
+                )
+                self.nested_status = nested.status
+
+
+async def test_phase_b_durable_reproof_skips_deletion_after_operator_won(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-9 finding 1: an operator who stamped, COMPLETED, and released between
+    Phase A and the row's Phase-B delete leaves no live claim -- the in-process
+    check alone would still delete data whose remove=no already won durably. The
+    pre-delete re-proof (one fresh SELECT) sees the terminal row and skips the
+    removal, dropping the completion; the operator's semantics stand."""
+    ids = await _seed_two_failed_movies(sessionmaker_)
+    hash_x, hash_y = "a" * 40, "b" * 40  # X removed first; Y is the operator's row
+    x_download_id = ids[hash_x][1]
+    y_request_id, y_download_id = ids[hash_y]
+
+    qbt = _CompleteOtherRowDuringRemovalQbt(sessionmaker_, y_download_id, hash_x)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The nested operator command fully completed Y with remove=no semantics...
+    assert qbt.nested_status == "failed"
+    # ...and Phase B's durable re-proof kept reconcile from deleting Y's data:
+    # only X's torrent was ever removed.
+    assert qbt.removed == [(hash_x, True)]
+
+    async with sessionmaker_() as session:
+        download_x = await session.get(Download, x_download_id)
+        download_y = await session.get(Download, y_download_id)
+        request_y = await session.get(MediaRequest, y_request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    # X completed normally under reconcile-default semantics.
+    assert download_x is not None and download_x.status == "failed"
+    assert [row.torrent_hash for row in blocklist] == [hash_x]
+    # Y's operator semantics stand end-to-end: terminal via the operator, request
+    # re-armed, no blocklist row, and no deletion.
+    assert download_y is not None and download_y.status == "failed"
+    assert download_y.failed_reason == "marked failed by operator"
+    assert request_y is not None and request_y.status is RequestStatus.searching
+
+
+async def test_completed_removal_is_durable_and_heals_without_a_client(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 finding 2: a mark_failed(remove_torrent=True) whose Phase B removed
+    the torrent persists that outcome as a remove=done marker (committed at once),
+    so a Phase-C exhaustion leaves a residual the DB-only healer completes during
+    an outage / unconfigured-client stretch -- it no longer waits forever for a
+    removal that already happened."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        # Commits: #1 Phase A (marker remove=yes), #2 the remove=done restamp,
+        # #3..#5 the three Phase-C attempts -- fail exactly those.
+        _fail_commit_on(session, monkeypatch, {3, 4, 5})
+        with pytest.raises(OperationalError):
+            await queue_service.mark_failed(
+                session, qbt, download_id=download_id, blocklist=False, remove_torrent=True
+            )
+
+    # The removal ran AND its outcome is durable on the residual.
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None and download.status == "failed_pending"
+    assert download.failed_reason is not None
+    assert re.fullmatch(
+        r"operator mark-failed in progress \(blocklist=no, remove=done, nonce=\d+\)",
+        download.failed_reason,
+    )
+
+    # The DB-only healer (outage / unconfigured client) completes it -- no client,
+    # no removal attempt, operator flags honored.
+    async with sessionmaker_() as session:
+        await queue_service.heal_failed_pending_without_client(session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None and download.status == "failed"
+    assert download.failed_reason == "marked failed by operator"
+    assert request is not None and request.status is RequestStatus.searching
+    assert blocklist == []  # blocklist=False survived
