@@ -9,6 +9,7 @@ import {
 } from '../api/hooks'
 import type { SettingsResponse, SettingsUpdate } from '../api/types'
 import type { ApiError } from '../lib/errors'
+import { AuthErrorCard } from '../components/AuthErrorCard'
 import { Button } from '../components/ui/Button'
 import { LinkButton } from '../components/ui/LinkButton'
 import { Field } from '../components/ui/Field'
@@ -247,6 +248,20 @@ function AccessSection() {
 
         {status.isLoading ? (
           <p className="text-xs text-faint">Checking for a recovery key…</p>
+        ) : status.isError ? (
+          // A persistent status-fetch failure must NOT fall through to the
+          // no-key "Generate" control: a key may well exist, and the single mint
+          // endpoint ROTATES it — silently invalidating every other device and
+          // API automation. Surface the honest error and offer only a Retry;
+          // never a blind destructive action on unknown state (north star #3).
+          <div className="flex flex-col gap-3">
+            <AuthErrorCard error={status.error} />
+            <div>
+              <Button variant="secondary" onClick={() => void status.refetch()}>
+                Retry
+              </Button>
+            </div>
+          </div>
         ) : exists ? (
           <div className="flex flex-wrap gap-3">
             <Button

@@ -7,7 +7,7 @@ import {
   useValidateService,
 } from '../api/hooks'
 import type { PlexLibraryOption, SetupCompleteRequest } from '../api/types'
-import { clearSetupToken, setSetupToken } from '../lib/apiKey'
+import { clearSetupToken, getSetupToken, setSetupToken } from '../lib/apiKey'
 import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { cn } from '../lib/cn'
 import { PlexLogin } from '../components/PlexLogin'
@@ -159,7 +159,15 @@ export function SetupWizard() {
   const [roots, setRoots] = useState<LibraryRoots>(EMPTY_ROOTS)
   const [results, setResults] = useState<ResultsState>(EMPTY_RESULTS)
   const [testing, setTesting] = useState<PendingState>(EMPTY_TESTING)
-  const [setupTokenInput, setSetupTokenInput] = useState('')
+  // Seed from the PERSISTED token, not just an empty string: a mid-wizard reload
+  // survives auth (the 30-day session cookie) but loses in-memory React state, so
+  // an input that started empty would leave `setupTokenReady` false with no field
+  // in sight — a dead end where Test/Complete are disabled but the token is still
+  // sent from sessionStorage (north-star-#1 violation). Restoring the input from
+  // getSetupToken() keeps the gate's source of truth aligned with what is actually
+  // transmitted, and the token card (rendered on every step below) still lets a
+  // fresh tab, whose per-tab sessionStorage is empty, (re)enter it.
+  const [setupTokenInput, setSetupTokenInput] = useState(() => getSetupToken() ?? '')
   // Reveal a typed override instead of the Plex pick-list (split-mount / odd layout).
   const [manualPath, setManualPath] = useState(false)
   const [manualTvPath, setManualTvPath] = useState(false)
@@ -184,11 +192,15 @@ export function SetupWizard() {
   const setupTokenReady =
     status.data?.setup_token_required !== true || setupTokenInput.trim().length > 0
 
+  // Rendered on EVERY step while required (not only sign-in): a post-reload or
+  // fresh-tab operator lands on the server/services step already authed, and
+  // without a reachable token field here they could neither re-enter the token
+  // nor run Test/Complete — a terminal-only recovery (north star #1).
   const tokenCard = status.data?.setup_token_required ? (
     <section className="mb-4 rounded-2xl border border-hairline bg-surface p-5">
       <h2 className="font-display text-lg font-bold text-ink">Setup token</h2>
       <p className="mt-1 text-sm text-muted">
-        Enter the one-time bootstrap token from your server's environment before signing in.
+        Enter the one-time bootstrap token from your server's environment to continue setup.
       </p>
       <div className="mt-4">
         <Field
@@ -222,6 +234,7 @@ export function SetupWizard() {
   if (step === 'server' || server === null) {
     return (
       <Shell>
+        {tokenCard}
         <ServerPicker onVerified={(verified) => setServer(verified)} />
       </Shell>
     )
@@ -303,6 +316,7 @@ export function SetupWizard() {
 
   return (
     <Shell>
+      {tokenCard}
       <section className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-available/40 bg-surface p-4">
         <span className="min-w-0 truncate text-sm text-ink">
           Plex: {server.url} — verified ✓

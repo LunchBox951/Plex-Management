@@ -104,6 +104,13 @@ async function createPin(): Promise<PlexPin> {
       method: 'POST',
       headers: plexHeaders(),
     })
+    // `fetch` only rejects on a network failure, NOT on an HTTP 4xx/5xx. plex.tv
+    // answers rate-limits (429) and contract errors (400) with a parseable JSON
+    // error envelope, so `res.json()` would succeed and yield an id/code/expiresIn
+    // of `undefined` — driving the popup at `&code=undefined` and polling a dead
+    // PIN until the 30-minute expiry. Treat any non-2xx as the honest unreachable
+    // failure the docstring promises, not a misleading dead-end (north star #3).
+    if (!res.ok) throw new PlexPinError('plex_tv_unreachable_browser')
     body = (await res.json()) as PlexPinResponse
   } catch {
     throw new PlexPinError('plex_tv_unreachable_browser')
@@ -117,6 +124,10 @@ async function readPinToken(id: number): Promise<string | null> {
     const res = await fetch(`https://plex.tv/api/v2/pins/${encodeURIComponent(String(id))}`, {
       headers: plexHeaders(),
     })
+    // Same as createPin: a non-2xx poll (e.g. plex.tv rate-limiting) carries a
+    // JSON error envelope that would parse to `authToken: undefined` and poll
+    // forever. Surface the honest unreachable code instead of silently retrying.
+    if (!res.ok) throw new PlexPinError('plex_tv_unreachable_browser')
     body = (await res.json()) as PlexPinResponse
   } catch {
     throw new PlexPinError('plex_tv_unreachable_browser')

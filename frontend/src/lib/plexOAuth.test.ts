@@ -13,6 +13,14 @@ function pinBody(overrides: Record<string, unknown> = {}): Response {
   return { ok: true, status: 200, json: async () => data } as unknown as Response
 }
 
+/** A non-2xx plex.tv response whose body is STILL valid JSON — the v2 API's
+ * documented error-envelope shape for 400/401/429/5xx. `res.json()` resolves
+ * here (no throw), so only an `res.ok` check catches it. */
+function errorBody(status = 429, overrides: Record<string, unknown> = {}): Response {
+  const data = { errors: [{ code: 1029, message: 'rate limited', status }], ...overrides }
+  return { ok: false, status, json: async () => data } as unknown as Response
+}
+
 /** A stand-in for the popup Window handle the click handler pre-opened. */
 function makePopup(): Window {
   return {
@@ -160,6 +168,40 @@ describe('runPlexPinFlow', () => {
       .fn()
       .mockResolvedValueOnce(pinBody({ id: 5 })) // create ok
       .mockRejectedValueOnce(new TypeError('Failed to fetch')) // poll rejects
+    vi.stubGlobal('fetch', fetch)
+
+    const promise = runPlexPinFlow(popup)
+    const assertion = expect(promise).rejects.toMatchObject({
+      code: 'plex_tv_unreachable_browser',
+    })
+    await vi.advanceTimersByTimeAsync(1000)
+    await assertion
+  })
+
+  it('rejects with plex_tv_unreachable_browser when create answers non-2xx with a JSON body', async () => {
+    // plex.tv rate-limiting (429) / a contract 400 returns a parseable JSON error
+    // envelope, so `res.json()` succeeds and the id/code are `undefined`. Without
+    // an `res.ok` check the flow would drive the popup at `&code=undefined` and
+    // poll a dead PIN until the 30-minute expiry — the honest unreachable code
+    // must fire instead of a misleading dead-end.
+    const popup = makePopup()
+    const fetch = vi.fn().mockResolvedValue(errorBody(429))
+    vi.stubGlobal('fetch', fetch)
+
+    await expect(runPlexPinFlow(popup)).rejects.toMatchObject({
+      code: 'plex_tv_unreachable_browser',
+    })
+    // Never navigated the popup at a bogus code=undefined URL.
+    expect(popup.location.href).toBe('')
+  })
+
+  it('rejects with plex_tv_unreachable_browser when a poll answers non-2xx with a JSON body', async () => {
+    vi.useFakeTimers()
+    const popup = makePopup()
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(pinBody({ id: 5 })) // create ok
+      .mockResolvedValueOnce(errorBody(429)) // poll: rate-limited, JSON envelope
     vi.stubGlobal('fetch', fetch)
 
     const promise = runPlexPinFlow(popup)

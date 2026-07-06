@@ -21,6 +21,10 @@ const h = vi.hoisted(() => ({
   servers: { servers: [] } as PlexServersResponse,
   initialized: false,
   setupTokenRequired: false,
+  // The token as it survives in sessionStorage across a same-tab reload (per-tab,
+  // so a fresh tab sees null). Drives the getSetupToken() mock the wizard seeds
+  // its input from.
+  storedSetupToken: null as string | null,
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -47,6 +51,7 @@ vi.mock('../api/hooks', () => ({
 }))
 
 vi.mock('../lib/apiKey', () => ({
+  getSetupToken: () => h.storedSetupToken,
   setSetupToken: h.setSetupToken,
   clearSetupToken: h.clearSetupToken,
 }))
@@ -112,6 +117,7 @@ function resetMocks() {
   h.servers = { servers: [] }
   h.initialized = false
   h.setupTokenRequired = false
+  h.storedSetupToken = null
 }
 
 /** Sign in + pick + verify a server so a test lands on the services step. */
@@ -388,5 +394,43 @@ describe('SetupWizard — setup token (pre-init hardening)', () => {
   it('does not show the setup-token field when the backend does not require it', () => {
     render(<SetupWizard />, { wrapper: Wrapper })
     expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument()
+  })
+
+  it('restores the persisted token after an authed reload so the services step is not stranded', async () => {
+    // A mid-wizard reload keeps the 30-day session cookie (authed → past the
+    // sign-in step) but resets React state. The token still lives in
+    // sessionStorage; pre-fix the input re-initialized empty, leaving
+    // setupTokenReady=false with the token card unreachable — Test/Complete
+    // permanently disabled with no field to recover (north-star-#1 dead end).
+    h.setupTokenRequired = true
+    h.authenticated = true
+    h.servers = SERVERS
+    h.storedSetupToken = 'boot-token'
+    h.validatePlex.mockResolvedValue(plexVerifyOk([movieLibrary, tvLibrary]))
+    await reachServices()
+
+    // The token card is reachable on the services step, showing the restored value.
+    expect(screen.getByLabelText('Setup token')).toHaveValue('boot-token')
+    // Every "Test connection" is enabled — the gate reflects the persisted token.
+    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+      expect(button).toBeEnabled()
+    }
+  })
+
+  it('lets a fresh authed tab (empty per-tab storage) re-enter the token on the server step', () => {
+    // A brand-new tab shares the session cookie (authed) but not sessionStorage,
+    // so no token is present and the server step's own fetch would 401. The token
+    // card must be reachable here too so the operator can supply it — never a
+    // terminal-only recovery.
+    h.setupTokenRequired = true
+    h.authenticated = true
+    h.storedSetupToken = null
+    h.servers = { servers: [] } // stays on the server step (no verify needed)
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    const field = screen.getByLabelText('Setup token')
+    expect(field).toHaveValue('')
+    fireEvent.change(field, { target: { value: 'boot-token' } })
+    expect(h.setSetupToken).toHaveBeenCalledWith('boot-token')
   })
 })

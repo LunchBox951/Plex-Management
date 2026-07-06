@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PlexLibraryOption, SettingsResponse, SettingsUpdate } from '../api/types'
+import type { ApiError } from '../lib/errors'
 import { Settings } from './Settings'
 
 // Hoisted shared state so the vi.mock factories (hoisted above imports) can read it.
@@ -22,6 +23,11 @@ const h = vi.hoisted(() => ({
   // state (the status endpoint only ever reports existence, never the key).
   appKeyExists: false,
   statusLoading: false,
+  // A persistent status-fetch failure. `data` is withheld while erroring so the
+  // component can never derive `exists` from a stale/absent body.
+  statusIsError: false,
+  statusError: null as ApiError | null,
+  statusRefetch: vi.fn(),
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -40,8 +46,11 @@ vi.mock('../api/hooks', () => ({
     refetch: h.librariesRefetch,
   }),
   useAppKeyStatus: () => ({
-    data: h.statusLoading ? undefined : { exists: h.appKeyExists },
+    data: h.statusLoading || h.statusIsError ? undefined : { exists: h.appKeyExists },
     isLoading: h.statusLoading,
+    isError: h.statusIsError,
+    error: h.statusError,
+    refetch: h.statusRefetch,
   }),
   useRotateAppKey: () => ({ mutateAsync: h.rotateMutateAsync, isPending: h.rotatePending }),
   useRevokeAppKey: () => ({ mutateAsync: h.revokeMutateAsync, isPending: h.revokePending }),
@@ -513,6 +522,9 @@ describe('Settings — Access recovery key (opt-in, ADR-0016)', () => {
     h.rotatePending = false
     h.revokePending = false
     h.statusLoading = false
+    h.statusIsError = false
+    h.statusError = null
+    h.statusRefetch.mockReset()
     h.appKeyExists = false
     h.settingsData = {
       plex_url: 'http://plex:32400',
@@ -622,6 +634,33 @@ describe('Settings — Access recovery key (opt-in, ADR-0016)', () => {
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(h.revokeMutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('shows the honest error (never a blind Generate) when the status fetch persistently fails', async () => {
+    // A persistent status 5xx leaves `exists` underivable. The pre-fix code fell
+    // through to the no-key "Generate recovery key" button — but the single mint
+    // endpoint ROTATES an existing key, so clicking it would silently invalidate
+    // every other device/automation. The error branch must surface the failure
+    // and offer only a Retry, never a destructive action on unknown state.
+    h.statusIsError = true
+    h.statusError = {
+      code: 'upstream_error',
+      message: 'An upstream service failed. Try again shortly.',
+      status: 500,
+    }
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('An upstream service failed')
+    // No mint control of ANY kind is offered while the key's existence is unknown.
+    expect(
+      screen.queryByRole('button', { name: /generate recovery key/i }),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^rotate$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^revoke$/i })).not.toBeInTheDocument()
+
+    // Retry re-runs the status query so the operator can recover without a reload.
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    expect(h.statusRefetch).toHaveBeenCalledTimes(1)
   })
 
   it('surfaces a rotate CAS conflict (app_key_changed) honestly, matching the production copy', async () => {
