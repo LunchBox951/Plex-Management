@@ -239,6 +239,46 @@ async def test_fetch_account_non_json_body_maps_to_bad_response() -> None:
     assert "status" not in excinfo.value.diagnostics
 
 
+async def test_fetch_account_redirect_with_json_body_is_never_returned_as_data() -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of plex.tv) must be rejected like
+    any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes 3xx, so the
+    prior check would have read a redirect carrying a JSON body as legitimate
+    identity data even though it never actually reached plex.tv. #122 fixed the
+    other four adapter wrappers but deferred this fifth ``oauth.py`` site because it
+    lived only on the then-unmerged PR #45 branch."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, json=V2_USER, headers={"Location": "/web/login"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_account(_USER_TOKEN)
+
+    assert excinfo.value.code == "plex_tv_bad_response"
+    assert excinfo.value.diagnostics["host"] == "plex.tv"
+    assert excinfo.value.diagnostics["status"] == "302"
+
+
+async def test_fetch_account_redirect_with_empty_body_is_status_aware_not_non_json() -> None:
+    """A 3xx with an empty body must raise the SAME status-aware ``bad_response``
+    error as a 3xx with a JSON body — not fall through to the JSON-decode failure
+    path, which would report a misleading "non-JSON response" diagnosis (no
+    ``status``) for what is actually a redirect being rejected."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "/web/login"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_account(_USER_TOKEN)
+
+    assert excinfo.value.code == "plex_tv_bad_response"
+    assert excinfo.value.diagnostics["host"] == "plex.tv"
+    assert excinfo.value.diagnostics["status"] == "302"
+
+
 @pytest.mark.parametrize(
     "payload",
     [

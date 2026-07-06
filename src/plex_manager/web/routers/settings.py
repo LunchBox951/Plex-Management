@@ -92,6 +92,36 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorEnvelope,
         "description": "The signed-in admin does not own the replacement Plex server",
     },
+    409: {
+        "model": ErrorEnvelope,
+        "description": "The signed-in admin has no Plex account on file to verify ownership",
+    },
+    # This status code has THREE distinct producers, so all three shapes are
+    # documented (mirroring queue.py's ``_GRAB_ERROR_RESPONSES`` /
+    # search_preview.py's anyOf, which document the same body-validation-vs-app-error
+    # collision): FastAPI's own request-body validation (``HTTPValidationError``),
+    # ``_validate_disk_pressure_pair``'s plain ``HTTPException`` (``ErrorDetail``),
+    # and the repoint verification ladder's ``plex_token_invalid`` ``AppError``
+    # (``ErrorEnvelope``). Declaring only ``ErrorEnvelope`` here would silently
+    # overwrite FastAPI's auto-generated validation-error entry instead of adding
+    # to it.
+    422: {
+        "description": (
+            "Request validation failed, the disk-pressure pair would invert, "
+            "or the replacement Plex server rejected the effective Plex token"
+        ),
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {"$ref": "#/components/schemas/ErrorDetail"},
+                        {"$ref": "#/components/schemas/ErrorEnvelope"},
+                    ]
+                }
+            }
+        },
+    },
     502: {
         "model": ErrorEnvelope,
         "description": "The replacement Plex server did not answer the /identity probe",

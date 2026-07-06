@@ -4279,15 +4279,35 @@
             },
             "description": "The signed-in admin does not own the replacement Plex server"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The signed-in admin has no Plex account on file to verify ownership"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelope"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Request validation failed, the disk-pressure pair would invert, or the replacement Plex server rejected the effective Plex token"
           },
           "502": {
             "content": {
