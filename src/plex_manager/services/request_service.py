@@ -427,6 +427,38 @@ async def create_request_result(
         # the season to 'pending').
         present = await _present_seasons_or_empty(library, tmdb_id)
         if present:
+            # Serialize + RE-READ the active row under the per-media lock -- the
+            # TV twin of the movie path's under-lock re-read above. A second TV
+            # re-request can commit an active 'pending' re-grab between the
+            # top-of-function find_active and here; ``evicted_seasons`` (keyed on
+            # the newest non-cancelled row per season) then sees that newer
+            # PENDING row, subtracts nothing, and the superset check below would
+            # dedup onto an OLDER stale 'available' row -- answering in-library
+            # for a season the sweep is deleting. The lock is taken only AFTER
+            # the Plex crawl above (never hold the write transaction open across
+            # network I/O; the movie path orders its Plex check the same way).
+            await repo.acquire_media_lock(tmdb_id, media_type)
+            existing_active = await repo.find_active(tmdb_id, media_type)
+            if existing_active is not None:
+                # Dedup onto the concurrent re-grab, mirroring the top-of-function
+                # dedup path (grow its tracked season set, re-read past the
+                # rollup). Release the media lock FIRST: ensure_seasons crawls
+                # Plex, and the lock's write transaction must not stay open
+                # across that network call (the rollback discards only the lock
+                # acquisition -- nothing else is pending in this session here).
+                await session.rollback()
+                await season_request_service.ensure_seasons(
+                    session,
+                    library,
+                    media_request_id=existing_active.id,
+                    tmdb_id=tmdb_id,
+                    seasons=season_numbers,
+                )
+                await session.commit()
+                return CreateRequestResult(
+                    record=await repo.get(existing_active.id) or existing_active,
+                    created=False,
+                )
             present = present - await SqlSeasonRequestRepository(session).evicted_seasons(tmdb_id)
         if present.issuperset(season_numbers):
             in_library = await repo.find_in_library(tmdb_id, media_type)

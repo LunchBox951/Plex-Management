@@ -3024,3 +3024,170 @@ async def test_resume_releases_a_legacy_season_breadcrumb_when_a_newer_row_owns_
     assert len(new_seasons) == 1
     assert new_seasons[0].status is RequestStatus.available  # the owner untouched
     assert new_seasons[0].library_path == shared_path
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-4 finding 1: recovery covers EVERY pre-grab breadcrumb status.
+# A crash-window re-arm lands on 'pending', but auto-grab can promote it to
+# 'searching' and park it 'no_acceptable_release' before the next sweep; a
+# pending-only enumeration missed those, stranding the file (invisible to
+# candidate assembly) behind a dishonest "nothing found".
+# --------------------------------------------------------------------------- #
+
+
+async def test_sweep_recovers_a_rearmed_season_promoted_to_searching(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The re-arm was promoted 'pending' -> 'searching' by auto-grab before the
+    sweep ran: recovery must still fold it back to 'available' off the
+    breadcrumb (per-status CAS from 'searching')."""
+    s1_path = _movie_file(tmp_path, "Promoted Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=660, title="Promoted Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.searching  # promoted by auto-grab
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.searching
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None and season_row.status is RequestStatus.available
+    assert season_row.library_path == s1_path
+    assert show is not None and show.status is RequestStatus.available
+
+
+async def test_sweep_recovers_a_rearmed_season_parked_no_acceptable_release(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex's exact round-4 scenario: the re-arm was searched and PARKED
+    ('no_acceptable_release') before the sweep ran. Without breadth the parked
+    breadcrumb-bearing row is never restored -- the file stays on disk forever
+    (parked rows are not eviction candidates) behind a dishonest duplicate
+    "nothing found". Recovery folds it back to 'available'."""
+    s1_path = _movie_file(tmp_path, "Parked Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=661, title="Parked Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.no_acceptable_release  # searched + parked
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.no_acceptable_release
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()  # never deleted -- and now reclaimable again
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None and season_row.status is RequestStatus.available
+    assert show is not None and show.status is RequestStatus.available
+
+
+async def test_sweep_releases_the_breadcrumb_of_a_parked_rearmed_season_whose_file_is_gone(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """File-gone half for the broadened statuses: the parked search over a
+    truly-gone file is legitimate -- the row stays parked, the stale breadcrumb
+    is released, and the missing history/Plex refresh land."""
+    missing_path = str(tmp_path / "tv" / "Parked Gone" / "Season 01")  # never created
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=662, title="Parked Gone", seasons={1: missing_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.no_acceptable_release
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.no_acceptable_release
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 662)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.no_acceptable_release  # the park stands
+    assert season_row.library_path is None  # stale breadcrumb released
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+    assert (missing_path, "tv") in library.scan_calls

@@ -677,17 +677,25 @@ async def _resume_interrupted_evictions(
       the eviction fresh through the normal claim -> purge path). File gone ->
       finalize now (CAS-clear breadcrumb as the single-winner gate, history row,
       the Plex refresh the crash swallowed).
-    * ``pending`` + breadcrumb (TV only) -- an in-window re-request re-armed the
+    * PRE-GRAB + breadcrumb (TV only; every status in
+      :data:`_PRE_GRAB_STATUSES`) -- an in-window re-request re-armed the
       claimed season row (``ensure_seasons``, ``evicted`` -> ``pending``) before
       recovery ran, so the ``evicted`` enumeration alone would MISS it and let
-      the re-grab download a duplicate of a file that never left. A season can
-      only carry ``pending`` + a breadcrumb through that exact re-arm (fresh
-      season rows have no breadcrumb; report-issue's keep-the-breadcrumb re-arm
-      sets ``searching``, never ``pending``), so recovery folds it back to
-      ``available`` when the file is present, or releases the stale breadcrumb
-      (the re-grab is then legitimate) when it is gone -- see
-      :func:`_recover_rearmed_season`. Movies have no same-row re-arm (a movie
-      re-request always creates a NEW row), so this shape is season-only.
+      the re-grab download a duplicate of a file that never left. The re-arm
+      lands on ``pending``, but auto-grab (or a manual search) can promote it to
+      ``searching`` and park it ``no_acceptable_release`` before this sweep
+      runs, so ALL THREE pre-grab statuses are enumerated -- a parked
+      breadcrumb-bearing season would otherwise show a dishonest "nothing
+      found" over a playable file that no sweep could ever reclaim (evicted
+      rows are not candidates; parked rows aren't either). Recovery folds the
+      row back to ``available`` when the file is present (a per-status-honest
+      CAS from EXACTLY the status that was read, so an advance mid-recovery
+      loses cleanly), or releases the stale breadcrumb (the re-grab/search is
+      then legitimate) when it is gone -- see :func:`_recover_rearmed_season`,
+      including the one deliberate tradeoff this breadth buys. Movies have no
+      same-row re-arm (a movie re-request always creates a NEW row; a movie
+      ``searching`` + breadcrumb row is report-issue's failed-purge redo and
+      must never be touched), so this shape is season-only.
 
     Before restoring/folding ANY file-present row, :func:`_path_claimed_by_another_row`
     distinguishes interrupted from FINALIZED-BUT-SUPERSEDED: if another live row
@@ -705,7 +713,7 @@ async def _resume_interrupted_evictions(
     an I/O error); one row's failure never aborts the rest.
     """
     pairs: list[tuple[str, str | None, _Pending]] = []  # (library_path, title, pending)
-    rearmed: list[tuple[str, str | None, _SeasonPending]] = []
+    rearmed: list[tuple[str, str | None, str, _SeasonPending]] = []
     if media_type == "movie":
         request_repo = SqlRequestRepository(session)
         for row in await request_repo.list_by_status(RequestStatus.evicted.value):
@@ -736,28 +744,34 @@ async def _resume_interrupted_evictions(
                 size_bytes=None,
             )
             pairs.append((season.library_path, parent.title if parent else None, pending))
-        # The re-armed shape: 'pending' + breadcrumb (see the docstring) -- the
+        # The re-armed shape: PRE-GRAB + breadcrumb (see the docstring) -- the
         # crash-window re-request already rewrote the status, so the 'evicted'
-        # enumeration above cannot see it.
-        for season in await season_repo.list_by_status(RequestStatus.pending.value):
-            if season.library_path is None or not _owned_by_root(
-                season.library_path, root_path, all_roots
-            ):
-                continue
-            parent = await request_repo.get(season.media_request_id)
-            rearmed.append(
-                (
-                    season.library_path,
-                    parent.title if parent else None,
-                    _SeasonPending(
-                        media_request_id=season.media_request_id,
-                        season_request_id=season.id,
-                        season_number=season.season_number,
-                        tmdb_id=season.tmdb_id,
-                        size_bytes=None,
-                    ),
+        # enumeration above cannot see it; and auto-grab can have promoted the
+        # re-arm past 'pending' (searching, or parked no_acceptable_release)
+        # before this sweep ran, so every pre-grab status is enumerated. The
+        # status each row was READ at travels with it: the fold CAS compares
+        # against exactly that status, never the whole pre-grab set.
+        for pre_grab_status in sorted(_PRE_GRAB_STATUSES):
+            for season in await season_repo.list_by_status(pre_grab_status):
+                if season.library_path is None or not _owned_by_root(
+                    season.library_path, root_path, all_roots
+                ):
+                    continue
+                parent = await request_repo.get(season.media_request_id)
+                rearmed.append(
+                    (
+                        season.library_path,
+                        parent.title if parent else None,
+                        pre_grab_status,
+                        _SeasonPending(
+                            media_request_id=season.media_request_id,
+                            season_request_id=season.id,
+                            season_number=season.season_number,
+                            tmdb_id=season.tmdb_id,
+                            size_bytes=None,
+                        ),
+                    )
                 )
-            )
 
     for library_path, title, pending in pairs:
         try:
@@ -778,13 +792,14 @@ async def _resume_interrupted_evictions(
                 "resuming an interrupted eviction failed unexpectedly; will retry next sweep",
                 extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
             )
-    for library_path, title, season_pending in rearmed:
+    for library_path, title, observed_status, season_pending in rearmed:
         try:
             await _recover_rearmed_season(
                 session=session,
                 library=library,
                 library_path=library_path,
                 title=title,
+                observed_status=observed_status,
                 pending=season_pending,
             )
         except Exception:
@@ -805,24 +820,41 @@ async def _recover_rearmed_season(
     library: LibraryPort,
     library_path: str,
     title: str | None,
+    observed_status: str,
     pending: _SeasonPending,
 ) -> None:
-    """Recover ONE re-armed (``pending`` + breadcrumb) crash-window season --
+    """Recover ONE re-armed (pre-grab + breadcrumb) crash-window season --
     the second enumeration shape of :func:`_resume_interrupted_evictions`.
 
-    File present and unclaimed elsewhere -> fold ``pending`` back to
-    ``available`` (CAS from ``pending`` ONLY -- deliberately narrower than
-    :data:`_PRE_GRAB_STATUSES`, so a row that meanwhile advanced to
-    ``searching``/parked is left to auto-grab/the reconciler rather than folded
-    on a stale read): the file never left, so the re-grab's reason evaporated,
-    exactly the same-row fold :func:`_restore_after_failed_delete` applies when
-    its own restore CAS loses to this re-arm. File present but another live row
-    claims the path -> release the stale breadcrumb and leave the row
-    ``pending`` (the re-grab is legitimate; its import will stamp a fresh
-    breadcrumb). File gone -> the interrupted purge actually completed: record
-    the eviction history it never got, release the breadcrumb (single-winner
-    CAS), refresh Plex, and leave the row ``pending`` -- the re-grab is exactly
-    right for a file that is truly gone.
+    File present and unclaimed elsewhere -> fold back to ``available``, CAS'd
+    from EXACTLY ``observed_status`` (the status the enumeration read), never
+    the whole pre-grab set -- a row that advances mid-recovery (auto-grab
+    promoting ``pending`` -> ``searching``, or a grab landing ``downloading``)
+    loses the swap cleanly and is retried/left next sweep. The file never left,
+    so the re-grab's reason evaporated; a parked row in particular must not
+    keep showing "nothing found" over a playable file no sweep can reclaim.
+
+    DELIBERATE TRADEOFF (stated, not hidden): ``searching``/parked + breadcrumb
+    is ambiguous between (a) this crash-window re-arm promoted by auto-grab and
+    (b) report-issue's failed-purge redo (``reset_for_research(clear_library_
+    path=False)`` keeps the breadcrumb over the REPORTED-BAD file; its inline
+    re-search can park it). No stored discriminator separates them, and both
+    fold. For shape (b) the fold is still FACTUALLY honest -- the purge failed,
+    so the reported file is on disk and in Plex, i.e. genuinely watchable --
+    and it returns the row to a state every subsystem can manage (re-reportable,
+    evictable), but it does cancel the pending redo: the operator re-reports if
+    the bad copy still matters. Folding was chosen over leaving shape (a)
+    stranded because (a) leaks disk FOREVER (a parked/evicted-less row is
+    invisible to candidate assembly), while (b)'s cost is one repeated, fully
+    supported operator action on a rare double-failure (purge failed AND no
+    replacement found).
+
+    File present but another live row claims the path -> release the stale
+    breadcrumb and leave the row as it is (the re-grab/search is legitimate; its
+    import will stamp a fresh breadcrumb). File gone -> the interrupted purge
+    actually completed: record the eviction history it never got, release the
+    breadcrumb (single-winner CAS), refresh Plex, and leave the status alone --
+    a re-grab/search over a truly-gone file is exactly right.
     """
     try:
         await asyncio.to_thread(os.stat, library_path)
@@ -854,7 +886,7 @@ async def _recover_rearmed_season(
             media_request_id=pending.media_request_id,
             season_request_id=pending.season_request_id,
             status=RequestStatus.available.value,
-            allowed_from=frozenset({RequestStatus.pending.value}),
+            allowed_from=frozenset({observed_status}),
             tolerate_active_conflict=True,
         )
         if folded:
@@ -869,16 +901,16 @@ async def _recover_rearmed_season(
         else:
             await session.rollback()
             _logger.info(
-                "re-armed season %s moved on before recovery (searching/grabbed); "
-                "leaving it to auto-grab/the reconciler",
+                "re-armed season %s moved on before recovery (advanced past the "
+                "status it was read at); leaving it to auto-grab/the reconciler",
                 pending.season_number,
                 extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
             )
         return
 
-    # File gone: the interrupted purge completed before the crash, so the re-grab
-    # is legitimate -- record the eviction it never got to log, release the
-    # breadcrumb, refresh Plex, and leave the row 'pending'.
+    # File gone: the interrupted purge completed before the crash, so the
+    # re-grab/search is legitimate -- record the eviction it never got to log,
+    # release the breadcrumb, refresh Plex, and leave the status alone.
     cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
         pending.season_request_id
     )
@@ -1071,7 +1103,12 @@ async def _evict_one(
        in-window re-grab standing -- the file never left, so its reason
        evaporated: pre-grab re-requests are CAS-cancelled / folded back to
        ``available``; anything that already grabbed is left to the
-       reconciler/import dedup (see :func:`_restore_after_failed_delete`).
+       reconciler/import dedup (see :func:`_restore_after_failed_delete`). The
+       REVERSE race -- the cancel CAS winning against a row whose grab is
+       mid-``qbt.add`` -- is closed on the GRAB side: ``grab_service``'s
+       post-add status move is itself a CAS that refuses a cancelled row,
+       removes the just-added torrent, and raises the honest
+       ``RequestNotActiveError`` (see ``_GRABBABLE_*_STATUS_VALUES`` there).
 
     Full lifecycle state table, from the moment the claim COMMITS (row
     ``evicted``, breadcrumb set, file on disk); every permutation of
@@ -1100,12 +1137,16 @@ async def _evict_one(
     re-request in-window, user CANCELS it,    guards ignore ``cancelled`` rows, so
     another re-request follows                it still lands ``pending`` (never a
                                               stale-Plex ``available`` mint)
-    crash + season re-armed ``pending``       recovered next sweep off the
-    (file present)                            BREADCRUMB: folded back ``available``
-                                              (the file never left)
-    crash + season re-armed ``pending``       breadcrumb released + the missing
-    (file gone)                               history/Plex refresh; the re-grab
-                                              proceeds (legitimate)
+    crash + season re-armed to ANY pre-grab   recovered next sweep off the
+    status, incl. auto-grab promoting it to   BREADCRUMB: folded back ``available``
+    searching / parking it (file present)     via a per-status CAS (file never left)
+    crash + season re-armed, any pre-grab     breadcrumb released + the missing
+    status (file gone)                        history/Plex refresh; the re-grab
+                                              or parked search proceeds (legitimate)
+    cancel (restore reconciliation or user)   closed grab-side: the post-add CAS
+    lands while a grab's qbt.add is in        loses on the cancelled row, the
+    flight                                    just-added torrent is removed,
+                                              RequestNotActiveError raised
     file present but ANOTHER live row now     finalized-but-superseded (legacy /
     claims the same path                      completed re-import): breadcrumb
                                               released, NOTHING restored -- the

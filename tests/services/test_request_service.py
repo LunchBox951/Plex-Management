@@ -561,6 +561,96 @@ async def test_create_request_tv_skips_in_library_dedup_for_just_evicted_seasons
     assert {r.season_number: r.status.value for r in rows} == {1: "pending"}  # re-grabs
 
 
+async def test_create_request_tv_dedups_onto_concurrent_regrab_under_the_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-4 finding 3: the TV twin of the movie under-lock re-read. A second
+    TV re-request commits an active 'pending' re-grab between this caller's
+    top-of-function find_active and the in-library dedup; evicted_seasons (newest
+    non-cancelled row per season) then sees that PENDING row, subtracts nothing,
+    and -- without the under-lock re-read -- the superset check dedups onto an
+    OLDER stale 'available' row for the season the sweep is deleting. The racing
+    request must dedup onto the pending re-grab instead."""
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=670,
+            media_type=MediaType.tv,
+            title="Raced Show",
+            status=RequestStatus.available,  # the stale leftover
+        )
+        session.add(stale)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=stale.id, season_number=1, status=RequestStatus.available
+            )
+        )
+        evicted = MediaRequest(
+            tmdb_id=670,
+            media_type=MediaType.tv,
+            title="Raced Show",
+            status=RequestStatus.evicted,  # the claim window
+        )
+        session.add(evicted)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=evicted.id, season_number=1, status=RequestStatus.evicted
+            )
+        )
+        # The CONCURRENT re-request's already-committed pending re-grab (newest).
+        regrab = MediaRequest(
+            tmdb_id=670,
+            media_type=MediaType.tv,
+            title="Raced Show",
+            status=RequestStatus.pending,
+        )
+        session.add(regrab)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=regrab.id, season_number=1, status=RequestStatus.pending)
+        )
+        await session.commit()
+        stale_id, regrab_id = stale.id, regrab.id
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        # The top-of-function check misses the concurrent re-grab (not yet
+        # visible to this transaction); the UNDER-LOCK re-read sees it.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(
+        shows={670: TvMetadata(tmdb_id=670, title="Raced Show", year=2020, season_count=1)}
+    )
+    library = FakeLibrary(available_tv_seasons={670: frozenset({1})})  # Plex still lists it
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session, tmdb, tmdb_id=670, media_type="tv", seasons=[1], library=library
+        )
+
+    assert result.id == regrab_id  # deduped onto the concurrent re-grab...
+    assert result.id != stale_id  # ...never the stale leftover 'available' row
+    assert result.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 670)))
+            .scalars()
+            .all()
+        )
+    # No fourth row minted -- and no 'available' answer for the doomed season.
+    assert sorted(r.status.value for r in rows) == ["available", "evicted", "pending"]
+
+
 async def test_create_request_after_cancelled_in_window_regrab_still_re_grabs(
     sessionmaker_: SessionMaker,
 ) -> None:

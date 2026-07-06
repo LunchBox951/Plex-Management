@@ -31,6 +31,7 @@ from plex_manager.models import (
 )
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
@@ -62,6 +63,31 @@ DEFAULT_CATEGORY: Final = "plex-manager"
 # Terminal download states (string values) — a download in one of these is
 # finished, so an identical hash may be grabbed afresh.
 _TERMINAL_STATUS_VALUES: Final[frozenset[str]] = frozenset(s.value for s in TERMINAL_STATES)
+
+# Post-add status-move CAS predicates. ``grab`` awaits ``qbt.add(...)`` BEFORE it
+# moves the request/season to ``downloading``, and a cancel — the operator's
+# cancel verb, or the eviction restore's redundant-re-grab reconciliation — can
+# commit ``cancelled`` during that await. The up-front terminal gate ran before
+# the add, so the post-add move must be a compare-and-swap, not an unconditional
+# write: flipping a just-cancelled row back to ``downloading`` would resurrect a
+# request against the user's explicit stop (and, for a movie, re-enter
+# ``uq_media_requests_active`` — potentially colliding with a newer active row
+# AFTER the torrent was already added). A losing CAS is handled like the other
+# post-add losses (see the lost-parallel-grab branches): roll back, best-effort
+# remove the just-added torrent, raise the honest ``RequestNotActiveError``.
+#
+# The MOVIE predicate excludes the full terminal set (mirror of the up-front
+# gate: never un-terminate a finished request). The SEASON predicate excludes
+# ONLY ``cancelled``: a grab deliberately reopens an ``available``/``completed``
+# season to chase one more missing episode (see ``season_request_service.
+# set_status``'s docstring), so the pre-existing reopen semantics must survive —
+# ``cancelled`` is the one status meaning "the user just said stop".
+_GRABBABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = (
+    frozenset(s.value for s in RequestStatus) - TERMINAL_REQUEST_STATUS_VALUES
+)
+_GRABBABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value for s in RequestStatus if s is not RequestStatus.cancelled
+)
 
 
 class NoGrabSourceError(Exception):
@@ -596,21 +622,57 @@ async def grab(
         # coerces season back to None for a non-tv request -- so this never
         # branches on a caller-supplied season alone, only on the media type it
         # was already validated against.
+        #
+        # POST-ADD CAS (see _GRABBABLE_*_STATUS_VALUES): the up-front terminal
+        # gate ran BEFORE qbt.add, so a cancel that committed while the add was
+        # in flight must make this move match zero rows -- never be overwritten
+        # back to 'downloading'.
         if season is not None:
             # TV: the request's status is a COMPUTED rollup of its seasons, never a
-            # direct target -- route through season_request_service so the season
-            # row (created lazily here, like the Download row) moves to
-            # 'downloading' and the parent's rollup is recomputed in the same
-            # transaction, rather than stomping the request status directly.
-            await season_request_service.set_status(
+            # direct target -- resolve the season row (created lazily here, like
+            # the Download row) and CAS it to 'downloading';
+            # season_request_service recomputes the parent's rollup in the same
+            # transaction ONLY when the swap actually won.
+            season_row = await SqlSeasonRequestRepository(session).ensure(
+                request_id, season, status=RequestStatus.pending.value
+            )
+            moved = await season_request_service.set_status_if_in(
                 session,
                 media_request_id=request_id,
-                season_number=season,
+                season_request_id=season_row.id,
                 status=RequestStatus.downloading.value,
+                allowed_from=_GRABBABLE_SEASON_STATUS_VALUES,
             )
         else:
-            await SqlRequestRepository(session).set_status(
-                request_id, RequestStatus.downloading.value
+            moved = await SqlRequestRepository(session).set_status_if_in(
+                request_id,
+                RequestStatus.downloading.value,
+                _GRABBABLE_REQUEST_STATUS_VALUES,
             )
+        if not moved:
+            # The request/season was cancelled (or, for a movie, went terminal)
+            # while qbt.add was in flight. The torrent is already in the client
+            # and the Download row + 'grabbed' history are pending in this
+            # transaction -- discard them, then best-effort remove the just-added
+            # torrent WITH data (the same orphan cleanup the lost-parallel-grab
+            # branches above perform; leaving it would seed forever for content
+            # nobody wants), and refuse honestly. Every caller already handles
+            # RequestNotActiveError: the endpoint as 409, auto-grab by leaving
+            # the scope as-is, report-issue via its _GRAB_ERRORS park (whose
+            # never-un-terminate guard skips a cancelled row).
+            await session.rollback()
+            try:
+                await qbt.remove(torrent_hash, delete_files=True)
+            except Exception:
+                _logger.warning(
+                    "failed to remove orphaned torrent after the request was "
+                    "cancelled mid-grab; it may keep seeding until removed manually",
+                    exc_info=True,
+                    extra={
+                        "request_id": safe_int(request_id),
+                        "torrent_hash": safe_text(torrent_hash),
+                    },
+                )
+            raise RequestNotActiveError(request_id)
     await session.commit()
     return record

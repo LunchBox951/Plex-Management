@@ -1181,3 +1181,218 @@ async def test_grab_terminal_reuse_cas_lost_to_same_request_conflicting_scope_ra
     assert row.status == "downloading"
     assert row.season == 1
     assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "pending"}
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-4 finding 2 (PR #117): a cancel committing while ``qbt.add`` is
+# in flight must never be overwritten back to 'downloading' by grab's post-add
+# status move. The move is now a CAS; a loser rolls back, removes the
+# just-added torrent (the same orphan cleanup as the lost-parallel-grab
+# branches), and raises the honest RequestNotActiveError. Uses a real
+# file-backed engine (like the eviction double-count test): the mid-add cancel
+# commits in a genuinely separate session/connection.
+# --------------------------------------------------------------------------- #
+
+
+class _CancelMovieDuringAddQbt(FakeQbittorrent):
+    """A FakeQbittorrent whose ``add`` commits a CANCEL of the movie request in a
+    separate session before returning -- the mid-add race, made deterministic."""
+
+    def __init__(self, sm: SessionMaker, request_id: int) -> None:
+        super().__init__()
+        self._sm = sm
+        self._request_id = request_id
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        async with self._sm() as session:
+            row = await session.get(MediaRequest, self._request_id)
+            assert row is not None
+            row.status = RequestStatus.cancelled
+            await session.commit()
+        return await super().add(magnet_or_url, save_path, category)
+
+
+class _CancelSeasonDuringAddQbt(FakeQbittorrent):
+    """The TV twin: ``add`` commits a CANCEL of the season row mid-flight."""
+
+    def __init__(self, sm: SessionMaker, season_request_id: int) -> None:
+        super().__init__()
+        self._sm = sm
+        self._season_request_id = season_request_id
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+        async with self._sm() as session:
+            row = await session.get(SeasonRequest, self._season_request_id)
+            assert row is not None
+            row.status = RequestStatus.cancelled
+            await session.commit()
+        return await super().add(magnet_or_url, save_path, category)
+
+
+async def _file_backed_sessionmaker(tmp_path: Any, name: str) -> tuple[SessionMaker, Any]:
+    """A real file-backed engine (two sessions = two real connections)."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from plex_manager.db import Base, enable_sqlite_fk_enforcement
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return async_sessionmaker(engine, expire_on_commit=False), engine
+
+
+async def test_grab_refuses_a_movie_cancelled_while_qbt_add_was_in_flight(
+    tmp_path: Any,
+) -> None:
+    """The up-front terminal gate passes (row 'pending'), the cancel commits
+    during the awaited qbt.add, and the post-add CAS must LOSE: no Download row,
+    no 'grabbed' history, the cancel stands (never flipped back to
+    'downloading'), the just-added torrent is removed with its data, and the
+    caller gets the honest RequestNotActiveError."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "cancel_mid_grab_movie.db")
+    try:
+        async with sm() as session:
+            req = MediaRequest(
+                tmdb_id=700,
+                media_type=MediaType.movie,
+                title="Stopped",
+                status=RequestStatus.pending,
+            )
+            session.add(req)
+            await session.commit()
+            request_id = req.id
+
+        qbt = _CancelMovieDuringAddQbt(sm, request_id)
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt, session, scored=_scored(_HASH), request_id=request_id, tmdb_id=700
+                )
+
+        # The just-added torrent was cleaned up WITH its data (orphan cleanup).
+        assert (_HASH, True) in qbt.removed
+        async with sm() as session:
+            row = await session.get(MediaRequest, request_id)
+            downloads = (
+                (await session.execute(select(Download).where(Download.torrent_hash == _HASH)))
+                .scalars()
+                .all()
+            )
+            history = (
+                (
+                    await session.execute(
+                        select(DownloadHistory).where(DownloadHistory.tmdb_id == 700)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert row is not None
+        assert row.status is RequestStatus.cancelled  # the user's stop STANDS
+        assert downloads == []  # no tracked download for cancelled content
+        assert history == []  # no 'grabbed' record for a refused grab
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_refuses_a_season_cancelled_while_qbt_add_was_in_flight(
+    tmp_path: Any,
+) -> None:
+    """The TV twin: the season row is cancelled mid-add. The post-add season CAS
+    loses (cancelled is the ONE excluded season status -- the deliberate
+    reopen of available/completed seasons still works), the parent rollup is
+    never recomputed off a write that lost, and the torrent is cleaned up."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "cancel_mid_grab_tv.db")
+    try:
+        async with sm() as session:
+            show = MediaRequest(
+                tmdb_id=701,
+                media_type=MediaType.tv,
+                title="Stopped Show",
+                status=RequestStatus.pending,
+            )
+            session.add(show)
+            await session.flush()
+            season_row = SeasonRequest(
+                media_request_id=show.id, season_number=1, status=RequestStatus.pending
+            )
+            session.add(season_row)
+            await session.commit()
+            show_id, season_id = show.id, season_row.id
+
+        qbt = _CancelSeasonDuringAddQbt(sm, season_id)
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored(_HASH),
+                    request_id=show_id,
+                    tmdb_id=701,
+                    season=1,
+                )
+
+        assert (_HASH, True) in qbt.removed
+        async with sm() as session:
+            season_row = await session.get(SeasonRequest, season_id)
+            show = await session.get(MediaRequest, show_id)
+            downloads = (
+                (await session.execute(select(Download).where(Download.torrent_hash == _HASH)))
+                .scalars()
+                .all()
+            )
+        assert season_row is not None
+        assert season_row.status is RequestStatus.cancelled  # never un-cancelled
+        assert show is not None
+        assert show.status is RequestStatus.pending  # rollup untouched by the loser
+        assert downloads == []
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_still_reopens_an_available_season_after_the_cas(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Regression guard for the season CAS scope: grab must STILL be able to
+    reopen an already-'available' season (chasing one more missing episode) --
+    only 'cancelled' is excluded from the season predicate."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=702,
+            media_type=MediaType.tv,
+            title="Reopen Show",
+            status=RequestStatus.available,
+        )
+        session.add(show)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.available
+        )
+        session.add(season_row)
+        await session.commit()
+        show_id, season_id = show.id, season_row.id
+
+    # NOTE: the parent is terminal ('available'), which the up-front gate would
+    # refuse -- reopening goes through an ACTIVE parent in practice. Re-arm the
+    # parent as the re-request path would (partially_available is active).
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.partially_available
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=show_id,
+            tmdb_id=702,
+            season=1,
+        )
+    assert record.status == "downloading"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.downloading  # the reopen still works
