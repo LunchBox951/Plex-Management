@@ -180,12 +180,28 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
-    async def list_active(self) -> list[DownloadRecord]:
+    async def list_active(self, *, populate_existing: bool = False) -> list[DownloadRecord]:
+        """Active (non-terminal) downloads as read-model DTOs.
+
+        ``populate_existing`` (issue #77) overwrites already-loaded identity-map
+        rows with the freshly-SELECTed DB values instead of letting the identity
+        map win. A row that LOST a status compare-and-swap earlier in the SAME
+        session — e.g. ``reconcile_and_list`` computed a transition from a stale
+        snapshot but a concurrent writer had already advanced the row to another
+        NON-terminal status — otherwise keeps its stale in-memory status
+        (``expire_on_commit=False``, so the intervening commit does not refresh it,
+        and a plain SELECT does not overwrite a loaded instance). The terminal
+        post-cycle read then reports a status the DB no longer holds. Refreshing on
+        that read closes the honesty gap; the default stays ``False`` so ordinary
+        callers keep the cheaper identity-map behaviour.
+        """
         stmt = (
             select(Download)
             .where(Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES))
             .order_by(Download.id)
         )
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 

@@ -637,3 +637,129 @@ async def test_reconcile_transition_does_not_overwrite_concurrent_status_change(
         row = await session.get(Download, download_id)
     assert row is not None
     assert row.status == "failed"
+
+
+class _StatusAtRemoveQbt(FakeQbittorrent):
+    """A :class:`FakeQbittorrent` that records the owning request's status at the
+    exact moment ``remove`` runs -- so a test can prove the torrent removal
+    (Phase B) happens BEFORE the request is re-armed to 'searching' (Phase C).
+    Issue #68: only once the request is 'searching' can an auto-grab re-resolve to
+    the same info_hash, so a removal that runs while the request is still
+    'downloading' can never delete a fresh same-hash re-grab."""
+
+    def __init__(self, sm: SessionMaker, request_id: int) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._request_id = request_id
+        self.request_status_at_remove: list[str] = []
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        async with self._sm() as session:
+            request = await session.get(MediaRequest, self._request_id)
+            assert request is not None
+            self.request_status_at_remove.append(request.status.value)
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_reconcile_removes_the_torrent_before_rearming_the_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #68: the failed torrent must be removed BEFORE its request re-arms to
+    'searching'. A re-grab can only re-acquire the same info_hash once the request
+    is due again ('searching'); proving removal ran while the request was still
+    'downloading' proves the stale removal cannot delete a fresh same-hash grab."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    qbt = _StatusAtRemoveQbt(sessionmaker_, request_id)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The removal fired while the request was STILL 'downloading' (pre-re-arm) --
+    # the ordering guarantee. The re-arm to 'searching' only lands afterwards.
+    assert qbt.request_status_at_remove == ["downloading"]
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None
+    assert request.status is RequestStatus.searching
+
+
+class _RemoveFailsQbt(FakeQbittorrent):
+    """A client whose ``remove`` always fails, exercising the best-effort contract:
+    ``purge_service.remove_torrent`` logs (never raises), so the re-arm still runs."""
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        raise RuntimeError("qbt remove exploded")
+
+
+async def test_reconcile_removal_failure_still_rearms_and_stays_visible(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #68 honesty contract: if the torrent removal FAILS, the row must land
+    in a visible, retryable state -- not silently stuck. Removal is best-effort
+    (logged, never raised), so a failure does not block the Phase C re-arm: the
+    download is terminal Failed (visible) and its request is 'searching'
+    (retryable)."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(_RemoveFailsQbt(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        failed = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert failed.status == "failed"  # visible terminal failure
+    assert request is not None
+    assert request.status is RequestStatus.searching  # re-armed despite the removal failure
+
+
+async def test_reconcile_batch_fails_removes_and_rearms_multiple_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #68: the batch path applies the same three-phase ordering to EVERY
+    failed row -- each download goes terminal Failed, each request re-arms to
+    'searching', and each torrent is removed."""
+    hash_a, hash_b = "a" * 40, "b" * 40
+    async with sessionmaker_() as session:
+        owners: list[tuple[int, str, int]] = []  # (request_id, torrent_hash, tmdb_id)
+        for tmdb_id, torrent_hash in ((701, hash_a), (702, hash_b)):
+            request = MediaRequest(
+                tmdb_id=tmdb_id,
+                media_type=MediaType.movie,
+                title=f"Movie {tmdb_id}",
+                status=RequestStatus.downloading,
+            )
+            session.add(request)
+            await session.flush()
+            session.add(
+                Download(
+                    torrent_hash=torrent_hash,
+                    status="downloading",
+                    media_request_id=request.id,
+                    tmdb_id=tmdb_id,
+                    first_seen_at=datetime.now(UTC) - timedelta(minutes=11),
+                )
+            )
+            owners.append((request.id, torrent_hash, tmdb_id))
+        await session.commit()
+
+    qbt = FakeQbittorrent(statuses=[])  # both torrents gone beyond grace
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        for request_id, torrent_hash, _ in owners:
+            request = await session.get(MediaRequest, request_id)
+            download = (
+                await session.execute(select(Download).where(Download.torrent_hash == torrent_hash))
+            ).scalar_one()
+            assert request is not None
+            assert request.status is RequestStatus.searching
+            assert download.status == "failed"
+    assert set(qbt.removed) == {(hash_a, True), (hash_b, True)}

@@ -18,6 +18,7 @@ row is written and the originating request is set back to ``searching``.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -70,6 +71,57 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True)
+class _FailedReArm:
+    """The owning request/season to re-arm to ``searching`` AFTER torrent removal.
+
+    Issue #68: re-arming a failed request makes it due for auto-grab again, and a
+    re-grab resolving to the SAME info_hash BEFORE the old torrent's removal
+    completes would have its live torrent + data deleted by that (now stale)
+    removal. Radarr avoids this by running its ``RedownloadFailedDownloadService``
+    with ``EventHandleOrder.Last`` -- removal precedes re-search eligibility. We
+    mirror that with a three-phase flow (fail+blocklist commit -> remove_torrent ->
+    re-arm commit), so the re-arm target must survive the FIRST commit as a plain
+    value rather than being re-derived from the (now terminal, possibly identity-
+    map-stale) ``Download`` row on the far side of the boundary.
+
+    ``media_type`` is the resolved media namespace of the failed release; it is
+    threaded alongside ``media_request_id`` / ``season`` so the re-arm phase holds
+    the full failure identity without touching the committed row (``season is not
+    None`` is what actually routes TV through the season rollup below).
+    """
+
+    media_request_id: int
+    season: int | None
+    media_type: str | None
+
+
+async def _rearm_failed_request(session: AsyncSession, rearm: _FailedReArm) -> None:
+    """Phase C: re-arm the owning request/season to ``searching`` (issue #68).
+
+    Runs in a SEPARATE transaction AFTER ``remove_torrent`` (Phase B) so the
+    request only becomes due for auto-grab once the old torrent is gone -- closing
+    the window in which a same-hash re-grab could be deleted by the stale removal.
+    TV routes through ``season_request_service`` (the SEASON re-arms and the
+    parent's computed rollup recomputes in the same transaction) with the
+    ``skip_if_terminal`` guard: a season a PRIOR download already finished must
+    never be dragged back to ``searching`` by THIS (later, unrelated) download's
+    failure. A movie (no season) sets the request status directly.
+    """
+    if rearm.season is not None:
+        await season_request_service.set_status(
+            session,
+            media_request_id=rearm.media_request_id,
+            season_number=rearm.season,
+            status=RequestStatus.searching.value,
+            skip_if_terminal=True,
+        )
+    else:
+        await SqlRequestRepository(session).set_status(
+            rearm.media_request_id, RequestStatus.searching.value
+        )
+
+
 def _media_type_for_blocklist(
     record: DownloadRecord | None, request_media_type: str | None
 ) -> str | None:
@@ -86,16 +138,27 @@ async def _handle_failed(
     session: AsyncSession,
     event: DownloadFailed,
     rows: list[DownloadRecord],
-) -> None:
-    """Blocklist a failed release and re-arm its request (DB writes only).
+) -> _FailedReArm | None:
+    """Phase A of a reconcile-driven failure: blocklist the release and complete
+    ``FailedPending`` -> ``Failed`` (DB writes only). Returns the owning
+    request/season to re-arm, or ``None`` if the row has no owning request.
 
-    Does NOT remove the torrent: that ``qbt.remove(delete_files=True)`` is external
-    client I/O and must not run inside the reconcile write transaction -- holding
-    SQLite's write lock across a network round-trip, and (worse) a later write failure
-    in the same transaction would roll the DB back AFTER the torrent was already
-    deleted. :func:`reconcile_and_list` instead collects the failed hashes and removes
-    them best-effort AFTER its final commit (mirroring :func:`mark_failed`'s own
-    after-commit removal); an already-gone hash is a no-op success there.
+    Deliberately does NOT re-arm the request here (issue #68). Re-arming to
+    ``searching`` makes the request due for auto-grab again; if that re-grab
+    re-resolves to the SAME info_hash before the old torrent's removal completes,
+    the (stale) removal would delete the freshly-grabbed torrent + its data. So the
+    re-arm is handed back to the caller to apply in a LATER transaction, AFTER
+    :func:`purge_service.remove_torrent` has run (Radarr's ``EventHandleOrder.Last``
+    ordering). :func:`reconcile_and_list` threads the returned descriptors across
+    that commit boundary.
+
+    Does NOT remove the torrent either: that ``qbt.remove(delete_files=True)`` is
+    external client I/O and must not run inside the reconcile write transaction --
+    holding SQLite's write lock across a network round-trip, and (worse) a later
+    write failure in the same transaction would roll the DB back AFTER the torrent
+    was already deleted. :func:`reconcile_and_list` removes the failed hashes
+    best-effort AFTER the Phase A commit (mirroring :func:`mark_failed`); an
+    already-gone hash is a no-op success there.
     """
     blocklist_repo = SqlBlocklistRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -126,37 +189,30 @@ async def _handle_failed(
             record, request.media_type if request is not None else None
         ),
     )
-    if record is not None and record.media_request_id is not None:
-        if record.season is not None:
-            # TV: route through season_request_service so the SEASON re-arms to
-            # 'searching' and the parent's computed rollup is recomputed in the
-            # same transaction, rather than stomping the request status directly.
-            # ``skip_if_terminal``: a season a PRIOR download already finished
-            # (completed/available/failed) must never be dragged back to
-            # 'searching' by THIS (later, unrelated) download's failure -- e.g. a
-            # supplementary per-episode re-grab for an already-available season.
-            # This download's own row still moves to Failed (+ blocklist) below
-            # regardless, so the failure stays fully visible in the queue.
-            await season_request_service.set_status(
-                session,
-                media_request_id=record.media_request_id,
-                season_number=record.season,
-                status=RequestStatus.searching.value,
-                skip_if_terminal=True,
-            )
-        else:
-            await request_repo.set_status(record.media_request_id, RequestStatus.searching.value)
-
     # Complete the FailedPending -> Failed transition. The reconciler only moves
     # the row as far as ``failed_pending``; without this advance the row would be
     # stranded there forever — it is neither terminal (so it lingers in
     # ``list_active`` and the queue shows a zombie torrent) nor active (so the
-    # reconciler never revisits it). The blocklist + re-search has now fired, so
-    # the row is genuinely Failed.
+    # reconciler never revisits it). The blocklist has now fired and the re-arm is
+    # deferred to Phase C, so the row is genuinely Failed.
     if record is not None:
         await SqlDownloadRepository(session).update_status(
             record.id, DownloadState.Failed.value, failed_reason=event.reason
         )
+
+    # Hand the owning request/season back for Phase C re-arm (after removal). The
+    # descriptor is captured here — while ``record``/``request`` are in hand —
+    # rather than re-read after the commit boundary, where the now-terminal row
+    # would be excluded from ``list_active`` and the identity map may be stale.
+    if record is not None and record.media_request_id is not None:
+        return _FailedReArm(
+            media_request_id=record.media_request_id,
+            season=record.season,
+            media_type=_media_type_for_blocklist(
+                record, request.media_type if request is not None else None
+            ),
+        )
+    return None
 
 
 async def list_queue(session: AsyncSession) -> list[DownloadRecord]:
@@ -233,24 +289,38 @@ async def reconcile_and_list(
                 row.id, progress=live.progress, seed_ratio=live.ratio
             )
 
-    # Collect the failed events during the transaction (blocklist + re-arm are DB
-    # writes), then remove their torrents AFTER the commit below -- qbt.remove is
-    # external client I/O and must not run while the reconcile write transaction holds
-    # SQLite's write lock (nor before a later write that could roll the DB back after
-    # the torrent was already deleted). Feed the CAS-APPLIED transitions only: a
-    # transition that lost its compare-and-set (a concurrent writer moved the row)
-    # must not spawn a blocklist/re-arm for a state change that never persisted.
+    # Issue #68 — three-phase failure handling so a torrent removal can NEVER
+    # delete a fresh same-hash re-grab (Radarr's EventHandleOrder.Last: removal
+    # precedes re-search eligibility):
+    #
+    #   Phase A: blocklist + FailedPending->Failed, committed, WITHOUT re-arming.
+    #   Phase B: best-effort remove_torrent per failed hash (old torrent gone).
+    #   Phase C: NOW re-arm the request/season to 'searching' and commit.
+    #
+    # Feed the CAS-APPLIED transitions only: a transition that lost its
+    # compare-and-set (a concurrent writer moved the row) must not spawn a
+    # blocklist/re-arm for a state change that never persisted.
     failed_events = list(failed_download_events(applied_transitions, rows, occurred_at=now))
+    rearms: list[_FailedReArm] = []
     for event in failed_events:
-        await _handle_failed(session, event, rows)
+        rearm = await _handle_failed(session, event, rows)
+        if rearm is not None:
+            rearms.append(rearm)
 
+    # Phase A commit. qbt.remove is external client I/O and must not run while this
+    # write transaction holds SQLite's write lock (nor before a later write that
+    # could roll the DB back after the torrent was already deleted), so it is
+    # deferred to Phase B below.
     await session.commit()
 
-    # Close the seeding leak (ADR-0014) AFTER the commit, mirroring mark_failed's
-    # after-commit removal: a client hiccup here never undoes the committed
-    # blocklist/re-arm, and an already-gone hash (the common case -- the row usually
-    # failed BECAUSE it went ClientMissing) is a no-op success. Best-effort per hash,
-    # preserving the per-hash log extra.
+    # Phase B: close the seeding leak (ADR-0014) AND, per issue #68, ensure the old
+    # torrent is gone BEFORE the request is re-armed. A client hiccup here never
+    # undoes the committed blocklist/fail, and an already-gone hash (the common
+    # case -- the row usually failed BECAUSE it went ClientMissing) is a no-op
+    # success. Best-effort per hash, preserving the per-hash log extra. Because it
+    # is best-effort (logged, never raised), a removal failure does NOT block the
+    # Phase C re-arm: the row still lands Failed (visible) with its request re-armed
+    # to 'searching' (retryable) -- honesty over silence.
     for event in failed_events:
         await purge_service.remove_torrent(
             qbt,
@@ -259,7 +329,19 @@ async def reconcile_and_list(
             extra={"torrent_hash": event.torrent_hash, "tmdb_id": event.tmdb_id},
         )
 
-    return await download_repo.list_active()
+    # Phase C: re-arm the owning requests/seasons now that the old torrents are
+    # gone, then commit. Threaded from Phase A as plain values so no post-commit,
+    # possibly-stale row read is needed.
+    for rearm in rearms:
+        await _rearm_failed_request(session, rearm)
+    if rearms:
+        await session.commit()
+
+    # ``populate_existing`` refreshes the returned rows from the DB (issue #77):
+    # with ``expire_on_commit=False`` a row that LOST a status CAS earlier in this
+    # cycle keeps its stale in-memory status, and the identity map would otherwise
+    # win over this SELECT, reporting a status the DB no longer holds.
+    return await download_repo.list_active(populate_existing=True)
 
 
 async def mark_failed(
@@ -348,37 +430,38 @@ async def mark_failed(
             ),
         )
 
-    # Re-arm the owning request unconditionally — the blocklist flag governs ONLY
-    # whether a Blocklist row is written, NOT whether the request status is
-    # corrected. Without this, a mark-failed(blocklist=false) drives the download
-    # to terminal Failed (gone from the active queue) while the request stays
-    # 'downloading' forever: a dishonest status asserting an active download that
-    # no longer exists, with nothing to re-search or re-fail it. Mirrors the
-    # reconcile-driven ``_handle_failed`` re-arm.
+    # Capture the owning request/season to re-arm, BEFORE the Phase A commit. The
+    # re-arm is unconditional — the blocklist flag governs ONLY whether a Blocklist
+    # row is written, NOT whether the request status is corrected. Without it, a
+    # mark-failed(blocklist=false) drives the download to terminal Failed (gone from
+    # the active queue) while the request stays 'downloading' forever: a dishonest
+    # status asserting an active download that no longer exists, with nothing to
+    # re-search or re-fail it. But per issue #68 the re-arm is DEFERRED to Phase C
+    # (after the torrent removal) so a same-hash re-grab cannot be deleted by the
+    # stale removal -- mirroring the reconcile-driven ``_handle_failed`` ordering.
+    rearm: _FailedReArm | None = None
     if row.media_request_id is not None:
-        if row.season is not None:
-            # TV: same rollup-aware routing (and the same terminal-season guard)
-            # as _handle_failed above.
-            await season_request_service.set_status(
-                session,
-                media_request_id=row.media_request_id,
-                season_number=row.season,
-                status=RequestStatus.searching.value,
-                skip_if_terminal=True,
-            )
-        else:
-            await SqlRequestRepository(session).set_status(
-                row.media_request_id, RequestStatus.searching.value
-            )
+        rearm = _FailedReArm(
+            media_request_id=row.media_request_id,
+            season=row.season,
+            media_type=(
+                row.media_type.value
+                if row.media_type is not None
+                else ("tv" if row.season is not None else "movie")
+            ),
+        )
 
+    # Phase A commit: the fail + optional blocklist are persisted; the request is
+    # NOT yet re-armed.
     await session.commit()
 
-    # Close the seeding leak (ADR-0014): remove the torrent + its data AFTER the
-    # DB fail/blocklist/re-arm has committed, so a client hiccup never undoes that
-    # committed state. Best-effort + already-gone-is-a-no-op (see
-    # ``purge_service.remove_torrent``). ``qbt is not None`` is guaranteed by the
-    # top-of-function guard whenever ``remove_torrent`` is True; the explicit check
-    # narrows the optional type for the type checker.
+    # Phase B: close the seeding leak (ADR-0014) and, per issue #68, remove the old
+    # torrent BEFORE re-arming. Best-effort + already-gone-is-a-no-op (see
+    # ``purge_service.remove_torrent``): a client hiccup never undoes the committed
+    # fail/blocklist, and — because removal is logged-not-raised — never blocks the
+    # Phase C re-arm below, so the row still lands in a visible, retryable state.
+    # ``qbt is not None`` is guaranteed by the top-of-function guard whenever
+    # ``remove_torrent`` is True; the explicit check narrows the optional type.
     if remove_torrent and qbt is not None:
         await purge_service.remove_torrent(
             qbt,
@@ -386,6 +469,11 @@ async def mark_failed(
             context="an operator mark-failed",
             extra={"torrent_hash": row.torrent_hash, "download_id": safe_int(download_id)},
         )
+
+    # Phase C: re-arm now that the old torrent is gone, then commit.
+    if rearm is not None:
+        await _rearm_failed_request(session, rearm)
+        await session.commit()
 
     failed = await download_repo.get_by_hash(row.torrent_hash)
     if failed is None:  # pragma: no cover - just updated this row
