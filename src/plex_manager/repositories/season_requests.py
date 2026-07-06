@@ -137,14 +137,20 @@ class SqlSeasonRequestRepository:
         ``SqlRequestRepository.latest_request_evicted``; see its docstring for the
         eviction delete window this closes). It re-grabs (``pending``) instead.
 
-        Keyed on the NEWEST row PER SEASON (the highest ``id`` among every
-        ``MediaRequest`` sharing this ``tmdb_id``, since a title accrues several
-        rows over its lifetime -- see ``uq_media_requests_active``): a season
-        legitimately re-downloaded after an earlier eviction (its newest row now
-        ``available``) is NOT falsely suppressed, only one whose most recent
-        history really is an eviction. Movies never reach here -- only ``tv``
-        parents own ``season_requests`` rows -- but the ``media_type`` filter is
-        kept explicit against a ``tmdb_id`` shared across the movie/tv namespaces.
+        Keyed on the NEWEST NON-``cancelled`` row PER SEASON (the highest ``id``
+        among every ``MediaRequest`` sharing this ``tmdb_id``, since a title
+        accrues several rows over its lifetime -- see
+        ``uq_media_requests_active``): a season legitimately re-downloaded after
+        an earlier eviction (its newest row now ``available``) is NOT falsely
+        suppressed, only one whose most recent history really is an eviction.
+        ``cancelled`` rows are IGNORED outright, exactly like
+        ``SqlRequestRepository.latest_request_evicted`` (see there): a
+        cancellation says nothing about on-disk truth, so an in-window re-grab
+        the user then cancelled must not reset this guard for the NEXT
+        re-request while the sweep is still deleting the season's files. Movies
+        never reach here -- only ``tv`` parents own ``season_requests`` rows --
+        but the ``media_type`` filter is kept explicit against a ``tmdb_id``
+        shared across the movie/tv namespaces.
         """
         stmt = (
             select(SeasonRequest.season_number, SeasonRequest.status)
@@ -152,15 +158,73 @@ class SqlSeasonRequestRepository:
             .where(
                 MediaRequest.tmdb_id == tmdb_id,
                 MediaRequest.media_type == MediaType.tv,
+                SeasonRequest.status != RequestStatus.cancelled,
             )
             .order_by(SeasonRequest.season_number, SeasonRequest.id)
         )
         # Ascending ``id`` per season means the LAST row seen for each season is its
-        # newest; keep only the newest status, then filter to the evicted ones.
+        # newest (cancelled rows already filtered out above); keep only the newest
+        # status, then filter to the evicted ones.
         newest: dict[int, RequestStatus] = {}
         for season_number, status in (await self._session.execute(stmt)).all():
             newest[season_number] = status
         return frozenset(s for s, status in newest.items() if status == RequestStatus.evicted)
+
+    async def list_sibling_seasons(
+        self, tmdb_id: int, season_number: int, statuses: frozenset[str], exclude_id: int
+    ) -> list[SeasonRequestRecord]:
+        """Every OTHER request's row for the SAME ``(tmdb_id, season_number)``
+        whose status is in ``statuses``, oldest first.
+
+        The season-granularity mirror of ``SqlRequestRepository.list_for_media``
+        (see there), for the eviction restore's re-grab reconciliation
+        (ADR-0012 #67): a title accrues several ``MediaRequest`` rows over its
+        lifetime, so an in-window re-request for a WHOLLY evicted show tracks
+        this same season under a NEWER parent -- those duplicates are what the
+        restore cancels when the file never actually left. ``exclude_id`` is the
+        restored row itself. A plain read, not a CAS: the caller re-compares via
+        :meth:`set_status_if_in`.
+        """
+        stmt = (
+            select(SeasonRequest, MediaRequest.tmdb_id)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType.tv,
+                SeasonRequest.season_number == season_number,
+                SeasonRequest.id != exclude_id,
+                SeasonRequest.status.in_([RequestStatus(s) for s in statuses]),
+            )
+            .order_by(SeasonRequest.id)
+        )
+        return [
+            _to_record(row, parent_tmdb_id)
+            for row, parent_tmdb_id in (await self._session.execute(stmt)).all()
+        ]
+
+    async def clear_library_path_if_set(self, season_request_id: int) -> bool:
+        """Null the season's eviction breadcrumb ONLY if currently set; return
+        whether this call actually cleared it.
+
+        The season-granularity mirror of ``SqlRequestRepository.
+        clear_library_path_if_set`` (see there): the eviction finalize's
+        single-winner gate -- only the finalize/resume pass that actually cleared
+        the breadcrumb writes the eviction history row, so two passes racing over
+        the same interrupted eviction never double-record it.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(SeasonRequest)
+                .where(
+                    SeasonRequest.id == season_request_id,
+                    SeasonRequest.library_path.is_not(None),
+                )
+                .values(library_path=None)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         stmt = select(SeasonRequest)

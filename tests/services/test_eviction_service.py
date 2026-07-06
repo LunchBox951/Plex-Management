@@ -190,6 +190,11 @@ async def test_evicts_a_watched_past_grace_movie_and_deletes_the_file(
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status is RequestStatus.evicted
+        # The finalize cleared the breadcrumb in the same commit as the history
+        # row: 'evicted' + a non-NULL library_path always means "claimed but not
+        # finalized" (the crash-recovery signature), so a COMPLETED eviction must
+        # never keep looking like an interrupted one.
+        assert row.library_path is None
 
         history = (
             (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 1)))
@@ -663,9 +668,13 @@ async def test_evicts_one_watched_season_and_rolls_up_partially_available(
             .all()
         )
         by_season = {s.season_number: s.status for s in seasons}
+        breadcrumbs = {s.season_number: s.library_path for s in seasons}
         show = await session.get(MediaRequest, show_id)
 
     assert by_season == {1: RequestStatus.evicted, 2: RequestStatus.available}
+    # The finalize cleared season 1's breadcrumb (completed eviction, never to be
+    # mistaken for an interrupted one); season 2's untouched breadcrumb survives.
+    assert breadcrumbs == {1: None, 2: s2_path}
     assert show is not None
     # Season 1 evicted (file gone), season 2 still genuinely available -- never
     # dishonestly rolled up to plain "available".
@@ -2177,3 +2186,557 @@ async def test_failed_season_delete_restores_the_claimed_season_to_available(
         show = await session.get(MediaRequest, show_id)
         assert show is not None
         assert show.status is RequestStatus.available  # rollup restored too
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-2 finding 1: crash resumability. The claim commits 'evicted'
+# BEFORE the purge and the finalize clears the breadcrumb AFTER it, so
+# 'evicted' + a non-NULL library_path is always a claimed-but-not-finalized
+# eviction (a crash landed between the two). Sweeps only assemble 'available'
+# rows, so without the resume pass such a row -- and its live file -- would be
+# invisible to every later sweep forever. The tests seed that exact post-crash
+# state directly and prove the next sweep recovers it, in BOTH directions.
+# --------------------------------------------------------------------------- #
+
+
+async def test_sweep_resumes_an_interrupted_movie_eviction_and_re_evicts(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Crash between claim-commit and purge, still under pressure: the next sweep
+    restores the row to 'available' (file still on disk) and then re-decides the
+    eviction FRESH through the normal claim -> purge path -- the interrupted
+    purge is effectively resumed, the pressured disk actually gets relieved."""
+    library_path = _movie_file(tmp_path, "Interrupted.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=600,
+        title="Interrupted",
+        library_path=library_path,
+        status=RequestStatus.evicted,  # the committed claim the crash stranded
+    )
+    library = FakeLibrary(
+        watch_states={(600, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,  # pressure still on -> the fresh decision re-evicts
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert [o.title for o in outcomes] == ["Interrupted"]
+    assert not Path(library_path).exists()  # the interrupted delete finally ran
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.evicted
+        assert row.library_path is None  # finalized this time
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 600)))
+            .scalars()
+            .all()
+        )
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+
+
+async def test_sweep_restores_an_interrupted_movie_eviction_even_without_pressure(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Crash recovery never waits for disk pressure: below threshold (where the
+    sweep evicts nothing) the resume pass still runs -- the stranded 'evicted'
+    row over a live file goes back to 'available', and nothing is deleted (the
+    pressure that justified the eviction is gone, so the decision is honestly
+    re-made as 'keep')."""
+    library_path = _movie_file(tmp_path, "Stranded.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=601,
+        title="Stranded",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    library = FakeLibrary(
+        watch_states={(601, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,  # unreachable -- no pressure, sweep evicts nothing
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()  # nothing deleted without pressure
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available  # restored, re-evictable later
+        assert row.library_path == library_path  # breadcrumb kept for that retry
+
+
+async def test_sweep_finalizes_an_interrupted_movie_eviction_whose_file_is_gone(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Crash AFTER the purge but before the finalize: the file is gone but the
+    history row, breadcrumb clear, and Plex refresh never happened. The resume
+    pass finalizes -- never restores 'available' over nothing."""
+    missing_path = str(tmp_path / "movies" / "Already Gone.mkv")  # never created
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=602,
+        title="Already Gone",
+        library_path=missing_path,
+        status=RequestStatus.evicted,
+    )
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,  # recovery must not need pressure
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.evicted  # the eviction stands
+        assert row.library_path is None  # finalized: never matched again
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 602)))
+            .scalars()
+            .all()
+        )
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+    assert history[0].message is not None and "finalized" in history[0].message
+    # The Plex refresh the interrupted sweep never got to fire.
+    assert (missing_path, "movie") in library.scan_calls
+
+
+async def test_sweep_restores_an_interrupted_season_eviction_without_pressure(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The TV twin of the movie restore: a season claimed 'evicted' whose file
+    still exists goes back to 'available' (parent rollup recomputed) on the next
+    tv sweep, pressure or not."""
+    s1_path = _movie_file(tmp_path, "Interrupted Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=610, title="Interrupted Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.evicted  # the stranded claim
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.evicted  # its rollup, as the claim left it
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None and season_row.status is RequestStatus.available
+    assert season_row.library_path == s1_path
+    assert show is not None and show.status is RequestStatus.available  # rollup too
+
+
+async def test_sweep_finalizes_an_interrupted_season_eviction_whose_file_is_gone(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The TV twin of the movie finalize: purge done, finalize crashed away --
+    the season keeps 'evicted', its breadcrumb is cleared, the history row and
+    Plex refresh land."""
+    missing_path = str(tmp_path / "tv" / "Gone Show" / "Season 01")  # never created
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=611, title="Gone Show", seasons={1: missing_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.evicted
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.evicted
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 611)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # the eviction stands
+    assert season_row.library_path is None  # finalized
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+    assert (missing_path, "tv") in library.scan_calls
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-2 finding 3: a restore (failed delete OR resumed crash) must not
+# leave the in-window re-grab it made redundant standing -- the file never
+# left, so a pre-grab re-request is cancelled (movie / sibling season) or
+# folded back to 'available' (the same-row TV re-arm); anything that already
+# grabbed is left to the reconciler / import dedup.
+# --------------------------------------------------------------------------- #
+
+
+async def test_failed_delete_restore_cancels_the_in_window_movie_regrab(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claim commits -> a re-request lands ('pending', per the stale-Plex guard)
+    -> the purge then FAILS -> the old row is restored 'available'. Without
+    reconciliation the live 'available' row and the active 'pending' re-grab now
+    coexist for content that never left disk, and the app downloads a duplicate.
+    The restore must cancel the pre-grab re-grab (with a history row)."""
+    library_path = _movie_file(tmp_path, "Never Left.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=620, title="Never Left", library_path=library_path
+    )
+    # The in-window re-grab (as create_request's guard mints it mid-window).
+    async with sessionmaker_() as session:
+        regrab = MediaRequest(
+            tmdb_id=620,
+            media_type=MediaType.movie,
+            title="Never Left",
+            status=RequestStatus.pending,
+        )
+        session.add(regrab)
+        await session.commit()
+        regrab_id = regrab.id
+
+    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.error, 0, "OSError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Never Left",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=620, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(library_path).exists()  # nothing deleted
+    async with sessionmaker_() as session:
+        old_row = await session.get(MediaRequest, request_id)
+        regrab_row = await session.get(MediaRequest, regrab_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 620)))
+            .scalars()
+            .all()
+        )
+    assert old_row is not None and old_row.status is RequestStatus.available  # restored
+    # The redundant re-grab is cancelled, never left to download a duplicate.
+    assert regrab_row is not None and regrab_row.status is RequestStatus.cancelled
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.cancelled]
+
+
+async def test_failed_delete_restore_leaves_a_regrab_that_already_grabbed(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reconciliation CAS is scoped to PRE-GRAB statuses only: a re-grab that
+    already advanced to 'downloading' has a live torrent -- cancelling underneath
+    it would orphan the download, so it is left to the reconciler/import dedup
+    (the import simply re-places the file)."""
+    library_path = _movie_file(tmp_path, "Already Grabbing.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=621, title="Already Grabbing", library_path=library_path
+    )
+    async with sessionmaker_() as session:
+        regrab = MediaRequest(
+            tmdb_id=621,
+            media_type=MediaType.movie,
+            title="Already Grabbing",
+            status=RequestStatus.downloading,
+        )
+        session.add(regrab)
+        await session.commit()
+        regrab_id = regrab.id
+
+    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.error, 0, "OSError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
+    monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Already Grabbing",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=621, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    async with sessionmaker_() as session:
+        old_row = await session.get(MediaRequest, request_id)
+        regrab_row = await session.get(MediaRequest, regrab_id)
+    assert old_row is not None and old_row.status is RequestStatus.available
+    # The in-flight download is untouched -- reconciler/import dedup owns it.
+    assert regrab_row is not None and regrab_row.status is RequestStatus.downloading
+
+
+async def test_restore_folds_a_rearmed_tv_season_back_to_available(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The mixed-show TV shape: the in-window re-request re-arms the SAME season
+    row (ensure_seasons, evicted -> pending), so the restore's evicted->available
+    CAS loses. The row is the season's only tracking record and its file never
+    left -- it must be folded straight back to 'available' (never cancelled, and
+    never left 'pending' to download a duplicate)."""
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=630, title="Rearmed Show", seasons={1: "/media/tv/Rearmed/S01"}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.pending  # as the in-window re-arm left it
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.pending
+        await session.commit()
+        season_id = season_row.id
+
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_id,
+        season_number=1,
+        tmdb_id=630,
+        size_bytes=None,
+    )
+    async with sessionmaker_() as session:
+        await eviction_service._restore_after_failed_delete(  # pyright: ignore[reportPrivateUsage]
+            session, pending
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None and season_row.status is RequestStatus.available
+    assert show is not None and show.status is RequestStatus.available  # rollup follows
+
+
+async def test_restore_cancels_the_sibling_season_regrab_under_a_newer_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The wholly-evicted TV shape: the in-window re-request created a NEW
+    MediaRequest tracking the same season ('pending'). Restoring the OLD season
+    to 'available' makes that duplicate redundant -- it is CAS-cancelled and the
+    new parent's rollup recomputed, with a history row (honesty over silence)."""
+    old_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=631, title="Whole Show", seasons={1: "/media/tv/Whole/S01"}
+    )
+    async with sessionmaker_() as session:
+        old_season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == old_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        old_season.status = RequestStatus.evicted  # the committed claim
+        old_show = await session.get(MediaRequest, old_show_id)
+        assert old_show is not None
+        old_show.status = RequestStatus.evicted  # rollup: wholly evicted
+        # The in-window re-request: a NEW request for the same show + season.
+        new_show = MediaRequest(
+            tmdb_id=631,
+            media_type=MediaType.tv,
+            title="Whole Show",
+            status=RequestStatus.pending,
+        )
+        session.add(new_show)
+        await session.flush()
+        new_season = SeasonRequest(
+            media_request_id=new_show.id, season_number=1, status=RequestStatus.pending
+        )
+        session.add(new_season)
+        await session.commit()
+        old_season_id = old_season.id
+        new_show_id, new_season_id = new_show.id, new_season.id
+
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=old_show_id,
+        season_request_id=old_season_id,
+        season_number=1,
+        tmdb_id=631,
+        size_bytes=None,
+    )
+    async with sessionmaker_() as session:
+        await eviction_service._restore_after_failed_delete(  # pyright: ignore[reportPrivateUsage]
+            session, pending
+        )
+
+    async with sessionmaker_() as session:
+        old_season = await session.get(SeasonRequest, old_season_id)
+        new_season = await session.get(SeasonRequest, new_season_id)
+        new_show = await session.get(MediaRequest, new_show_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 631)))
+            .scalars()
+            .all()
+        )
+    assert old_season is not None and old_season.status is RequestStatus.available  # restored
+    # The duplicate under the newer request is cancelled, its parent's rollup
+    # recomputed off the cancelled season.
+    assert new_season is not None and new_season.status is RequestStatus.cancelled
+    assert new_show is not None and new_show.status is RequestStatus.cancelled
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.cancelled]
+
+
+async def test_resume_restores_and_cancels_the_regrab_after_a_crash(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Findings 1 + 3 composed: crash mid-eviction (claim committed, file still
+    on disk) AND an in-window re-request already landed 'pending'. The next
+    sweep's resume restores the old row to 'available' AND cancels the now
+    redundant re-grab -- converging to exactly one honest row over the live
+    file, with nothing queued to download a duplicate."""
+    library_path = _movie_file(tmp_path, "Crashed Mid Evict.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=640,
+        title="Crashed Mid Evict",
+        library_path=library_path,
+        status=RequestStatus.evicted,  # the stranded claim
+    )
+    async with sessionmaker_() as session:
+        regrab = MediaRequest(
+            tmdb_id=640,
+            media_type=MediaType.movie,
+            title="Crashed Mid Evict",
+            status=RequestStatus.pending,  # the in-window re-grab
+        )
+        session.add(regrab)
+        await session.commit()
+        regrab_id = regrab.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,  # no pressure: recovery only, no re-evict
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        old_row = await session.get(MediaRequest, request_id)
+        regrab_row = await session.get(MediaRequest, regrab_id)
+    assert old_row is not None and old_row.status is RequestStatus.available
+    assert regrab_row is not None and regrab_row.status is RequestStatus.cancelled

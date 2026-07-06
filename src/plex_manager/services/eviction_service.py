@@ -29,15 +29,24 @@ trigger) is expected to call it once per configured root. Per call:
    rollup) ONLY if it is still ``available`` and un-pinned -- the pin folded into
    the compared predicate so a ``keep_forever`` landing after assembly makes the
    claim match no row. THEN, and only for a winning claim, ``fs.delete(
-   library_path)`` and log to ``download_history`` + (via the ordinary
+   library_path)`` and FINALIZE: log to ``download_history`` + (via the ordinary
    ``logging`` capture pipeline, see ``services/log_capture_service.py``)
-   ``log_events``. Claiming BEFORE deleting is what stops a concurrent pin/keep
-   from ever losing a kept file to a delete that had already run; if the delete
-   then fails, the claim is restored to ``available`` so a failed unlink can never
-   strand an ``evicted`` row over a still-watchable file. A candidate missing its
-   ``library_path`` breadcrumb, or one the filesystem guard refuses, is skipped +
-   logged — NEVER guessed at, never a silent no-op, and never lets one bad
-   candidate abort the rest of the sweep.
+   ``log_events``, clearing the ``library_path`` breadcrumb in the same commit --
+   ``evicted`` + a still-set breadcrumb thereby always means "claimed but not
+   finalized", which is what step 0.5's crash recovery keys on. Claiming BEFORE
+   deleting is what stops a concurrent pin/keep from ever losing a kept file to a
+   delete that had already run; if the delete then fails, the claim is restored
+   to ``available`` (and any in-window re-grab it spawned is reconciled away) so
+   a failed unlink can never strand an ``evicted`` row over a still-watchable
+   file. A candidate missing its ``library_path`` breadcrumb, or one the
+   filesystem guard refuses, is skipped + logged — NEVER guessed at, never a
+   silent no-op, and never lets one bad candidate abort the rest of the sweep.
+
+Step 0.5 (before the pressure pre-check, after the root's disk stat): recover
+claimed-but-not-finalized evictions -- :func:`_resume_interrupted_evictions` --
+so a crash between the claim commit and the finalize can never permanently
+strand a live file invisible to every later sweep. See :func:`_evict_one`'s
+docstring for the full invariant set + lifecycle state table.
 """
 
 from __future__ import annotations
@@ -121,6 +130,45 @@ class _SeasonPending:
 
 
 _Pending = _MoviePending | _SeasonPending
+
+# Request/season statuses at which an in-window RE-REQUEST has not yet grabbed
+# anything: nothing was added to the download client, no import ran. These are
+# the ONLY statuses the failed-delete restore may reconcile away (cancel / fold
+# back) -- see :func:`_restore_after_failed_delete`. ``no_acceptable_release``
+# belongs here: it is a parked pre-grab dead-end, and leaving it standing over a
+# restored-``available`` file would show (and dedup-block on) a dishonest
+# "nothing found" for content that is watchable right now. Anything that DID
+# grab (``downloading``/``import_blocked``/``completed``/...) is left alone --
+# the reconciler / import dedup owns an in-flight duplicate download.
+_PRE_GRAB_STATUSES: frozenset[str] = frozenset(
+    {
+        RequestStatus.pending.value,
+        RequestStatus.searching.value,
+        RequestStatus.no_acceptable_release.value,
+    }
+)
+
+# In-PROCESS registry of rows currently inside :func:`_evict_one`'s
+# claim->finalize window: ``("movie", media_request_id)`` /
+# ``("season", season_request_id)``. :func:`_resume_interrupted_evictions` skips
+# registered rows -- a committed ``evicted``+breadcrumb row that is merely
+# MID-PURGE in a concurrent sweep (the periodic loop racing the manual trigger)
+# is not a crash leftover, and "resuming" it would restore ``available`` under a
+# delete that is about to succeed, stranding an available row over nothing.
+# Registration happens BEFORE the claim commits and is removed in a ``finally``,
+# so any resume pass that can even SEE the committed claim also sees the
+# registration (single event loop: register < claim-commit < any later resume
+# read; both sweeps run in this one process -- the deployment is a single app
+# process over single-writer SQLite, so an in-process set is an honest guard,
+# and a crash clears it by definition, which is exactly when resume SHOULD act).
+_ACTIVE_EVICTIONS: set[tuple[str, int]] = set()
+
+
+def _claim_key(pending: _Pending) -> tuple[str, int]:
+    """The :data:`_ACTIVE_EVICTIONS` registry key for ``pending``."""
+    if isinstance(pending, _SeasonPending):
+        return ("season", pending.season_request_id)
+    return ("movie", pending.media_request_id)
 
 
 def _size_bytes(path: str) -> int | None:
@@ -381,27 +429,54 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
 
 
 async def _restore_after_failed_delete(session: AsyncSession, pending: _Pending) -> None:
-    """Undo a committed eviction CLAIM whose filesystem delete then failed (#67).
+    """Undo a committed eviction CLAIM whose filesystem delete then failed --
+    or never ran (a crash resumed by :func:`_resume_interrupted_evictions`) (#67).
 
     :func:`_evict_one` flips the row to ``evicted`` and COMMITS it before deleting
     (so a genuinely concurrent sweep sees the claim and stands down). When the
-    delete then refuses/errors, the file is still on disk and still watchable --
-    the row must NOT be left saying ``evicted``, which would strand an
-    evicted-status row over a live file (a re-request would re-grab content that
-    never actually left). This compare-and-swaps the row back ``evicted`` ->
-    ``available`` (recomputing the TV parent rollup) and commits, so the next
-    sweep can honestly retry the delete.
+    delete then refuses/errors -- or a crash left the claim committed with the
+    file still on disk -- the file is still watchable: the row must NOT be left
+    saying ``evicted``, which would strand an evicted-status row over a live file
+    (a re-request would re-grab content that never actually left). This
+    compare-and-swaps the row back ``evicted`` -> ``available`` (recomputing the
+    TV parent rollup) and commits, so the next sweep can honestly retry.
 
-    The restore is itself a CAS guarded on the still-``evicted`` precondition: this
-    sweep owns the claim and ``evicted`` is a settled status no other actor moves
-    (a re-request creates a NEW row rather than touching this one), so the swap
-    normally wins -- but if some other writer DID move it on, that is honored
-    rather than clobbered. ``tolerate_active_conflict=True`` mirrors the claim: the
+    The restore is itself a CAS guarded on the still-``evicted`` precondition:
+    if some other writer moved the row on, that is honored rather than
+    clobbered. ``tolerate_active_conflict=True`` mirrors the claim: the
     parent-rollup recompute this triggers can collide with a newer active request
     for the same show, and the season-level restore must survive that collision.
+
+    RE-GRAB RECONCILIATION: the committed ``evicted`` claim is exactly what let
+    an in-window re-request re-grab this media (``latest_request_evicted`` /
+    ``evicted_seasons`` steered it to ``pending`` instead of a stale-Plex
+    ``available`` mint). Once this restore commits ``available``, that re-grab's
+    reason has EVAPORATED -- the file never left -- and leaving it standing would
+    let the app download a duplicate of on-disk content (and, for a movie, leave
+    a live ``available`` row AND an active re-grab row coexisting). So, only when
+    the restore CAS actually WON:
+
+    * movie -- every OTHER row for the same ``(tmdb_id, media_type)`` still in a
+      :data:`_PRE_GRAB_STATUSES` status is CAS-cancelled (per-row
+      ``set_status_if_in``, so a row that concurrently advanced is never
+      clobbered), each with a ``cancelled`` history row (honesty over silence: a
+      user-visible request never just vanishes).
+    * tv -- same, per duplicate season row for this ``(tmdb_id, season_number)``
+      under OTHER requests (the wholly-evicted re-request shape), recomputing
+      each affected parent's rollup.
+
+    When the SEASON restore CAS LOSES, the cause is the OTHER re-request shape:
+    a mixed-show re-request re-arms this SAME row (``ensure_seasons``,
+    ``evicted`` -> ``pending``). The row then isn't a duplicate to cancel -- it
+    IS the season's tracking record and its file never left -- so it is folded
+    straight back to ``available`` (CAS from :data:`_PRE_GRAB_STATUSES` only).
+    A row that advanced past pre-grab (``downloading``, ...) is left alone in
+    every branch: a grab already happened, and the reconciler / import dedup
+    own resolving that duplicate download (the import simply re-places the
+    file); cancelling underneath it would orphan a live torrent.
     """
     if isinstance(pending, _SeasonPending):
-        await season_request_service.set_status_if_in(
+        restored = await season_request_service.set_status_if_in(
             session,
             media_request_id=pending.media_request_id,
             season_request_id=pending.season_request_id,
@@ -409,13 +484,310 @@ async def _restore_after_failed_delete(session: AsyncSession, pending: _Pending)
             allowed_from=frozenset({RequestStatus.evicted.value}),
             tolerate_active_conflict=True,
         )
+        if restored:
+            await _cancel_redundant_season_regrabs(session, pending)
+        else:
+            # The row already left 'evicted' -- an in-window re-request re-armed
+            # this SAME row (the mixed-show shape). Fold it back to 'available'
+            # if it is still pre-grab: the file never left, so re-downloading it
+            # would be a duplicate of on-disk content.
+            folded = await season_request_service.set_status_if_in(
+                session,
+                media_request_id=pending.media_request_id,
+                season_request_id=pending.season_request_id,
+                status=RequestStatus.available.value,
+                allowed_from=_PRE_GRAB_STATUSES,
+                tolerate_active_conflict=True,
+            )
+            if folded:
+                _logger.info(
+                    "folded a re-armed re-request for season %s back to 'available': "
+                    "the eviction's delete failed, so the file never left disk",
+                    pending.season_number,
+                    extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+                )
+            else:
+                _logger.info(
+                    "eviction restore for season %s found the row advanced past "
+                    "pre-grab (or otherwise moved on); leaving it to the "
+                    "reconciler/import dedup",
+                    pending.season_number,
+                    extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+                )
     else:
-        await SqlRequestRepository(session).set_status_if_in(
+        restored = await SqlRequestRepository(session).set_status_if_in(
             pending.media_request_id,
             RequestStatus.available.value,
             frozenset({RequestStatus.evicted.value}),
         )
+        if restored:
+            await _cancel_redundant_movie_regrabs(session, pending)
     await session.commit()
+
+
+async def _cancel_redundant_movie_regrabs(session: AsyncSession, pending: _MoviePending) -> None:
+    """Cancel every OTHER pre-grab request row for this movie (see
+    :func:`_restore_after_failed_delete`'s re-grab reconciliation). Flush-only;
+    the caller owns the commit, so restore + reconciliation land atomically."""
+    repo = SqlRequestRepository(session)
+    for row in await repo.list_for_media(pending.tmdb_id, "movie", _PRE_GRAB_STATUSES):
+        if row.id == pending.media_request_id:
+            continue  # the restored row itself (defensive; it is 'available' now)
+        cancelled = await repo.set_status_if_in(
+            row.id, RequestStatus.cancelled.value, _PRE_GRAB_STATUSES
+        )
+        if not cancelled:
+            continue  # advanced concurrently -- the reconciler/import dedup owns it
+        session.add(
+            DownloadHistory(
+                tmdb_id=pending.tmdb_id,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.cancelled,
+                source_title=row.title,
+                message=(
+                    "re-request cancelled: the eviction that prompted it failed and "
+                    "the original copy was restored to 'available' (file never left disk)"
+                ),
+            )
+        )
+        _logger.info(
+            "cancelled a redundant in-window re-request: the eviction it answered "
+            "failed and the original copy is 'available' again",
+            extra={"request_id": row.id, "tmdb_id": pending.tmdb_id},
+        )
+
+
+async def _cancel_redundant_season_regrabs(session: AsyncSession, pending: _SeasonPending) -> None:
+    """Cancel this season's pre-grab duplicates under OTHER requests (see
+    :func:`_restore_after_failed_delete`'s re-grab reconciliation), recomputing
+    each affected parent's rollup. Flush-only; the caller owns the commit."""
+    season_repo = SqlSeasonRequestRepository(session)
+    request_repo = SqlRequestRepository(session)
+    siblings = await season_repo.list_sibling_seasons(
+        pending.tmdb_id,
+        pending.season_number,
+        _PRE_GRAB_STATUSES,
+        exclude_id=pending.season_request_id,
+    )
+    for sibling in siblings:
+        cancelled = await season_request_service.set_status_if_in(
+            session,
+            media_request_id=sibling.media_request_id,
+            season_request_id=sibling.id,
+            status=RequestStatus.cancelled.value,
+            allowed_from=_PRE_GRAB_STATUSES,
+            tolerate_active_conflict=True,
+        )
+        if not cancelled:
+            continue  # advanced concurrently -- the reconciler/import dedup owns it
+        parent = await request_repo.get(sibling.media_request_id)
+        session.add(
+            DownloadHistory(
+                tmdb_id=pending.tmdb_id,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.cancelled,
+                source_title=parent.title if parent is not None else None,
+                message=(
+                    f"re-request cancelled for season {pending.season_number}: the "
+                    "eviction that prompted it failed and the original copy was "
+                    "restored to 'available' (file never left disk)"
+                ),
+            )
+        )
+        _logger.info(
+            "cancelled a redundant in-window re-request for season %s: the eviction "
+            "it answered failed and the original copy is 'available' again",
+            pending.season_number,
+            extra={"request_id": sibling.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+
+
+async def _resume_interrupted_evictions(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    media_type: Literal["movie", "tv"],
+    root_path: str,
+    all_roots: Sequence[str],
+) -> None:
+    """Recover every CLAIMED-BUT-NOT-FINALIZED eviction owned by this root
+    (ADR-0012 #67, crash resumability).
+
+    The claim commits ``evicted`` BEFORE the purge, and the finalize clears the
+    ``library_path`` breadcrumb (same commit as the history row) AFTER it -- so
+    ``evicted`` + a non-NULL breadcrumb is always an eviction that never
+    finished: a crash (or an unexpected error the sweep's per-candidate guard
+    caught after the claim commit) landed between the two. Sweeps only assemble
+    ``available`` rows, so WITHOUT this pass such a row is invisible to every
+    later sweep -- its live file keeps holding the pressured disk forever and
+    only a manual re-request would ever touch it. Runs at the START of every
+    sweep, BEFORE the pressure pre-check (recovery must not wait for pressure)
+    and only after the root's disk stat succeeded (an unmounted root must never
+    make its files read as "gone" below). Per row, skipping any registered in
+    :data:`_ACTIVE_EVICTIONS` (mid-purge in a concurrent sweep, not a crash
+    leftover):
+
+    * file still on disk -> :func:`_restore_after_failed_delete`: the row goes
+      back to ``available`` (incl. the re-grab reconciliation), and THIS sweep's
+      own candidate assembly then re-decides its eviction fresh through the
+      normal claim -> purge path -- no duplicated delete logic, and no delete at
+      all if the pressure that justified it is gone.
+    * file gone -> the purge completed but the finalize never did: finalize now
+      (CAS-clear the breadcrumb -- the single-winner gate against a concurrent
+      resume -- then the history row + the Plex refresh the crash swallowed).
+    * transient stat error (not a plain missing path) -> skip + log; never guess
+      "gone" off an I/O error. Retried next sweep.
+
+    Rows evicted BEFORE the finalize started clearing breadcrumbs (legacy) are
+    swept into the file-gone branch once, each gaining its (previously missing)
+    finalize -- one retroactive history row, then never matched again. One row's
+    failure never aborts the rest (mirrors the sweep's per-candidate guard).
+    """
+    pairs: list[tuple[str, str | None, _Pending]] = []  # (library_path, title, pending)
+    if media_type == "movie":
+        request_repo = SqlRequestRepository(session)
+        for row in await request_repo.list_by_status(RequestStatus.evicted.value):
+            if (
+                row.media_type != "movie"
+                or row.library_path is None
+                or ("movie", row.id) in _ACTIVE_EVICTIONS
+                or not _owned_by_root(row.library_path, root_path, all_roots)
+            ):
+                continue
+            pending: _Pending = _MoviePending(
+                media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
+            )
+            pairs.append((row.library_path, row.title, pending))
+    else:
+        season_repo = SqlSeasonRequestRepository(session)
+        request_repo = SqlRequestRepository(session)
+        for season in await season_repo.list_by_status(RequestStatus.evicted.value):
+            if (
+                season.library_path is None
+                or ("season", season.id) in _ACTIVE_EVICTIONS
+                or not _owned_by_root(season.library_path, root_path, all_roots)
+            ):
+                continue
+            parent = await request_repo.get(season.media_request_id)
+            pending = _SeasonPending(
+                media_request_id=season.media_request_id,
+                season_request_id=season.id,
+                season_number=season.season_number,
+                tmdb_id=season.tmdb_id,
+                size_bytes=None,
+            )
+            pairs.append((season.library_path, parent.title if parent else None, pending))
+
+    for library_path, title, pending in pairs:
+        try:
+            await _resume_one(
+                session=session,
+                library=library,
+                media_type=media_type,
+                library_path=library_path,
+                title=title,
+                pending=pending,
+            )
+        except Exception:
+            # One interrupted eviction's recovery failing must never abort the
+            # rest (nor poison the next row's transaction) -- same posture as the
+            # sweep's per-candidate guard.
+            await session.rollback()
+            _logger.exception(
+                "resuming an interrupted eviction failed unexpectedly; will retry next sweep",
+                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            )
+
+
+async def _resume_one(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    media_type: Literal["movie", "tv"],
+    library_path: str,
+    title: str | None,
+    pending: _Pending,
+) -> None:
+    """Recover ONE claimed-but-not-finalized eviction — see
+    :func:`_resume_interrupted_evictions` for the three-way decision."""
+    season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
+    try:
+        await asyncio.to_thread(os.stat, library_path)
+        file_present = True
+    except (FileNotFoundError, NotADirectoryError):
+        file_present = False
+    except OSError as exc:
+        # A transient stat failure (permission flap, I/O error, hung submount) is
+        # NOT evidence the file is gone -- finalizing off it would orphan a live
+        # file with its only breadcrumb erased. Skip honestly; retry next sweep.
+        _logger.warning(
+            "cannot stat the interrupted eviction's path (%s); leaving it for the "
+            "next sweep rather than guessing",
+            type(exc).__name__,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return
+
+    if file_present:
+        # The claim committed but the purge never completed: the file is still
+        # watchable, so restore 'available' (+ the re-grab reconciliation) and
+        # let THIS sweep's normal candidate assembly re-decide the eviction
+        # fresh -- through the standard claim -> purge path, or not at all if
+        # the pressure that justified it is gone.
+        _logger.info(
+            "resuming an interrupted eviction of %r%s: the file is still on disk; "
+            "restored to 'available' for a fresh sweep decision",
+            title,
+            season_note,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        await _restore_after_failed_delete(session, pending)
+        return
+
+    # The purge completed but the finalize never ran (crash after the delete, or
+    # a legacy eviction predating breadcrumb-clearing): finalize now. The
+    # CAS-clear is the single-winner gate -- only the pass that actually clears
+    # the breadcrumb writes the history row, so two concurrent resumes (or a
+    # resume racing the sweep that just finalized) never double-record.
+    if isinstance(pending, _SeasonPending):
+        cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
+            pending.season_request_id
+        )
+    else:
+        cleared = await SqlRequestRepository(session).clear_library_path_if_set(
+            pending.media_request_id
+        )
+    if not cleared:
+        await session.rollback()  # a concurrent pass finalized first -- honor it
+        return
+    session.add(
+        DownloadHistory(
+            tmdb_id=pending.tmdb_id,
+            torrent_hash=None,
+            event_type=DownloadHistoryEvent.evicted,
+            source_title=title,
+            message=(
+                f"eviction finalized{season_note}: recovered after an interrupted "
+                f"sweep, the file was already gone ({library_path})"
+            ),
+        )
+    )
+    await session.commit()
+    # The Plex refresh the interrupted sweep never got to -- same best-effort
+    # posture as the normal finalize (Plex catches up on its next scheduled scan).
+    await purge_service.trigger_library_scan(
+        library,
+        library_path=library_path,
+        media_type=media_type,
+        context="eviction",
+        extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+    )
+    _logger.info(
+        "finalized an interrupted eviction of %r%s: the file was already gone",
+        title,
+        season_note,
+        extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+    )
 
 
 async def _evict_one(
@@ -447,9 +819,50 @@ async def _evict_one(
        committed ``evicted`` status is published BEFORE the delete (needed for #3),
        which is exactly the window the request side must not trust Plex over: the
        in-library short-circuit consults ``RequestRepository.latest_request_evicted``
-       / ``SeasonRequestRepository.evicted_seasons`` and re-grabs (``pending``)
-       rather than minting availability off a STALE 'present' reading (see
+       / ``SeasonRequestRepository.evicted_seasons`` -- both keyed on the newest
+       NON-``cancelled`` row, so cancelling an in-window re-grab cannot reset the
+       guard mid-window -- and re-grabs (``pending``) rather than minting
+       availability off a STALE 'present' reading (see
        ``request_service.create_request`` / ``season_request_service.ensure_seasons``).
+    5. A crash mid-eviction NEVER strands the claim -- ``evicted`` + a non-NULL
+       ``library_path`` breadcrumb means "claimed but not finalized" (the finalize
+       clears the breadcrumb in the same commit as the history row), and
+       :func:`_resume_interrupted_evictions` recovers exactly those rows on the
+       next sweep.
+    6. A restore (failed delete OR resumed crash) NEVER leaves a redundant
+       in-window re-grab standing -- the file never left, so its reason
+       evaporated: pre-grab re-requests are CAS-cancelled / folded back to
+       ``available``; anything that already grabbed is left to the
+       reconciler/import dedup (see :func:`_restore_after_failed_delete`).
+
+    Full lifecycle state table, from the moment the claim COMMITS (row
+    ``evicted``, breadcrumb set, file on disk); every permutation of
+    [crash | re-request | cancel | purge-fail | purge-ok] lands in one row:
+
+    ========================================  =======================================
+    event after the claim commit              end state
+    ========================================  =======================================
+    purge ok                                  ``evicted``, breadcrumb CLEARED,
+                                              history row, Plex refreshed (finalized)
+    purge refused / error                     restored ``available`` (+ TV rollup);
+                                              breadcrumb kept; retried next sweep
+    crash, file still present                 resumed next sweep: restored
+                                              ``available``, re-decided fresh
+    crash, file already purged                resumed next sweep: finalized
+                                              (breadcrumb cleared, history, refresh)
+    re-request in-window                      lands ``pending`` (invariant #4), the
+                                              old row's outcome per the rows above
+    re-request in-window, then purge fails    old row ``available``; the pre-grab
+    / crash-with-file                         re-grab CANCELLED (movie / sibling
+                                              season) or folded back ``available``
+                                              (same-row TV re-arm) -- invariant #6
+    re-request advanced to a grab, then       old row ``available``; the in-flight
+    purge fails                               download is LEFT (reconciler/import
+                                              dedup re-places the file in place)
+    re-request in-window, user CANCELS it,    guards ignore ``cancelled`` rows, so
+    another re-request follows                it still lands ``pending`` (never a
+                                              stale-Plex ``available`` mint)
+    ========================================  =======================================
     """
     library_path = candidate.library_path
     if library_path is None:
@@ -481,6 +894,47 @@ async def _evict_one(
         )
         return None
 
+    # Register this row in the in-process registry for the WHOLE claim->finalize
+    # window (see :data:`_ACTIVE_EVICTIONS`): a concurrent sweep's resume pass
+    # must never mistake our mid-purge committed claim for a crash leftover and
+    # restore it to 'available' under a delete that is about to succeed.
+    # OWNERSHIP-aware: if a concurrent _evict_one already registered this row
+    # (this call is about to LOSE the claim CAS and skip -- only one winner ever
+    # proceeds), do not register, so this loser's ``finally`` can never strip the
+    # in-flight winner's registration mid-purge. The check-and-add is atomic
+    # enough on the single event loop (no await between them).
+    key = _claim_key(pending)
+    registered = key not in _ACTIVE_EVICTIONS
+    if registered:
+        _ACTIVE_EVICTIONS.add(key)
+    try:
+        return await _claim_purge_and_finalize(
+            session=session,
+            fs=fs,
+            library=library,
+            candidate=candidate,
+            pending=pending,
+            library_path=library_path,
+            season_note=season_note,
+        )
+    finally:
+        if registered:
+            _ACTIVE_EVICTIONS.discard(key)
+
+
+async def _claim_purge_and_finalize(
+    *,
+    session: AsyncSession,
+    fs: FileSystemPort,
+    library: LibraryPort,
+    candidate: EvictionCandidate,
+    pending: _Pending,
+    library_path: str,
+    season_note: str,
+) -> EvictionOutcome | None:
+    """The claim -> purge -> finalize core of :func:`_evict_one`, split out so the
+    caller's ``try/finally`` :data:`_ACTIVE_EVICTIONS` registration covers every
+    exit path (incl. an unexpected raise) without a whole-body reindent."""
     # THE eviction CLAIM (#67, ADR-0012 C6/C7): a real, database-enforced
     # compare-and-swap that flips the row to ``evicted`` and runs BEFORE any
     # filesystem delete -- a genuine REORDER of the old "delete, then flip" flow.
@@ -540,10 +994,14 @@ async def _evict_one(
     # Persist the claim BEFORE deleting. The committed 'evicted' status is exactly
     # what makes a genuinely concurrent sweep's own claim above match zero rows
     # (it sees the committed 'evicted' and stands down, rather than racing us to a
-    # second delete of the same file). A crash between here and the delete leaves
-    # an 'evicted' row over a still-present file -- self-healing, since 'evicted'
-    # is settled + re-requestable (ADR-0012): no later sweep re-picks it, and a
-    # re-request re-grabs the content fresh.
+    # second delete of the same file). A crash between here and the finalize below
+    # leaves an 'evicted' row whose ``library_path`` breadcrumb is STILL SET --
+    # exactly the "claimed but not finalized" signature the next sweep's
+    # :func:`_resume_interrupted_evictions` picks up: it restores the row to
+    # 'available' if the file is still on disk (so the eviction is re-decided
+    # fresh), or finalizes the eviction if the purge had already completed. The
+    # row is never stranded invisible to every sweep (evicted rows are not
+    # candidates) over a live file that keeps holding the pressured disk.
     #
     # This same pre-delete publish opens a window where the file is still on disk
     # (Plex still lists it, until the post-delete refresh below) yet the row reads
@@ -590,8 +1048,13 @@ async def _evict_one(
         return None
     freed_bytes = purge.freed_bytes
 
-    # The claim already flipped + committed the status; record the history row for
-    # the now-completed delete and commit it.
+    # FINALIZE: the claim already flipped + committed the status; record the
+    # history row for the now-completed delete AND clear the ``library_path``
+    # breadcrumb in the SAME commit. The cleared breadcrumb is what marks this
+    # eviction FINALIZED: 'evicted' + a non-NULL breadcrumb always means "claimed
+    # but not finalized" (a crash window), which is exactly the signature
+    # :func:`_resume_interrupted_evictions` keys on -- so a finalized eviction
+    # must never keep looking like an interrupted one.
     session.add(
         DownloadHistory(
             tmdb_id=pending.tmdb_id,
@@ -604,6 +1067,12 @@ async def _evict_one(
             ),
         )
     )
+    if isinstance(pending, _SeasonPending):
+        await SqlSeasonRequestRepository(session).clear_library_path_if_set(
+            pending.season_request_id
+        )
+    else:
+        await SqlRequestRepository(session).clear_library_path_if_set(pending.media_request_id)
     await session.commit()
 
     # Tell Plex the media is gone, so a subsequent "Request again" sees it as ABSENT
@@ -773,7 +1242,10 @@ async def run_eviction_sweep(
     WHOLE sweep for this root — logged, never a crash — since there is nothing
     to assess pressure against. One candidate failing never aborts the rest
     (see :func:`_evict_one`); each successful eviction commits independently so
-    a mid-sweep crash only loses progress on the one candidate in flight.
+    a mid-sweep crash only loses progress on the one candidate in flight — and
+    even THAT candidate is recovered by the next sweep's
+    :func:`_resume_interrupted_evictions` pass (step 0.5), which runs before the
+    pressure pre-check so recovery never waits for disk pressure.
     """
     try:
         # Offloaded for the same reason as ``preview_candidates`` above: a
@@ -788,6 +1260,30 @@ async def run_eviction_sweep(
         )
         return []
 
+    # Nested-root ownership scope: see ``assemble_candidates``'s ``all_roots``
+    # docstring — a breadcrumb owned by a nested more-specific root is never a
+    # candidate for this (parent) root's pressure. Computed BEFORE the pressure
+    # pre-check because the crash-recovery pass below needs it too.
+    scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
+
+    # Crash recovery FIRST, and deliberately BEFORE the pressure pre-check: a
+    # claimed-but-not-finalized eviction (see _resume_interrupted_evictions) is
+    # invisible to candidate assembly (its status is 'evicted', not 'available'),
+    # so no amount of ordinary sweeping would ever retry its live file -- and its
+    # recovery must not wait for disk pressure either (a stranded 'evicted' row
+    # over a live file is dishonest at ANY pressure). Placed AFTER the disk stat
+    # above so an unmounted/unreadable root can never make its files read as
+    # "gone" and be wrongly finalized. A row restored here (file still present)
+    # is 'available' again by the time candidates are assembled below, so THIS
+    # same sweep re-decides its eviction fresh through the normal claim path.
+    await _resume_interrupted_evictions(
+        session=session,
+        library=library,
+        media_type=media_type,
+        root_path=root_path,
+        all_roots=scope,
+    )
+
     disk_used_pct = used_percent(disk)
     if not proactive and disk_used_pct < threshold_pct:
         # Cheap pre-check, BEFORE assembling candidates: select_evictions applies
@@ -799,11 +1295,6 @@ async def run_eviction_sweep(
         # pressure -- the common case. A proactive sweep has no pressure gate, so
         # this check is skipped for it (it always needs the full candidate set).
         return []
-
-    # Nested-root ownership scope: see ``assemble_candidates``'s ``all_roots``
-    # docstring — a breadcrumb owned by a nested more-specific root is never a
-    # candidate for this (parent) root's pressure.
-    scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
     pairs = (
         await _movie_candidates(session, library, disk.total_bytes, root_path, scope)
         if media_type == "movie"

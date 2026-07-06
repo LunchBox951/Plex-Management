@@ -308,3 +308,43 @@ async def test_evicted_seasons_reflects_the_newest_row_per_season(
     other = await _make_show(session, tmdb_id=941)
     await repo.ensure(other.id, 1, status="available")
     assert await repo.evicted_seasons(941) == frozenset()
+
+
+async def test_evicted_seasons_ignores_cancelled_rows(session: AsyncSession) -> None:
+    """The season twin of ``latest_request_evicted``'s cancelled-blindness: an
+    in-window re-grab of an evicted season that the user then cancelled (a
+    'cancelled' row NEWER than the evicted one) must not drop the season out of
+    the evicted set -- the next re-request must still re-grab, not trust the
+    stale Plex 'present' while the sweep deletes the files."""
+    repo = SqlSeasonRequestRepository(session)
+
+    old = MediaRequest(tmdb_id=950, media_type="tv", title="Show", status="evicted")
+    session.add(old)
+    await session.flush()
+    await repo.ensure(old.id, 1, status="evicted")
+    assert await repo.evicted_seasons(950) == frozenset({1})
+
+    # The in-window re-request's duplicate season row, cancelled by the user:
+    # newest row for season 1 is 'cancelled', but the newest NON-cancelled row is
+    # still the eviction -- the guard must hold.
+    new = MediaRequest(tmdb_id=950, media_type="tv", title="Show", status="cancelled")
+    session.add(new)
+    await session.flush()
+    await repo.ensure(new.id, 1, status="cancelled")
+    assert await repo.evicted_seasons(950) == frozenset({1})
+
+
+async def test_season_clear_library_path_if_set_is_a_single_winner_gate(
+    session: AsyncSession,
+) -> None:
+    """Season mirror of the movie-side guarded clear: True exactly once."""
+    show = await _make_show(session, tmdb_id=951)
+    repo = SqlSeasonRequestRepository(session)
+    season = await repo.ensure(show.id, 1, status="evicted")
+    await repo.set_library_path(season.id, "/media/tv/Show/Season 01")
+
+    assert await repo.clear_library_path_if_set(season.id) is True
+    assert await repo.clear_library_path_if_set(season.id) is False  # already cleared
+    fetched = await repo.get(season.id)
+    assert fetched is not None
+    assert fetched.library_path is None

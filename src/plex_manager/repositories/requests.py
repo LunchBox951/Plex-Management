@@ -203,23 +203,79 @@ class SqlRequestRepository:
         -- the exact race this guards. When this returns ``True`` the caller
         re-grabs (``pending``) instead of trusting Plex.
 
-        Keyed on the NEWEST row (``ORDER BY id DESC``) so a movie legitimately
-        re-downloaded after an earlier eviction (whose newest row is ``available``
-        / active, already resolved by ``find_in_library`` / ``find_active`` before
-        this is ever reached) is never falsely suppressed -- only a media whose
-        most recent history really is an eviction is treated as stale-in-Plex.
+        Keyed on the NEWEST NON-``cancelled`` row (``ORDER BY id DESC``) so a
+        movie legitimately re-downloaded after an earlier eviction (whose newest
+        row is ``available`` / active, already resolved by ``find_in_library`` /
+        ``find_active`` before this is ever reached) is never falsely suppressed
+        -- only a media whose most recent history really is an eviction is
+        treated as stale-in-Plex. ``cancelled`` rows are IGNORED outright rather
+        than counted as "newest": a cancellation says nothing about on-disk
+        truth, so an in-window re-grab the user then cancelled (evicted ->
+        pending -> cancelled) must not reset this guard and let the NEXT
+        re-request mint ``available`` off the same stale Plex reading while the
+        sweep is still deleting the file.
         """
         stmt = (
             select(MediaRequest.status)
             .where(
                 MediaRequest.tmdb_id == tmdb_id,
                 MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.status != RequestStatus.cancelled,
             )
             .order_by(MediaRequest.id.desc())
             .limit(1)
         )
         status = (await self._session.execute(stmt)).scalars().first()
         return status == RequestStatus.evicted
+
+    async def list_for_media(
+        self, tmdb_id: int, media_type: str, statuses: frozenset[str]
+    ) -> list[RequestRecord]:
+        """Every request row for ``(tmdb_id, media_type)`` whose status is in
+        ``statuses``, oldest first.
+
+        Backs the eviction restore's re-grab reconciliation (ADR-0012 #67):
+        after a failed/interrupted delete restores the claimed row to
+        ``available``, any in-window re-request for the SAME media that has not
+        yet grabbed anything (``pending``/``searching``/``no_acceptable_release``)
+        is redundant -- the file never left -- and the restore cancels it via a
+        per-row :meth:`set_status_if_in` CAS. A plain read, not itself a CAS: the
+        caller must re-compare on write.
+        """
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.status.in_([RequestStatus(s) for s in statuses]),
+            )
+            .order_by(MediaRequest.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def clear_library_path_if_set(self, request_id: int) -> bool:
+        """Null the eviction breadcrumb ONLY if it is currently set; return whether
+        this call actually cleared it.
+
+        The guarded (``WHERE library_path IS NOT NULL``) variant of
+        :meth:`clear_library_path`, for the eviction finalize (ADR-0012 #67):
+        clearing the breadcrumb is what marks a claimed ``evicted`` row as
+        FINALIZED (file gone), and two resume passes racing over the same
+        interrupted eviction use this as their single-winner gate -- only the
+        caller that actually cleared it (``True``) writes the history row, so a
+        concurrent finalize never double-records the same eviction.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(MediaRequest.id == request_id, MediaRequest.library_path.is_not(None))
+                .values(library_path=None)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
 
     async def acquire_media_lock(self, tmdb_id: int, media_type: str) -> None:
         """Serialize create-request decisions for one ``(tmdb_id, media_type)``.

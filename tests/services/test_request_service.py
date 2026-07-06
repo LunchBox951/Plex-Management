@@ -451,6 +451,51 @@ async def test_create_request_after_whole_show_eviction_re_grabs_when_plex_stale
     assert {r.season_number: r.status.value for r in rows} == {1: "pending", 2: "pending"}
 
 
+async def test_create_request_after_cancelled_in_window_regrab_still_re_grabs(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 finding 2: evicted -> in-window re-grab ('pending', per the
+    guard) -> user CANCELS the re-grab -> newest row is now 'cancelled'. The next
+    re-request in the still-open delete window must STILL re-grab ('pending') --
+    the guard keys on the newest NON-cancelled row (still the eviction), because
+    a cancellation says nothing about on-disk truth. Before the fix, the
+    cancelled row reset the guard and this request minted 'available' over the
+    file the sweep was deleting."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=640,
+            media_type=MediaType.movie,
+            title="Doomed Twice",
+            status=RequestStatus.evicted,
+        )
+        cancelled = MediaRequest(
+            tmdb_id=640,
+            media_type=MediaType.movie,
+            title="Doomed Twice",
+            status=RequestStatus.cancelled,
+        )
+        session.add(evicted)
+        await session.flush()  # evicted gets the lower id
+        session.add(cancelled)
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={640: MovieMetadata(tmdb_id=640, title="Doomed Twice", year=2021)})
+    library = FakeLibrary(available={640})  # Plex STILL lists the doomed file
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=640, media_type="movie", library=library
+        )
+
+    assert fresh.status == RequestStatus.pending.value  # re-grabbed, never 'available'
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 640)))
+            .scalars()
+            .all()
+        )
+    assert sorted(r.status.value for r in rows) == ["cancelled", "evicted", "pending"]
+
+
 async def test_create_request_dedups_onto_concurrent_regrab_in_eviction_window(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,

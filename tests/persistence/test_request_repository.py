@@ -375,3 +375,38 @@ async def test_latest_request_evicted_reflects_the_newest_row(session: AsyncSess
     await repo.create(tmdb_id=700, media_type="tv", title="Gone Show", status="evicted")
     assert await repo.latest_request_evicted(700, "movie") is False
     assert await repo.latest_request_evicted(700, "tv") is True
+
+
+async def test_latest_request_evicted_ignores_cancelled_rows(session: AsyncSession) -> None:
+    """An in-window re-grab the user then CANCELLED must not reset the eviction
+    stale-Plex guard: a cancellation says nothing about on-disk truth, so the
+    guard keys on the newest NON-cancelled row. Without this, evicted -> re-grab
+    (pending) -> cancel would let the NEXT re-request mint 'available' over the
+    file the sweep is still deleting."""
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=701, media_type="movie", title="Doomed", status="evicted")
+    assert await repo.latest_request_evicted(701, "movie") is True
+
+    # The in-window re-grab, cancelled by the user: newest row is now 'cancelled',
+    # but the newest NON-cancelled row is still the eviction.
+    await repo.create(tmdb_id=701, media_type="movie", title="Doomed", status="cancelled")
+    assert await repo.latest_request_evicted(701, "movie") is True
+
+    # A media whose ONLY row is cancelled has no eviction history -> False.
+    await repo.create(tmdb_id=702, media_type="movie", title="Other", status="cancelled")
+    assert await repo.latest_request_evicted(702, "movie") is False
+
+
+async def test_clear_library_path_if_set_is_a_single_winner_gate(session: AsyncSession) -> None:
+    """The guarded breadcrumb clear returns True exactly once -- the eviction
+    finalize's single-winner gate: only the pass that actually cleared it writes
+    the history row, so two racing resume/finalize passes never double-record."""
+    repo = SqlRequestRepository(session)
+    created = await repo.create(tmdb_id=703, media_type="movie", title="Gone", status="evicted")
+    await repo.set_library_path(created.id, "/media/movies/Gone.mkv")
+
+    assert await repo.clear_library_path_if_set(created.id) is True
+    assert await repo.clear_library_path_if_set(created.id) is False  # already cleared
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.library_path is None
