@@ -271,13 +271,20 @@ class RequestRepository(Protocol):
         """Update a request's status."""
 
     async def set_status_if_in(
-        self, request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_unpinned: bool = False,
     ) -> bool:
-        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
+        (and, with ``require_unpinned``, only if not ``keep_forever``-pinned).
 
         Returns whether the row was actually updated -- ``False`` means a
-        genuinely concurrent writer already moved it elsewhere. The eviction
-        sweep's authoritative double-count guard (ADR-0012, C6): see
+        genuinely concurrent writer already moved it elsewhere (or pinned it). The
+        eviction sweep's authoritative double-count guard (ADR-0012, C6) and, with
+        ``require_unpinned``, its pre-delete pin-safe CLAIM (#67): see
         ``SqlRequestRepository.set_status_if_in``'s docstring.
         """
         raise NotImplementedError
@@ -505,9 +512,16 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def set_status_if_in(
-        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        season_request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_parent_unpinned: bool = False,
     ) -> bool:
-        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
+        (and, with ``require_parent_unpinned``, only if the PARENT show is not
+        ``keep_forever``-pinned).
 
         The season-granularity mirror of ``RequestRepository.set_status_if_in``;
         see ``SqlSeasonRequestRepository.set_status_if_in``'s docstring.

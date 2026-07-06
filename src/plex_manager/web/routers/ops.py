@@ -380,9 +380,10 @@ async def _disk_root_item(
 ) -> DiskRootItem:
     """One configured root's usage gauge + its ranked eviction preview.
 
-    TTL-cached (~15s, keyed on ``root_path`` — see :func:`_get_disk_preview_cache`)
-    so a dashboard polling every ~15s never maps 1:1 onto a fresh Plex
-    ``watch_state`` call per title plus an ``os.walk`` per title on every poll.
+    TTL-cached (~15s, keyed on the role ``label`` + ``root_path`` — see the
+    ``cache_key`` note below and :func:`_get_disk_preview_cache`) so a dashboard
+    polling every ~15s never maps 1:1 onto a fresh Plex ``watch_state`` call per
+    title plus an ``os.walk`` per title on every poll.
 
     An unreadable root reports ``error`` set (zeroed gauges, no candidates —
     there is nothing to preview against); this is cached too, so a persistently
@@ -401,12 +402,18 @@ async def _disk_root_item(
     (logged), the same honest degraded-preview posture as an unreadable root,
     rather than 500ing the WHOLE ``/ops/disk`` response over one root's preview.
     """
-    # Key by media_type AND path: movies_root and tv_root can be configured to the
-    # SAME directory, and the movie vs TV preview of that path is different
-    # (different candidate sets). Keying on root_path alone would serve the first
-    # role's cached DiskRootItem for the second, duplicating one root and never
-    # computing the other's preview until the TTL expired.
-    cache_key = f"{media_type}:{root_path}"
+    # Key by the ROLE LABEL and path (#97): two roots can be configured to the
+    # SAME directory -- not only movies_root vs tv_root (different media_type),
+    # but also a normal vs anime root of the SAME media_type (e.g. movies_root and
+    # anime_movie_root both pointing at one shared movie tree). The cached value
+    # carries the role's ``label`` (``DiskRootItem.root``), so keying on
+    # ``media_type:root_path`` alone would serve the FIRST role's cached item --
+    # its label and all -- back for the second same-media_type role, collapsing
+    # two configured roots into one duplicated row and hiding the other from the
+    # Status response. The label is unique per role, so it keeps every configured
+    # root's preview distinct even when two share a path (and still differs across
+    # media_type, since each label maps to exactly one media_type).
+    cache_key = f"{label}:{root_path}"
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
@@ -538,10 +545,10 @@ async def disk_endpoint(
         )
     # ADR-0015 anime library routing — its own DiskRootItem rows, so a separate
     # anime disk is never a silent gap on the Status page. Cached (like every
-    # other root) by ``f"{media_type}:{root_path}"``; an operator who points an
-    # anime root at the SAME path as movies_root/tv_root gets the earlier
-    # role's cached entry back (same acceptable same-path caveat as pointing
-    # movies_root and tv_root at one shared path today).
+    # other root) by ``f"{label}:{root_path}"`` (#97): the role label keeps an
+    # anime root pointed at the SAME path as movies_root/tv_root as its OWN
+    # distinct row, rather than serving back the earlier role's cached entry and
+    # hiding one configured root.
     if anime_movie_root:
         roots.append(
             await _disk_root_item(
@@ -673,6 +680,20 @@ async def evict_endpoint(
                 media_type,
                 root,
             )
+            # Every root shares THIS request's single session, so a SQLAlchemy
+            # failure mid-sweep leaves it in a poisoned (aborted) transaction --
+            # without a rollback the NEXT root's sweep would then raise too,
+            # cascading one root's failure into every remaining root (#95). Roll
+            # back to a clean state before continuing; the rollback is itself
+            # guarded so even a broken session is logged, never masked.
+            try:
+                await session.rollback()
+            except Exception:
+                _logger.exception(
+                    "rollback after a failed eviction sweep for %s root %s also failed; continuing",
+                    media_type,
+                    root,
+                )
             errors.append(
                 EvictErrorItem(root=root_label, detail=f"sweep failed ({type(exc).__name__})")
             )

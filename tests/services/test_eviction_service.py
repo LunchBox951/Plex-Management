@@ -41,6 +41,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.library import WatchState
 from plex_manager.services import eviction_service, season_request_service
+from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
 from tests.web.fakes import FakeLibrary
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -1843,3 +1844,336 @@ async def test_concurrent_evict_one_calls_for_the_same_row_never_double_count(
         assert len(history) == 1  # one eviction, one history row -- never double-counted
     finally:
         await engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# #67 -- the eviction CLAIM: the status compare-and-swap runs BEFORE any delete,
+# folding the pin into the compared predicate. These tests deliberately bypass
+# the cheap ``_still_evictable`` early read-filter (monkeypatched to always pass)
+# so the assertions prove the CLAIM ITSELF -- not the pre-read -- is what gates
+# the delete. A fix that only re-reads keep_forever (without moving the delete
+# after the claim) would fail these: the delete would run before the claim.
+# --------------------------------------------------------------------------- #
+
+
+async def _always_evictable(_session: AsyncSession, _pending: object) -> bool:
+    """Force ``_evict_one`` past its cheap read-filter so only the CLAIM can stop it."""
+    return True
+
+
+async def test_claim_refuses_to_delete_a_movie_pinned_before_the_claim(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#67 (movie): a ``keep_forever`` pin committed after candidate assembly but
+    before the claim makes the pre-delete CAS (``... AND keep_forever = false``)
+    match no row -- so the file is left intact, the row stays ``available`` (never
+    ``evicted``), and ``purge_library_path`` is never even reached. Proves the
+    delete is gated on the CLAIM, not merely on a re-read."""
+    library_path = _movie_file(tmp_path, "Pinned Before Claim.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=400, title="Pinned Before Claim", library_path=library_path
+    )
+    # The operator's pin lands (separate session) AFTER the candidate below was
+    # assembled but BEFORE the claim runs.
+    async with sessionmaker_() as pin_session:
+        row = await pin_session.get(MediaRequest, request_id)
+        assert row is not None
+        row.keep_forever = True
+        await pin_session.commit()
+
+    monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
+
+    async def _forbidden_purge(_fs: object, _path: str) -> PurgeResult:
+        raise AssertionError("purge must never run once the claim has lost")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _forbidden_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Pinned Before Claim",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=400, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(library_path).exists(), "the pin must stop the delete at the claim"
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available  # never flipped to evicted
+        assert row.keep_forever is True  # the pin stands
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 400)))
+            .scalars()
+            .all()
+        )
+    assert history == []  # no eviction was ever recorded
+
+
+async def test_claim_refuses_to_delete_a_season_whose_parent_pinned_before_the_claim(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#67 (tv): the pin lives on the PARENT show, so the season claim folds it in
+    via a correlated subquery (``require_parent_unpinned``). A parent pin landing
+    before the claim makes the season CAS match no row -- season file intact,
+    season row stays ``available``. Proves the parent-pin guard is enforced at the
+    CLAIM, past the bypassed read-filter."""
+    s1_path = _movie_file(tmp_path, "Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=401, title="Pinned Parent Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_request_id = season_row.id
+
+    async with sessionmaker_() as pin_session:
+        parent = await pin_session.get(MediaRequest, show_id)
+        assert parent is not None
+        parent.keep_forever = True
+        await pin_session.commit()
+
+    monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
+
+    async def _forbidden_purge(_fs: object, _path: str) -> PurgeResult:
+        raise AssertionError("purge must never run once the parent-pin claim has lost")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _forbidden_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Pinned Parent Show",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=s1_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=401,
+        size_bytes=1024,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(s1_path).exists(), "the parent pin must stop the delete at the claim"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        assert season_row.status is RequestStatus.available
+
+
+async def test_claim_loser_on_a_concurrent_status_change_never_deletes(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#67: a row moved OUT of ``available`` (to a non-evictable status) by a
+    concurrent writer between assembly and the claim loses the CAS -- so the file
+    is never deleted and no second ``evicted`` history is written. Bypasses the
+    read-filter to prove the CLAIM is the gate."""
+    library_path = _movie_file(tmp_path, "Concurrently Moved.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=402, title="Concurrently Moved", library_path=library_path
+    )
+    # A concurrent writer moves it to a non-evictable status (e.g. re-opened for
+    # a supplementary download) after the candidate was assembled.
+    async with sessionmaker_() as other_session:
+        row = await other_session.get(MediaRequest, request_id)
+        assert row is not None
+        row.status = RequestStatus.completed
+        await other_session.commit()
+
+    monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
+
+    async def _forbidden_purge(_fs: object, _path: str) -> PurgeResult:
+        raise AssertionError("purge must never run for a claim loser")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _forbidden_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Concurrently Moved",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=402, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.completed  # the concurrent status stands
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 402)))
+            .scalars()
+            .all()
+        )
+    assert history == []
+
+
+async def test_failed_delete_restores_the_claimed_row_to_available(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#67: the claim wins (row flips to ``evicted``, committed) and THEN the
+    filesystem delete fails -- the file is still on disk. The row must be RESTORED
+    to ``available`` so a failed unlink never strands an ``evicted`` status over a
+    still-watchable file, and no eviction history is written for a delete that did
+    not happen. The next sweep can retry honestly."""
+    library_path = _movie_file(tmp_path, "Unlink Fails.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=403, title="Unlink Fails", library_path=library_path
+    )
+
+    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+        # The claim already flipped the row to 'evicted' and committed; the delete
+        # itself now fails (e.g. EACCES / EIO) with nothing removed.
+        return PurgeResult(PurgeOutcome.error, 0, "OSError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Unlink Fails",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=403, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(library_path).exists()  # the file is still there -- delete failed
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        # Restored: never left stranded as 'evicted' over a live file.
+        assert row.status is RequestStatus.available
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 403)))
+            .scalars()
+            .all()
+        )
+    assert history == []  # no eviction recorded for a delete that never happened
+
+
+async def test_failed_season_delete_restores_the_claimed_season_to_available(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#67 (tv): the season claim wins and its delete then fails -- the season row
+    is restored from ``evicted`` back to ``available`` (parent rollup recomputed),
+    never stranded over a still-present season file."""
+    s1_path = _movie_file(tmp_path, "Restore Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=404, title="Restore Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_request_id = season_row.id
+
+    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.error, 0, "OSError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Restore Show",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=s1_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=404,
+        size_bytes=1024,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        assert season_row.status is RequestStatus.available
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.status is RequestStatus.available  # rollup restored too

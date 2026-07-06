@@ -323,10 +323,17 @@ class SqlRequestRepository:
         await self._session.flush()
 
     async def set_status_if_in(
-        self, request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_unpinned: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
-        status is in ``allowed_from``. Returns whether a row was actually updated.
+        status is in ``allowed_from`` (and, with ``require_unpinned``, only if the
+        row is not ``keep_forever``-pinned). Returns whether a row was actually
+        updated.
 
         Mirrors ``SqlDownloadRepository.update_status_if_in`` (see its docstring): a
         single ``UPDATE ... WHERE id = ? AND status IN (...)`` lets the DATABASE --
@@ -347,18 +354,31 @@ class SqlRequestRepository:
         (the row already left ``available`` once the winner committed) and must
         skip rather than double-count.
 
+        ``require_unpinned`` (opt-in for the eviction CLAIM, ADR-0012 #67) folds the
+        pin into the compared predicate: ``... AND keep_forever = false``. Because
+        the eviction claim now runs this CAS BEFORE any filesystem delete, a
+        ``keep_forever`` pin that commits after candidate assembly but before the
+        claim makes the UPDATE match zero rows -- the DATABASE, not a read-then-act
+        check, is what refuses to delete a freshly-pinned title. ``keep_forever``
+        lives on the same row as ``status``, so a single UPDATE can compare both
+        atomically (the TV pin lives on the PARENT row and needs a subquery -- see
+        ``SqlSeasonRequestRepository.set_status_if_in``'s ``require_parent_unpinned``).
+
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map
         instance (e.g. from this session's own ``get_fresh`` re-check moments
         earlier) consistent with the DB result, so anything read afterwards in
         THIS session (an eviction sweep never re-reads the row again, but mirrors
         ``update_status_if_in`` for consistency) sees the honest post-CAS status.
         """
+        predicates = [
+            MediaRequest.id == request_id,
+            MediaRequest.status.in_([RequestStatus(s) for s in allowed_from]),
+        ]
+        if require_unpinned:
+            predicates.append(MediaRequest.keep_forever.is_(False))
         stmt = (
             update(MediaRequest)
-            .where(
-                MediaRequest.id == request_id,
-                MediaRequest.status.in_([RequestStatus(s) for s in allowed_from]),
-            )
+            .where(*predicates)
             .values(status=RequestStatus(status))
             .execution_options(synchronize_session="fetch")
         )

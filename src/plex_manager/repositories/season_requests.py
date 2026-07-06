@@ -231,10 +231,17 @@ class SqlSeasonRequestRepository:
         await self._session.flush()
 
     async def set_status_if_in(
-        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        season_request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_parent_unpinned: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
-        status is in ``allowed_from``. Returns whether a row was actually updated.
+        status is in ``allowed_from`` (and, with ``require_parent_unpinned``, only
+        if the PARENT show is not ``keep_forever``-pinned). Returns whether a row
+        was actually updated.
 
         The season-granularity mirror of ``SqlRequestRepository.set_status_if_in``
         (see its docstring for the full rationale) -- the eviction sweep's
@@ -243,13 +250,36 @@ class SqlSeasonRequestRepository:
         recomputes the parent rollup, but ONLY when this CAS actually changed
         the row -- a losing sweep must never re-derive (and re-persist) a
         rollup off a row it did not actually get to move.
+
+        ``require_parent_unpinned`` (opt-in for the eviction CLAIM, ADR-0012 #67)
+        folds the TV pin into the compared predicate. The pin lives on the PARENT
+        ``MediaRequest`` (``keep_forever``), never on the season row, so -- unlike
+        the movie CAS, which compares ``keep_forever`` on its own row -- this needs
+        a correlated ``EXISTS`` subquery: the UPDATE additionally requires that NO
+        parent row with this season's ``media_request_id`` is pinned. Because the
+        eviction claim now runs this CAS BEFORE any filesystem delete, a pin that
+        commits on the parent after a season candidate was assembled but before the
+        claim makes the UPDATE match zero rows -- the DATABASE atomically refuses to
+        delete a season whose show was just pinned, rather than a read-then-act
+        check that a concurrent pin could slip past.
         """
+        predicates = [
+            SeasonRequest.id == season_request_id,
+            SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
+        ]
+        if require_parent_unpinned:
+            parent_pinned = (
+                select(MediaRequest.id)
+                .where(
+                    MediaRequest.id == SeasonRequest.media_request_id,
+                    MediaRequest.keep_forever.is_(True),
+                )
+                .exists()
+            )
+            predicates.append(~parent_pinned)
         stmt = (
             update(SeasonRequest)
-            .where(
-                SeasonRequest.id == season_request_id,
-                SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
-            )
+            .where(*predicates)
             .values(status=RequestStatus(status))
             .execution_options(synchronize_session="fetch")
         )

@@ -366,6 +366,7 @@ async def set_status_if_in(
     season_request_id: int,
     status: str,
     allowed_from: frozenset[str],
+    require_parent_unpinned: bool = False,
     tolerate_active_conflict: bool = False,
 ) -> bool:
     """Compare-and-swap ONE season's status, recomputing the parent rollup ONLY when
@@ -380,6 +381,14 @@ async def set_status_if_in(
     double-count race it closes. A losing CAS (``False``) must never recompute
     (and persist) a rollup derived from a row it did not actually get to move.
 
+    ``require_parent_unpinned`` (opt-in for the eviction CLAIM, #67) is passed
+    straight through to the repository CAS: it folds the PARENT show's
+    ``keep_forever`` pin into the compared predicate (via a correlated subquery),
+    so a pin landing on the show before the claim atomically refuses the swap --
+    the DATABASE, not a read-then-act check, is what stops a freshly-pinned show's
+    season from being evicted. ``eviction_service._evict_one`` opts in for its
+    pre-delete claim.
+
     ``tolerate_active_conflict`` (default ``False``, strict for every ordinary
     caller) is passed straight through to :func:`_recompute_parent` -- see its
     docstring. ``eviction_service._evict_one`` is the ONLY caller that opts in
@@ -389,7 +398,7 @@ async def set_status_if_in(
     collides with a newer active request for the same show.
     """
     changed = await SqlSeasonRequestRepository(session).set_status_if_in(
-        season_request_id, status, allowed_from
+        season_request_id, status, allowed_from, require_parent_unpinned=require_parent_unpinned
     )
     if changed:
         await _recompute_parent(

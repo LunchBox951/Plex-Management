@@ -526,30 +526,17 @@ async def _eviction_tick(app: FastAPI) -> float:
                             root,
                         )
 
-            evicted = await eviction_service.run_eviction_sweep(
-                session=session,
-                library=library,
-                fs=fs,
-                media_type=media_type,
-                root_path=root,
-                all_roots=all_roots,
-                threshold_pct=threshold_pct,
-                target_pct=target_pct,
-                grace_days=grace_days,
-            )
-            if evicted:
-                _logger.info(
-                    "evicted %d %s title(s) from %s under disk pressure",
-                    len(evicted),
-                    media_type,
-                    root,
-                )
-            if proactive_enabled:
-                # A SEPARATE pass, never gated on the pressure sweep above having
-                # fired: opting in means "also clear past-grace watched content
-                # regardless of usage". Candidates the pressure sweep already
-                # evicted are naturally absent here (no longer `available`).
-                proactive_evicted = await eviction_service.run_eviction_sweep(
+            # Wrapped in its OWN try/except + guarded rollback, exactly like the
+            # telemetry sweep above (and for the same reason): every root shares
+            # THIS tick's single session, so a SQLAlchemy failure mid-sweep leaves
+            # that session in a poisoned (aborted) transaction. Without the
+            # rollback the NEXT root's sweep -- and the proactive pass just below
+            # -- would then raise too, so ONE root's failure would silently skip
+            # every remaining root this tick. Roll back to a clean state before
+            # continuing; the rollback is itself guarded so even a broken session
+            # is logged, never masked.
+            try:
+                evicted = await eviction_service.run_eviction_sweep(
                     session=session,
                     library=library,
                     fs=fs,
@@ -559,15 +546,75 @@ async def _eviction_tick(app: FastAPI) -> float:
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,
-                    proactive=True,
                 )
-                if proactive_evicted:
-                    _logger.info(
-                        "proactively evicted %d %s title(s) from %s (past grace)",
-                        len(proactive_evicted),
+            except Exception:
+                _logger.exception(
+                    "eviction sweep failed for %s root %s; continuing with remaining roots",
+                    media_type,
+                    root,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    _logger.exception(
+                        "rollback after a failed eviction sweep for %s root %s "
+                        "also failed; continuing",
                         media_type,
                         root,
                     )
+            else:
+                if evicted:
+                    _logger.info(
+                        "evicted %d %s title(s) from %s under disk pressure",
+                        len(evicted),
+                        media_type,
+                        root,
+                    )
+            if proactive_enabled:
+                # A SEPARATE pass, never gated on the pressure sweep above having
+                # fired: opting in means "also clear past-grace watched content
+                # regardless of usage". Candidates the pressure sweep already
+                # evicted are naturally absent here (no longer `available`). Same
+                # guarded-rollback wrapper as the pressure sweep above -- a
+                # proactive-pass failure on one root must not poison the shared
+                # session for the next root either.
+                try:
+                    proactive_evicted = await eviction_service.run_eviction_sweep(
+                        session=session,
+                        library=library,
+                        fs=fs,
+                        media_type=media_type,
+                        root_path=root,
+                        all_roots=all_roots,
+                        threshold_pct=threshold_pct,
+                        target_pct=target_pct,
+                        grace_days=grace_days,
+                        proactive=True,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "proactive eviction sweep failed for %s root %s; "
+                        "continuing with remaining roots",
+                        media_type,
+                        root,
+                    )
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        _logger.exception(
+                            "rollback after a failed proactive eviction sweep for "
+                            "%s root %s also failed; continuing",
+                            media_type,
+                            root,
+                        )
+                else:
+                    if proactive_evicted:
+                        _logger.info(
+                            "proactively evicted %d %s title(s) from %s (past grace)",
+                            len(proactive_evicted),
+                            media_type,
+                            root,
+                        )
     return interval_minutes * 60.0
 
 

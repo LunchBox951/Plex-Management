@@ -23,13 +23,21 @@ trigger) is expected to call it once per configured root. Per call:
    :func:`~plex_manager.domain.eviction.rank_eviction_candidates` (every eligible
    candidate, no pressure gate) when ``proactive=True`` — the opt-in
    ``eviction_proactive_enabled`` setting.
-3. For each SELECTED candidate: ``fs.delete(library_path)``, flip its status to
-   the non-terminal, re-requestable ``evicted`` (per-season for TV, recomputing
-   the parent show's rollup), and log to ``download_history`` + (via the
-   ordinary ``logging`` capture pipeline, see ``services/log_capture_service.py``)
-   ``log_events``. A candidate missing its ``library_path`` breadcrumb, or one
-   the filesystem guard refuses, is skipped + logged — NEVER guessed at, never a
-   silent no-op, and never lets one bad candidate abort the rest of the sweep.
+3. For each SELECTED candidate, in this exact order (#67): first CLAIM the row
+   with an atomic compare-and-swap that flips its status to the non-terminal,
+   re-requestable ``evicted`` (per-season for TV, recomputing the parent show's
+   rollup) ONLY if it is still ``available`` and un-pinned -- the pin folded into
+   the compared predicate so a ``keep_forever`` landing after assembly makes the
+   claim match no row. THEN, and only for a winning claim, ``fs.delete(
+   library_path)`` and log to ``download_history`` + (via the ordinary
+   ``logging`` capture pipeline, see ``services/log_capture_service.py``)
+   ``log_events``. Claiming BEFORE deleting is what stops a concurrent pin/keep
+   from ever losing a kept file to a delete that had already run; if the delete
+   then fails, the claim is restored to ``available`` so a failed unlink can never
+   strand an ``evicted`` row over a still-watchable file. A candidate missing its
+   ``library_path`` breadcrumb, or one the filesystem guard refuses, is skipped +
+   logged — NEVER guessed at, never a silent no-op, and never lets one bad
+   candidate abort the rest of the sweep.
 """
 
 from __future__ import annotations
@@ -326,14 +334,15 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
     it is a genuinely useful early filter for C6 (overlapping sweeps) too — but
     it is a plain READ, not a compare-and-swap: two genuinely concurrent sweeps
     can both pass it in their own uncommitted transactions before either
-    commits. It is NOT what makes C6 safe; :meth:`SqlRequestRepository.
-    set_status_if_in` / :meth:`SqlSeasonRequestRepository.set_status_if_in`
-    (a real, DATABASE-enforced compare-and-swap on the status flip in
-    :func:`_evict_one`) is the actual double-count guard — this function only
-    means fewer wasted deletes reach that point, and it is what stops a pin
-    from ever being silently ignored (a plain status CAS alone cannot see
-    ``keep_forever``, which lives outside the compared column, or the
-    PARENT's pin for a TV season).
+    commits. It is NOT what makes C6/C7 safe; the eviction CLAIM in
+    :func:`_evict_one` -- :meth:`SqlRequestRepository.set_status_if_in`
+    (``require_unpinned``) / :meth:`SqlSeasonRequestRepository.set_status_if_in`
+    (``require_parent_unpinned``), a real, DATABASE-enforced compare-and-swap that
+    flips the status BEFORE any delete and folds the pin into the compared
+    predicate -- is the actual double-count AND pin guard. This function only
+    means fewer wasted claims/deletes reach that point; it uniquely still covers
+    ``in_flight`` (an active download), which the status/pin claim does not
+    compare.
 
     Movies: the request itself must still be ``available``, unpinned, and have
     no active download. TV: the pin lives on the PARENT (fetched separately),
@@ -371,6 +380,44 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
     )
 
 
+async def _restore_after_failed_delete(session: AsyncSession, pending: _Pending) -> None:
+    """Undo a committed eviction CLAIM whose filesystem delete then failed (#67).
+
+    :func:`_evict_one` flips the row to ``evicted`` and COMMITS it before deleting
+    (so a genuinely concurrent sweep sees the claim and stands down). When the
+    delete then refuses/errors, the file is still on disk and still watchable --
+    the row must NOT be left saying ``evicted``, which would strand an
+    evicted-status row over a live file (a re-request would re-grab content that
+    never actually left). This compare-and-swaps the row back ``evicted`` ->
+    ``available`` (recomputing the TV parent rollup) and commits, so the next
+    sweep can honestly retry the delete.
+
+    The restore is itself a CAS guarded on the still-``evicted`` precondition: this
+    sweep owns the claim and ``evicted`` is a settled status no other actor moves
+    (a re-request creates a NEW row rather than touching this one), so the swap
+    normally wins -- but if some other writer DID move it on, that is honored
+    rather than clobbered. ``tolerate_active_conflict=True`` mirrors the claim: the
+    parent-rollup recompute this triggers can collide with a newer active request
+    for the same show, and the season-level restore must survive that collision.
+    """
+    if isinstance(pending, _SeasonPending):
+        await season_request_service.set_status_if_in(
+            session,
+            media_request_id=pending.media_request_id,
+            season_request_id=pending.season_request_id,
+            status=RequestStatus.available.value,
+            allowed_from=frozenset({RequestStatus.evicted.value}),
+            tolerate_active_conflict=True,
+        )
+    else:
+        await SqlRequestRepository(session).set_status_if_in(
+            pending.media_request_id,
+            RequestStatus.available.value,
+            frozenset({RequestStatus.evicted.value}),
+        )
+    await session.commit()
+
+
 async def _evict_one(
     *,
     session: AsyncSession,
@@ -379,8 +426,10 @@ async def _evict_one(
     candidate: EvictionCandidate,
     pending: _Pending,
 ) -> EvictionOutcome | None:
-    """Delete + flip + log ONE selected candidate. ``None`` means it was skipped
-    (logged honestly), never a silent success."""
+    """Claim (status CAS) + delete + log ONE selected candidate, in that order
+    (#67): the atomic claim runs BEFORE the delete, so nothing is deleted until
+    the row is won, and a failed delete restores the claim. ``None`` means it was
+    skipped (logged honestly), never a silent success."""
     library_path = candidate.library_path
     if library_path is None:
         # An eligible candidate predating the library_path breadcrumb (ADR-0012):
@@ -392,65 +441,39 @@ async def _evict_one(
         )
         return None
 
-    # Re-check IMMEDIATELY before the delete (see _still_evictable's docstring):
-    # closes the TOCTOU window between candidate assembly and this exact delete,
-    # so a keep_forever pin that lands after assembly actually stops this
-    # eviction (north-star #1: the correction button must work even in-flight).
-    # This is a cheap early filter, NOT the double-count guard for C6 (two
-    # genuinely concurrent sweeps can both pass this plain read before either
-    # commits) -- the real CAS below is what makes that safe.
+    season_note = f" season {candidate.season}" if candidate.season is not None else ""
+
+    # Cheap EARLY filter (see _still_evictable's docstring): closes the obvious
+    # TOCTOU cases -- a keep_forever pin, an active download racing in, or an
+    # already-evicted row -- with an honest log BEFORE paying for the claim +
+    # delete. It is a plain read, NOT the authority: the claim CAS below is what
+    # actually makes the pin/status decision race-safe. It uniquely still covers
+    # ``in_flight`` (an active download), which the status/pin claim does not
+    # compare.
     if not await _still_evictable(session, pending):
-        season_note = f" season {candidate.season}" if candidate.season is not None else ""
         _logger.info(
             "skipping eviction of %r%s: now pinned/keep_forever, already evicted, "
-            "or no longer an eviction candidate (re-checked immediately before delete)",
+            "or no longer an eviction candidate (re-checked immediately before the claim)",
             candidate.title,
             season_note,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
         )
         return None
 
-    # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are
-    # both done by the shared ``purge_service.purge_library_path`` primitive
-    # (ADR-0014, "reuse don't duplicate") -- same accounting-before-delete order
-    # (a file's link count is only readable while it still exists, R4-6, ADR-0012),
-    # same containment guard, same idempotent already-gone no-op. Eviction keeps
-    # its OWN log message + logger for each outcome (the primitive classifies, the
-    # caller logs) so the existing honest skip messages are unchanged.
-    purge = await purge_service.purge_library_path(fs, library_path)
-    if purge.outcome is PurgeOutcome.refused:
-        # The root-containment guard refused (a stale/misconfigured breadcrumb
-        # pointing outside every currently-configured library root) -- never
-        # silently skipped, never mis-deleted.
-        _logger.warning(
-            "eviction of %r refused by the filesystem guard (%s); skipping",
-            candidate.title,
-            purge.detail,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
-        )
-        return None
-    if purge.outcome is PurgeOutcome.error:
-        _logger.warning(
-            "eviction of %r failed (%s); will retry next sweep",
-            candidate.title,
-            purge.detail,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
-        )
-        return None
-    freed_bytes = purge.freed_bytes
-
-    season_note = f" season {candidate.season}" if candidate.season is not None else ""
-
-    # THE double-count guard (ADR-0012, C6): a real, database-enforced
-    # compare-and-swap -- ``UPDATE ... WHERE status = 'available'`` -- not a
-    # read-then-write. ``fs.delete`` above is idempotent (a missing path is a
-    # no-op success, see ``LocalFileSystem.delete``), so BOTH racing sweeps can
-    # harmlessly reach this point after having "deleted" the same already-gone
-    # file; this CAS is what ensures only ONE of them ever flips the status,
-    # writes the history row, and counts the freed bytes. The loser's CAS
-    # returns ``False`` (the row already left ``available`` once the winner
-    # committed) and must skip the history/outcome entirely -- never a second
-    # 'evicted' record for space that was only ever freed once.
+    # THE eviction CLAIM (#67, ADR-0012 C6/C7): a real, database-enforced
+    # compare-and-swap that flips the row to ``evicted`` and runs BEFORE any
+    # filesystem delete -- a genuine REORDER of the old "delete, then flip" flow.
+    # Nothing is deleted until this claim has atomically WON the row. The pin is
+    # FOLDED into the compared predicate (``keep_forever = false`` for a movie; a
+    # parent-pin subquery for a TV season, via ``require_parent_unpinned``), so a
+    # ``keep_forever`` pin -- or a concurrent status transition -- that commits in
+    # the window between candidate assembly and here makes the UPDATE match zero
+    # rows: the DATABASE itself refuses to delete a freshly-pinned/moved title,
+    # not a read-then-act check a racing writer could slip past. Only the winning
+    # claim (``rowcount == 1``) is allowed to touch the filesystem; a loser skips
+    # entirely (never deleting a file the DB still says is kept/available), which
+    # is ALSO the C6 double-count guard: two concurrent sweeps cannot both claim
+    # the same row.
     if isinstance(pending, _SeasonPending):
         # tolerate_active_conflict=True: an OLD, already-settled parent (rollup
         # 'available') can legitimately coexist with a NEWER active request for
@@ -458,35 +481,88 @@ async def _evict_one(
         # docstring) -- evicting one of the old parent's remaining seasons folds
         # its rollup back to the active 'partially_available', which can collide
         # with that newer row's slot in uq_media_requests_active. The season CAS
-        # just below (+ the history row/commit after it) is the source of truth
-        # for "the file is gone" and MUST survive that collision; only the
-        # coarser parent-rollup write is allowed to fail softly.
-        changed = await season_request_service.set_status_if_in(
+        # (+ the history row/commit after the delete) is the source of truth for
+        # "the file is gone" and MUST survive that collision; only the coarser
+        # parent-rollup write is allowed to fail softly.
+        claimed = await season_request_service.set_status_if_in(
             session,
             media_request_id=pending.media_request_id,
             season_request_id=pending.season_request_id,
             status=RequestStatus.evicted.value,
             allowed_from=frozenset({RequestStatus.available.value}),
+            require_parent_unpinned=True,
             tolerate_active_conflict=True,
         )
     else:
-        changed = await SqlRequestRepository(session).set_status_if_in(
+        claimed = await SqlRequestRepository(session).set_status_if_in(
             pending.media_request_id,
             RequestStatus.evicted.value,
             frozenset({RequestStatus.available.value}),
+            require_unpinned=True,
         )
 
-    if not changed:
+    if not claimed:
+        # The claim matched no row: a keep_forever pin landed, the row already
+        # left 'available' (a concurrent sweep claimed it first), or it vanished.
+        # Nothing has been deleted -- honor it, never overwrite it.
         await session.rollback()
         _logger.info(
-            "lost the eviction race for %r%s to a concurrent writer (status changed "
-            "out from under the compare-and-swap); not double-counting",
+            "did not claim %r%s for eviction: now pinned/keep_forever, already "
+            "evicted, or a concurrent writer moved it out of 'available' first "
+            "(the pre-delete compare-and-swap matched no row); nothing deleted",
             candidate.title,
             season_note,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
         )
         return None
 
+    # Persist the claim BEFORE deleting. The committed 'evicted' status is exactly
+    # what makes a genuinely concurrent sweep's own claim above match zero rows
+    # (it sees the committed 'evicted' and stands down, rather than racing us to a
+    # second delete of the same file). A crash between here and the delete leaves
+    # an 'evicted' row over a still-present file -- self-healing, since 'evicted'
+    # is settled + re-requestable (ADR-0012): no later sweep re-picks it, and a
+    # re-request re-grabs the content fresh.
+    await session.commit()
+
+    # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are
+    # both done by the shared ``purge_service.purge_library_path`` primitive
+    # (ADR-0014, "reuse don't duplicate") -- same accounting-before-delete order
+    # (a file's link count is only readable while it still exists, R4-6, ADR-0012),
+    # same containment guard, same idempotent already-gone no-op. Eviction keeps
+    # its OWN log message + logger for each outcome (the primitive classifies, the
+    # caller logs).
+    purge = await purge_service.purge_library_path(fs, library_path)
+    if purge.outcome is not PurgeOutcome.deleted:
+        # The delete refused (a stale/misconfigured breadcrumb pointing outside
+        # every currently-configured library root) or errored (permission/I/O).
+        # The file is STILL on disk and still watchable -- so RESTORE the row to
+        # 'available' (#67): a failed unlink must never strand an 'evicted' status
+        # over a live file (a re-request would then re-grab content that never
+        # left). Never silently skipped, never mis-deleted; a later sweep retries.
+        await _restore_after_failed_delete(session, pending)
+        if purge.outcome is PurgeOutcome.refused:
+            _logger.warning(
+                "eviction of %r%s refused by the filesystem guard (%s); "
+                "restored to 'available' (nothing deleted)",
+                candidate.title,
+                season_note,
+                purge.detail,
+                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            )
+        else:
+            _logger.warning(
+                "eviction of %r%s failed (%s); restored to 'available', will retry next sweep",
+                candidate.title,
+                season_note,
+                purge.detail,
+                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            )
+        return None
+    freed_bytes = purge.freed_bytes
+
+    # The claim already flipped + committed the status; record the history row for
+    # the now-completed delete and commit it.
     session.add(
         DownloadHistory(
             tmdb_id=pending.tmdb_id,
