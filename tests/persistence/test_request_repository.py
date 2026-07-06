@@ -349,3 +349,29 @@ async def test_display_statuses_returns_tv_parent_rollup(session: AsyncSession) 
 async def test_display_statuses_empty_input_returns_empty(session: AsyncSession) -> None:
     repo = SqlRequestRepository(session)
     assert await repo.display_statuses_by_tmdb_ids([]) == {}
+
+
+async def test_latest_request_evicted_reflects_the_newest_row(session: AsyncSession) -> None:
+    """``latest_request_evicted`` is the in-library short-circuit's stale-Plex guard
+    (ADR-0012): it reports whether the NEWEST request row for this media is
+    ``evicted``. Keyed on the newest id so a movie re-downloaded after an earlier
+    eviction (a later ``available`` row) is never falsely suppressed."""
+    repo = SqlRequestRepository(session)
+
+    # No rows at all -> not evicted.
+    assert await repo.latest_request_evicted(700, "movie") is False
+
+    # A lone evicted row -> True.
+    await repo.create(tmdb_id=700, media_type="movie", title="Gone", status="evicted")
+    assert await repo.latest_request_evicted(700, "movie") is True
+
+    # A NEWER available row for the same media (a legitimate re-download) -> False:
+    # the eviction is no longer the most recent history for this title.
+    await repo.create(tmdb_id=700, media_type="movie", title="Gone", status="available")
+    assert await repo.latest_request_evicted(700, "movie") is False
+
+    # Scoped to the (tmdb_id, media_type) namespace: a tv row with the same tmdb_id
+    # does not bleed into the movie answer.
+    await repo.create(tmdb_id=700, media_type="tv", title="Gone Show", status="evicted")
+    assert await repo.latest_request_evicted(700, "movie") is False
+    assert await repo.latest_request_evicted(700, "tv") is True

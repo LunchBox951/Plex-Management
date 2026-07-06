@@ -234,6 +234,17 @@ class RequestRepository(Protocol):
         """
         raise NotImplementedError
 
+    async def latest_request_evicted(self, tmdb_id: int, media_type: str) -> bool:
+        """Whether the NEWEST request row for this media is ``evicted`` (ADR-0012).
+
+        Lets the in-library short-circuit refuse to trust a STALE Plex 'present'
+        reading during the eviction delete window (the sweep commits ``evicted``
+        before it unlinks the file and before the post-delete Plex refresh), so a
+        re-request re-grabs instead of minting an ``available`` row over a doomed
+        file. See ``SqlRequestRepository.latest_request_evicted``'s docstring.
+        """
+        raise NotImplementedError
+
     async def display_statuses_by_tmdb_ids(
         self, keys: Sequence[tuple[int, str]]
     ) -> dict[tuple[int, str], str]:
@@ -465,6 +476,18 @@ class SeasonRequestRepository(Protocol):
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         """List season requests, optionally filtered by ``status``."""
+        raise NotImplementedError
+
+    async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Season numbers whose NEWEST row (across this ``tmdb_id``'s ``tv``
+        requests) is ``evicted`` (ADR-0012).
+
+        ``ensure_seasons`` subtracts these from Plex's ``present_seasons`` snapshot
+        so a season the disk-pressure sweep is mid-deleting is never created or
+        re-armed straight to ``available`` off a STALE 'present' reading -- the
+        season-level twin of :meth:`RequestRepository.latest_request_evicted`. See
+        ``SqlSeasonRequestRepository.evicted_seasons``'s docstring.
+        """
         raise NotImplementedError
 
     async def list_due_for_search(

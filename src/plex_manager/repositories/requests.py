@@ -188,6 +188,39 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
+    async def latest_request_evicted(self, tmdb_id: int, media_type: str) -> bool:
+        """Whether the NEWEST request row for this media is ``evicted`` (ADR-0012).
+
+        The in-library short-circuit (``request_service.create_request``) consults
+        this AFTER :meth:`find_in_library` finds no ``available``/``completed`` row.
+        A fresh ``LibraryPort.is_available`` reading is eventually-consistent and
+        STALE during the eviction delete window: the sweep commits the row
+        ``evicted`` BEFORE it unlinks the file and BEFORE the post-delete Plex
+        refresh (``eviction_service._evict_one``, ADR-0012 #67), so for that whole
+        window Plex still reports the (doomed / just-removed) file present. Minting
+        a fresh ``available`` row off that stale reading would leave a request
+        marked available with nothing on disk to watch and nothing queued to grab
+        -- the exact race this guards. When this returns ``True`` the caller
+        re-grabs (``pending``) instead of trusting Plex.
+
+        Keyed on the NEWEST row (``ORDER BY id DESC``) so a movie legitimately
+        re-downloaded after an earlier eviction (whose newest row is ``available``
+        / active, already resolved by ``find_in_library`` / ``find_active`` before
+        this is ever reached) is never falsely suppressed -- only a media whose
+        most recent history really is an eviction is treated as stale-in-Plex.
+        """
+        stmt = (
+            select(MediaRequest.status)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+            )
+            .order_by(MediaRequest.id.desc())
+            .limit(1)
+        )
+        status = (await self._session.execute(stmt)).scalars().first()
+        return status == RequestStatus.evicted
+
     async def acquire_media_lock(self, tmdb_id: int, media_type: str) -> None:
         """Serialize create-request decisions for one ``(tmdb_id, media_type)``.
 

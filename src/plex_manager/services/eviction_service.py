@@ -429,7 +429,28 @@ async def _evict_one(
     """Claim (status CAS) + delete + log ONE selected candidate, in that order
     (#67): the atomic claim runs BEFORE the delete, so nothing is deleted until
     the row is won, and a failed delete restores the claim. ``None`` means it was
-    skipped (logged honestly), never a silent success."""
+    skipped (logged honestly), never a silent success.
+
+    The invariant set this ordering + the request-side guard together uphold:
+
+    1. A pinned file is NEVER deleted -- the claim CAS folds the ``keep_forever``
+       pin into its predicate (``require_unpinned`` / ``require_parent_unpinned``)
+       and runs before any ``fs.delete``, so a pin landing after candidate
+       assembly makes the claim match zero rows.
+    2. A failed/refused delete NEVER strands a terminal-status row over a live
+       file -- ``_restore_after_failed_delete`` compare-and-swaps the row back
+       ``evicted`` -> ``available`` (recomputing the TV parent rollup).
+    3. Concurrent sweep ticks NEVER double-process -- only the single winning claim
+       (``rowcount == 1``) proceeds to delete/history; a loser skips.
+    4. A re-request during the delete window NEVER produces an ``available`` row
+       (movie) / ``available`` season (TV) whose file the sweep then removes. The
+       committed ``evicted`` status is published BEFORE the delete (needed for #3),
+       which is exactly the window the request side must not trust Plex over: the
+       in-library short-circuit consults ``RequestRepository.latest_request_evicted``
+       / ``SeasonRequestRepository.evicted_seasons`` and re-grabs (``pending``)
+       rather than minting availability off a STALE 'present' reading (see
+       ``request_service.create_request`` / ``season_request_service.ensure_seasons``).
+    """
     library_path = candidate.library_path
     if library_path is None:
         # An eligible candidate predating the library_path breadcrumb (ADR-0012):
@@ -523,6 +544,14 @@ async def _evict_one(
     # an 'evicted' row over a still-present file -- self-healing, since 'evicted'
     # is settled + re-requestable (ADR-0012): no later sweep re-picks it, and a
     # re-request re-grabs the content fresh.
+    #
+    # This same pre-delete publish opens a window where the file is still on disk
+    # (Plex still lists it, until the post-delete refresh below) yet the row reads
+    # 'evicted' (invisible to find_active / find_in_library). A re-request landing
+    # here must NOT trust Plex's stale 'present' and mint an 'available' row over
+    # the doomed file -- the request side closes that window by consulting
+    # ``latest_request_evicted`` / ``evicted_seasons`` and re-grabbing instead (see
+    # invariant #4 above; ``request_service`` / ``season_request_service``).
     await session.commit()
 
     # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are

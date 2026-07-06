@@ -180,12 +180,18 @@ async def test_ensure_seasons_re_arms_an_evicted_season_to_pending(
     assert show.status is RequestStatus.partially_available
 
 
-async def test_ensure_seasons_re_arms_an_evicted_season_straight_to_available_when_present(
+async def test_ensure_seasons_re_grabs_an_evicted_season_even_when_plex_reports_present(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """The re-arm mirrors a FRESH row's already-in-library short-circuit: if Plex
-    already has the evicted season again, re-requesting goes straight to
-    'available', not 'pending'."""
+    """P1 (ADR-0012 #67): the eviction sweep commits a season 'evicted' BEFORE it
+    unlinks the file and before the post-delete Plex refresh, so Plex's fresh
+    'present' reading is STALE for that whole window. Re-requesting the evicted
+    season must therefore re-grab it ('pending') rather than trust that stale
+    reading and re-arm straight to 'available' over a file the sweep is about to
+    (or just did) delete -- ``ensure_seasons`` subtracts just-evicted seasons
+    (``evicted_seasons``) from the trusted present set. (This deliberately
+    supersedes the old "straight to available when present" fast path, which
+    trusted Plex presence during the exact window this closes.)"""
     show_id = await _make_show(sessionmaker_, tmdb_id=711)
     async with sessionmaker_() as session:
         await season_request_service.ensure_seasons(
@@ -203,11 +209,12 @@ async def test_ensure_seasons_re_arms_an_evicted_season_straight_to_available_wh
         )
         await session.commit()
 
-    assert {(r.season_number, r.status) for r in records} == {(1, "available")}
+    # Re-grabbed, NOT minted 'available' off the stale in-Plex reading.
+    assert {(r.season_number, r.status) for r in records} == {(1, "pending")}
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
     assert show is not None
-    assert show.status is RequestStatus.available
+    assert show.status is RequestStatus.pending
 
 
 async def test_ensure_seasons_never_regresses_a_non_evicted_terminal_season(

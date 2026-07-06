@@ -284,8 +284,11 @@ async def ensure_seasons(
     would be a silent no-op forever (the sweep already deleted the file; nothing
     would ever re-search/re-grab it). So: a season that comes back ``evicted``
     from ``ensure()`` is explicitly re-armed to exactly the status a FRESH row
-    would have gotten just above (``available`` if Plex already has it again,
-    otherwise ``pending`` so search/grab picks it up) -- mirroring how
+    would have gotten just above -- and because ``evicted_seasons`` removes a
+    just-reclaimed season from ``trusted_present`` (its Plex 'present' reading is
+    STALE during the eviction delete window; see the inline comment above), that
+    status is ``pending`` so search/grab re-fetches the file, NEVER ``available``
+    over a file the sweep is about to (or just did) delete -- mirroring how
     re-requesting an evicted MOVIE creates a fresh grabbable row. Scoped
     EXCLUSIVELY to ``evicted``: ``ensure()`` never constructs a NEW row with that
     status, so reaching it here always means a pre-existing row, and every other
@@ -298,11 +301,23 @@ async def ensure_seasons(
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
     )
     season_repo = SqlSeasonRequestRepository(session)
+    # Never trust a fresh Plex 'present' reading for a season the disk-pressure
+    # sweep most recently reclaimed (ADR-0012): its row is committed 'evicted'
+    # BEFORE its file is unlinked and BEFORE the post-delete Plex refresh, so for
+    # that whole window Plex still lists the doomed / just-removed file. Creating
+    # or re-arming the season straight to 'available' off that stale reading would
+    # leave it marked watchable over a file the sweep then deletes (the season-level
+    # twin of the movie P1 closed in ``request_service``). Subtract those seasons so
+    # they re-grab ('pending') instead. Only queried when Plex reported SOMETHING
+    # present -- otherwise every season is 'pending' regardless, nothing to subtract.
+    trusted_present = present
+    if present:
+        trusted_present = present - await season_repo.evicted_seasons(tmdb_id)
     records: list[SeasonRequestRecord] = []
     for season_number in seasons:
         initial_status = (
             RequestStatus.available.value
-            if season_number in present
+            if season_number in trusted_present
             else RequestStatus.pending.value
         )
         record = await season_repo.ensure(media_request_id, season_number, status=initial_status)

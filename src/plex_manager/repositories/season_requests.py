@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
+from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.repositories import SeasonRequestRecord
 
 if TYPE_CHECKING:
@@ -124,6 +124,43 @@ class SqlSeasonRequestRepository:
         for row, tmdb_id in (await self._session.execute(stmt)).all():
             grouped.setdefault(row.media_request_id, []).append(_to_record(row, tmdb_id))
         return grouped
+
+    async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Season numbers whose NEWEST tracked row (across every ``tv``
+        ``MediaRequest`` for this ``tmdb_id``) is ``evicted`` (ADR-0012).
+
+        ``season_request_service.ensure_seasons`` subtracts these from Plex's fresh
+        ``present_seasons`` snapshot, so a season the disk-pressure sweep is
+        mid-deleting -- or has just deleted, before the post-delete Plex refresh
+        lands -- is never created or re-armed straight to ``available`` off a STALE
+        'present' reading (the season-level twin of
+        ``SqlRequestRepository.latest_request_evicted``; see its docstring for the
+        eviction delete window this closes). It re-grabs (``pending``) instead.
+
+        Keyed on the NEWEST row PER SEASON (the highest ``id`` among every
+        ``MediaRequest`` sharing this ``tmdb_id``, since a title accrues several
+        rows over its lifetime -- see ``uq_media_requests_active``): a season
+        legitimately re-downloaded after an earlier eviction (its newest row now
+        ``available``) is NOT falsely suppressed, only one whose most recent
+        history really is an eviction. Movies never reach here -- only ``tv``
+        parents own ``season_requests`` rows -- but the ``media_type`` filter is
+        kept explicit against a ``tmdb_id`` shared across the movie/tv namespaces.
+        """
+        stmt = (
+            select(SeasonRequest.season_number, SeasonRequest.status)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType.tv,
+            )
+            .order_by(SeasonRequest.season_number, SeasonRequest.id)
+        )
+        # Ascending ``id`` per season means the LAST row seen for each season is its
+        # newest; keep only the newest status, then filter to the evicted ones.
+        newest: dict[int, RequestStatus] = {}
+        for season_number, status in (await self._session.execute(stmt)).all():
+            newest[season_number] = status
+        return frozenset(s for s, status in newest.items() if status == RequestStatus.evicted)
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         stmt = select(SeasonRequest)

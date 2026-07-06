@@ -364,10 +364,38 @@ async def create_request_result(
         # terminal row. A movie REMOVED from Plex reads not-available above and falls
         # through to a normal pending request, so re-requests still work.
         await repo.acquire_media_lock(tmdb_id, media_type)
+        # Re-read the ACTIVE row UNDER the lock: our find_active at the top ran
+        # before the lock, so a concurrent re-request for the same just-evicted
+        # movie may have committed an active 'pending' re-grab in the meantime (the
+        # evicted-guard branch below mints exactly that, which find_in_library --
+        # available/completed only -- would NOT catch). Dedup onto it so two racing
+        # re-requests in the eviction delete window never leave a second row, and in
+        # particular never let the LATER one mint 'available' over the doomed file
+        # just because the newest row is now that concurrent 'pending' one.
+        existing_active = await repo.find_active(tmdb_id, media_type)
+        if existing_active is not None:
+            return CreateRequestResult(record=existing_active, created=False)
         in_library = await repo.find_in_library(tmdb_id, media_type)
         if in_library is not None:
             return CreateRequestResult(record=in_library, created=False)
-        initial_status = RequestStatus.available.value
+        if await repo.latest_request_evicted(tmdb_id, media_type):
+            # The disk-pressure sweep (ADR-0012) most recently reclaimed this
+            # movie's file: the row is 'evicted' and either mid-delete or awaiting
+            # the post-delete Plex refresh, so Plex's fresh 'present' reading is
+            # STALE. Trusting it would mint an 'available' row over a file the sweep
+            # is about to (or just did) delete -- leaving a fresh request marked
+            # available with nothing on disk and nothing queued to grab (the P1 this
+            # closes). Fall through to a normal 'pending' re-grab instead: honesty
+            # over silence, and symmetric with the eviction crash-recovery self-heal
+            # (``eviction_service._evict_one``: "a re-request re-grabs it fresh").
+            _logger.info(
+                "movie reads in-Plex but its most-recent request is 'evicted'; "
+                "re-grabbing rather than trusting a stale in-library reading during "
+                "the eviction delete window",
+                extra={"tmdb_id": safe_int(tmdb_id)},
+            )
+        else:
+            initial_status = RequestStatus.available.value
 
     if media_type == "tv" and library is not None and season_numbers:
         # TV in-library dedup — the per-season analogue of the movie short-circuit

@@ -273,3 +273,38 @@ async def test_list_due_suppresses_parked_season_until_backoff_elapses(
 
     due = await repo.list_due_for_search(_DUE_STATUSES, _NOW)
     assert due == []
+
+
+async def test_evicted_seasons_reflects_the_newest_row_per_season(
+    session: AsyncSession,
+) -> None:
+    """``evicted_seasons`` is the TV twin of ``latest_request_evicted`` (ADR-0012):
+    the seasons whose NEWEST row (across every tv MediaRequest for this tmdb_id) is
+    ``evicted``. ``ensure_seasons`` subtracts these from Plex's present set so a
+    just-reclaimed season is never re-armed 'available' off a stale in-Plex reading.
+    Keyed on the newest row per season so a season re-downloaded under a LATER
+    MediaRequest (a fresh 'available' row) is not falsely suppressed."""
+    repo = SqlSeasonRequestRepository(session)
+
+    # Old request, wholly evicted (settled, so it does not occupy the active-dedup
+    # slot when the newer request below is created): season 1 + season 2 evicted.
+    old = MediaRequest(tmdb_id=940, media_type="tv", title="Show", status="evicted")
+    session.add(old)
+    await session.flush()
+    await repo.ensure(old.id, 1, status="evicted")
+    await repo.ensure(old.id, 2, status="evicted")
+    assert await repo.evicted_seasons(940) == frozenset({1, 2})
+
+    # A NEWER MediaRequest for the same show re-downloaded season 1 -> its newest
+    # season-1 row is 'available', so season 1 drops out; season 2 (still only the
+    # old evicted row) remains.
+    new = MediaRequest(tmdb_id=940, media_type="tv", title="Show", status="partially_available")
+    session.add(new)
+    await session.flush()
+    await repo.ensure(new.id, 1, status="available")
+    assert await repo.evicted_seasons(940) == frozenset({2})
+
+    # A show with no evicted history at all -> empty.
+    other = await _make_show(session, tmdb_id=941)
+    await repo.ensure(other.id, 1, status="available")
+    assert await repo.evicted_seasons(941) == frozenset()
