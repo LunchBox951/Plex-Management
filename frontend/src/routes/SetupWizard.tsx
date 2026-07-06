@@ -8,7 +8,7 @@ import {
 } from '../api/hooks'
 import type { PlexLibraryOption, SetupCompleteRequest } from '../api/types'
 import { clearSetupToken, setSetupToken } from '../lib/apiKey'
-import type { ApiError } from '../lib/errors'
+import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { cn } from '../lib/cn'
 import { PlexLogin } from '../components/PlexLogin'
 import { ServerPicker, type VerifiedServer } from '../components/setup/ServerPicker'
@@ -119,8 +119,13 @@ type PendingState = Record<ServiceKey, boolean>
 const EMPTY_RESULTS: ResultsState = { prowlarr: null, qbittorrent: null, tmdb: null }
 const EMPTY_TESTING: PendingState = { prowlarr: false, qbittorrent: false, tmdb: false }
 
+// A rejection from `unwrap`/`ensureOk` is already a normalized ApiError; pass it
+// through. Anything else (a bug, a non-envelope network throw) is routed through
+// `toApiError` so the card renders a real, honest message rather than the
+// `undefined` a bare `error as ApiError` cast would leave when there's no
+// `.message` (matches ServerPicker/PlexLogin's `asDisplayError`).
 function asApiError(error: unknown): ApiError {
-  return error as ApiError
+  return isApiError(error) ? error : toApiError(error)
 }
 
 function bodyFor(service: ServiceKey, form: ServicesForm): Record<string, string> {

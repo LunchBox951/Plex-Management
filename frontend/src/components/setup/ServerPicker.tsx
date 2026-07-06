@@ -136,6 +136,14 @@ export function ServerPicker({ onVerified }: { onVerified: (server: VerifiedServ
         </div>
       ) : (
         <div className="mt-4 flex flex-col gap-4">
+          {/* An ERROR (a 409 plex_account_required, a 5xx) is NOT "you own no
+              servers": surface the honest failure rather than silently rendering
+              the empty-state hint below, which would misattribute the outage to
+              the account. Custom entry stays available regardless. */}
+          {serversQuery.isError ? (
+            <AuthErrorCard error={asDisplayError(serversQuery.error)} />
+          ) : null}
+
           {hasServers && !inCustom ? (
             <select
               aria-label="Plex server"
@@ -186,7 +194,7 @@ export function ServerPicker({ onVerified }: { onVerified: (server: VerifiedServ
               />
               Enter a custom server URL instead
             </label>
-          ) : (
+          ) : serversQuery.isError ? null : (
             <p className="text-xs text-faint">
               Your account owns no auto-discoverable server — enter its URL directly.
             </p>

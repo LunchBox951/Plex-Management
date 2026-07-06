@@ -136,4 +136,24 @@ describe('ServerPicker', () => {
     expect(screen.queryByLabelText('Plex server')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Server URL')).toBeInTheDocument()
   })
+
+  it('surfaces the real discovery error (not a misleading empty state), keeping custom entry available', () => {
+    // A 409 plex_account_required (or a 5xx) is an ERROR, not "you own no
+    // servers": show the honest AuthErrorCard, never the empty-state hint.
+    h.servers.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: toApiError({ detail: 'plex_account_required' }, 409),
+    })
+    render(<ServerPicker onVerified={vi.fn()} />)
+
+    expect(
+      screen.getByText('Server discovery needs a Plex-signed-in admin. Sign in with Plex first.'),
+    ).toBeInTheDocument()
+    // The dishonest "owns no auto-discoverable server" hint must NOT appear.
+    expect(screen.queryByText(/owns no auto-discoverable server/i)).not.toBeInTheDocument()
+    // Custom entry stays available so the operator is never stuck.
+    expect(screen.getByLabelText('Server URL')).toBeInTheDocument()
+  })
 })

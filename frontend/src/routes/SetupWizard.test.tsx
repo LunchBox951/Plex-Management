@@ -329,6 +329,18 @@ describe('SetupWizard — service validation flow', () => {
     expect(screen.getByText('0/3 verified')).toBeInTheDocument()
   })
 
+  it('normalizes a non-envelope service-test throw so the card shows a real message, never blank', async () => {
+    // A bare, non-envelope throw (a bug/network failure with no `.message`) must
+    // be routed through toApiError, or the bare `error as ApiError` cast would
+    // leave the card message `undefined` — a silent, dishonest blank.
+    h.validate.mockRejectedValueOnce('kaboom')
+    await reachServices()
+
+    fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
+
+    expect(await screen.findByText(/unexpected error/i)).toBeInTheDocument()
+  })
+
   it('keeps each service test disabled while its own validation is pending', async () => {
     const prowlarrPending = deferred<ServiceValidateResponse>()
     const qbPending = deferred<ServiceValidateResponse>()

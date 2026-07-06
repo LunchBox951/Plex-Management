@@ -105,7 +105,8 @@ export function SetupGate() {
 
   // usePlexSignIn already seeds /auth/me and invalidates queries on success; the
   // refetch here re-derives gate state so the newly-authenticated session lands
-  // on <Outlet/> without a reload. (Task 13 restructures this gate.)
+  // on <Outlet/> without a reload. onUseAccessKey drops to the KeyEntry recovery
+  // path for a browser locked out of Plex.
   return (
     <PlexLogin onSignedIn={() => void auth.refetch()} onUseAccessKey={() => setAuthMode('key')} />
   )

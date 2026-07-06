@@ -59,7 +59,7 @@ export function KeyEntry({
         <div className="font-display text-xl font-extrabold">Enter your access key</div>
         <p className="mt-2 text-sm text-muted">
           This install is already set up, but this browser doesn't have a valid access key. Paste the
-          key that was shown once when setup completed.
+          recovery key you generated from Settings → Access.
         </p>
         <form
           className="mt-5 flex flex-col gap-4"

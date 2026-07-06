@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
-  useRevealAppKey,
+  useAppKeyStatus,
+  useRevokeAppKey,
   useRotateAppKey,
   usePlexLibraries,
   useSettings,
@@ -138,119 +139,151 @@ function isValidNumberInput(value: string): boolean {
 
 const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
 
-/**
- * Reveal / rotate the app's own X-Api-Key (issue #28's OAuth-deferral
- * hardening): the belt-and-braces recovery path for a lost key on a new
- * device, and a full rotate if the key was ever exposed. Both actions require
- * the caller to already hold a currently-valid key (this whole router is
- * authenticated), so this is not a privilege escalation.
- */
-function AppKeySection() {
-  const reveal = useRevealAppKey()
-  const rotate = useRotateAppKey()
-  const { toast } = useToast()
-  const [revealedKey, setRevealedKey] = useState<string | null>(null)
-  // Distinguishes the label ("Current" vs "New") without depending on the
-  // mutation hook's own isSuccess flag staying true across re-renders/tests.
-  const [justRotated, setJustRotated] = useState(false)
-  const [confirmOpen, setConfirmOpen] = useState(false)
-  // Monotonic ticket shared by reveal AND rotate. Each click takes the next
-  // ticket BEFORE it awaits, and a resolving handler paints the displayed key
-  // only while its ticket is still the latest. Without it a Reveal (which
-  // authenticated with the OLD key) that resolves AFTER a Rotate would clobber
-  // the freshly rotated key on screen — the operator would then pair a new
-  // device with an already-dead key. A ref (not state): bumping it must not
-  // trigger a re-render, and every in-flight closure must see the newest value.
-  const latestActionTicket = useRef(0)
+/** The exact one-time reveal caption (ADR-0016). Kept verbatim so it never
+ * drifts from what the operator was promised when the key was generated. */
+const RECOVERY_KEY_CAPTION =
+  'Store this somewhere safe. It can sign you in if plex.tv is down and authenticates API automations.'
 
-  const handleReveal = async () => {
-    const ticket = (latestActionTicket.current += 1)
+/**
+ * Settings → Access — the OPT-IN recovery key (ADR-0016). Setup mints nothing;
+ * the operator generates a recovery key here on demand. It is a break-glass
+ * sign-in for when plex.tv is unreachable, and the `X-Api-Key` that API
+ * automations authenticate with. The plaintext is shown EXACTLY ONCE, at
+ * generate/rotate time — the status endpoint only ever reports whether a key
+ * exists, never the key — so there is no persistent reveal; a lost key is
+ * replaced by rotating. Every action requires a currently-authenticated caller
+ * (this whole router is admin-gated), so it is not a privilege escalation.
+ */
+function AccessSection() {
+  const status = useAppKeyStatus()
+  const rotate = useRotateAppKey()
+  const revoke = useRevokeAppKey()
+  const { toast } = useToast()
+  // The freshly-minted key, held only in this session's memory. Never seeded
+  // from a query (status carries no plaintext) and never re-shown after a
+  // refetch/navigation — the operator gets exactly one chance to copy it.
+  const [revealedKey, setRevealedKey] = useState<string | null>(null)
+  const [confirmRevokeOpen, setConfirmRevokeOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  const exists = status.data?.exists === true
+
+  // Generate (no key yet) and Rotate (replace an existing key) are the SAME
+  // mint endpoint — the only difference is the label and whether a key existed.
+  const mint = async (failTitle: string) => {
+    // Drop any key shown by a prior mint BEFORE this one runs: if this rotate
+    // fails (e.g. a 409 CAS conflict — someone else already rotated), the old
+    // key on screen is now dead, and leaving it visible would have the operator
+    // pair a device with a stale key. A success repaints the fresh one.
+    setRevealedKey(null)
+    setCopied(false)
     try {
-      const result = await reveal.mutateAsync()
-      // A newer reveal/rotate superseded this one while it was in flight — drop
-      // this now-stale key rather than overwrite what the newer action showed.
-      if (ticket !== latestActionTicket.current) return
+      const result = await rotate.mutateAsync()
       setRevealedKey(result.app_api_key)
-      setJustRotated(false)
     } catch (err) {
-      const apiError = err as ApiError
-      toast({ title: "Couldn't reveal the app key", description: apiError.message, intent: 'error' })
+      toast({ title: failTitle, description: (err as ApiError).message, intent: 'error' })
     }
   }
 
-  const handleRotate = async () => {
-    const ticket = (latestActionTicket.current += 1)
+  const handleRevoke = async () => {
     try {
-      // useRotateAppKey's onSuccess persists the new key into THIS browser's
-      // own store first (setApiKey), so the current session survives the
-      // rotation before we ever touch component state.
-      const result = await rotate.mutateAsync()
-      // Paint the new key only if no later action has since superseded this
-      // rotation; the rotation itself succeeded (the key was already persisted
-      // above) regardless, so the dialog still closes and the toast still fires.
-      if (ticket === latestActionTicket.current) {
-        setRevealedKey(result.app_api_key)
-        setJustRotated(true)
-      }
-      setConfirmOpen(false)
-      toast({
-        title: 'App key rotated',
-        description: 'This device is already updated. Every other device needs the new key.',
-        intent: 'success',
-      })
+      await revoke.mutateAsync()
+      // The key is gone; drop any still-shown plaintext and close the dialog.
+      setRevealedKey(null)
+      setConfirmRevokeOpen(false)
     } catch (err) {
-      const apiError = err as ApiError
-      toast({ title: 'Rotate failed', description: apiError.message, intent: 'error' })
+      toast({ title: 'Revoke failed', description: (err as ApiError).message, intent: 'error' })
+    }
+  }
+
+  const copyKey = async () => {
+    if (revealedKey === null) return
+    // `navigator.clipboard` is undefined outside a secure context (plain http://
+    // LAN deployments, a common self-hosted topology); say so honestly and let
+    // the operator select + copy the visible key by hand rather than failing.
+    if (!navigator.clipboard?.writeText) {
+      toast({
+        title: 'Clipboard unavailable',
+        description: 'Copying needs a secure context (HTTPS). Select the key and copy it manually.',
+        intent: 'info',
+      })
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(revealedKey)
+      setCopied(true)
+      toast({ title: 'Copied the recovery key', intent: 'success' })
+    } catch {
+      toast({
+        title: 'Copy failed',
+        description: 'Select the key and copy it manually.',
+        intent: 'info',
+      })
     }
   }
 
   return (
     <section className="rounded-xl border border-hairline bg-surface p-5">
-      <h2 className="font-display text-sm font-semibold text-ink">App key</h2>
+      <h2 className="font-display text-sm font-semibold text-ink">Access</h2>
       <p className="mt-1 text-xs text-faint">
-        The <code>X-Api-Key</code> every device uses to talk to this app. Reveal it to pair a
-        new device without re-running setup, or rotate it if it's ever been exposed.
+        An optional recovery key. It can sign you in if plex.tv is unreachable, and it's the{' '}
+        <code>X-Api-Key</code> that API automations authenticate with. Plex sign-in keeps working
+        either way.
       </p>
-      <div className="mt-4 flex flex-col gap-3">
-        {revealedKey ? (
-          <Field
-            label={justRotated ? 'New app key' : 'Current app key'}
-            value={revealedKey}
-            readOnly
-            onFocus={(e) => e.currentTarget.select()}
-            hint="Copy this into any other device's key entry screen."
-          />
+
+      <div className="mt-4 flex flex-col gap-4">
+        {revealedKey !== null ? (
+          <div className="rounded-xl border border-gold/40 bg-bg p-4">
+            <div className="text-xs font-medium text-muted">Recovery key</div>
+            <code className="mt-1 block font-mono text-sm break-all text-ink">{revealedKey}</code>
+            <div className="mt-3">
+              <Button variant="secondary" size="sm" onClick={() => void copyKey()}>
+                {copied ? 'Copied' : 'Copy'}
+              </Button>
+            </div>
+            <p className="mt-3 text-xs text-faint">{RECOVERY_KEY_CAPTION}</p>
+          </div>
         ) : null}
-        <div className="flex flex-wrap gap-3">
-          <Button
-            variant="secondary"
-            loading={reveal.isPending}
-            // A rotation in flight will replace the key; block starting a reveal
-            // (which would authenticate with the about-to-die key) until it lands.
-            disabled={rotate.isPending}
-            onClick={() => void handleReveal()}
-          >
-            Reveal
-          </Button>
-          <Button variant="secondary" onClick={() => setConfirmOpen(true)}>
-            Rotate
-          </Button>
-        </div>
+
+        {status.isLoading ? (
+          <p className="text-xs text-faint">Checking for a recovery key…</p>
+        ) : exists ? (
+          <div className="flex flex-wrap gap-3">
+            <Button
+              variant="secondary"
+              loading={rotate.isPending}
+              onClick={() => void mint('Rotate failed')}
+            >
+              Rotate
+            </Button>
+            <Button variant="secondary" onClick={() => setConfirmRevokeOpen(true)}>
+              Revoke
+            </Button>
+          </div>
+        ) : (
+          <div>
+            <Button loading={rotate.isPending} onClick={() => void mint('Generate failed')}>
+              Generate recovery key
+            </Button>
+          </div>
+        )}
       </div>
 
-      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen} title="Rotate the app key?">
+      <Dialog
+        open={confirmRevokeOpen}
+        onOpenChange={setConfirmRevokeOpen}
+        title="Revoke the recovery key?"
+      >
         <p className="text-sm text-muted">
-          This mints a brand-new key and immediately invalidates the current one. Every{' '}
-          <strong className="text-ink">other</strong> device or browser with the old key saved
-          will be signed out and need the new key pasted in before it can talk to this app
-          again — this device updates itself automatically and stays signed in.
+          This deletes the recovery key. Any API automation using it — and access-key sign-in on
+          every device — stops working until you generate a new one. Plex sign-in is unaffected.
         </p>
         <div className="mt-6 flex justify-end gap-3">
-          <Button variant="secondary" onClick={() => setConfirmOpen(false)}>
+          <Button variant="secondary" onClick={() => setConfirmRevokeOpen(false)}>
             Cancel
           </Button>
-          <Button variant="danger" loading={rotate.isPending} onClick={() => void handleRotate()}>
-            Rotate key
+          <Button variant="danger" loading={revoke.isPending} onClick={() => void handleRevoke()}>
+            Revoke key
           </Button>
         </div>
       </Dialog>
@@ -852,7 +885,7 @@ export function Settings() {
         </Button>
       </div>
 
-      <AppKeySection />
+      <AccessSection />
 
       <section className="rounded-xl border border-hairline bg-surface p-5">
         <h2 className="font-display text-sm font-semibold text-ink">More</h2>

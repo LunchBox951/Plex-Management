@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -13,11 +13,15 @@ const h = vi.hoisted(() => ({
   toast: vi.fn(),
   librariesError: null as Error | null,
   librariesRefetch: vi.fn(),
-  revealMutateAsync: vi.fn(),
   rotateMutateAsync: vi.fn(),
-  // Drives useRotateAppKey().isPending so a test can assert the Reveal button is
-  // disabled while a rotation is in flight.
+  revokeMutateAsync: vi.fn(),
   rotatePending: false,
+  revokePending: false,
+  // Settings → Access recovery-key status ({ exists }). A mutable flag so a
+  // generate/revoke mock can flip it; the ensuing re-render reflects the new
+  // state (the status endpoint only ever reports existence, never the key).
+  appKeyExists: false,
+  statusLoading: false,
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -35,12 +39,12 @@ vi.mock('../api/hooks', () => ({
     error: h.librariesError,
     refetch: h.librariesRefetch,
   }),
-  useRevealAppKey: () => ({ mutateAsync: h.revealMutateAsync, isPending: false }),
-  useRotateAppKey: () => ({
-    mutateAsync: h.rotateMutateAsync,
-    isPending: h.rotatePending,
-    isSuccess: false,
+  useAppKeyStatus: () => ({
+    data: h.statusLoading ? undefined : { exists: h.appKeyExists },
+    isLoading: h.statusLoading,
   }),
+  useRotateAppKey: () => ({ mutateAsync: h.rotateMutateAsync, isPending: h.rotatePending }),
+  useRevokeAppKey: () => ({ mutateAsync: h.revokeMutateAsync, isPending: h.revokePending }),
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -496,12 +500,20 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
   })
 })
 
-describe('Settings — app key reveal/rotate (issue #28)', () => {
+describe('Settings — Access recovery key (opt-in, ADR-0016)', () => {
+  // The exact one-time reveal caption the operator must see (verbatim per the
+  // Task 13 amendment) — asserted so a copy drift is a test failure.
+  const CAPTION =
+    'Store this somewhere safe. It can sign you in if plex.tv is down and authenticates API automations.'
+
   beforeEach(() => {
-    h.revealMutateAsync.mockReset()
     h.rotateMutateAsync.mockReset()
+    h.revokeMutateAsync.mockReset()
     h.toast.mockReset()
     h.rotatePending = false
+    h.revokePending = false
+    h.statusLoading = false
+    h.appKeyExists = false
     h.settingsData = {
       plex_url: 'http://plex:32400',
       plex_token: '***',
@@ -516,126 +528,123 @@ describe('Settings — app key reveal/rotate (issue #28)', () => {
     h.libraries = []
   })
 
-  it('reveals the current key on click', async () => {
-    h.revealMutateAsync.mockResolvedValue({ app_api_key: 'current-key-abc' })
+  it('offers Generate (not Rotate/Revoke) when no recovery key exists', () => {
+    h.appKeyExists = false
     render(<Settings />, { wrapper: Wrapper })
 
-    fireEvent.click(screen.getByRole('button', { name: /^reveal$/i }))
-
-    await waitFor(() => expect(screen.getByLabelText(/current app key/i)).toBeInTheDocument())
-    expect(screen.getByLabelText(/current app key/i)).toHaveValue('current-key-abc')
-    expect(h.revealMutateAsync).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: /generate recovery key/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^rotate$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^revoke$/i })).not.toBeInTheDocument()
+    // Nothing is revealed until the operator generates one.
+    expect(screen.queryByText(CAPTION)).not.toBeInTheDocument()
   })
 
-  it('shows a confirm dialog before rotating, and does not rotate until confirmed', () => {
+  it('generates a key, reveals it exactly once with the storage caption, and flips to Rotate/Revoke', async () => {
+    h.appKeyExists = false
+    h.rotateMutateAsync.mockImplementation(async () => {
+      h.appKeyExists = true // the mint endpoint now reports a key exists
+      return { app_api_key: 'fresh-recovery-key' }
+    })
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /generate recovery key/i }))
+
+    await waitFor(() => expect(screen.getByText('fresh-recovery-key')).toBeInTheDocument())
+    expect(screen.getByText(CAPTION)).toBeInTheDocument()
+    expect(h.rotateMutateAsync).toHaveBeenCalledTimes(1)
+    // Minting flips the card to the key-exists controls.
+    expect(screen.getByRole('button', { name: /^rotate$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^revoke$/i })).toBeInTheDocument()
+  })
+
+  it('offers Rotate + Revoke (no Generate, no key shown) when a key already exists', () => {
+    h.appKeyExists = true
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('button', { name: /^rotate$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^revoke$/i })).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: /generate recovery key/i }),
+    ).not.toBeInTheDocument()
+    // The status endpoint never carries the plaintext, so nothing is shown on load.
+    expect(screen.queryByText(CAPTION)).not.toBeInTheDocument()
+  })
+
+  it('rotates and re-reveals the new key once', async () => {
+    h.appKeyExists = true
+    h.rotateMutateAsync.mockResolvedValue({ app_api_key: 'rotated-recovery-key' })
     render(<Settings />, { wrapper: Wrapper })
 
     fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
 
-    expect(screen.getByText(/rotate the app key\?/i)).toBeInTheDocument()
-    // The dialog warns that every OTHER device is signed out, but this one is not.
-    expect(screen.getByText(/signed out/i)).toBeInTheDocument()
-    expect(h.rotateMutateAsync).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText('rotated-recovery-key')).toBeInTheDocument())
+    expect(screen.getByText(CAPTION)).toBeInTheDocument()
+    expect(h.rotateMutateAsync).toHaveBeenCalledTimes(1)
   })
 
-  it('rotates and displays the new key once confirmed', async () => {
-    h.rotateMutateAsync.mockResolvedValue({ app_api_key: 'brand-new-key-xyz' })
+  it('revokes behind an in-app confirm dialog (never window.confirm) and flips back to Generate', async () => {
+    h.appKeyExists = true
+    h.revokeMutateAsync.mockImplementation(async () => {
+      h.appKeyExists = false // the key no longer exists after a revoke
+    })
+    // A native window.confirm would block automation + break the app's UX
+    // conventions — assert it is NEVER used.
+    const confirmSpy = vi.spyOn(window, 'confirm')
     render(<Settings />, { wrapper: Wrapper })
 
-    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^revoke$/i }))
+
+    expect(confirmSpy).not.toHaveBeenCalled()
     const dialog = screen.getByRole('dialog')
-    fireEvent.click(within(dialog).getByRole('button', { name: /rotate key/i }))
+    expect(within(dialog).getByText(/revoke the recovery key\?/i)).toBeInTheDocument()
+    // Not revoked until confirmed.
+    expect(h.revokeMutateAsync).not.toHaveBeenCalled()
 
-    await waitFor(() => expect(h.rotateMutateAsync).toHaveBeenCalledTimes(1))
-    // useRotateAppKey itself is responsible for persisting the key via
-    // setApiKey (issue #28: the current session must survive its own
-    // rotation) -- this component only needs to display what came back.
-    await waitFor(() => expect(screen.getByLabelText(/new app key/i)).toHaveValue(
-      'brand-new-key-xyz',
-    ))
+    fireEvent.click(within(dialog).getByRole('button', { name: /revoke key/i }))
+
+    await waitFor(() => expect(h.revokeMutateAsync).toHaveBeenCalledTimes(1))
+    // Status flips to no-key: the Generate control returns, Rotate/Revoke are gone.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /generate recovery key/i })).toBeInTheDocument(),
+    )
+    expect(screen.queryByRole('button', { name: /^revoke$/i })).not.toBeInTheDocument()
+
+    confirmSpy.mockRestore()
   })
 
-  it('surfaces the 409 (key changed mid-flight) honestly and keeps the dialog open to retry', async () => {
+  it('cancelling the revoke dialog revokes nothing', () => {
+    h.appKeyExists = true
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: /^revoke$/i }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: /^cancel$/i }))
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(h.revokeMutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a rotate CAS conflict (app_key_changed) honestly, matching the production copy', async () => {
+    h.appKeyExists = true
+    // What production renders: unwrap() throws a normalized ApiError whose message
+    // is the crafted DETAIL_MESSAGES copy for this code (lib/errors.ts, Task 11).
     h.rotateMutateAsync.mockRejectedValueOnce({
       code: 'app_key_changed',
-      message: 'The app key changed while this request was in flight — refresh and retry.',
+      message: 'The recovery key changed while you were rotating it. Refresh and try again.',
       status: 409,
     })
     render(<Settings />, { wrapper: Wrapper })
 
     fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
-    const dialog = screen.getByRole('dialog')
-    fireEvent.click(within(dialog).getByRole('button', { name: /rotate key/i }))
 
-    await waitFor(() => expect(h.rotateMutateAsync).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(h.toast).toHaveBeenCalledTimes(1))
     expect(h.toast).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: 'Rotate failed',
-        description: expect.stringContaining('changed while this request was in flight'),
         intent: 'error',
+        description: expect.stringContaining('recovery key changed while you were rotating it'),
       }),
     )
-    // The confirm dialog stays open so the operator can refresh and try again;
-    // no dead key is displayed as if the rotation had succeeded.
-    expect(screen.getByRole('dialog')).toBeInTheDocument()
-    expect(screen.queryByLabelText(/new app key/i)).not.toBeInTheDocument()
-  })
-
-  it('cancelling the confirm dialog rotates nothing', () => {
-    render(<Settings />, { wrapper: Wrapper })
-
-    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
-    const dialog = screen.getByRole('dialog')
-    fireEvent.click(within(dialog).getByRole('button', { name: /^cancel$/i }))
-
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    expect(h.rotateMutateAsync).not.toHaveBeenCalled()
-  })
-
-  it('Round-2: a reveal resolving AFTER a rotate does not clobber the rotated key', async () => {
-    // The reveal starts FIRST (so it authenticates with the OLD key) but is made
-    // to resolve LAST -- the exact stale-response race. A monotonic ticket must
-    // drop the late reveal so it never overwrites the freshly rotated key (which
-    // would otherwise have the operator pair a new device with a dead key).
-    let resolveReveal!: (value: { app_api_key: string }) => void
-    h.revealMutateAsync.mockReturnValue(
-      new Promise<{ app_api_key: string }>((resolve) => {
-        resolveReveal = resolve
-      }),
-    )
-    h.rotateMutateAsync.mockResolvedValue({ app_api_key: 'rotated-key-new' })
-
-    render(<Settings />, { wrapper: Wrapper })
-
-    // 1. Reveal in flight (authenticated with the old key), not yet resolved.
-    fireEvent.click(screen.getByRole('button', { name: /^reveal$/i }))
-    // 2. Rotate to completion -- it paints the new key.
-    fireEvent.click(screen.getByRole('button', { name: /^rotate$/i }))
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: /rotate key/i }),
-    )
-    await waitFor(() =>
-      expect(screen.getByLabelText(/new app key/i)).toHaveValue('rotated-key-new'),
-    )
-
-    // 3. NOW the stale reveal finally resolves, carrying the now-dead old key.
-    await act(async () => {
-      resolveReveal({ app_api_key: 'stale-dead-key' })
-    })
-
-    // The rotated key survives; the stale reveal neither overwrites the value nor
-    // flips the label back to "Current app key".
-    expect(screen.getByLabelText(/new app key/i)).toHaveValue('rotated-key-new')
-    expect(screen.queryByLabelText(/current app key/i)).not.toBeInTheDocument()
-    expect(screen.queryByDisplayValue('stale-dead-key')).not.toBeInTheDocument()
-  })
-
-  it('Round-2: disables the Reveal button while a rotation is in flight', () => {
-    // A reveal started mid-rotation would authenticate with the about-to-die key;
-    // block it at the source while rotate.isPending.
-    h.rotatePending = true
-    render(<Settings />, { wrapper: Wrapper })
-
-    expect(screen.getByRole('button', { name: /^reveal$/i })).toBeDisabled()
+    // No dead key painted as if the rotation had succeeded.
+    expect(screen.queryByText(CAPTION)).not.toBeInTheDocument()
   })
 })

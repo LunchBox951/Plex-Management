@@ -53,6 +53,7 @@ export type TmdbValidateRequest = Schemas['TmdbValidateRequest']
 
 export type KeepForeverBody = Schemas['KeepForeverBody']
 export type AppApiKeyResponse = Schemas['AppApiKeyResponse']
+export type AppApiKeyStatusResponse = Schemas['AppApiKeyStatusResponse']
 
 /* ------------------------------------------------------------------- ops -- */
 // ADR-0012 — health/status dashboard, log viewer, disk-pressure eviction.

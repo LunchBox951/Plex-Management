@@ -10,6 +10,7 @@ import { unwrap, ensureOk } from './http'
 import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
 import type {
   AppApiKeyResponse,
+  AppApiKeyStatusResponse,
   AuthMeResponse,
   BlocklistResponse,
   CreateRequestBody,
@@ -226,31 +227,50 @@ export function useUpdateSettings() {
 }
 
 /**
- * Reveal the CURRENT app X-Api-Key in plaintext — the break-glass recovery
- * path for a new device/browser, without re-running setup. On-demand
- * (mutation, not a query) so the key is only ever fetched on an explicit
- * "Reveal" click, never pre-fetched/cached.
+ * Whether an opt-in recovery key currently exists — WITHOUT revealing it (the
+ * status endpoint never carries the plaintext). Drives Settings → Access:
+ * `Generate` when none exists, `Rotate` + `Revoke` once one does.
  */
-export function useRevealAppKey() {
-  return useMutation({
-    mutationFn: async (): Promise<AppApiKeyResponse> =>
-      unwrap(await client.GET('/api/v1/settings/app-key')),
+export function useAppKeyStatus() {
+  return useQuery({
+    queryKey: queryKeys.appKeyStatus,
+    queryFn: async (): Promise<AppApiKeyStatusResponse> =>
+      unwrap(await client.GET('/api/v1/settings/app-key/status')),
   })
 }
 
 /**
- * Mint a brand-new app X-Api-Key, invalidating the old one everywhere. The
- * CALLER'S own stored key must be updated immediately (via setApiKey) or the
- * current session's very next request would 401 with no saved key to fall
- * back to — every OTHER device/browser holding the old key is, correctly,
- * locked out until it's re-paired with the new one.
+ * Mint the app X-Api-Key — GENERATE the first one, or ROTATE an existing key
+ * (the single POST does both; setup mints nothing, ADR-0016). The plaintext is
+ * returned exactly once. The CALLER'S own stored key is updated immediately
+ * (via setApiKey) so the current session survives its own rotation — every
+ * OTHER device holding the old key is, correctly, locked out until re-paired.
+ * The status query is invalidated so the Access card flips to Rotate/Revoke.
  */
 export function useRotateAppKey() {
+  const qc = useQueryClient()
   return useMutation({
     mutationFn: async (): Promise<AppApiKeyResponse> =>
       unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
     onSuccess: (data) => {
       setApiKey(data.app_api_key)
+      void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
+    },
+  })
+}
+
+/**
+ * Revoke the app X-Api-Key: the shared key is cleared server-side, locking out
+ * every device holding it (browser Plex-session auth is unaffected). Nothing is
+ * written into THIS browser's own key store — there is no new key. Invalidates
+ * the status query so the Access card flips back to Generate.
+ */
+export function useRevokeAppKey() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<void> => ensureOk(await client.DELETE('/api/v1/settings/app-key')),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
     },
   })
 }
