@@ -226,11 +226,23 @@ class RequestRepository(Protocol):
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return an existing non-terminal request for this media, for dedup."""
 
-    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
-        """Return the latest already-in-library (available/completed) request.
+    async def find_in_library(
+        self, tmdb_id: int, media_type: str, *, prefer_user_id: int | None = None
+    ) -> RequestRecord | None:
+        """Return an already-in-library (available/completed) request for dedup.
 
         Dedups the Plex-availability short-circuit: a repeat request for a movie
         already recorded as available returns that row instead of a duplicate.
+
+        ``prefer_user_id`` scopes WHICH terminal row is returned when several
+        exist for the same media (a legitimate state — see the remove-then-
+        reacquire flow): a row owned by that user is preferred, then an ownerless
+        (claimable) one, then anyone else's; newest-by-id within each rank. This
+        is the per-user visibility rule for shared (non-admin) sessions — without
+        it, another user's NEWER terminal row shadows the caller's own older one
+        and turns their re-request into a spurious ``requested_by_another_user``
+        rejection. ``None`` (the default; admins and API-key automation) returns
+        the newest row unconditionally, the pre-preference behavior.
         """
         raise NotImplementedError
 
@@ -246,7 +258,7 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]]
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
         """Batch the DISPLAY request status per ``(tmdb_id, media_type)`` for tiles.
 
@@ -259,6 +271,12 @@ class RequestRepository(Protocol):
         ``MediaRequest.status`` carries the persisted per-season rollup
         (``partially_available``/...), so no per-season fan-out is needed. Keys with
         no request row are simply ABSENT from the mapping (never a fabricated status).
+
+        ``for_user_id`` scopes the lookup to ONE user's own request rows -- the
+        per-user visibility rule for shared (non-admin) sessions, mirroring the
+        requests list/get filtering exactly (``user_id == for_user_id``; ownerless
+        rows are excluded too, just as the list hides them). ``None`` (the
+        default) is unscoped: admins and API-key automation see every row.
         """
         raise NotImplementedError
 

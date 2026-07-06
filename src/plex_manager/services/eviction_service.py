@@ -1363,8 +1363,22 @@ async def _evict_one(
     # same containment guard, same idempotent already-gone no-op. Eviction keeps
     # its OWN log message + logger for each outcome (the primitive classifies, the
     # caller logs).
-    purge = await purge_service.purge_library_path(fs, library_path)
+    purge_held = False
+    purge = await purge_service.purge_library_path(fs, library_path, hold_purge_registration=True)
+    if purge.outcome is PurgeOutcome.deleted:
+        purge_held = True
     if purge.outcome is not PurgeOutcome.deleted:
+        if purge.outcome is PurgeOutcome.deferred:
+            _logger.info(
+                "eviction of %r%s deferred because an import is placing into the "
+                "same path (%s); leaving the eviction claim for recovery after "
+                "the import settles",
+                candidate.title,
+                season_note,
+                purge.detail,
+                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            )
+            return None
         # The delete refused (a stale/misconfigured breadcrumb pointing outside
         # every currently-configured library root) or errored (permission/I/O).
         # The file is STILL on disk and still watchable -- so RESTORE the row to
@@ -1399,55 +1413,59 @@ async def _evict_one(
     # but not finalized" (a crash window), which is exactly the signature
     # :func:`_resume_interrupted_evictions` keys on -- so a finalized eviction
     # must never keep looking like an interrupted one.
-    session.add(
-        DownloadHistory(
-            tmdb_id=pending.tmdb_id,
-            torrent_hash=None,  # not tied to any download -- see DownloadHistoryEvent.evicted
-            event_type=DownloadHistoryEvent.evicted,
-            source_title=candidate.title,
-            message=(
-                f"evicted{season_note}: watched, past grace period, "
-                f"disk-pressure relief ({library_path})"
-            ),
+    try:
+        session.add(
+            DownloadHistory(
+                tmdb_id=pending.tmdb_id,
+                torrent_hash=None,  # not tied to any download -- see DownloadHistoryEvent.evicted
+                event_type=DownloadHistoryEvent.evicted,
+                source_title=candidate.title,
+                message=(
+                    f"evicted{season_note}: watched, past grace period, "
+                    f"disk-pressure relief ({library_path})"
+                ),
+            )
         )
-    )
-    if isinstance(pending, _SeasonPending):
-        # The clear is value-predicated on the path this sweep just purged: if a
-        # replacement import somehow re-stamped a FRESH breadcrumb mid-purge,
-        # that import owns the row and its breadcrumb survives.
-        await SqlSeasonRequestRepository(session).clear_library_path_if_set(
-            pending.season_request_id, expected_path=library_path
-        )
-        # DISK-TRUTH-OVER-INTENT: the claim committed 'evicted', but an
-        # in-window re-request can re-arm this SAME row to 'pending' and the
-        # user can CANCEL it, all while the purge above was deleting -- leaving
-        # the row 'cancelled' at this finalize. A cancellation describes an
-        # aborted re-grab INTENT, not what is on disk: the file is genuinely
-        # gone now, and a 'cancelled' row is invisible to ``evicted_seasons``
-        # (which rightly ignores cancelled rows), so leaving it would let the
-        # next re-request mint 'available' off stale Plex over the just-deleted
-        # file. Flip it back to the disk truth -- 'evicted' (CAS from
-        # {cancelled} only; a re-arm still in flight keeps its pre-grab status
-        # and is the recovery pass's/restore's business, exactly as before).
-        # Re-requesting an evicted season is already a first-class path, so
-        # every downstream flow reads correctly. Movies never need this flip:
-        # a movie re-grab is a SEPARATE row, so cancelling it leaves the
-        # ORIGINAL row 'evicted' and the newest-non-cancelled guard already
-        # holds -- and the claimed movie row itself ('evicted') is not even
-        # cancellable (outside CANCELLABLE_REQUEST_STATUS_VALUES).
-        await season_request_service.set_status_if_in(
-            session,
-            media_request_id=pending.media_request_id,
-            season_request_id=pending.season_request_id,
-            status=RequestStatus.evicted.value,
-            allowed_from=frozenset({RequestStatus.cancelled.value}),
-            tolerate_active_conflict=True,
-        )
-    else:
-        await SqlRequestRepository(session).clear_library_path_if_set(
-            pending.media_request_id, expected_path=library_path
-        )
-    await session.commit()
+        if isinstance(pending, _SeasonPending):
+            # The clear is value-predicated on the path this sweep just purged: if a
+            # replacement import somehow re-stamped a FRESH breadcrumb mid-purge,
+            # that import owns the row and its breadcrumb survives.
+            await SqlSeasonRequestRepository(session).clear_library_path_if_set(
+                pending.season_request_id, expected_path=library_path
+            )
+            # DISK-TRUTH-OVER-INTENT: the claim committed 'evicted', but an
+            # in-window re-request can re-arm this SAME row to 'pending' and the
+            # user can CANCEL it, all while the purge above was deleting -- leaving
+            # the row 'cancelled' at this finalize. A cancellation describes an
+            # aborted re-grab INTENT, not what is on disk: the file is genuinely
+            # gone now, and a 'cancelled' row is invisible to ``evicted_seasons``
+            # (which rightly ignores cancelled rows), so leaving it would let the
+            # next re-request mint 'available' off stale Plex over the just-deleted
+            # file. Flip it back to the disk truth -- 'evicted' (CAS from
+            # {cancelled} only; a re-arm still in flight keeps its pre-grab status
+            # and is the recovery pass's/restore's business, exactly as before).
+            # Re-requesting an evicted season is already a first-class path, so
+            # every downstream flow reads correctly. Movies never need this flip:
+            # a movie re-grab is a SEPARATE row, so cancelling it leaves the
+            # ORIGINAL row 'evicted' and the newest-non-cancelled guard already
+            # holds -- and the claimed movie row itself ('evicted') is not even
+            # cancellable (outside CANCELLABLE_REQUEST_STATUS_VALUES).
+            await season_request_service.set_status_if_in(
+                session,
+                media_request_id=pending.media_request_id,
+                season_request_id=pending.season_request_id,
+                status=RequestStatus.evicted.value,
+                allowed_from=frozenset({RequestStatus.cancelled.value}),
+                tolerate_active_conflict=True,
+            )
+        else:
+            await SqlRequestRepository(session).clear_library_path_if_set(
+                pending.media_request_id, expected_path=library_path
+            )
+        await session.commit()
+    finally:
+        if purge_held:
+            purge_service.end_purge(library_path)
 
     # Tell Plex the media is gone, so a subsequent "Request again" sees it as ABSENT
     # (a fresh pending request that re-grabs), not a stale in-library 'available'. A

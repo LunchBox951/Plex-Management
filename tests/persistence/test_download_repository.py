@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from plex_manager.models import MediaRequest, MediaType, RequestStatus
+from plex_manager.db import Base, enable_sqlite_fk_enforcement
+from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
 from plex_manager.repositories import SqlDownloadRepository
 
 
@@ -227,3 +230,87 @@ async def test_update_status_stamps_first_seen_at_grace_anchor(
     assert again is not None
     assert again.first_seen_at is not None
     assert again.first_seen_at.replace(tzinfo=UTC) == anchor
+
+
+async def test_list_active_populate_existing_refreshes_stale_identity_map_row(
+    tmp_path: Path,
+) -> None:
+    """Issue #77: after a status compare-and-swap LOSES to a concurrent writer, the
+    already-loaded row lingers in the session identity map with its stale, pre-CAS
+    status. Because the app runs ``expire_on_commit=False``, the intervening commit
+    does not refresh it, and a plain SELECT keeps the loaded instance rather than
+    overwriting it -- so ``reconcile_and_list``'s terminal read reports a status the
+    DB no longer holds. ``list_active(populate_existing=True)`` closes that gap.
+
+    This reproduces the bug faithfully with REAL concurrency: a file-backed DB with
+    a SEPARATE engine for the concurrent writer -> a genuinely distinct connection,
+    unlike the suite's shared single-connection in-memory ``StaticPool``. Diverging
+    the row via the reader's own session (ORM or textual DML) would auto-expire its
+    identity map and mask the bug. The exact production sequence is exercised: load
+    -> a concurrent writer advances the row to another NON-terminal status -> the
+    reader's CAS misses -> commit -> terminal read.
+
+    A strong reference to the loaded ORM instance is deliberately held: SQLAlchemy's
+    identity map is WEAK, so the stale row survives only while something references
+    it -- which is exactly when the bug bites (and why #77 is intermittent: under GC
+    pressure the discarded instance is collected and the next SELECT reloads fresh).
+    Pinning it makes the regression deterministic instead of GC-timing-dependent.
+    """
+    url = f"sqlite+aiosqlite:///{tmp_path / 'queue.db'}"
+    engine = create_async_engine(url)
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with maker() as setup:
+        created = await SqlDownloadRepository(setup).create(
+            torrent_hash="cas", status="downloading"
+        )
+        await setup.commit()
+        download_id = created.id
+
+    reader = maker()
+    repo = SqlDownloadRepository(reader)
+    try:
+        # Load the row into the reader's identity map (status 'downloading') and
+        # PIN the ORM instance so the weak identity map keeps it (see docstring).
+        loaded = await repo.list_active()
+        assert [r.status for r in loaded] == ["downloading"]
+        pinned = (await reader.execute(select(Download))).scalars().all()
+        assert [row.status for row in pinned] == ["downloading"]
+
+        # A CONCURRENT writer on a DISTINCT connection (separate engine) advances the
+        # row to another NON-terminal status and commits -- a true cross-connection
+        # change the reader's session knows nothing about.
+        writer_engine = create_async_engine(url)
+        try:
+            async with async_sessionmaker(writer_engine)() as writer:
+                await writer.execute(
+                    text("UPDATE downloads SET status = 'importing' WHERE id = :id"),
+                    {"id": download_id},
+                )
+                await writer.commit()
+        finally:
+            await writer_engine.dispose()
+
+        # The reader's own CAS now MISSES (the row left 'downloading'); a miss leaves
+        # the loaded instance untouched (not expired).
+        applied = await repo.update_status_if_in(
+            download_id, "import_pending", frozenset({"downloading"})
+        )
+        assert applied is False
+        await reader.commit()  # end the read snapshot (mirrors reconcile Phase A)
+
+        # Default read: the identity map still wins, so the stale status leaks.
+        stale = await repo.list_active()
+        assert [r.status for r in stale] == ["downloading"]
+        assert pinned[0].status == "downloading"  # the pinned instance is still stale
+
+        # populate_existing overwrites the loaded instance from the DB -> honest.
+        refreshed = await repo.list_active(populate_existing=True)
+        assert [r.status for r in refreshed] == ["importing"]
+        assert pinned[0].status == "importing"  # the pinned instance was refreshed too
+    finally:
+        await reader.close()
+        await engine.dispose()

@@ -10,8 +10,9 @@ authoritative record; a client/Plex/FS hiccup here must never undo it:
   ``library_path`` breadcrumb, plus the hardlink-aware reclaimable-bytes
   accounting (measured BEFORE the delete, since a file's link count can only be
   read while it still exists). Returns a :class:`PurgeResult` classifying the
-  outcome (``deleted`` / ``refused`` by the containment guard / ``error``); the
-  CALLER logs, so each keeps its own context-appropriate message and logger.
+  outcome (``deleted`` / ``refused`` by the containment guard / ``deferred`` to
+  an active import / ``error``); the CALLER logs, so each keeps its own
+  context-appropriate message and logger.
 * :func:`trigger_library_scan` — the best-effort Plex refresh (delete-file-then-
   trigger_scan is how a title/season is removed from Plex; there is no
   ``LibraryPort`` delete API and none is needed).
@@ -49,6 +50,7 @@ __all__ = [
     "PurgeResult",
     "begin_placement",
     "end_placement",
+    "end_purge",
     "purge_library_path",
     "remove_torrent",
     "trigger_library_scan",
@@ -71,10 +73,12 @@ _logger = logging.getLogger(__name__)
 # and the loser defers fast rather than waiting -- the check-and-register below
 # has no ``await`` between them, so it is atomic on the single event loop:
 #
-# * ``purge_library_path`` defers (``PurgeOutcome.error`` with an explicit
-#   detail) when an import is mid-placement into a conflicting path: the caller
-#   already treats ``error`` as retryable (eviction restores the row to
-#   ``available`` and re-decides next sweep; report-issue keeps the breadcrumb).
+# * ``purge_library_path`` defers (``PurgeOutcome.deferred`` with an explicit
+#   detail) when an import is mid-placement into a conflicting path. That is NOT
+#   an ordinary unlink failure for eviction: a replacement import may be about to
+#   own the path, so the old eviction claim stays published with its breadcrumb
+#   for the next recovery pass to adjudicate. Report-issue keeps the breadcrumb
+#   like a retryable delete failure.
 # * ``begin_placement`` (called by ``import_service`` before its ``Importing``
 #   claim) refuses when a purge is mid-delete on a conflicting path: the import
 #   attempt is skipped for THIS cycle and honestly retried on the next one (the
@@ -138,6 +142,11 @@ def end_placement(library_path: str) -> None:
     _unregister(library_path, _ACTIVE_PLACEMENT_PATHS)
 
 
+def end_purge(library_path: str) -> None:
+    """Release a held purge registration (refcounted)."""
+    _unregister(library_path, _ACTIVE_PURGE_PATHS)
+
+
 class PurgeOutcome(StrEnum):
     """How a :func:`purge_library_path` attempt resolved."""
 
@@ -147,6 +156,9 @@ class PurgeOutcome(StrEnum):
     #: The root-containment guard refused: the path resolves outside every
     #: configured library root (a stale/misconfigured breadcrumb). Nothing deleted.
     refused = "refused"
+    #: A replacement import is actively placing into this path. Nothing deleted;
+    #: eviction should leave the claim/breadcrumb for later recovery.
+    deferred = "deferred"
     #: An ``OSError`` (permission denied, I/O error) while deleting. Nothing (or
     #: only part of a tree) deleted; the caller may retry later.
     error = "error"
@@ -167,7 +179,9 @@ class PurgeResult:
     detail: str | None = None
 
 
-async def purge_library_path(fs: FileSystemPort, library_path: str) -> PurgeResult:
+async def purge_library_path(
+    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool = False
+) -> PurgeResult:
     """Root-guarded delete of ``library_path`` + hardlink-aware freed-bytes accounting.
 
     Both the size accounting and the delete are real, synchronous disk I/O
@@ -183,13 +197,16 @@ async def purge_library_path(fs: FileSystemPort, library_path: str) -> PurgeResu
     """
     # PURGE-vs-IMPORT ordering rule (see the registry block above): defer to an
     # import that is mid-placement into this path -- deleting under it would eat
-    # files the import is about to (or just did) commit as placed. ``error`` is
-    # the honest retryable outcome every caller already handles: eviction
-    # restores the claim to 'available' and re-decides next sweep; report-issue
-    # keeps the breadcrumb. Check-and-register has no await between them.
+    # files the import is about to (or just did) commit as placed. ``deferred`` is
+    # distinct from a real unlink failure because eviction must not restore the
+    # old owner while a replacement import may be finalizing that same path.
+    # Check-and-register has no await between them.
     if _conflicts_with(library_path, _ACTIVE_PLACEMENT_PATHS):
-        return PurgeResult(PurgeOutcome.error, 0, "deferred: an import is placing into this path")
+        return PurgeResult(
+            PurgeOutcome.deferred, 0, "deferred: an import is placing into this path"
+        )
     _register(library_path, _ACTIVE_PURGE_PATHS)
+    release_registration = True
     try:
         # Fail an out-of-root breadcrumb CLOSED and FAST, BEFORE the (potentially
         # huge, recursive) reclaimable_bytes walk. A stale/misconfigured breadcrumb
@@ -220,9 +237,12 @@ async def purge_library_path(fs: FileSystemPort, library_path: str) -> PurgeResu
             return PurgeResult(PurgeOutcome.refused, 0, str(exc))
         except OSError as exc:
             return PurgeResult(PurgeOutcome.error, 0, type(exc).__name__)
+        if hold_purge_registration:
+            release_registration = False
         return PurgeResult(PurgeOutcome.deleted, freed_bytes)
     finally:
-        _unregister(library_path, _ACTIVE_PURGE_PATHS)
+        if release_registration:
+            _unregister(library_path, _ACTIVE_PURGE_PATHS)
 
 
 async def trigger_library_scan(
@@ -264,7 +284,7 @@ async def remove_torrent(
     *,
     context: str,
     extra: dict[str, object] | None = None,
-) -> None:
+) -> bool:
     """Best-effort ``qbt.remove(delete_files=True)`` — closes the seeding leak.
 
     A blocklisted / cancelled / reported download must not keep seeding and
@@ -273,6 +293,13 @@ async def remove_torrent(
     (honesty over silence) but never raised: the caller's blocklist/status writes
     have already committed and must not be undone by a client hiccup — the leak is
     made VISIBLE in the log rather than aborting the correction.
+
+    Returns whether the client call SUCCEEDED (an already-gone hash counts as
+    success). ``queue_service`` uses this to persist the removal outcome into its
+    provenance marker (``remove=done``): a durable "already removed" record must
+    only be written for a removal that actually happened, so a client hiccup
+    returns ``False`` and the marker keeps saying the removal is still owed.
+    Callers that only need the best-effort behaviour may ignore the result.
 
     ``context`` is a static caller description, logged verbatim (never an
     interpolated request-derived string — log-injection convention); the
@@ -292,3 +319,5 @@ async def remove_torrent(
             exc_info=True,
             extra=extra,
         )
+        return False
+    return True

@@ -336,7 +336,7 @@ async def test_import_generic_file_under_release_folder_succeeds(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
     # A folder torrent whose NAME carries the title/year/quality, containing a
-    # generic feature file (movie.mkv). _resolve_source anchors the relative path
+    # generic feature file (movie.mkv). _resolve_sources anchors the relative path
     # above the download root so the folder tokens reach the validator, whose
     # full-path parse identifies it — the import succeeds instead of blocking as
     # wrong/unknown media.
@@ -357,6 +357,44 @@ async def test_import_generic_file_under_release_folder_succeeds(
     assert record.status == DownloadState.Imported.value
     dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
     assert dst.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.completed
+
+
+async def test_import_movie_selects_real_feature_over_larger_featurette(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # issue #69: a movie download that ships a LARGER featurette/extra beside the
+    # real feature must import the feature, not block as NO_VIDEO_FILE. The old
+    # service narrowed to the single largest file BEFORE validating, so the 200 MiB
+    # featurette was the only file the validator saw -- it dropped that sample-named
+    # file and reported "no importable video". Now EVERY candidate reaches the
+    # validator, which drops the featurette by name and picks the smaller real
+    # feature as the surviving largest.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    feature = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    featurette = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.featurette.mkv"
+    _make_video(feature, size_bytes=100 * 1024 * 1024)
+    _make_video(featurette, size_bytes=200 * 1024 * 1024)  # larger than the feature
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert record.failed_reason is None
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    # It imported the real feature (100 MiB), never the larger featurette decoy.
+    assert dst.stat().st_size == 100 * 1024 * 1024
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.completed
@@ -895,6 +933,44 @@ async def test_run_import_cycle_drains_pending_download_to_completed(
         assert request is not None and request.status == RequestStatus.completed
 
 
+async def test_run_import_cycle_blocks_ownerless_row_instead_of_skipping_it(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # issue #74: an ownerless auto-drain row (media_request_id NULL) must reach
+    # import_download and become a visible, retryable ImportBlocked, not be filtered
+    # out of the cycle and left stuck in ImportPending forever. The cycle no longer
+    # skips ownerless rows; import_download already blocks them honestly with
+    # "import has no owning request".
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="0" * 40,
+            status=DownloadState.ImportPending.value,
+            media_request_id=None,
+            tmdb_id=_TMDB_ID,
+            year=1999,
+        )
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+
+    async with sessionmaker_() as session:
+        await run_import_cycle(
+            fs=LocalFileSystem(),
+            library=FakeLibrary(),
+            qbt=FakeQbittorrent(statuses=[]),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(tmp_path / "library"),
+        )
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None
+    assert download.status == DownloadState.ImportBlocked.value
+    assert download.failed_reason == "import has no owning request"
+
+
 async def test_run_availability_cycle_promotes_completed_to_available_when_in_plex(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1356,6 +1432,44 @@ async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
     assert season_row.status.value == "completed"
     assert request is not None
     assert request.status is RequestStatus.completed  # "Finalizing", not yet available
+
+
+async def test_import_tv_retry_success_clears_stale_failed_reason(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # issue #73: a TV row retried out of ImportBlocked that imports cleanly must
+    # land with a null failed_reason, matching the movie path. Before the fix the
+    # TV claim/finalize CAS omitted clear_failed_reason, so a successfully-imported
+    # season kept displaying its stale import-block reason in the queue and audit.
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, season_id = await _seed_tv(
+        sessionmaker_,
+        season=2,
+        request_status=RequestStatus.import_blocked,
+        season_status=RequestStatus.import_blocked.value,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.failed_reason = "stale tv block reason"
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert record.failed_reason is None
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        season_row = await session.get(SeasonRequest, season_id)
+    assert download is not None
+    assert download.status == DownloadState.Imported.value
+    assert download.failed_reason is None
+    assert season_row is not None and season_row.status.value == "completed"
 
 
 async def test_import_tv_defers_when_live_client_status_is_not_settled(
@@ -2150,9 +2264,9 @@ async def test_purge_defers_while_an_import_is_placing_into_the_path(
     tmp_path: Path,
 ) -> None:
     """Purge side of the ordering rule: with an import mid-placement into the
-    path (or any path it contains), purge_library_path defers with the honest
-    retryable ``error`` outcome -- eviction restores its claim to 'available'
-    and re-decides next sweep; report-issue keeps the breadcrumb -- and deletes
+    path (or any path it contains), purge_library_path defers with an explicit
+    ``deferred`` outcome -- eviction leaves its claim for recovery after the
+    replacement import settles; report-issue keeps the breadcrumb -- and deletes
     NOTHING. Once the placement releases, the purge proceeds normally."""
     movie_dir = tmp_path / "library" / "The Matrix (1999)"
     movie_file = movie_dir / "The Matrix (1999).mkv"
@@ -2167,7 +2281,7 @@ async def test_purge_defers_while_an_import_is_placing_into_the_path(
     finally:
         purge_service.end_placement(str(movie_file))
 
-    assert result.outcome is purge_service.PurgeOutcome.error  # honest, retryable
+    assert result.outcome is purge_service.PurgeOutcome.deferred
     assert result.detail is not None and "deferred" in result.detail
     assert movie_file.exists()  # nothing deleted under the placement
 

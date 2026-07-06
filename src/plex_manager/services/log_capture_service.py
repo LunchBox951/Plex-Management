@@ -68,6 +68,7 @@ __all__ = [
     "configure_logging",
     "drain_once",
     "prune_once",
+    "resolve_log_level",
     "stop_logging",
 ]
 
@@ -184,10 +185,14 @@ _TELEMETRY_LOGGERS: Final = (
 #: verbatim into the durable, EXPORTABLE ``log_events`` store (the store the
 #: blueprint designs to be pasted straight into an LLM). ``httpcore`` (the
 #: transport httpx is built on) has its own noisy INFO/DEBUG connection-pool
-#: logging with the same risk. Both are pinned to WARNING regardless of the
-#: configured root level: no adapter call site can opt back into leaking a URL
-#: by raising ``log_level`` to DEBUG for troubleshooting -- "secrets are never
-#: logged" is a hard invariant, not a verbosity trade-off. Every adapter's own
+#: logging with the same risk. Both are pinned to ``max(resolved_level, WARNING)``
+#: (see :func:`configure_logging`), so WARNING is a hard FLOOR: no adapter call
+#: site can opt back into leaking a URL by raising ``log_level`` to DEBUG for
+#: troubleshooting -- "secrets are never logged" is a hard invariant, not a
+#: verbosity trade-off -- while an operator who raises the floor to ERROR quiets
+#: these loggers to ERROR too, never receiving WARNING chatter below their floor.
+#: The pin only ever QUIETS relative to the operator level, never loosens it.
+#: Every adapter's own
 #: error messages already name a status code or exception type, never a raw
 #: URL/token (see e.g. ``adapters/tmdb/adapter.py``); this only closes the gap
 #: the underlying HTTP library itself opened around that discipline.
@@ -201,7 +206,7 @@ _EXC_FORMATTER: Final = logging.Formatter()
 _logger = logging.getLogger(__name__)
 
 #: Fallback effective level when ``config.log_level`` cannot be resolved to a
-#: real stdlib level (see :func:`_resolve_log_level`) — INFO, the same default
+#: real stdlib level (see :func:`resolve_log_level`) — INFO, the same default
 #: ``config.py`` ships, so an unrecognized override degrades to "as if unset"
 #: rather than to something surprising.
 _DEFAULT_LOG_LEVEL: Final = logging.INFO
@@ -378,7 +383,7 @@ class LogCaptureHandler(logging.Handler):
             self.dropped_count += 1
 
 
-def _resolve_log_level(level: str) -> int:
+def resolve_log_level(level: str) -> int:
     """Normalize a configured level string to a valid stdlib numeric level.
 
     ``logging``'s level-name table is keyed by UPPERCASE names ('DEBUG',
@@ -397,8 +402,47 @@ def _resolve_log_level(level: str) -> int:
     warning, through this module's own logger) rather than either dying or
     quietly pretending the value was fine — it falls back to
     :data:`_DEFAULT_LOG_LEVEL`.
+
+    Public (not module-private) so the console entry point
+    (:func:`plex_manager.__main__.main`) can normalize ``config.log_level``
+    into a real numeric level BEFORE handing it to ``uvicorn.run`` — see that
+    module's docstring for why: ``uvicorn.Config`` looks a ``str`` level up in
+    its OWN name table and raises ``KeyError`` on anything it doesn't
+    recognize, which would crash the process before the FastAPI ``lifespan``
+    (and this exact tolerant resolver, wired in via :func:`configure_logging`)
+    ever runs. Reusing this one resolver for both call sites means "what counts
+    as a valid log level" can never drift between the two -- an int level
+    always passes ``uvicorn.Config`` straight through with no lookup at all,
+    sidestepping its ``KeyError`` path entirely. ``__main__.main`` does NOT
+    route every value through this function, though: see
+    :func:`plex_manager.__main__._uvicorn_log_level` for the ``'trace'``
+    carve-out that bypasses this resolver entirely for uvicorn's own launch
+    argument.
+
+    ``TRACE`` gets an explicit rule of its own, checked BEFORE the name-table
+    lookup below: uvicorn defines a real, lower-than-DEBUG ``'trace'`` level
+    for ASGI/protocol-level tracing (see ``uvicorn.config.LOG_LEVELS``), but
+    stdlib ``logging`` has never heard of it -- ``logging.getLevelNamesMapping()``
+    has no ``'TRACE'`` entry unless something in THIS process already called
+    ``logging.addLevelName(5, "TRACE")`` (uvicorn's own ``Config.__init__``
+    does exactly that as a side effect, but this function must not depend on
+    whether some uvicorn ``Config`` happens to have been constructed already
+    -- that is not an ordering this module can assume, and callers like
+    :func:`configure_logging` are exercised directly in tests with no uvicorn
+    involved at all). For THIS function's only consumer -- the app's own
+    stdlib root-logger threshold, via :func:`configure_logging` -- DEBUG is
+    the honest analogue: it is the next real stdlib level below INFO, which is
+    what "more than normal" has to mean for a logger that has no level below
+    it. This is deliberately separate from uvicorn's OWN effective level,
+    where a distinct TRACE constant matters because ``uvicorn.Config`` only
+    installs its ASGI ``MessageLoggerMiddleware`` when its OWN level is <= that
+    constant -- ``_uvicorn_log_level`` passes ``'trace'`` to ``uvicorn.run``
+    verbatim, untouched by this function, so uvicorn's TRACE-aware ``Config``
+    does that lookup itself.
     """
     candidate = level.strip()
+    if candidate.upper() == "TRACE":
+        return logging.DEBUG
     by_name = logging.getLevelNamesMapping().get(candidate.upper())
     if by_name is not None:
         return by_name
@@ -418,13 +462,17 @@ def _resolve_log_level(level: str) -> int:
 def configure_logging(level: str, *, logger: logging.Logger | None = None) -> LogCaptureHandler:
     """Attach a fresh :class:`LogCaptureHandler` to ``logger`` (default: the root
     logger) and set its effective level from ``level`` (``config.log_level``),
-    normalized by :func:`_resolve_log_level` so a case mismatch or unrecognized
+    normalized by :func:`resolve_log_level` so a case mismatch or unrecognized
     value never raises out of here (see that function's docstring).
 
     Also pins :data:`_THIRD_PARTY_LOGGERS_TO_QUIET` (``httpx``/``httpcore``) to
-    :data:`_THIRD_PARTY_LOGGER_LEVEL` — see that constant's docstring for why this
-    is a hard secret-safety invariant, not merely reducing noise, and why it is
-    unconditional regardless of ``level``. This happens EVERY call (not just when
+    ``max(resolved_level, _THIRD_PARTY_LOGGER_LEVEL)`` — see that constant's
+    docstring for why WARNING is a hard secret-safety FLOOR, not merely reducing
+    noise. The pin only ever QUIETS relative to the operator's own resolved
+    ``level``, never loosens below it: a DEBUG/INFO floor still yields WARNING (so
+    URL-bearing INFO records can never leak), while an ERROR floor yields ERROR on
+    these loggers too rather than spilling WARNING chatter below the operator's
+    chosen floor. This happens EVERY call (not just when
     ``logger`` is the root) since these loggers propagate up to the root either
     way; a caller passing a non-root ``logger`` (tests, mainly) still gets the
     same quieting so no test path silently relies on the child not having it.
@@ -455,9 +503,18 @@ def configure_logging(level: str, *, logger: logging.Logger | None = None) -> Lo
     target = logger if logger is not None else logging.getLogger()
     handler = LogCaptureHandler()
     target.addHandler(handler)
-    target.setLevel(_resolve_log_level(level))
+    resolved = resolve_log_level(level)
+    target.setLevel(resolved)
+    # Pin the third-party HTTP client loggers to ``max(resolved, WARNING)``: the
+    # pin only ever QUIETS relative to the operator's floor, never loosens below
+    # it. WARNING is the secret-safety FLOOR (see _THIRD_PARTY_LOGGER_LEVEL) -- a
+    # DEBUG/INFO operator level still yields WARNING here, so the URL-bearing INFO
+    # records can never leak -- but an ERROR operator floor now yields ERROR on
+    # httpx/httpcore too, honouring the operator's chosen floor instead of
+    # spilling WARNING chatter below it.
+    third_party_level = max(resolved, _THIRD_PARTY_LOGGER_LEVEL)
     for name in _THIRD_PARTY_LOGGERS_TO_QUIET:
-        logging.getLogger(name).setLevel(_THIRD_PARTY_LOGGER_LEVEL)
+        logging.getLogger(name).setLevel(third_party_level)
     for name in _TELEMETRY_LOGGERS:
         logging.getLogger(name).setLevel(_TELEMETRY_LOGGER_LEVEL)
     return handler

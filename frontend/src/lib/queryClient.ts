@@ -28,9 +28,14 @@ export const queryClient = new QueryClient({
 
 /** Stable query-key roots so mutations can invalidate precisely. */
 export const queryKeys = {
+  authMe: ['auth', 'me'] as const,
   setupStatus: ['setup', 'status'] as const,
+  setupPlexServers: ['setup', 'plex-servers'] as const,
   settings: ['settings'] as const,
   plexLibraries: ['settings', 'plex-libraries'] as const,
+  // Kept OFF the ['settings'] prefix on purpose: a settings save must not
+  // invalidate the recovery-key existence check (they are independent facts).
+  appKeyStatus: ['app-key', 'status'] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
   queue: ['queue'] as const,

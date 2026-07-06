@@ -67,7 +67,7 @@ function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () 
   return (
     <li className="rounded-xl border border-hairline bg-surface">
       {/* role="button" (not a native <button>) so the block-level row content
-          (div/p/ul/li) stays valid HTML5 — mirrors the PosterCard convention. */}
+          (div/p/ul/li) stays valid HTML5. */}
       <div
         role="button"
         tabIndex={0}

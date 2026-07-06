@@ -48,6 +48,24 @@ class LibraryRoots:
     anime_movie: str | None = None
     anime_tv: str | None = None
 
+    def __post_init__(self) -> None:
+        """Normalize a whitespace-only field to ``None`` at construction (issue #83).
+
+        A stored setting that is present but only whitespace (e.g. an operator
+        submitting a stray space through ``PUT /settings``) is truthy in Python and
+        would otherwise sail past every ``if self.movies`` check below -- and past
+        every caller's own truthy check on the field -- as if it were a real,
+        configured root. Normalizing HERE, once, at the single shared bundle every
+        caller builds and reads from, means ``configured()``/``fallback_for()`` and
+        direct field access all see the same honest ``None`` for a blank value,
+        with no scattered ``.strip()`` calls needed at each call site. Uses
+        ``object.__setattr__`` because the dataclass is frozen.
+        """
+        for field in ("movies", "tv", "anime_movie", "anime_tv"):
+            value = getattr(self, field)
+            if isinstance(value, str) and not value.strip():
+                object.__setattr__(self, field, None)
+
     def configured(self) -> tuple[str, ...]:
         """Every non-empty configured root, in declaration order."""
         return tuple(r for r in (self.movies, self.tv, self.anime_movie, self.anime_tv) if r)
@@ -88,12 +106,25 @@ def deepest_containing_root(path: str, roots: Sequence[str]) -> str | None:
     best: str | None = None
     best_depth = -1
     for root in roots:
-        if not root:
+        if not root or not root.strip():
             continue
         root_norm = os.path.normpath(root)
-        if candidate != root_norm and not candidate.startswith(root_norm + os.sep):
+        if root_norm == os.sep:
+            # The filesystem root is a special case: ``root_norm + os.sep`` would
+            # build "//" (normpath never leaves a trailing separator on "/"
+            # itself), which no absolute path starts with -- so the general
+            # prefix check below can never match "/" and it would fail closed
+            # for every child even though "/" trivially contains every absolute
+            # path. Match directly instead of via the "+ os.sep" prefix probe.
+            contains = candidate.startswith(os.sep)
+            # Depth 0: shallower than any real root (e.g. "/media" is depth 1),
+            # so a nested root configured alongside "/" still wins as "deepest".
+            depth = 0
+        else:
+            contains = candidate == root_norm or candidate.startswith(root_norm + os.sep)
+            depth = root_norm.count(os.sep)
+        if not contains:
             continue
-        depth = root_norm.count(os.sep)
         if depth > best_depth:
             best = root
             best_depth = depth

@@ -1895,7 +1895,9 @@ async def test_claim_refuses_to_delete_a_movie_pinned_before_the_claim(
 
     monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
 
-    async def _forbidden_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _forbidden_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         raise AssertionError("purge must never run once the claim has lost")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _forbidden_purge)
@@ -1969,7 +1971,9 @@ async def test_claim_refuses_to_delete_a_season_whose_parent_pinned_before_the_c
 
     monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
 
-    async def _forbidden_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _forbidden_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         raise AssertionError("purge must never run once the parent-pin claim has lost")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _forbidden_purge)
@@ -2029,7 +2033,9 @@ async def test_claim_loser_on_a_concurrent_status_change_never_deletes(
 
     monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
 
-    async def _forbidden_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _forbidden_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         raise AssertionError("purge must never run for a claim loser")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _forbidden_purge)
@@ -2083,7 +2089,9 @@ async def test_failed_delete_restores_the_claimed_row_to_available(
         sessionmaker_, tmdb_id=403, title="Unlink Fails", library_path=library_path
     )
 
-    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _erroring_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         # The claim already flipped the row to 'evicted' and committed; the delete
         # itself now fails (e.g. EACCES / EIO) with nothing removed.
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
@@ -2127,6 +2135,151 @@ async def test_failed_delete_restores_the_claimed_row_to_available(
     assert history == []  # no eviction recorded for a delete that never happened
 
 
+async def test_deferred_purge_does_not_restore_while_replacement_import_owns_path(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A purge deferred to an active replacement import is not a real unlink
+    failure: restoring the old row would leave two live rows claiming one path
+    once the replacement import finalizes. Keep the eviction claim + breadcrumb
+    standing so the next sweep's interrupted-eviction recovery can decide after
+    the import settles."""
+    library_path = _movie_file(tmp_path, "Import Owns Path.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=423, title="Import Owns Path", library_path=library_path
+    )
+
+    async def _deferred_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        assert hold_purge_registration is True
+        return PurgeResult(
+            PurgeOutcome.deferred,
+            0,
+            "deferred: an import is placing into this path",
+        )
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _deferred_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Import Owns Path",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=423, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is None
+    assert Path(library_path).exists()  # the import owns the path; nothing was deleted
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 423)))
+            .scalars()
+            .all()
+        )
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert history == []
+
+
+async def test_tv_purge_registration_stays_held_until_eviction_finalizes(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The import-vs-purge exclusion must cover finalization too, not only the
+    filesystem delete. A same-row TV re-import beginning after delete but before
+    the breadcrumb clear can stamp the same deterministic season_dir; eviction's
+    value-predicated clear would then erase the fresh breadcrumb. Holding the
+    purge registration through the finalize commit makes that placement defer."""
+    season_dir = tmp_path / "tv" / "Finalize Race" / "Season 01"
+    episode = season_dir / "Finalize Race - S01E01.mkv"
+    episode.parent.mkdir(parents=True)
+    episode.write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=424, title="Finalize Race", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_request_id = season_row.id
+
+    attempted_placement_allowed: list[bool] = []
+    original_clear = SqlSeasonRequestRepository.clear_library_path_if_set
+
+    async def _clear_after_import_attempt(
+        self: SqlSeasonRequestRepository,
+        season_request_id: int,
+        *,
+        expected_path: str | None = None,
+    ) -> bool:
+        attempted_placement_allowed.append(
+            eviction_service.purge_service.begin_placement(str(season_dir))
+        )
+        if attempted_placement_allowed[-1]:
+            eviction_service.purge_service.end_placement(str(season_dir))
+        return await original_clear(self, season_request_id, expected_path=expected_path)
+
+    monkeypatch.setattr(
+        SqlSeasonRequestRepository,
+        "clear_library_path_if_set",
+        _clear_after_import_attempt,
+    )
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Finalize Race",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(season_dir),
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=424,
+        size_bytes=1024,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is not None
+    assert attempted_placement_allowed == [False]
+    assert not season_dir.exists()
+    # Registration was released after finalize, so later imports can proceed.
+    assert eviction_service.purge_service.begin_placement(str(season_dir)) is True
+    eviction_service.purge_service.end_placement(str(season_dir))
+
+
 async def test_failed_season_delete_restores_the_claimed_season_to_available(
     sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2149,7 +2302,9 @@ async def test_failed_season_delete_restores_the_claimed_season_to_available(
         )
         season_request_id = season_row.id
 
-    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _erroring_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
@@ -2476,7 +2631,9 @@ async def test_failed_delete_restore_cancels_the_in_window_movie_regrab(
         await session.commit()
         regrab_id = regrab.id
 
-    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _erroring_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
@@ -2541,7 +2698,9 @@ async def test_failed_delete_restore_leaves_a_regrab_that_already_grabbed(
         await session.commit()
         regrab_id = regrab.id
 
-    async def _erroring_purge(_fs: object, _path: str) -> PurgeResult:
+    async def _erroring_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _erroring_purge)
@@ -3311,7 +3470,9 @@ async def test_finalize_flips_a_cancelled_rearm_to_evicted_and_the_guard_holds(
     async with sessionmaker_() as session:
         # The purge fake deletes "successfully" while the re-arm + user cancel
         # land on the row -- compressed to the end state the finalize then sees.
-        async def _cancelling_purge(_fs: object, _path: str) -> PurgeResult:
+        async def _cancelling_purge(
+            _fs: object, _path: str, *, hold_purge_registration: bool = False
+        ) -> PurgeResult:
             row = await session.get(SeasonRequest, season_id)
             assert row is not None
             row.status = RequestStatus.cancelled

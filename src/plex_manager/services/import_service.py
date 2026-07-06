@@ -103,10 +103,6 @@ _IMPORT_READY_RAW_STATES: frozenset[str] = frozenset(
 _MAX_BLOCK_REASONS: Final = 10
 
 
-class _NoVideoError(Exception):
-    """No importable video file was found under the resolved content path."""
-
-
 class _UnsafeContentPathError(Exception):
     """The download client reported a content path outside its save path."""
 
@@ -156,50 +152,41 @@ def _resolve_content(status: DownloadStatus | None, download_path: str | None) -
     return None
 
 
-def _resolve_source(fs: FileSystemPort, content_path: str) -> tuple[str, int, str]:
-    """Find the primary video file under ``content_path``: ``(abs_path, size, rel)``.
+def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, int, str]]:
+    """Enumerate EVERY candidate video file under a download's content.
 
-    ``rel`` includes the release FOLDER, not just the file. A torrent whose folder
-    carries the title/quality (``The.Matrix.1999.1080p.WEB-DL/movie.mkv``) but ships
-    a generic feature file would otherwise reach the validator as a token-less
-    ``movie.mkv`` and be wrongly rejected as wrong/unknown media; anchoring the
-    relative path ABOVE the download root keeps the folder tokens — and any
-    ``CD1``/``Disc 1`` split-disk marker under it — in the string the validator
-    parses. For a single-file torrent (``content_path`` is the file) the anchor is
-    the save dir, so ``rel`` is just the token-rich filename, which is sufficient.
-    """
-    src = fs.largest_video_file(content_path)
-    if src is None:
-        raise _NoVideoError(content_path)
-    anchor = (
-        os.path.dirname(os.path.normpath(content_path))
-        if os.path.isdir(content_path)
-        else os.path.dirname(content_path)
-    )
-    return src, os.path.getsize(src), os.path.relpath(src, anchor)
+    Returns ``(abs_path, size, rel)`` for each eligible file. ``rel`` is anchored
+    ABOVE the download root, so it includes the release FOLDER, not just the file.
+    A torrent whose folder carries the title/quality
+    (``The.Matrix.1999.1080p.WEB-DL/movie.mkv``) but ships a generic feature file
+    would otherwise reach the validator as a token-less ``movie.mkv`` and be
+    wrongly rejected as wrong/unknown media; anchoring the relative path above the
+    download root keeps the folder tokens — and any ``CD1``/``Disc 1`` split-disk
+    marker under it — in the string the validator parses.
 
-
-def _resolve_tv_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, int, str]]:
-    """Enumerate EVERY candidate video file under a TV download's content.
-
-    Same anchor-above-content-root trick as :func:`_resolve_source` (the release
-    folder's season/quality tokens stay in the parsed relative path), but returns
-    every eligible file rather than picking one "largest" feature: a season pack
-    legitimately ships many independently-valid episodes, each validated on its
-    own by :func:`~plex_manager.domain.import_validation.validate_season_import`.
+    Shared by BOTH the movie and TV import paths (issue #69): the validator is
+    designed to see EVERY candidate so it can drop sample/trailer/extra names
+    itself and pick the largest surviving feature. Handing it a single
+    pre-selected "largest" file (the old movie behaviour) let a larger
+    featurette/proof/decoy beside the real feature be the only file the validator
+    ever saw, wrongly blocking the download as ``NO_VIDEO_FILE`` / wrong-media even
+    though the true feature was present. The movie path picks its one feature from
+    the returned list via :func:`~plex_manager.domain.import_validation.validate_import`
+    (largest non-sample survivor); the TV path validates every file independently
+    via :func:`~plex_manager.domain.import_validation.validate_season_import` (a
+    season pack legitimately ships many independently-valid episodes).
     """
     root_path = Path(content_path)
     if root_path.is_file():
-        # A single-file torrent (no season-pack folder): mirror
-        # ``largest_video_file``'s is_file branch (adapters/filesystem/local.py)
-        # verbatim -- the lone file is the only candidate, and its filename alone
-        # is sufficient (no folder to anchor above). Same containment + extension
-        # guard as that branch: a single-episode grab is a single-file torrent, so
-        # a content root that is ITSELF a symlink escaping its own parent
-        # directory (or that isn't even a video file) must never be followed, or
-        # the importer would copy an arbitrary out-of-tree file into the public
-        # TV library. An honest "no video found" ([]) -> whole-download block,
-        # never a silent skip.
+        # A single-file torrent (no release folder): mirror ``largest_video_file``'s
+        # is_file branch (adapters/filesystem/local.py) verbatim -- the lone file is
+        # the only candidate, and its filename alone is sufficient (no folder to
+        # anchor above). Same containment + extension guard as that branch: a
+        # single-file grab is a single-file torrent, so a content root that is
+        # ITSELF a symlink escaping its own parent directory (or that isn't even a
+        # video file) must never be followed, or the importer would copy an
+        # arbitrary out-of-tree file into the public library. An honest "no video
+        # found" ([]) -> whole-download block, never a silent skip.
         resolved = os.path.realpath(content_path)
         parent_real = os.path.realpath(root_path.parent)
         if root_path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(
@@ -573,9 +560,8 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    try:
-        src, size, source_rel = await asyncio.to_thread(_resolve_source, fs, content)
-    except _NoVideoError:
+    sources = await asyncio.to_thread(_resolve_sources, fs, content)
+    if not sources:
         await _block(
             session,
             download_repo,
@@ -585,11 +571,15 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
-    # Validate the file IS the requested movie at acceptable quality (same brain as
-    # search), gating on profile-allowed (not equal-to-grab) so benign source drift
-    # imports while CAM/TS/sample is rejected — the prototype's defining-bug fix.
+    # Validate the download IS the requested movie at acceptable quality (same brain
+    # as search), gating on profile-allowed (not equal-to-grab) so benign source
+    # drift imports while CAM/TS/sample is rejected — the prototype's defining-bug
+    # fix. Hand the validator EVERY candidate (issue #69), not one pre-selected
+    # "largest": it drops sample/trailer/extra-named files itself and picks the
+    # largest surviving feature, so a larger featurette/proof/decoy beside the real
+    # feature no longer blinds it into a false ``NO_VIDEO_FILE`` / wrong-media block.
     validation = validate_import(
-        [VideoFile(relative_path=source_rel, size_bytes=size)],
+        [VideoFile(relative_path=rel, size_bytes=size) for _abs, size, rel in sources],
         parser=parser,
         profile=profile,
         expected_title=request.title,
@@ -603,6 +593,23 @@ async def _import_download_locked(
         await _block(session, download_repo, download_id, reason, request_id=request.id)
         return await download_repo.get_by_hash(torrent_hash)
 
+    # Map the validator's chosen feature back to its absolute source path — exactly
+    # the ``abs_by_rel`` shape the TV path uses — so placement copies the file the
+    # validator actually selected, not a separately re-derived "largest". An
+    # ``accepted`` validation ALWAYS carries a chosen ``video`` (accepted is defined
+    # as "no rejections", reachable only after a feature was picked), so the None
+    # guard is unreachable defence-in-depth for the type checker.
+    if validation.video is None:  # pragma: no cover - accepted implies a chosen feature
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "no video file found in the download",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
+    src = abs_by_rel[validation.video.relative_path]
     ext = os.path.splitext(src)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
@@ -867,7 +874,7 @@ async def _import_tv_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
-    sources = await asyncio.to_thread(_resolve_tv_sources, fs, content)
+    sources = await asyncio.to_thread(_resolve_sources, fs, content)
     if not sources:
         await _block(
             session,
@@ -1000,7 +1007,14 @@ async def _import_tv_locked(
         # the movie path, conditional on the row still being resumable (an operator's
         # mark_failed during the validation gap above must not be overwritten).
         claimed = await download_repo.update_status_if_in(
-            download_id, DownloadState.Importing.value, _RESUMABLE
+            download_id,
+            DownloadState.Importing.value,
+            _RESUMABLE,
+            # Clear any prior block reason on a clean retry (issue #73), mirroring the
+            # movie path: a row re-entering import from ``ImportBlocked`` must not carry
+            # its stale ``failed_reason`` forward into a successful import, or the queue
+            # and audit trail would keep showing a block that no longer applies.
+            clear_failed_reason=True,
         )
         if not claimed:
             await session.rollback()
@@ -1084,6 +1098,11 @@ async def _import_tv_locked(
             DownloadState.Imported.value,
             frozenset({DownloadState.Importing.value}),
             download_path=str(season_dir),
+            # Clear any prior block reason on finalize (issue #73), mirroring the movie
+            # path: a TV row that reached ``Imported`` via a retry must land with a null
+            # ``failed_reason`` so a successfully-imported season never displays a stale
+            # import-block reason (honesty over silence - the state and the reason agree).
+            clear_failed_reason=True,
         )
         if not finalized:
             await session.rollback()
@@ -1150,7 +1169,14 @@ async def run_import_cycle(
     """
     download_repo = SqlDownloadRepository(session)
     for row in await download_repo.list_active():
-        if row.status in _AUTO_DRAIN and row.media_request_id is not None:
+        # Auto-drain EVERY resumable row, ownerless ones included (issue #74). A row
+        # whose ``media_request_id`` is NULL used to be filtered out here and so sat
+        # in ``ImportPending`` / ``Importing`` forever, never surfacing. But
+        # ``_import_download_locked`` already handles an ownerless row honestly — it
+        # blocks it as a retryable ``ImportBlocked`` ("import has no owning request")
+        # — so letting it through turns an invisible stuck row into a visible,
+        # retryable block instead of silently skipping it every cycle.
+        if row.status in _AUTO_DRAIN:
             try:
                 await import_download(
                     download_id=row.id,

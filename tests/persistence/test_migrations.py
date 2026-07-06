@@ -11,15 +11,25 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
+import plex_manager.models as models
 from plex_manager.config import get_settings
+from plex_manager.db import Base
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 # The last revision before TV support — an existing install would be at (at least)
 # this point when the TV migration first runs.
 _PRE_TV_REVISION = "41d427bd38e6"
+_EXPECTED_ENUM_CHECK_NAMES = {
+    "blocklist": {"ck_blocklist_media_type_enum", "ck_blocklist_reason_enum"},
+    "download_history": {"ck_download_history_event_type_enum"},
+    "media_requests": {"ck_media_requests_media_type_enum", "ck_media_requests_status_enum"},
+    "request_dedup_locks": {"ck_request_dedup_locks_media_type_enum"},
+    "season_requests": {"ck_season_requests_status_enum"},
+    "downloads": {"ck_downloads_media_type_enum"},
+}
 
 
 def _alembic(db: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -51,6 +61,23 @@ def _media_request_cols(db: Path) -> set[str]:
         return {r[1] for r in con.execute("PRAGMA table_info(media_requests)")}
     finally:
         con.close()
+
+
+def test_fresh_schema_uses_migration_enum_check_constraint_names() -> None:
+    engine = create_engine("sqlite://")
+    try:
+        assert models.MediaRequest.__tablename__ == "media_requests"
+        Base.metadata.create_all(engine)
+        inspector = inspect(engine)
+
+        names_by_table = {
+            table: {constraint["name"] for constraint in inspector.get_check_constraints(table)}
+            for table in _EXPECTED_ENUM_CHECK_NAMES
+        }
+
+        assert names_by_table == _EXPECTED_ENUM_CHECK_NAMES
+    finally:
+        engine.dispose()
 
 
 def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> None:

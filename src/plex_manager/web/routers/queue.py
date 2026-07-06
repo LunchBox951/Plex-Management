@@ -32,7 +32,7 @@ from plex_manager.services.grab_service import (
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
 )
-from plex_manager.services.queue_service import InvalidStateTransitionError
+from plex_manager.services.queue_service import InvalidStateTransitionError, RemovalInProgressError
 from plex_manager.web.deps import (
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
@@ -47,7 +47,7 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_session,
     get_tv_root_optional,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.routers.search_preview import run_preview
 from plex_manager.web.schemas import (
@@ -63,7 +63,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/queue",
     tags=["queue"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 _QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -213,19 +213,26 @@ async def grab_endpoint(
             request.id, season=body.season
         )
         if active is None:
+            # Both services are FLUSH-ONLY -- a genuine compare-and-swap (issue
+            # #72), not read-then-write -- so this caller owns the commit boundary
+            # for both branches uniformly, and commits ONLY when the CAS actually
+            # won: a concurrent writer that already moved the row out of the
+            # parkable set (e.g. a racing grab landed it on ``downloading``
+            # between the ``find_active_for_request`` re-check above and this
+            # write) is left alone rather than silently regressed.
             if body.season is not None:
                 # TV: record the dead-end on the SEASON so it is visible + retryable
                 # per season, and let the parent MediaRequest.status stay a computed
-                # rollup (never a direct write _recompute_parent would clobber). The
-                # season service is FLUSH-ONLY by contract, so this caller owns the
-                # commit boundary (request_service.mark_no_acceptable_release, the
-                # movie path, commits internally instead).
-                await season_request_service.mark_no_acceptable_release(
+                # rollup (never a direct write _recompute_parent would clobber).
+                parked = await season_request_service.mark_no_acceptable_release(
                     session, media_request_id=request.id, season_number=body.season
                 )
+            else:
+                parked = await request_service.mark_no_acceptable_release(session, request.id)
+            if parked:
                 await session.commit()
             else:
-                await request_service.mark_no_acceptable_release(session, request.id)
+                await session.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)
@@ -365,5 +372,13 @@ async def mark_failed_endpoint(
     except InvalidStateTransitionError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="invalid_state_transition"
+        ) from exc
+    except RemovalInProgressError as exc:
+        # Ownership protocol step 5 (queue_service module docstring): another
+        # mark-failed's torrent removal is mid-flight for this download, so its
+        # remove decision is already irreversible -- superseding it would lie.
+        # Honest 409; the operator retries once the in-flight call resolves.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="removal_in_progress"
         ) from exc
     return _to_item(record)

@@ -2,11 +2,15 @@
 # (setup, config, recovery) happens in the browser. See ADR-0003 / ADR-0005.
 #
 #   cp .env.example .env   # then adjust
+#   docker compose up -d
+#
+# First-run setup needs no token — it is claimed by the first Plex server owner to
+# sign in. Optional hardening: to ALSO gate setup behind a shared secret, add a
+# PLEX_MANAGER_SETUP_TOKEN to .env before starting:
 #   python - <<'PY' >> .env
 #   import secrets
 #   print(f"PLEX_MANAGER_SETUP_TOKEN={secrets.token_urlsafe(32)}")
 #   PY
-#   docker compose up -d
 #
 # Canary host: set PLEX_MANAGER_IMAGE=ghcr.io/<owner>/plex-manager:edge
 # Release host: ...:stable (the default in .env.example)
@@ -21,9 +25,10 @@ services:
       # Keep the in-container app and healthcheck on 8000. Use
       # PLEX_MANAGER_HOST_BIND / PLEX_MANAGER_HOST_PORT below for the host socket.
       PLEX_MANAGER_PORT: "8000"
-      # Required for first-run setup when a port is published. The setup wizard
-      # asks for this token before accepting service probes or completion.
-      PLEX_MANAGER_SETUP_TOKEN: ${PLEX_MANAGER_SETUP_TOKEN:?set PLEX_MANAGER_SETUP_TOKEN in .env}
+      # Optional hardening — never required. When set (here or via .env), first-run
+      # setup ALSO demands this token; unset/empty boots tokenless and setup is
+      # claimed by the first Plex server owner to sign in.
+      PLEX_MANAGER_SETUP_TOKEN: ${PLEX_MANAGER_SETUP_TOKEN:-}
     ports:
       - "${PLEX_MANAGER_HOST_BIND:-127.0.0.1}:${PLEX_MANAGER_HOST_PORT:-8000}:8000"
     volumes:

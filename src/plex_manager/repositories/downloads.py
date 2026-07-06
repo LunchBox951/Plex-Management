@@ -29,6 +29,16 @@ _TERMINAL_DOWNLOAD_STATUSES: frozenset[str] = frozenset(
 )
 
 
+class _NoReasonPredicate:
+    """Sentinel type for :meth:`SqlDownloadRepository.update_status_if_in`'s
+    ``require_failed_reason``: distinguishes "no predicate" (the default) from a
+    real predicate value — which may legitimately be ``None`` ("the reason must
+    currently be NULL")."""
+
+
+NO_REASON_PREDICATE = _NoReasonPredicate()
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     """Coerce a stored timestamp to tz-aware UTC.
 
@@ -69,8 +79,20 @@ class SqlDownloadRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get_by_hash(self, torrent_hash: str) -> DownloadRecord | None:
+    async def get_by_hash(
+        self, torrent_hash: str, *, populate_existing: bool = False
+    ) -> DownloadRecord | None:
+        """Return the download for ``torrent_hash``, or ``None``.
+
+        ``populate_existing`` mirrors :meth:`list_active` (issue #77): with
+        ``expire_on_commit=False`` a plain SELECT lets this session's identity map
+        win over the DB row, so a status a DIFFERENT session committed mid-call
+        (e.g. a superseding ``mark_failed`` completing the row while the original
+        call yields) would be reported stale. ``True`` forces the fresh DB values.
+        """
         stmt = select(Download).where(Download.torrent_hash == torrent_hash)
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
@@ -180,12 +202,28 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
-    async def list_active(self) -> list[DownloadRecord]:
+    async def list_active(self, *, populate_existing: bool = False) -> list[DownloadRecord]:
+        """Active (non-terminal) downloads as read-model DTOs.
+
+        ``populate_existing`` (issue #77) overwrites already-loaded identity-map
+        rows with the freshly-SELECTed DB values instead of letting the identity
+        map win. A row that LOST a status compare-and-swap earlier in the SAME
+        session — e.g. ``reconcile_and_list`` computed a transition from a stale
+        snapshot but a concurrent writer had already advanced the row to another
+        NON-terminal status — otherwise keeps its stale in-memory status
+        (``expire_on_commit=False``, so the intervening commit does not refresh it,
+        and a plain SELECT does not overwrite a loaded instance). The terminal
+        post-cycle read then reports a status the DB no longer holds. Refreshing on
+        that read closes the honesty gap; the default stays ``False`` so ordinary
+        callers keep the cheaper identity-map behaviour.
+        """
         stmt = (
             select(Download)
             .where(Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES))
             .order_by(Download.id)
         )
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
@@ -307,6 +345,7 @@ class SqlDownloadRepository:
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -324,6 +363,15 @@ class SqlDownloadRepository:
         cleanup in the SAME compare-and-swap — never overwriting a row that already
         left ``allowed_from``. ``clear_download_path`` / ``clear_first_seen_at`` /
         ``clear_failed_reason`` take precedence over their corresponding set values.
+
+        ``require_failed_reason`` (default: no predicate) additionally constrains the
+        WHERE to rows whose CURRENT ``failed_reason`` exactly equals the given value
+        (``None`` means "must be NULL"). This is queue_service's durable-ownership
+        predicate: its nonce-carrying ``failed_reason`` marker identifies WHICH
+        actor/call owns a ``failed_pending`` row, so gating a mutation on the exact
+        observed/owned marker value makes the ownership decision and the write ONE
+        atomic statement — a concurrent restamp changes ``failed_reason`` and this
+        statement then matches 0 rows, with no check-then-act window.
 
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS
@@ -361,6 +409,10 @@ class SqlDownloadRepository:
             .values(**values)
             .execution_options(synchronize_session="fetch")
         )
+        if not isinstance(require_failed_reason, _NoReasonPredicate):
+            # SQLAlchemy renders ``== None`` as ``IS NULL``, so one comparison
+            # covers both the exact-marker and the must-be-unset predicates.
+            stmt = stmt.where(Download.failed_reason == require_failed_reason)
         # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
         # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it). The
         # cast target is referenced at runtime (not a string) so CodeQL does not read

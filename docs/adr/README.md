@@ -15,8 +15,16 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0007](0007-sqlite-alembic-migrations.md) | SQLite + Alembic migrations from day one | Accepted |
 | [0008](0008-release-parser-guessit.md) | `guessit` parses; the quality model stays ours | Accepted |
 | [0009](0009-frontend-typed-spa.md) | Frontend is a typed SPA (Vite + React + TS), contract-bound | Accepted |
+| [0010](0010-import-pipeline-honest-availability.md) | Import pipeline + honest two-phase availability contract | Accepted |
+| [0011](0011-tv-season-episode-support.md) | TV support — per-season lifecycle with a computed rollup | Accepted |
+| [0012](0012-operability-health-logs-eviction.md) | Operability — health surface, log store, watch-aware eviction | Accepted |
+| [0013](0013-auto-grab-worker.md) | Auto-grab worker — background request→search→grab spine | Accepted |
+| [0014](0014-correction-verbs.md) | Correction verbs — report-issue (blocklist + purge + re-search) and cancel | Accepted |
+| [0015](0015-anime-library-routing.md) | Anime library routing (optional anime roots, routing only) | Accepted |
+| [0016](0016-plex-oauth-owner-sessions.md) | Plex-first setup + browser-side Plex sign-in (single verify endpoint, session cookie) | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
-first frontend-alpha session. Full context:
+first frontend-alpha session; 0010–0016 across the subsequent beta feature
+sessions (each ADR's own header carries its date). Full context:
 [`docs/design/overview.md`](../design/overview.md).
