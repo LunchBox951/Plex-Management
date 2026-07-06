@@ -20,7 +20,7 @@ function errorMessage(err: unknown): string {
     const message = (err as { message: unknown }).message
     if (typeof message === 'string') return message
   }
-  return 'Something went wrong. Please try again.'
+  return 'The request failed for an unknown reason. Try again.'
 }
 
 export function Blocklist() {
