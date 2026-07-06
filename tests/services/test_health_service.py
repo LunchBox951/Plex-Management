@@ -279,10 +279,12 @@ async def test_health_probe_straddling_a_settings_invalidate_is_not_resurrected(
         # above (still using the now-superseded "old-key") is in flight.
         cache.invalidate("prowlarr")
         release_probe.set()
-        await probe_task
+        stale_results = await probe_task
 
-    # The completed probe's cache.set() must have been a no-op: the stale,
-    # pre-invalidation result is not sitting in the cache.
+    # The straddling probe still answers its OWN caller with the result it
+    # derived — only the cache write is suppressed. The stale, pre-invalidation
+    # result must not be sitting in the cache afterwards.
+    assert next(r for r in stale_results if r.name == "prowlarr").status == "ok"
     assert cache.get("prowlarr") is None
 
     # The very next read is an honest miss, so re-probing with the NEW
