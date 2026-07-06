@@ -344,6 +344,15 @@ class SettingsStore:
         ordinary update path below -- the net effect is a true upsert: the last
         write to actually commit always wins, and exactly one row exists either
         way.
+
+        Last-write-wins is the RIGHT resolution for ordinary settings -- every
+        caller is storing a preference, and the later write should win exactly
+        as it would have arriving sequentially -- but it makes ``set`` unsuitable
+        for CREATE-ONCE identity keys: a loser absorbing its insert conflict
+        here falls through to the value assignment below and OVERWRITES the
+        winner's freshly minted identity, with no way to tell the caller which
+        value actually survived. Keys that must never rotate once minted (e.g.
+        the plex.tv client identifier) go through :meth:`set_if_absent` instead.
         """
         is_secret = key in SECRET_SETTING_KEYS
         row = await self._row(key)
@@ -386,6 +395,75 @@ class SettingsStore:
             row.value = value
             row.encrypted_value = None
         await self._session.flush()
+
+    async def set_if_absent(self, key: str, value: str) -> str:
+        """Create ``key`` exactly once; return the value that actually persisted.
+
+        The CREATE-ONCE counterpart to :meth:`set`, for keys that are minted
+        IDENTITIES rather than preferences. :meth:`set` is an upsert whose
+        concurrent-first-write recovery deliberately resolves to last-write-wins
+        -- right when every caller is asking to store a preference, wrong when
+        the key is an identity that must never rotate once minted. The canonical
+        example is ``plex_oauth_client_identifier``, the app's persisted plex.tv
+        device identity: plex.tv registers every DISTINCT
+        ``X-Plex-Client-Identifier`` as a NEW device on the operator's account,
+        and the auth, setup, and settings routers all present the stored value
+        on their plex.tv calls, so exactly one identifier may ever persist.
+        Routing such a key through :meth:`set` would let the LOSER of two racing
+        first sign-ins absorb its insert conflict and then OVERWRITE the
+        winner's freshly persisted identifier while returning its own, unstored
+        candidate to its caller -- the two racers would proceed under DIFFERENT
+        device identities and the stored one would have silently rotated
+        mid-flight.
+
+        Semantics: if a value is already persisted under ``key``, return it
+        untouched and write nothing (this call's candidate is discarded).
+        Otherwise INSERT this call's ``value`` inside a SAVEPOINT -- the same
+        scoped recovery as :meth:`set`; see that docstring for why a
+        full-session rollback is forbidden here -- and if the INSERT collides
+        with a concurrent first write, roll the SAVEPOINT back, re-read, and
+        return the WINNER's committed value: never overwrite it, and never
+        raise for what is a benign race. The return value is therefore always
+        the value that actually persisted, so every racer converges on the same
+        identity. Secret keys route to the encrypted column exactly like
+        :meth:`set`.
+        """
+        is_secret = key in SECRET_SETTING_KEYS
+        row = await self._row(key)
+        if row is None:
+            # SAVEPOINT before add(), for the same snapshot reason as set().
+            nested = await self._session.begin_nested()
+            row = Setting(key=key, is_secret=is_secret)
+            self._session.add(row)
+            try:
+                await self._session.flush()
+            except IntegrityError:
+                # A concurrent first write won. Scoped rollback (see set()),
+                # then ADOPT the winner's row -- crucially, without falling
+                # through to the value assignment below.
+                await nested.rollback()
+                existing = await self._row(key)
+                if existing is None:  # pragma: no cover - the conflicting row must exist
+                    raise
+                row = existing
+            else:
+                await nested.commit()
+        persisted = row.encrypted_value if is_secret else row.value
+        if persisted is not None:
+            return persisted
+        # No value has ever persisted under this key: either the row was created
+        # by THIS call just above, or (degenerately) a pre-existing row carries
+        # nothing in the column this key's current classification reads. Writing
+        # this call's value here IS the create, not a rotation.
+        row.is_secret = is_secret
+        if is_secret:
+            row.encrypted_value = value
+            row.value = None
+        else:
+            row.value = value
+            row.encrypted_value = None
+        await self._session.flush()
+        return value
 
     async def delete(self, key: str) -> None:
         """Remove ``key`` if present; a no-op when it was never set.

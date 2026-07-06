@@ -1319,6 +1319,114 @@ async def test_settings_store_set_collision_recovery_does_not_lose_earlier_write
         assert await SettingsStore(session).get("tv_root") == "/loser"
 
 
+async def test_settings_store_set_if_absent_creates_and_returns_value_when_missing(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The genuine first create: the key persists this call's value and returns
+    it, so the caller can adopt the return value unconditionally."""
+    async with sessionmaker_() as session:
+        returned = await SettingsStore(session).set_if_absent("movies_root", "/minted")
+        await session.commit()
+
+    assert returned == "/minted"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == "/minted"
+
+
+async def test_settings_store_set_if_absent_returns_existing_value_without_overwrite(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """An already-persisted value is returned untouched and the candidate is
+    discarded — create-once, where ``set()`` would have upserted the candidate."""
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("movies_root", "/original")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        returned = await SettingsStore(session).set_if_absent("movies_root", "/candidate")
+        await session.commit()
+
+    assert returned == "/original"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == "/original"
+
+
+async def test_settings_store_set_if_absent_adopts_winner_on_concurrent_first_create(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create-once counterpart of
+    ``test_settings_store_set_recovers_from_concurrent_first_write``: same race,
+    OPPOSITE resolution. ``set()`` resolves its first-write collision to
+    last-write-wins (right for preferences); ``set_if_absent()`` must resolve it
+    to FIRST-write-wins (right for minted identities like the plex.tv client
+    identifier, which must never rotate): the loser's recovery ADOPTS the
+    winner's committed value — returning it to the caller — and never overwrites
+    it. Simulated identically: the winner commits first, then the loser's own
+    initial ``_row`` lookup is stubbed to report "not found" once (as if it ran
+    before the winner's insert became visible), forcing it down the insert path
+    so its flush collides on the real unique index.
+    """
+    async with sessionmaker_() as winner_session:
+        await SettingsStore(winner_session).set("movies_root", "/winner")
+        await winner_session.commit()
+
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_row(self, key)
+
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
+
+    async with sessionmaker_() as loser_session:
+        # Must not raise — and must hand back the WINNER's value, not its own.
+        returned = await SettingsStore(loser_session).set_if_absent("movies_root", "/loser")
+        await loser_session.commit()
+
+    assert returned == "/winner"  # the loser converged on the persisted identity
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Setting).where(Setting.key == "movies_root")))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # never two rows for the same key
+    # The winner's value survived intact: create-once means the stored identity
+    # never rotates, no matter how many racers arrive after it persisted.
+    assert rows[0].value == "/winner"
+
+
+async def test_settings_store_set_if_absent_routes_secret_keys_to_encrypted_column(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Secret routing parity with ``set()``: a secret key created via
+    ``set_if_absent`` lands in the encrypted column, never plaintext at rest."""
+    plaintext = "first-write-tmdb-secret"
+    async with sessionmaker_() as session:
+        returned = await SettingsStore(session).set_if_absent("tmdb_api_key", plaintext)
+        await session.commit()
+    assert returned == plaintext
+
+    # Inspect the raw columns, bypassing the EncryptedStr decryption layer.
+    async with sessionmaker_() as session:
+        raw_value, raw_encrypted, is_secret = (
+            await session.execute(
+                text(
+                    "SELECT value, encrypted_value, is_secret "
+                    "FROM settings WHERE key = 'tmdb_api_key'"
+                )
+            )
+        ).one()
+    assert bool(is_secret) is True
+    assert raw_value is None  # the plaintext column is never used for a secret
+    assert raw_encrypted is not None
+    assert plaintext not in raw_encrypted  # at-rest value is ciphertext, not plaintext
+
+
 async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(
     client: httpx.AsyncClient,
     seed: SeedFn,
