@@ -222,6 +222,30 @@ def test_prefer_season_pack_breaks_ties_toward_the_pack() -> None:
     assert result.no_acceptable_release is False
 
 
+def test_score_reflects_accepted_rank_not_additive_seeder_lead() -> None:
+    # #105: with prefer_season_pack, the comparator ranks a low-seeder pack ABOVE
+    # a non-pack with a >1e6 seeder lead (the scope tiebreak fires before
+    # seeders). The OLD additive score gave the non-pack a higher score than the
+    # pack ranked above it -- score contradicted the accepted order.
+    pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
+    single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=2_000_000)
+    result = decide(
+        [single, pack],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+
+    assert result.accepted[0].candidate is pack
+    assert result.accepted[1].candidate is single
+    # Score must not contradict that ordering.
+    assert result.accepted[0].score >= result.accepted[1].score
+    scores = [scored.score for scored in result.accepted]
+    assert scores == sorted(scores, reverse=True)
+
+
 def test_multi_season_pack_is_permanently_rejected_not_preferred() -> None:
     # Issue #24 beta posture (mirrors Sonarr's MultiSeasonSpecification): a
     # multi-season pack (S01-S03) is a PERMANENT rejection, never scored -- even
