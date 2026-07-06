@@ -54,7 +54,11 @@ describe('PlexLogin', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /sign in with plex/i }))
 
-    expect(await screen.findByText('Plex popup blocked')).toBeInTheDocument()
+    expect(
+      await screen.findByText(
+        'Your browser blocked the Plex sign-in popup. Allow popups for this site and try again.',
+      ),
+    ).toBeInTheDocument()
     expect(h.signIn).not.toHaveBeenCalled()
     expect(onSignedIn).not.toHaveBeenCalled()
   })
@@ -66,7 +70,11 @@ describe('PlexLogin', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /sign in with plex/i }))
 
-    expect(await screen.findByText('No owned servers')).toBeInTheDocument()
+    expect(
+      await screen.findByText(
+        'Your Plex account does not own any Plex Media Server. Sign in with the account that owns the server this app should manage.',
+      ),
+    ).toBeInTheDocument()
     expect(onSignedIn).not.toHaveBeenCalled()
   })
 

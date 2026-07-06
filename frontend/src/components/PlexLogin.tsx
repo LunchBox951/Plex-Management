@@ -1,23 +1,21 @@
 import { useState } from 'react'
 import { usePlexSignIn } from '../api/hooks'
-import { type ApiError, toApiError } from '../lib/errors'
+import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { PlexPinError, openPlexPopup, runPlexPinFlow } from '../lib/plexOAuth'
+import { AuthErrorCard } from './AuthErrorCard'
 import { Button } from './ui/Button'
-import { StateMessage } from './ui/feedback'
 
 /**
- * Turn a sign-in failure into an honest, retryable message. Browser-side PIN
- * failures ({@link PlexPinError}) aren't API errors, so humanize their typed
- * code the same way {@link toApiError} humanizes a backend `detail` — never a
- * generic "went wrong". Backend rejections are already normalized `ApiError`s
- * (thrown by `unwrap`) carrying a human message. Task 11's AuthErrorCard
- * replaces this with crafted per-code copy.
+ * Normalize a sign-in failure into what {@link AuthErrorCard} renders. Browser
+ * PIN failures ({@link PlexPinError}) pass straight through; backend rejections
+ * are already normalized `ApiError`s (thrown by `unwrap`) and pass through too;
+ * any other throw is routed through {@link toApiError} so the card never
+ * receives `undefined` and never renders a generic "went wrong".
  */
-function signInErrorMessage(err: unknown): string {
-  if (err instanceof PlexPinError) {
-    return toApiError({ detail: err.code }).message
-  }
-  return (err as ApiError).message
+function toDisplayError(err: unknown): ApiError | PlexPinError {
+  if (err instanceof PlexPinError) return err
+  if (isApiError(err)) return err
+  return toApiError(err)
 }
 
 /**
@@ -37,7 +35,7 @@ export function PlexLogin({
 }) {
   const signIn = usePlexSignIn()
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | undefined>(undefined)
+  const [error, setError] = useState<ApiError | PlexPinError | undefined>(undefined)
 
   const startSignIn = () => {
     if (busy) return
@@ -54,7 +52,7 @@ export function PlexLogin({
       await signIn.mutateAsync({ auth_token: authToken })
       onSignedIn()
     } catch (err) {
-      setError(signInErrorMessage(err))
+      setError(toDisplayError(err))
     } finally {
       setBusy(false)
     }
@@ -75,7 +73,7 @@ export function PlexLogin({
         </div>
         {error ? (
           <div className="mt-4">
-            <StateMessage tone="error" title="Sign-in failed" message={error} />
+            <AuthErrorCard error={error} />
           </div>
         ) : null}
       </div>
