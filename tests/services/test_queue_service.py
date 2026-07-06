@@ -917,8 +917,10 @@ async def test_reconcile_phase_c_commit_failure_recovers_via_retry(
     )
 
     async with sessionmaker_() as session:
-        # Fail the FIRST Phase C commit (#2 overall); the retry (#3) succeeds.
-        _fail_commit_on(session, monkeypatch, {2})
+        # Commits: #1 Phase A, #2 the remove=done restamp (guarded, not under
+        # test here), #3.. the Phase C attempts. Fail the FIRST Phase C commit
+        # (#3); the retry (#4) succeeds.
+        _fail_commit_on(session, monkeypatch, {3})
         await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
 
     async with sessionmaker_() as session:
@@ -942,9 +944,10 @@ async def test_reconcile_phase_c_exhaustion_leaves_reconcilable_state_next_cycle
         sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
     )
 
-    # Every Phase C commit (#2, #3, #4 -- the 3 bounded attempts) fails.
+    # Commits: #1 Phase A, #2 the remove=done restamp, #3-#5 the three bounded
+    # Phase C attempts -- fail exactly those three.
     async with sessionmaker_() as session:
-        _fail_commit_on(session, monkeypatch, {2, 3, 4})
+        _fail_commit_on(session, monkeypatch, {3, 4, 5})
         with pytest.raises(OperationalError):
             await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
 
@@ -1003,7 +1006,9 @@ async def test_mark_failed_phase_c_exhaustion_leaves_reconcilable_state(
         request_id, download_id = request.id, download.id
 
     async with sessionmaker_() as session:
-        _fail_commit_on(session, monkeypatch, {2, 3, 4})  # every Phase C attempt
+        # Commits: #1 Phase A, #2 the remove=done restamp, #3-#5 the Phase C
+        # attempts -- fail exactly those three.
+        _fail_commit_on(session, monkeypatch, {3, 4, 5})
         with pytest.raises(OperationalError):
             await queue_service.mark_failed(
                 session, FakeQbittorrent(statuses=[]), download_id=download_id, blocklist=False
@@ -2436,3 +2441,109 @@ async def test_completed_removal_is_durable_and_heals_without_a_client(
     assert download.failed_reason == "marked failed by operator"
     assert request is not None and request.status is RequestStatus.searching
     assert blocklist == []  # blocklist=False survived
+
+
+# ---------------------------------------------------------------------------
+# Round 10: guard-first ordering in Phase B, and reconcile-owned removals
+# persist their outcome too.
+# ---------------------------------------------------------------------------
+
+
+async def test_removal_guard_bars_operators_before_the_pre_delete_reproof(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-10 finding 1 (interleave b): the removal-physics guard is registered
+    SYNCHRONOUSLY before the durable re-proof's first await, so an operator
+    arriving in the re-proof window is refused by the guard -- there is no yield
+    point between "operators are barred" and "the row's durable state is
+    verified". (Interleave a -- the operator finishing BEFORE the bar -- is
+    caught by the re-proof read instead:
+    test_phase_b_durable_reproof_skips_deletion_after_operator_won.)"""
+    _, download_id = await _seed_movie_request_and_download(sessionmaker_)
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.first_seen_at = datetime.now(UTC) - timedelta(minutes=11)
+        await session.commit()
+
+    refusals: list[Exception] = []
+    async with sessionmaker_() as session:
+        real_rollback = session.rollback
+
+        async def _probe_then_rollback() -> None:
+            # The FIRST Phase-B rollback runs immediately after the guard-add;
+            # with guard-first ordering an operator registration here must be
+            # refused. (Were the guard registered after the re-proof, this
+            # registration would succeed and the probe list would stay empty.)
+            in_flight = queue_service._reconcile_removals_in_flight  # pyright: ignore[reportPrivateUsage]
+            if download_id in in_flight and not refusals:
+                try:
+                    _register_operator_claim(
+                        download_id, _OperatorFailFlags(blocklist=False, remove_torrent=False)
+                    )
+                except RemovalInProgressError as exc:
+                    refusals.append(exc)
+            await real_rollback()
+
+        monkeypatch.setattr(session, "rollback", _probe_then_rollback)
+        qbt = FakeQbittorrent(statuses=[])
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The pre-delete window refused the operator (guard registered first)...
+    assert len(refusals) == 1 and isinstance(refusals[0], RemovalInProgressError)
+    # ...and the cycle then completed normally.
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None and download.status == "failed"
+    assert not queue_service._reconcile_removals_in_flight  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_reconcile_owned_removal_outcome_is_durable_and_heals_without_client(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-10 finding 2: a PLAIN (unmarked) reconcile failure whose delete
+    succeeded but whose Phase C exhausted now carries the reconcile-provenance
+    remove=done record, so the DB-only healer completes it during an outage with
+    the reconcile-default semantics -- it no longer waits for client I/O that
+    already happened."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.first_seen_at = datetime.now(UTC) - timedelta(minutes=11)
+        await session.commit()
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        # Commits: #1 Phase A, #2 the reconcile-done restamp, #3-#5 the Phase C
+        # attempts -- exhaust exactly those three.
+        _fail_commit_on(session, monkeypatch, {3, 4, 5})
+        with pytest.raises(OperationalError):
+            await queue_service.reconcile_and_list(qbt, session)
+
+    # The removal ran AND the reconcile-provenance outcome is durable.
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None and download.status == "failed_pending"
+    assert (
+        download.failed_reason
+        == "reconcile failure in progress (blocklist=yes, remove=done, nonce=0)"
+    )
+
+    # The DB-only healer (outage / unconfigured client) completes it with the
+    # reconcile DEFAULT semantics: blocklisted (reason 'failed'), re-armed, and
+    # an honest final reason -- without any client.
+    async with sessionmaker_() as session:
+        await queue_service.heal_failed_pending_without_client(session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None and download.status == "failed"
+    assert download.failed_reason == "download failed; torrent already removed"
+    assert request is not None and request.status is RequestStatus.searching
+    assert len(blocklist) == 1
+    assert blocklist[0].reason.value == "failed"  # reconcile vocabulary, not operator
