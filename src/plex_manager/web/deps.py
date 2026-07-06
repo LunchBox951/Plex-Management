@@ -650,12 +650,32 @@ async def get_library_optional(
         return None
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Normalize an unset OR whitespace-only stored root value to ``None`` (issue #83).
+
+    A root setting is free-text and may be present-but-whitespace (e.g. an
+    operator submitting a stray space through ``PUT /settings``, which has no
+    validator stripping it, unlike ``POST /setup/complete``'s
+    ``SetupCompleteRequest``). Such a value is truthy in Python, so a plain
+    ``or None``/``if not root`` check -- as every ``get_*_root*`` function below
+    used to do -- lets it sail through as if it were a real, configured root:
+    downstream code would then resolve a relative whitespace path against the
+    process CWD instead of tripping the honest "unset" refusal it's meant to.
+    This is the ONE place every root read goes through, so the strip lives here
+    rather than scattered across each of the six getters below.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 async def get_movies_root(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> str:
     """Return the configured Movies library root, or 409 if unset."""
-    root = await SettingsStore(session).get("movies_root")
-    if not root:
+    root = _blank_to_none(await SettingsStore(session).get("movies_root"))
+    if root is None:
         raise ServiceNotConfiguredError("movies_root")
     return root
 
@@ -665,13 +685,14 @@ async def get_movies_root_optional(
 ) -> str | None:
     """Return the Movies root, or ``None`` when unset (the importer waits, no crash).
 
-    Normalizes a falsy stored value (``""``) to ``None`` so callers can use a
-    single ``is None`` check, matching :func:`get_movies_root`'s ``if not root``
-    treatment of "unset". Without this, an empty-string root would sail past an
-    ``is None`` guard downstream and silently resolve relative paths against the
-    process CWD instead of tripping the honest ``ImportBlocked`` it's meant to.
+    Normalizes a falsy OR whitespace-only stored value to ``None`` (see
+    :func:`_blank_to_none`) so callers can use a single ``is None`` check,
+    matching :func:`get_movies_root`'s treatment of "unset". Without this, an
+    empty-string or whitespace-only root would sail past an ``is None`` guard
+    downstream and silently resolve relative paths against the process CWD
+    instead of tripping the honest ``ImportBlocked`` it's meant to.
     """
-    return await SettingsStore(session).get("movies_root") or None
+    return _blank_to_none(await SettingsStore(session).get("movies_root"))
 
 
 async def get_tv_root(
@@ -685,8 +706,8 @@ async def get_tv_root(
     replaces an upfront 409 -- but this is kept as the required counterpart for
     symmetry with the movies-side dependency and any future all-or-nothing route).
     """
-    root = await SettingsStore(session).get("tv_root")
-    if not root:
+    root = _blank_to_none(await SettingsStore(session).get("tv_root"))
+    if root is None:
         raise ServiceNotConfiguredError("tv_root")
     return root
 
@@ -698,11 +719,11 @@ async def get_tv_root_optional(
     per-row ``ImportBlocked`` for a tv download instead of a crash or an upfront
     409 that would also block importing movies on an install with no TV root).
 
-    Mirrors :func:`get_movies_root_optional`'s falsy-to-``None`` normalization: an
-    empty-string setting is "unset", not a valid root, so downstream ``is None``
-    guards must see it as such.
+    Mirrors :func:`get_movies_root_optional`'s falsy-or-whitespace-to-``None``
+    normalization: an empty-string OR whitespace-only setting is "unset", not a
+    valid root, so downstream ``is None`` guards must see it as such.
     """
-    return await SettingsStore(session).get("tv_root") or None
+    return _blank_to_none(await SettingsStore(session).get("tv_root"))
 
 
 async def get_anime_movie_root_optional(
@@ -710,11 +731,11 @@ async def get_anime_movie_root_optional(
 ) -> str | None:
     """Return the anime-movies library root, or ``None`` when unset (ADR-0015).
 
-    Mirrors :func:`get_movies_root_optional`'s falsy-to-``None`` normalization.
-    Unset is the common case — importing then routes an anime movie to the
-    normal ``movies_root`` exactly as before this setting existed.
+    Mirrors :func:`get_movies_root_optional`'s falsy-or-whitespace-to-``None``
+    normalization. Unset is the common case — importing then routes an anime
+    movie to the normal ``movies_root`` exactly as before this setting existed.
     """
-    return await SettingsStore(session).get("anime_movie_root") or None
+    return _blank_to_none(await SettingsStore(session).get("anime_movie_root"))
 
 
 async def get_anime_tv_root_optional(
@@ -722,11 +743,11 @@ async def get_anime_tv_root_optional(
 ) -> str | None:
     """Return the anime-TV library root, or ``None`` when unset (ADR-0015).
 
-    Mirrors :func:`get_tv_root_optional`'s falsy-to-``None`` normalization.
-    Unset is the common case — importing then routes an anime episode to the
-    normal ``tv_root`` exactly as before this setting existed.
+    Mirrors :func:`get_tv_root_optional`'s falsy-or-whitespace-to-``None``
+    normalization. Unset is the common case — importing then routes an anime
+    episode to the normal ``tv_root`` exactly as before this setting existed.
     """
-    return await SettingsStore(session).get("anime_tv_root") or None
+    return _blank_to_none(await SettingsStore(session).get("anime_tv_root"))
 
 
 # --------------------------------------------------------------------------- #

@@ -128,6 +128,21 @@ class TtlCache[V]:
         """
         self._store.clear()
 
+    def invalidate(self, key: str) -> None:
+        """Drop ONE cached entry (a no-op if it isn't present).
+
+        The targeted counterpart to :meth:`clear` (issue #93): ``PUT /settings``
+        calls this per AFFECTED subsystem after a successful credential save —
+        e.g. a Plex URL/token edit invalidates only the ``"plex"`` entry — so the
+        very next ``GET /health`` re-probes that subsystem instead of serving up
+        to ``SUBSYSTEM_PROBE_TTL_SECONDS`` of pre-edit ``ok``/``down``/
+        ``not_configured`` state back to the operator who just fixed (or broke) a
+        credential. Deliberately narrower than :meth:`clear`: an edit to ONE
+        subsystem's credentials must never discard another subsystem's still-valid
+        cached probe.
+        """
+        self._store.pop(key, None)
+
 
 # --------------------------------------------------------------------------- #
 # Value objects

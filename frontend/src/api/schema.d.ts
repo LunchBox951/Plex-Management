@@ -588,6 +588,17 @@ export interface paths {
          *     silently leave the whole threshold-to-target band unable to relieve pressure
          *     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
          *     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
+         *
+         *     After a successful commit, invalidates (issue #93) the cached ``GET /health``
+         *     probe for every subsystem whose credential field(s) were ACTUALLY persisted
+         *     this call (see :data:`_SUBSYSTEM_CREDENTIAL_FIELDS`) — tracked separately from
+         *     ``body.model_fields_set`` because a field can be present-but-``None`` (leave
+         *     unchanged) or a secret sent back as the ``"***"`` mask (also a no-op); neither
+         *     should invalidate anything, since nothing about that subsystem's config
+         *     actually changed. Runs strictly AFTER ``session.commit()`` so a failed save
+         *     (a raised validation error above, or a DB error during the write loop/commit)
+         *     never touches the cache — a failed write must leave any still-valid cached
+         *     probe exactly as it was.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
