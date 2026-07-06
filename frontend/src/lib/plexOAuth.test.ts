@@ -59,7 +59,7 @@ describe('openPlexPopup', () => {
     const open = vi.spyOn(window, 'open').mockReturnValue(popup)
     expect(openPlexPopup()).toBe(popup)
     expect(open).toHaveBeenCalledTimes(1)
-    expect(open.mock.calls[0][0]).toBe('about:blank')
+    expect(open.mock.calls[0]?.[0]).toBe('about:blank')
   })
 
   it('returns null when the browser blocks the popup', () => {
@@ -179,5 +179,51 @@ describe('runPlexPinFlow', () => {
     const assertion = expect(promise).rejects.toMatchObject({ code: 'plex_pin_expired' })
     await vi.advanceTimersByTimeAsync(4000)
     await assertion
+  })
+
+  it('closes the popup even when the flow ends in failure', async () => {
+    vi.useFakeTimers()
+    const popup = makePopup()
+    // Never approved; the deadline is one poll out, so the flow expires and must
+    // still tidy up the popup it was handed (not just on the success path).
+    const fetch = vi.fn().mockResolvedValue(pinBody({ id: 9, expiresIn: 1 }))
+    vi.stubGlobal('fetch', fetch)
+
+    const promise = runPlexPinFlow(popup)
+    const assertion = expect(promise).rejects.toMatchObject({ code: 'plex_pin_expired' })
+    await vi.advanceTimersByTimeAsync(1000)
+    await assertion
+    expect(popup.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to a finite expiry when plex.tv omits a usable expiresIn (no NaN infinite poll)', async () => {
+    vi.useFakeTimers()
+    const popup = makePopup()
+    // A malformed create response (expiresIn not a finite number) must not leave
+    // the deadline as NaN — the guard falls back to 1800s so expiry still fires.
+    const fetch = vi.fn().mockResolvedValue(pinBody({ id: 9, expiresIn: Number.NaN }))
+    vi.stubGlobal('fetch', fetch)
+
+    const promise = runPlexPinFlow(popup)
+    const assertion = expect(promise).rejects.toMatchObject({ code: 'plex_pin_expired' })
+    await vi.advanceTimersByTimeAsync(1_800_000)
+    await assertion
+  })
+
+  it('treats an empty-string authToken as not-yet-approved', async () => {
+    vi.useFakeTimers()
+    const popup = makePopup()
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(pinBody({ id: 3 })) // create
+      .mockResolvedValueOnce(pinBody({ id: 3, authToken: '' })) // poll 1: empty, not approved
+      .mockResolvedValueOnce(pinBody({ id: 3, authToken: 'tok-real' })) // poll 2: approved
+    vi.stubGlobal('fetch', fetch)
+
+    const promise = runPlexPinFlow(popup)
+    await vi.advanceTimersByTimeAsync(1000) // poll 1: '' must NOT resolve the flow
+    await vi.advanceTimersByTimeAsync(1000) // poll 2: real token resolves
+
+    await expect(promise).resolves.toBe('tok-real')
   })
 })

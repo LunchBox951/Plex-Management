@@ -6,7 +6,7 @@ import { Blocklist } from './routes/Blocklist'
 import { Discover } from './routes/Discover'
 import { Logs } from './routes/Logs'
 import { NotFound } from './routes/NotFound'
-import { PlexCallback } from './routes/PlexCallback'
+import { PlexPopupLoading } from './routes/PlexPopupLoading'
 import { QualityProfile } from './routes/QualityProfile'
 import { Queue } from './routes/Queue'
 import { Requests } from './routes/Requests'
@@ -18,7 +18,7 @@ export const router = createBrowserRouter([
   // The wizard lives outside the gate so it is reachable pre-init (the backend
   // allowlists it too; see SetupGuardMiddleware).
   { path: '/setup', element: <SetupWizard /> },
-  { path: '/auth/plex/callback', element: <PlexCallback /> },
+  { path: '/login/plex/loading', element: <PlexPopupLoading /> },
   {
     element: <SetupGate />,
     children: [

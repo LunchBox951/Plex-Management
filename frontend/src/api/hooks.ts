@@ -22,8 +22,7 @@ import type {
   LogsResponse,
   LogsTailResponse,
   PlexLibraryOption,
-  PlexLoginCompleteRequest,
-  PlexLoginStartResponse,
+  PlexSignInRequest,
   QualityProfileResponse,
   QueueItem,
   QueueResponse,
@@ -56,18 +55,18 @@ export function useAuthMe(enabled = true) {
   })
 }
 
-export function useStartPlexLogin() {
-  return useMutation({
-    mutationFn: async (): Promise<PlexLoginStartResponse> =>
-      unwrap(await client.POST('/api/v1/auth/plex/start')),
-  })
-}
-
-export function useCompletePlexLogin() {
+/**
+ * Verify a browser-obtained plex.tv token and mint a session. The browser ran
+ * the plex.tv PIN flow itself (see `lib/plexOAuth`); this posts the resulting
+ * `auth_token` for the backend to re-derive identity + ownership and set the
+ * session cookie. On success the api-key path is dropped and the fresh
+ * `/auth/me` answer is seeded so the gate re-renders authenticated at once.
+ */
+export function usePlexSignIn() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (body: PlexLoginCompleteRequest): Promise<AuthMeResponse> =>
-      unwrap(await client.POST('/api/v1/auth/plex/complete', { body })),
+    mutationFn: async (body: PlexSignInRequest): Promise<AuthMeResponse> =>
+      unwrap(await client.POST('/api/v1/auth/plex', { body })),
     onSuccess: (data) => {
       disableApiKeyAuth()
       qc.setQueryData(queryKeys.authMe, data)

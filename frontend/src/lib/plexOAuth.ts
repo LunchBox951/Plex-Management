@@ -135,31 +135,45 @@ function delay(ms: number): Promise<void> {
   })
 }
 
+/** plex.tv PINs live 30 minutes; the fallback when a create response omits a
+ * usable `expiresIn`, so the expiry guard always fires instead of polling forever. */
+const DEFAULT_PIN_TTL_SECONDS = 1800
+
 /**
  * Create the PIN, point the popup at plex.tv's hosted login, and poll once a
- * second until the PIN carries an `authToken`. Resolves with that token (closing
- * the popup) or rejects with a {@link PlexPinError} carrying one of the four
- * terminal {@link PlexPinFailure} codes.
+ * second until the PIN carries an `authToken`. Resolves with that token or
+ * rejects with a {@link PlexPinError} carrying one of the four terminal
+ * {@link PlexPinFailure} codes. The popup is closed on EVERY terminal path (a
+ * `finally`), so a failed flow never strands an orphaned window.
  */
 export async function runPlexPinFlow(popup: Window | null): Promise<string> {
   if (popup === null) {
     throw new PlexPinError('plex_popup_blocked')
   }
-  const pin = await createPin()
-  popup.location.href = authPopupUrl(pin.code)
-  const expiresAt = Date.now() + pin.expiresIn * 1000
-  for (;;) {
-    await delay(POLL_INTERVAL_MS)
-    if (popup.closed) {
-      throw new PlexPinError('plex_popup_closed')
+  try {
+    const pin = await createPin()
+    popup.location.href = authPopupUrl(pin.code)
+    // A malformed create response (non-finite `expiresIn`) must not leave the
+    // deadline as NaN — `Date.now() >= NaN` is always false, which would poll
+    // forever. Fall back to the 30-minute default so expiry still fires.
+    const ttlSeconds = Number.isFinite(pin.expiresIn) ? pin.expiresIn : DEFAULT_PIN_TTL_SECONDS
+    const expiresAt = Date.now() + ttlSeconds * 1000
+    for (;;) {
+      await delay(POLL_INTERVAL_MS)
+      if (popup.closed) {
+        throw new PlexPinError('plex_popup_closed')
+      }
+      if (Date.now() >= expiresAt) {
+        throw new PlexPinError('plex_pin_expired')
+      }
+      const token = await readPinToken(pin.id)
+      // An empty-string token is plex.tv's "not approved yet", not a credential —
+      // truthiness (not `!== null`) keeps polling until a real token arrives.
+      if (token) {
+        return token
+      }
     }
-    if (Date.now() >= expiresAt) {
-      throw new PlexPinError('plex_pin_expired')
-    }
-    const token = await readPinToken(pin.id)
-    if (token !== null) {
-      popup.close()
-      return token
-    }
+  } finally {
+    popup.close()
   }
 }

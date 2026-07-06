@@ -103,5 +103,10 @@ export function SetupGate() {
     return <Outlet />
   }
 
-  return <PlexLogin onUseAccessKey={() => setAuthMode('key')} />
+  // usePlexSignIn already seeds /auth/me and invalidates queries on success; the
+  // refetch here re-derives gate state so the newly-authenticated session lands
+  // on <Outlet/> without a reload. (Task 13 restructures this gate.)
+  return (
+    <PlexLogin onSignedIn={() => void auth.refetch()} onUseAccessKey={() => setAuthMode('key')} />
+  )
 }
