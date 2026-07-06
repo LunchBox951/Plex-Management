@@ -33,6 +33,8 @@ __all__ = [
 
 _PLEX_TV_BASE_URL: Final = "https://plex.tv"
 _PLEX_TV_HOST: Final = "plex.tv"
+_HTTP_OK: Final = 200
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_UNAUTHORIZED: Final = 401
 _HTTP_FORBIDDEN: Final = 403
 
@@ -280,7 +282,13 @@ class PlexTvClient:
                 f"Plex request rejected: {method} {_safe_path(url)} ({status})",
                 diagnostics={"host": host, "status": str(status)},
             )
-        if response.is_error:
+        # Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        # (issue #87): ``is_error`` is only true for >=400, so a 3xx (the shared
+        # client never follows redirects) would read as a successful verification
+        # even though it never reached plex.tv/the server. #122 fixed the other
+        # four adapter wrappers but deferred this fifth site because oauth.py lived
+        # only on the then-unmerged PR #45 branch.
+        if not (_HTTP_OK <= status < _HTTP_MULTIPLE_CHOICES):
             raise PlexVerifyError(
                 bad_response_code,
                 f"Plex request failed: {method} {_safe_path(url)} ({status})",

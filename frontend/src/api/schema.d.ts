@@ -3125,13 +3125,22 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Validation Error */
+            /** @description The signed-in admin has no Plex account on file to verify ownership */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Request validation failed, the disk-pressure pair would invert, or the replacement Plex server rejected the effective Plex token */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"] | components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description The replacement Plex server did not answer the /identity probe */
