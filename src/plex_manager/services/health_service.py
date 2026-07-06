@@ -99,11 +99,32 @@ def _now() -> datetime:
 # separate app instances (e.g. in tests) never share stale probe results.
 # --------------------------------------------------------------------------- #
 class TtlCache[V]:
-    """A minimal monotonic-clock TTL cache. Only fresh hits are ever returned."""
+    """A minimal monotonic-clock TTL cache. Only fresh hits are ever returned.
+
+    INVARIANT (Codex P2, the "stale probe straddles an invalidation" race): a
+    result may only be cached if no invalidation happened after the probe that
+    produced it began. Without this, a slow probe running with OLD credentials
+    can straddle a concurrent :meth:`invalidate`: the probe reads a cache miss,
+    starts its (possibly seconds-long) upstream call, THEN a settings write
+    commits and calls :meth:`invalidate` -- but the in-flight probe's
+    ``cache.set()`` still lands afterwards, silently resurrecting the
+    pre-invalidation result and serving it for another full TTL. Each key
+    therefore carries a monotonically increasing GENERATION counter, bumped by
+    :meth:`invalidate`. A caller that might race a concurrent invalidation
+    snapshots the key's generation via :meth:`current_generation` BEFORE
+    starting its (slow) probe, then passes that snapshot back into
+    :meth:`set` as ``generation``: if the generation has moved by the time the
+    probe completes, ``set`` silently no-ops instead of writing the stale
+    value. Callers that own the only writer for a key (nothing else can
+    invalidate it concurrently) may omit ``generation`` and keep the old
+    unconditional-write behavior -- e.g. the disk-preview cache in
+    ``web/routers/ops.py``.
+    """
 
     def __init__(self, ttl_seconds: float = SUBSYSTEM_PROBE_TTL_SECONDS) -> None:
         self._ttl = ttl_seconds
         self._store: dict[str, tuple[float, V]] = {}
+        self._generation: dict[str, int] = {}
 
     def get(self, key: str) -> V | None:
         entry = self._store.get(key)
@@ -115,7 +136,29 @@ class TtlCache[V]:
             return None
         return value
 
-    def set(self, key: str, value: V) -> None:
+    def current_generation(self, key: str) -> int:
+        """Snapshot ``key``'s current generation counter.
+
+        Call this BEFORE starting a probe that might race a concurrent
+        :meth:`invalidate`, then pass the returned value back into
+        :meth:`set` once the probe completes -- see the class docstring's
+        invariant.
+        """
+        return self._generation.get(key, 0)
+
+    def set(self, key: str, value: V, *, generation: int | None = None) -> None:
+        """Cache ``value`` under ``key``.
+
+        ``generation``, when given, must be a snapshot :meth:`current_generation`
+        took for this key BEFORE the probe that produced ``value`` started. If
+        :meth:`invalidate` ran for this key since then, the generation has
+        moved and this call is a silent no-op -- writing the stale,
+        pre-invalidation result back in would resurrect it for another full
+        TTL (see the class docstring). Omit ``generation`` to always write
+        unconditionally.
+        """
+        if generation is not None and generation != self._generation.get(key, 0):
+            return
         self._store[key] = (time.monotonic() + self._ttl, value)
 
     def clear(self) -> None:
@@ -129,7 +172,8 @@ class TtlCache[V]:
         self._store.clear()
 
     def invalidate(self, key: str) -> None:
-        """Drop ONE cached entry (a no-op if it isn't present).
+        """Drop ONE cached entry (a no-op if it isn't present) and bump its
+        generation counter.
 
         The targeted counterpart to :meth:`clear` (issue #93): ``PUT /settings``
         calls this per AFFECTED subsystem after a successful credential save —
@@ -140,8 +184,15 @@ class TtlCache[V]:
         credential. Deliberately narrower than :meth:`clear`: an edit to ONE
         subsystem's credentials must never discard another subsystem's still-valid
         cached probe.
+
+        The generation bump ALWAYS happens, even when there was nothing cached to
+        drop: a probe already in flight when this runs has necessarily already
+        taken its ``current_generation`` snapshot (it can only be in flight after
+        a cache-miss :meth:`get`), so bumping unconditionally still fences it out
+        (see the class docstring's invariant).
         """
         self._store.pop(key, None)
+        self._generation[key] = self._generation.get(key, 0) + 1
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +404,10 @@ async def _check_plex(
     cached = cache.get("plex")
     if cached is not None:
         return cached
+    # Snapshotted BEFORE the (possibly slow) probe below so a concurrent
+    # ``PUT /settings`` invalidate() that lands while this probe is in flight is
+    # detected -- see ``TtlCache``'s class docstring invariant.
+    generation = cache.current_generation("plex")
     if not creds.plex_url or not creds.plex_token:
         result = await _not_configured("plex")
     else:
@@ -363,7 +418,7 @@ async def _check_plex(
             detail=None if response.ok else response.message,
             checked_at=_now(),
         )
-    cache.set("plex", result)
+    cache.set("plex", result, generation=generation)
     return result
 
 
@@ -373,6 +428,9 @@ async def _check_prowlarr(
     cached = cache.get("prowlarr")
     if cached is not None:
         return cached
+    # See ``_check_plex``'s identical comment: snapshot BEFORE probing so a
+    # concurrent invalidate() mid-probe is detected, not silently overwritten.
+    generation = cache.current_generation("prowlarr")
     if not creds.prowlarr_url or not creds.prowlarr_api_key:
         result = await _not_configured("prowlarr")
     else:
@@ -383,7 +441,7 @@ async def _check_prowlarr(
             detail=None if response.ok else response.message,
             checked_at=_now(),
         )
-    cache.set("prowlarr", result)
+    cache.set("prowlarr", result, generation=generation)
     return result
 
 
@@ -393,6 +451,9 @@ async def _check_qbittorrent(
     cached = cache.get("qbittorrent")
     if cached is not None:
         return cached
+    # See ``_check_plex``'s identical comment: snapshot BEFORE probing so a
+    # concurrent invalidate() mid-probe is detected, not silently overwritten.
+    generation = cache.current_generation("qbittorrent")
     if (
         not creds.qbittorrent_url
         or not creds.qbittorrent_username
@@ -409,7 +470,7 @@ async def _check_qbittorrent(
             detail=None if response.ok else response.message,
             checked_at=_now(),
         )
-    cache.set("qbittorrent", result)
+    cache.set("qbittorrent", result, generation=generation)
     return result
 
 
@@ -419,6 +480,9 @@ async def _check_tmdb(
     cached = cache.get("tmdb")
     if cached is not None:
         return cached
+    # See ``_check_plex``'s identical comment: snapshot BEFORE probing so a
+    # concurrent invalidate() mid-probe is detected, not silently overwritten.
+    generation = cache.current_generation("tmdb")
     if not creds.tmdb_api_key:
         result = await _not_configured("tmdb")
     else:
@@ -429,7 +493,7 @@ async def _check_tmdb(
             detail=None if response.ok else response.message,
             checked_at=_now(),
         )
-    cache.set("tmdb", result)
+    cache.set("tmdb", result, generation=generation)
     return result
 
 

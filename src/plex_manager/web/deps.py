@@ -663,11 +663,21 @@ def _blank_to_none(value: str | None) -> str | None:
     process CWD instead of tripping the honest "unset" refusal it's meant to.
     This is the ONE place every root read goes through, so the strip lives here
     rather than scattered across each of the six getters below.
+
+    WHITESPACE-ONLY DETECTION ONLY: a stripped-empty value becomes ``None``,
+    but any non-blank value is returned byte-identical to what was stored --
+    NEVER ``.strip()``-ed. A previous version returned the stripped value for
+    the non-blank case too, which silently retargeted import/scan/evict to a
+    different path than the one ``GET /settings`` displays whenever a stored
+    root carried incidental leading/trailing padding (e.g. ``"  /media/x  "``):
+    the operator sees one path, but every filesystem operation resolves
+    another. Settings display and filesystem behavior must always agree.
     """
     if value is None:
         return None
-    stripped = value.strip()
-    return stripped or None
+    if not value.strip():
+        return None
+    return value
 
 
 async def get_movies_root(

@@ -234,6 +234,35 @@ async def test_whitespace_only_root_reads_back_as_unset(
         assert await get_tv_root_optional(session) is None
 
 
+async def test_padded_non_blank_root_reads_back_byte_identical(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Codex P2: a stored root that is non-blank but carries incidental
+    leading/trailing whitespace (distinct from the ALL-whitespace case
+    ``test_whitespace_only_root_reads_back_as_unset`` above covers) must read
+    back through ``get_*_root_optional`` BYTE-IDENTICAL to what ``GET /settings``
+    displays (``SettingsStore.get``/``redacted`` never strip). ``_blank_to_none``
+    previously ``.strip()``-ed every non-``None`` value, which would silently
+    retarget import/scan/evict to a different directory than the one the
+    operator sees configured -- writing directly via ``SettingsStore`` here
+    (bypassing ``PUT /settings``'s schema validator, which only touches the
+    ALL-whitespace case) isolates ``_blank_to_none``'s own behavior against
+    already-stored data of this shape."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    padded = "  /media/movies  "
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("movies_root", padded)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # What GET /settings would display (SettingsStore.redacted() -> row.value,
+        # never stripped) ...
+        assert await SettingsStore(session).get("movies_root") == padded
+        # ... must match EXACTLY what the importer/eviction dependency resolves --
+        # never a trimmed variant of it.
+        assert await get_movies_root_optional(session) == padded
+
+
 # --------------------------------------------------------------------------- #
 # Service URL shape validation at write time (issue #44)
 # --------------------------------------------------------------------------- #

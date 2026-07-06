@@ -211,6 +211,93 @@ async def test_probe_result_is_refreshed_once_the_ttl_expires() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Codex P2: a probe that straddles a concurrent invalidate() must not
+# resurrect its stale, pre-invalidation result (the generation guard).
+# --------------------------------------------------------------------------- #
+
+
+def test_ttl_cache_set_is_a_no_op_when_the_generation_has_moved() -> None:
+    """Unit-level: exercises ``TtlCache`` directly, simulating the exact
+    interleave a real settings PUT racing an in-flight probe would produce --
+    the probe reads its generation snapshot BEFORE probing, an invalidate()
+    lands while it's "in flight", and the probe's own ``set()`` (using the
+    now-stale snapshot) must be silently dropped."""
+    cache = TtlCache[str](ttl_seconds=60.0)
+
+    # The probe starts: cache miss, so it snapshots the generation before doing
+    # its (here, simulated) slow upstream call.
+    assert cache.get("plex") is None
+    generation = cache.current_generation("plex")
+
+    # A settings PUT commits and invalidates "plex" WHILE the probe above is
+    # still in flight (e.g. awaiting a slow httpx call with the OLD creds).
+    cache.invalidate("plex")
+
+    # The probe finally completes and tries to cache its now-stale result --
+    # this must be a silent no-op, never resurrecting pre-invalidation data.
+    cache.set("plex", "stale-result-from-old-credentials", generation=generation)
+    assert cache.get("plex") is None
+
+    # The next read is an honest cache miss, so the caller re-probes -- this
+    # time with fresh credentials -- and that result caches normally.
+    fresh_generation = cache.current_generation("plex")
+    cache.set("plex", "fresh-result-from-new-credentials", generation=fresh_generation)
+    assert cache.get("plex") == "fresh-result-from-new-credentials"
+
+
+def test_ttl_cache_set_without_generation_still_writes_unconditionally() -> None:
+    """Callers that never race a concurrent invalidate() (e.g. the disk-preview
+    cache in ``web/routers/ops.py``) may omit ``generation`` and keep the plain
+    unconditional-write behavior."""
+    cache = TtlCache[str](ttl_seconds=60.0)
+    cache.invalidate("k")  # bump past generation 0, to prove omission ignores it
+    cache.set("k", "v")
+    assert cache.get("k") == "v"
+
+
+async def test_health_probe_straddling_a_settings_invalidate_is_not_resurrected() -> None:
+    """Integration-level: reproduces the ORIGINAL Codex-flagged race through the
+    real ``_check_prowlarr`` probe path (not just the ``TtlCache`` primitive
+    above) -- a slow probe using OLD credentials is in flight when the
+    equivalent of a ``PUT /settings`` invalidate() lands, and the probe's own
+    ``cache.set()`` afterwards must not resurrect the stale result."""
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+
+    async def slow_handler(_request: httpx.Request) -> httpx.Response:
+        probe_started.set()
+        await release_probe.wait()
+        return httpx.Response(200, json={"version": "1.0"})
+
+    old_creds = HealthCredentials(prowlarr_url="http://prowlarr.local", prowlarr_api_key="old-key")
+    cache = TtlCache[SubsystemHealth](ttl_seconds=60.0)
+
+    async with _client(slow_handler) as client:
+        probe_task = asyncio.create_task(check_subsystems(client, old_creds, cache))
+        await probe_started.wait()
+        # The settings PUT commits and invalidates "prowlarr" WHILE the probe
+        # above (still using the now-superseded "old-key") is in flight.
+        cache.invalidate("prowlarr")
+        release_probe.set()
+        await probe_task
+
+    # The completed probe's cache.set() must have been a no-op: the stale,
+    # pre-invalidation result is not sitting in the cache.
+    assert cache.get("prowlarr") is None
+
+    # The very next read is an honest miss, so re-probing with the NEW
+    # credentials caches a fresh result normally.
+    async def fresh_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"version": "2.0"})
+
+    new_creds = HealthCredentials(prowlarr_url="http://prowlarr.local", prowlarr_api_key="new-key")
+    async with _client(fresh_handler) as client:
+        results = await check_subsystems(client, new_creds, cache)
+    assert next(r for r in results if r.name == "prowlarr").status == "ok"
+    assert cache.get("prowlarr") is not None
+
+
+# --------------------------------------------------------------------------- #
 # R5-3: the four probes must run CONCURRENTLY, not serialize — otherwise
 # several simultaneously-blackholed (timeout, not conn-refused) upstreams stack
 # their ~30s httpx timeouts into minutes before /ops/health returns anything.
