@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { PlexPinError, openPlexPopup, plexClientId, runPlexPinFlow } from './plexOAuth'
+import { PlexPinError, openPlexPopup, plexClientId, runPlexPinFlow, uuidV4 } from './plexOAuth'
+
+/** RFC 4122 v4 shape: the 13th hex digit is `4` (version) and the 17th is one of
+ * 8/9/a/b (variant). Both the native and the getRandomValues fallback must match. */
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 /** A plex.tv v2 pin body, as returned by both POST /pins and GET /pins/{id}. */
 function pinBody(overrides: Record<string, unknown> = {}): Response {
@@ -34,6 +38,34 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+})
+
+describe('uuidV4', () => {
+  it('prefers crypto.randomUUID when it is available (secure context)', () => {
+    vi.stubGlobal('crypto', {
+      randomUUID: vi.fn(() => '11111111-2222-4333-8444-555555555555'),
+      getRandomValues: vi.fn(() => {
+        throw new Error('getRandomValues must not be used when randomUUID exists')
+      }),
+    })
+    expect(uuidV4()).toBe('11111111-2222-4333-8444-555555555555')
+  })
+
+  it('falls back to a well-formed v4 UUID when randomUUID is absent (plain-HTTP LAN)', () => {
+    // Secure-context-only `crypto.randomUUID` is undefined on plain HTTP: stub a
+    // crypto WITHOUT it (getRandomValues alone, as a non-secure context exposes)
+    // and prove the fallback still mints a correctly bit-set v4 UUID.
+    const fill = (bytes: Uint8Array): Uint8Array => {
+      for (let i = 0; i < bytes.length; i += 1) bytes[i] = (i * 37 + 11) % 256
+      return bytes
+    }
+    vi.stubGlobal('crypto', { getRandomValues: vi.fn(fill) })
+    const id = uuidV4()
+    expect(id).toMatch(UUID_V4)
+    // The version/variant nibbles are forced regardless of the random bytes.
+    expect(id[14]).toBe('4') // version 4
+    expect('89ab').toContain(id[19]) // variant 10xx
+  })
 })
 
 describe('plexClientId', () => {

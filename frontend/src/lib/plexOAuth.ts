@@ -38,6 +38,30 @@ const POLL_INTERVAL_MS = 1000
 let memoryClientId: string | null = null
 
 /**
+ * A RFC 4122 v4 UUID. Prefers `crypto.randomUUID`, but that API is restricted to
+ * SECURE contexts (HTTPS / `localhost`) — and this app explicitly supports plain
+ * HTTP LAN deployments (non-Secure cookies), where `crypto.randomUUID` is
+ * `undefined` and calling it throws. That would kill the PIN flow before it even
+ * requests a PIN (surfacing as `plex_tv_unreachable_browser`). So fall back to
+ * `crypto.getRandomValues` — present in EVERY context, secure or not — and set
+ * the version (4) and variant (10xx) bits by hand (RFC 4122 §4.4), so a
+ * per-install client id can always be minted. `randomUUID` stays preferred.
+ */
+export function uuidV4(): string {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  // `noUncheckedIndexedAccess` types a Uint8Array index as `number | undefined`;
+  // the `?? 0` is a typing formality (all 16 indices exist after the fill).
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40 // version 4
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80 // variant 10xx
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+/**
  * A stable, per-install client identifier persisted in localStorage. It MUST be
  * identical for the PIN create and every subsequent poll, so an in-memory
  * fallback keeps it stable for the session even when localStorage is unavailable
@@ -52,7 +76,7 @@ export function plexClientId(): string {
     /* storage unreadable — fall through to the in-memory copy */
   }
   if (memoryClientId !== null) return memoryClientId
-  const id = crypto.randomUUID()
+  const id = uuidV4()
   memoryClientId = id
   try {
     localStorage.setItem(CLIENT_ID_KEY, id)

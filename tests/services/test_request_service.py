@@ -1185,3 +1185,223 @@ async def test_non_admin_claims_ownerless_tv_all_present_row_on_dedup(
         )
     assert len(rows) == 1
     assert rows[0].user_id == claimer_id  # claimed for the requester
+
+
+# --------------------------------------------------------------------------- #
+# Lost-claim race + ownerless recovery/collapse (issue #58, wave 3):           #
+#  - the ownerless-adoption helper must NOT bless a LOST claim race as a silent #
+#    success — the loser is routed through the same foreign-owner 409;          #
+#  - the IntegrityError recovery AND the available-race collapse must ADOPT an  #
+#    ownerless winner before returning/mutating it, never hand back a hidden    #
+#    row the requester's own per-user list/get filter out.                      #
+# --------------------------------------------------------------------------- #
+
+
+async def test_lost_claim_race_loser_gets_foreign_owner_rejection(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-admin deduping onto an OWNERLESS active request whose adoption UPDATE
+    LOSES a concurrent race (0 rows claimed — another user took it first) must get
+    the SAME honest 409 as a row that was already foreign at read time, never a
+    success on a row now owned by someone else that their own /requests list hides."""
+    other_id = await _make_user(sessionmaker_, username="race-victor")
+    claimer_id = await _make_user(sessionmaker_, username="race-loser")
+    tmdb = FakeTmdb(movies={7108: MovieMetadata(tmdb_id=7108, title="Race", year=2020)})
+
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7108, media_type="movie", user_id=None
+        )
+    async with sessionmaker_() as session:
+        seeded = await session.get(MediaRequest, ownerless.id)
+        assert seeded is not None and seeded.user_id is None  # ownerless to start
+
+    async with sessionmaker_() as session:
+
+        async def losing_claim(self: SqlRequestRepository, request_id: int, user_id: int) -> bool:
+            # Simulate losing the adoption race: a concurrent writer takes ownership
+            # between the ownerless read and our UPDATE (which then touches 0 rows).
+            # Assign it in THIS session (create_request's own) so the helper's
+            # get_fresh re-read observes the winning owner, then report the loss.
+            row = await session.get(MediaRequest, request_id)
+            assert row is not None
+            row.user_id = other_id
+            await session.flush()
+            return False
+
+        monkeypatch.setattr(SqlRequestRepository, "claim_if_unowned", losing_claim)
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7108,
+                media_type="movie",
+                user_id=claimer_id,
+                actor_is_admin=False,
+            )
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7108)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # a dedup path — the loser never minted a duplicate row
+    assert rows[0].user_id is None  # the lost-race UPDATE rolled back with the 409
+
+
+async def test_integrity_race_recovery_claims_ownerless_movie_winner(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared user whose INSERT loses the active-unique race to an OWNERLESS
+    automation row must ADOPT that recovery winner: without the claim, the
+    ``winner.user_id is None`` guard passes and the ownerless row is returned
+    behind the caller's own per-user filter — a success that vanishes (issue #58)."""
+    claimer_id = await _make_user(sessionmaker_, username="race-claim-m")
+    tmdb = FakeTmdb(movies={7109: MovieMetadata(tmdb_id=7109, title="Race", year=2020)})
+
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7109, media_type="movie", user_id=None
+        )
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7109,
+            media_type="movie",
+            user_id=claimer_id,
+            actor_is_admin=False,
+        )
+    assert result.id == ownerless.id  # recovered onto the existing active winner
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7109)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # the loser's insert was rolled back — no orphan
+    assert rows[0].user_id == claimer_id  # ownerless winner ADOPTED, not returned hidden
+
+
+async def test_integrity_race_recovery_claims_ownerless_tv_winner_and_grows_seasons(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tv mutate case: the recovery winner is adopted BEFORE ensure_seasons, so
+    the claimer's requested season grows an ownerless automation row they now own —
+    never mutates + returns a row hidden behind their own per-user filter (issue #58)."""
+    claimer_id = await _make_user(sessionmaker_, username="race-claim-tv")
+    tmdb = FakeTmdb(
+        shows={7110: TvMetadata(tmdb_id=7110, title="Race Show", year=2020, season_count=5)}
+    )
+
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7110, media_type="tv", seasons=[1], user_id=None
+        )
+    assert await _season_numbers(sessionmaker_, ownerless.id) == {1}
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7110,
+            media_type="tv",
+            seasons=[2],
+            user_id=claimer_id,
+            actor_is_admin=False,
+        )
+    assert result.id == ownerless.id
+    assert await _season_numbers(sessionmaker_, ownerless.id) == {1, 2}  # grown on the winner
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7110)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].user_id == claimer_id  # ADOPTED before the season mutation
+
+
+async def test_available_race_collapse_claims_ownerless_winner(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The available-race collapse must ADOPT an ownerless EARLIER winner for this
+    user before deleting their own duplicate row — else it deletes their row and
+    returns one their per-user list/get hide. The user's row collapses onto the
+    now-claimed winner: one available row survives, owned by the requester (#58)."""
+    claimer_id = await _make_user(sessionmaker_, username="avail-claimer")
+    tmdb = FakeTmdb(movies={7111: MovieMetadata(tmdb_id=7111, title="Both Avail", year=2020)})
+    library = FakeLibrary(available={7111})
+
+    # An OWNERLESS automation create records the movie in-library first (the winner).
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7111, media_type="movie", user_id=None, library=library
+        )
+    assert ownerless.status == RequestStatus.available.value
+
+    # Force find_in_library to MISS so the non-admin inserts their OWN available row;
+    # the post-commit collapse must then adopt the ownerless winner, not just delete
+    # the user's row and hand back a hidden one.
+    async def racing_find_in_library(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        return None
+
+    monkeypatch.setattr(SqlRequestRepository, "find_in_library", racing_find_in_library)
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7111,
+            media_type="movie",
+            user_id=claimer_id,
+            actor_is_admin=False,
+            library=library,
+        )
+    assert result.id == ownerless.id  # collapsed onto the winner, now visible to them
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7111)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # the user's duplicate was collapsed away
+    assert rows[0].user_id == claimer_id  # winner ADOPTED, not left ownerless-and-hidden
+    assert rows[0].status is RequestStatus.available
