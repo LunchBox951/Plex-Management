@@ -69,8 +69,20 @@ class SqlDownloadRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get_by_hash(self, torrent_hash: str) -> DownloadRecord | None:
+    async def get_by_hash(
+        self, torrent_hash: str, *, populate_existing: bool = False
+    ) -> DownloadRecord | None:
+        """Return the download for ``torrent_hash``, or ``None``.
+
+        ``populate_existing`` mirrors :meth:`list_active` (issue #77): with
+        ``expire_on_commit=False`` a plain SELECT lets this session's identity map
+        win over the DB row, so a status a DIFFERENT session committed mid-call
+        (e.g. a superseding ``mark_failed`` completing the row while the original
+        call yields) would be reported stale. ``True`` forces the fresh DB values.
+        """
         stmt = select(Download).where(Download.torrent_hash == torrent_hash)
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 

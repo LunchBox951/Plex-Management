@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -23,6 +24,13 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import queue_service
+from plex_manager.services.queue_service import (
+    _is_operator_claimed,  # pyright: ignore[reportPrivateUsage]
+    _OperatorFailFlags,  # pyright: ignore[reportPrivateUsage]
+    _owns_operator_claim,  # pyright: ignore[reportPrivateUsage]
+    _register_operator_claim,  # pyright: ignore[reportPrivateUsage]
+    _release_operator_claim,  # pyright: ignore[reportPrivateUsage]
+)
 from tests.web.fakes import FakeQbittorrent
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -30,6 +38,14 @@ SessionMaker = async_sessionmaker[AsyncSession]
 _HASH = "f" * 40
 _TITLE = "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
 _INDEXER = "FakeIndexer"
+
+
+@pytest.fixture(autouse=True)
+def clear_operator_claims() -> Iterator[None]:
+    """Isolate the module-level claim registry between tests: a claim a failing
+    test left registered must never leak into (and cascade through) later tests."""
+    yield
+    queue_service._operator_fail_claims.clear()  # pyright: ignore[reportPrivateUsage]
 
 
 async def _seed_request_with_download(
@@ -1247,3 +1263,249 @@ async def test_mark_failed_adopts_a_stranded_failed_pending_row(
     assert request is not None
     assert request.status is RequestStatus.searching
     assert blocklist == []  # the operator's no-blocklist choice governed
+
+
+# ---------------------------------------------------------------------------
+# Round 4: single-owner claim TOKEN protocol. Reconcile treats claimed ids as
+# invisible at EVERY phase boundary (A-transition building, per-hash before each
+# B-removal await, per-completion inside C), and mark_failed's completion +
+# cleanup are token-gated so the NEWEST operator command always wins.
+# ---------------------------------------------------------------------------
+
+
+def test_claim_token_registry_single_owner_semantics() -> None:
+    """Protocol unit test: registration replaces (later command owns), ownership is
+    token-exact, and release is token-gated — a stale finisher's release can never
+    clear the newer command's live claim."""
+    download_id = 987_654
+    flags_a = _OperatorFailFlags(blocklist=True, remove_torrent=True)
+    flags_b = _OperatorFailFlags(blocklist=False, remove_torrent=False)
+
+    token_a = _register_operator_claim(download_id, flags_a)
+    assert _is_operator_claimed(download_id)
+    assert _owns_operator_claim(download_id, token_a)
+
+    token_b = _register_operator_claim(download_id, flags_b)  # later command wins
+    assert token_b > token_a  # monotonic
+    assert not _owns_operator_claim(download_id, token_a)  # superseded
+    assert _owns_operator_claim(download_id, token_b)
+
+    _release_operator_claim(download_id, token_a)  # stale finisher: MUST no-op
+    assert _is_operator_claimed(download_id)
+    assert _owns_operator_claim(download_id, token_b)  # newer claim survives
+
+    _release_operator_claim(download_id, token_b)  # current owner: pops
+    assert not _is_operator_claimed(download_id)
+
+
+class _ClaimDuringSnapshotQbt(FakeQbittorrent):
+    """A client whose ``get_all_statuses`` registers an operator claim on the
+    seeded download — modelling a mark_failed that has REGISTERED but not yet
+    stamped its marker while a reconcile cycle is mid-Phase-A (finding 1)."""
+
+    def __init__(self, download_id: int) -> None:
+        super().__init__(statuses=[])
+        self._download_id = download_id
+        self.token: int | None = None
+
+    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+        self.token = _register_operator_claim(
+            self._download_id, _OperatorFailFlags(blocklist=False, remove_torrent=False)
+        )
+        return []
+
+
+async def test_reconcile_phase_a_skips_a_claimed_row_entirely(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 1: a claim registered BEFORE the operator stamps its marker makes the
+    row invisible to reconcile's Phase-A transition building — reconcile must NOT
+    move it to an unmarked failed_pending (which would make the operator's own
+    Phase-A CAS lose and the residual heal as reconcile-owned). Once the claim is
+    released (the operator never completed), the next cycle proceeds normally."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+    # Beyond missing grace: without the claim this cycle WOULD fail the row.
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.first_seen_at = datetime.now(UTC) - timedelta(minutes=11)
+        await session.commit()
+
+    qbt = _ClaimDuringSnapshotQbt(download_id)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The claimed row was untouched: still downloading, nothing removed, nothing
+    # blocklisted, request untouched — fully invisible to the cycle.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None
+    assert download.status == "downloading"  # no unmarked failed_pending
+    assert download.failed_reason is None
+    assert request is not None
+    assert request.status is RequestStatus.downloading
+    assert blocklist == []
+    assert qbt.removed == []
+
+    # The operator abandons (claim released, nothing stamped): the row is still
+    # active, so the next unclaimed cycle resumes the normal failure flow.
+    assert qbt.token is not None
+    _release_operator_claim(download_id, qbt.token)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None
+    assert download.status == "failed"
+    assert request is not None
+    assert request.status is RequestStatus.searching
+    assert len(blocklist) == 1  # reconcile-default semantics, exactly once
+
+
+class _ClaimSecondHashQbt(FakeQbittorrent):
+    """A client whose FIRST removal registers an operator claim on the SECOND
+    failed download — a mark_failed starting while reconcile awaits an earlier
+    hash's removal (finding 2). The per-hash re-check must protect the later one."""
+
+    def __init__(self, claim_download_id: int) -> None:
+        super().__init__(statuses=[])
+        self._claim_download_id = claim_download_id
+        self.token: int | None = None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        if self.token is None:
+            self.token = _register_operator_claim(
+                self._claim_download_id,
+                _OperatorFailFlags(blocklist=False, remove_torrent=False),
+            )
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_claim_registered_mid_phase_b_protects_the_later_hash(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 2: the pre-loop claim filter is a stale snapshot by the second
+    iteration — the registry must be re-checked immediately before EACH removal
+    await. A claim registered during hash A's removal keeps hash B's torrent from
+    being removed and defers B's completion; releasing the claim lets the next
+    cycle heal B normally."""
+    hash_a, hash_b = "a" * 40, "b" * 40
+    async with sessionmaker_() as session:
+        ids: dict[str, tuple[int, int]] = {}  # hash -> (request_id, download_id)
+        for tmdb_id, torrent_hash in ((701, hash_a), (702, hash_b)):
+            request = MediaRequest(
+                tmdb_id=tmdb_id,
+                media_type=MediaType.movie,
+                title=f"Movie {tmdb_id}",
+                status=RequestStatus.downloading,
+            )
+            session.add(request)
+            await session.flush()
+            download = Download(
+                torrent_hash=torrent_hash,
+                status="downloading",
+                media_request_id=request.id,
+                tmdb_id=tmdb_id,
+                first_seen_at=datetime.now(UTC) - timedelta(minutes=11),
+            )
+            session.add(download)
+            await session.flush()
+            ids[torrent_hash] = (request.id, download.id)
+        await session.commit()
+
+    # list_active orders by id, so hash A (seeded first) is removed first; its
+    # removal registers the claim on hash B's download.
+    qbt = _ClaimSecondHashQbt(ids[hash_b][1])
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        request_b = await session.get(MediaRequest, ids[hash_b][0])
+        download_b = await session.get(Download, ids[hash_b][1])
+        download_a = await session.get(Download, ids[hash_a][1])
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert qbt.removed == [(hash_a, True)]  # B's torrent NOT removed
+    assert download_a is not None and download_a.status == "failed"  # A completed
+    assert download_b is not None
+    assert download_b.status == "failed_pending"  # B deferred, not stolen
+    assert request_b is not None
+    assert request_b.status is RequestStatus.downloading  # B not re-armed
+    assert [row.torrent_hash for row in blocklist] == [hash_a]  # only A blocklisted
+
+    # The claiming operator abandons: release, and the next cycle heals B with the
+    # default semantics (its residual carries no marker).
+    assert qbt.token is not None
+    _release_operator_claim(ids[hash_b][1], qbt.token)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        request_b = await session.get(MediaRequest, ids[hash_b][0])
+        download_b = await session.get(Download, ids[hash_b][1])
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download_b is not None and download_b.status == "failed"
+    assert request_b is not None and request_b.status is RequestStatus.searching
+    assert set(qbt.removed) == {(hash_a, True), (hash_b, True)}
+    assert sorted(row.torrent_hash or "" for row in blocklist) == [hash_a, hash_b]
+
+
+class _SupersedingMarkFailedQbt(FakeQbittorrent):
+    """A client whose ``remove`` (the FIRST call's Phase B) runs a SECOND, nested
+    mark_failed on the same download with CONFLICTING flags — two overlapping
+    operator commands (finding 3). The nested (newer) call must win: the earlier
+    call's Phase C yields instead of completing with its stale choices, and its
+    finally must not clear anything the newer call owns."""
+
+    def __init__(self, sm: SessionMaker, download_id: int) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._download_id = download_id
+        self.nested_status: str | None = None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        async with self._sm() as session:
+            nested = await queue_service.mark_failed(
+                session,
+                None,
+                download_id=self._download_id,
+                blocklist=False,  # conflicts with the outer call's blocklist=True
+                remove_torrent=False,
+            )
+            self.nested_status = nested.status
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_overlapping_mark_faileds_the_later_call_wins(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 3: overlapping mark_faileds with conflicting flags — the later call
+    re-stamps the claim (token replaced) and completes with ITS flags; the earlier
+    call's Phase C sees its token superseded and yields, so its stale blocklist=True
+    can never land after the newer blocklist=False command."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+
+    qbt = _SupersedingMarkFailedQbt(sessionmaker_, download_id)
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(
+            session, qbt, download_id=download_id, blocklist=True, remove_torrent=True
+        )
+
+    # The nested (later) call completed the row; the outer call yielded and returns
+    # the completed state honestly.
+    assert qbt.nested_status == "failed"
+    assert record.status == "failed"
+    assert record.failed_reason == "marked failed by operator"
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None
+    assert request.status is RequestStatus.searching
+    assert blocklist == []  # the LATER call's blocklist=False won; no stale row
+    # Neither finisher left a live claim behind (token-gated release both sides).
+    assert not queue_service._operator_fail_claims  # pyright: ignore[reportPrivateUsage]
