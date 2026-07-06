@@ -17,8 +17,14 @@ a terminal):
   run the SAME decision-engine -> grab path the grab endpoint uses, so the re-search
   happens inline -- the blocklist now excludes the bad release, guaranteeing a
   DIFFERENT one is grabbed (or the honest ``no_acceptable_release`` park if nothing is
-  acceptable). The synchronous re-grab IS the auto re-search AND the undo (the
-  content comes back), which is why no recycle bin is needed for the beta.
+  acceptable). Following ``auto_grab_service``'s operational-vs-park taxonomy, ONLY a
+  genuinely empty acceptable-release set (or every candidate per-release-unusable)
+  parks ``no_acceptable_release``; an OPERATIONAL failure -- the indexer unreachable
+  during the re-search, the download client erroring, or a grab that left a live
+  untracked torrent -- must NOT park (that would LIE about content exhaustion) and
+  instead leaves the scope at the already-committed ``searching`` for the merged
+  auto-grab worker to retry. The synchronous re-grab IS the auto re-search AND the undo
+  (the content comes back), which is why no recycle bin is needed for the beta.
 
   Ordering rationale (ADR-0014 race fix): steps (c)/(d) are IRREVERSIBLE, so the
   slot claim (b) runs first and is committed atomically WITH them -- SQLite
@@ -175,42 +181,55 @@ _PER_RELEASE_GRAB_ERRORS: Final = (
     QbittorrentSourceError,
 )
 
-# The remaining grab-path exceptions the inline re-grab may raise (all defined in
-# ``grab_service``). A report-issue that has ALREADY purged + blocklisted must not
-# then 500/409 on a grab hiccup: it lands on the honest, retryable
-# ``no_acceptable_release`` park instead, exactly like the grab endpoint's own
-# empty-preview branch -- the request is left visible and re-searchable.
-# (``NoGrabSourceError``/``DownloadScopeConflictError`` are listed for
-# completeness but are consumed by the per-release fall-through above first.)
-_GRAB_ERRORS: Final = (
-    grab_service.NoGrabSourceError,
-    grab_service.GrabError,
+# The OPERATIONAL grab-pipeline failure the inline re-grab may raise: qBittorrent
+# ACCEPTED the torrent but no info-hash could be derived (an opaque URL, and the
+# indexer supplied none either), leaving a LIVE, untracked torrent and no
+# ``Download`` row. Mirrors ``auto_grab_service``'s ``GrabError`` handling: this is
+# NOT "nothing acceptable" -- releases exist; the grab PIPELINE failed -- so parking
+# ``no_acceptable_release`` would LIE. The handler leaves the scope at the
+# ``searching`` committed at (b) for the merged auto-grab worker to retry, and does
+# NOT try another candidate (a second grab against the live orphan would double-
+# download).
+_GRAB_OPERATIONAL_ERRORS: Final = (grab_service.GrabError,)
+
+# The SCOPE-level grab refusals the inline re-grab may raise (all defined in
+# ``grab_service``). Unlike the per-release failures, these apply to the whole SCOPE,
+# not this one release, so trying a lower-ranked candidate cannot help: the scope now
+# has an active download (``AlreadyDownloadingError``), or is terminal / mis-shaped
+# (``RequestNotActiveError`` / ``SeasonRequiredError``). Mirrors auto-grab's
+# settle-and-leave: discard the partial write and LEAVE the scope's committed
+# ``searching`` as-is -- never a ``no_acceptable_release`` park (that would LIE:
+# releases exist; the grab was refused for a scope reason, not exhaustion).
+_GRAB_SCOPE_REFUSALS: Final = (
     grab_service.AlreadyDownloadingError,
-    grab_service.DownloadScopeConflictError,
     grab_service.RequestNotActiveError,
     grab_service.SeasonRequiredError,
 )
 
 # The indexer failures the inline RE-SEARCH (``decision_service.preview`` ->
-# ``prowlarr.search``) may raise. Like ``_GRAB_ERRORS`` for the grab step, a
-# report-issue that has ALREADY blocklisted + purged must not then propagate a
-# Prowlarr transport/rate-limit/HTTP failure out as a 5xx that leaves the row lying
-# as ``searching`` with nothing in flight: it lands on the honest, retryable
-# ``no_acceptable_release`` park instead. ``IndexerRateLimitError`` is a subclass of
-# ``IndexerError`` and so is covered.
+# ``prowlarr.search``) may raise. Mirrors ``auto_grab_service``'s raised-search
+# handling: a report-issue that has ALREADY blocklisted + purged must not propagate a
+# Prowlarr transport/rate-limit/HTTP failure out as a 5xx -- but this is an
+# OPERATIONAL failure (Prowlarr down / rate-limited), NOT content exhaustion, so it
+# must NOT park ``no_acceptable_release`` either (that would LIE: releases may well
+# exist; the INDEXER is unreachable). The scope is LEFT at the ``searching`` committed
+# at (b) for the merged auto-grab worker to retry on its next tick.
+# ``IndexerRateLimitError`` is a subclass of ``IndexerError`` and so is covered.
 _INDEXER_ERRORS: Final = (IndexerError,)
 
 # The download-client failures the inline RE-GRAB (``grab_service.grab`` ->
-# ``qbt.add``) may raise. Unlike ``_GRAB_ERRORS`` (application-level grab refusals),
-# these are an OPERATIONAL client failure -- qBittorrent is unreachable / erroring
-# -- AFTER the blocklist/purge/reset already committed. Following ADR-0013's
-# park-vs-operational distinction, this must NOT park ``no_acceptable_release`` (that
-# would LIE: releases exist; it is the CLIENT that failed, exactly like auto-grab's
-# ``GrabError`` handling). The report-issue handler catches this family and LEAVES
-# the scope at ``searching`` -- the merged auto-grab worker picks up an eager
-# ``searching`` scope on its next tick, so the state self-heals -- rather than
-# letting a 502 escape after a successful correction. ``QbittorrentAuthError`` is a
-# subclass of ``QbittorrentError`` and so is covered.
+# ``qbt.add``) may raise. Unlike the SCOPE refusals (``_GRAB_SCOPE_REFUSALS``) and the
+# per-release failures, these are an OPERATIONAL client failure -- qBittorrent is
+# unreachable / erroring -- AFTER the blocklist/purge/reset already committed.
+# Following ADR-0013's park-vs-operational distinction, this must NOT park
+# ``no_acceptable_release`` (that would LIE: releases exist; it is the CLIENT that
+# failed, exactly like auto-grab's ``GrabError`` handling). The report-issue handler
+# catches this family and LEAVES the scope at ``searching`` -- the merged auto-grab
+# worker picks up an eager ``searching`` scope on its next tick, so the state
+# self-heals -- rather than letting a 502 escape after a successful correction.
+# ``QbittorrentSourceError`` is caught FIRST by the inner per-release handler (it
+# subclasses ``QbittorrentError`` but is a source veto, not an outage), and
+# ``QbittorrentAuthError`` is a subclass of ``QbittorrentError`` and so is covered.
 _DOWNLOAD_CLIENT_ERRORS: Final = (QbittorrentError,)
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal
@@ -432,9 +451,10 @@ async def report_issue(
     """Report a bad imported file: blocklist + purge (torrent + library) + re-search.
 
     Returns the updated request record (re-read after the inline re-grab, so its
-    status reflects ``downloading`` on a successful replacement grab, or
-    ``no_acceptable_release`` / the season rollup when nothing acceptable was
-    found). See the module docstring for the full ordered flow and the caveats.
+    status reflects ``downloading`` on a successful replacement grab,
+    ``no_acceptable_release`` / the season rollup when nothing acceptable was found, or
+    ``searching`` when an OPERATIONAL failure -- see below -- left the scope for the
+    auto-grab worker). See the module docstring for the full ordered flow and caveats.
 
     Re-grab client failure (ADR-0013 park-vs-operational): if the inline re-grab's
     ``qbt.add`` raises a download-client error (``_DOWNLOAD_CLIENT_ERRORS``) AFTER the
@@ -456,6 +476,18 @@ async def report_issue(
     mistaken for the client outage its base class signals, which would strand
     the promised synchronous re-grab at ``searching`` (worst with auto-grab
     disabled: nothing would ever retry it).
+
+    Re-search / operational-grab failures (issue #71, mirroring auto-grab's
+    operational-vs-park taxonomy): an indexer failure during the inline RE-SEARCH
+    (``_INDEXER_ERRORS`` -- Prowlarr down / rate-limited), an operational GRAB failure
+    that left a live untracked torrent (``_GRAB_OPERATIONAL_ERRORS`` --
+    ``grab_service.GrabError``), or a scope-level grab refusal (``_GRAB_SCOPE_REFUSALS``
+    -- the scope now has an active download, or is terminal / mis-shaped) are all
+    OPERATIONAL, NOT content exhaustion, and so must NOT park ``no_acceptable_release``
+    (a LIE: releases exist / may exist; the PIPELINE failed). Each LEAVES the scope at
+    the ``searching`` committed at (b) for the merged auto-grab worker to retry --
+    identical to the download-client-outage handling above. ONLY a genuinely empty
+    acceptable-release set (or every candidate per-release-unusable) parks.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -688,32 +720,37 @@ async def report_issue(
         )
     except _INDEXER_ERRORS as exc:
         # The re-search could not reach the indexer AFTER the blocklist/purge/reset
-        # already committed. Park honestly (retryable) rather than propagate a 5xx that
-        # leaves the row lying as 'searching' with nothing actually in flight -- exactly
-        # the posture the empty-preview / grab-failure branches take.
+        # already committed. This is OPERATIONAL (Prowlarr down / rate-limited), NOT
+        # content exhaustion -- mirroring auto-grab's raised-search taxonomy -- so it
+        # must NOT park ``no_acceptable_release`` (that would LIE: releases may exist;
+        # the INDEXER is unreachable) and must NOT propagate a 5xx. Leave the scope at
+        # the ``searching`` committed at (b): the merged auto-grab worker picks up an
+        # eager ``searching`` scope on its next tick, so the state self-heals. The
+        # re-read below then returns 'searching' (a 200).
         _logger.warning(
-            "report-issue re-search for %r failed to reach the indexer (%s); parking as "
-            "no_acceptable_release (retryable)",
+            "report-issue re-search for %r failed to reach the indexer (%s); leaving the "
+            "scope at 'searching' for the auto-grab worker to retry",
             safe_text(request.title),
             type(exc).__name__,
             extra=log_extra,
         )
-        await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
     else:
         if not result.accepted:
             await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
         else:
             # Try the accepted replacements in rank order, mirroring auto-grab's
-            # bounded fall-through: a PER-RELEASE failure on the top pick (its
-            # source is unusable/vetoed, or its hash is already tracked
-            # elsewhere) must not sink the whole correction -- a lower-ranked
-            # replacement may still grab. Only when the list (or the shared
-            # attempt cap) exhausts with nothing grabbed does the scope park on
-            # the honest, retryable ``no_acceptable_release``. Any settling
-            # failure (an operational client outage, an application-level grab
-            # refusal) is handled by the outer except clauses exactly as before.
+            # bounded fall-through AND its operational-vs-park taxonomy.
+            # ``park_scope`` starts True and is cleared by ANY settling outcome (a
+            # grab, an operational grab failure, or a scope-level refusal); only a
+            # PER-RELEASE failure on every attempted candidate leaves it True, so the
+            # scope parks on the honest, retryable ``no_acceptable_release`` -- exactly
+            # the park an empty preview takes. An OPERATIONAL failure (the download
+            # client unreachable, or a grab that left a live untracked torrent) must
+            # NEVER park -- that would LIE: releases exist; the PIPELINE failed -- so
+            # it leaves the scope at the ``searching`` committed at (b) for the merged
+            # auto-grab worker to retry.
             try:
-                grabbed = False
+                park_scope = True
                 for scored in result.accepted[:MAX_GRAB_ATTEMPTS_PER_SCOPE]:
                     try:
                         await grab_service.grab(
@@ -726,7 +763,7 @@ async def report_issue(
                             season=target.season,
                             episodes=None,
                         )
-                        grabbed = True
+                        park_scope = False
                         break
                     except _PER_RELEASE_GRAB_ERRORS as exc:
                         # This RELEASE is unusable (nothing live to track --
@@ -734,6 +771,7 @@ async def report_issue(
                         # anything reaches the client, and must not be mistaken
                         # for the client outage its base class signals); discard
                         # the partial write and try the next-ranked replacement.
+                        # ``park_scope`` stays True, so an EXHAUSTED list parks.
                         await session.rollback()
                         _logger.warning(
                             "report-issue re-grab for %r: replacement release "
@@ -742,9 +780,45 @@ async def report_issue(
                             type(exc).__name__,
                             extra=log_extra,
                         )
-                if not grabbed:
-                    # Every attempted replacement was unusable: the SAME honest
-                    # park an empty preview takes -- never a silent 'searching'.
+                    except _GRAB_OPERATIONAL_ERRORS as exc:
+                        # qBittorrent ACCEPTED the torrent but no info-hash could be
+                        # derived -> a LIVE, untracked torrent now exists. Mirrors
+                        # auto-grab's ``GrabError`` handling: OPERATIONAL, NOT "nothing
+                        # acceptable". Discard the partial write, do NOT try another
+                        # candidate (a second grab against the orphan would double-
+                        # download), do NOT park (that would LIE), and leave the scope
+                        # at the ``searching`` committed at (b) for the auto-grab worker.
+                        await session.rollback()
+                        park_scope = False
+                        _logger.warning(
+                            "report-issue re-grab for %r left a live untracked torrent "
+                            "(%s); leaving the scope at 'searching' for the auto-grab "
+                            "worker to retry",
+                            safe_text(request.title),
+                            type(exc).__name__,
+                            extra=log_extra,
+                        )
+                        break
+                    except _GRAB_SCOPE_REFUSALS as exc:
+                        # A SCOPE-level refusal (the scope now has an active download,
+                        # or is terminal / mis-shaped): another candidate cannot help.
+                        # Mirrors auto-grab's settle-and-leave -- discard the partial
+                        # write, do NOT park (not exhaustion), and leave the scope's
+                        # committed ``searching`` as-is.
+                        await session.rollback()
+                        park_scope = False
+                        _logger.warning(
+                            "report-issue re-grab for %r refused (%s); leaving the scope "
+                            "for the auto-grab worker",
+                            safe_text(request.title),
+                            type(exc).__name__,
+                            extra=log_extra,
+                        )
+                        break
+                if park_scope:
+                    # Every attempted replacement was per-release unusable (list or
+                    # attempt cap exhausted): the SAME honest park an empty preview
+                    # takes -- never a silent 'searching'.
                     await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
             except _DOWNLOAD_CLIENT_ERRORS as exc:
                 # OPERATIONAL client failure (qBittorrent unreachable/erroring), NOT
@@ -761,15 +835,6 @@ async def report_issue(
                     type(exc).__name__,
                     extra=log_extra,
                 )
-            except _GRAB_ERRORS as exc:
-                _logger.warning(
-                    "report-issue re-grab for %r failed (%s); parking as "
-                    "no_acceptable_release (retryable)",
-                    safe_text(request.title),
-                    type(exc).__name__,
-                    extra=log_extra,
-                )
-                await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
 
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
@@ -780,14 +845,28 @@ async def report_issue(
 async def _park_no_acceptable(
     session: AsyncSession, request_id: int, season: int | None, *, is_tv: bool
 ) -> None:
-    """Land the request/season on the honest ``no_acceptable_release`` dead-end."""
+    """Land the request/season on the honest ``no_acceptable_release`` dead-end.
+
+    Both branches now go through a genuine compare-and-swap (issue #72) --
+    ``request_service`` / ``season_request_service.mark_no_acceptable_release``
+    -- so a concurrent writer that already moved the row out of the parkable set
+    (e.g. a racing grab landed it on ``downloading``) is left alone rather than
+    silently regressed: the CAS's boolean return decides whether to commit this
+    write, never whether to raise or retry. This function's own caller
+    (``report_issue``) always re-reads the request's ACTUAL row afterward, so the
+    response reflects the true state regardless of whether this particular write
+    landed.
+    """
     if is_tv and season is not None:
-        await season_request_service.mark_no_acceptable_release(
+        parked = await season_request_service.mark_no_acceptable_release(
             session, media_request_id=request_id, season_number=season
         )
+    else:
+        parked = await request_service.mark_no_acceptable_release(session, request_id)
+    if parked:
         await session.commit()
     else:
-        await request_service.mark_no_acceptable_release(session, request_id)
+        await session.rollback()
 
 
 async def cancel_request(

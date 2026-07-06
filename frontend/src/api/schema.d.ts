@@ -712,6 +712,21 @@ export interface paths {
          *     ``service_not_configured``), and revoking on a half-configured install is
          *     the same lockout trap the probe exists to prevent; the PUT that completes
          *     the pair is a verified repoint and revokes then.
+         *
+         *     After a successful commit, invalidates (issue #93) the cached ``GET /health``
+         *     probe for every subsystem whose credential field(s) were ACTUALLY persisted
+         *     this call (see :data:`_SUBSYSTEM_CREDENTIAL_FIELDS`) — tracked separately from
+         *     ``body.model_fields_set`` because a field can be present-but-``None`` (leave
+         *     unchanged) or a secret sent back as the ``"***"`` mask (also a no-op); neither
+         *     should invalidate anything, since nothing about that subsystem's config
+         *     actually changed. Runs strictly AFTER ``session.commit()`` so a failed save
+         *     (a raised validation error above, a failed verification, or a DB error during
+         *     the write loop/commit) never touches the cache — a failed write must leave any
+         *     still-valid cached probe exactly as it was. This covers the Plex repoint path
+         *     too, with no special-casing: a verified (or unverifiable-but-written) repoint's
+         *     ``plex_url``/``plex_token`` land in ``written_fields`` exactly like any other
+         *     field, so the very next ``GET /health`` re-probes the NEW server instead of
+         *     serving a stale pre-repoint ``ok``/``down`` card.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;

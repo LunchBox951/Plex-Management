@@ -398,6 +398,47 @@ async def test_preview_rejects_wrong_episode_even_at_top_quality(
     assert rejected[wrong_episode_top_quality.title] is RejectionReason.WRONG_MEDIA
 
 
+async def test_preview_multi_episode_request_rejects_partial_single_episode(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """issue #70: a request scoped to BOTH E04 and E05 must NOT accept a single-
+    episode S02E04 release that covers only PART of the request -- any-overlap
+    would have grabbed it and then blocked import on the missing E05. A release
+    that COVERS the whole request (a multi-episode E04-E05 file, or a whole-season
+    pack) is still accepted, so the operator is never left with nothing grabbable
+    when a complete alternative exists."""
+    partial = candidate(
+        "The.Mandalorian.S02E04.2160p.WEB-DL.x264-GROUP", info_hash="1" * 40, seeders=999
+    )
+    complete_multi = candidate(
+        "The.Mandalorian.S02E04-E05.1080p.WEB-DL.x264-GROUP", info_hash="2" * 40, seeders=10
+    )
+    pack = candidate("The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="3" * 40, seeders=10)
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([partial, complete_multi, pack]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+            episodes=[4, 5],
+        )
+
+    accepted_titles = [s.candidate.title for s in result.accepted]
+    # The partial single-episode release is rejected even though it is the highest
+    # quality; the complete multi-episode file and the whole-season pack accept.
+    assert partial.title not in accepted_titles
+    assert complete_multi.title in accepted_titles
+    assert pack.title in accepted_titles
+    assert result.accepted[0].candidate.title != partial.title
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert rejected[partial.title] is RejectionReason.WRONG_MEDIA
+
+
 async def test_preview_whole_season_request_still_accepts_all_episodes(
     sessionmaker_: SessionMaker,
 ) -> None:

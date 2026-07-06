@@ -31,6 +31,7 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, User
 from plex_manager.ports.library import LibraryPort
+from plex_manager.services.health_service import SubsystemHealth, TtlCache
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     PLEX_MACHINE_ID_SETTING,
@@ -43,6 +44,7 @@ from plex_manager.web.deps import (
     ensure_system_settings,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
+    get_health_cache,
     get_http_client,
     get_library,
     load_system_settings,
@@ -117,6 +119,22 @@ _rotate_lock = asyncio.Lock()
 
 async def _redacted(store: SettingsStore) -> SettingsResponse:
     return SettingsResponse.model_validate(await store.redacted())
+
+
+# Which ``SettingsUpdate`` fields feed each subsystem's health probe (issue #93):
+# ``PUT /settings`` clears ONLY the affected subsystem's cached ``GET /health``
+# result after a successful save, so an operator who just fixed (or broke) a
+# credential sees a fresh probe on the very next poll instead of up to
+# ``SUBSYSTEM_PROBE_TTL_SECONDS`` of stale ``ok``/``down``/``not_configured``
+# state left over from before the edit. Deliberately a static field->subsystem
+# map, not an event-driven invalidation framework -- see
+# ``put_settings_endpoint`` for exactly where/when it fires.
+_SUBSYSTEM_CREDENTIAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "plex": ("plex_url", "plex_token"),
+    "prowlarr": ("prowlarr_url", "prowlarr_api_key"),
+    "qbittorrent": ("qbittorrent_url", "qbittorrent_username", "qbittorrent_password"),
+    "tmdb": ("tmdb_api_key",),
+}
 
 
 def _to_stored_string(value: object) -> str:
@@ -456,6 +474,7 @@ async def put_settings_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     context: Annotated[AuthContext, Depends(require_admin)],
+    health_cache: Annotated[TtlCache[SubsystemHealth], Depends(get_health_cache)],
 ) -> SettingsResponse:
     """Upsert the provided config and return the redacted result.
 
@@ -533,6 +552,21 @@ async def put_settings_endpoint(
     ``service_not_configured``), and revoking on a half-configured install is
     the same lockout trap the probe exists to prevent; the PUT that completes
     the pair is a verified repoint and revokes then.
+
+    After a successful commit, invalidates (issue #93) the cached ``GET /health``
+    probe for every subsystem whose credential field(s) were ACTUALLY persisted
+    this call (see :data:`_SUBSYSTEM_CREDENTIAL_FIELDS`) — tracked separately from
+    ``body.model_fields_set`` because a field can be present-but-``None`` (leave
+    unchanged) or a secret sent back as the ``"***"`` mask (also a no-op); neither
+    should invalidate anything, since nothing about that subsystem's config
+    actually changed. Runs strictly AFTER ``session.commit()`` so a failed save
+    (a raised validation error above, a failed verification, or a DB error during
+    the write loop/commit) never touches the cache — a failed write must leave any
+    still-valid cached probe exactly as it was. This covers the Plex repoint path
+    too, with no special-casing: a verified (or unverifiable-but-written) repoint's
+    ``plex_url``/``plex_token`` land in ``written_fields`` exactly like any other
+    field, so the very next ``GET /health`` re-probes the NEW server instead of
+    serving a stale pre-repoint ``ok``/``down`` card.
     """
     await _validate_disk_pressure_pair(body, session)
 
@@ -542,6 +576,7 @@ async def put_settings_endpoint(
         body, session, store, client, context
     )
 
+    written_fields: set[str] = set()
     for field in body.model_fields_set:
         value = getattr(body, field)
         if value is None:
@@ -549,6 +584,7 @@ async def put_settings_endpoint(
         if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
             continue
         await store.set(field, _to_stored_string(value))
+        written_fields.add(field)
     if plex_identity_changed:
         if machine_identifier is None:
             # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
@@ -565,6 +601,11 @@ async def put_settings_endpoint(
                 .values(revoked_at=datetime.now(UTC))
             )
     await session.commit()
+
+    for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
+        if written_fields.intersection(fields):
+            health_cache.invalidate(subsystem)
+
     return await _redacted(store)
 
 

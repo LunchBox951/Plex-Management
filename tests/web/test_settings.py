@@ -649,6 +649,69 @@ async def test_empty_string_root_reads_back_as_unset(
         assert await get_tv_root_optional(session) is None
 
 
+async def test_whitespace_only_root_reads_back_as_unset(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #83: a whitespace-only root (e.g. an operator submitting a stray
+    space) is truthy in Python and has no "leave unchanged" ``None`` meaning --
+    unlike ``SetupCompleteRequest``, ``SettingsUpdate`` had no validator
+    stripping this, so it would previously be persisted VERBATIM and then read
+    back as a non-``None``, seemingly-configured root. ``PUT /settings`` must
+    normalize it to the SAME "" clear-to-unset write ``test_empty_string_root_
+    reads_back_as_unset`` above already covers, and every ``get_*_root_optional``
+    read must independently treat it as unset too (defense in depth)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "   ", "tv_root": "\t\n "},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    # The redacted response mirrors the raw stored ("") value exactly like
+    # test_empty_string_root_reads_back_as_unset above -- it is the TYPED
+    # get_*_root_optional deps (checked below), not this response, that report
+    # "unset".
+    assert put.json()["movies_root"] == ""
+    assert put.json()["tv_root"] == ""
+
+    async with sessionmaker_() as session:
+        # Normalized to "" at write time (the model_validator), matching the
+        # established empty-string clear-to-unset convention.
+        assert await SettingsStore(session).get("movies_root") == ""
+        assert await SettingsStore(session).get("tv_root") == ""
+        assert await get_movies_root_optional(session) is None
+        assert await get_tv_root_optional(session) is None
+
+
+async def test_padded_non_blank_root_reads_back_byte_identical(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Codex P2: a stored root that is non-blank but carries incidental
+    leading/trailing whitespace (distinct from the ALL-whitespace case
+    ``test_whitespace_only_root_reads_back_as_unset`` above covers) must read
+    back through ``get_*_root_optional`` BYTE-IDENTICAL to what ``GET /settings``
+    displays (``SettingsStore.get``/``redacted`` never strip). ``_blank_to_none``
+    previously ``.strip()``-ed every non-``None`` value, which would silently
+    retarget import/scan/evict to a different directory than the one the
+    operator sees configured -- writing directly via ``SettingsStore`` here
+    (bypassing ``PUT /settings``'s schema validator, which only touches the
+    ALL-whitespace case) isolates ``_blank_to_none``'s own behavior against
+    already-stored data of this shape."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    padded = "  /media/movies  "
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("movies_root", padded)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # What GET /settings would display (SettingsStore.redacted() -> row.value,
+        # never stripped) ...
+        assert await SettingsStore(session).get("movies_root") == padded
+        # ... must match EXACTLY what the importer/eviction dependency resolves --
+        # never a trimmed variant of it.
+        assert await get_movies_root_optional(session) == padded
+
+
 # --------------------------------------------------------------------------- #
 # Service URL shape validation at write time (issue #44)
 # --------------------------------------------------------------------------- #
@@ -1010,6 +1073,114 @@ async def test_put_single_field_threshold_above_stored_target_still_succeeds(
     async with sessionmaker_() as session:
         assert await get_disk_pressure_threshold_percent(session) == 90.0
         assert await get_disk_pressure_target_percent(session) == 80.0  # untouched
+
+
+# --------------------------------------------------------------------------- #
+# Health-probe cache invalidation on credential save (issue #93)
+# --------------------------------------------------------------------------- #
+_HEALTH_HEADERS = {"X-Api-Key": _API_KEY}
+
+
+async def test_put_settings_invalidates_health_cache_for_the_written_subsystem(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A credential save must not leave the OLD cached probe sitting around for
+    up to ``SUBSYSTEM_PROBE_TTL_SECONDS`` -- the very next ``GET /health`` after
+    fixing (or breaking) a subsystem must re-probe it, not echo the pre-edit
+    result. Uses prowlarr (not plex) fields: a changed prowlarr_url/api_key never
+    enters the Plex repoint verification ladder (:func:`_verify_plex_repoint`),
+    so this stays a plain settings save with no live upstream probe -- the
+    honest, simplest path to exercise the cache-invalidation contract itself."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # Warm every subsystem's cache entry (all unconfigured -> "not_configured").
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("prowlarr") is not None
+    assert cache.get("tmdb") is not None
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"prowlarr_url": "http://prowlarr.local", "prowlarr_api_key": "tok"},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 200
+
+    # The edited subsystem's cache entry is gone...
+    assert cache.get("prowlarr") is None
+    # ...but this is a TARGETED invalidation -- an unrelated subsystem's still-
+    # valid cached probe must survive untouched.
+    assert cache.get("tmdb") is not None
+
+
+async def test_put_settings_with_no_credential_fields_leaves_health_cache_alone(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A PUT that writes only a non-credential field (e.g. an eviction knob) must
+    invalidate nothing -- no subsystem's config actually changed."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("plex") is not None
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"eviction_enabled": False},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 200
+    assert cache.get("plex") is not None
+
+
+async def test_put_settings_secret_mask_round_trip_does_not_invalidate_health_cache(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A secret field sent back as the ``"***"`` redaction mask is a documented
+    no-op write (see ``put_settings_endpoint``) -- it must not count as "this
+    subsystem's credentials changed" and invalidate a still-valid cached probe."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.local")
+        await store.set("plex_token", "tok")
+        await session.commit()
+
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("plex") is not None
+
+    # Sending back ONLY the masked secret (e.g. a FE form that re-submits every
+    # field it displays, including the "***" it read from GET) writes nothing
+    # for plex -- SettingsStore.set is never called for this field.
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_token": "***"},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 200
+    assert cache.get("plex") is not None
+
+
+async def test_put_settings_does_not_invalidate_health_cache_on_failed_save(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A rejected (422) write must leave any still-valid cached probe exactly as
+    it was -- a failed save changed nothing, so nothing should be invalidated."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("plex") is not None
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "not a url at all"},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 422
+    assert cache.get("plex") is not None
 
 
 # --------------------------------------------------------------------------- #
