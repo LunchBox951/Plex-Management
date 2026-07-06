@@ -62,3 +62,17 @@ def test_set_optional_bool_env_var_still_parses(monkeypatch: pytest.MonkeyPatch)
     settings = _settings_no_dotenv()
 
     assert settings.auth_cookie_secure is True
+
+
+def test_uninitialized_boot_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC1: a fresh install boots with ZERO auth env vars.
+
+    ``Settings()`` constructs (== validates) without raising, and carries no setup
+    token — first-run setup is claimed by the first Plex owner to sign in, never
+    gated on an env token. The old tokenless-first-run startup refusal is gone.
+    """
+    monkeypatch.delenv("PLEX_MANAGER_SETUP_TOKEN", raising=False)
+
+    settings = _settings_no_dotenv()  # constructing == validating; must not raise
+
+    assert settings.setup_token is None

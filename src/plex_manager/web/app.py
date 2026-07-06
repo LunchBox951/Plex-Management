@@ -29,7 +29,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings, validate_startup_exposure
+from plex_manager.config import get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -675,19 +675,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         system = await ensure_system_settings(session)
         initialized = system.initialized
         await session.commit()
-    # Uniform launch-path guard (Codex PR #21): every launch path — the console
-    # entry point / Docker entrypoint AND anything serving
-    # ``plex_manager.web.app:app`` directly — passes through this lifespan, so
-    # enforcing here (and ONLY here) means advertisement and enforcement cannot
-    # diverge. Tokenless + bypass-off would otherwise deadlock first-run setup
-    # (the pre-init gate 401s every call while /setup/status honestly advertises
-    # no token) — and loosening pre-init auth instead would expose the
-    # validate/* SSRF probes and let anyone who can reach the port claim the
-    # install. Enforced AFTER the ``initialized`` read because only a
-    # FIRST-RUN-CAPABLE server is refused: an initialized install is API-key
-    # gated everywhere and never consults the setup token again, so it must
-    # keep restarting/upgrading tokenless.
-    validate_startup_exposure(get_settings(), initialized=initialized)
     prepare_encryption(initialized=initialized)
 
     app.state.http_client = create_upstream_http_client()

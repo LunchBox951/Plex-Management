@@ -26,7 +26,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import SystemSettings, User
-from plex_manager.web import middleware
 from plex_manager.web.deps import SettingsStore
 from plex_manager.web.routers import auth as auth_module
 
@@ -39,28 +38,12 @@ _MACHINE_ID = "abc123machine"
 
 
 # --------------------------------------------------------------------------- #
-# Order-independence + pre-init reachability shims
+# Order-independence
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
 def _reset_throttle() -> None:
     """Clear the in-process sign-in throttle so tests never leak attempt counts."""
     auth_module._reset_sign_in_throttle()
-
-
-@pytest.fixture(autouse=True)
-def _allow_auth_pre_init(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``/api/v1/auth`` reachable before the install is initialized.
-
-    Task 6 adds ``/api/v1/auth`` to the real setup-guard allowlist; until it
-    lands, shim it here so the pre-init sign-in tests reach the endpoint instead
-    of the guard's 409 ``setup_required``. ``_is_allowed`` reads the module
-    global at request time, so patching it takes effect for the already-built app.
-    """
-    monkeypatch.setattr(
-        middleware,
-        "SETUP_ALLOWLIST_PREFIXES",
-        (*middleware.SETUP_ALLOWLIST_PREFIXES, "/api/v1/auth"),
-    )
 
 
 # --------------------------------------------------------------------------- #
