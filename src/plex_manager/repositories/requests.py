@@ -10,7 +10,13 @@ from sqlalchemy import CursorResult, case, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from plex_manager.models import MediaRequest, MediaType, RequestDedupLock, RequestStatus
+from plex_manager.models import (
+    MediaRequest,
+    MediaType,
+    RequestDedupLock,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.ports.repositories import RequestRecord
 
 if TYPE_CHECKING:
@@ -464,29 +470,69 @@ class SqlRequestRepository:
         row.next_search_at = None
         await self._session.flush()
 
-    async def clear_completed_at(self, request_id: int) -> None:
-        """Null the parent's ``completed_at`` outside any status transition (ADR-0014).
+    async def clear_completed_at_if_no_imported_done_season(self, request_id: int) -> bool:
+        """Null a TV parent's ``completed_at``, but ONLY if no season still backs it.
 
-        Added for the TV report-issue path (``season_request_service.
-        reset_for_research``, #76): a TV parent's ``completed_at`` is not stamped
-        directly (a TV ``MediaRequest`` never goes through ``mark_completed``/
-        ``mark_available`` -- see ``stamp_completed_at_if_unset``'s docstring), so
-        report-issue cannot reuse this class's own :meth:`reset_for_research`
-        (that method is the single-row MOVIE verb: it also flips ``status`` to
-        ``searching`` and clears ``library_verified_at``/``library_path``/backoff
-        fields that a TV parent's status is a pure ROLLUP of its seasons for, and
-        that live per-season on ``SeasonRequest`` instead). The caller decides
-        WHEN to call this (only once no OTHER tracked season is still
-        ``completed``/``available`` -- see ``season_request_service.
-        reset_for_research``'s docstring for why), so this method itself is
-        unconditional, mirroring :meth:`clear_library_path`'s bare, no-transition
-        write.
+        INVARIANT (agrees with ``season_request_service._recompute_parent``'s stamp
+        and :meth:`stamp_completed_at_if_unset`): a TV parent's ``completed_at`` is
+        the show's FIRST genuine completion and stays set for as long as ANY tracked
+        season still GENUINELY BACKS that claim -- i.e. is currently
+        ``completed``/``available`` **and** genuinely completed an import. This
+        clears the stamp iff NO such season remains, so the next genuine
+        re-completion can re-stamp through ``stamp_completed_at_if_unset``'s ``IS
+        NULL`` guard (#76). Returns whether the stamp was actually cleared.
+
+        Discriminator -- ``library_path`` presence (the honest "did an import
+        actually run" bit; see ``SeasonRequest.library_path``): the report-issue
+        reset must NOT count a Plex-present-only season as backing the stamp.
+        ``ensure_seasons`` creates an already-in-Plex season straight to
+        ``available`` with a ``NULL`` ``library_path`` (no import, no eviction
+        breadcrumb), whereas ``import_service._import_tv_locked`` calls
+        ``set_library_path`` in the SAME transaction as ``mark_completed`` for every
+        genuine season import. So ``status IN (completed, available) AND library_path
+        IS NOT NULL`` is exactly "a season that genuinely completed an import and is
+        still on disk-done" -- Plex-present-available (``library_path IS NULL``) is
+        excluded. Without this, a mixed request (S1 already in Plex, S2 imported)
+        whose S2 is report-issued would see S1 ``available`` and wrongly preserve
+        S2's now-stale stamp, so S2's re-import could never re-stamp (Codex P2 #1).
+
+        Closes a TOCTOU on the clear (Codex P2 #2): the predicate is re-asserted at
+        UPDATE time as a correlated ``NOT EXISTS`` in the WHERE clause -- one atomic
+        conditional ``UPDATE``, NOT a decision made off an earlier in-memory
+        snapshot. A sibling season that reaches a genuine (imported) completion and
+        commits between when the caller last observed the seasons and when this flush
+        lands is therefore seen HERE and its fresh, valid stamp survives (the
+        ``UPDATE`` matches zero rows). This mirrors the same DB-authoritative CAS
+        discipline as :meth:`set_status_if_in` / :meth:`stamp_completed_at_if_unset`,
+        and holds on SQLite AND the Postgres-ready posture the repo keeps
+        (``NOT EXISTS`` + partial re-read under the row's write lock). A zero
+        ``rowcount`` means either a genuine-done season still backs the stamp (leave
+        it -- the honest outcome) or the parent row is gone; both correctly leave
+        ``completed_at`` untouched, so unlike the other writers here this is not a
+        ``LookupError`` (the caller has just re-armed a season under this parent, so
+        the parent provably exists and the zero means the guard held).
         """
-        row = await self._session.get(MediaRequest, request_id)
-        if row is None:
-            raise LookupError(f"media request {request_id} does not exist")
-        row.completed_at = None
-        await self._session.flush()
+        still_backed = (
+            select(SeasonRequest.id)
+            .where(
+                # Correlate to the outer ``media_requests`` row so the guard is
+                # re-evaluated against live DB state at UPDATE time, not a snapshot.
+                SeasonRequest.media_request_id == MediaRequest.id,
+                SeasonRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
+                SeasonRequest.library_path.is_not(None),
+            )
+            .exists()
+        )
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(MediaRequest.id == request_id, ~still_backed)
+                .values(completed_at=None)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
 
     async def clear_library_path(self, request_id: int) -> None:
         """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).

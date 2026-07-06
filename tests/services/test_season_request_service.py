@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import season_request_service
 from tests.web.fakes import FakeLibrary
 
@@ -690,14 +691,35 @@ async def test_reset_for_research_leaves_completed_at_when_a_sibling_is_still_do
     ``completed_at`` intact when a DIFFERENT season is report-issue reset -- the
     show's first-completion fact does not become false just because a sibling
     season is being redone (the documented approximation in
-    ``retention_telemetry_service._candidate_context``)."""
+    ``retention_telemetry_service._candidate_context``).
+
+    Season 1 is a GENUINE import (it has a ``library_path`` breadcrumb, exactly as
+    ``import_service._import_tv_locked`` writes one in the same transaction as
+    ``mark_completed``), so the guarded clear counts it as still backing the stamp
+    -- distinct from a Plex-present-only ``available`` season (no ``library_path``),
+    which must NOT (Codex P2 #1)."""
     show_id = await _make_show(sessionmaker_, tmdb_id=725)
     async with sessionmaker_() as session:
         await season_request_service.ensure_seasons(
             session, None, media_request_id=show_id, tmdb_id=725, seasons=[1, 2]
         )
+        # A genuine import stamps the eviction breadcrumb (library_path) in the SAME
+        # transaction as mark_completed -- mirror that so season 1 reads as truly
+        # imported, not merely Plex-present.
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
         await season_request_service.mark_completed(
             session, media_request_id=show_id, season_number=1
+        )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=2,
+            library_path="/media/tv/Some Show/Season 02",
         )
         await season_request_service.mark_available(
             session, media_request_id=show_id, season_number=2
@@ -722,3 +744,132 @@ async def test_reset_for_research_leaves_completed_at_when_a_sibling_is_still_do
         show = await session.get(MediaRequest, show_id)
         assert show is not None
         assert show.completed_at == first_stamp
+
+
+async def test_reset_clears_completed_at_when_only_a_plex_present_sibling_remains(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex P2 #1: a Plex-present-only ``available`` season must NOT count as
+    backing the parent's ``completed_at``. ``ensure_seasons`` creates an
+    already-in-Plex season straight to ``available`` with NO ``library_path`` (no
+    import ran); only a genuine import writes one (``import_service.
+    _import_tv_locked`` sets ``library_path`` in the SAME transaction as
+    ``mark_completed``). So when the ONLY other still-``available`` sibling is
+    Plex-present, report-issuing the genuinely-imported season must CLEAR the now
+    stale stamp -- otherwise the re-import can never re-stamp
+    (``stamp_completed_at_if_unset`` would see a non-null ``completed_at``). Before
+    the fix the predicate counted S1's Plex-present ``available`` and wrongly
+    preserved the stamp."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=730)
+    library = FakeLibrary(available_tv_seasons={730: frozenset({1})})
+
+    # S1 already in Plex -> available, NO library_path. S2 missing -> pending.
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, library, media_request_id=show_id, tmdb_id=730, seasons=[1, 2]
+        )
+        # S2 genuinely imports: breadcrumb + mark_completed, mirroring import_service.
+        # This is the only genuine completion, so it stamps the parent completed_at.
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=2,
+            library_path="/media/tv/Some Show/Season 02",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    assert {r.season_number: r.status for r in records} == {1: "available", 2: "pending"}
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None  # stamped by S2's genuine import
+
+    # report-issue on S2: the only OTHER 'available' season (S1) is Plex-present
+    # (library_path IS NULL), so it does NOT back the stamp -> the stamp must clear.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None  # NOT preserved by the Plex-present sibling
+
+    # S2 re-imports -> the parent re-stamps (the IS NULL guard no longer blocks it).
+    async with sessionmaker_() as session:
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=2,
+            library_path="/media/tv/Some Show/Season 02",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None
+
+
+async def test_clear_completed_at_guard_reasserts_a_committed_done_sibling(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex P2 #2 (TOCTOU): ``clear_completed_at_if_no_imported_done_season`` is a
+    single GUARDED atomic UPDATE -- it re-asserts 'no genuinely-imported done season
+    remains' (a correlated ``NOT EXISTS`` over ``status IN (completed, available)
+    AND library_path IS NOT NULL``) in its WHERE at UPDATE time, NOT off a prior
+    in-memory snapshot. When a sibling's genuine (imported) completion has committed,
+    the UPDATE matches zero rows and the fresh, valid stamp survives; the pre-fix
+    unconditional clear -- deciding off a snapshot taken before that commit -- would
+    have erased it. Mirrors the DB-authoritative CAS in ``set_status_if_in`` and
+    holds on SQLite and the Postgres-ready posture the repo keeps."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=732)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=732, seasons=[1, 2]
+        )
+        # An earlier completion to protect (round-tripped through the DB below so the
+        # later equality compares like-for-like on SQLite's naive datetimes).
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.completed_at = datetime.now(UTC)
+        await session.commit()
+
+    # A separate session commits S2's genuine import (library_path + completed) --
+    # the sibling completion landing before the clear. Its own recompute cannot
+    # re-stamp (completed_at already set), but it now BACKS the stamp.
+    async with sessionmaker_() as session:
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=2,
+            library_path="/media/tv/Some Show/Season 02",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        surviving_stamp = show.completed_at
+        assert surviving_stamp is not None
+
+    # The guarded clear re-asserts at UPDATE time -> S2 genuinely backs the stamp ->
+    # zero rows matched, nothing cleared.
+    async with sessionmaker_() as session:
+        cleared = await SqlRequestRepository(session).clear_completed_at_if_no_imported_done_season(
+            show_id
+        )
+        await session.commit()
+    assert cleared is False
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at == surviving_stamp  # survived the clear

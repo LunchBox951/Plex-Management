@@ -518,25 +518,40 @@ async def reset_for_research(
     reclaim the orphan, never stranded with no handle (honesty over silence).
 
     Also clears the PARENT'S ``completed_at`` (#76) when this reset leaves NO
-    tracked season still ``completed``/``available``. Read against the movie
-    path's own ``SqlRequestRepository.reset_for_research``, which
-    unconditionally nulls ``completed_at`` because a movie is a single row: its
-    completion claim is entirely invalidated the instant it is re-armed. A TV
-    parent's ``completed_at`` is a DIFFERENT thing -- not "this row's own
-    completion" but "the show's FIRST tracked season to complete" (a documented,
-    known approximation; see ``retention_telemetry_service._candidate_context``
-    and ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally
-    clearing it here would make the honest case (another season is STILL
-    genuinely complete/available, unaffected by this reset) regress to
-    "unknown" for no reason -- the show, in fact, DID first complete at that
-    earlier stamp, and that historical fact does not become false just because
-    a DIFFERENT season is now being redone. So this recomputes rather than
-    blindly clears: the stamp is cleared ONLY when the season being reset was
-    the last one still holding up that claim (no season remains ``completed``/
-    ``available`` after this reset), so a subsequent genuine re-completion can
-    re-stamp via ``stamp_completed_at_if_unset``'s ``IS NULL`` guard (#76,
-    closing the "redone season never re-stamps" gap) -- otherwise the earlier,
-    still-true stamp is left standing.
+    tracked season still GENUINELY backing it. Read against the movie path's own
+    ``SqlRequestRepository.reset_for_research``, which unconditionally nulls
+    ``completed_at`` because a movie is a single row: its completion claim is
+    entirely invalidated the instant it is re-armed. A TV parent's
+    ``completed_at`` is a DIFFERENT thing -- not "this row's own completion" but
+    "the show's FIRST tracked season to complete" (a documented, known
+    approximation; see ``retention_telemetry_service._candidate_context`` and
+    ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally clearing
+    it here would make the honest case (another season is STILL genuinely
+    complete/available, unaffected by this reset) regress to "unknown" for no
+    reason -- the show, in fact, DID first complete at that earlier stamp, and
+    that historical fact does not become false just because a DIFFERENT season is
+    now being redone. So the clear is a single GUARDED, atomic conditional UPDATE
+    (:meth:`SqlRequestRepository.clear_completed_at_if_no_imported_done_season`):
+    the stamp is cleared ONLY when NO tracked season is currently
+    ``completed``/``available`` AND genuinely completed an import -- otherwise the
+    earlier, still-true stamp is left standing, and a subsequent genuine
+    re-completion re-stamps via ``stamp_completed_at_if_unset``'s ``IS NULL``
+    guard (#76, closing the "redone season never re-stamps" gap).
+
+    INVARIANT (this and that repo method state the same one): the stamp survives
+    iff some tracked season is ``completed``/``available`` AND has a non-``NULL``
+    ``library_path``. ``library_path`` is the honest imported-vs-Plex-present
+    discriminator (Codex P2 #1): ``ensure_seasons`` creates an already-in-Plex
+    season ``available`` with NO ``library_path`` (no import ran), while
+    ``import_service._import_tv_locked`` sets it in the SAME transaction as
+    ``mark_completed`` for every genuine import -- so a Plex-present-only sibling
+    no longer wrongly preserves a re-armed season's stale stamp. The predicate now
+    lives ONLY in that UPDATE's ``WHERE`` (a correlated ``NOT EXISTS``), re-asserted
+    at UPDATE time rather than read here into a Python snapshot -- closing the
+    TOCTOU where a sibling's genuine completion, committed between an earlier read
+    and this clear, would otherwise be erased (Codex P2 #2). The just-reset season
+    is already flushed to ``searching`` above, so that ``NOT EXISTS`` correctly
+    sees it as no longer done.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
@@ -548,14 +563,9 @@ async def reset_for_research(
     await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
-    # #76: re-read every tracked season AFTER this one's own status write above,
-    # so the just-reset season is seen as ``searching`` (not stale ``completed``/
-    # ``available``) in this membership test -- an accurate "does anything ELSE
-    # still back the parent's completion stamp" check, not a snapshot from before
-    # this reset.
-    seasons = await season_repo.list_for_request(media_request_id)
-    if not any(season.status in _REAL_DONE_SEASON_STATUS_VALUES for season in seasons):
-        await SqlRequestRepository(session).clear_completed_at(media_request_id)
+    await SqlRequestRepository(session).clear_completed_at_if_no_imported_done_season(
+        media_request_id
+    )
     await _recompute_parent(session, media_request_id)
 
 
