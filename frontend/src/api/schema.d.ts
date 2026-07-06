@@ -665,6 +665,23 @@ export interface paths {
          *     deliberately-simple price of a rare repoint). A masked-secret round-trip
          *     (``"***"``, skipped below) and a same-value re-PUT are NOT changes, so neither
          *     needlessly drops a still-valid id.
+         *
+         *     Repointing also revokes EVERY active browser session, in the SAME transaction
+         *     that clears the cached id. Clearing the id alone only changes how FUTURE
+         *     sign-ins resolve server access; an already-minted :class:`AuthSession` keeps
+         *     authorizing against its persisted ``User.permissions`` for up to 30 days, so
+         *     the OLD server's users (and admins) would silently survive the repoint —
+         *     exactly the stale-authority leak the id invalidation exists to close. A
+         *     repoint is an auth-domain change (ADR-0016 derives every session's authority
+         *     from access to THE configured server), so everyone — including the admin
+         *     performing the repoint — must re-sign-in and be re-evaluated against the NEW
+         *     server. The self-lockout is deliberate and honest, not collateral damage:
+         *     this request already passed auth at dependency time, so the response below
+         *     completes normally for the now-revoked session; the admin's very next request
+         *     re-authenticates (they still own a Plex account — one sign-in, no data loss).
+         *     Revocation stamps ``revoked_at`` on rows where it is NULL (the model's
+         *     auditable-revoke convention) rather than deleting; API-key auth is untouched,
+         *     so the ``X-Api-Key`` recovery path still works throughout.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
@@ -852,6 +869,27 @@ export interface paths {
          *     overwrite the stored creds nor re-claim the install. The claim sets ONLY
          *     ``initialized``/``setup_completed_at`` — the pre-init sign-in already stamped
          *     ``setup_started_at`` (deliberately never overwritten here).
+         *
+         *     The persisted machine identifier is RE-DERIVED here, never trusted from the
+         *     body. ``validate/plex`` asserts ownership of the server it probes, but that
+         *     proves nothing about what a direct API caller later POSTs to THIS endpoint:
+         *     pairing server-X's ``plex_url``/``plex_token`` with server-Y's machine id
+         *     would make post-init sign-in admit (and grant admin to) server-Y's audience
+         *     while the app actually operates server-X. So, in the same request that
+         *     persists it, the id is probed live from the SUBMITTED ``plex_url`` +
+         *     resolved token via the exact ``/identity`` code path ``validate/plex`` uses
+         *     (:meth:`PlexTvClient.fetch_server_identity`; an unreachable server is the
+         *     same honest 502 envelope), and the SAME ownership assertion
+         *     (:func:`_assert_admin_owns_server`, 403 ``server_not_owned``) is re-checked
+         *     against the signed-in admin's own plex.tv resources. Only the re-derived id
+         *     is stored; ``body.plex_machine_identifier`` is advisory at most (the wizard
+         *     sends the matching one — a mismatch means the caller bypassed the wizard,
+         *     and the derived truth simply wins). Like the token resolution, all of this
+         *     runs BEFORE the claim, so a failed probe / foreign server can never leave a
+         *     half-claimed, credential-less row. Under ``dev_auth_bypass`` (dev only, no
+         *     Plex account exists to assert ownership with — the whole credential model is
+         *     already bypassed) the body id is stored as-is, exactly as the bypass skips
+         *     ``require_setup_admin`` itself.
          */
         post: operations["complete_api_v1_setup_complete_post"];
         delete?: never;
@@ -3187,6 +3225,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The Plex server was unreachable */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };

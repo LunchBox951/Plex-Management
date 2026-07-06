@@ -254,6 +254,24 @@ def _owned_by_another_user(
     )
 
 
+def _dedup_preference_user_id(user_id: int | None, actor_is_admin: bool) -> int | None:
+    """The ``prefer_user_id`` scope for a terminal in-library dedup lookup.
+
+    Exactly the actors :func:`_owned_by_another_user` can REJECT — a non-admin
+    authenticated user — get the owner-preference lookup (their own terminal row,
+    then an ownerless claimable one, before a foreign row; see
+    :meth:`~plex_manager.ports.repositories.RequestRepository.find_in_library`).
+    Without it, multiple terminal rows for one media (a legitimate state — the
+    remove-then-reacquire flow, or the per-user keep-own-row race collapse) make
+    the dedup check only the newest GLOBAL row: user A, who owns an older visible
+    ``available`` row, would be 409-rejected because user B's newer row shadows
+    it. Admins and API-key automation (``user_id`` ``None``) return ``None`` —
+    they are never ownership-rejected, so they keep the unscoped newest-row-wins
+    lookup unchanged.
+    """
+    return user_id if user_id is not None and not actor_is_admin else None
+
+
 async def _claim_dedup_winner_if_unowned(
     session: AsyncSession,
     repo: SqlRequestRepository,
@@ -458,7 +476,12 @@ async def create_request_result(
     behind the caller's per-user filter; the post-commit available-race collapse
     instead KEEPS the caller's own row (see :func:`_collapse_available_race`).
     Admins and API-key automation (``user_id`` None) keep the shared dedup
-    behavior (issue #58).
+    behavior (issue #58). The terminal ``find_in_library`` lookups are
+    owner-preferring for exactly the actors this can reject (see
+    :func:`_dedup_preference_user_id`): with several terminal rows for one media,
+    the caller's OWN row — then an ownerless claimable one — wins over a foreign
+    row, so the 409 fires only when every candidate truly belongs to someone else,
+    never because another user's newer row shadows the caller's own.
     """
     if media_type not in {"movie", "tv"}:
         raise MediaTypeDeferredError(media_type)
@@ -527,11 +550,16 @@ async def create_request_result(
         # terminal row. A movie REMOVED from Plex reads not-available above and falls
         # through to a normal pending request, so re-requests still work.
         await repo.acquire_media_lock(tmdb_id, media_type)
-        in_library = await repo.find_in_library(tmdb_id, media_type)
+        in_library = await repo.find_in_library(
+            tmdb_id, media_type, prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin)
+        )
         if in_library is not None:
             # Issue #58: same ownership decision as the find_active dedup above —
             # a terminal in-library row owned by ANOTHER user must not be handed to
             # a non-admin (their list/get hide it: a success that instantly vanishes).
+            # The owner-preference lookup already picked the caller's OWN row (or an
+            # ownerless claimable one) over a foreign row when several terminal rows
+            # exist, so this rejection now fires only when EVERY candidate is foreign.
             if _owned_by_another_user(in_library, user_id, actor_is_admin):
                 raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
             # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
@@ -556,11 +584,17 @@ async def create_request_result(
         # normal tracked request so the missing season is still searched/grabbed.
         present = await _present_seasons_or_empty(library, tmdb_id)
         if present.issuperset(season_numbers):
-            in_library = await repo.find_in_library(tmdb_id, media_type)
+            in_library = await repo.find_in_library(
+                tmdb_id,
+                media_type,
+                prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin),
+            )
             if in_library is not None:
                 # Issue #58: same ownership decision as the movie short-circuit —
                 # rejected BEFORE ensure_seasons, so another user's terminal request
                 # is never grown with this caller's seasons nor returned to them.
+                # As in the movie path, the owner-preference lookup means a foreign
+                # row is only rejected when the caller has NO own/ownerless candidate.
                 if _owned_by_another_user(in_library, user_id, actor_is_admin):
                     raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
                 # Adopt an OWNERLESS in-library row for this requester before growing

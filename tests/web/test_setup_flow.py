@@ -422,10 +422,15 @@ async def test_complete_requires_a_session(client: httpx.AsyncClient, seed: Seed
 
 
 async def test_complete_is_keyless_and_stores_the_machine_id(
-    client: httpx.AsyncClient, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
 ) -> None:
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
+    # complete re-derives the machine id from the submitted server's /identity and
+    # re-asserts ownership against the admin's plex.tv resources (the honest path).
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
 
     response = await client.post(
         "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
@@ -448,13 +453,16 @@ async def test_complete_is_keyless_and_stores_the_machine_id(
 
 
 async def test_complete_preserves_the_sign_in_claim_timestamp(
-    client: httpx.AsyncClient, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
 ) -> None:
     # The pre-init sign-in stamped ``setup_started_at``; complete only sets
     # ``setup_completed_at`` and must never overwrite the claim.
     claimed_at = datetime(2026, 7, 4, 12, 0, tzinfo=UTC)
     await _seed_admin_session(sessionmaker_, setup_started_at=claimed_at)
     _authenticate(client)
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
 
     response = await client.post(
         "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
@@ -472,10 +480,13 @@ async def test_complete_preserves_the_sign_in_claim_timestamp(
 
 
 async def test_complete_is_rejected_after_init(
-    client: httpx.AsyncClient, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
 ) -> None:
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
 
     first = await client.post(
         "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
@@ -486,6 +497,88 @@ async def test_complete_is_rejected_after_init(
     )
     assert second.status_code == 409
     assert second.json()["detail"] == "already_initialized"
+
+
+# --------------------------------------------------------------------------- #
+# POST /setup/complete never trusts the caller's machine id (it re-derives it)
+# --------------------------------------------------------------------------- #
+async def test_complete_ignores_a_forged_machine_id_and_stores_the_derived_one(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    """A direct API caller pairing server-X creds with server-Y's machine id must
+    not poison the stored identity: /complete probes the SUBMITTED server's
+    /identity itself and persists that derived id — the body's id is advisory."""
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
+
+    body = {**_complete_body(), "plex_machine_identifier": "forged-other-server-id"}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_CSRF_HEADERS)
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        # The DERIVED id won; the forged claim was never persisted.
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) == _MACHINE_ID
+
+
+async def test_complete_rejects_a_server_the_admin_does_not_own(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    """The submitted server derives to a machine id the admin only has SHARED
+    access to: the same 403 ``server_not_owned`` as validate/plex — and, because
+    the check runs BEFORE the claim, the install is left fully unclaimed (no
+    half-initialized row, no stored creds)."""
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+    await _use_transport(
+        app,
+        _validate_transport(
+            identity="shared999",
+            resources=[_owned_server(), _shared_server("shared999")],
+        ),
+    )
+
+    response = await client.post(
+        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "server_not_owned"
+    async with sessionmaker_() as session:
+        row = await session.get(SystemSettings, 1)
+        assert row is not None
+        assert row.initialized is False  # the one-shot claim was never consumed
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) is None
+
+
+async def test_complete_unreachable_submitted_server_is_502_and_unclaimed(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    """The /identity re-derivation uses the same honest 502 envelope as
+    validate/plex when the submitted server is unreachable — and never consumes
+    the one-shot claim, so the operator can retry after fixing the URL."""
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "plex.tv":
+            return httpx.Response(200, json=[_owned_server()])
+        raise httpx.ConnectError("connection refused", request=request)
+
+    await _use_transport(app, httpx.MockTransport(handler))
+
+    response = await client.post(
+        "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "server_unreachable_from_backend"
+    async with sessionmaker_() as session:
+        row = await session.get(SystemSettings, 1)
+        assert row is not None
+        assert row.initialized is False
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +603,7 @@ async def test_status_has_no_app_api_key_field(client: httpx.AsyncClient, seed: 
 # --------------------------------------------------------------------------- #
 async def test_configured_setup_token_still_gates_pre_init(
     client: httpx.AsyncClient,
+    app: FastAPI,
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -517,6 +611,9 @@ async def test_configured_setup_token_still_gates_pre_init(
     get_settings.cache_clear()
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
 
     # A configured hardening token is required BEFORE the session check pre-init.
     missing = await client.post(
@@ -541,6 +638,11 @@ async def test_post_init_sign_in_uses_the_stored_machine_id(
 ) -> None:
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
+    # complete itself probes /identity once (deriving the id it stores) — the
+    # assertion below is that the POST-INIT SIGN-IN never re-probes it.
+    await _use_transport(
+        app, _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()])
+    )
 
     complete = await client.post(
         "/api/v1/setup/complete", json=_complete_body(), headers=_CSRF_HEADERS

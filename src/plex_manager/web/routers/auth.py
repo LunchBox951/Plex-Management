@@ -23,6 +23,7 @@ from typing import Annotated, Any, cast
 import httpx
 from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy import CursorResult, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.plex.oauth import (
@@ -309,14 +310,48 @@ def reset_sign_in_throttle() -> None:
 # Persistence helpers
 # --------------------------------------------------------------------------- #
 async def _get_or_create_client_identifier(session: AsyncSession) -> str:
+    """Return the app's stable plex.tv device identifier, creating it once.
+
+    Concurrency-safe at THIS call site, mirroring :func:`ensure_system_settings`'
+    pattern: two simultaneous first-ever sign-ins on a clean DB can both observe
+    no stored identifier and both attempt the INSERT; ``settings.key`` is UNIQUE,
+    so the loser's flush raises ``IntegrityError``. That loser must not 500 (an
+    honest sign-in racing an identical sign-in is not an error): roll the failed
+    transaction back and re-read the WINNER's committed identifier, so both
+    requests proceed under the SAME device identity — which is the whole point of
+    persisting one. The rollback is safe here because nothing else is pending in
+    the session yet: this runs before any claim/user write in the sign-in flow.
+    (A store-level retry belongs to the resilience track — see PR #121; this
+    call-site guard is deliberately scoped and stays harmless alongside it.)
+    """
     store = SettingsStore(session)
     existing = await store.get(_CLIENT_ID_SETTING)
     if existing:
         return existing
     created = f"plex-manager-{secrets.token_urlsafe(18)}"
-    await store.set(_CLIENT_ID_SETTING, created)
-    await session.flush()
+    try:
+        await store.set(_CLIENT_ID_SETTING, created)
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        winner = await store.get(_CLIENT_ID_SETTING)
+        if winner is None:  # pragma: no cover - the conflicting row must exist
+            raise
+        return winner
     return created
+
+
+async def find_user_by_plex_id(session: AsyncSession, plex_id: int) -> User | None:
+    """Return the ``User`` row for a Plex account id, or ``None``.
+
+    Public (no leading underscore) on purpose, mirroring
+    :func:`reset_sign_in_throttle`: the upsert race test monkeypatches this
+    lookup to simulate the concurrent-first-sign-in window (both racers observe
+    "no row" before either commits) without reaching into private module state,
+    which pyright's private-usage check would reject.
+    """
+    result = await session.execute(select(User).where(User.plex_id == plex_id))
+    return result.scalars().first()
 
 
 async def _upsert_user(
@@ -326,15 +361,40 @@ async def _upsert_user(
     username: str,
     is_admin: bool,
 ) -> User:
-    result = await session.execute(select(User).where(User.plex_id == account_id))
-    user = result.scalars().first()
+    """Create-or-update the ``User`` row for this verified Plex account.
+
+    Concurrency-safe on the FIRST sign-in: two simultaneous first-time sign-ins
+    for the SAME Plex account can both pass the no-row lookup and both INSERT;
+    ``users.plex_id`` is UNIQUE, so the loser's flush raises ``IntegrityError``.
+    The loser must not 500 (the account is legitimately signing in — the same
+    identity merely arrived twice): roll the failed transaction back, re-read the
+    WINNER's committed row, and proceed — the caller's session mint then attaches
+    a second ``AuthSession`` to the one shared user row, exactly as two
+    sequential sign-ins would. The rollback is safe on the realistic (post-init)
+    path because nothing else is pending in the session — post-init access
+    decisions only read; the pre-init claim CAS serializes same-account sign-ins
+    at the ``setup_started_at`` UPDATE before this runs, so a pre-init loser
+    with a pending claim write cannot reach this collision.
+
+    The refreshed fields (``username``/``permissions``) are applied to the
+    winner's row too — recovery converges on the same state the plain update
+    path would have written.
+    """
+    user = await find_user_by_plex_id(session, account_id)
     if user is None:
-        user = User(plex_id=account_id, username=username, permissions=1 if is_admin else 0)
-        session.add(user)
-        await session.flush()
-    else:
-        user.username = username
-        user.permissions = 1 if is_admin else 0
+        created = User(plex_id=account_id, username=username, permissions=1 if is_admin else 0)
+        session.add(created)
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            user = await find_user_by_plex_id(session, account_id)
+            if user is None:  # pragma: no cover - the conflicting row must exist
+                raise
+        else:
+            return created
+    user.username = username
+    user.permissions = 1 if is_admin else 0
     return user
 
 

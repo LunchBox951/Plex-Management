@@ -174,17 +174,36 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
-    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
-        stmt = (
-            select(MediaRequest)
-            .where(
-                MediaRequest.tmdb_id == tmdb_id,
-                MediaRequest.media_type == MediaType(media_type),
-                MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
-            )
-            .order_by(MediaRequest.id.desc())
-            .limit(1)
+    async def find_in_library(
+        self, tmdb_id: int, media_type: str, *, prefer_user_id: int | None = None
+    ) -> RequestRecord | None:
+        """Return an already-in-library (available/completed) request, or ``None``.
+
+        ``prefer_user_id`` (the per-user visibility scope — see the port
+        docstring) reorders WHICH terminal row wins when several exist for the
+        same media: (a) a row OWNED by that user first, then (b) an OWNERLESS
+        (claimable) row, then (c) anyone else's — newest-by-id within each rank.
+        Without the preference, the newest GLOBAL row wins unconditionally, so a
+        user whose own older ``available`` row is shadowed by another user's
+        newer one would be handed the foreign row — which the service can only
+        honestly reject (409) even though a perfectly returnable row of their own
+        exists. ``None`` (admins / API-key automation) keeps the plain
+        newest-row-wins behavior unchanged.
+        """
+        stmt = select(MediaRequest).where(
+            MediaRequest.tmdb_id == tmdb_id,
+            MediaRequest.media_type == MediaType(media_type),
+            MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
         )
+        if prefer_user_id is not None:
+            ownership_rank = case(
+                (MediaRequest.user_id == prefer_user_id, 0),
+                (MediaRequest.user_id.is_(None), 1),
+                else_=2,
+            )
+            stmt = stmt.order_by(ownership_rank, MediaRequest.id.desc()).limit(1)
+        else:
+            stmt = stmt.order_by(MediaRequest.id.desc()).limit(1)
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 

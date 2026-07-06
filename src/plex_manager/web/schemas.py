@@ -327,8 +327,11 @@ class SetupCompleteRequest(BaseModel):
     )
 
     plex_url: str
-    # The wizard's chosen (owned, ownership-verified) server, persisted so post-init
-    # sign-in resolves server access from the stored id without re-probing /identity.
+    # The wizard's chosen server — ADVISORY only: ``/setup/complete`` re-derives the
+    # persisted id live from the submitted server's ``/identity`` and re-asserts
+    # ownership, so a direct API caller cannot pair server-X creds with server-Y's
+    # id (see ``web.routers.setup.complete``). Post-init sign-in then resolves
+    # server access from the STORED (derived) id without re-probing /identity.
     plex_machine_identifier: str
     # OPTIONAL: ``None`` (omitted) means "persist the signed-in admin's stored Plex
     # OAuth token" — the keyless wizard never re-types the token. A non-null value is

@@ -23,10 +23,11 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
-from plex_manager.models import SystemSettings, User
+from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
 from plex_manager.web.routers import auth as auth_module
 
@@ -587,6 +588,124 @@ async def test_logout_revokes_session_cookie(
     client.cookies.set("plexmgr.session", session_cookie)
     settings = await client.get("/api/v1/settings")
     assert settings.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# First-sign-in races: two concurrent racers on a clean DB must both succeed
+# --------------------------------------------------------------------------- #
+async def test_concurrent_client_id_create_race_loser_reuses_winner_id(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two simultaneous first-ever POST /auth/plex on a clean DB both observe no
+    ``plex_oauth_client_identifier``; ``settings.key`` is UNIQUE, so the loser's
+    INSERT flush raises ``IntegrityError``. The loser must roll back, re-read the
+    winner's committed identifier, and complete the sign-in under THAT device
+    identity — never a 500, never a second identifier. Simulated exactly like the
+    request-dedup race tests: the loser's first read MISSES (the winner's row was
+    not yet visible when it looked) while the winner's identifier is already
+    committed, and the losing write raises the ``IntegrityError`` its INSERT
+    would."""
+    await seed(initialized=False)
+    # The WINNER's identifier is committed (its request got there first).
+    await _store_setting(sessionmaker_, "plex_oauth_client_identifier", "winner-client-id")
+
+    real_get = SettingsStore.get
+    missed = {"n": 0}
+
+    async def racing_get(self: SettingsStore, key: str) -> str | None:
+        # The loser's FIRST lookup ran before the winner committed: miss once.
+        if key == "plex_oauth_client_identifier" and missed["n"] == 0:
+            missed["n"] = 1
+            return None
+        return await real_get(self, key)
+
+    async def losing_set(self: SettingsStore, key: str, value: str) -> None:
+        # The loser's INSERT collides with the winner's committed unique key.
+        assert key == "plex_oauth_client_identifier"
+        raise IntegrityError(
+            "INSERT INTO settings", None, Exception("UNIQUE constraint failed: settings.key")
+        )
+
+    monkeypatch.setattr(SettingsStore, "get", racing_get)
+    monkeypatch.setattr(SettingsStore, "set", losing_set)
+
+    # Capture the device identifier every plex.tv call actually carried.
+    used_identifiers: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        used_identifiers.append(request.headers.get("X-Plex-Client-Identifier"))
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/user":
+            return httpx.Response(200, json=_OWNER_USER)
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/resources":
+            return httpx.Response(200, json=[_owned_server()])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await _use_transport(app, httpx.MockTransport(handler))
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+
+    assert response.status_code == 200  # the loser signs in, never a 500
+    assert response.json()["user"]["is_admin"] is True
+    # Every plex.tv call ran under the WINNER's identifier — the loser adopted it.
+    assert used_identifiers and set(used_identifiers) == {"winner-client-id"}
+    async with sessionmaker_() as db:
+        stored = await SettingsStore(db).get("plex_oauth_client_identifier")
+    assert stored == "winner-client-id"  # the winner's identifier survived intact
+
+
+async def test_concurrent_same_account_first_sign_in_yields_one_user_two_sessions(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent FIRST-TIME post-init sign-ins for the SAME Plex account both
+    pass the no-row lookup and both INSERT; ``users.plex_id`` is UNIQUE, so the
+    loser's flush raises ``IntegrityError``. The loser must recover onto the
+    winner's row and still mint its session: both browsers end up signed in, ONE
+    user row exists. Simulated like the request-dedup race tests: the winner's
+    sign-in commits first, then the loser's first lookup is forced to MISS (as it
+    would mid-race) so its INSERT genuinely collides on the unique index."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    winner = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert winner.status_code == 200
+
+    real_find = auth_module.find_user_by_plex_id
+    missed = {"n": 0}
+
+    async def racing_find(session: AsyncSession, plex_id: int) -> User | None:
+        # The loser looked BEFORE the winner committed: miss once, then real.
+        if missed["n"] == 0:
+            missed["n"] = 1
+            return None
+        return await real_find(session, plex_id)
+
+    monkeypatch.setattr(auth_module, "find_user_by_plex_id", racing_find)
+    client.cookies.clear()  # the loser is a separate browser, not the winner's session
+
+    loser = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+
+    assert loser.status_code == 200  # never a 500 — the same account merely raced itself
+    assert loser.cookies.get("plexmgr.session")
+    assert missed["n"] == 1  # the race path (miss -> collide -> recover) actually ran
+    async with sessionmaker_() as db:
+        users = (await db.execute(select(User).where(User.plex_id == 42))).scalars().all()
+        assert len(users) == 1  # ONE shared user row — the loser adopted the winner's
+        assert users[0].permissions == 1  # the recovery re-applied the admin decision
+        session_rows = (
+            (await db.execute(select(AuthSession).where(AuthSession.user_id == users[0].id)))
+            .scalars()
+            .all()
+        )
+    assert len(session_rows) == 2  # BOTH racers hold a live session
 
 
 async def test_openapi_advertises_both_cookie_and_apikey_auth(app: FastAPI) -> None:

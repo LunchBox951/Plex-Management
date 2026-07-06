@@ -151,7 +151,11 @@ async def test_create_request_collapses_racing_in_library_available_rows(
     # the winner's row is not yet visible to the racing transaction. This drives the
     # duplicate insert the active-dedup index cannot catch.
     async def racing_find_in_library(
-        self: SqlRequestRepository, tmdb_id: int, media_type: str
+        self: SqlRequestRepository,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        prefer_user_id: int | None = None,
     ) -> RequestRecord | None:
         return None
 
@@ -186,7 +190,11 @@ async def test_in_library_short_circuit_locks_before_terminal_dedup_lookup(
         calls.append("lock")
 
     async def find_in_library(
-        self: SqlRequestRepository, tmdb_id: int, media_type: str
+        self: SqlRequestRepository,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        prefer_user_id: int | None = None,
     ) -> RequestRecord | None:
         assert calls == ["lock"]
         calls.append("find")
@@ -505,7 +513,11 @@ async def test_create_request_tv_collapses_racing_in_library_available_rows(
     # the second create inserts a duplicate the active-dedup index cannot catch. The
     # racer requests a DIFFERENT season (2) than the winner tracked (1).
     async def racing_find_in_library(
-        self: SqlRequestRepository, tmdb_id: int, media_type: str
+        self: SqlRequestRepository,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        prefer_user_id: int | None = None,
     ) -> RequestRecord | None:
         return None
 
@@ -1066,7 +1078,11 @@ async def test_non_admin_available_race_collapse_keeps_their_own_row(
     # Force find_in_library to MISS (the race window): the second, non-admin user
     # inserts their own available row instead of hitting the terminal-row guard.
     async def racing_find_in_library(
-        self: SqlRequestRepository, tmdb_id: int, media_type: str
+        self: SqlRequestRepository,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        prefer_user_id: int | None = None,
     ) -> RequestRecord | None:
         return None
 
@@ -1185,6 +1201,173 @@ async def test_non_admin_claims_ownerless_tv_all_present_row_on_dedup(
         )
     assert len(rows) == 1
     assert rows[0].user_id == claimer_id  # claimed for the requester
+
+
+# --------------------------------------------------------------------------- #
+# In-library dedup winner PREFERENCE (issue #58): with SEVERAL terminal rows    #
+# for one media, a non-admin's own row — then an ownerless claimable one —      #
+# must win over a foreign row. Newest-global-row-wins alone made user B's       #
+# newer row shadow user A's older visible row, turning A's re-request into a    #
+# spurious requested_by_another_user 409.                                       #
+# --------------------------------------------------------------------------- #
+
+
+async def _seed_available_row(
+    sm: SessionMaker,
+    *,
+    tmdb_id: int,
+    user_id: int | None,
+    media_type: str = "movie",
+    title: str = "Seeded",
+) -> int:
+    """Insert a terminal ``available`` request row directly (a prior watchable)."""
+    async with sm() as session:
+        row = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType(media_type),
+            title=title,
+            status=RequestStatus.available,
+            user_id=user_id,
+        )
+        session.add(row)
+        await session.commit()
+        return row.id
+
+
+async def test_non_admin_movie_in_library_dedup_prefers_their_own_older_row(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """User A owns an OLDER available row; user B's NEWER one exists for the same
+    movie (a legitimate state — the per-user keep-own-row collapse produces it).
+    A's re-request must return A's OWN row, not 409 because B's newer row would
+    win a newest-global lookup."""
+    a_id = await _make_user(sessionmaker_, username="pref-a")
+    b_id = await _make_user(sessionmaker_, username="pref-b")
+    older_a = await _seed_available_row(sessionmaker_, tmdb_id=7301, user_id=a_id)
+    newer_b = await _seed_available_row(sessionmaker_, tmdb_id=7301, user_id=b_id)
+    assert older_a < newer_b  # A's row is genuinely the shadowed older one
+
+    tmdb = FakeTmdb(movies={7301: MovieMetadata(tmdb_id=7301, title="Seeded", year=2020)})
+    library = FakeLibrary(available={7301})
+
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7301,
+            media_type="movie",
+            user_id=a_id,
+            actor_is_admin=False,
+            library=library,
+        )
+
+    assert record.id == older_a  # their own row, not a 409 and not B's row
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7301)))
+            .scalars()
+            .all()
+        )
+    assert {row.id for row in rows} == {older_a, newer_b}  # nothing new, nothing deleted
+    by_id = {row.id: row for row in rows}
+    assert by_id[older_a].user_id == a_id
+    assert by_id[newer_b].user_id == b_id  # B's row untouched
+
+
+async def test_non_admin_movie_in_library_dedup_claims_ownerless_over_foreign(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """With a FOREIGN row and an OWNERLESS one both terminal for the same movie,
+    the ownerless (claimable) row wins for a non-admin — adopted via the existing
+    claim helper — instead of rejecting on the foreign row."""
+    a_id = await _make_user(sessionmaker_, username="pref-claim-a")
+    b_id = await _make_user(sessionmaker_, username="pref-claim-b")
+    foreign_older = await _seed_available_row(sessionmaker_, tmdb_id=7302, user_id=b_id)
+    ownerless_newer = await _seed_available_row(sessionmaker_, tmdb_id=7302, user_id=None)
+
+    tmdb = FakeTmdb(movies={7302: MovieMetadata(tmdb_id=7302, title="Seeded", year=2020)})
+    library = FakeLibrary(available={7302})
+
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7302,
+            media_type="movie",
+            user_id=a_id,
+            actor_is_admin=False,
+            library=library,
+        )
+
+    assert record.id == ownerless_newer
+    async with sessionmaker_() as session:
+        claimed = await session.get(MediaRequest, ownerless_newer)
+        foreign = await session.get(MediaRequest, foreign_older)
+    assert claimed is not None and claimed.user_id == a_id  # adopted for the requester
+    assert foreign is not None and foreign.user_id == b_id  # the foreign row untouched
+
+
+async def test_non_admin_movie_in_library_dedup_only_foreign_rows_still_409(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """When EVERY terminal row belongs to other users, the honest 409 is unchanged
+    — the preference only reorders candidates, it never admits a foreign row."""
+    a_id = await _make_user(sessionmaker_, username="pref-409-a")
+    b_id = await _make_user(sessionmaker_, username="pref-409-b")
+    c_id = await _make_user(sessionmaker_, username="pref-409-c")
+    await _seed_available_row(sessionmaker_, tmdb_id=7303, user_id=b_id)
+    await _seed_available_row(sessionmaker_, tmdb_id=7303, user_id=c_id)
+
+    tmdb = FakeTmdb(movies={7303: MovieMetadata(tmdb_id=7303, title="Seeded", year=2020)})
+    library = FakeLibrary(available={7303})
+
+    async with sessionmaker_() as session:
+        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
+            await request_service.create_request(
+                session,
+                tmdb,
+                tmdb_id=7303,
+                media_type="movie",
+                user_id=a_id,
+                actor_is_admin=False,
+                library=library,
+            )
+
+
+async def test_non_admin_tv_all_present_dedup_prefers_their_own_older_row(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV analogue: A's own older available show row wins over B's newer one,
+    and ensure_seasons grows A's OWN row — never B's."""
+    a_id = await _make_user(sessionmaker_, username="tv-pref-a")
+    b_id = await _make_user(sessionmaker_, username="tv-pref-b")
+    older_a = await _seed_available_row(
+        sessionmaker_, tmdb_id=7304, user_id=a_id, media_type="tv", title="Seeded Show"
+    )
+    newer_b = await _seed_available_row(
+        sessionmaker_, tmdb_id=7304, user_id=b_id, media_type="tv", title="Seeded Show"
+    )
+
+    tmdb = FakeTmdb(
+        shows={7304: TvMetadata(tmdb_id=7304, title="Seeded Show", year=2020, season_count=3)}
+    )
+    library = FakeLibrary(available_tv_seasons={7304: frozenset({1, 2})})
+
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7304,
+            media_type="tv",
+            seasons=[1],
+            user_id=a_id,
+            actor_is_admin=False,
+            library=library,
+        )
+
+    assert record.id == older_a  # their own row, not a 409 and not B's row
+    assert await _season_numbers(sessionmaker_, older_a) == {1}  # A's row grew the season
+    assert await _season_numbers(sessionmaker_, newer_b) == set()  # B's row untouched
 
 
 # --------------------------------------------------------------------------- #
@@ -1378,7 +1561,11 @@ async def test_available_race_collapse_claims_ownerless_winner(
     # the post-commit collapse must then adopt the ownerless winner, not just delete
     # the user's row and hand back a hidden one.
     async def racing_find_in_library(
-        self: SqlRequestRepository, tmdb_id: int, media_type: str
+        self: SqlRequestRepository,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        prefer_user_id: int | None = None,
     ) -> RequestRecord | None:
         return None
 

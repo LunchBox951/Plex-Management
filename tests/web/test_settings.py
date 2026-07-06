@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import AuthSession, User
@@ -191,6 +191,93 @@ async def test_put_masked_and_unchanged_plex_values_keep_cached_machine_id(
     )
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # kept, not dropped
+
+
+async def _active_session_count(sessionmaker_: SessionMaker) -> int:
+    """Count auth sessions that are still usable (``revoked_at`` unset)."""
+    async with sessionmaker_() as session:
+        result = await session.execute(
+            select(func.count()).select_from(AuthSession).where(AuthSession.revoked_at.is_(None))
+        )
+        return result.scalar_one()
+
+
+async def test_put_plex_repoint_revokes_every_active_session_including_the_callers(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Repointing Plex is an auth-domain change (ADR-0016): clearing the cached
+    machine id only fixes FUTURE sign-ins, so every already-minted session — whose
+    persisted ``User.permissions`` still encodes the OLD server's authority — must
+    be revoked in the same transaction. That includes the admin performing the
+    repoint (deliberate, honest self-lockout): their PUT still completes cleanly
+    (auth ran at dependency time), and their very NEXT request re-authenticates."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9201, tag="repoint-adm")
+    other_cookies, _ = await _admin_session_cookies(app, plex_id=9202, tag="repoint-other")
+    assert await _active_session_count(sessionmaker_) == 2
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=admin_cookies,
+        headers=admin_csrf,
+    )
+
+    # The write itself completes for the now-revoked caller — never a mid-request 401.
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 0  # everyone, caller included
+
+    # Both old-server sessions must re-sign-in against the NEW server.
+    assert (await client.get("/api/v1/settings", cookies=admin_cookies)).status_code == 401
+    assert (await client.get("/api/v1/settings", cookies=other_cookies)).status_code == 401
+    # The X-Api-Key recovery path is untouched — the repoint never locks the API out.
+    assert (
+        await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    ).status_code == 200
+
+
+async def test_put_non_plex_fields_keep_sessions_active(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A PUT that touches no Plex identity field is NOT a repoint: nobody is
+    signed out over a library-root or Prowlarr edit."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9203, tag="non-plex")
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"tv_root": "/library/tv", "prowlarr_url": "http://prowlarr.local:9696"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 1  # still signed in
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_masked_and_unchanged_plex_values_keep_sessions_active(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The masked-secret round-trip ('***') and a same-value plex_url are NOT
+    repoints (the same non-changes that keep the cached machine id): the FE
+    saving an unrelated field must never sign the whole install out."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9204, tag="masked")
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://old:32400", "plex_token": "***"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 1  # still signed in
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
 
 
 async def test_secret_is_stored_encrypted(

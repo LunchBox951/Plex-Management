@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
+from plex_manager.models import AuthSession
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
@@ -351,6 +354,23 @@ async def put_settings_endpoint(
     deliberately-simple price of a rare repoint). A masked-secret round-trip
     (``"***"``, skipped below) and a same-value re-PUT are NOT changes, so neither
     needlessly drops a still-valid id.
+
+    Repointing also revokes EVERY active browser session, in the SAME transaction
+    that clears the cached id. Clearing the id alone only changes how FUTURE
+    sign-ins resolve server access; an already-minted :class:`AuthSession` keeps
+    authorizing against its persisted ``User.permissions`` for up to 30 days, so
+    the OLD server's users (and admins) would silently survive the repoint —
+    exactly the stale-authority leak the id invalidation exists to close. A
+    repoint is an auth-domain change (ADR-0016 derives every session's authority
+    from access to THE configured server), so everyone — including the admin
+    performing the repoint — must re-sign-in and be re-evaluated against the NEW
+    server. The self-lockout is deliberate and honest, not collateral damage:
+    this request already passed auth at dependency time, so the response below
+    completes normally for the now-revoked session; the admin's very next request
+    re-authenticates (they still own a Plex account — one sign-in, no data loss).
+    Revocation stamps ``revoked_at`` on rows where it is NULL (the model's
+    auditable-revoke convention) rather than deleting; API-key auth is untouched,
+    so the ``X-Api-Key`` recovery path still works throughout.
     """
     await _validate_disk_pressure_pair(body, session)
 
@@ -370,6 +390,14 @@ async def put_settings_endpoint(
         await store.set(field, new_value)
     if plex_identity_changed:
         await store.delete(PLEX_MACHINE_ID_SETTING)
+        # Same transaction as the id invalidation: revoke every ACTIVE session so
+        # nobody's old-server authority outlives the repoint (see the docstring —
+        # this includes the caller's own session, deliberately).
+        await session.execute(
+            update(AuthSession)
+            .where(AuthSession.revoked_at.is_(None))
+            .values(revoked_at=datetime.now(UTC))
+        )
     await session.commit()
     return await _redacted(store)
 
