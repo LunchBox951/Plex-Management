@@ -40,6 +40,8 @@ __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
 
 _logger = logging.getLogger(__name__)
 
+_HTTP_OK: Final = 200
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_UNAUTHORIZED: Final = 401
 _HTTP_FORBIDDEN: Final = 403
 _PAGE_SIZE: Final = 100
@@ -325,7 +327,11 @@ class PlexLibrary:
                 f"Plex rejected the request to {path} (HTTP {status}): "
                 "the token is missing or invalid"
             )
-        if response.is_error:
+        # Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        # (issue #87): ``is_error`` is only true for >=400, so a 3xx redirect (e.g. a
+        # proxy/auth redirect in front of Plex) would read as success even though the
+        # requested scan/query never actually ran.
+        if not (_HTTP_OK <= status < _HTTP_MULTIPLE_CHOICES):
             raise PlexLibraryError(f"Plex request to {path} failed (HTTP {status})")
         return response
 

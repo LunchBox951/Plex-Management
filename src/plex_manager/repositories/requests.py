@@ -174,17 +174,36 @@ class SqlRequestRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
-    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
-        stmt = (
-            select(MediaRequest)
-            .where(
-                MediaRequest.tmdb_id == tmdb_id,
-                MediaRequest.media_type == MediaType(media_type),
-                MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
-            )
-            .order_by(MediaRequest.id.desc())
-            .limit(1)
+    async def find_in_library(
+        self, tmdb_id: int, media_type: str, *, prefer_user_id: int | None = None
+    ) -> RequestRecord | None:
+        """Return an already-in-library (available/completed) request, or ``None``.
+
+        ``prefer_user_id`` (the per-user visibility scope — see the port
+        docstring) reorders WHICH terminal row wins when several exist for the
+        same media: (a) a row OWNED by that user first, then (b) an OWNERLESS
+        (claimable) row, then (c) anyone else's — newest-by-id within each rank.
+        Without the preference, the newest GLOBAL row wins unconditionally, so a
+        user whose own older ``available`` row is shadowed by another user's
+        newer one would be handed the foreign row — which the service can only
+        honestly reject (409) even though a perfectly returnable row of their own
+        exists. ``None`` (admins / API-key automation) keeps the plain
+        newest-row-wins behavior unchanged.
+        """
+        stmt = select(MediaRequest).where(
+            MediaRequest.tmdb_id == tmdb_id,
+            MediaRequest.media_type == MediaType(media_type),
+            MediaRequest.status.in_([RequestStatus.available, RequestStatus.completed]),
         )
+        if prefer_user_id is not None:
+            ownership_rank = case(
+                (MediaRequest.user_id == prefer_user_id, 0),
+                (MediaRequest.user_id.is_(None), 1),
+                else_=2,
+            )
+            stmt = stmt.order_by(ownership_rank, MediaRequest.id.desc()).limit(1)
+        else:
+            stmt = stmt.order_by(MediaRequest.id.desc()).limit(1)
         row = (await self._session.execute(stmt)).scalars().first()
         return _to_record(row) if row is not None else None
 
@@ -221,7 +240,7 @@ class SqlRequestRepository:
         await self._session.execute(stmt)
 
     async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]]
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
         """Batch the DISPLAY status per ``(tmdb_id, media_type)`` — see the port docstring.
 
@@ -231,14 +250,18 @@ class SqlRequestRepository:
         backend is a config swap). Rows come back ``id``-ascending, so per key the
         first non-settled row is the lowest-id ACTIVE one (matching ``find_active``)
         and ``group[-1]`` is the newest fallback when every row is settled.
+
+        ``for_user_id`` (when set) restricts the scan to that user's own rows —
+        the shared-session visibility scope; see the port docstring.
         """
         key_set = set(keys)
         if not key_set:
             return {}
         tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
-        stmt = (
-            select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids)).order_by(MediaRequest.id)
-        )
+        stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
+        if for_user_id is not None:
+            stmt = stmt.where(MediaRequest.user_id == for_user_id)
+        stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         grouped: dict[tuple[int, str], list[MediaRequest]] = {}
         for row in rows:
@@ -389,6 +412,29 @@ class SqlRequestRepository:
         if row.completed_at is None:
             row.completed_at = now
         await self._session.flush()
+
+    async def claim_if_unowned(self, request_id: int, user_id: int) -> bool:
+        """Assign ``user_id`` to a request that currently has NO owner.
+
+        A single ``UPDATE ... WHERE id = ? AND user_id IS NULL`` so the DATABASE
+        decides: an already-owned row is left untouched (an existing owner is never
+        reassigned). Returns whether a row was actually claimed.
+
+        Used on the create-dedup path so a signed-in user whose request collapses
+        onto a previously ownerless active request (e.g. one created via the
+        API-key automation path, which carries no user identity) has the request
+        show up in THEIR own list, rather than succeeding yet silently vanishing
+        behind the per-user list filter.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(MediaRequest.id == request_id, MediaRequest.user_id.is_(None))
+                .values(user_id=user_id)
+            ),
+        )
+        return result.rowcount == 1
 
     async def stamp_completed_at_if_unset(self, request_id: int) -> None:
         """Stamp ``completed_at`` = now, but ONLY if it is currently unset.

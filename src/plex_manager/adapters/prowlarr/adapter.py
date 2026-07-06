@@ -48,6 +48,7 @@ _logger = logging.getLogger(__name__)
 _SEARCH_PATH: Final = "/api/v1/search"
 _INDEXER_PATH: Final = "/api/v1/indexer"
 _HTTP_OK: Final = 200
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_BAD_REQUEST: Final = 400
 _DEFAULT_INDEXER_PRIORITY: Final = 25
 _PRIORITY_TTL_SECONDS: Final = 300.0
@@ -252,6 +253,11 @@ class ProwlarrIndexer:
                 headers={"X-Api-Key": self._api_key},
                 timeout=self._search_timeout,
             )
+        except httpx.InvalidURL as exc:
+            # A malformed stored base URL (issue #88): httpx.InvalidURL is NOT a
+            # RequestError subclass, so without this it would escape untyped as an
+            # opaque 500 instead of the intended indexer-unavailable response.
+            raise IndexerError("Prowlarr search request failed: invalid indexer URL") from exc
         except httpx.RequestError as exc:
             # Prowlarr unreachable (DNS / refused / timeout): surface a retryable
             # error rather than an opaque 500. No url/api key in the message.
@@ -261,9 +267,14 @@ class ProwlarrIndexer:
                 "Prowlarr returned HTTP 400 for the search — all indexers are "
                 "rate-limited or the query was rejected"
             )
-        if response.is_error:
-            # Non-400 HTTP failure (5xx / auth): surface a retryable IndexerError
-            # rather than letting httpx's HTTPStatusError escape (it embeds the url).
+        # Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        # (issue #87): ``is_error`` is only true for >=400, so a 3xx redirect (e.g. a
+        # proxy/auth redirect in front of Prowlarr) would read as a successful search
+        # even though it returned no actual release data.
+        if not (_HTTP_OK <= response.status_code < _HTTP_MULTIPLE_CHOICES):
+            # Non-400 HTTP failure (5xx / auth / redirect): surface a retryable
+            # IndexerError rather than letting httpx's HTTPStatusError escape (it
+            # embeds the url).
             raise IndexerError(f"Prowlarr search failed (HTTP {response.status_code})")
 
         try:
@@ -306,6 +317,16 @@ class ProwlarrIndexer:
                 f"{self._base_url}{_INDEXER_PATH}",
                 headers={"X-Api-Key": self._api_key},
             )
+        except httpx.InvalidURL as exc:
+            # A malformed stored base URL (issue #88): unlike a transient network
+            # failure, every subsequent call with this same URL fails identically,
+            # so this is NOT degraded to the best-effort empty map below — it is a
+            # genuine configuration error and must surface as IndexerError rather
+            # than escape untyped (httpx.InvalidURL is NOT a RequestError/HTTPError
+            # subclass) or be silently swallowed into default priorities.
+            raise IndexerError(
+                "Prowlarr indexer priority lookup failed: invalid indexer URL"
+            ) from exc
         except httpx.HTTPError as exc:
             _logger.warning("could not fetch Prowlarr indexer priorities: %s", exc)
             return {}

@@ -22,6 +22,12 @@ vi.mock('../api/hooks', () => ({
   useDiscoverSearch: vi.fn(),
   useRequests: vi.fn(),
   useRequestsInvalidated: vi.fn(() => false),
+  // Admin context for the shared modal's RBAC gating (same default as
+  // Requests.test.tsx): this suite tests quick-request gating, not roles.
+  useAuthMe: vi.fn(() => ({
+    data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+    isLoading: false,
+  })),
   useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useQueue: vi.fn(() => ({ data: { queue: [] } })),
   useSearchPreview: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
@@ -65,8 +71,8 @@ const SHOW: DiscoverResult = {
   library_state: 'none',
 }
 
-// Exact-string matches: the enclosing PosterCard role="button" folds this aria-label
-// into its own name-from-content, so a loose /request/ regex would be ambiguous.
+// Exact-string matches select the quick-request action, not the card details
+// button that includes the same title in its accessible name.
 const REQUEST_MOVIE = 'Request Fresh Movie'
 const REQUEST_SHOW = 'Request Fresh Show'
 
