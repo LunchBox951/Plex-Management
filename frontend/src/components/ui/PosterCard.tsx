@@ -34,25 +34,13 @@ export function PosterCard({
   const interactive = typeof onClick === 'function'
   return (
     <div
+      data-poster-card
       className={cn(
         'group relative aspect-[2/3] overflow-hidden rounded-[7px] bg-poster',
         'ring-1 ring-white/5 transition-transform duration-200',
-        interactive && 'cursor-pointer hover:-translate-y-1 hover:ring-white/15',
+        interactive && 'hover:-translate-y-1 hover:ring-white/15 focus-within:ring-white/15',
         className,
       )}
-      {...(interactive
-        ? {
-            role: 'button',
-            tabIndex: 0,
-            onClick,
-            onKeyDown: (e: React.KeyboardEvent) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault()
-                onClick?.()
-              }
-            },
-          }
-        : {})}
     >
       {posterUrl ? (
         <img
@@ -67,10 +55,20 @@ export function PosterCard({
 
       <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-transparent" />
 
-      {badge ? <div className="absolute top-2 left-2 z-10">{badge}</div> : null}
-      {action ? <div className="absolute top-2 right-2 z-10">{action}</div> : null}
+      {interactive ? (
+        <button
+          type="button"
+          data-poster-card-trigger
+          aria-label={year ? `View details for ${title} (${year})` : `View details for ${title}`}
+          onClick={onClick}
+          className="absolute inset-0 z-10 cursor-pointer rounded-[7px] border-0 bg-transparent p-0 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-gold/60"
+        />
+      ) : null}
 
-      <div className="absolute right-2.5 bottom-2 left-2.5">
+      {badge ? <div className="pointer-events-none absolute top-2 left-2 z-20">{badge}</div> : null}
+      {action ? <div className="absolute top-2 right-2 z-30">{action}</div> : null}
+
+      <div className="pointer-events-none absolute right-2.5 bottom-2 left-2.5 z-20">
         <div className="font-display text-[12.5px] leading-tight font-bold text-ink line-clamp-2">
           {title}
         </div>

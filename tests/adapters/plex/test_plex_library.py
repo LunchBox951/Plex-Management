@@ -638,6 +638,24 @@ async def test_server_error_raises_plex_library_error_without_token(status: int)
     assert str(status) in message
 
 
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_redirect_status_raises_plex_library_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of Plex) must be rejected like
+    any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes 3xx, so
+    the prior check would have read a redirect as a successful scan/query even
+    though it never actually reached Plex."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers={"Location": "/web/login"})
+
+    adapter = _adapter(handler, base_url=f"http://redirect-{status}:32400")
+    with pytest.raises(PlexLibraryError) as exc_info:
+        await adapter.list_sections()
+    message = str(exc_info.value)
+    assert TOKEN not in message
+    assert str(status) in message
+
+
 async def test_transport_outage_raises_plex_library_error_without_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("name resolution failed", request=request)
@@ -688,6 +706,22 @@ def test_adapter_satisfies_library_port() -> None:
     from plex_manager.ports.library import LibraryPort
 
     assert isinstance(_adapter(_main_handler), LibraryPort)
+
+
+def test_package_root_re_exports_typed_errors() -> None:
+    """The Plex adapter package root must re-export ``PlexAuthError`` and
+    ``PlexLibraryError`` (issue #113), matching every sibling adapter package
+    (``prowlarr``, ``tmdb``, ``qbittorrent``) which all expose their public
+    typed errors at ``__init__``, not just their implementation submodule — a
+    caller following that established contract must not hit an ``ImportError``
+    for the Plex adapter alone."""
+    from plex_manager.adapters.plex import PlexAuthError as RootAuthError
+    from plex_manager.adapters.plex import PlexLibrary as RootLibrary
+    from plex_manager.adapters.plex import PlexLibraryError as RootLibraryError
+
+    assert RootAuthError is PlexAuthError
+    assert RootLibraryError is PlexLibraryError
+    assert RootLibrary is PlexLibrary
 
 
 SECTIONS_NO_MOVIE: dict[str, Any] = {

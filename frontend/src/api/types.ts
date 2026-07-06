@@ -35,18 +35,25 @@ export type QualityProfileItemResponse = Schemas['QualityProfileItemResponse']
 
 export type SettingsResponse = Schemas['SettingsResponse']
 export type SettingsUpdate = Schemas['SettingsUpdate']
+export type AuthMeResponse = Schemas['AuthMeResponse']
+export type AuthUser = Schemas['AuthUser']
+export type PlexSignInRequest = Schemas['PlexSignInRequest']
 
 export type SetupStatusResponse = Schemas['SetupStatusResponse']
 export type SetupCompleteRequest = Schemas['SetupCompleteRequest']
 export type ServiceValidateResponse = Schemas['ServiceValidateResponse']
 export type PlexLibraryOption = Schemas['PlexLibraryOption']
 export type PlexValidateRequest = Schemas['PlexValidateRequest']
+export type PlexServersResponse = Schemas['PlexServersResponse']
+export type PlexServerOption = Schemas['PlexServerOption']
+export type PlexServerConnection = Schemas['PlexServerConnection']
 export type ProwlarrValidateRequest = Schemas['ProwlarrValidateRequest']
 export type QbittorrentValidateRequest = Schemas['QbittorrentValidateRequest']
 export type TmdbValidateRequest = Schemas['TmdbValidateRequest']
 
 export type KeepForeverBody = Schemas['KeepForeverBody']
 export type AppApiKeyResponse = Schemas['AppApiKeyResponse']
+export type AppApiKeyStatusResponse = Schemas['AppApiKeyStatusResponse']
 
 /* ------------------------------------------------------------------- ops -- */
 // ADR-0012 — health/status dashboard, log viewer, disk-pressure eviction.
