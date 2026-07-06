@@ -22,6 +22,12 @@ vi.mock('../api/hooks', () => ({
   useDiscoverSearch: vi.fn(),
   useRequests: vi.fn(),
   useRequestsInvalidated: vi.fn(() => false),
+  // Admin context for the shared modal's RBAC gating (same default as
+  // Requests.test.tsx): this suite tests quick-request gating, not roles.
+  useAuthMe: vi.fn(() => ({
+    data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+    isLoading: false,
+  })),
   useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useQueue: vi.fn(() => ({ data: { queue: [] } })),
   useSearchPreview: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),

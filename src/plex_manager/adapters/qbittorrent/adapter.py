@@ -60,6 +60,7 @@ _logger = logging.getLogger(__name__)
 _API: Final = "/api/v2"
 _HTTP_OK: Final = 200
 _HTTP_NO_CONTENT: Final = 204
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
@@ -712,8 +713,13 @@ class QbittorrentClient:
         carries the status code only — never the url or any secret. Auth (403) is
         already handled by ``_request``'s transparent re-login, so a status reaching
         here is a genuine, surfaced failure.
+
+        Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        (issue #87): ``is_error`` is only true for >=400, so a 3xx redirect (e.g. a
+        proxy/auth redirect in front of qBittorrent) would read as success even
+        though the requested operation never actually ran.
         """
-        if response.is_error:
+        if not (_HTTP_OK <= response.status_code < _HTTP_MULTIPLE_CHOICES):
             raise QbittorrentError(f"qBittorrent request failed (HTTP {response.status_code})")
 
     # ---- auth ----------------------------------------------------------- #

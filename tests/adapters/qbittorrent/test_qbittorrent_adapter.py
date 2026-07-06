@@ -275,6 +275,31 @@ async def test_list_files_error_status_raises_typed_error() -> None:
         await _client(handler).list_files(MAGNET_HASH)
 
 
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_list_files_redirect_status_raises_typed_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of qBittorrent) must be rejected
+    like any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes 3xx,
+    so the prior check would have read a redirect as a successful operation even
+    though the requested torrent-files listing never actually happened."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            # A valid JSON body on the redirect ensures this test only passes via
+            # the explicit 2xx-range check in _raise_for_status (issue #87): if
+            # that check were reverted to ``response.is_error``, the 3xx would
+            # sail past it and _decode_json would happily parse the empty-list
+            # body, silently reading the redirect as a successful (empty) files
+            # listing — the exact regression this test must catch.
+            return httpx.Response(status, json=[], headers={"Location": "/login"})
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).list_files(MAGNET_HASH)
+    assert str(status) in str(exc_info.value)
+
+
 async def test_relogin_on_403() -> None:
     calls = {"login": 0, "info": 0}
 

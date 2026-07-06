@@ -284,6 +284,21 @@ async def test_transport_outage_raises_indexer_error() -> None:
     assert BASE_URL not in str(exc_info.value)
 
 
+async def test_malformed_stored_base_url_raises_indexer_error() -> None:
+    """A malformed stored base URL (e.g. a corrupted Settings row) makes httpx
+    raise ``InvalidURL`` while BUILDING the request — before any transport I/O.
+    ``InvalidURL`` is NOT a ``RequestError`` subclass (issue #88), so without an
+    explicit catch it would escape untyped as an opaque 500 instead of the
+    intended indexer-unavailable ``IndexerError``. The malformed port breaks the
+    indexer-priority lookup first (best-effort no longer applies to a config
+    error) and that is what search() observes."""
+    client = httpx.AsyncClient()
+    adapter = ProwlarrIndexer(client, "http://prowlarr.local:notaport", API_KEY)
+    with pytest.raises(IndexerError):
+        await adapter.search(IndexerSearchRequest(query="x"))
+    await client.aclose()
+
+
 async def test_search_5xx_raises_indexer_error() -> None:
     """A non-400 HTTP failure (5xx) on the search is wrapped as IndexerError."""
 
@@ -294,6 +309,29 @@ async def test_search_5xx_raises_indexer_error() -> None:
 
     with pytest.raises(IndexerError):
         await _adapter(handler).search(IndexerSearchRequest(query="x"))
+
+
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_search_redirect_status_raises_indexer_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of Prowlarr) must be rejected
+    like any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes
+    3xx, so the prior check would have read a redirect as a successful search
+    even though it returned no actual release data."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS)
+        # A JSON body on the redirect ensures this test only passes via the
+        # explicit 2xx-range status check (issue #87): if that check were
+        # reverted to ``response.is_error``, the 3xx would fall through to
+        # response.json(), succeed (the body is valid JSON), and the redirect
+        # would be silently read as a successful empty search — the exact
+        # regression this test must catch.
+        return httpx.Response(status, headers={"Location": "/login"}, json=[])
+
+    with pytest.raises(IndexerError) as exc_info:
+        await _adapter(handler).search(IndexerSearchRequest(query="x"))
+    assert str(status) in str(exc_info.value)
 
 
 async def test_search_non_json_200_raises_indexer_error() -> None:

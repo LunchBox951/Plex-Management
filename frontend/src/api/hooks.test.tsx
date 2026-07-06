@@ -7,6 +7,7 @@ import {
   useEvict,
   useMarkFailed,
   useRequestsInvalidated,
+  useRevokeAppKey,
   useRotateAppKey,
   useUpdateSettings,
 } from './hooks'
@@ -23,7 +24,7 @@ import type {
 
 // No network: the typed client is replaced with controllable GET/PUT/POST mocks.
 vi.mock('./client', () => ({
-  client: { GET: vi.fn(), PUT: vi.fn(), POST: vi.fn() },
+  client: { GET: vi.fn(), PUT: vi.fn(), POST: vi.fn(), DELETE: vi.fn() },
 }))
 
 function createWrapper(qc: QueryClient) {
@@ -35,6 +36,7 @@ function createWrapper(qc: QueryClient) {
 beforeEach(() => {
   vi.mocked(client.POST).mockReset()
   vi.mocked(client.PUT).mockReset()
+  vi.mocked(client.DELETE).mockReset()
 })
 
 describe('useUpdateSettings', () => {
@@ -201,6 +203,7 @@ describe('useRotateAppKey', () => {
     const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries')
     const { result } = renderHook(() => useRotateAppKey(), { wrapper: createWrapper(qc) })
     const outcome = await result.current.mutateAsync()
 
@@ -210,5 +213,30 @@ describe('useRotateAppKey', () => {
     // rotated it -- every other device is correctly locked out, but this one
     // must not be.
     expect(setApiKeySpy).toHaveBeenCalledWith('brand-new-key')
+    // Minting flips the Access card from Generate to Rotate/Revoke: the status
+    // query must be invalidated so the card reflects that a key now exists.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
+  })
+})
+
+describe('useRevokeAppKey', () => {
+  it('deletes the key and invalidates the status without persisting anything locally', async () => {
+    ;(client.DELETE as unknown as Mock).mockResolvedValue({
+      data: undefined,
+      response: { status: 204 },
+    })
+    const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
+    setApiKeySpy.mockClear()
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries')
+    const { result } = renderHook(() => useRevokeAppKey(), { wrapper: createWrapper(qc) })
+    await result.current.mutateAsync()
+
+    expect(client.DELETE).toHaveBeenCalledWith('/api/v1/settings/app-key')
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
+    // Revoke clears the SHARED server-side key; it must never write a value into
+    // this browser's own key store.
+    expect(setApiKeySpy).not.toHaveBeenCalled()
   })
 })

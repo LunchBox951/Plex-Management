@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from plex_manager.adapters.plex.library import PlexLibrary
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
 
-__all__ = ["PlexLibrary"]
+__all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]

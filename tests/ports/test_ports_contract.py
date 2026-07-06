@@ -6,7 +6,12 @@ match the spec, and a minimal fake satisfies each runtime-checkable Protocol.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
+
+import pytest
 
 from plex_manager.domain.release import (
     CandidateRelease,
@@ -141,3 +146,93 @@ def test_port_protocols_are_importable() -> None:
 async def test_fake_indexer_returns_list() -> None:
     result = await _FakeIndexer().search(IndexerSearchRequest(query="test"))
     assert result == []
+
+
+# --------------------------------------------------------------------------- #
+# Mutating default methods must fail loudly, never silently no-op (#80, #81)
+# --------------------------------------------------------------------------- #
+class _FileSystemMissingMutators(FileSystemPort):
+    """A minimal ``FileSystemPort`` that overrides every *query* method but
+    deliberately leaves ``move``/``hardlink_or_copy`` un-overridden, to prove the
+    Protocol's own default bodies are what runs (not a subclass override)."""
+
+    def available_bytes(self, path: Path) -> int:
+        return 0
+
+    def largest_video_file(self, root: str) -> str | None:
+        return None
+
+    def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+        return []
+
+    def delete(self, path: str) -> None:
+        return None
+
+    def delete_guard_refuses(self, path: str) -> bool:
+        return False
+
+    def reclaimable_bytes(self, path: str) -> int:
+        return 0
+
+
+def test_filesystem_port_move_default_raises_not_implemented() -> None:
+    """A ``FileSystemPort`` implementation (or fake) that forgets ``move`` must
+    fail loudly at call time (issue #80) — a silent no-op default would let an
+    import pipeline report a file as placed without ever moving it."""
+    fs = _FileSystemMissingMutators()  # pyright: ignore[reportAbstractUsage]
+    with pytest.raises(NotImplementedError):
+        fs.move(Path("/src"), Path("/dst"))
+
+
+def test_filesystem_port_hardlink_or_copy_default_raises_not_implemented() -> None:
+    """Same rationale as :func:`test_filesystem_port_move_default_raises_not_implemented`
+    for ``hardlink_or_copy`` (issue #80)."""
+    fs = _FileSystemMissingMutators()  # pyright: ignore[reportAbstractUsage]
+    with pytest.raises(NotImplementedError):
+        fs.hardlink_or_copy(Path("/src"), Path("/dst"))
+
+
+class _LibraryMissingTriggerScan(LibraryPort):
+    """A minimal ``LibraryPort`` that overrides every other method but
+    deliberately leaves ``trigger_scan`` un-overridden, to prove the Protocol's
+    own default body is what runs (not a subclass override)."""
+
+    async def is_available(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        use_cache: bool = True,
+        season: int | None = None,
+    ) -> bool:
+        return False
+
+    async def present_seasons(self, tmdb_id: int) -> frozenset[int]:
+        return frozenset()
+
+    async def present_ids(
+        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        return frozenset()
+
+    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+        return []
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        season: int | None = None,
+    ) -> WatchState:
+        return WatchState(watched=False)
+
+
+async def test_library_port_trigger_scan_default_raises_not_implemented() -> None:
+    """A ``LibraryPort`` implementation (or fake) that forgets ``trigger_scan``
+    must fail loudly at call time (issue #81) — a silent no-op default would let
+    a future adapter or fake falsely report a completed Plex scan after an
+    import or purge."""
+    library = _LibraryMissingTriggerScan()  # pyright: ignore[reportAbstractUsage]
+    with pytest.raises(NotImplementedError):
+        await library.trigger_scan("/movies/Some.Movie", "movie")
