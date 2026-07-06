@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from plex_manager.models import (
+    Download,
     MediaRequest,
     MediaType,
     RequestDedupLock,
@@ -470,69 +471,129 @@ class SqlRequestRepository:
         row.next_search_at = None
         await self._session.flush()
 
-    async def clear_completed_at_if_no_imported_done_season(self, request_id: int) -> bool:
-        """Null a TV parent's ``completed_at``, but ONLY if no season still backs it.
+    async def heal_completed_at(self, request_id: int) -> None:
+        """Re-align a TV parent's ``completed_at`` with its committed done seasons.
 
-        INVARIANT (agrees with ``season_request_service._recompute_parent``'s stamp
-        and :meth:`stamp_completed_at_if_unset`): a TV parent's ``completed_at`` is
-        the show's FIRST genuine completion and stays set for as long as ANY tracked
-        season still GENUINELY BACKS that claim -- i.e. is currently
-        ``completed``/``available`` **and** genuinely completed an import. This
-        clears the stamp iff NO such season remains, so the next genuine
-        re-completion can re-stamp through ``stamp_completed_at_if_unset``'s ``IS
-        NULL`` guard (#76). Returns whether the stamp was actually cleared.
+        INVARIANT (shared with ``season_request_service.reset_for_research`` /
+        ``ensure_seasons``, agreeing with ``_recompute_parent``'s stamp and
+        :meth:`stamp_completed_at_if_unset`): after this heal, ``completed_at`` is
+        non-``NULL`` iff some tracked season GENUINELY completed an import and is
+        still ``completed``/``available`` -- keeping the FIRST stamp untouched when
+        one is already set (the never-moves rule), clearing it when nothing backs
+        it (so the next genuine re-completion can re-stamp through the ``IS NULL``
+        guard, #76), and re-stamping when a backing season exists but the stamp was
+        lost. Idempotent and self-correcting: re-running it never changes a
+        consistent row. A TV-parent verb only -- a movie request has no season
+        rows, so this would always read "unbacked" for one; movies keep using
+        :meth:`reset_for_research`'s direct clear.
 
-        Discriminator -- ``library_path`` presence (the honest "did an import
-        actually run" bit; see ``SeasonRequest.library_path``): the report-issue
-        reset must NOT count a Plex-present-only season as backing the stamp.
-        ``ensure_seasons`` creates an already-in-Plex season straight to
-        ``available`` with a ``NULL`` ``library_path`` (no import, no eviction
-        breadcrumb), whereas ``import_service._import_tv_locked`` calls
-        ``set_library_path`` in the SAME transaction as ``mark_completed`` for every
-        genuine season import. So ``status IN (completed, available) AND library_path
-        IS NOT NULL`` is exactly "a season that genuinely completed an import and is
-        still on disk-done" -- Plex-present-available (``library_path IS NULL``) is
-        excluded. Without this, a mixed request (S1 already in Plex, S2 imported)
-        whose S2 is report-issued would see S1 ``available`` and wrongly preserve
-        S2's now-stale stamp, so S2's re-import could never re-stamp (Codex P2 #1).
+        "GENUINELY imported" discriminator -- breadcrumb OR imported-download
+        linkage, per season:
 
-        Closes a TOCTOU on the clear (Codex P2 #2): the predicate is re-asserted at
-        UPDATE time as a correlated ``NOT EXISTS`` in the WHERE clause -- one atomic
-        conditional ``UPDATE``, NOT a decision made off an earlier in-memory
-        snapshot. A sibling season that reaches a genuine (imported) completion and
-        commits between when the caller last observed the seasons and when this flush
-        lands is therefore seen HERE and its fresh, valid stamp survives (the
-        ``UPDATE`` matches zero rows). This mirrors the same DB-authoritative CAS
-        discipline as :meth:`set_status_if_in` / :meth:`stamp_completed_at_if_unset`,
-        and holds on SQLite AND the Postgres-ready posture the repo keeps
-        (``NOT EXISTS`` + partial re-read under the row's write lock). A zero
-        ``rowcount`` means either a genuine-done season still backs the stamp (leave
-        it -- the honest outcome) or the parent row is gone; both correctly leave
-        ``completed_at`` untouched, so unlike the other writers here this is not a
-        ``LookupError`` (the caller has just re-armed a season under this parent, so
-        the parent provably exists and the zero means the guard held).
+        * ``SeasonRequest.library_path IS NOT NULL``: ``import_service.
+          _import_tv_locked`` writes the breadcrumb in the SAME transaction as
+          ``mark_completed`` for every current-version import; ``ensure_seasons``'s
+          already-in-Plex creation leaves it ``NULL`` (no import ever ran).
+        * OR an ``imported`` ``Download`` row for the same ``(media_request_id,
+          season)``: the import finalize CAS moves the placing download to
+          ``imported`` in that same transaction, and this linkage is exactly how
+          report-issue resolves its culprit ("the download that OWNS the placed
+          library file" -- ``SqlDownloadRepository.find_latest_imported_for_
+          request``). This arm covers LEGACY seasons imported before the
+          breadcrumb column existed (``models.SeasonRequest.library_path``:
+          "``None`` for seasons imported before this breadcrumb existed") -- their
+          genuinely-backed stamp must not be erased just because the breadcrumb
+          predates them. A Plex-present-only season (the ``ensure_seasons``
+          short-circuit) has NEITHER marker -- no grab ever ran for that season
+          under this request, so no ``imported`` download row can exist for the
+          pair -- and stays excluded. Known best-effort edge: a terminal download
+          row can later be re-owned by a fresh grab of the same torrent
+          (``update_status``'s ``replace_grab_metadata`` path rewrites its
+          request/season scope), which could drop legacy evidence; that failure
+          degrades to the conservative clear-and-restamp-on-reimport behavior,
+          never to counting a Plex-present-only season.
+
+        Shape -- two atomic conditional ``UPDATE``s whose predicate lives in their
+        OWN ``WHERE`` (DB-authoritative at statement time, never a prior Python
+        snapshot; the same discipline as :meth:`set_status_if_in`):
+
+        1. clear-if-unbacked: ``SET completed_at = NULL`` only while NO qualifying
+           season exists.
+        2. re-stamp-if-backed-but-``NULL``: stamp now() when a qualifying season
+           exists but the stamp is missing. This is the recovery arm for the
+           masked-sibling TOCTOU on MVCC (the Postgres-ready posture): a sibling
+           import finalizing concurrently while MASKED by a higher-precedence
+           season (e.g. a third season ``downloading``) never touches the parent
+           row -- its rollup write is a no-change and its
+           ``stamp_completed_at_if_unset`` no-ops against the still-non-``NULL``
+           stale stamp -- so a clear whose statement snapshot predates that commit
+           erases the stamp with nobody left to re-stamp. Statement 2 runs with a
+           FRESH statement snapshot (READ COMMITTED) and repairs exactly that
+           aftermath. The re-stamp value is ``now()`` because the schema records
+           NO per-season completion timestamp to recompute the true import time
+           from (``Download.completed_at`` is never written by any code path;
+           ``retention_telemetry_service`` documents the deliberately-deferred
+           per-season ``completed_at`` column) -- in the race aftermath now() is
+           within moments of the sibling's actual import commit, and in the legacy
+           never-stamped case it restores a backed, re-clearable stamp rather than
+           a permanently-unknown one.
+
+        RESIDUAL WINDOW, stated honestly: SQLite's single writer serializes the
+        whole heal. On Postgres READ COMMITTED, a sibling whose season write AND
+        commit both land between statement 1's snapshot and statement 2's
+        snapshot -- while its own conditional stamp evaluated against our
+        not-yet-committed clear -- can still end un-stamped. The heal is
+        idempotent, so the NEXT invocation (any later report-issue or evicted
+        re-arm on this show) repairs it; closing the window entirely would require
+        the import hot path and this heal to serialize on a parent-row lock
+        (``SELECT FOR UPDATE``), which the import path deliberately does not take.
         """
-        still_backed = (
+        season_genuinely_imported = (
+            select(Download.id)
+            .where(
+                Download.media_request_id == SeasonRequest.media_request_id,
+                Download.season == SeasonRequest.season_number,
+                # Literal (not the P4 ``DownloadState`` enum) -- mirrors
+                # ``repositories.downloads``' deliberately-decoupled string
+                # vocabulary; ``imported`` is that enum's value.
+                Download.status == "imported",
+            )
+            .exists()
+        )
+        qualifying = (
             select(SeasonRequest.id)
             .where(
                 # Correlate to the outer ``media_requests`` row so the guard is
                 # re-evaluated against live DB state at UPDATE time, not a snapshot.
                 SeasonRequest.media_request_id == MediaRequest.id,
                 SeasonRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
-                SeasonRequest.library_path.is_not(None),
+                or_(
+                    SeasonRequest.library_path.is_not(None),
+                    season_genuinely_imported,
+                ),
             )
             .exists()
         )
-        result = cast(
-            CursorResult[Any],
-            await self._session.execute(
-                update(MediaRequest)
-                .where(MediaRequest.id == request_id, ~still_backed)
-                .values(completed_at=None)
-                .execution_options(synchronize_session="fetch")
-            ),
+        await self._session.execute(
+            update(MediaRequest)
+            .where(
+                MediaRequest.id == request_id,
+                MediaRequest.completed_at.is_not(None),
+                ~qualifying,
+            )
+            .values(completed_at=None)
+            .execution_options(synchronize_session="fetch")
         )
-        return result.rowcount == 1
+        await self._session.execute(
+            update(MediaRequest)
+            .where(
+                MediaRequest.id == request_id,
+                MediaRequest.completed_at.is_(None),
+                qualifying,
+            )
+            .values(completed_at=datetime.now(UTC))
+            .execution_options(synchronize_session="fetch")
+        )
 
     async def clear_library_path(self, request_id: int) -> None:
         """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).

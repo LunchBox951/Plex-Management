@@ -304,12 +304,29 @@ async def ensure_seasons(
     misread it as still reclaimable) and/or a stale ``search_attempts``/
     ``next_search_at`` backoff from the run that led to eviction, throttling the
     operator's brand-new request exactly like a fresh row never would.
+
+    The re-arm ALSO heals the parent's ``completed_at``
+    (:meth:`SqlRequestRepository.heal_completed_at` -- the same guarded verb
+    :func:`reset_for_research` uses, sharing its invariant): an evicted season's
+    OLD completion may be the only thing the parent's stamp records, and eviction
+    itself deliberately never clears it (a reclaimed file is not an un-completion
+    -- the show's first completion remains a historical fact while the show sits
+    settled). But the moment the operator RE-REQUESTS that season, a stale stamp
+    becomes a trap: ``stamp_completed_at_if_unset``'s ``IS NULL`` guard means the
+    re-import could never re-stamp, exactly the #76 gap at the eviction re-arm
+    entrance. The heal clears the stamp ONLY when no genuinely-imported
+    ``completed``/``available`` sibling still backs it (e.g. S1 evicted + S2
+    pending -> cleared, so S1's re-import re-stamps; S2 imported-and-done ->
+    preserved, the first-completion fact is still true). Gated to the re-arm case
+    -- plain creations never touch the stamp, keeping the R5 rule that request
+    time NEVER records a completion.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
     )
     season_repo = SqlSeasonRequestRepository(session)
     records: list[SeasonRequestRecord] = []
+    re_armed_evicted = False
     for season_number in seasons:
         initial_status = (
             RequestStatus.available.value
@@ -325,7 +342,12 @@ async def ensure_seasons(
             await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
             await season_repo.clear_library_path(record.id)
             record = await season_repo.get(record.id) or record
+            re_armed_evicted = True
         records.append(record)
+    if re_armed_evicted:
+        # After the loop (not per season) so the heal sees every re-armed season's
+        # new status; see the docstring for why only a re-arm triggers it.
+        await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
     return records
 
@@ -517,41 +539,36 @@ async def reset_for_research(
     disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
     reclaim the orphan, never stranded with no handle (honesty over silence).
 
-    Also clears the PARENT'S ``completed_at`` (#76) when this reset leaves NO
-    tracked season still GENUINELY backing it. Read against the movie path's own
-    ``SqlRequestRepository.reset_for_research``, which unconditionally nulls
-    ``completed_at`` because a movie is a single row: its completion claim is
-    entirely invalidated the instant it is re-armed. A TV parent's
-    ``completed_at`` is a DIFFERENT thing -- not "this row's own completion" but
-    "the show's FIRST tracked season to complete" (a documented, known
-    approximation; see ``retention_telemetry_service._candidate_context`` and
-    ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally clearing
-    it here would make the honest case (another season is STILL genuinely
-    complete/available, unaffected by this reset) regress to "unknown" for no
-    reason -- the show, in fact, DID first complete at that earlier stamp, and
-    that historical fact does not become false just because a DIFFERENT season is
-    now being redone. So the clear is a single GUARDED, atomic conditional UPDATE
-    (:meth:`SqlRequestRepository.clear_completed_at_if_no_imported_done_season`):
-    the stamp is cleared ONLY when NO tracked season is currently
-    ``completed``/``available`` AND genuinely completed an import -- otherwise the
-    earlier, still-true stamp is left standing, and a subsequent genuine
-    re-completion re-stamps via ``stamp_completed_at_if_unset``'s ``IS NULL``
-    guard (#76, closing the "redone season never re-stamps" gap).
-
-    INVARIANT (this and that repo method state the same one): the stamp survives
-    iff some tracked season is ``completed``/``available`` AND has a non-``NULL``
-    ``library_path``. ``library_path`` is the honest imported-vs-Plex-present
-    discriminator (Codex P2 #1): ``ensure_seasons`` creates an already-in-Plex
-    season ``available`` with NO ``library_path`` (no import ran), while
-    ``import_service._import_tv_locked`` sets it in the SAME transaction as
-    ``mark_completed`` for every genuine import -- so a Plex-present-only sibling
-    no longer wrongly preserves a re-armed season's stale stamp. The predicate now
-    lives ONLY in that UPDATE's ``WHERE`` (a correlated ``NOT EXISTS``), re-asserted
-    at UPDATE time rather than read here into a Python snapshot -- closing the
-    TOCTOU where a sibling's genuine completion, committed between an earlier read
-    and this clear, would otherwise be erased (Codex P2 #2). The just-reset season
-    is already flushed to ``searching`` above, so that ``NOT EXISTS`` correctly
-    sees it as no longer done.
+    Also HEALS the PARENT'S ``completed_at`` (#76) against its remaining seasons.
+    Read against the movie path's own ``SqlRequestRepository.reset_for_research``,
+    which unconditionally nulls ``completed_at`` because a movie is a single row:
+    its completion claim is entirely invalidated the instant it is re-armed. A TV
+    parent's ``completed_at`` is a DIFFERENT thing -- not "this row's own
+    completion" but "the show's FIRST tracked season to complete" (a documented,
+    known approximation; see ``retention_telemetry_service._candidate_context``
+    and ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally
+    clearing it here would make the honest case (another season is STILL
+    genuinely complete/available, unaffected by this reset) regress to "unknown"
+    for no reason. So the stamp goes through
+    :meth:`SqlRequestRepository.heal_completed_at` (see its docstring for the
+    full contract), whose INVARIANT this function shares: after the reset,
+    ``completed_at`` is non-``NULL`` iff some tracked season GENUINELY completed
+    an import AND is still ``completed``/``available``. "Genuinely imported"
+    means the season has the ``library_path`` breadcrumb (written by
+    ``import_service._import_tv_locked`` in the SAME transaction as
+    ``mark_completed``) OR an ``imported`` ``Download`` row for its
+    ``(media_request_id, season)`` -- the latter covering LEGACY seasons imported
+    before the breadcrumb column existed (``models.SeasonRequest.library_path``).
+    A Plex-present-only season (``ensure_seasons``'s already-in-Plex creation:
+    ``available``, NO breadcrumb, no grab ever ran) matches neither and never
+    preserves a re-armed season's stale stamp (Codex P2 #1), so a redone season's
+    re-import can always re-stamp via ``stamp_completed_at_if_unset``'s ``IS
+    NULL`` guard. The predicate lives ONLY in the heal's own UPDATE ``WHERE``
+    clauses -- re-asserted at UPDATE time, never read here into a Python snapshot
+    (Codex P2 #2) -- and the heal's second (re-stamp) statement repairs the
+    masked-sibling aftermath where a concurrently-committed sibling completion
+    would otherwise be left stampless. The just-reset season is already flushed
+    to ``searching`` above, so the heal correctly sees it as no longer done.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
@@ -563,9 +580,7 @@ async def reset_for_research(
     await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
-    await SqlRequestRepository(session).clear_completed_at_if_no_imported_done_season(
-        media_request_id
-    )
+    await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
 
 

@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import PlexLibraryError
-from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import season_request_service
 from tests.web.fakes import FakeLibrary
@@ -817,33 +817,51 @@ async def test_reset_clears_completed_at_when_only_a_plex_present_sibling_remain
         assert show.completed_at is not None
 
 
-async def test_clear_completed_at_guard_reasserts_a_committed_done_sibling(
+async def test_heal_completed_at_keeps_and_repairs_around_a_masked_sibling_import(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """Codex P2 #2 (TOCTOU): ``clear_completed_at_if_no_imported_done_season`` is a
-    single GUARDED atomic UPDATE -- it re-asserts 'no genuinely-imported done season
-    remains' (a correlated ``NOT EXISTS`` over ``status IN (completed, available)
-    AND library_path IS NOT NULL``) in its WHERE at UPDATE time, NOT off a prior
-    in-memory snapshot. When a sibling's genuine (imported) completion has committed,
-    the UPDATE matches zero rows and the fresh, valid stamp survives; the pre-fix
-    unconditional clear -- deciding off a snapshot taken before that commit -- would
-    have erased it. Mirrors the DB-authoritative CAS in ``set_status_if_in`` and
-    holds on SQLite and the Postgres-ready posture the repo keeps."""
+    """Codex round-2 #2 (masked-sibling TOCTOU): ``heal_completed_at``'s two
+    conditional UPDATEs carry the qualifying-done-season predicate in their OWN
+    WHERE, evaluated at UPDATE time -- never off a prior Python snapshot -- and the
+    second (re-stamp) statement repairs the aftermath a stale-snapshot clear leaves
+    behind. The masked sibling: S2's import finalizes while S3 (``downloading``,
+    higher rollup precedence) masks the parent status, so S2's transaction never
+    touches the parent row -- its ``stamp_completed_at_if_unset`` no-ops against
+    the still-non-null stale stamp of the season about to be reported. Phase A: a
+    reset AFTER S2's commit sees it in the clear's WHERE and the stamp survives.
+    Phase B: simulating the MVCC interleave (the clear committed off a snapshot
+    that predated S2's commit -- stamp NULL, S2 committed-done), any heal
+    invocation re-stamps off the committed done season, so the show never ends
+    permanently stampless while a season genuinely backs it."""
     show_id = await _make_show(sessionmaker_, tmdb_id=732)
     async with sessionmaker_() as session:
         await season_request_service.ensure_seasons(
-            session, None, media_request_id=show_id, tmdb_id=732, seasons=[1, 2]
+            session, None, media_request_id=show_id, tmdb_id=732, seasons=[1, 2, 3]
         )
-        # An earlier completion to protect (round-tripped through the DB below so the
-        # later equality compares like-for-like on SQLite's naive datetimes).
+        # S1: the future culprit -- genuinely imported (breadcrumb) and stamps first.
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=1
+        )
+        # S3: still downloading -- the higher-precedence mask over any later rollup.
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=3, status="downloading"
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
         assert show is not None
-        show.completed_at = datetime.now(UTC)
-        await session.commit()
+        stale_stamp = show.completed_at
+        assert stale_stamp is not None
 
-    # A separate session commits S2's genuine import (library_path + completed) --
-    # the sibling completion landing before the clear. Its own recompute cannot
-    # re-stamp (completed_at already set), but it now BACKS the stamp.
+    # A SEPARATE session commits the MASKED sibling S2's genuine import: its own
+    # stamp no-ops (completed_at already non-null) and the rollup stays masked at
+    # 'downloading', so S2's transaction leaves the parent row untouched.
     async with sessionmaker_() as session:
         await season_request_service.set_library_path(
             session,
@@ -858,18 +876,292 @@ async def test_clear_completed_at_guard_reasserts_a_committed_done_sibling(
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
         assert show is not None
-        surviving_stamp = show.completed_at
-        assert surviving_stamp is not None
+        assert show.status is RequestStatus.downloading  # masked -- parent untouched
+        assert show.completed_at == stale_stamp
 
-    # The guarded clear re-asserts at UPDATE time -> S2 genuinely backs the stamp ->
-    # zero rows matched, nothing cleared.
+    # Phase A: report-issue the culprit S1 AFTER S2's commit. The heal's clear
+    # re-asserts its WHERE at UPDATE time -> committed S2 backs the stamp -> the
+    # first stamp survives untouched (never moves once genuinely backed).
     async with sessionmaker_() as session:
-        cleared = await SqlRequestRepository(session).clear_completed_at_if_no_imported_done_season(
-            show_id
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=1
         )
         await session.commit()
-    assert cleared is False
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
         assert show is not None
-        assert show.completed_at == surviving_stamp  # survived the clear
+        assert show.completed_at == stale_stamp
+
+    # Phase B: simulate the MVCC aftermath the pre-fix clear leaves behind on the
+    # Postgres posture -- the clear committed off a statement snapshot predating
+    # S2's commit (stamp NULL despite S2 committed-done, S2's own stamp no-op'd).
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.completed_at = None
+        await session.commit()
+    # ANY heal invocation is self-correcting: statement 2 (fresh snapshot) sees the
+    # committed done season and re-stamps, ending non-null.
+    async with sessionmaker_() as session:
+        await SqlRequestRepository(session).heal_completed_at(show_id)
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None  # reflects the committed done S2
+
+
+async def test_reset_keeps_stamp_backed_by_legacy_imported_season_without_breadcrumb(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 #1 (legacy imported seasons): on upgraded installs a season
+    imported BEFORE ``SeasonRequest.library_path`` existed has a NULL breadcrumb
+    (``models.SeasonRequest.library_path``: "None for seasons imported before this
+    breadcrumb existed") -- but it still has the OTHER committed import marker: the
+    placing ``Download`` row finalized to ``imported`` for its ``(media_request_id,
+    season)`` (the same linkage report-issue uses to resolve its culprit,
+    ``find_latest_imported_for_request``). Such a done season genuinely backs the
+    parent's ``completed_at``, so a sibling's report-issue reset must PRESERVE the
+    stamp -- under the breadcrumb-only round-1 discriminator it was wrongly
+    cleared. A Plex-present-only season stays excluded (no grab ever ran for it, so
+    no imported download row exists for the pair -- pinned by
+    ``test_reset_clears_completed_at_when_only_a_plex_present_sibling_remains``)."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=733)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=733, seasons=[1, 2]
+        )
+        # S1: LEGACY import -- no breadcrumb, but the imported Download row a real
+        # pre-breadcrumb import left behind, then Plex-confirmed available.
+        session.add(
+            Download(
+                torrent_hash="legacy-s1-import",
+                status="imported",
+                media_request_id=show_id,
+                media_type=MediaType.tv,
+                tmdb_id=733,
+                season=1,
+            )
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        # S2: a modern import with the breadcrumb.
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=2,
+            library_path="/media/tv/Some Show/Season 02",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        first_stamp = show.completed_at
+        assert first_stamp is not None
+
+    # report-issue on S2: the legacy S1 (done + imported-download evidence, NULL
+    # breadcrumb) still backs the stamp -> preserved.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at == first_stamp
+
+    # report-issue on S1 too: its status leaves (completed, available), so the old
+    # imported download alone no longer qualifies -> nothing backs the stamp -> clear.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None
+
+
+async def test_ensure_seasons_evicted_re_arm_heals_stale_completed_at(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 #3 (evicted re-arm): eviction deliberately never clears the
+    parent's ``completed_at`` (a reclaimed file is not an un-completion), but a
+    RE-REQUEST of the evicted season turns the stale stamp into a trap --
+    ``stamp_completed_at_if_unset``'s IS NULL guard would block the re-import from
+    ever re-stamping. The re-arm now runs the same guarded heal as report-issue:
+    with NO genuinely-imported done sibling left (S1 evicted -> pending, S2 still
+    pending), the stamp is cleared, and S1's re-import re-stamps."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=734)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=734, seasons=[1, 2]
+        )
+        # S1 genuinely imports (breadcrumb + the imported download a real run has)
+        # and is Plex-confirmed -> the parent stamps.
+        session.add(
+            Download(
+                torrent_hash="evicted-s1-import",
+                status="imported",
+                media_request_id=show_id,
+                media_type=MediaType.tv,
+                tmdb_id=734,
+                season=1,
+            )
+        )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None
+        season1 = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == show_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season1_id = season1.id
+
+    # The disk-pressure sweep evicts S1 -- the stamp deliberately survives eviction.
+    async with sessionmaker_() as session:
+        changed = await season_request_service.set_status_if_in(
+            session,
+            media_request_id=show_id,
+            season_request_id=season1_id,
+            status=RequestStatus.evicted.value,
+            allowed_from=frozenset({RequestStatus.available.value}),
+            tolerate_active_conflict=True,
+        )
+        await session.commit()
+    assert changed is True
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None  # eviction is not an un-completion
+
+    # Re-requesting S1 re-arms it (evicted -> pending) AND heals the stamp: S1 is
+    # no longer done and nothing else genuinely backs it (the old imported download
+    # row no longer counts once the season left completed/available) -> cleared.
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=734, seasons=[1]
+        )
+        await session.commit()
+    assert [(r.season_number, r.status) for r in records] == [(1, "pending")]
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None
+
+    # S1 re-imports -> the IS NULL guard no longer blocks -> the parent re-stamps.
+    async with sessionmaker_() as session:
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None
+
+
+async def test_ensure_seasons_evicted_re_arm_preserves_stamp_backed_by_done_sibling(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The evicted re-arm's heal is GUARDED, exactly like report-issue's: when a
+    genuinely-imported sibling is STILL done (S2 completed with its breadcrumb),
+    re-requesting the evicted S1 must leave the parent's first-completion stamp
+    standing -- that historical fact is still backed."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=735)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=735, seasons=[1, 2]
+        )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=2,
+            library_path="/media/tv/Some Show/Season 02",
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        first_stamp = show.completed_at
+        assert first_stamp is not None
+        season1 = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == show_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season1_id = season1.id
+
+    async with sessionmaker_() as session:
+        changed = await season_request_service.set_status_if_in(
+            session,
+            media_request_id=show_id,
+            season_request_id=season1_id,
+            status=RequestStatus.evicted.value,
+            allowed_from=frozenset({RequestStatus.available.value}),
+            tolerate_active_conflict=True,
+        )
+        await session.commit()
+    assert changed is True
+
+    # Re-request the evicted S1: S2 (genuinely imported, still 'completed') backs
+    # the stamp, so the re-arm's heal preserves it.
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=735, seasons=[1]
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at == first_stamp
