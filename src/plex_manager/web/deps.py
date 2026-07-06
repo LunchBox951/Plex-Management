@@ -542,7 +542,12 @@ def _require_csrf_for_session(request: Request) -> None:
         or not cookie
         or not hmac.compare_digest(header.encode("utf-8"), cookie.encode("utf-8"))
     ):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="csrf_token_required")
+        raise AppError(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="csrf_token_required",
+            message="The request was blocked by CSRF protection.",
+            hint="Refresh the page and try again.",
+        )
 
 
 def _normalize_dt(value: datetime) -> datetime:

@@ -61,7 +61,9 @@ const DETAIL_MESSAGES: Record<string, string> = {
   sign_in_throttled: 'Too many sign-in attempts. Wait a minute and try again.',
   plex_account_required:
     'Server discovery needs a Plex-signed-in admin. Sign in with Plex first.',
-  service_not_configured: 'No Plex server is configured yet. An administrator must finish setup first.',
+  service_not_configured:
+    "This service isn't configured yet. Finish setup, or add it from the Settings page.",
+  csrf_token_required: 'The request was blocked by CSRF protection.',
   already_initialized: 'Setup is already complete. Change settings from the Settings page instead.',
   app_key_not_set: 'No recovery key exists. Generate one from Settings → Access.',
   app_key_changed: 'The recovery key changed while you were rotating it. Refresh and try again.',
@@ -126,18 +128,26 @@ function extractDetail(error: unknown): ExtractedDetail | undefined {
   return undefined
 }
 
+/** snake_case → sentence case: `no_acceptable_release` → `No acceptable release`. */
+export function humanize(value: string): string {
+  return value.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase())
+}
+
 export function toApiError(error: unknown, status = 0): ApiError {
   const extracted = extractDetail(error)
   const code = extracted?.code ?? 'unknown_error'
   // An explicit envelope message wins; then the crafted per-code copy; then, for
-  // a detail-less failure, the HTTP status; otherwise the raw code itself. Never
-  // a generic string — an unknown code is surfaced, not swallowed (north star #3).
+  // a detail-less failure, the HTTP status; otherwise a humanized rendering of the
+  // code so an unmapped pipeline code (e.g. a correction/request verb) still reads
+  // as a phrase, not raw snake_case. `code` itself stays the raw machine value for
+  // technical display. Never a generic string — nothing is swallowed (north star
+  // #3), and the banned catch-all sentence never reappears.
   const message =
     extracted?.message ??
     DETAIL_MESSAGES[code] ??
     (code === 'unknown_error'
       ? `The server returned an unexpected error (HTTP ${String(status)}).`
-      : code)
+      : humanize(code))
   const result: ApiError = { code, message, status }
   if (extracted?.hint) result.hint = extracted.hint
   if (extracted?.diagnostics) result.diagnostics = extracted.diagnostics

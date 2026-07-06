@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { toApiError } from './errors'
+import { humanize, toApiError } from './errors'
+
+describe('humanize', () => {
+  it('turns a snake_case code into a readable sentence-case phrase', () => {
+    expect(humanize('no_acceptable_release')).toBe('No acceptable release')
+  })
+})
 
 describe('toApiError', () => {
   it('maps a known detail code to a friendly, honest message', () => {
@@ -9,10 +15,14 @@ describe('toApiError', () => {
     expect(err.message).toMatch(/no acceptable release/i)
   })
 
-  it('renders the raw code for an unknown detail code instead of swallowing it', () => {
-    const err = toApiError({ detail: 'some_unmapped_code' }, 500)
-    expect(err.code).toBe('some_unmapped_code')
-    expect(err.message).toBe('some_unmapped_code')
+  it('humanizes an unmapped detail code instead of surfacing raw snake_case', () => {
+    // A pipeline code absent from DETAIL_MESSAGES (e.g. a correction/request verb)
+    // must still read as a phrase — regression guard for the dropped fallback.
+    const err = toApiError({ detail: 'active_duplicate' }, 409)
+    // The raw code stays available for technical display...
+    expect(err.code).toBe('active_duplicate')
+    // ...while the message is the readable, humanized rendering.
+    expect(err.message).toBe('Active duplicate')
   })
 
   it('maps the recovery-key rotation 409 to the honest refresh-and-retry copy', () => {

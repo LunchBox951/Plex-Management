@@ -40,7 +40,8 @@ const COPY = {
   plex_tv_bad_response:
     'plex.tv answered in an unexpected way. Try again; if it keeps happening, plex.tv may be having issues.',
   service_not_configured:
-    'No Plex server is configured yet. An administrator must finish setup first.',
+    "This service isn't configured yet. Finish setup, or add it from the Settings page.",
+  csrf_token_required: 'The request was blocked by CSRF protection.',
   already_initialized:
     'Setup is already complete. Change settings from the Settings page instead.',
   app_key_changed: 'The recovery key changed while you were rotating it. Refresh and try again.',
@@ -60,10 +61,14 @@ describe('AuthErrorCard', () => {
     expect(screen.getByText(COPY.plex_popup_blocked)).toBeInTheDocument()
   })
 
-  it('renders the raw code (never a generic string) for an unknown detail code', () => {
+  it('humanizes an unmapped code but keeps the raw code in the Technical details expando', () => {
     render(<AuthErrorCard error={toApiError({ detail: 'totally_unknown_code' }, 500)} />)
-    // The raw code appears as the message AND in the technical details.
-    expect(screen.getAllByText('totally_unknown_code').length).toBeGreaterThan(0)
+    // The message is the readable, humanized phrase (never a generic catch-all)...
+    expect(screen.getByText('Totally unknown code')).toBeInTheDocument()
+    // ...while the raw snake_case code stays available for a bug report.
+    const details = screen.getByText('Technical details').closest('details')
+    expect(details).not.toBeNull()
+    expect(within(details as HTMLElement).getByText('totally_unknown_code')).toBeInTheDocument()
   })
 
   it('renders the honest HTTP-status fallback (no bare catch-all) for a detail-less failure', () => {

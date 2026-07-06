@@ -159,6 +159,27 @@ async def test_uninitialized_admin_session_is_allowed(
     assert res.json() == {"method": "plex_session"}
 
 
+async def test_session_without_csrf_header_is_honest_envelope(
+    guarded_app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    """A session mutation missing its CSRF header answers the AppError envelope.
+
+    The double-submit check must surface an honest ``csrf_token_required`` envelope
+    (``detail`` + ``message`` + ``hint``), never a bare ``{"detail": ...}`` — an
+    operator sees what happened and what to do (north star #3).
+    """
+    await _seed_admin_session(sessionmaker_, permissions=1)
+    # Valid session + CSRF cookies, but NO matching X-CSRF-Token header.
+    cookies = {SESSION_COOKIE_NAME: _SESSION_TOKEN, CSRF_COOKIE_NAME: _CSRF_TOKEN}
+    async with _client(guarded_app, cookies=cookies) as client:
+        res = await client.post("/guarded")
+    assert res.status_code == 403
+    body = res.json()
+    assert body["detail"] == "csrf_token_required"
+    assert body["message"] == "The request was blocked by CSRF protection."
+    assert body["hint"] == "Refresh the page and try again."
+
+
 async def test_uninitialized_non_admin_session_is_forbidden(
     guarded_app: FastAPI, sessionmaker_: SessionMaker
 ) -> None:
