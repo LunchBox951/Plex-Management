@@ -145,11 +145,14 @@ async def _probe_connection(
     """Probe ``{uri}/identity`` for reachability from THIS backend (never raises).
 
     A transport failure (or timeout) is the reachability verdict, not an error that
-    fails the enclosing listing: the operator sees which connection to use.
+    fails the enclosing listing: the operator sees which connection to use. A
+    malformed uri plex.tv advertised raises ``httpx.InvalidURL`` (NOT an
+    ``httpx.HTTPError``) while building the request — caught here too, so one bad
+    connection reads as unreachable instead of failing the whole listing.
     """
     try:
         await client.get(f"{uri.rstrip('/')}/identity", timeout=_PROBE_TIMEOUT_SECONDS)
-    except httpx.HTTPError:
+    except (httpx.HTTPError, httpx.InvalidURL):
         return "unreachable", _SERVER_UNREACHABLE_CODE
     return "ok", None
 

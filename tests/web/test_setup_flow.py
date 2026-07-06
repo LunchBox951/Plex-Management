@@ -52,7 +52,7 @@ _API_KEY = "flow-app-api-key"
 @pytest.fixture(autouse=True)
 def reset_throttle() -> None:
     """Clear the in-process sign-in throttle so tests never leak attempt counts."""
-    auth_module._reset_sign_in_throttle()
+    auth_module.reset_sign_in_throttle()
 
 
 # --------------------------------------------------------------------------- #
@@ -240,6 +240,47 @@ async def test_servers_lists_owned_server_with_probed_connections(
             "error_code": "server_unreachable_from_backend",
         },
     ]
+
+
+async def test_servers_marks_a_malformed_connection_uri_unreachable(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    # plex.tv can advertise a malformed connection uri (here an invalid port).
+    # httpx raises ``InvalidURL`` — which is NOT an ``httpx.HTTPError`` — while
+    # building the probe request, so one bad connection must be caught and marked
+    # unreachable, never blow up the whole owned-server listing.
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+
+    bad_conn: dict[str, object] = {
+        "protocol": "http",
+        "address": "apollo.plex.direct",
+        "port": 32400,
+        "uri": "http://apollo.plex.direct:notaport",
+        "local": False,
+        "relay": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/resources":
+            return httpx.Response(200, json=[_owned_server(connections=[_LOCAL_CONN, bad_conn])])
+        if request.url.path == "/identity" and request.url.host == "localhost":
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await _use_transport(app, httpx.MockTransport(handler))
+
+    response = await client.get("/api/v1/setup/plex/servers")
+
+    assert response.status_code == 200
+    connections = response.json()["servers"][0]["connections"]
+    assert connections[1] == {
+        "uri": "http://apollo.plex.direct:notaport",
+        "local": False,
+        "relay": False,
+        "status": "unreachable",
+        "error_code": "server_unreachable_from_backend",
+    }
 
 
 async def test_servers_requires_a_plex_signed_in_admin(

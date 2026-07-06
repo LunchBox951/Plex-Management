@@ -41,9 +41,9 @@ _MACHINE_ID = "abc123machine"
 # Order-independence
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
-def _reset_throttle() -> None:
+def reset_throttle() -> None:
     """Clear the in-process sign-in throttle so tests never leak attempt counts."""
-    auth_module._reset_sign_in_throttle()
+    auth_module.reset_sign_in_throttle()
 
 
 # --------------------------------------------------------------------------- #

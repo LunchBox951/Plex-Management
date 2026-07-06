@@ -22,7 +22,6 @@ def app() -> FastAPI:
     app = FastAPI()
     install_error_handlers(app)
 
-    @app.get("/boom-app")
     async def boom_app() -> None:
         raise AppError(
             status_code=403,
@@ -31,7 +30,6 @@ def app() -> FastAPI:
             hint="Sign in with the account that owns the server, or pick a server you own.",
         )
 
-    @app.get("/boom-verify")
     async def boom_verify() -> None:
         raise PlexVerifyError(
             "plex_tv_unreachable_server",
@@ -39,6 +37,10 @@ def app() -> FastAPI:
             diagnostics={"host": "plex.tv"},
         )
 
+    # Register by name (not the ``@app.get`` decorator) so the handlers count as
+    # referenced under strict pyright's reportUnusedFunction.
+    app.add_api_route("/boom-app", boom_app)
+    app.add_api_route("/boom-verify", boom_verify)
     return app
 
 

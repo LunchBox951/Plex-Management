@@ -63,9 +63,9 @@ async def _use_transport(app: FastAPI, transport: httpx.MockTransport) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_throttle() -> None:
+def reset_throttle() -> None:
     """Clear the in-process sign-in throttle so a prior file's attempts never leak."""
-    auth_module._reset_sign_in_throttle()
+    auth_module.reset_sign_in_throttle()
 
 
 async def test_auth_sign_in_reachable_pre_init(

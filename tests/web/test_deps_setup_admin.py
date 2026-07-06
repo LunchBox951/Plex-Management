@@ -81,11 +81,14 @@ def guarded_app(sessionmaker_: SessionMaker) -> FastAPI:
     app = FastAPI()
     install_error_handlers(app)
 
-    @app.post("/guarded")
     async def guarded(
         context: Annotated[AuthContext, Depends(require_setup_admin)],
     ) -> dict[str, str]:
         return {"method": context.method.value}
+
+    # Register by name (not the ``@app.post`` decorator) so the handler counts as
+    # referenced under strict pyright's reportUnusedFunction.
+    app.add_api_route("/guarded", guarded, methods=["POST"])
 
     async def _override_session() -> AsyncIterator[AsyncSession]:
         async with sessionmaker_() as session:

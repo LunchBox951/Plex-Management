@@ -440,7 +440,7 @@ export function SetupWizard() {
           {verifiedCount}/{SERVICES.length} verified
         </span>
         <Button
-          disabled={!allVerified || !setupTokenReady}
+          disabled={!allVerified}
           loading={complete.isPending}
           onClick={() => void onComplete()}
         >

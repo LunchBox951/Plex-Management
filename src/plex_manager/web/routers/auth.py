@@ -63,7 +63,7 @@ _COOKIE_PATH = "/"
 # In-process, per-client-IP sign-in throttle. A best-effort abuse brake for the
 # ONE unauthenticated write endpoint, not a security boundary: it is deliberately
 # simple (a sliding 60s window in a module-level dict), resets on restart, and is
-# per-process. Tests clear it via ``_reset_sign_in_throttle``.
+# per-process. Tests clear it via ``reset_sign_in_throttle``.
 _SIGN_IN_MAX_PER_MINUTE = 10
 _SIGN_IN_WINDOW_SECONDS = 60.0
 _sign_in_attempts: dict[str, list[float]] = {}
@@ -278,8 +278,14 @@ def _throttle_sign_in(request: Request) -> None:
     _sign_in_attempts[key] = attempts
 
 
-def _reset_sign_in_throttle() -> None:
-    """Clear the in-process throttle (test hook — keeps tests order-independent)."""
+def reset_sign_in_throttle() -> None:
+    """Clear the in-process sign-in throttle.
+
+    A deliberately public test-isolation hook: the throttle is module-level state
+    that would otherwise leak attempt counts across tests, so suites call this from
+    an autouse fixture to stay order-independent. Named without a leading underscore
+    so tests reference it without tripping pyright's private-usage check.
+    """
     _sign_in_attempts.clear()
 
 

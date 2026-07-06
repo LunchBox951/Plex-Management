@@ -257,7 +257,7 @@ def test_parse_account_missing_fields_maps_to_bad_response(payload: dict[str, ob
     assert excinfo.value.diagnostics["host"] == "plex.tv"
 
 
-async def test_fetch_server_identity_ok_and_failures() -> None:
+async def test_fetch_server_identity_ok() -> None:
     async def ok_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/identity"
         assert request.headers["X-Plex-Token"] == "service-token"
@@ -268,6 +268,8 @@ async def test_fetch_server_identity_ok_and_failures() -> None:
         identity = await client.fetch_server_identity("http://plex", "service-token")
     assert identity == "abc123machine"
 
+
+async def test_fetch_server_identity_connect_error_is_unreachable() -> None:
     async def connect_error_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
@@ -277,6 +279,8 @@ async def test_fetch_server_identity_ok_and_failures() -> None:
             await client.fetch_server_identity("http://plex", "service-token")
     assert excinfo.value.code == "server_unreachable_from_backend"
 
+
+async def test_fetch_server_identity_non_json_is_identity_failed() -> None:
     async def html_handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, text="<html>not a plex server</html>", headers={"content-type": "text/html"}

@@ -135,7 +135,10 @@ export function useValidatePlex() {
   })
 }
 
-export type SetupService = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb'
+// Plex is NOT here: its connection is verified on the wizard's server step via
+// `useValidatePlex` (owned-server ownership + optional token), never as a typed
+// service card. These are the three card-driven services only.
+export type SetupService = 'prowlarr' | 'qbittorrent' | 'tmdb'
 
 export function useValidateService() {
   return useMutation({
@@ -144,12 +147,6 @@ export function useValidateService() {
       body: Record<string, string>
     }): Promise<ServiceValidateResponse> => {
       switch (args.service) {
-        case 'plex':
-          return unwrap(
-            await client.POST('/api/v1/setup/validate/plex', {
-              body: args.body as { url: string; token: string },
-            }),
-          )
         case 'prowlarr':
           return unwrap(
             await client.POST('/api/v1/setup/validate/prowlarr', {
