@@ -47,15 +47,49 @@ same torrent, which Phase B would then delete. Radarr's ``EventHandleOrder.Last`
 (removal precedes re-search eligibility) is the real guard, so the re-arm MUST stay
 after removal — the strand risk is instead removed by making the residual
 reconcilable, above.
+
+Operator provenance — a ``failed_pending`` row carries WHOSE failure it is, so the
+reconcile heal can never override an operator's explicit ``mark_failed`` choices
+(``blocklist=False`` / ``remove_torrent=False``). Two mechanisms compose:
+
+* **Live claim registry** (``_operator_fail_claims``): an in-process map of
+  download id -> the operator's flags, registered by :func:`mark_failed` BEFORE its
+  Phase-A commit and cleared (``finally``) once its Phase C resolves.
+  :func:`reconcile_and_list` skips claimed rows both when building its completion
+  set (before Phase B) and again inside its Phase-C transaction, so a reconcile
+  tick landing during the operator's Phase-B await can neither remove the torrent
+  against ``remove_torrent=False`` nor steal the ``failed_pending`` -> ``Failed``
+  CAS with reconcile-default side effects. This is safe as in-process state because
+  the deployment is single-process by design (the same assumption
+  ``web/routers/settings.py``'s ``_rotate_lock`` documents) and the registry is
+  only ever touched by synchronous dict operations on the one event loop — there
+  is no await inside any read-modify-write, so no lock is needed (a module-level
+  ``asyncio.Lock`` would also bind to the first event loop that acquires it,
+  breaking per-test loops, for zero added safety here).
+* **Persistent marker** (crash/exhaustion provenance): :func:`mark_failed`'s Phase
+  A stamps a structured marker into the existing ``failed_reason`` column (no
+  schema change), the exact string
+  ``operator mark-failed in progress (blocklist=yes|no, remove=yes|no)`` — see
+  ``_operator_fail_marker`` / ``_parse_operator_fail_marker``. A residual that
+  outlives the claim (Phase-C exhaustion, process crash) is re-derived by the
+  reconcile heal WITH the operator's original semantics: ``remove=no`` skips the
+  Phase-B removal, ``blocklist=no`` skips the blocklist row, and the blocklist
+  reason stays ``user_reported`` (the operator vocabulary) rather than ``failed``.
+  Completion replaces the marker with the final human-readable reason ("marked
+  failed by operator"), so the marker never survives on a terminal row. A
+  ``failed_pending`` row whose ``failed_reason`` is absent, unrelated free text, or
+  a malformed marker parses to ``None`` and heals with today's reconcile-default
+  semantics (blocklist + removal) — genuinely reconcile-derived rows are unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -119,6 +153,70 @@ _REARMABLE_REQUEST_STATUS_VALUES: frozenset[str] = (
 # ``_PHASE_C_MAX_ATTEMPTS - 1`` (no sleep after the final attempt).
 _PHASE_C_MAX_ATTEMPTS = 3
 _PHASE_C_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.1)
+
+
+@dataclass(frozen=True)
+class _OperatorFailFlags:
+    """An operator ``mark_failed``'s explicit semantics, carried as provenance.
+
+    ``blocklist``: whether the operator asked for a Blocklist row. ``remove_torrent``:
+    whether the operator asked for the torrent + data to be removed from the client.
+    Threaded through both provenance mechanisms (the live claim registry and the
+    persisted ``failed_reason`` marker — module docstring) so the reconcile heal of
+    an operator-initiated ``failed_pending`` residual runs with the operator's
+    ORIGINAL choices, never the reconcile defaults.
+    """
+
+    blocklist: bool
+    remove_torrent: bool
+
+
+# Live claim registry (module docstring, "Operator provenance"): download id -> the
+# in-flight operator mark_failed's flags. Registered before mark_failed's Phase-A
+# commit, cleared in its ``finally``. Read/written ONLY via synchronous dict ops on
+# the single event loop (single-process deployment by design — see
+# web/routers/settings.py's _rotate_lock), so no lock is required.
+_operator_fail_claims: dict[int, _OperatorFailFlags] = {}
+
+# The persisted provenance marker (module docstring): the EXACT ``failed_reason``
+# string mark_failed's Phase A stamps, and the ONLY form the heal parses. Anything
+# else (absent / free text / malformed) parses to ``None`` -> reconcile-default
+# semantics. Human-readable on purpose: ``failed_reason`` surfaces in the queue UI
+# during the (normally brief) ``failed_pending`` window.
+_OPERATOR_FAIL_MARKER_RE: Final = re.compile(
+    r"^operator mark-failed in progress \(blocklist=(yes|no), remove=(yes|no)\)$"
+)
+
+_OPERATOR_FAIL_FINAL_REASON: Final = "marked failed by operator"
+
+
+def _operator_fail_marker(flags: _OperatorFailFlags) -> str:
+    """Render the Phase-A ``failed_reason`` provenance marker for ``flags``."""
+    return (
+        "operator mark-failed in progress "
+        f"(blocklist={'yes' if flags.blocklist else 'no'}, "
+        f"remove={'yes' if flags.remove_torrent else 'no'})"
+    )
+
+
+def _parse_operator_fail_marker(failed_reason: str | None) -> _OperatorFailFlags | None:
+    """Parse a ``failed_reason`` back into operator flags, or ``None``.
+
+    ``None`` means "no operator provenance" — the row is healed with the
+    reconcile-default semantics. Deliberately tolerant: an absent reason, unrelated
+    free text (a reconcile transition reason), or an unknown/malformed marker all
+    return ``None`` rather than raising, so a genuinely reconcile-derived row (or a
+    future marker revision) can never wedge the heal.
+    """
+    if failed_reason is None:
+        return None
+    match = _OPERATOR_FAIL_MARKER_RE.match(failed_reason)
+    if match is None:
+        return None
+    return _OperatorFailFlags(
+        blocklist=match.group(1) == "yes",
+        remove_torrent=match.group(2) == "yes",
+    )
 
 
 class InvalidStateTransitionError(Exception):
@@ -270,6 +368,26 @@ async def _commit_phase_c_with_retry(
             await asyncio.sleep(_PHASE_C_BACKOFF_SECONDS[attempt - 1])
 
 
+@dataclass(frozen=True)
+class _FailureCompletion:
+    """One failed download to complete in Phase B/C, WITH its provenance.
+
+    ``blocklist`` / ``remove_torrent`` are the semantics this failure completes
+    under: reconcile defaults (both ``True``) for a genuinely reconcile-derived
+    failure, or the operator's original flags for a marker-carrying residual (see
+    the module docstring's "Operator provenance"). ``blocklist_reason`` keeps the
+    vocabulary honest: ``failed`` for a reconcile detection, ``user_reported`` for
+    an operator decision the heal is finishing. ``download_id`` is what the claim
+    registry is checked against (before Phase B AND again inside Phase C).
+    """
+
+    download_id: int
+    event: DownloadFailed
+    blocklist: bool
+    remove_torrent: bool
+    blocklist_reason: str
+
+
 def _media_type_for_blocklist(
     record: DownloadRecord | None, request_media_type: str | None
 ) -> str | None:
@@ -284,13 +402,14 @@ def _media_type_for_blocklist(
 
 async def _handle_failed(
     session: AsyncSession,
-    event: DownloadFailed,
+    completion: _FailureCompletion,
     rows: list[DownloadRecord],
 ) -> _FailedReArm | None:
     """Phase C completion for one failed download: advance ``failed_pending`` ->
-    ``Failed`` (compare-and-swap), write the blocklist row, and return the owning
-    request/season to re-arm (or ``None`` if the row has no owning request or the
-    row was already completed by a concurrent writer).
+    ``Failed`` (compare-and-swap), write the blocklist row (when the completion's
+    provenance asks for one), and return the owning request/season to re-arm (or
+    ``None`` if the row has no owning request or the row was already completed by a
+    concurrent writer).
 
     The terminal advance is a CAS (``failed_pending`` -> ``Failed`` only if still
     ``failed_pending``), and the blocklist + re-arm are GATED on winning it, for two
@@ -305,18 +424,21 @@ async def _handle_failed(
       pick up the same ``failed_pending`` row; only the one that wins the CAS writes
       the blocklist / re-arm -- the loser no-ops.
 
+    The winning CAS writes ``completion.event.reason`` as the FINAL ``failed_reason``
+    -- for an operator-marker residual that is the human-readable
+    ``_OPERATOR_FAIL_FINAL_REASON``, so the Phase-A provenance marker never survives
+    onto a terminal row.
+
     Deferring the blocklist + ``Failed`` advance out of Phase A (they used to commit
     there) is what makes an exhausted Phase C leave a RECONCILABLE ``failed_pending``
     row rather than an un-healable terminal ``Failed`` (see the module docstring).
     """
-    record = next(
-        (r for r in rows if r.torrent_hash.lower() == event.torrent_hash.lower()),
-        None,
-    )
+    event = completion.event
+    record = next((r for r in rows if r.id == completion.download_id), None)
     if record is None:
-        # Every failed event is built from a row in ``rows`` (a reconcile transition
+        # Every completion is built from a row in ``rows`` (a reconcile transition
         # or the strand re-derivation), so this is unreachable in practice; guard
-        # rather than fail a KeyError on a row we cannot advance.
+        # rather than fail on a row we cannot advance.
         return None
 
     # Complete the FailedPending -> Failed transition (CAS). The reconciler only
@@ -334,30 +456,34 @@ async def _handle_failed(
     if not won:
         return None
 
-    blocklist_repo = SqlBlocklistRepository(session)
     request_repo = SqlRequestRepository(session)
     request = (
         await request_repo.get(record.media_request_id)
         if record.media_request_id is not None
         else None
     )
-    source_title = (
-        await blocklist_service.source_title_for(session, event.torrent_hash) or event.source_title
-    )
-    indexer = await blocklist_service.indexer_for(session, event.torrent_hash)
-    await blocklist_repo.create(
-        source_title=source_title,
-        reason=BlocklistReason.failed.value,
-        tmdb_id=request.tmdb_id if request is not None else event.tmdb_id,
-        torrent_hash=event.torrent_hash,
-        indexer=indexer,
-        # Scope by media namespace so this entry can't reject a movie/show that
-        # happens to share the tmdb id. Prefer the owning request; fall back to the
-        # persisted download metadata or season scope for orphan rows.
-        media_type=_media_type_for_blocklist(
-            record, request.media_type if request is not None else None
-        ),
-    )
+    # Honor the completion's provenance: an operator residual with blocklist=no is
+    # healed WITHOUT a blocklist row -- the operator's explicit choice survives the
+    # heal (the whole point of the marker; see the module docstring).
+    if completion.blocklist:
+        source_title = (
+            await blocklist_service.source_title_for(session, event.torrent_hash)
+            or event.source_title
+        )
+        indexer = await blocklist_service.indexer_for(session, event.torrent_hash)
+        await SqlBlocklistRepository(session).create(
+            source_title=source_title,
+            reason=completion.blocklist_reason,
+            tmdb_id=request.tmdb_id if request is not None else event.tmdb_id,
+            torrent_hash=event.torrent_hash,
+            indexer=indexer,
+            # Scope by media namespace so this entry can't reject a movie/show that
+            # happens to share the tmdb id. Prefer the owning request; fall back to
+            # the persisted download metadata or season scope for orphan rows.
+            media_type=_media_type_for_blocklist(
+                record, request.media_type if request is not None else None
+            ),
+        )
 
     # Hand the owning request/season back for the re-arm (same Phase-C transaction).
     # Captured from ``record``/``request`` in hand rather than re-read after a commit
@@ -458,7 +584,8 @@ async def reconcile_and_list(
     # Build the set of failed rows to complete this cycle:
     #   1. Rows that transitioned TO ``failed_pending`` THIS cycle (CAS-APPLIED only
     #      -- a transition that lost its compare-and-set must not spawn a
-    #      blocklist/re-arm for a state change that never persisted).
+    #      blocklist/re-arm for a state change that never persisted). These are
+    #      genuinely reconcile-detected failures: reconcile-default provenance.
     #   2. Rows ALREADY at ``failed_pending`` in the cycle-start snapshot -- a prior
     #      cycle/operator advanced them there but Phase C never completed (a strand).
     #      They are disjoint from (1) BY CONSTRUCTION: a row transitioned to
@@ -467,21 +594,72 @@ async def reconcile_and_list(
     #      ``failed_pending``. Without this re-derivation such a strand would linger
     #      forever -- the pure reconciler skips ``failed_pending`` (not an ACTIVE
     #      state), so it emits no transition and no fresh event. THIS is the concrete
-    #      heal a Phase-C failure relies on.
-    failed_events = list(failed_download_events(applied_transitions, rows, occurred_at=now))
-    failed_events += [
-        DownloadFailed(
-            torrent_hash=row.torrent_hash,
-            source_title=row.torrent_hash,
-            reason=row.failed_reason or "recovered stranded failed_pending row",
-            tmdb_id=row.tmdb_id,
-            occurred_at=now,
+    #      heal a Phase-C failure relies on. Each strand's ``failed_reason`` is
+    #      parsed for the operator provenance marker (module docstring): a marker
+    #      row heals with the operator's ORIGINAL flags (skip removal / skip
+    #      blocklist as chosen, ``user_reported`` reason, operator final reason);
+    #      anything else heals with reconcile defaults.
+    row_id_by_hash = {r.torrent_hash.lower(): r.id for r in rows}
+    completions: list[_FailureCompletion] = []
+    for event in failed_download_events(applied_transitions, rows, occurred_at=now):
+        event_row_id = row_id_by_hash.get(event.torrent_hash.lower())
+        if event_row_id is None:  # pragma: no cover - events derive from ``rows``
+            continue
+        completions.append(
+            _FailureCompletion(
+                download_id=event_row_id,
+                event=event,
+                blocklist=True,
+                remove_torrent=True,
+                blocklist_reason=BlocklistReason.failed.value,
+            )
         )
-        for row in rows
-        if row.status == DownloadState.FailedPending.value
-    ]
+    for row in rows:
+        if row.status != DownloadState.FailedPending.value:
+            continue
+        operator_flags = _parse_operator_fail_marker(row.failed_reason)
+        completions.append(
+            _FailureCompletion(
+                download_id=row.id,
+                event=DownloadFailed(
+                    torrent_hash=row.torrent_hash,
+                    source_title=row.torrent_hash,
+                    reason=(
+                        _OPERATOR_FAIL_FINAL_REASON
+                        if operator_flags is not None
+                        else row.failed_reason or "recovered stranded failed_pending row"
+                    ),
+                    tmdb_id=row.tmdb_id,
+                    occurred_at=now,
+                ),
+                blocklist=operator_flags.blocklist if operator_flags is not None else True,
+                remove_torrent=(
+                    operator_flags.remove_torrent if operator_flags is not None else True
+                ),
+                blocklist_reason=(
+                    BlocklistReason.user_reported.value
+                    if operator_flags is not None
+                    else BlocklistReason.failed.value
+                ),
+            )
+        )
 
-    if not failed_events:
+    # Live-claim filter (module docstring, "Operator provenance"): a row an operator
+    # mark_failed currently has in flight is THAT call's to complete -- skipping it
+    # here keeps this cycle's Phase B from removing a torrent the operator said to
+    # keep, and its Phase C from stealing the failed_pending -> Failed CAS with the
+    # wrong side effects. If the operator call later fails, its claim is cleared and
+    # the marker-carrying residual heals (with the operator's flags) next cycle.
+    deferred = [c for c in completions if c.download_id in _operator_fail_claims]
+    completions = [c for c in completions if c.download_id not in _operator_fail_claims]
+    for completion in deferred:
+        _logger.info(
+            "deferring reconcile completion of download %s: an operator mark-failed "
+            "holds the claim",
+            safe_int(completion.download_id),
+        )
+
+    if not completions:
         # ``populate_existing`` refreshes the returned rows from the DB (issue #77):
         # with ``expire_on_commit=False`` a row that LOST a status CAS earlier in this
         # cycle keeps its stale in-memory status, and the identity map would otherwise
@@ -493,22 +671,34 @@ async def reconcile_and_list(
     # hiccup never undoes the committed Phase A, an already-gone hash (the common
     # case -- the row usually failed BECAUSE it went ClientMissing) is a no-op
     # success, and because it is logged-not-raised a removal failure does not block
-    # the Phase C completion below (the row still lands Failed + re-armed).
-    for event in failed_events:
+    # the Phase C completion below (the row still lands Failed + re-armed). An
+    # operator residual whose marker says remove=no is honored: no removal.
+    for completion in completions:
+        if not completion.remove_torrent:
+            continue
         await purge_service.remove_torrent(
             qbt,
-            event.torrent_hash,
+            completion.event.torrent_hash,
             context="a reconcile-driven download failure",
-            extra={"torrent_hash": event.torrent_hash, "tmdb_id": event.tmdb_id},
+            extra={
+                "torrent_hash": completion.event.torrent_hash,
+                "tmdb_id": completion.event.tmdb_id,
+            },
         )
 
     # Phase C: complete each failure (failed_pending -> Failed + blocklist + re-arm)
     # in ONE bounded-retry transaction. On exhaustion the rows stay at the reconcilable
-    # ``failed_pending`` for a later cycle's strand re-derivation to heal.
+    # ``failed_pending`` for a later cycle's strand re-derivation to heal. The claim
+    # registry is RE-CHECKED per completion: an operator mark_failed that claimed a
+    # row after the filter above (its Phase A landing during this cycle's Phase B
+    # await) must not have its completion stolen with the wrong semantics -- skip it;
+    # the operator call (or, if it fails, the next cycle's heal) completes it.
     async def _complete_reconcile_failures() -> None:
         rearms: list[_FailedReArm] = []
-        for event in failed_events:
-            rearm = await _handle_failed(session, event, rows)
+        for completion in completions:
+            if completion.download_id in _operator_fail_claims:
+                continue
+            rearm = await _handle_failed(session, completion, rows)
             if rearm is not None:
                 rearms.append(rearm)
         for rearm in rearms:
@@ -518,7 +708,7 @@ async def reconcile_and_list(
         session,
         _complete_reconcile_failures,
         context="reconcile-driven failures",
-        identity=[event.torrent_hash for event in failed_events],
+        identity=[completion.event.torrent_hash for completion in completions],
     )
 
     # ``populate_existing`` refreshes the returned rows from the DB (issue #77): see
@@ -556,6 +746,14 @@ async def mark_failed(
     ``Failed`` advance is DEFERRED to Phase C so an exhausted Phase C leaves a
     reconcilable ``failed_pending`` row (which the reconcile loop re-derives and
     heals) rather than an un-healable terminal ``Failed`` + ``downloading`` request.
+
+    The operator's explicit ``blocklist`` / ``remove_torrent`` choices are carried
+    as provenance so neither a concurrent reconcile tick nor the later heal can
+    override them (module docstring, "Operator provenance"): the live claim
+    registry is registered BEFORE the Phase-A commit (and cleared in ``finally``),
+    so a reconcile cycle landing during the Phase-B await skips this row entirely;
+    and Phase A stamps the structured ``failed_reason`` marker, so a residual that
+    outlives this call (Phase-C exhaustion, crash) heals with THESE flags.
     """
     if remove_torrent and qbt is None:
         raise ValueError("mark_failed(remove_torrent=True) requires a qBittorrent client")
@@ -597,85 +795,118 @@ async def mark_failed(
         actual = latest.status if latest is not None else current.value
         raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
 
-    # Route to the pre-terminal ``failed_pending`` pause (unless already there). The
-    # legal graph reaches ``Failed`` only from ``failed_pending``, so an actively
-    # Downloading torrent (etc.) must pass through it first.
-    if current is not DownloadState.FailedPending:
-        if not is_legal_transition(current, DownloadState.FailedPending):
-            raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
-        pending = await download_repo.update_status_if_in(
-            download_id,
-            DownloadState.FailedPending.value,
-            frozenset({current.value}),
-        )
-        if not pending:
-            await _raise_current_transition()
-
-    # Phase A commit: the row is at ``failed_pending`` (reconcilable). The blocklist,
-    # the terminal ``Failed`` advance, and the re-arm are NOT yet written.
-    await session.commit()
-
-    # Phase B: close the seeding leak (ADR-0014) and, per issue #68, remove the old
-    # torrent BEFORE re-arming. Best-effort + already-gone-is-a-no-op (see
-    # ``purge_service.remove_torrent``): a client hiccup never undoes the committed
-    # Phase A, and -- because removal is logged-not-raised -- never blocks Phase C.
-    # ``qbt is not None`` is guaranteed by the top-of-function guard whenever
-    # ``remove_torrent`` is True; the explicit check narrows the optional type.
-    if remove_torrent and qbt is not None:
-        await purge_service.remove_torrent(
-            qbt,
-            torrent_hash,
-            context="an operator mark-failed",
-            extra={"torrent_hash": torrent_hash, "download_id": safe_int(download_id)},
-        )
-
-    # Phase C: complete ``failed_pending`` -> ``Failed`` (CAS) + optional blocklist +
-    # re-arm, in one bounded-retry transaction. A losing terminal CAS means a
-    # concurrent completer (a reconcile strand-heal) already finished this row: honor
-    # it (the operator's intent -- fail the download -- is satisfied) and skip the
-    # duplicate blocklist/re-arm. On retry exhaustion the row stays at the
-    # reconcilable ``failed_pending`` for the reconcile loop to heal.
-    async def _complete_mark_failed() -> None:
-        won = await download_repo.update_status_if_in(
-            download_id,
-            DownloadState.Failed.value,
-            frozenset({DownloadState.FailedPending.value}),
-            failed_reason="marked failed by operator",
-        )
-        if not won:
-            return
-        if blocklist:
-            source_title = (
-                await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
+    # Operator provenance (module docstring): the live claim is registered BEFORE
+    # any Phase-A write and cleared in the ``finally`` below, so a reconcile cycle
+    # observing the committed ``failed_pending`` row at ANY point while this call is
+    # in flight defers to it. The marker persists the same flags for a residual that
+    # outlives the claim (Phase-C exhaustion / crash).
+    flags = _OperatorFailFlags(blocklist=blocklist, remove_torrent=remove_torrent)
+    marker = _operator_fail_marker(flags)
+    _operator_fail_claims[download_id] = flags
+    try:
+        # Route to the pre-terminal ``failed_pending`` pause. The legal graph reaches
+        # ``Failed`` only from ``failed_pending``, so an actively Downloading torrent
+        # (etc.) must pass through it first. A row ALREADY at ``failed_pending`` (a
+        # reconcile detection or a stranded prior attempt) is re-stamped with THIS
+        # call's marker via a same-state CAS instead: the operator's flags now own
+        # the residual (they are the most recent explicit instruction), and a losing
+        # CAS means the row was just completed under us -- surfaced as the same 409
+        # as any other lost race.
+        if current is not DownloadState.FailedPending:
+            if not is_legal_transition(current, DownloadState.FailedPending):
+                raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
+            pending = await download_repo.update_status_if_in(
+                download_id,
+                DownloadState.FailedPending.value,
+                frozenset({current.value}),
+                failed_reason=marker,
             )
-            indexer = await blocklist_service.indexer_for(session, torrent_hash)
-            request = (
-                await SqlRequestRepository(session).get(request_id)
-                if request_id is not None
-                else None
+            if not pending:
+                await _raise_current_transition()
+        else:
+            stamped = await download_repo.update_status_if_in(
+                download_id,
+                DownloadState.FailedPending.value,
+                frozenset({DownloadState.FailedPending.value}),
+                failed_reason=marker,
             )
-            await SqlBlocklistRepository(session).create(
-                source_title=source_title,
-                reason=BlocklistReason.user_reported.value,
-                tmdb_id=request.tmdb_id if request is not None else download_tmdb_id,
-                torrent_hash=torrent_hash,
-                indexer=indexer,
-                # Scope by media namespace (see _handle_failed). Prefer the owning
-                # request; fall back to the persisted download metadata or season scope.
-                media_type=_media_type_for_blocklist(
-                    await download_repo.get_by_hash(torrent_hash),
-                    request.media_type if request is not None else None,
-                ),
-            )
-        if rearm is not None:
-            await _rearm_failed_request(session, rearm)
+            if not stamped:
+                await _raise_current_transition()
 
-    await _commit_phase_c_with_retry(
-        session,
-        _complete_mark_failed,
-        context="operator mark-failed",
-        identity=safe_int(download_id),
-    )
+        # Phase A commit: the row is at ``failed_pending`` (reconcilable), carrying
+        # the provenance marker. The blocklist, the terminal ``Failed`` advance, and
+        # the re-arm are NOT yet written.
+        await session.commit()
+
+        # Phase B: close the seeding leak (ADR-0014) and, per issue #68, remove the
+        # old torrent BEFORE re-arming. Best-effort + already-gone-is-a-no-op (see
+        # ``purge_service.remove_torrent``): a client hiccup never undoes the
+        # committed Phase A, and -- because removal is logged-not-raised -- never
+        # blocks Phase C. ``qbt is not None`` is guaranteed by the top-of-function
+        # guard whenever ``remove_torrent`` is True; the explicit check narrows the
+        # optional type.
+        if remove_torrent and qbt is not None:
+            await purge_service.remove_torrent(
+                qbt,
+                torrent_hash,
+                context="an operator mark-failed",
+                extra={"torrent_hash": torrent_hash, "download_id": safe_int(download_id)},
+            )
+
+        # Phase C: complete ``failed_pending`` -> ``Failed`` (CAS) + optional
+        # blocklist + re-arm, in one bounded-retry transaction. The winning CAS
+        # replaces the Phase-A marker with the final human-readable reason. A losing
+        # terminal CAS means a concurrent completer already finished this row: honor
+        # it (the operator's intent -- fail the download -- is satisfied) and skip
+        # the duplicate blocklist/re-arm. On retry exhaustion the row stays at the
+        # reconcilable ``failed_pending`` WITH the marker, so the reconcile loop
+        # heals it under these same flags.
+        async def _complete_mark_failed() -> None:
+            won = await download_repo.update_status_if_in(
+                download_id,
+                DownloadState.Failed.value,
+                frozenset({DownloadState.FailedPending.value}),
+                failed_reason=_OPERATOR_FAIL_FINAL_REASON,
+            )
+            if not won:
+                return
+            if blocklist:
+                source_title = (
+                    await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
+                )
+                indexer = await blocklist_service.indexer_for(session, torrent_hash)
+                request = (
+                    await SqlRequestRepository(session).get(request_id)
+                    if request_id is not None
+                    else None
+                )
+                await SqlBlocklistRepository(session).create(
+                    source_title=source_title,
+                    reason=BlocklistReason.user_reported.value,
+                    tmdb_id=request.tmdb_id if request is not None else download_tmdb_id,
+                    torrent_hash=torrent_hash,
+                    indexer=indexer,
+                    # Scope by media namespace (see _handle_failed). Prefer the owning
+                    # request; fall back to the persisted metadata or season scope.
+                    media_type=_media_type_for_blocklist(
+                        await download_repo.get_by_hash(torrent_hash),
+                        request.media_type if request is not None else None,
+                    ),
+                )
+            if rearm is not None:
+                await _rearm_failed_request(session, rearm)
+
+        await _commit_phase_c_with_retry(
+            session,
+            _complete_mark_failed,
+            context="operator mark-failed",
+            identity=safe_int(download_id),
+        )
+    finally:
+        # Clear the live claim on EVERY exit -- success, a 409'd lost race, or a
+        # Phase-C exhaustion. After an exhaustion the persisted marker (not the
+        # claim) is what carries the flags to the reconcile heal.
+        _operator_fail_claims.pop(download_id, None)
 
     failed = await download_repo.get_by_hash(torrent_hash)
     if failed is None:  # pragma: no cover - just updated this row
