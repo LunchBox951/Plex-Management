@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.ports.repositories import SeasonRequestRecord
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 from tests.web.fakes import FakeLibrary
 
@@ -215,6 +217,69 @@ async def test_ensure_seasons_re_grabs_an_evicted_season_even_when_plex_reports_
         show = await session.get(MediaRequest, show_id)
     assert show is not None
     assert show.status is RequestStatus.pending
+
+
+async def test_ensure_seasons_rearm_loses_cleanly_to_a_concurrent_recovery_restore(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round-6: the evicted-season re-arm is a CAS from exactly the status
+    ``ensure()`` read, never an unconditional write. The eviction recovery can
+    RESTORE the row to 'available' (its file is present -- the interrupted purge
+    never actually deleted anything) between that read and the re-arm write;
+    clobbering the restored row back to 'pending' would queue a duplicate
+    download of on-disk content that recovery (already past) couldn't catch
+    until a whole sweep later. Simulated by making the read stale: the DB row is
+    already 'available' (the committed restore) while ``ensure()`` hands back
+    the pre-restore 'evicted' snapshot. The lost CAS must honor the restore --
+    the row stays 'available', no pending duplicate, and the re-request dedups
+    onto the watchable season exactly like an already-in-Plex one."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=730)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
+        )
+        # The recovery restore's end state: 'available' over a live file.
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        stmt = select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+        season_id = (await session.execute(stmt)).scalars().one().id
+
+    real_ensure = SqlSeasonRequestRepository.ensure
+
+    async def stale_ensure(
+        self: SqlSeasonRequestRepository,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+    ) -> SeasonRequestRecord:
+        record = await real_ensure(self, media_request_id, season_number, status=status)
+        # The stale pre-restore snapshot: this caller read the row as 'evicted'
+        # a moment before the recovery restore committed 'available'.
+        return record.model_copy(update={"status": RequestStatus.evicted.value})
+
+    monkeypatch.setattr(SqlSeasonRequestRepository, "ensure", stale_ensure)
+
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
+        )
+        await session.commit()
+
+    # The lost CAS honored the restore: returned AND persisted 'available',
+    # never clobbered back to a duplicate-downloading 'pending'.
+    assert {(r.season_number, r.status) for r in records} == {(1, "available")}
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available
+    assert show is not None
+    assert show.status is RequestStatus.available
 
 
 async def test_ensure_seasons_never_regresses_a_non_evicted_terminal_season(

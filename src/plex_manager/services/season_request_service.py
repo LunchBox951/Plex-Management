@@ -296,6 +296,17 @@ async def ensure_seasons(
     ``searching``/``downloading``/``import_blocked``/``no_acceptable_release``/
     ``pending``) is left completely untouched -- an in-flight or already-finished
     season is never regressed by a re-request.
+
+    The re-arm itself is a CAS from exactly the ``evicted`` that was read, not
+    an unconditional write: the eviction sweep's recovery pass can RESTORE the
+    row to ``available`` (its file is present -- an interrupted purge that never
+    actually deleted anything) between ``ensure()``'s read and the re-arm, and
+    clobbering that back to ``pending`` would queue a duplicate download of
+    on-disk content that recovery (already past) could not catch until a whole
+    sweep later. A lost re-arm CAS takes the honest branch for the row's CURRENT
+    status: for a recovery-restored ``available`` row that is the same no-op
+    every other non-evicted status gets -- the re-request simply dedups onto the
+    watchable season, exactly like an already-in-Plex one.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
@@ -322,7 +333,23 @@ async def ensure_seasons(
         )
         record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
         if record.status == RequestStatus.evicted.value:
-            await season_repo.set_status(record.id, initial_status)
+            # The re-arm is a CAS from EXACTLY the status ensure() just read --
+            # the same write discipline as every other status move in the
+            # eviction lifecycle. The eviction recovery can restore this row to
+            # 'available' (its file is present -- an interrupted purge that
+            # never actually deleted anything) between the ensure() read and
+            # this write; an unconditional re-arm would clobber that live-file
+            # row back to 'pending', and with the sweep's recovery pass already
+            # past, auto-grab would download a duplicate until a later sweep
+            # folded it again. A lost CAS is honored, never overwritten: the
+            # re-read below returns the row at its CURRENT status, and the
+            # honest branch for a recovery-restored 'available' row is exactly
+            # the no-op every other non-evicted status already takes -- the
+            # re-request dedups onto it, precisely like an already-in-Plex
+            # season.
+            await season_repo.set_status_if_in(
+                record.id, initial_status, frozenset({RequestStatus.evicted.value})
+            )
             record = await season_repo.get(record.id) or record
         records.append(record)
     await _recompute_parent(session, media_request_id)
