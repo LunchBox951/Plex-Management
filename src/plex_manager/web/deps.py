@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -66,6 +67,11 @@ from plex_manager.services.health_service import (
     TtlCache,
 )
 from plex_manager.web.errors import AppError
+from plex_manager.web.settings_bounds import (
+    EVICTION_GRACE_DAYS_MAX,
+    EVICTION_INTERVAL_MAX_MINUTES,
+    LOG_RETENTION_DAYS_MAX,
+)
 
 __all__ = [
     "API_KEY_HEADER_NAME",
@@ -76,10 +82,13 @@ __all__ = [
     "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
     "EVICTION_ENABLED_DEFAULT",
     "EVICTION_GRACE_DAYS_DEFAULT",
+    "EVICTION_GRACE_DAYS_MAX",
+    "EVICTION_INTERVAL_MAX_MINUTES",
     "EVICTION_INTERVAL_MINUTES_DEFAULT",
     "EVICTION_PROACTIVE_ENABLED_DEFAULT",
     "KNOWN_SETTING_KEYS",
     "LOG_RETENTION_DAYS_DEFAULT",
+    "LOG_RETENTION_DAYS_MAX",
     "PLEX_MACHINE_ID_SETTING",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
@@ -1125,6 +1134,14 @@ LOG_RETENTION_DAYS_DEFAULT: int = 7
 # default; an operator can turn it off from Settings without touching a terminal.
 AUTO_GRAB_ENABLED_DEFAULT: bool = True
 
+# Upper bounds for the three settings above that feed directly into a sleep
+# duration or a timedelta cutoff (issue #92) live in ``web.settings_bounds``,
+# a dependency-free leaf module both this module AND ``web.schemas`` import --
+# see that module's docstring for why (a real, verified circular import if
+# ``web.schemas`` imported these from here instead). Re-exported via
+# ``__all__`` above so callers/tests reach them the same way as every other
+# operability constant, via ``web.deps``.
+
 # Values that parse as boolean-true; anything else (including unset/unparsable)
 # is false. Matches the plain-string ``settings.value`` storage -- there is no
 # dedicated boolean column type here (mirrors ``is_secret``'s own dialect-portable
@@ -1133,23 +1150,33 @@ _TRUE_STRINGS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 
 async def _get_float_setting(session: AsyncSession, key: str, default: float) -> float:
-    """Return ``key`` parsed as ``float``, or ``default`` if unset/unparsable.
+    """Return ``key`` parsed as ``float``, or ``default`` if unset/unparsable/non-finite.
 
     A parse failure is logged (never silent) but never raises -- a malformed
     stored value must not crash the reconcile / eviction / log-retention loops
     that read these; it falls back to the safe default instead (honesty over
     silence: the fallback is visible in the log, not just silently applied).
+
+    ``float()`` happily parses ``"inf"``/``"nan"`` without raising -- a stored
+    non-finite value would otherwise sail past the ``except ValueError`` below
+    and hang whichever loop feeds it into ``asyncio.sleep`` (issue #92). Gate on
+    :func:`math.isfinite` after the parse so every caller gets the same
+    honest-fallback treatment a genuinely unparsable value already got.
     """
     raw = await SettingsStore(session).get(key)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         _logger.warning(
             "setting %r has an unparsable value %r; using default %s", key, raw, default
         )
         return default
+    if not math.isfinite(value):
+        _logger.warning("setting %r has a non-finite value %r; using default %s", key, raw, default)
+        return default
+    return value
 
 
 async def _get_int_setting(session: AsyncSession, key: str, default: int) -> int:
@@ -1189,8 +1216,24 @@ async def get_disk_pressure_target_percent(session: AsyncSession) -> float:
 
 
 async def get_eviction_grace_days(session: AsyncSession) -> int:
-    """Minimum days since ``last_viewed_at`` before a watched title is evictable (default 30)."""
-    return await _get_int_setting(session, "eviction_grace_days", EVICTION_GRACE_DAYS_DEFAULT)
+    """Minimum days since ``last_viewed_at`` before a watched title is evictable (default 30).
+
+    Range-guarded to ``[0, EVICTION_GRACE_DAYS_MAX]``: a corrupt NEGATIVE stored
+    value would push ``eviction_service``'s ``grace_cutoff`` into the FUTURE,
+    over-evicting titles that are still within grace; a huge value overflows
+    ``timedelta`` (its own limit is 999,999,999 days). Falls back to the default
+    (with a WARNING naming the key) rather than either failure mode.
+    """
+    value = await _get_int_setting(session, "eviction_grace_days", EVICTION_GRACE_DAYS_DEFAULT)
+    if not 0 <= value <= EVICTION_GRACE_DAYS_MAX:
+        _logger.warning(
+            "setting 'eviction_grace_days' resolved to %s, outside [0, %s]; using default %s",
+            value,
+            EVICTION_GRACE_DAYS_MAX,
+            EVICTION_GRACE_DAYS_DEFAULT,
+        )
+        return EVICTION_GRACE_DAYS_DEFAULT
+    return value
 
 
 async def get_eviction_enabled(session: AsyncSession) -> bool:
@@ -1206,15 +1249,47 @@ async def get_eviction_proactive_enabled(session: AsyncSession) -> bool:
 
 
 async def get_eviction_interval_minutes(session: AsyncSession) -> float:
-    """How often the eviction sweep's own periodic task runs (default 30 minutes)."""
-    return await _get_float_setting(
+    """How often the eviction sweep's own periodic task runs (default 30 minutes).
+
+    Range-guarded to ``(0, EVICTION_INTERVAL_MAX_MINUTES]``: ``_get_float_setting``
+    already rejects a NON-finite stored value, but a finite-huge one (e.g. a
+    hand-edited ``"999999"``) would pass that gate and still sleep
+    ``_eviction_loop`` for effectively ever -- the same silent-death failure mode
+    an ``isfinite``-only fix would miss. Falls back to the default (with a
+    WARNING naming the key) instead.
+    """
+    value = await _get_float_setting(
         session, "eviction_interval_minutes", EVICTION_INTERVAL_MINUTES_DEFAULT
     )
+    if not 0 < value <= EVICTION_INTERVAL_MAX_MINUTES:
+        _logger.warning(
+            "setting 'eviction_interval_minutes' resolved to %s, outside (0, %s]; using default %s",
+            value,
+            EVICTION_INTERVAL_MAX_MINUTES,
+            EVICTION_INTERVAL_MINUTES_DEFAULT,
+        )
+        return EVICTION_INTERVAL_MINUTES_DEFAULT
+    return value
 
 
 async def get_log_retention_days(session: AsyncSession) -> int:
-    """How many days of captured ``log_events`` rows the retention sweep keeps (default 7)."""
-    return await _get_int_setting(session, "log_retention_days", LOG_RETENTION_DAYS_DEFAULT)
+    """How many days of captured ``log_events`` rows the retention sweep keeps (default 7).
+
+    Range-guarded to ``[0, LOG_RETENTION_DAYS_MAX]`` for the same reason as
+    :func:`get_eviction_grace_days`: a corrupt negative value would push
+    ``log_capture_service``'s cutoff into the future (wholesale log deletion);
+    a huge value overflows ``timedelta``.
+    """
+    value = await _get_int_setting(session, "log_retention_days", LOG_RETENTION_DAYS_DEFAULT)
+    if not 0 <= value <= LOG_RETENTION_DAYS_MAX:
+        _logger.warning(
+            "setting 'log_retention_days' resolved to %s, outside [0, %s]; using default %s",
+            value,
+            LOG_RETENTION_DAYS_MAX,
+            LOG_RETENTION_DAYS_DEFAULT,
+        )
+        return LOG_RETENTION_DAYS_DEFAULT
+    return value
 
 
 async def get_auto_grab_enabled(session: AsyncSession) -> bool:

@@ -5,12 +5,20 @@ say what happened and what to do; ``diagnostics`` carries only non-secret
 context. Raising :class:`AppError` (or the adapter's ``PlexVerifyError``)
 anywhere under FastAPI renders the envelope via :func:`install_error_handlers`,
 which ``web/app.py`` wires into the application.
+
+:func:`install_error_handlers` also overrides FastAPI's DEFAULT
+``RequestValidationError`` handler with :func:`_request_validation_error_handler`
+-- see that function's docstring for why a plain 422 body is not safe to render
+as-is when the rejected value was a non-finite float (issue #92).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final
+import math
+from typing import TYPE_CHECKING, Final, cast
 
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from starlette.responses import JSONResponse
 
 from plex_manager.adapters.plex.oauth import PlexVerifyError
@@ -107,7 +115,61 @@ async def _plex_verify_error_handler(request: Request, exc: Exception) -> Respon
     )
 
 
+def _sanitize_validation_error_value(value: object) -> object:
+    """Recursively replace a non-finite ``float`` with its ``repr()`` string.
+
+    Recurses into ``dict``/``list`` only -- the two container shapes
+    ``jsonable_encoder(ValidationError.errors())`` ever produces (each error
+    item's ``"input"``/``"ctx"`` keys can themselves hold nested structures,
+    e.g. a rejected list-of-floats body). Every other value (str, int, bool,
+    None, an already-finite float) passes through unchanged.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)  # "inf" / "nan" / "-inf" -- readable, JSON-safe
+    if isinstance(value, dict):
+        # ``jsonable_encoder`` output is JSON-shaped: every dict key is a str.
+        typed_dict = cast("dict[str, object]", value)
+        return {key: _sanitize_validation_error_value(item) for key, item in typed_dict.items()}
+    if isinstance(value, list):
+        typed_list = cast("list[object]", value)
+        return [_sanitize_validation_error_value(item) for item in typed_list]
+    return value
+
+
+async def _request_validation_error_handler(request: Request, exc: Exception) -> Response:
+    """Render a request-body validation failure as 422 -- never a 500.
+
+    FastAPI's DEFAULT handler for this exception echoes the REJECTED raw value
+    back in each error item's ``"input"`` key (so the operator can see exactly
+    what was rejected) via ``JSONResponse(content=jsonable_encoder(exc.errors()))``.
+    That is fine for almost every rejected value -- except a non-finite float
+    (``inf``/``nan``): Starlette's ``JSONResponse`` renders with
+    ``json.dumps(..., allow_nan=False)`` (strict RFC-8259 JSON), which RAISES
+    on a non-finite float.
+
+    This is a PRE-EXISTING latent bug, not one issue #92 introduces: any field
+    already bounded with ``ge``/``le`` (e.g. ``disk_pressure_threshold_percent``'s
+    ``ge=0, le=100``) already rejects a raw ``NaN`` today, because a NaN
+    comparison is always ``False`` -- ``nan >= 0`` is ``False`` just like
+    ``nan <= 100`` is, so it already fails that bound and 500s the SAME way,
+    with or without this PR. Issue #92 just adds MORE fields where this was
+    reachable (``eviction_interval_minutes``'s new ``le=`` now also rejects
+    ``+Infinity``, which its old ``gt=0``-only bound let through). Fixing it
+    generically here closes the bug everywhere at once rather than only for
+    the three newly-bounded settings fields. Sanitizing the echoed value to
+    its ``repr()`` keeps the response strictly valid JSON while still telling
+    the operator exactly what was rejected (honesty over silence: this must
+    422 cleanly, never crash while reporting a validation failure).
+    """
+    if not isinstance(exc, RequestValidationError):  # pragma: no cover - registered per exact type
+        raise exc
+    content = _sanitize_validation_error_value(jsonable_encoder(exc.errors()))
+    return JSONResponse(status_code=422, content=content)
+
+
 def install_error_handlers(app: FastAPI) -> None:
-    """Register the envelope handlers for :class:`AppError` and ``PlexVerifyError``."""
+    """Register the envelope handlers for :class:`AppError` and ``PlexVerifyError``,
+    plus the non-finite-safe override for FastAPI's own request-validation 422."""
     app.add_exception_handler(AppError, _app_error_handler)
     app.add_exception_handler(PlexVerifyError, _plex_verify_error_handler)
+    app.add_exception_handler(RequestValidationError, _request_validation_error_handler)

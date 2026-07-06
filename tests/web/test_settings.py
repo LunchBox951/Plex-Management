@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import AuthSession, Setting, User
 from plex_manager.web.deps import (
+    EVICTION_GRACE_DAYS_DEFAULT,
+    EVICTION_GRACE_DAYS_MAX,
+    EVICTION_INTERVAL_MAX_MINUTES,
+    EVICTION_INTERVAL_MINUTES_DEFAULT,
     KNOWN_SETTING_KEYS,
+    LOG_RETENTION_DAYS_DEFAULT,
+    LOG_RETENTION_DAYS_MAX,
     PLEX_MACHINE_ID_SETTING,
+    SECRET_SETTING_KEYS,
     AuthContext,
     AuthMethod,
     SettingsStore,
@@ -33,6 +43,11 @@ from plex_manager.web.deps import (
     hash_session_token,
     load_system_settings,
     require_api_key,
+)
+from plex_manager.web.routers.settings import (
+    _BOOL_TYPED_SETTING_KEYS,  # pyright: ignore[reportPrivateUsage]
+    _FLOAT_TYPED_SETTING_KEYS,  # pyright: ignore[reportPrivateUsage]
+    _INT_TYPED_SETTING_KEYS,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
 
@@ -1073,6 +1088,321 @@ async def test_put_single_field_threshold_above_stored_target_still_succeeds(
     async with sessionmaker_() as session:
         assert await get_disk_pressure_threshold_percent(session) == 90.0
         assert await get_disk_pressure_target_percent(session) == 80.0  # untouched
+
+
+# --------------------------------------------------------------------------- #
+# Non-finite / overflow typed settings (issue #92): reject on write, tolerate
+# on read. A stored ``inf``/``nan`` (or a finite-but-huge value) must never
+# hang the eviction loop's ``asyncio.sleep`` or 500 ``GET /settings``.
+# --------------------------------------------------------------------------- #
+def test_settings_update_rejects_non_finite_interval() -> None:
+    """Model-level guard (mirrors ``test_settings_update_rejects_target_above_
+    threshold`` above): every non-finite value AND anything past the upper
+    ceiling must fail construction, while the ceiling itself and an ordinary
+    value both still construct fine."""
+    for bad in (float("inf"), float("nan"), float("-inf"), EVICTION_INTERVAL_MAX_MINUTES + 1):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(eviction_interval_minutes=bad)
+    SettingsUpdate(eviction_interval_minutes=EVICTION_INTERVAL_MAX_MINUTES)  # boundary, inclusive
+    SettingsUpdate(eviction_interval_minutes=45.0)  # an ordinary value still works
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("eviction_interval_minutes", float("inf")),
+        ("eviction_interval_minutes", float("nan")),
+        ("eviction_interval_minutes", EVICTION_INTERVAL_MAX_MINUTES + 1),
+        ("disk_pressure_threshold_percent", float("inf")),
+        ("disk_pressure_threshold_percent", float("nan")),
+        ("eviction_grace_days", EVICTION_GRACE_DAYS_MAX + 1),
+        ("log_retention_days", LOG_RETENTION_DAYS_MAX + 1),
+    ],
+)
+async def test_put_rejects_non_finite_and_overflow_operability_settings(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    bad_value: float,
+) -> None:
+    """Extends ``test_put_rejects_out_of_range_operability_settings`` (which
+    already covers ``150``/``0``/``-1``) with the non-finite and
+    finite-but-over-the-new-ceiling cases -- each must 422 AND never persist
+    (mirroring ``..._does_not_persist`` above).
+
+    Built as raw wire bytes via the stdlib's OWN ``json.dumps`` (default
+    ``allow_nan=True``) rather than httpx's ``json=`` convenience: httpx
+    encodes with ``allow_nan=False`` and would raise ``ValueError`` in the
+    TEST CLIENT itself before a non-finite value ever reached the server --
+    masking the very case under test. The ``Infinity``/``NaN`` tokens this
+    produces are exactly what a non-Python client (or hand-crafted request)
+    would send, and Starlette's request-side ``json.loads`` (default
+    ``allow_nan=True``) accepts them.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY, "Content-Type": "application/json"}
+
+    put = await client.put(
+        "/api/v1/settings",
+        content=json.dumps({field: bad_value}).encode(),
+        headers=headers,
+    )
+    assert put.status_code == 422
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get(field) is None
+
+
+async def test_put_rejects_wire_level_numeric_overflow_as_non_finite(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A ``1e400`` numeral folds to ``inf`` at the JSON PARSER (``json.loads``),
+    not via Python already having collapsed the float literal at import time --
+    distinct from the ``float("inf")`` case above, which never touches the
+    number parser at all. Sent as raw wire bytes (not httpx's ``json=`` kwarg,
+    which would just re-serialize an already-``inf`` Python float as the
+    ``Infinity`` token) so the overflow-during-parse path is genuinely
+    exercised."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY, "Content-Type": "application/json"}
+
+    put = await client.put(
+        "/api/v1/settings",
+        content=b'{"eviction_interval_minutes": 1e400}',
+        headers=headers,
+    )
+    assert put.status_code == 422
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("eviction_interval_minutes") is None
+
+
+async def test_put_accepts_upper_bound_operability_settings(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The new ``le`` bounds must not over-reject their own boundary value."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    update = {
+        "eviction_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
+        "eviction_grace_days": EVICTION_GRACE_DAYS_MAX,
+        "log_retention_days": LOG_RETENTION_DAYS_MAX,
+    }
+
+    put = await client.put("/api/v1/settings", json=update, headers=headers)
+    assert put.status_code == 200
+    body = put.json()
+    assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
+    assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+
+    got = (await client.get("/api/v1/settings", headers=headers)).json()
+    assert got == body
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
+        assert await get_eviction_grace_days(session) == EVICTION_GRACE_DAYS_MAX
+        assert await get_log_retention_days(session) == LOG_RETENTION_DAYS_MAX
+
+
+@pytest.mark.parametrize("stored", ["inf", "nan", "-inf"])
+async def test_get_eviction_interval_minutes_falls_back_on_non_finite_stored_value(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_interval_minutes", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_eviction_interval_minutes(session)
+
+    assert value == EVICTION_INTERVAL_MINUTES_DEFAULT
+    assert "eviction_interval_minutes" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("0", EVICTION_INTERVAL_MINUTES_DEFAULT),
+        ("-5", EVICTION_INTERVAL_MINUTES_DEFAULT),
+        (str(EVICTION_INTERVAL_MAX_MINUTES + 1), EVICTION_INTERVAL_MINUTES_DEFAULT),
+        ("45", 45.0),
+        (str(EVICTION_INTERVAL_MAX_MINUTES), EVICTION_INTERVAL_MAX_MINUTES),
+    ],
+)
+async def test_get_eviction_interval_minutes_falls_back_on_out_of_range_stored_value(
+    sessionmaker_: SessionMaker, stored: str, expected: float
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_interval_minutes", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_interval_minutes(session) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("-1", EVICTION_GRACE_DAYS_DEFAULT),
+        (str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_DEFAULT),
+        ("14", 14),
+        ("abc", EVICTION_GRACE_DAYS_DEFAULT),
+    ],
+)
+async def test_get_eviction_grace_days_falls_back_on_negative_or_overflow(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: int,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_grace_days", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_eviction_grace_days(session)
+
+    assert value == expected
+    if expected == EVICTION_GRACE_DAYS_DEFAULT:
+        assert "eviction_grace_days" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("-1", LOG_RETENTION_DAYS_DEFAULT),
+        (str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_DEFAULT),
+        ("14", 14),
+        ("abc", LOG_RETENTION_DAYS_DEFAULT),
+    ],
+)
+async def test_get_log_retention_days_falls_back_on_negative_or_overflow(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: int,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("log_retention_days", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_log_retention_days(session)
+
+    assert value == expected
+    if expected == LOG_RETENTION_DAYS_DEFAULT:
+        assert "log_retention_days" in caplog.text
+
+
+async def test_get_settings_does_not_500_on_non_finite_stored_interval(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Headline AC2: a stored non-finite value must not 500 ``GET /settings`` --
+    proves the ``json.dumps(..., allow_nan=False)`` render path is avoided."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_interval_minutes", "inf")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["eviction_interval_minutes"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt"),
+    [
+        ("disk_pressure_threshold_percent", "not-a-number"),
+        ("eviction_grace_days", "1.5"),
+        ("log_retention_days", "abc"),
+        ("eviction_enabled", "maybe"),
+        ("eviction_interval_minutes", "inf"),
+    ],
+)
+async def test_get_settings_tolerates_corrupt_stored_typed_values(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    corrupt: str,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set(field, corrupt)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body[field] is None
+    # An unrelated, uncorrupted plaintext field is unaffected by the sanitizer.
+    assert body["plex_url"] == "http://plex.example.com:32400"
+
+
+async def test_get_settings_preserves_valid_typed_values(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Regression guard: the sanitizer must null ONLY corrupt values, never a
+    valid stored one."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    valid: dict[str, str] = {
+        "disk_pressure_threshold_percent": "88.5",
+        "disk_pressure_target_percent": "75.0",
+        "eviction_grace_days": "14",
+        "eviction_enabled": "false",
+        "eviction_proactive_enabled": "true",
+        "eviction_interval_minutes": "45.0",
+        "log_retention_days": "3",
+    }
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        for key, value in valid.items():
+            await store.set(key, value)
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["disk_pressure_threshold_percent"] == 88.5
+    assert body["disk_pressure_target_percent"] == 75.0
+    assert body["eviction_grace_days"] == 14
+    assert body["eviction_enabled"] is False
+    assert body["eviction_proactive_enabled"] is True
+    assert body["eviction_interval_minutes"] == 45.0
+    assert body["log_retention_days"] == 3
+
+
+def test_typed_setting_key_groups_cover_all_typed_response_fields() -> None:
+    """Parity guard (mirrors ``test_every_known_setting_key_has_a_response_and_
+    update_field`` above): the union of the three ``_*_TYPED_SETTING_KEYS``
+    tuples the sanitizer walks must equal every ``KNOWN_SETTING_KEYS`` entry
+    whose ``SettingsResponse`` field is NOT a plain ``str`` -- i.e. every
+    numeric/bool typed setting -- and none of them may be a secret. Otherwise a
+    future typed field could be added to the response without ever being
+    routed through ``_sanitize_typed_settings``, silently reopening the 500."""
+    from typing import get_args
+
+    typed_keys = (
+        set(_FLOAT_TYPED_SETTING_KEYS)
+        | set(_INT_TYPED_SETTING_KEYS)
+        | set(_BOOL_TYPED_SETTING_KEYS)
+    )
+    expected = {
+        key
+        for key in KNOWN_SETTING_KEYS
+        if str not in get_args(SettingsResponse.model_fields[key].annotation)
+    }
+    assert typed_keys == expected
+    assert typed_keys.isdisjoint(SECRET_SETTING_KEYS)
 
 
 # --------------------------------------------------------------------------- #

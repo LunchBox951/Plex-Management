@@ -2310,6 +2310,7 @@
           "eviction_grace_days": {
             "anyOf": [
               {
+                "maximum": 3650.0,
                 "minimum": 0.0,
                 "type": "integer"
               },
@@ -2323,6 +2324,7 @@
             "anyOf": [
               {
                 "exclusiveMinimum": 0.0,
+                "maximum": 10080.0,
                 "type": "number"
               },
               {
@@ -2345,6 +2347,7 @@
           "log_retention_days": {
             "anyOf": [
               {
+                "maximum": 3650.0,
                 "minimum": 0.0,
                 "type": "integer"
               },

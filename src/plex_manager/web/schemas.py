@@ -13,6 +13,11 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from plex_manager.web.settings_bounds import (
+    EVICTION_GRACE_DAYS_MAX,
+    EVICTION_INTERVAL_MAX_MINUTES,
+    LOG_RETENTION_DAYS_MAX,
+)
 from plex_manager.web.url_validation import url_shape_error
 
 __all__ = [
@@ -541,14 +546,23 @@ class SettingsUpdate(BaseModel):
     # semantics; bounded with ``ge``/``le`` so a malformed operator input is a
     # visible 422, not a value that silently sails past ``web.deps``'s own
     # unset/unparsable fallback (that fallback only guards a CORRUPT stored
-    # value, not a bad NEW value coming in over this endpoint).
+    # value, not a bad NEW value coming in over this endpoint). The upper
+    # bounds on ``eviction_grace_days``/``eviction_interval_minutes``/
+    # ``log_retention_days`` (issue #92) ALSO reject ``Infinity``/``NaN`` with
+    # no separate ``isfinite`` validator needed: a non-finite value fails every
+    # ``gt``/``ge``/``le`` comparison (``NaN`` fails all of them; ``+inf``
+    # fails ``le``; ``-inf`` fails ``ge``/``gt``), so a would-be
+    # ``mode="after"`` isfinite check would be unreachable dead code -- these
+    # bounds ARE the finiteness guard.
     disk_pressure_threshold_percent: float | None = Field(default=None, ge=0, le=100)
     disk_pressure_target_percent: float | None = Field(default=None, ge=0, le=100)
-    eviction_grace_days: int | None = Field(default=None, ge=0)
+    eviction_grace_days: int | None = Field(default=None, ge=0, le=EVICTION_GRACE_DAYS_MAX)
     eviction_enabled: bool | None = Field(default=None)
     eviction_proactive_enabled: bool | None = Field(default=None)
-    eviction_interval_minutes: float | None = Field(default=None, gt=0)
-    log_retention_days: int | None = Field(default=None, ge=0)
+    eviction_interval_minutes: float | None = Field(
+        default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
+    )
+    log_retention_days: int | None = Field(default=None, ge=0, le=LOG_RETENTION_DAYS_MAX)
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)

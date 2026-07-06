@@ -16,12 +16,15 @@ OAuth-deferral analysis).
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
@@ -66,6 +69,8 @@ from plex_manager.web.setup_validation import (
 )
 
 __all__ = ["router"]
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/settings",
@@ -147,8 +152,99 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
 _rotate_lock = asyncio.Lock()
 
 
+# Which typed ``KNOWN_SETTING_KEYS`` entries ``SettingsResponse`` coerces to
+# which non-``str`` Python type -- used ONLY by ``_sanitize_typed_settings``
+# below to re-validate a raw stored string with the SAME accept/reject rule
+# ``SettingsResponse.model_validate`` itself applies, so the sanitizer's
+# accept/reject set can never drift from the response model's own coercion
+# (issue #92, parity guard: ``test_typed_setting_key_groups_cover_all_typed_
+# response_fields``). Every one of these is non-secret plaintext config (see
+# ``SECRET_SETTING_KEYS``) so logging a corrupt raw value below is logsafe.
+_FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
+    "disk_pressure_threshold_percent",
+    "disk_pressure_target_percent",
+    "eviction_interval_minutes",
+)
+_INT_TYPED_SETTING_KEYS: tuple[str, ...] = ("eviction_grace_days", "log_retention_days")
+_BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = (
+    "eviction_enabled",
+    "eviction_proactive_enabled",
+    "auto_grab_enabled",
+)
+_FLOAT_SETTING_ADAPTER: TypeAdapter[float] = TypeAdapter(float)
+_INT_SETTING_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
+_BOOL_SETTING_ADAPTER: TypeAdapter[bool] = TypeAdapter(bool)
+
+
+def _drop_corrupt_setting(out: dict[str, str | None], key: str, value: str) -> None:
+    """Null a stored value ``GET /settings`` cannot honestly show (issue #92).
+
+    Logged as a WARNING naming the key (never silent -- north star #3); the
+    value itself is safe to log because every key routed through this helper
+    is plain, non-secret config (never one of ``SECRET_SETTING_KEYS``).
+    """
+    _logger.warning(
+        "stored setting %r has an invalid value %r; presenting it as unset in GET /settings",
+        key,
+        value,
+    )
+    out[key] = None
+
+
+def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None]:
+    """Null any stored typed value that would otherwise 500 ``GET /settings``.
+
+    A hand-edited or pre-migration-corrupt stored value can fail in two ways
+    that ``SettingsResponse.model_validate`` alone does not catch:
+
+    * unparsable / wrong-shape (``"abc"`` for a float, ``"1.5"`` for an int,
+      ``"maybe"`` for a bool) -- raises ``pydantic.ValidationError`` at
+      ``model_validate``.
+    * ``"inf"`` / ``"nan"`` -- pydantic ACCEPTS these as a valid ``float``, but
+      Starlette's ``JSONResponse`` renders with ``json.dumps(...,
+      allow_nan=False)``, which raises ``ValueError`` on a non-finite float at
+      SERIALIZATION time -- after validation has already succeeded, so no
+      ``except ValidationError`` here would ever catch it.
+
+    Both failure modes would otherwise 500 the whole ``GET /settings``
+    response over a single corrupt field. Degrading just that field to
+    ``None`` (unset) mirrors what the corresponding ``web.deps`` getter
+    already does at runtime (falls back to its default) -- honest, visible
+    (WARNING logged), never a crash.
+    """
+    out = dict(raw)
+    for key in _FLOAT_TYPED_SETTING_KEYS:
+        value = out.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = _FLOAT_SETTING_ADAPTER.validate_python(value)
+        except ValidationError:
+            _drop_corrupt_setting(out, key, value)
+            continue
+        if not math.isfinite(parsed):
+            _drop_corrupt_setting(out, key, value)
+    for key in _INT_TYPED_SETTING_KEYS:
+        value = out.get(key)
+        if value is None:
+            continue
+        try:
+            _INT_SETTING_ADAPTER.validate_python(value)
+        except ValidationError:
+            _drop_corrupt_setting(out, key, value)
+    for key in _BOOL_TYPED_SETTING_KEYS:
+        value = out.get(key)
+        if value is None:
+            continue
+        try:
+            _BOOL_SETTING_ADAPTER.validate_python(value)
+        except ValidationError:
+            _drop_corrupt_setting(out, key, value)
+    return out
+
+
 async def _redacted(store: SettingsStore) -> SettingsResponse:
-    return SettingsResponse.model_validate(await store.redacted())
+    return SettingsResponse.model_validate(_sanitize_typed_settings(await store.redacted()))
 
 
 # Which ``SettingsUpdate`` fields feed each subsystem's health probe (issue #93):
