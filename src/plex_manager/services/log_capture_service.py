@@ -409,9 +409,36 @@ def resolve_log_level(level: str) -> int:
     ever runs. Reusing this one resolver for both call sites means "what counts
     as a valid log level" can never drift between the two -- an int level
     always passes ``uvicorn.Config`` straight through with no lookup at all,
-    sidestepping its ``KeyError`` path entirely.
+    sidestepping its ``KeyError`` path entirely. ``__main__.main`` does NOT
+    route every value through this function, though: see
+    :func:`plex_manager.__main__._uvicorn_log_level` for the ``'trace'``
+    carve-out that bypasses this resolver entirely for uvicorn's own launch
+    argument.
+
+    ``TRACE`` gets an explicit rule of its own, checked BEFORE the name-table
+    lookup below: uvicorn defines a real, lower-than-DEBUG ``'trace'`` level
+    for ASGI/protocol-level tracing (see ``uvicorn.config.LOG_LEVELS``), but
+    stdlib ``logging`` has never heard of it -- ``logging.getLevelNamesMapping()``
+    has no ``'TRACE'`` entry unless something in THIS process already called
+    ``logging.addLevelName(5, "TRACE")`` (uvicorn's own ``Config.__init__``
+    does exactly that as a side effect, but this function must not depend on
+    whether some uvicorn ``Config`` happens to have been constructed already
+    -- that is not an ordering this module can assume, and callers like
+    :func:`configure_logging` are exercised directly in tests with no uvicorn
+    involved at all). For THIS function's only consumer -- the app's own
+    stdlib root-logger threshold, via :func:`configure_logging` -- DEBUG is
+    the honest analogue: it is the next real stdlib level below INFO, which is
+    what "more than normal" has to mean for a logger that has no level below
+    it. This is deliberately separate from uvicorn's OWN effective level,
+    where a distinct TRACE constant matters because ``uvicorn.Config`` only
+    installs its ASGI ``MessageLoggerMiddleware`` when its OWN level is <= that
+    constant -- ``_uvicorn_log_level`` passes ``'trace'`` to ``uvicorn.run``
+    verbatim, untouched by this function, so uvicorn's TRACE-aware ``Config``
+    does that lookup itself.
     """
     candidate = level.strip()
+    if candidate.upper() == "TRACE":
+        return logging.DEBUG
     by_name = logging.getLevelNamesMapping().get(candidate.upper())
     if by_name is not None:
         return by_name

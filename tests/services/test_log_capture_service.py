@@ -308,6 +308,40 @@ def test_resolve_log_level_falls_back_to_info_on_a_negative_number_string() -> N
     assert resolve_log_level("-5") == -5
 
 
+@pytest.mark.parametrize("configured", ["trace", "TRACE", "  Trace  "])
+def test_resolve_log_level_maps_trace_to_debug_for_the_app_logger(configured: str) -> None:
+    """``trace`` is a REAL uvicorn ``--log-level`` name (see
+    ``uvicorn.config.LOG_LEVELS``) one rung below ``debug``, but stdlib
+    ``logging`` has no such level -- ``logging.getLevelNamesMapping()`` has no
+    ``'TRACE'`` entry unless some uvicorn ``Config`` has already registered it
+    as a process-wide side effect, which this resolver must not depend on (it
+    is exercised directly here with no uvicorn involved at all). For the
+    app's OWN stdlib logger -- the only consumer of this int, wired in via
+    ``configure_logging`` -- DEBUG is the honest analogue: the next real level
+    down from INFO. This must NOT go through the generic
+    unrecognized-name-warns-and-falls-back-to-INFO path: 'trace' is a
+    genuinely valid setting, not a typo, and downgrading it all the way to
+    INFO (skipping DEBUG entirely) would be a worse misrepresentation than
+    mapping it to DEBUG outright. Uvicorn's own, separately-normalized launch
+    argument (``plex_manager.__main__._uvicorn_log_level``) is what actually
+    preserves full uvicorn-native TRACE behavior for the ASGI server itself.
+    """
+    assert resolve_log_level(configured) == logging.DEBUG
+
+
+async def test_configure_logging_does_not_raise_on_trace(test_logger: logging.Logger) -> None:
+    """End-to-end sanity check for the app-side consumer: a 'trace'
+    ``config.log_level`` must reach ``configure_logging`` (called from the
+    real ASGI lifespan) exactly like any other value -- no crash, and the
+    logger ends up at DEBUG (see
+    ``test_resolve_log_level_maps_trace_to_debug_for_the_app_logger``)."""
+    handler = configure_logging("trace", logger=test_logger)
+    try:
+        assert test_logger.level == logging.DEBUG
+    finally:
+        stop_logging(handler, logger=test_logger)
+
+
 async def test_configure_logging_quiets_httpx_and_httpcore_even_at_debug(
     test_logger: logging.Logger,
 ) -> None:

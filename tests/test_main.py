@@ -162,3 +162,78 @@ def test_main_normalizes_log_level_before_uvicorn_run(
     assert captured["app"] == "plex_manager.web.app:app"
     assert isinstance(captured["log_level"], int)
     assert captured["log_level"] == expected_uvicorn_level
+
+
+@pytest.mark.parametrize(
+    ("configured_log_level", "expected_uvicorn_log_level"),
+    [
+        ("trace", "trace"),
+        ("TRACE ", "trace"),  # case + incidental env-var whitespace
+        ("  Debug", "debug"),  # an ordinary uvicorn-recognized name too
+    ],
+)
+def test_main_passes_uvicorn_native_levels_through_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_log_level: str,
+    expected_uvicorn_log_level: str,
+) -> None:
+    """A regression guard for the #100 fix's own follow-on bug: ``trace`` is a
+    VALID uvicorn ``--log-level`` name (one rung below ``debug``, used for
+    ASGI/protocol-level tracing -- see ``uvicorn.config.LOG_LEVELS``) that
+    stdlib ``logging`` has never heard of. Routing it through
+    ``resolve_log_level`` (which only ever produces a stdlib int) would
+    silently downgrade it to the INFO fallback, and uvicorn only installs its
+    ASGI ``MessageLoggerMiddleware`` when ITS OWN effective level is <= trace
+    -- so an int-downgraded 'trace' would silently disable the feature the
+    setting exists for. ``main()`` must instead pass any of uvicorn's own
+    recognized names straight through as a (lowercased, stripped) STRING, so
+    ``uvicorn.Config`` performs its own trace-aware lookup.
+    """
+    monkeypatch.setenv("PLEX_MANAGER_LOG_LEVEL", configured_log_level)
+    get_settings.cache_clear()
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(app: str, **kwargs: Any) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main_module.uvicorn, "run", fake_run)
+
+    try:
+        main_module.main()  # must not raise
+    finally:
+        get_settings.cache_clear()
+
+    assert captured["app"] == "plex_manager.web.app:app"
+    assert captured["log_level"] == expected_uvicorn_log_level
+    assert isinstance(captured["log_level"], str)
+
+
+def test_main_still_falls_back_on_a_typo_that_resembles_a_real_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The uvicorn-native pass-through must not widen the #100 crash gap: a
+    near-miss typo (here, 'trace' misspelled) is not in uvicorn's own name
+    table either, so it still degrades through ``resolve_log_level`` to the
+    INFO int fallback -- never reaches ``uvicorn.Config`` as an unrecognized
+    string, and never crashes.
+    """
+    monkeypatch.setenv("PLEX_MANAGER_LOG_LEVEL", "traec")
+    get_settings.cache_clear()
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(app: str, **kwargs: Any) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main_module.uvicorn, "run", fake_run)
+
+    try:
+        main_module.main()  # must not raise
+    finally:
+        get_settings.cache_clear()
+
+    assert isinstance(captured["log_level"], int)
+    assert captured["log_level"] == logging.INFO
