@@ -277,6 +277,29 @@ class SqlRequestRepository:
         )
         return result.rowcount == 1
 
+    async def other_row_claims_path(
+        self, library_path: str, *, exclude_request_id: int | None = None
+    ) -> bool:
+        """Whether any (other) request row currently claims ``library_path``.
+
+        The eviction recovery pass's finalized-vs-interrupted discriminator
+        (ADR-0012 #67): a breadcrumb whose exact path another LIVE row also
+        carries belongs to a media that was re-imported in place under a newer
+        request -- restoring the stale row would put two rows over one file, and
+        a later sweep evicting either would delete the path out from under the
+        actual owner. ``evicted``/``cancelled`` rows do not count as claims
+        (their content claim is dead by definition). ``exclude_request_id`` is
+        the row being recovered itself.
+        """
+        predicates = [
+            MediaRequest.library_path == library_path,
+            MediaRequest.status.notin_([RequestStatus.evicted, RequestStatus.cancelled]),
+        ]
+        if exclude_request_id is not None:
+            predicates.append(MediaRequest.id != exclude_request_id)
+        stmt = select(MediaRequest.id).where(*predicates).limit(1)
+        return (await self._session.execute(stmt)).scalars().first() is not None
+
     async def acquire_media_lock(self, tmdb_id: int, media_type: str) -> None:
         """Serialize create-request decisions for one ``(tmdb_id, media_type)``.
 

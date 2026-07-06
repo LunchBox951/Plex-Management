@@ -18,6 +18,7 @@ from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.logsafe import safe_int
 from plex_manager.models import RequestStatus
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
@@ -375,9 +376,6 @@ async def create_request_result(
         existing_active = await repo.find_active(tmdb_id, media_type)
         if existing_active is not None:
             return CreateRequestResult(record=existing_active, created=False)
-        in_library = await repo.find_in_library(tmdb_id, media_type)
-        if in_library is not None:
-            return CreateRequestResult(record=in_library, created=False)
         if await repo.latest_request_evicted(tmdb_id, media_type):
             # The disk-pressure sweep (ADR-0012) most recently reclaimed this
             # movie's file: the row is 'evicted' and either mid-delete or awaiting
@@ -385,9 +383,16 @@ async def create_request_result(
             # STALE. Trusting it would mint an 'available' row over a file the sweep
             # is about to (or just did) delete -- leaving a fresh request marked
             # available with nothing on disk and nothing queued to grab (the P1 this
-            # closes). Fall through to a normal 'pending' re-grab instead: honesty
-            # over silence, and symmetric with the eviction crash-recovery self-heal
-            # (``eviction_service._evict_one``: "a re-request re-grabs it fresh").
+            # closes). Checked BEFORE the find_in_library return below, not after:
+            # a media can carry an OLDER stale 'available' row alongside the
+            # just-evicted one (the removed-then-reacquired leftover keeps BOTH
+            # available rows; the sweep claims only the one it evicts), and
+            # returning that leftover here would hand back an in-library answer
+            # for content the sweep is deleting -- bypassing this guard entirely.
+            # The guard must gate EVERY path that can answer 'available' off Plex
+            # presence. Fall through to a normal 'pending' re-grab instead:
+            # honesty over silence, and symmetric with the eviction crash-recovery
+            # self-heal (``eviction_service``: "a re-request re-grabs it fresh").
             _logger.info(
                 "movie reads in-Plex but its most-recent request is 'evicted'; "
                 "re-grabbing rather than trusting a stale in-library reading during "
@@ -395,6 +400,9 @@ async def create_request_result(
                 extra={"tmdb_id": safe_int(tmdb_id)},
             )
         else:
+            in_library = await repo.find_in_library(tmdb_id, media_type)
+            if in_library is not None:
+                return CreateRequestResult(record=in_library, created=False)
             initial_status = RequestStatus.available.value
 
     if media_type == "tv" and library is not None and season_numbers:
@@ -407,7 +415,19 @@ async def create_request_result(
         # the movie collapse below is movie-only, so nothing else would catch the
         # duplicate. A show with a NEW (not-yet-present) season falls through to a
         # normal tracked request so the missing season is still searched/grabbed.
+        #
+        # The Plex-present set is TRUSTED only after subtracting just-evicted
+        # seasons (the TV twin of the movie guard ordering above): during the
+        # eviction delete window Plex still lists a season the sweep is deleting,
+        # and an OLDER stale available request row can exist for this show -- the
+        # unsubtracted superset check would dedup onto it and answer in-library
+        # for content that is being removed. A season named here that was just
+        # evicted therefore falls through to a normal tracked request instead
+        # (mirrors ``ensure_seasons``'s own subtraction, which then also steers
+        # the season to 'pending').
         present = await _present_seasons_or_empty(library, tmdb_id)
+        if present:
+            present = present - await SqlSeasonRequestRepository(session).evicted_seasons(tmdb_id)
         if present.issuperset(season_numbers):
             in_library = await repo.find_in_library(tmdb_id, media_type)
             if in_library is not None:

@@ -226,6 +226,26 @@ class SqlSeasonRequestRepository:
         )
         return result.rowcount == 1
 
+    async def other_row_claims_path(
+        self, library_path: str, *, exclude_season_request_id: int | None = None
+    ) -> bool:
+        """Whether any (other) season row currently claims ``library_path``.
+
+        The season-granularity mirror of ``SqlRequestRepository.
+        other_row_claims_path`` (see there): the eviction recovery pass's
+        finalized-vs-interrupted discriminator. ``evicted``/``cancelled`` rows do
+        not count as claims; ``exclude_season_request_id`` is the row being
+        recovered itself.
+        """
+        predicates = [
+            SeasonRequest.library_path == library_path,
+            SeasonRequest.status.notin_([RequestStatus.evicted, RequestStatus.cancelled]),
+        ]
+        if exclude_season_request_id is not None:
+            predicates.append(SeasonRequest.id != exclude_season_request_id)
+        stmt = select(SeasonRequest.id).where(*predicates).limit(1)
+        return (await self._session.execute(stmt)).scalars().first() is not None
+
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         stmt = select(SeasonRequest)
         if status is not None:

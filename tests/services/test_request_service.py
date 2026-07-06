@@ -451,6 +451,116 @@ async def test_create_request_after_whole_show_eviction_re_grabs_when_plex_stale
     assert {r.season_number: r.status.value for r in rows} == {1: "pending", 2: "pending"}
 
 
+async def test_create_request_never_returns_a_stale_leftover_available_row_in_the_window(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-3 finding 4 (guard ordering): a media can carry an OLDER stale
+    'available' row alongside the just-evicted one (the removed-then-reacquired
+    pattern keeps BOTH available rows; the sweep claims only the one it evicts).
+    find_in_library would return that leftover BEFORE the evicted-guard ran,
+    handing back an in-library answer for content the sweep is deleting. The
+    guard must gate every path that answers 'available' off Plex presence: the
+    re-request must land as a fresh 'pending' re-grab, not the stale row."""
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=660,
+            media_type=MediaType.movie,
+            title="Leftover",
+            status=RequestStatus.available,  # the old remove-then-reacquire leftover
+        )
+        session.add(stale)
+        await session.flush()  # stale gets the lower id
+        evicted = MediaRequest(
+            tmdb_id=660,
+            media_type=MediaType.movie,
+            title="Leftover",
+            status=RequestStatus.evicted,  # the just-claimed eviction (newest row)
+        )
+        session.add(evicted)
+        await session.commit()
+        stale_id = stale.id
+
+    tmdb = FakeTmdb(movies={660: MovieMetadata(tmdb_id=660, title="Leftover", year=2018)})
+    library = FakeLibrary(available={660})  # Plex STILL lists the doomed file
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=660, media_type="movie", library=library
+        )
+
+    assert fresh.id != stale_id  # the stale leftover row is NOT handed back
+    assert fresh.status == RequestStatus.pending.value  # a real re-grab
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 660)))
+            .scalars()
+            .all()
+        )
+    assert sorted(r.status.value for r in rows) == ["available", "evicted", "pending"]
+
+
+async def test_create_request_tv_skips_in_library_dedup_for_just_evicted_seasons(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV analogue of the guard-ordering fix: an older stale 'available' show
+    row exists while the newest row's season was just claimed 'evicted' (the
+    delete window). The in-library dedup's Plex-present superset check must
+    subtract just-evicted seasons FIRST -- otherwise it dedups onto the stale row
+    and answers in-library for a season the sweep is deleting. The re-request
+    must instead create a fresh tracked request whose season re-grabs."""
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=661,
+            media_type=MediaType.tv,
+            title="Leftover Show",
+            status=RequestStatus.available,  # the stale leftover
+        )
+        session.add(stale)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=stale.id, season_number=1, status=RequestStatus.available
+            )
+        )
+        evicted = MediaRequest(
+            tmdb_id=661,
+            media_type=MediaType.tv,
+            title="Leftover Show",
+            status=RequestStatus.evicted,  # the just-claimed eviction (newest)
+        )
+        session.add(evicted)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=evicted.id, season_number=1, status=RequestStatus.evicted
+            )
+        )
+        await session.commit()
+        stale_id = stale.id
+
+    tmdb = FakeTmdb(
+        shows={661: TvMetadata(tmdb_id=661, title="Leftover Show", year=2019, season_count=1)}
+    )
+    library = FakeLibrary(available_tv_seasons={661: frozenset({1})})  # Plex still lists it
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=661, media_type="tv", seasons=[1], library=library
+        )
+
+    assert fresh.id != stale_id  # never deduped onto the stale leftover
+    assert fresh.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == fresh.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert {r.season_number: r.status.value for r in rows} == {1: "pending"}  # re-grabs
+
+
 async def test_create_request_after_cancelled_in_window_regrab_still_re_grabs(
     sessionmaker_: SessionMaker,
 ) -> None:

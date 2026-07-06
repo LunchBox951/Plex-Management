@@ -2740,3 +2740,287 @@ async def test_resume_restores_and_cancels_the_regrab_after_a_crash(
         regrab_row = await session.get(MediaRequest, regrab_id)
     assert old_row is not None and old_row.status is RequestStatus.available
     assert regrab_row is not None and regrab_row.status is RequestStatus.cancelled
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-3: mechanism REMOVED -- sweeps are serialized in-process (a
+# module latch), which deletes the overlapping-sweep permutation class the
+# per-row registry used to (incompletely) defend, so the registry is gone.
+# Recovery is keyed on the BREADCRUMB (not only the 'evicted' status), and a
+# breadcrumb whose path another live row claims is released, never restored.
+# --------------------------------------------------------------------------- #
+
+
+async def test_second_sweep_invocation_no_ops_while_one_is_running(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Sweeps are serialized: a second run_eviction_sweep entered while one is in
+    flight (the manual POST /ops/evict button landing mid-tick) no-ops with a log
+    line and returns [] -- exactly one sweep does the work, one eviction, one
+    history row. This serialization is what deleted the overlapping-sweep race
+    class (double-claim, recovery-vs-mid-purge) outright."""
+    library_path = _movie_file(tmp_path, "Only Once.mkv")
+    await _movie(sessionmaker_, tmdb_id=650, title="Only Once", library_path=library_path)
+    library = FakeLibrary(
+        watch_states={(650, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async def _sweep() -> list[eviction_service.EvictionOutcome]:
+        async with sessionmaker_() as session:
+            return await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.eviction_service"):
+        first, second = await asyncio.gather(_sweep(), _sweep())
+
+    # Exactly ONE invocation swept; the other no-op'd (never a double eviction).
+    outcome_lists = [o for o in (first, second) if o]
+    assert len(outcome_lists) == 1
+    assert [o.title for o in outcome_lists[0]] == ["Only Once"]
+    assert "already in progress" in caplog.text
+    assert not Path(library_path).exists()
+    async with sessionmaker_() as session:
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 650)))
+            .scalars()
+            .all()
+        )
+    assert len(history) == 1  # one sweep, one eviction record
+
+
+async def test_sweep_recovers_a_rearmed_pending_season_when_its_file_still_exists(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Round-3 finding 2: crash window, then a re-request re-armed the claimed
+    season to 'pending' (same row, breadcrumb still set) BEFORE recovery ran --
+    the 'evicted' enumeration alone would miss it and the re-grab would download
+    a duplicate of a file that never left. Recovery keys on the BREADCRUMB:
+    'pending' + breadcrumb is uniquely that re-arm shape (report-issue's
+    keep-the-breadcrumb re-arm sets 'searching'), so the season is folded back
+    to 'available'."""
+    s1_path = _movie_file(tmp_path, "Rearmed Crash Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=651, title="Rearmed Crash Show", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.pending  # the crash-window re-arm
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.pending
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,  # recovery must not need pressure
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()  # the file never left, and nothing deleted it
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        show = await session.get(MediaRequest, show_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available  # folded back, no duplicate download
+    assert season_row.library_path == s1_path  # still the honest breadcrumb
+    assert show is not None and show.status is RequestStatus.available
+
+
+async def test_sweep_releases_the_breadcrumb_of_a_rearmed_season_whose_file_is_gone(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The other half of the re-armed shape: the interrupted purge actually
+    completed (file gone) before the crash, so the re-grab is legitimate -- the
+    season stays 'pending', the stale breadcrumb is released, and the eviction
+    gets the history row + Plex refresh the crash swallowed."""
+    missing_path = str(tmp_path / "tv" / "Rearmed Gone" / "Season 01")  # never created
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=652, title="Rearmed Gone", seasons={1: missing_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.pending
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        show.status = RequestStatus.pending
+        await session.commit()
+        season_id = season_row.id
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 652)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.pending  # the re-grab proceeds
+    assert season_row.library_path is None  # stale breadcrumb released
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+    assert (missing_path, "tv") in library.scan_calls
+
+
+async def test_resume_releases_a_legacy_movie_breadcrumb_when_a_newer_row_owns_the_path(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Round-3 finding 3: a LEGACY eviction (breadcrumb never cleared by the old
+    flow) whose media was later re-imported to the SAME path under a newer row.
+    The file exists, but restoring the legacy row would put two rows over one
+    file -- and a later sweep evicting either would delete the path out from
+    under the current owner. Recovery must recognize finalized-not-interrupted:
+    release the breadcrumb, restore nothing, write no duplicate history."""
+    shared_path = _movie_file(tmp_path, "Reimported.mkv")
+    legacy_id = await _movie(
+        sessionmaker_,
+        tmdb_id=653,
+        title="Reimported",
+        library_path=shared_path,
+        status=RequestStatus.evicted,  # the legacy eviction, breadcrumb never cleared
+    )
+    current_id = await _movie(  # the newer re-import that owns the path today
+        sessionmaker_, tmdb_id=653, title="Reimported", library_path=shared_path
+    )
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(shared_path).exists()  # the current owner's file is untouched
+    async with sessionmaker_() as session:
+        legacy = await session.get(MediaRequest, legacy_id)
+        current = await session.get(MediaRequest, current_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 653)))
+            .scalars()
+            .all()
+        )
+    assert legacy is not None
+    assert legacy.status is RequestStatus.evicted  # NOT restored over the owner's file
+    assert legacy.library_path is None  # breadcrumb released -- never matched again
+    assert current is not None
+    assert current.status is RequestStatus.available  # the owner is untouched
+    assert current.library_path == shared_path
+    assert history == []  # nothing was evicted NOW -- no duplicate record
+
+
+async def test_resume_releases_a_legacy_season_breadcrumb_when_a_newer_row_owns_the_path(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The TV twin of the legacy superseded-path release."""
+    shared_path = _movie_file(tmp_path, "Reimported Show S01.mkv")
+    old_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=654, title="Reimported Show", seasons={1: shared_path}
+    )
+    async with sessionmaker_() as session:
+        old_season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == old_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        old_season.status = RequestStatus.evicted  # legacy eviction, breadcrumb kept
+        old_show = await session.get(MediaRequest, old_show_id)
+        assert old_show is not None
+        old_show.status = RequestStatus.evicted
+        await session.commit()
+        old_season_id = old_season.id
+    # The newer request whose re-import owns the path today.
+    new_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=654, title="Reimported Show", seasons={1: shared_path}
+    )
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert Path(shared_path).exists()
+    async with sessionmaker_() as session:
+        old_season = await session.get(SeasonRequest, old_season_id)
+        new_seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == new_show_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert old_season is not None
+    assert old_season.status is RequestStatus.evicted  # not restored
+    assert old_season.library_path is None  # breadcrumb released
+    assert len(new_seasons) == 1
+    assert new_seasons[0].status is RequestStatus.available  # the owner untouched
+    assert new_seasons[0].library_path == shared_path
