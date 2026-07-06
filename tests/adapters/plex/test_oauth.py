@@ -201,6 +201,62 @@ async def test_connect_error_maps_to_unreachable() -> None:
     assert excinfo.value.diagnostics["host"] == "plex.tv"
 
 
+async def test_fetch_account_http_error_maps_to_bad_response() -> None:
+    """A plex.tv HTTP error (non-401/403) ARRIVED, so it is a bad response — not
+    an unreachable host. Diagnostics carry the reachable host and the status."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_account(_USER_TOKEN)
+
+    assert excinfo.value.code == "plex_tv_bad_response"
+    assert excinfo.value.diagnostics["host"] == "plex.tv"
+    assert excinfo.value.diagnostics["status"] == "500"
+
+
+async def test_fetch_account_non_json_body_maps_to_bad_response() -> None:
+    """A 200 whose body is not JSON reached us but is unusable — bad response,
+    not unreachable. There is no HTTP error, so no ``status`` is reported."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html>definitely not json</html>",
+            headers={"content-type": "text/html"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PlexTvClient(http, client_identifier=_CLIENT_ID)
+        with pytest.raises(PlexVerifyError) as excinfo:
+            await client.fetch_account(_USER_TOKEN)
+
+    assert excinfo.value.code == "plex_tv_bad_response"
+    assert excinfo.value.diagnostics["host"] == "plex.tv"
+    assert "status" not in excinfo.value.diagnostics
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"id": 173000000},  # username/title missing
+        {"username": "lunchbox"},  # id missing
+    ],
+)
+def test_parse_account_missing_fields_maps_to_bad_response(payload: dict[str, object]) -> None:
+    """A well-formed 200 whose JSON lacks id/username reached us but is unusable:
+    plex.tv answered, just not with what we need — a bad response, not unreachable."""
+    with pytest.raises(PlexVerifyError) as excinfo:
+        PlexTvClient.parse_account(payload)
+
+    assert excinfo.value.code == "plex_tv_bad_response"
+    assert excinfo.value.diagnostics["host"] == "plex.tv"
+
+
 async def test_fetch_server_identity_ok_and_failures() -> None:
     async def ok_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/identity"
@@ -250,13 +306,26 @@ async def test_diagnostics_never_contain_token() -> None:
 @pytest.mark.parametrize(
     ("raw_owned", "expected"),
     [
+        # Known truthy encodings across the bool/int/str shapes plex.tv has used.
         (True, True),
         (1, True),
         ("1", True),
         ("true", True),
+        # Whitespace-tolerant truthy strings (matches _get_bool's strip()).
+        (" true ", True),
+        (" 1 ", True),
+        # Known falsey encodings.
+        (False, False),
         (0, False),
         ("false", False),
         (None, False),
+        # Fail CLOSED on anything unexpected: ints other than 1, unknown/empty
+        # strings must never mis-grant ownership.
+        (2, False),
+        (-1, False),
+        ("yes", False),
+        ("owned", False),
+        ("", False),
     ],
 )
 def test_parse_resources_owned_boolean_tolerance(raw_owned: object, expected: bool) -> None:

@@ -38,6 +38,7 @@ _HTTP_FORBIDDEN: Final = 403
 
 # Stable, user-facing error identifiers (see the web error taxonomy).
 _CODE_PLEX_TV_UNREACHABLE: Final = "plex_tv_unreachable_server"
+_CODE_PLEX_TV_BAD_RESPONSE: Final = "plex_tv_bad_response"
 _CODE_TOKEN_INVALID: Final = "plex_token_invalid"  # noqa: S105 - error code, not a secret
 _CODE_IDENTITY_FAILED: Final = "server_identity_failed"
 _CODE_SERVER_UNREACHABLE: Final = "server_unreachable_from_backend"
@@ -217,7 +218,7 @@ class PlexTvClient:
             f"{_PLEX_TV_BASE_URL}/api/v2/user",
             headers=self._token_headers(auth_token),
             unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
-            bad_response_code=_CODE_PLEX_TV_UNREACHABLE,
+            bad_response_code=_CODE_PLEX_TV_BAD_RESPONSE,
             invalid_token_code=_CODE_TOKEN_INVALID,
         )
         return self.parse_account(payload)
@@ -229,7 +230,7 @@ class PlexTvClient:
             params={"includeHttps": "1"},
             headers=self._token_headers(auth_token),
             unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
-            bad_response_code=_CODE_PLEX_TV_UNREACHABLE,
+            bad_response_code=_CODE_PLEX_TV_BAD_RESPONSE,
             invalid_token_code=_CODE_TOKEN_INVALID,
         )
         return self.parse_resources(payload)
@@ -316,8 +317,8 @@ class PlexTvClient:
         username = _get_str(payload, "username") or _get_str(payload, "title")
         if plex_id is None or username is None:
             raise PlexVerifyError(
-                _CODE_PLEX_TV_UNREACHABLE,
-                "Plex account response did not include id and username",
+                _CODE_PLEX_TV_BAD_RESPONSE,
+                "plex.tv answered in an unexpected way: account response missing id/username",
                 diagnostics={"host": _PLEX_TV_HOST},
             )
         return PlexAccount(
