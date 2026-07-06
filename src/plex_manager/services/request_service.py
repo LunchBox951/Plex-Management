@@ -254,6 +254,38 @@ def _owned_by_another_user(
     )
 
 
+async def _claim_dedup_winner_if_unowned(
+    session: AsyncSession,
+    repo: SqlRequestRepository,
+    record: RequestRecord,
+    user_id: int | None,
+) -> RequestRecord:
+    """Adopt an OWNERLESS dedup winner for the requesting user; return the row.
+
+    A dedup can collapse a signed-in user's request onto a row that has NO owner
+    (e.g. one created via the ``X-Api-Key`` automation path, which carries no user
+    identity). Returning that row unchanged would succeed yet vanish behind the
+    caller's own per-user list/get filter (``record.user_id == auth.user_id``) --
+    a create that silently disappears. So claim it first: a single
+    ``UPDATE ... WHERE user_id IS NULL`` (see :meth:`claim_if_unowned`) that never
+    reassigns a row already owned by someone else, then re-read past the claim.
+
+    A no-op — the record is returned untouched — when there is nothing to claim:
+    an admin / API-key caller (``user_id`` None), a row that already has an owner,
+    or a lost claim race. This is the ONE shared adoption path for every dedup
+    winner (the active ``find_active`` dedup AND both terminal ``find_in_library``
+    short-circuits), so no path drifts back into the silent-vanish bug (issue #58).
+    """
+    if (
+        user_id is not None
+        and record.user_id is None
+        and await repo.claim_if_unowned(record.id, user_id)
+    ):
+        await session.commit()
+        return await repo.get(record.id) or record
+    return record
+
+
 async def _collapse_available_race(
     session: AsyncSession,
     repo: SqlRequestRepository,
@@ -410,13 +442,7 @@ async def create_request_result(
         # requesting user so the dedup result appears in THEIR request list instead
         # of succeeding yet vanishing behind the per-user list filter. Never
         # reassigns a request that already belongs to another user.
-        if (
-            user_id is not None
-            and existing.user_id is None
-            and await repo.claim_if_unowned(existing.id, user_id)
-        ):
-            await session.commit()
-            existing = await repo.get(existing.id) or existing
+        existing = await _claim_dedup_winner_if_unowned(session, repo, existing, user_id)
         if media_type == "tv":
             season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
             await season_request_service.ensure_seasons(
@@ -467,6 +493,11 @@ async def create_request_result(
             # a non-admin (their list/get hide it: a success that instantly vanishes).
             if _owned_by_another_user(in_library, user_id, actor_is_admin):
                 raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+            # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
+            # must be adopted for this requester, exactly like the active-dedup path
+            # above — else the shared user gets a success for a row their own
+            # per-user list/get then hide (issue #58's silent-vanish).
+            in_library = await _claim_dedup_winner_if_unowned(session, repo, in_library, user_id)
             return CreateRequestResult(record=in_library, created=False)
         initial_status = RequestStatus.available.value
 
@@ -489,6 +520,13 @@ async def create_request_result(
                 # is never grown with this caller's seasons nor returned to them.
                 if _owned_by_another_user(in_library, user_id, actor_is_admin):
                     raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                # Adopt an OWNERLESS in-library row for this requester before growing
+                # + returning it, mirroring the movie short-circuit and the active
+                # dedup path — else the shared user's own per-user filter hides the
+                # very row this returns (issue #58's silent-vanish).
+                in_library = await _claim_dedup_winner_if_unowned(
+                    session, repo, in_library, user_id
+                )
                 await season_request_service.ensure_seasons(
                     session,
                     library,

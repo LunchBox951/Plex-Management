@@ -235,7 +235,16 @@ export function SetupWizard() {
     return (
       <Shell>
         {tokenCard}
-        <ServerPicker onVerified={(verified) => setServer(verified)} />
+        <ServerPicker
+          onVerified={(verified) => setServer(verified)}
+          // Gate + key the owned-servers discovery on the setup token: a fresh
+          // tab lands here already authed but with an empty per-tab token, so
+          // firing discovery now would 401 and cache (retry:false). `setupTokenReady`
+          // is false until the token is (re)entered; passing the trimmed value keys
+          // the query so entering/correcting it triggers a fresh fetch, not a reload.
+          setupTokenReady={setupTokenReady}
+          setupToken={setupTokenInput.trim()}
+        />
       </Shell>
     )
   }

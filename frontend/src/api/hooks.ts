@@ -105,10 +105,18 @@ export function useSetupStatus() {
  * just 401/409. `retry: false`: a 409 `plex_account_required` (no Plex session
  * yet) is a normal, honest state the picker surfaces, not a transient worth
  * retrying.
+ *
+ * `setupToken` makes the query REACT to the per-tab `PLEX_MANAGER_SETUP_TOKEN`.
+ * When the token is required, this endpoint needs `X-Setup-Token` (injected by
+ * the client from sessionStorage); a fresh tab starts with none, so the caller
+ * gates `enabled` on token readiness to avoid firing — and `retry: false` would
+ * otherwise cache that first 401 forever. Folding the token value into the query
+ * key means entering (or correcting) it re-keys the query and triggers a fresh
+ * fetch instead of leaving the operator stranded on a cached error until reload.
  */
-export function useSetupPlexServers(enabled: boolean) {
+export function useSetupPlexServers(enabled: boolean, setupToken = '') {
   return useQuery({
-    queryKey: queryKeys.setupPlexServers,
+    queryKey: [...queryKeys.setupPlexServers, setupToken],
     enabled,
     retry: false,
     queryFn: async (): Promise<PlexServersResponse> =>

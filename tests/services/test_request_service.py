@@ -1094,3 +1094,94 @@ async def test_non_admin_available_race_collapse_keeps_their_own_row(
     assert set(by_id) == {first.id, second.id}  # BOTH rows survive
     assert by_id[second.id].user_id == intruder_id
     assert all(row.status is RequestStatus.available for row in rows)
+
+
+# --------------------------------------------------------------------------- #
+# Ownerless-claim on the TERMINAL find_in_library short-circuits (issue #58):   #
+# an X-Api-Key-automation ('user_id' None) in-library row must be ADOPTED for a #
+# non-admin requester, exactly like the active find_active dedup — not merely   #
+# returned, which would succeed yet vanish behind their per-user list filter.   #
+# --------------------------------------------------------------------------- #
+async def test_non_admin_claims_ownerless_movie_in_library_row_on_dedup(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Terminal-row analogue of ``test_non_admin_claims_ownerless_request_on_dedup``:
+    an OWNERLESS 'available' in-library movie row is adopted for the non-admin
+    requester (no 409), so the dedup shows up in THEIR list instead of a success
+    that instantly vanishes behind the per-user filter."""
+    claimer_id = await _make_user(sessionmaker_, username="lib-claimer")
+    tmdb = FakeTmdb(movies={7106: MovieMetadata(tmdb_id=7106, title="Owned", year=2020)})
+    library = FakeLibrary(available={7106})
+
+    # An automation (user_id None) records the movie as in-library first.
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7106, media_type="movie", user_id=None, library=library
+        )
+    assert ownerless.status == RequestStatus.available.value
+    async with sessionmaker_() as session:
+        seeded = await session.get(MediaRequest, ownerless.id)
+        assert seeded is not None and seeded.user_id is None  # ownerless to start
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7106,
+            media_type="movie",
+            user_id=claimer_id,
+            actor_is_admin=False,
+            library=library,
+        )
+    assert result.id == ownerless.id  # deduped onto the same terminal row
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7106)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # no duplicate row minted
+    assert rows[0].user_id == claimer_id  # claimed, not left ownerless-and-hidden
+
+
+async def test_non_admin_claims_ownerless_tv_all_present_row_on_dedup(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV terminal short-circuit adopts an OWNERLESS all-seasons-present row too:
+    the non-admin requester claims it (and its seasons still grow), rather than
+    receiving a row their own per-user list would hide (issue #58)."""
+    claimer_id = await _make_user(sessionmaker_, username="tv-claimer")
+    tmdb = FakeTmdb(
+        shows={7107: TvMetadata(tmdb_id=7107, title="Done Show", year=2020, season_count=3)}
+    )
+    library = FakeLibrary(available_tv_seasons={7107: frozenset({1, 2})})
+
+    async with sessionmaker_() as session:
+        ownerless = await request_service.create_request(
+            session, tmdb, tmdb_id=7107, media_type="tv", seasons=[1], user_id=None, library=library
+        )
+    async with sessionmaker_() as session:
+        seeded = await session.get(MediaRequest, ownerless.id)
+        assert seeded is not None and seeded.user_id is None  # ownerless to start
+
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7107,
+            media_type="tv",
+            seasons=[2],
+            user_id=claimer_id,
+            actor_is_admin=False,
+            library=library,
+        )
+    assert result.id == ownerless.id  # deduped onto the same terminal row
+    assert await _season_numbers(sessionmaker_, ownerless.id) == {1, 2}  # season still grown
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7107)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].user_id == claimer_id  # claimed for the requester

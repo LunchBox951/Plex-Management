@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.models import AuthSession, User
 from plex_manager.web.deps import (
     KNOWN_SETTING_KEYS,
+    PLEX_MACHINE_ID_SETTING,
     AuthContext,
     AuthMethod,
     SettingsStore,
@@ -39,6 +40,10 @@ SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _API_KEY = "settings-key"
+# A throwaway Plex credential for the identity-cache tests. Held in a NAME (not an
+# inline keyword literal) so ruff's S106 secret-in-call heuristic stays quiet — it
+# is a fixture value, never a real secret.
+_SEED_PLEX_TOKEN = "seed-plex-token"  # noqa: S105 — test fixture value, not a credential
 
 
 def test_every_known_setting_key_has_a_response_and_update_field() -> None:
@@ -113,6 +118,79 @@ async def test_put_round_trips_and_redacts(client: httpx.AsyncClient, seed: Seed
     got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
     assert got["plex_url"] == "http://plex.local:32400"
     assert got["tmdb_api_key"] == "***"
+
+
+# --------------------------------------------------------------------------- #
+# Repointing Plex invalidates the cached server identity (post-init sign-in     #
+# trusts PLEX_MACHINE_ID_SETTING; a changed plex_url/plex_token must re-derive) #
+# --------------------------------------------------------------------------- #
+async def _seed_plex_identity(
+    sessionmaker_: SessionMaker,
+    *,
+    plex_url: str,
+    machine_id: str,
+    plex_token: str = _SEED_PLEX_TOKEN,
+) -> None:
+    """Store a plex_url + plex_token + cached machine id, as setup-complete would."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", plex_url)
+        await store.set("plex_token", plex_token)
+        await store.set(PLEX_MACHINE_ID_SETTING, machine_id)
+        await session.commit()
+
+
+async def _stored_machine_id(sessionmaker_: SessionMaker) -> str | None:
+    async with sessionmaker_() as session:
+        return await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING)
+
+
+async def test_put_changed_plex_url_clears_cached_machine_id(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Repointing plex_url drops the cached machine id so the next sign-in
+    re-derives it from /identity instead of admitting the OLD server's users."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+
+    put = await client.put(
+        "/api/v1/settings", json={"plex_url": "http://new:32400"}, headers={"X-Api-Key": _API_KEY}
+    )
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None
+
+
+async def test_put_changed_plex_token_clears_cached_machine_id(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A real (non-masked) plex_token change also invalidates the cached identity."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+
+    put = await client.put(
+        "/api/v1/settings", json={"plex_token": "new-token"}, headers={"X-Api-Key": _API_KEY}
+    )
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None
+
+
+async def test_put_masked_and_unchanged_plex_values_keep_cached_machine_id(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A round-tripped masked secret ('***') and a same-value plex_url are NOT
+    changes: neither may needlessly drop a still-valid cached machine id (which
+    would force a pointless /identity re-probe on the next sign-in)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+
+    # The FE round-trips the whole object: unchanged plex_url + masked plex_token.
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://old:32400", "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # kept, not dropped
 
 
 async def test_secret_is_stored_encrypted(
@@ -772,6 +850,54 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
         assert system.app_api_key == new_key
 
 
+async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The revoke null-hole: a rotate that OBSERVED a key must not resurrect it.
+
+    A rotation authenticates against the live key, then a concurrent REVOKE clears
+    the stored key to NULL before this request writes. The old CAS skipped its
+    check whenever the stored key was null ('nothing to compare, just mint') and so
+    minted a fresh key — silently undoing the revoke. The fixed CAS treats a null
+    stored key as the genuine first-key generate ONLY when this request also
+    observed null; here it observed a non-null key, so it must 409 and leave the
+    revoke standing (no key resurrected).
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    state = {"raced": False}
+
+    async def revoking_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        if not state["raced"]:
+            # Fire once: a competing REVOKE clears the key on a separate session
+            # AFTER this rotation authenticated against it but BEFORE it writes.
+            state["raced"] = True
+            async with sessionmaker_() as other:
+                other_row = await real_ensure(other)
+                other_row.app_api_key = None
+                await other.commit()
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", revoking_ensure)
+
+    losing = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert losing.status_code == 409
+    assert losing.json()["detail"] == "app_key_changed"
+
+    # The revoke held: no key was resurrected by the losing rotation.
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None
+
+
 async def _admin_session_cookies(
     app: FastAPI, *, plex_id: int, tag: str
 ) -> tuple[dict[str, str], dict[str, str]]:
@@ -978,3 +1104,88 @@ async def test_revoke_app_key_is_idempotent_when_no_key_exists(
     revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
     assert revoke.status_code == 204
     assert revoke.content == b""
+
+
+async def test_revoke_app_key_cas_rejects_stale_revoke_after_concurrent_rotation(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale revoke must not wipe a key rotated in between (lost update).
+
+    The revoke authenticates against the live key; a concurrent ROTATE then commits
+    a fresh key before this request writes ``None``. The earlier draft loaded
+    ``system`` and unconditionally cleared it, silently clobbering the rotation. The
+    revoke CAS (mirroring the rotate CAS) must re-read under the lock, see the key
+    is no longer the value it observed, and 409 — leaving the rotated key intact.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    winner_key = "rotated-mid-revoke-0123456789abcdef"
+    state = {"raced": False}
+
+    async def racing_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        if not state["raced"]:
+            # Fire once: a competing ROTATE commits a new key on a separate session
+            # AFTER this revoke authenticated against the old key but BEFORE it writes.
+            state["raced"] = True
+            async with sessionmaker_() as other:
+                other_row = await real_ensure(other)
+                other_row.app_api_key = winner_key
+                await other.commit()
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", racing_ensure)
+
+    losing = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert losing.status_code == 409
+    assert losing.json()["detail"] == "app_key_changed"
+
+    # The concurrently-rotated key survived — the stale revoke did not wipe it.
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == winner_key
+
+
+async def test_revoke_app_key_leaves_key_none_on_success(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A normal (non-raced) revoke still commits ``None`` and returns 204 under the
+    new CAS: the observed key matches the stored key, so the clear proceeds."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    revoke = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert revoke.status_code == 204
+    assert revoke.content == b""
+
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None
+
+
+async def test_revoke_app_key_via_session_auth_clears_present_key(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A Plex-SESSION admin revoking a PRESENT key exercises the CAS's other
+    ``observed`` source: session auth carries no ``X-Api-Key`` header, so the CAS
+    compares against the value this request's session loaded at auth time. An
+    unraced revoke must therefore still clear the key (204), not spuriously 409.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, csrf = await _admin_session_cookies(app, plex_id=7006, tag="revoke-present")
+
+    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    assert revoke.status_code == 204
+    assert revoke.content == b""
+
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None

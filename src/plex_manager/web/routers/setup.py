@@ -301,8 +301,10 @@ async def complete(
     now = datetime.now(UTC)
     # Atomically claim initialization; a concurrent second caller updates 0 rows and
     # is rejected below. ``setup_started_at`` is intentionally absent from ``values``.
+    # Unquoted cast: ``CursorResult``/``Any`` must be runtime references, or static
+    # scanners that skip string annotations flag them as unused imports.
     claim = cast(
-        "CursorResult[Any]",
+        CursorResult[Any],
         await session.execute(
             update(SystemSettings)
             .where(SystemSettings.id == 1, SystemSettings.initialized.is_(False))

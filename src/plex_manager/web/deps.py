@@ -332,6 +332,22 @@ class SettingsStore:
             row.encrypted_value = None
         await self._session.flush()
 
+    async def delete(self, key: str) -> None:
+        """Remove ``key`` if present; a no-op when it was never set.
+
+        Used to invalidate a DERIVED/cached setting whose source of truth just
+        changed -- e.g. the Plex ``machineIdentifier`` snapshot
+        (:data:`PLEX_MACHINE_ID_SETTING`) cached at setup, which must be dropped
+        when an admin repoints the app at a different server (new ``plex_url`` /
+        ``plex_token``) so the next sign-in re-derives it from ``/identity``
+        rather than trusting the OLD server's id. Idempotent: deleting an unset
+        key does nothing (never a crash), matching :meth:`set`'s upsert symmetry.
+        """
+        row = await self._row(key)
+        if row is not None:
+            await self._session.delete(row)
+            await self._session.flush()
+
     async def redacted(self) -> dict[str, str | None]:
         """Return ``{key: value}`` with secret values masked to ``"***"``.
 

@@ -72,9 +72,25 @@ function asDisplayError(err: unknown): ApiError {
  * advertise. Verify calls the ownership-checking probe; on success the verified
  * server (with its libraries + machine identifier) is handed up via `onVerified`,
  * on failure the honest {@link AuthErrorCard} is shown.
+ *
+ * `setupTokenReady` / `setupToken` thread the per-tab `PLEX_MANAGER_SETUP_TOKEN`
+ * into the owned-servers discovery query. When a token is required, discovery
+ * needs `X-Setup-Token`; a fresh tab opened by an already-signed-in operator has
+ * none yet, so gating the fetch on readiness (and keying it by the token value)
+ * means typing the token TRIGGERS the fetch instead of the query firing early,
+ * 401ing, and caching that error until a reload (`retry: false`). Both default
+ * to "no token required" so a caller that never sets a token is unaffected.
  */
-export function ServerPicker({ onVerified }: { onVerified: (server: VerifiedServer) => void }) {
-  const serversQuery = useSetupPlexServers(true)
+export function ServerPicker({
+  onVerified,
+  setupTokenReady = true,
+  setupToken = '',
+}: {
+  onVerified: (server: VerifiedServer) => void
+  setupTokenReady?: boolean
+  setupToken?: string
+}) {
+  const serversQuery = useSetupPlexServers(setupTokenReady, setupToken)
   const validate = useValidatePlex()
 
   const connections = useMemo(

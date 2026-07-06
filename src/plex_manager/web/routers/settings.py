@@ -27,6 +27,7 @@ from plex_manager.db import get_session
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
+    PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
     AuthContext,
@@ -218,6 +219,13 @@ async def rotate_app_key_endpoint(
     prevent. The check is skipped only under ``dev_auth_bypass`` (there is no
     authenticated key to compare against), exactly like ``require_api_key``
     itself.
+
+    The CAS also closes the revoke null-hole: a stored key that has become NULL
+    is the genuine first-key GENERATE only when this request ALSO observed null.
+    If this request observed a NON-null key that a concurrent REVOKE cleared
+    mid-flight, minting again would silently resurrect the revoked key, so it
+    409s too — a null stored value is not a blanket "nothing to compare, just
+    mint".
     """
     system = await ensure_system_settings(session)
     async with _rotate_lock:
@@ -238,16 +246,24 @@ async def rotate_app_key_endpoint(
             # and our own commit) so the CAS reflects any rotation that committed
             # while this request was in flight.
             await session.refresh(system)
-            # Generate-from-null is the "generate" path: with no key stored there
-            # is nothing to compare against, so the first call simply MINTS. The
-            # CAS applies only once a key exists -- and if the stored key has become
-            # non-null while THIS request observed null, a concurrent generate/rotate
-            # already minted one, so honour the same 409 rather than clobber it.
-            if system.app_api_key is not None and not api_key_matches(observed, system.app_api_key):
-                raise HTTPException(
-                    status_code=409,
-                    detail="app_key_changed",
-                )
+            if system.app_api_key is None:
+                # No key is stored right now. Two very different reasons land here:
+                #  * Genuine first-key GENERATE: this request ALSO observed no key
+                #    (``observed`` is None) -- nothing ever existed to change, so
+                #    simply MINT (fall through).
+                #  * Revoked-key null-hole: this request OBSERVED a non-null key
+                #    that a concurrent REVOKE cleared while we were in flight.
+                #    Minting now would silently resurrect a just-revoked key, so
+                #    honour the same 409 the rotate-vs-rotate CAS gives rather than
+                #    defeat the revoke. (The old ``is not None`` guard skipped the
+                #    CAS entirely here and re-minted -- the reported null-hole.)
+                if observed is not None:
+                    raise HTTPException(status_code=409, detail="app_key_changed")
+            elif not api_key_matches(observed, system.app_api_key):
+                # A key IS stored but it is no longer the one this request observed:
+                # a concurrent generate/rotate already minted it, so 409 rather than
+                # clobber the winner.
+                raise HTTPException(status_code=409, detail="app_key_changed")
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         system.app_api_key = new_key
         await session.commit()
@@ -256,19 +272,47 @@ async def rotate_app_key_endpoint(
 
 @router.delete("/app-key", status_code=204)
 async def revoke_app_key_endpoint(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
+    auth: Annotated[AuthContext, Depends(require_admin)],
 ) -> None:
     """Revoke the app ``X-Api-Key``: clear the stored key so none authenticates.
 
     Every device holding the old key is locked out at once (``X-Api-Key`` auth
     401s until a new key is generated); browser Plex-session auth is unaffected.
     Idempotent -- revoking a keyless install is a no-op 204, since the end state is
-    the same either way. Runs under ``_rotate_lock`` so the clear cannot interleave
-    with a concurrent generate/rotate; the write is unconditional (the target state
-    is always ``None``), so it needs no compare-and-swap.
+    the same either way.
+
+    Compare-and-swap, mirroring :func:`rotate_app_key_endpoint`: an EARLIER draft
+    loaded ``system`` then wrote ``None`` unconditionally, which lost the update
+    when a rotate committed a fresh key in between — a stale revoke (authenticated
+    against a now-superseded key) would wipe a key the operator had just rotated
+    to. Under ``_rotate_lock`` we re-read the stored key and, if it is non-null
+    and no longer the value THIS request observed (the presented ``X-Api-Key``
+    header for api-key auth, else the session-loaded value at auth time), 409
+    ``app_key_changed`` rather than clobber that rotation. A currently-null stored
+    key stays the idempotent 204 no-op (nothing to lose). The check is skipped
+    only under ``dev_auth_bypass`` (no authenticated key to compare against),
+    exactly like the rotate CAS and ``require_api_key`` itself.
     """
     system = await ensure_system_settings(session)
     async with _rotate_lock:
+        if not get_settings().dev_auth_bypass:
+            # The key this request observed BEFORE the fresh read below — same
+            # sourcing as the rotate CAS: api-key callers presented it in the
+            # header; session callers observed the value their request session
+            # loaded at auth time (a concurrent commit does not update that cached
+            # instance).
+            observed = (
+                request.headers.get(API_KEY_HEADER_NAME)
+                if auth.method is AuthMethod.api_key
+                else system.app_api_key
+            )
+            # Force a fresh read in this transaction, under _rotate_lock, so the CAS
+            # reflects any rotation that committed while this revoke was in flight.
+            await session.refresh(system)
+            if system.app_api_key is not None and not api_key_matches(observed, system.app_api_key):
+                raise HTTPException(status_code=409, detail="app_key_changed")
         system.app_api_key = None
         await session.commit()
 
@@ -294,17 +338,38 @@ async def put_settings_endpoint(
     silently leave the whole threshold-to-target band unable to relieve pressure
     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
+
+    Repointing Plex invalidates the cached server identity: the
+    ``plex_machine_identifier`` snapshot cached at setup
+    (:data:`PLEX_MACHINE_ID_SETTING`) is the id post-init sign-in trusts to admit
+    users. If an admin changes ``plex_url`` or ``plex_token`` to aim at a
+    DIFFERENT server, that cached id would keep admitting the OLD server's users
+    and rejecting the new owner. So when the EFFECTIVE value of either actually
+    CHANGES here, the cached id is cleared in this SAME transaction and every
+    subsequent sign-in re-derives it live from ``/identity`` (nothing post-init
+    re-caches it — a per-sign-in probe of the operator's own server is the
+    deliberately-simple price of a rare repoint). A masked-secret round-trip
+    (``"***"``, skipped below) and a same-value re-PUT are NOT changes, so neither
+    needlessly drops a still-valid id.
     """
     await _validate_disk_pressure_pair(body, session)
 
     store = SettingsStore(session)
+    plex_identity_changed = False
     for field in body.model_fields_set:
         value = getattr(body, field)
         if value is None:
             continue
         if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
             continue
-        await store.set(field, _to_stored_string(value))
+        new_value = _to_stored_string(value)
+        if field in ("plex_url", "plex_token") and new_value != await store.get(field):
+            # Read the CURRENT stored value BEFORE overwriting it: only a genuine
+            # change (not a same-value re-PUT) invalidates the cached machine id.
+            plex_identity_changed = True
+        await store.set(field, new_value)
+    if plex_identity_changed:
+        await store.delete(PLEX_MACHINE_ID_SETTING)
     await session.commit()
     return await _redacted(store)
 

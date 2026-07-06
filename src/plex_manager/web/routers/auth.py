@@ -210,7 +210,12 @@ async def _claim_or_resume_setup(
         )
     await ensure_system_settings(session)
     claim = cast(
-        "CursorResult[Any]",
+        # Unquoted (a runtime expression, not a string annotation) so both
+        # ``CursorResult`` and ``Any`` are genuine runtime references, not names
+        # that live only inside a string. SQLAlchemy's ``CursorResult`` supports
+        # subscription at runtime, so this evaluates fine; the string form left
+        # the imports looking unused to static scanners (CodeQL #269/#270).
+        CursorResult[Any],
         await session.execute(
             update(SystemSettings)
             .where(SystemSettings.id == 1, SystemSettings.setup_started_at.is_(None))

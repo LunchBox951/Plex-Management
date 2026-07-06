@@ -652,6 +652,19 @@ export interface paths {
          *     silently leave the whole threshold-to-target band unable to relieve pressure
          *     (see :func:`~plex_manager.web.routers.settings._validate_disk_pressure_pair`).
          *     Checked, and rejected with the SAME 422 shape, BEFORE anything is written.
+         *
+         *     Repointing Plex invalidates the cached server identity: the
+         *     ``plex_machine_identifier`` snapshot cached at setup
+         *     (:data:`PLEX_MACHINE_ID_SETTING`) is the id post-init sign-in trusts to admit
+         *     users. If an admin changes ``plex_url`` or ``plex_token`` to aim at a
+         *     DIFFERENT server, that cached id would keep admitting the OLD server's users
+         *     and rejecting the new owner. So when the EFFECTIVE value of either actually
+         *     CHANGES here, the cached id is cleared in this SAME transaction and every
+         *     subsequent sign-in re-derives it live from ``/identity`` (nothing post-init
+         *     re-caches it — a per-sign-in probe of the operator's own server is the
+         *     deliberately-simple price of a rare repoint). A masked-secret round-trip
+         *     (``"***"``, skipped below) and a same-value re-PUT are NOT changes, so neither
+         *     needlessly drops a still-valid id.
          */
         put: operations["put_settings_endpoint_api_v1_settings_put"];
         post?: never;
@@ -691,9 +704,19 @@ export interface paths {
          *     Every device holding the old key is locked out at once (``X-Api-Key`` auth
          *     401s until a new key is generated); browser Plex-session auth is unaffected.
          *     Idempotent -- revoking a keyless install is a no-op 204, since the end state is
-         *     the same either way. Runs under ``_rotate_lock`` so the clear cannot interleave
-         *     with a concurrent generate/rotate; the write is unconditional (the target state
-         *     is always ``None``), so it needs no compare-and-swap.
+         *     the same either way.
+         *
+         *     Compare-and-swap, mirroring :func:`rotate_app_key_endpoint`: an EARLIER draft
+         *     loaded ``system`` then wrote ``None`` unconditionally, which lost the update
+         *     when a rotate committed a fresh key in between — a stale revoke (authenticated
+         *     against a now-superseded key) would wipe a key the operator had just rotated
+         *     to. Under ``_rotate_lock`` we re-read the stored key and, if it is non-null
+         *     and no longer the value THIS request observed (the presented ``X-Api-Key``
+         *     header for api-key auth, else the session-loaded value at auth time), 409
+         *     ``app_key_changed`` rather than clobber that rotation. A currently-null stored
+         *     key stays the idempotent 204 no-op (nothing to lose). The check is skipped
+         *     only under ``dev_auth_bypass`` (no authenticated key to compare against),
+         *     exactly like the rotate CAS and ``require_api_key`` itself.
          */
         delete: operations["revoke_app_key_endpoint_api_v1_settings_app_key_delete"];
         options?: never;
@@ -746,6 +769,13 @@ export interface paths {
          *     prevent. The check is skipped only under ``dev_auth_bypass`` (there is no
          *     authenticated key to compare against), exactly like ``require_api_key``
          *     itself.
+         *
+         *     The CAS also closes the revoke null-hole: a stored key that has become NULL
+         *     is the genuine first-key GENERATE only when this request ALSO observed null.
+         *     If this request observed a NON-null key that a concurrent REVOKE cleared
+         *     mid-flight, minting again would silently resurrect the revoked key, so it
+         *     409s too — a null stored value is not a blanket "nothing to compare, just
+         *     mint".
          */
         post: operations["rotate_app_key_endpoint_api_v1_settings_app_key_rotate_post"];
         delete?: never;

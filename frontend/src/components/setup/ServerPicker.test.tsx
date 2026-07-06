@@ -10,7 +10,10 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../api/hooks', () => ({
-  useSetupPlexServers: () => h.servers(),
+  // Forward the (enabled, setupToken) args so tests can assert the discovery query
+  // reacts to the per-tab setup token (finding #6), while still returning whatever
+  // `serversLoaded()` staged for the render-facing behavior tests.
+  useSetupPlexServers: (...args: unknown[]) => h.servers(...args),
   useValidatePlex: () => ({ mutateAsync: h.validate, isPending: false }),
 }))
 
@@ -135,6 +138,26 @@ describe('ServerPicker', () => {
     // No select to pick from; the custom URL field is offered instead.
     expect(screen.queryByLabelText('Plex server')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Server URL')).toBeInTheDocument()
+  })
+
+  it('gates owned-server discovery until the setup token is ready (no premature cached 401)', () => {
+    // A fresh tab opened by an already-signed-in operator has an empty per-tab
+    // setup token: discovery must stay DISABLED (enabled=false) so it never fires
+    // the 401 that retry:false would cache until reload (finding #6).
+    render(<ServerPicker onVerified={vi.fn()} setupTokenReady={false} setupToken="" />)
+    expect(h.servers).toHaveBeenCalledWith(false, '')
+  })
+
+  it('enables discovery and keys the query by the token once it is entered', () => {
+    // Entering the token flips readiness true AND changes the query key, so React
+    // Query runs a fresh fetch instead of staying stranded on a cached error.
+    render(<ServerPicker onVerified={vi.fn()} setupTokenReady={true} setupToken="tok-123" />)
+    expect(h.servers).toHaveBeenCalledWith(true, 'tok-123')
+  })
+
+  it('defaults to no-token-required, so a tokenless install fetches immediately', () => {
+    render(<ServerPicker onVerified={vi.fn()} />)
+    expect(h.servers).toHaveBeenCalledWith(true, '')
   })
 
   it('surfaces the real discovery error (not a misleading empty state), keeping custom entry available', () => {
