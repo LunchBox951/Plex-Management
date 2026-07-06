@@ -40,9 +40,12 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.library import WatchState
-from plex_manager.services import eviction_service, season_request_service
+from plex_manager.ports.metadata import TvMetadata
+from plex_manager.ports.repositories import SeasonRequestRecord
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
+from plex_manager.services import eviction_service, request_service, season_request_service
 from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
-from tests.web.fakes import FakeLibrary
+from tests.web.fakes import FakeLibrary, FakeTmdb
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -3191,3 +3194,181 @@ async def test_sweep_releases_the_breadcrumb_of_a_parked_rearmed_season_whose_fi
     assert season_row.library_path is None  # stale breadcrumb released
     assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
     assert (missing_path, "tv") in library.scan_calls
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-7 findings 2 + 3.
+# --------------------------------------------------------------------------- #
+
+
+async def test_rearmed_recovery_never_wipes_a_replacement_imports_fresh_breadcrumb(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 finding 2: the file-gone breadcrumb clear is VALUE-predicated on
+    the exact stale path recovery observed. A replacement import can commit
+    between recovery's stat and the clear, stamping a FRESH breadcrumb (and
+    fresh content) onto the very same row -- an unconditional clear would wipe
+    it, leaving a playing season with no eviction/report handle. Simulated by a
+    stale enumeration read: the DB row already carries the import's fresh
+    breadcrumb + 'completed', while recovery observed the pre-import
+    'pending' + stale-path snapshot. The mismatch must leave the row entirely
+    untouched (fresh path kept, status kept, no history)."""
+    stale_path = str(tmp_path / "tv" / "Restamped" / "Season 01")  # gone (never created)
+    fresh_path = _movie_file(tmp_path, "Restamped S01 fresh.mkv")  # the import's file
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=670, title="Restamped", seasons={1: fresh_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.completed  # the replacement import landed
+        await session.commit()
+        season_id = season_row.id
+
+    real_list_by_status = SqlSeasonRequestRepository.list_by_status
+
+    async def stale_list_by_status(
+        self: SqlSeasonRequestRepository, status: str | None = None
+    ) -> list[SeasonRequestRecord]:
+        # Serve recovery the PRE-IMPORT snapshot it would have read moments
+        # before the import committed: 'pending' + the stale breadcrumb.
+        if status == RequestStatus.pending.value:
+            return [
+                SeasonRequestRecord(
+                    id=season_id,
+                    media_request_id=show_id,
+                    season_number=1,
+                    status=RequestStatus.pending.value,
+                    tmdb_id=670,
+                    library_path=stale_path,
+                )
+            ]
+        return await real_list_by_status(self, status)
+
+    monkeypatch.setattr(SqlSeasonRequestRepository, "list_by_status", stale_list_by_status)
+
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 670)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.library_path == fresh_path  # the import's fresh handle SURVIVES
+    assert season_row.status is RequestStatus.completed  # row untouched
+    assert history == []  # no bogus finalize was recorded
+
+
+async def test_finalize_flips_a_cancelled_rearm_to_evicted_and_the_guard_holds(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 finding 3 (disk-truth-over-intent): the claimed season is
+    re-armed and CANCELLED while the purge is deleting, so the finalize finds
+    the row 'cancelled' -- which evicted_seasons rightly ignores, so nothing
+    would be subtracted while Plex is stale and a re-request could mint
+    'available' over the just-deleted file. The finalize must flip
+    cancelled -> evicted (the cancel only aborted the re-grab INTENT; the file
+    is GENUINELY gone), after which a subsequent re-request mints 'pending',
+    never 'available'."""
+    library_path = str(tmp_path / "tv" / "Cancelled Mid Purge" / "Season 01")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=680, title="Cancelled Mid Purge", seasons={1: library_path}
+    )
+    async with sessionmaker_() as session_seed:
+        season_row = (
+            (
+                await session_seed.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_id = season_row.id
+
+    async with sessionmaker_() as session:
+        # The purge fake deletes "successfully" while the re-arm + user cancel
+        # land on the row -- compressed to the end state the finalize then sees.
+        async def _cancelling_purge(_fs: object, _path: str) -> PurgeResult:
+            row = await session.get(SeasonRequest, season_id)
+            assert row is not None
+            row.status = RequestStatus.cancelled
+            await session.commit()
+            return PurgeResult(PurgeOutcome.deleted, 0)
+
+        monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _cancelling_purge)
+
+        stale = eviction_service.EvictionCandidate(
+            request_id=season_id,
+            media_type="tv",
+            title="Cancelled Mid Purge",
+            season=1,
+            status="available",
+            watched=True,
+            last_viewed_at=_STALE,
+            keep_forever=False,
+            in_flight=False,
+            library_path=library_path,
+            size_percent=1.0,
+        )
+        pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+            media_request_id=show_id,
+            season_request_id=season_id,
+            season_number=1,
+            tmdb_id=680,
+            size_bytes=1024,
+        )
+        fs = LocalFileSystem(library_roots=[str(tmp_path)])
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+        )
+
+    assert outcome is not None  # the eviction itself completed
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 680)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    # Disk truth over intent: never left 'cancelled' (invisible to the guard).
+    assert season_row.status is RequestStatus.evicted
+    assert season_row.library_path is None  # finalized
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
+
+    # The full circle: a subsequent re-request during the stale-Plex window must
+    # mint 'pending' (evicted_seasons subtracts the flipped season), never an
+    # 'available' row over the just-deleted file.
+    tmdb = FakeTmdb(
+        shows={680: TvMetadata(tmdb_id=680, title="Cancelled Mid Purge", year=2020, season_count=1)}
+    )
+    plex_stale = FakeLibrary(available_tv_seasons={680: frozenset({1})})
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=680, media_type="tv", seasons=[1], library=plex_stale
+        )
+    assert fresh.id != show_id
+    assert fresh.status == RequestStatus.pending.value  # re-grabs, never 'available'

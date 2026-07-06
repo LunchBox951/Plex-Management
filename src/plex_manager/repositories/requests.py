@@ -254,9 +254,12 @@ class SqlRequestRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
-    async def clear_library_path_if_set(self, request_id: int) -> bool:
-        """Null the eviction breadcrumb ONLY if it is currently set; return whether
-        this call actually cleared it.
+    async def clear_library_path_if_set(
+        self, request_id: int, *, expected_path: str | None = None
+    ) -> bool:
+        """Null the eviction breadcrumb ONLY if it is currently set (and, with
+        ``expected_path``, only if it still holds EXACTLY that value); return
+        whether this call actually cleared it.
 
         The guarded (``WHERE library_path IS NOT NULL``) variant of
         :meth:`clear_library_path`, for the eviction finalize (ADR-0012 #67):
@@ -265,12 +268,22 @@ class SqlRequestRepository:
         interrupted eviction use this as their single-winner gate -- only the
         caller that actually cleared it (``True``) writes the history row, so a
         concurrent finalize never double-records the same eviction.
+
+        ``expected_path`` makes the clear VALUE-predicated (``AND library_path =
+        expected_path``): the eviction finalize/recovery observes a specific
+        stale path, and must never wipe a FRESH breadcrumb a replacement import
+        stamped onto the row between recovery's stat and this write -- a
+        mismatch means that newer import owns the row now, so the caller leaves
+        it (logged), keeping the row's eviction/report handle intact.
         """
+        predicates = [MediaRequest.id == request_id, MediaRequest.library_path.is_not(None)]
+        if expected_path is not None:
+            predicates.append(MediaRequest.library_path == expected_path)
         result = cast(
             CursorResult[Any],
             await self._session.execute(
                 update(MediaRequest)
-                .where(MediaRequest.id == request_id, MediaRequest.library_path.is_not(None))
+                .where(*predicates)
                 .values(library_path=None)
                 .execution_options(synchronize_session="fetch")
             ),

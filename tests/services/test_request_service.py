@@ -17,7 +17,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex import PlexLibrary
 from plex_manager.adapters.plex.library import PlexLibraryError, reset_caches
-from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import (
+    MediaRequest,
+    MediaType,
+    RequestDedupLock,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -1090,3 +1096,48 @@ async def test_set_keep_forever_missing_request_returns_none(
             session=session, request_id=999999, keep_forever=True
         )
     assert result is None
+
+
+async def test_create_request_tv_mixed_fall_through_releases_the_media_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-7 finding 1: the mixed present/missing-season fall-through (the
+    superset check fails) must release the media lock BEFORE proceeding to the
+    create path, whose ensure_seasons performs its own Plex crawl -- the same
+    discipline as the two dedup branches. Observable through the lock row
+    itself: the release rolls back the RequestDedupLock insert, so the create's
+    later commit persists NO lock row; without the release, the lock
+    acquisition would ride along into that commit (after having held the write
+    transaction across the crawl)."""
+    tmdb = FakeTmdb(
+        shows={690: TvMetadata(tmdb_id=690, title="Mixed Show", year=2021, season_count=2)}
+    )
+    # Season 1 present in Plex, season 2 missing -> present={1} acquires the
+    # lock, superset([1, 2]) fails -> the fall-through creates a fresh request.
+    library = FakeLibrary(available_tv_seasons={690: frozenset({1})})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=690, media_type="tv", seasons=[1, 2], library=library
+        )
+
+    # The fall-through create still works exactly as before...
+    assert record.status == RequestStatus.partially_available.value
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        locks = (
+            (await session.execute(select(RequestDedupLock).where(RequestDedupLock.tmdb_id == 690)))
+            .scalars()
+            .all()
+        )
+    assert {s.season_number: s.status.value for s in seasons} == {1: "available", 2: "pending"}
+    # ...and the lock acquisition was rolled back before the create, so it never
+    # rode into the final commit (the write transaction did not span the crawl).
+    assert locks == []

@@ -202,24 +202,32 @@ class SqlSeasonRequestRepository:
             for row, parent_tmdb_id in (await self._session.execute(stmt)).all()
         ]
 
-    async def clear_library_path_if_set(self, season_request_id: int) -> bool:
-        """Null the season's eviction breadcrumb ONLY if currently set; return
+    async def clear_library_path_if_set(
+        self, season_request_id: int, *, expected_path: str | None = None
+    ) -> bool:
+        """Null the season's eviction breadcrumb ONLY if currently set (and, with
+        ``expected_path``, only if it still holds EXACTLY that value); return
         whether this call actually cleared it.
 
         The season-granularity mirror of ``SqlRequestRepository.
-        clear_library_path_if_set`` (see there): the eviction finalize's
-        single-winner gate -- only the finalize/resume pass that actually cleared
-        the breadcrumb writes the eviction history row, so two passes racing over
-        the same interrupted eviction never double-record it.
+        clear_library_path_if_set`` (see there, including the ``expected_path``
+        value predicate): the eviction finalize's single-winner gate -- only the
+        finalize/recovery pass that actually cleared the breadcrumb writes the
+        eviction history row, and a clear predicated on the OBSERVED stale path
+        can never wipe the fresh breadcrumb a replacement import stamped onto
+        the row mid-recovery.
         """
+        predicates = [
+            SeasonRequest.id == season_request_id,
+            SeasonRequest.library_path.is_not(None),
+        ]
+        if expected_path is not None:
+            predicates.append(SeasonRequest.library_path == expected_path)
         result = cast(
             CursorResult[Any],
             await self._session.execute(
                 update(SeasonRequest)
-                .where(
-                    SeasonRequest.id == season_request_id,
-                    SeasonRequest.library_path.is_not(None),
-                )
+                .where(*predicates)
                 .values(library_path=None)
                 .execution_options(synchronize_session="fetch")
             ),

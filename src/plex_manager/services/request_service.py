@@ -426,6 +426,7 @@ async def create_request_result(
         # (mirrors ``ensure_seasons``'s own subtraction, which then also steers
         # the season to 'pending').
         present = await _present_seasons_or_empty(library, tmdb_id)
+        media_locked = bool(present)
         if present:
             # Serialize + RE-READ the active row under the per-media lock -- the
             # TV twin of the movie path's under-lock re-read above. A second TV
@@ -485,6 +486,22 @@ async def create_request_result(
                     record=await repo.get(in_library.id) or in_library,
                     created=False,
                 )
+        if media_locked:
+            # FALL-THROUGH release (the third branch): a mixed present/missing
+            # season set (superset failed) or no in-library row to dedup onto
+            # proceeds to the fresh-create path below, whose ensure_seasons
+            # performs its own Plex crawl -- release the media lock FIRST, the
+            # same discipline as the two dedup branches above (never hold the
+            # lock's write transaction across network I/O). Nothing read under
+            # the lock needs re-reading after the release: ``existing_active``'s
+            # ABSENCE only justified proceeding, and a concurrent active row
+            # committing after the release makes the create below collide on
+            # ``uq_media_requests_active`` -- resolved by the IntegrityError
+            # catch (the DB backstop) exactly like any other create race; and
+            # the ``evicted_seasons`` subtraction only fed the superset DECISION
+            # (a TV create always starts 'pending', and ensure_seasons re-derives
+            # presence + the evicted subtraction FRESH on its own crawl).
+            await session.rollback()
     created = True
     try:
         record = await repo.create(
