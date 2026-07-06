@@ -293,6 +293,17 @@ async def ensure_seasons(
     ``searching``/``downloading``/``import_blocked``/``no_acceptable_release``/
     ``pending``) is left completely untouched -- an in-flight or already-finished
     season is never regressed by a re-request.
+
+    That re-arm (#75) does not stop at ``set_status``: it also clears the
+    ``library_path`` eviction breadcrumb and resets the search backoff ladder,
+    MIRRORING the existing report-issue re-arm path (:func:`reset_for_research`'s
+    ``clear_library_path``/``schedule_search(search_attempts=0,
+    next_search_at=None)`` pair, cited there as ADR-0013/ADR-0014). Without this
+    a re-requested evicted season could inherit a stale ``library_path`` still
+    pointing at the file the sweep already deleted (a later eviction sweep would
+    misread it as still reclaimable) and/or a stale ``search_attempts``/
+    ``next_search_at`` backoff from the run that led to eviction, throttling the
+    operator's brand-new request exactly like a fresh row never would.
     """
     present: frozenset[int] = (
         await _present_seasons(library, tmdb_id) if library is not None else frozenset()
@@ -308,6 +319,11 @@ async def ensure_seasons(
         record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
         if record.status == RequestStatus.evicted.value:
             await season_repo.set_status(record.id, initial_status)
+            # Mirrors ``reset_for_research``'s re-arm exactly (see the docstring
+            # above): a fresh request must not inherit the evicted run's
+            # breadcrumb or backoff state.
+            await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
+            await season_repo.clear_library_path(record.id)
             record = await season_repo.get(record.id) or record
         records.append(record)
     await _recompute_parent(session, media_request_id)
@@ -500,6 +516,27 @@ async def reset_for_research(
     ``False`` when the purge failed/was refused (the season directory may still be on
     disk): the breadcrumb is then PRESERVED so a later retry / eviction can still
     reclaim the orphan, never stranded with no handle (honesty over silence).
+
+    Also clears the PARENT'S ``completed_at`` (#76) when this reset leaves NO
+    tracked season still ``completed``/``available``. Read against the movie
+    path's own ``SqlRequestRepository.reset_for_research``, which
+    unconditionally nulls ``completed_at`` because a movie is a single row: its
+    completion claim is entirely invalidated the instant it is re-armed. A TV
+    parent's ``completed_at`` is a DIFFERENT thing -- not "this row's own
+    completion" but "the show's FIRST tracked season to complete" (a documented,
+    known approximation; see ``retention_telemetry_service._candidate_context``
+    and ``_recompute_parent``'s ``stamp_completion`` doc). Unconditionally
+    clearing it here would make the honest case (another season is STILL
+    genuinely complete/available, unaffected by this reset) regress to
+    "unknown" for no reason -- the show, in fact, DID first complete at that
+    earlier stamp, and that historical fact does not become false just because
+    a DIFFERENT season is now being redone. So this recomputes rather than
+    blindly clears: the stamp is cleared ONLY when the season being reset was
+    the last one still holding up that claim (no season remains ``completed``/
+    ``available`` after this reset), so a subsequent genuine re-completion can
+    re-stamp via ``stamp_completed_at_if_unset``'s ``IS NULL`` guard (#76,
+    closing the "redone season never re-stamps" gap) -- otherwise the earlier,
+    still-true stamp is left standing.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
@@ -511,6 +548,14 @@ async def reset_for_research(
     await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
+    # #76: re-read every tracked season AFTER this one's own status write above,
+    # so the just-reset season is seen as ``searching`` (not stale ``completed``/
+    # ``available``) in this membership test -- an accurate "does anything ELSE
+    # still back the parent's completion stamp" check, not a snapshot from before
+    # this reset.
+    seasons = await season_repo.list_for_request(media_request_id)
+    if not any(season.status in _REAL_DONE_SEASON_STATUS_VALUES for season in seasons):
+        await SqlRequestRepository(session).clear_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
 
 

@@ -464,6 +464,30 @@ class SqlRequestRepository:
         row.next_search_at = None
         await self._session.flush()
 
+    async def clear_completed_at(self, request_id: int) -> None:
+        """Null the parent's ``completed_at`` outside any status transition (ADR-0014).
+
+        Added for the TV report-issue path (``season_request_service.
+        reset_for_research``, #76): a TV parent's ``completed_at`` is not stamped
+        directly (a TV ``MediaRequest`` never goes through ``mark_completed``/
+        ``mark_available`` -- see ``stamp_completed_at_if_unset``'s docstring), so
+        report-issue cannot reuse this class's own :meth:`reset_for_research`
+        (that method is the single-row MOVIE verb: it also flips ``status`` to
+        ``searching`` and clears ``library_verified_at``/``library_path``/backoff
+        fields that a TV parent's status is a pure ROLLUP of its seasons for, and
+        that live per-season on ``SeasonRequest`` instead). The caller decides
+        WHEN to call this (only once no OTHER tracked season is still
+        ``completed``/``available`` -- see ``season_request_service.
+        reset_for_research``'s docstring for why), so this method itself is
+        unconditional, mirroring :meth:`clear_library_path`'s bare, no-transition
+        write.
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.completed_at = None
+        await self._session.flush()
+
     async def clear_library_path(self, request_id: int) -> None:
         """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).
 

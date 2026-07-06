@@ -10,6 +10,7 @@ season-status write recomputes and persists the rollup in the SAME call.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -233,6 +234,61 @@ async def test_ensure_seasons_never_regresses_a_non_evicted_terminal_season(
         await session.commit()
 
     assert {(r.season_number, r.status) for r in records} == {(1, "failed")}
+
+
+async def test_ensure_seasons_re_arm_clears_library_path_and_backoff_on_evicted_reuse(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """#75 regression: re-requesting an EVICTED season must not just flip its
+    status back to pending/available -- it must ALSO clear the library_path
+    eviction breadcrumb and reset the search backoff ladder, exactly mirroring
+    ``reset_for_research``'s report-issue re-arm (ADR-0013/ADR-0014). Before the
+    fix, a re-requested evicted season inherited its stale library_path (a
+    later eviction sweep would misread it as still reclaimable) and its stale
+    search_attempts/next_search_at backoff (throttling the operator's brand-new
+    request exactly like a fresh row never would)."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=730)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
+        )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            library_path="/media/tv/Some Show/Season 01",
+        )
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=1, status="evicted"
+        )
+        await session.commit()
+
+    # Simulate a backoff ladder the season accrued before it was evicted (e.g. a
+    # stalled no_acceptable_release run) directly on the row.
+    async with sessionmaker_() as session:
+        stmt = select(SeasonRequest).where(
+            SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
+        )
+        season_row = (await session.execute(stmt)).scalars().one()
+        season_row.search_attempts = 6
+        season_row.next_search_at = datetime.now(UTC) + timedelta(hours=24)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
+        )
+        await session.commit()
+
+    assert {(r.season_number, r.status) for r in records} == {(1, "pending")}
+    async with sessionmaker_() as session:
+        stmt = select(SeasonRequest).where(
+            SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
+        )
+        season_row = (await session.execute(stmt)).scalars().one()
+    assert season_row.library_path is None
+    assert season_row.search_attempts == 0
+    assert season_row.next_search_at is None
 
 
 async def test_set_status_updates_one_season_and_recomputes_precedence_rollup(
@@ -575,3 +631,94 @@ async def test_eviction_rollup_never_stamps_completed_at(
         # eviction path never stamps completed_at.
         assert show.status is RequestStatus.partially_available
         assert show.completed_at is None
+
+
+async def test_reset_for_research_clears_completed_at_when_no_season_remains_done(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """#76 regression: a single-season show's report-issue reset must clear the
+    PARENT's stale ``completed_at`` so a redone season re-stamps on the next
+    genuine completion. Before the fix, ``reset_for_research`` only re-armed the
+    SEASON row -- the parent's ``completed_at`` (stamped once, idempotently, via
+    ``stamp_completed_at_if_unset``) was left standing, so ``mark_completed``'s
+    ``IS NULL`` guard silently skipped re-stamping it forever."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=724)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=724, seasons=[1]
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None  # the first (only) stamp
+
+    # report-issue: no OTHER tracked season is complete/available, so the reset
+    # must clear the now-stale parent stamp.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is None
+
+    # Redoing the season completes it again -> the parent re-stamps, honestly
+    # reflecting the NEW completion rather than staying permanently None.
+    async with sessionmaker_() as session:
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at is not None
+
+
+async def test_reset_for_research_leaves_completed_at_when_a_sibling_is_still_done(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The #76 fix RECOMPUTES rather than blindly clears: a multi-season show
+    with one season STILL genuinely complete/available must keep the parent's
+    ``completed_at`` intact when a DIFFERENT season is report-issue reset -- the
+    show's first-completion fact does not become false just because a sibling
+    season is being redone (the documented approximation in
+    ``retention_telemetry_service._candidate_context``)."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=725)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=725, seasons=[1, 2]
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=1
+        )
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        first_stamp = show.completed_at
+        assert first_stamp is not None
+
+    # report-issue on season 2 only -- season 1 is still 'completed', so the
+    # parent's completed_at must be left standing, not cleared.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.completed_at == first_stamp
