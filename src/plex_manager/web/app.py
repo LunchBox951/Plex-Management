@@ -232,6 +232,22 @@ async def _reconcile_once(app: FastAPI) -> None:
                     "running availability pass anyway",
                     type(exc).__name__,
                 )
+                # A remove=no operator residual needs NO client I/O, so an OUTAGE
+                # must not strand it for the outage's whole duration any more than
+                # an unconfigured client may (the branch below) -- run the same
+                # narrow DB-only heal on the rolled-back session; rows that need a
+                # removal keep waiting for the client to recover (counted + logged
+                # inside the heal, never silently dropped).
+                await queue_service.heal_failed_pending_without_client(session)
+        else:
+            # DB-only strand heal (queue_service module docstring, "Operator
+            # provenance"): with qBittorrent UNCONFIGURED the reconcile cycle above
+            # never runs, so a remove=no operator residual (mark_failed with
+            # remove_torrent=False -- which by the operator's own choice needs NO
+            # client I/O) would otherwise sit at failed_pending forever on exactly
+            # the installs that path exists for. Rows needing a removal still wait
+            # for the client (logged inside the heal, never silently dropped).
+            await queue_service.heal_failed_pending_without_client(session)
 
         # Availability promotion (completed -> available) needs ONLY Plex, so it runs
         # even when qBittorrent is down or the Movies root was cleared after an

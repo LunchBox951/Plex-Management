@@ -32,7 +32,7 @@ from plex_manager.services.grab_service import (
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
 )
-from plex_manager.services.queue_service import InvalidStateTransitionError
+from plex_manager.services.queue_service import InvalidStateTransitionError, RemovalInProgressError
 from plex_manager.web.deps import (
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
@@ -372,5 +372,13 @@ async def mark_failed_endpoint(
     except InvalidStateTransitionError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="invalid_state_transition"
+        ) from exc
+    except RemovalInProgressError as exc:
+        # Ownership protocol step 5 (queue_service module docstring): another
+        # mark-failed's torrent removal is mid-flight for this download, so its
+        # remove decision is already irreversible -- superseding it would lie.
+        # Honest 409; the operator retries once the in-flight call resolves.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="removal_in_progress"
         ) from exc
     return _to_item(record)
