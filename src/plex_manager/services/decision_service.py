@@ -19,8 +19,9 @@ before it can be scored — never silently grabbed. For a TV request naming
 specific ``episodes``, the same hook additionally gates on
 :func:`plex_manager.domain.season_pack.covers_requested_episodes`, so a
 single-episode release for the right show/season but the WRONG episode (a
-tracker that ignored or couldn't narrow to the requested episode) is rejected
-before it can rank/grab, rather than caught only later at import time.
+tracker that ignored or couldn't narrow to the requested episode) -- or one that
+covers only PART of the requested episodes -- is rejected before it can
+rank/grab, rather than caught only later at import time.
 """
 
 from __future__ import annotations
@@ -157,17 +158,20 @@ async def preview(
             expected_season=match_season,
         ):
             return False
-        # Episode-overlap gate (TV only, specific episodes named): the season
+        # Episode-coverage gate (TV only, specific episodes named): the season
         # gate above only confirms the release covers the right SEASON -- a
         # tracker that ignores (or can't narrow to) the requested episode(s) can
         # still return a single-episode release for a DIFFERENT episode of that
-        # same season (e.g. S02E01 when E04 was requested). Without this, that
-        # wrong-episode release would rank/grab like any other accepted
-        # candidate, and the importer would only catch it after the wrong
-        # torrent was already added (skipped_not_requested, a blocked download).
-        # A whole-season pack always passes (it inherently contains whatever
-        # episode is requested); movies and whole-season requests (no specific
-        # episodes named) are unaffected since ``episodes`` is empty/None then.
+        # same season (e.g. S02E01 when E04 was requested), or a PARTIAL one (only
+        # E04 when [4, 5] was requested). Without this, that wrong/partial-episode
+        # release would rank/grab like any other accepted candidate, and the
+        # importer would only catch it after the wrong torrent was already added --
+        # a blocked download (import validation requires EVERY requested episode).
+        # ``covers_requested_episodes`` now requires FULL coverage (issue #70), so a
+        # single-episode release must contain EVERY requested episode to pass; a
+        # whole-season pack always passes (it inherently contains them all). Movies
+        # and whole-season requests (no specific episodes named) are unaffected
+        # since ``episodes`` is empty/None then.
         if media_type != "tv" or not episodes:
             return True
         return covers_requested_episodes(parsed, episodes)
