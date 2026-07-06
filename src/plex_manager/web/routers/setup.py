@@ -38,12 +38,11 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import CursorResult, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.status import HTTP_403_FORBIDDEN, HTTP_409_CONFLICT
+from starlette.status import HTTP_409_CONFLICT
 
 from plex_manager.adapters.plex.oauth import (
     PlexResource,
     PlexTvClient,
-    find_owned_server,
     owned_servers,
 )
 from plex_manager.config import get_settings
@@ -75,6 +74,8 @@ from plex_manager.web.schemas import (
     TmdbValidateRequest,
 )
 from plex_manager.web.setup_validation import (
+    assert_admin_owns_server,
+    assert_plex_token_authorized,
     validate_plex,
     validate_prowlarr,
     validate_qbittorrent,
@@ -142,24 +143,6 @@ async def _admin_plex_token(session: AsyncSession, context: AuthContext) -> str:
 async def _plex_tv_client(session: AsyncSession, client: httpx.AsyncClient) -> PlexTvClient:
     identifier = await SettingsStore(session).get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER
     return PlexTvClient(client, client_identifier=identifier)
-
-
-def _assert_admin_owns_server(resources: Sequence[PlexResource], machine_identifier: str) -> None:
-    """403 ``server_not_owned`` unless ``machine_identifier`` is among the OWNED servers.
-
-    THE ownership assertion of the wizard, shared verbatim by ``validate/plex``
-    and ``complete`` so the two cannot drift: ``resources`` must be the SIGNED-IN
-    admin's own plex.tv resource list, and ``machine_identifier`` an id derived
-    live from the candidate server's ``/identity`` — never a caller-supplied
-    claim (see each endpoint's docstring for why its inputs satisfy this).
-    """
-    if find_owned_server(resources, machine_identifier) is None:
-        raise AppError(
-            status_code=HTTP_403_FORBIDDEN,
-            code="server_not_owned",
-            message="Your Plex account does not own that server.",
-            hint="Choose a server your Plex account owns, or sign in with the owner account.",
-        )
 
 
 async def _probe_connection(
@@ -254,7 +237,7 @@ async def validate_plex_endpoint(
     if not result.ok or result.machine_identifier is None:
         return result
     resources = await plex_tv.fetch_resources(admin_token)
-    _assert_admin_owns_server(resources, result.machine_identifier)
+    assert_admin_owns_server(resources, result.machine_identifier)
     return result
 
 
@@ -318,7 +301,7 @@ async def complete(
     resolved token via the exact ``/identity`` code path ``validate/plex`` uses
     (:meth:`PlexTvClient.fetch_server_identity`; an unreachable server is the
     same honest 502 envelope), and the SAME ownership assertion
-    (:func:`_assert_admin_owns_server`, 403 ``server_not_owned``) is re-checked
+    (:func:`assert_admin_owns_server`, 403 ``server_not_owned``) is re-checked
     against the signed-in admin's own plex.tv resources. Only the re-derived id
     is stored; ``body.plex_machine_identifier`` is advisory at most (the wizard
     sends the matching one — a mismatch means the caller bypassed the wizard,
@@ -328,6 +311,17 @@ async def complete(
     Plex account exists to assert ownership with — the whole credential model is
     already bypassed) the body id is stored as-is, exactly as the bypass skips
     ``require_setup_admin`` itself.
+
+    The RESOLVED token is verified with an AUTHENTICATED call too
+    (:func:`assert_plex_token_authorized`): ``/identity`` is deliberately
+    unauthenticated, so the derivation alone would bless a reachable server
+    paired with a wrong/revoked ``plex_token`` — the install would flip
+    ``initialized`` yet every subsequent library call would fail. The wizard's
+    validate-first flow already proves its token via ``validate/plex``'s
+    ``list_sections``; this runs the SAME check inline so a direct API caller
+    (especially one supplying an explicit token override) meets an equally
+    strong bar. A rejected token is the 422 ``plex_token_invalid`` envelope,
+    before the claim — never a half-initialized install.
     """
     # Resolve the Plex token BEFORE the claim so the None-token path's own 409 (no
     # signed-in Plex account) can never leave a half-claimed, credential-less row.
@@ -345,8 +339,11 @@ async def complete(
             plex_token = admin_token
         plex_tv = await _plex_tv_client(session, client)
         machine_identifier = await plex_tv.fetch_server_identity(body.plex_url, plex_token)
+        # /identity is unauthenticated: prove the RESOLVED token is actually
+        # accepted by this server before anything is claimed or stored.
+        await assert_plex_token_authorized(client, body.plex_url, plex_token)
         resources = await plex_tv.fetch_resources(admin_token)
-        _assert_admin_owns_server(resources, machine_identifier)
+        assert_admin_owns_server(resources, machine_identifier)
 
     # Ensure the singleton row (id=1) exists so the conditional update has a target.
     await ensure_system_settings(session)

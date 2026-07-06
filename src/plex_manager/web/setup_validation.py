@@ -16,24 +16,33 @@ import os
 from typing import TYPE_CHECKING, Literal, cast
 
 import httpx
+from starlette.status import (
+    HTTP_403_FORBIDDEN,
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_502_BAD_GATEWAY,
+)
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
+from plex_manager.adapters.plex.oauth import find_owned_server
 from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
+from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
 from plex_manager.web.url_validation import url_shape_error
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from plex_manager.adapters.plex.oauth import PlexTvClient
+    from plex_manager.adapters.plex.oauth import PlexResource, PlexTvClient
     from plex_manager.ports.library import LibrarySection
 
 __all__ = [
+    "assert_admin_owns_server",
+    "assert_plex_token_authorized",
     "library_options",
     "validate_plex",
     "validate_prowlarr",
@@ -120,6 +129,66 @@ def library_options(
         for section in sections
         for path in section.locations
     ]
+
+
+def assert_admin_owns_server(resources: Sequence[PlexResource], machine_identifier: str) -> None:
+    """403 ``server_not_owned`` unless ``machine_identifier`` is among the OWNED servers.
+
+    THE ownership assertion for anchoring the app to a Plex server, shared
+    verbatim by ``setup/validate/plex``, ``setup/complete``, and the SESSION-admin
+    path of ``PUT /settings``' repoint verification so they cannot drift:
+    ``resources`` must be the SIGNED-IN admin's own plex.tv resource list, and
+    ``machine_identifier`` an id derived live from the candidate server's
+    ``/identity`` — never a caller-supplied claim (see each endpoint's docstring
+    for why its inputs satisfy this).
+    """
+    if find_owned_server(resources, machine_identifier) is None:
+        raise AppError(
+            status_code=HTTP_403_FORBIDDEN,
+            code="server_not_owned",
+            message="Your Plex account does not own that server.",
+            hint="Choose a server your Plex account owns, or sign in with the owner account.",
+        )
+
+
+async def assert_plex_token_authorized(client: httpx.AsyncClient, url: str, token: str) -> None:
+    """Raise unless the Plex server at ``url`` ACCEPTS ``token`` on an authed call.
+
+    ``/identity`` is deliberately UNAUTHENTICATED (see :func:`validate_plex`'s
+    probe ordering below), so deriving a machine id proves reachability and
+    identity but says NOTHING about the credential. This is the shared
+    AUTHENTICATED bar for every path that PERSISTS a Plex identity
+    (``POST /setup/complete`` and ``PUT /settings``' repoint verification): the
+    same real-adapter ``list_sections`` call the validation path uses to catch
+    bad tokens, so a reachable server paired with a wrong/revoked token is a
+    FAILED verification — never a committed-but-unusable config.
+
+    A rejected token (``PlexAuthError``, HTTP 401/403 from Plex) is a 422
+    ``plex_token_invalid`` — the submitted config cannot be processed — reusing
+    the SAME stable code the envelope vocabulary already carries for a rejected
+    Plex credential. Any other failure (``PlexLibraryError``: transport error,
+    unexpected status, non-JSON 200) is the familiar 502
+    ``server_unreachable_from_backend`` envelope, matching the identity probe's
+    own failure mode. ``use_cache=False`` for the same reason as
+    :func:`validate_plex`: a verification must reflect the server as it is NOW,
+    never a section list cached from a previous healthy probe.
+    """
+    try:
+        await PlexLibrary(client, url, token).list_sections(use_cache=False)
+    except PlexAuthError as exc:
+        raise AppError(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            code="plex_token_invalid",
+            message="Plex rejected the token.",
+            hint="The server answered but refused this credential — check the Plex token.",
+        ) from exc
+    except PlexLibraryError as exc:
+        raise AppError(
+            status_code=HTTP_502_BAD_GATEWAY,
+            code="server_unreachable_from_backend",
+            message="Could not reach the Plex server.",
+            hint="Check the Plex URL and that the server is running, then try again.",
+        ) from exc
 
 
 async def validate_plex(

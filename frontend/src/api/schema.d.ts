@@ -656,25 +656,37 @@ export interface paths {
          *     Repointing Plex is VERIFIED before it is committed. The
          *     ``plex_machine_identifier`` snapshot (:data:`PLEX_MACHINE_ID_SETTING`) is the
          *     id post-init sign-in trusts to admit users, so when this PUT actually CHANGES
-         *     the effective ``plex_url``/``plex_token`` the REPLACEMENT server's
-         *     ``/identity`` is probed live FIRST (:func:`_verify_plex_repoint` — the same
-         *     code path ``/setup/complete`` and ``/setup/validate/plex`` use, resolving a
-         *     masked/omitted token to the stored real one). Only a server that answers
-         *     with a machine id gets committed: the settings are written, the freshly
-         *     DERIVED id replaces the cached one (better than clearing it — it was just
-         *     derived, so sign-in never needs a per-request re-probe), and every active
-         *     browser session is revoked. A probe failure is the same honest 502 envelope
-         *     as setup's, with NOTHING committed and every session intact — a typo'd
-         *     (syntactically valid but unreachable/wrong) url must not both break sign-in
-         *     AND sign everyone out, which would leave a keyless install recoverable only
-         *     by DB surgery (the exact never-locked-out violation ADR-0005 forbids).
+         *     the effective ``plex_url``/``plex_token`` the full verification ladder in
+         *     :func:`_verify_plex_repoint` runs FIRST: the REPLACEMENT server's
+         *     ``/identity`` derive, then an AUTHENTICATED ``list_sections`` check with the
+         *     effective token (``/identity`` is unauthenticated, so reachability alone
+         *     would bless a wrong/revoked token), then — for Plex-SESSION callers — the
+         *     wizard's ownership assertion. The same code paths ``/setup/complete`` and
+         *     ``/setup/validate/plex`` use, resolving a masked/omitted token to the stored
+         *     real one. Only a server that passes gets committed: the settings are
+         *     written, the freshly DERIVED id replaces the cached one (better than
+         *     clearing it — it was just derived, so sign-in never needs a per-request
+         *     re-probe), and every active browser session is revoked. Any verification
+         *     failure is its honest envelope (502 unreachable, 422 ``plex_token_invalid``,
+         *     403 ``server_not_owned``) with NOTHING committed and every session intact —
+         *     a typo'd url or wrong credential must not both break sign-in AND sign
+         *     everyone out, which would leave a keyless install recoverable only by DB
+         *     surgery (the exact never-locked-out violation ADR-0005 forbids).
          *
-         *     Ownership is deliberately NOT asserted here, unlike ``/setup/complete``: a
-         *     PUT caller may be an ``X-Api-Key`` admin with no Plex account, so there is
-         *     no resource list to assert against — reachability + identity is the right
-         *     bar for a config write. Ownership continues to gate who can SIGN IN (and
-         *     who is admin), which the freshly derived machine id now anchors to the NEW
-         *     server (ADR-0016).
+         *     OWNERSHIP asymmetry — honestly documented: a Plex-SESSION admin has a Plex
+         *     account with a stored OAuth token, so the derived id is asserted against
+         *     their OWN plex.tv resources (403 ``server_not_owned`` otherwise) BEFORE
+         *     committing/revoking — without it, repointing to a valid but NON-owned server
+         *     would revoke everyone and the admin's next sign-in resolves NON-admin
+         *     against the new id: a keyless install locked out of Settings. An
+         *     ``X-Api-Key`` (or dev-bypass) caller has NO Plex account to assert with, so
+         *     its bar is reachability + the authenticated-token check ONLY: an api-key
+         *     repoint to a reachable, token-accepting but non-owned server remains
+         *     possible. That residual is accepted and recoverable BY CONSTRUCTION — the
+         *     api key that made the change keeps working (session revocation never touches
+         *     api-key auth), so the same key can always repoint back. Ownership continues
+         *     to gate who can SIGN IN (and who is admin), which the freshly derived
+         *     machine id anchors to the NEW server (ADR-0016).
          *
          *     Why sessions are revoked on a verified repoint: clearing/replacing the id
          *     alone only changes how FUTURE sign-ins resolve server access; an
@@ -898,7 +910,7 @@ export interface paths {
          *     resolved token via the exact ``/identity`` code path ``validate/plex`` uses
          *     (:meth:`PlexTvClient.fetch_server_identity`; an unreachable server is the
          *     same honest 502 envelope), and the SAME ownership assertion
-         *     (:func:`_assert_admin_owns_server`, 403 ``server_not_owned``) is re-checked
+         *     (:func:`assert_admin_owns_server`, 403 ``server_not_owned``) is re-checked
          *     against the signed-in admin's own plex.tv resources. Only the re-derived id
          *     is stored; ``body.plex_machine_identifier`` is advisory at most (the wizard
          *     sends the matching one — a mismatch means the caller bypassed the wizard,
@@ -908,6 +920,17 @@ export interface paths {
          *     Plex account exists to assert ownership with — the whole credential model is
          *     already bypassed) the body id is stored as-is, exactly as the bypass skips
          *     ``require_setup_admin`` itself.
+         *
+         *     The RESOLVED token is verified with an AUTHENTICATED call too
+         *     (:func:`assert_plex_token_authorized`): ``/identity`` is deliberately
+         *     unauthenticated, so the derivation alone would bless a reachable server
+         *     paired with a wrong/revoked ``plex_token`` — the install would flip
+         *     ``initialized`` yet every subsequent library call would fail. The wizard's
+         *     validate-first flow already proves its token via ``validate/plex``'s
+         *     ``list_sections``; this runs the SAME check inline so a direct API caller
+         *     (especially one supplying an explicit token override) meets an equally
+         *     strong bar. A rejected token is the 422 ``plex_token_invalid`` envelope,
+         *     before the claim — never a half-initialized install.
          */
         post: operations["complete_api_v1_setup_complete_post"];
         delete?: never;
@@ -3076,6 +3099,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SettingsResponse"];
+                };
+            };
+            /** @description The signed-in admin does not own the replacement Plex server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */

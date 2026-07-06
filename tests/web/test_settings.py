@@ -40,10 +40,13 @@ SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _API_KEY = "settings-key"
-# A throwaway Plex credential for the identity-cache tests. Held in a NAME (not an
-# inline keyword literal) so ruff's S106 secret-in-call heuristic stays quiet — it
-# is a fixture value, never a real secret.
+# Throwaway Plex credentials for the identity-cache/repoint tests. Held in NAMES
+# (not inline keyword literals) so ruff's S106 secret-in-call heuristic stays
+# quiet — fixture values, never real secrets. ``_SEED_PLEX_TOKEN`` is the stored
+# SERVICE token; ``_SEED_OAUTH_TOKEN`` is a session admin's ACCOUNT OAuth token
+# (what the repoint ownership check presents to plex.tv).
 _SEED_PLEX_TOKEN = "seed-plex-token"  # noqa: S105 — test fixture value, not a credential
+_SEED_OAUTH_TOKEN = "seed-admin-oauth-token"  # noqa: S105 — test fixture value, not a credential
 
 
 def test_every_known_setting_key_has_a_response_and_update_field() -> None:
@@ -153,16 +156,56 @@ async def _use_transport(app: FastAPI, transport: httpx.MockTransport) -> None:
     app.state.http_client = httpx.AsyncClient(transport=transport)
 
 
-def _identity_transport(
-    machine_id: str, *, probes: list[httpx.Request] | None = None
+def _owned_resource(machine_id: str) -> dict[str, object]:
+    """A plex.tv resource entry for a server the account OWNS."""
+    return {
+        "name": "New Box",
+        "clientIdentifier": machine_id,
+        "provides": "server",
+        "owned": True,
+        "connections": [],
+    }
+
+
+def _shared_resource(machine_id: str) -> dict[str, object]:
+    """A plex.tv resource entry for a server merely SHARED with the account."""
+    return {
+        "name": "Someone Elses Box",
+        "clientIdentifier": machine_id,
+        "provides": "server",
+        "owned": False,
+        "connections": [],
+    }
+
+
+def _repoint_transport(
+    *,
+    identity: str,
+    authorized: bool = True,
+    resources: list[dict[str, object]] | None = None,
+    probes: list[httpx.Request] | None = None,
 ) -> httpx.MockTransport:
-    """Answer any ``/identity`` probe with ``machine_id``; record probes seen."""
+    """Serve the repoint verification ladder: /identity, /library/sections, plex.tv.
+
+    ``authorized=False`` makes the AUTHENTICATED ``/library/sections`` check
+    answer 401 (a reachable server that rejects the token). ``resources=None``
+    makes any plex.tv ownership lookup FAIL the test loudly — the api-key path
+    must never consult it; session-caller tests pass a resource list instead.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         if probes is not None:
             probes.append(request)
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/resources":
+            if resources is None:
+                raise AssertionError("ownership must not be consulted on this path")
+            return httpx.Response(200, json=resources)
         if request.url.path == "/identity":
-            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": machine_id}})
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": identity}})
+        if request.url.path == "/library/sections":
+            if not authorized:
+                return httpx.Response(401)
+            return httpx.Response(200, json={"MediaContainer": {"Directory": []}})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     return httpx.MockTransport(handler)
@@ -192,12 +235,15 @@ async def test_put_changed_plex_url_stores_the_freshly_derived_machine_id(
     """Repointing plex_url probes the NEW server's /identity BEFORE committing and
     caches the DERIVED id (better than the earlier clear-and-reprobe-per-sign-in:
     the id was just derived, so sign-in keeps its no-re-probe fast path). The FE
-    round-trips the token as the '***' mask, so the probe must resolve the
-    EFFECTIVE token — the STORED real one — never the mask literal."""
+    round-trips the token as the '***' mask, so BOTH verification calls (the
+    /identity derive and the authenticated /library/sections check) must resolve
+    the EFFECTIVE token — the STORED real one — never the mask literal. An
+    api-key caller has no Plex account, so plex.tv ownership is never consulted
+    (``resources=None`` fails loudly if it were)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     probes: list[httpx.Request] = []
-    await _use_transport(app, _identity_transport("NEW-MID", probes=probes))
+    await _use_transport(app, _repoint_transport(identity="NEW-MID", probes=probes))
 
     put = await client.put(
         "/api/v1/settings",
@@ -207,20 +253,24 @@ async def test_put_changed_plex_url_stores_the_freshly_derived_machine_id(
 
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # derived, not cleared
-    # The probe hit the SUBMITTED url with the STORED real token, not the mask.
-    assert [str(p.url) for p in probes] == ["http://new:32400/identity"]
-    assert probes[0].headers.get("X-Plex-Token") == _SEED_PLEX_TOKEN
+    # Both probes hit the SUBMITTED url with the STORED real token, not the mask.
+    assert [str(p.url) for p in probes] == [
+        "http://new:32400/identity",
+        "http://new:32400/library/sections",
+    ]
+    assert all(p.headers.get("X-Plex-Token") == _SEED_PLEX_TOKEN for p in probes)
 
 
 async def test_put_changed_plex_token_probes_with_the_new_token(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     """A real (non-masked) plex_token change is a repoint too: the stored url is
-    probed with the REPLACEMENT token and the derived id replaces the cache."""
+    probed (identity + authenticated sections) with the REPLACEMENT token and the
+    derived id replaces the cache."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     probes: list[httpx.Request] = []
-    await _use_transport(app, _identity_transport("NEW-MID", probes=probes))
+    await _use_transport(app, _repoint_transport(identity="NEW-MID", probes=probes))
 
     put = await client.put(
         "/api/v1/settings", json={"plex_token": "new-token"}, headers={"X-Api-Key": _API_KEY}
@@ -228,8 +278,11 @@ async def test_put_changed_plex_token_probes_with_the_new_token(
 
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
-    assert [str(p.url) for p in probes] == ["http://old:32400/identity"]
-    assert probes[0].headers.get("X-Plex-Token") == "new-token"  # the effective NEW token
+    assert [str(p.url) for p in probes] == [
+        "http://old:32400/identity",
+        "http://old:32400/library/sections",
+    ]
+    assert all(p.headers.get("X-Plex-Token") == "new-token" for p in probes)  # the NEW token
 
 
 async def test_put_unreachable_new_plex_url_is_502_and_commits_nothing(
@@ -336,7 +389,13 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9201, tag="repoint-adm")
     other_cookies, _ = await _admin_session_cookies(app, plex_id=9202, tag="repoint-other")
     assert await _active_session_count(sessionmaker_) == 2
-    await _use_transport(app, _identity_transport("NEW-MID"))
+    probes: list[httpx.Request] = []
+    await _use_transport(
+        app,
+        _repoint_transport(
+            identity="NEW-MID", resources=[_owned_resource("NEW-MID")], probes=probes
+        ),
+    )
 
     put = await client.put(
         "/api/v1/settings",
@@ -349,11 +408,106 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the verified anchor
     assert await _active_session_count(sessionmaker_) == 0  # everyone, caller included
+    # The ownership check presented the CALLER's own account OAuth token to plex.tv.
+    ownership = [p for p in probes if p.url.host == "plex.tv"]
+    assert ownership and ownership[0].headers.get("X-Plex-Token") == _SEED_OAUTH_TOKEN
 
     # Both old-server sessions must re-sign-in against the NEW server.
     assert (await client.get("/api/v1/settings", cookies=admin_cookies)).status_code == 401
     assert (await client.get("/api/v1/settings", cookies=other_cookies)).status_code == 401
     # The X-Api-Key recovery path is untouched — the repoint never locks the API out.
+    assert (
+        await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    ).status_code == 200
+
+
+async def test_put_reachable_but_unauthorized_token_is_422_and_commits_nothing(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """/identity is UNAUTHENTICATED, so reachability alone must not verify a
+    repoint: a reachable replacement server that REJECTS the effective token is
+    a failed verification — 422 ``plex_token_invalid`` (the same code the
+    envelope vocabulary already uses for a rejected Plex credential), with
+    NOTHING committed and every session intact."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9207, tag="badtoken")
+    await _use_transport(app, _repoint_transport(identity="NEW-MID", authorized=False))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 422
+    assert put.json()["detail"] == "plex_token_invalid"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_session_admin_repoint_to_non_owned_server_is_403(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The round-6 lockout class: a SESSION admin repointing to a valid,
+    reachable, token-accepting server they do NOT own would commit + revoke
+    everyone — and their next sign-in resolves NON-admin against the new machine
+    id, locking a keyless install out of Settings. The wizard's ownership bar
+    (403 ``server_not_owned``) must reject it BEFORE committing/revoking."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9208, tag="notowned")
+    # The account can SEE the new server (it is shared with them) but does not own it.
+    await _use_transport(
+        app,
+        _repoint_transport(identity="NEW-MID", resources=[_shared_resource("NEW-MID")]),
+    )
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 403
+    assert put.json()["detail"] == "server_not_owned"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The documented asymmetry: an api-key admin has no Plex account, so its
+    bar is reachability + the AUTHENTICATED token check only — plex.tv ownership
+    is never consulted (``resources=None`` fails loudly if it were). A verified
+    api-key repoint still revokes every browser session; the api key itself is
+    untouched, which is exactly why the asymmetry is recoverable."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, _csrf = await _admin_session_cookies(app, plex_id=9209, tag="apikey-repoint")
+    assert await _active_session_count(sessionmaker_) == 1
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert await _active_session_count(sessionmaker_) == 0  # browser sessions revoked
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 401
+    # The api key keeps working — the recoverable half of the asymmetry.
     assert (
         await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
     ).status_code == 200
@@ -1111,13 +1265,23 @@ async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(
 
 
 async def _admin_session_cookies(
-    app: FastAPI, *, plex_id: int, tag: str
+    app: FastAPI, *, plex_id: int, tag: str, plex_oauth_token: str | None = _SEED_OAUTH_TOKEN
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Mint a live ADMIN (owner) browser session; returns (cookies, csrf headers)."""
+    """Mint a live ADMIN (owner) browser session; returns (cookies, csrf headers).
+
+    ``plex_oauth_token`` seeds ``User.encrypted_plex_token`` by default — Plex
+    sign-in always stores the account token, and the repoint ownership check
+    reads it. Pass ``None`` only to model the degenerate token-less row.
+    """
     token = f"admin-session-{tag}"
     csrf = f"csrf-{tag}"
     async with app.state.sessionmaker() as session:
-        user = User(plex_id=plex_id, username=f"owner-{tag}", permissions=1)
+        user = User(
+            plex_id=plex_id,
+            username=f"owner-{tag}",
+            permissions=1,
+            encrypted_plex_token=plex_oauth_token,
+        )
         session.add(user)
         await session.flush()
         session.add(

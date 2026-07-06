@@ -24,11 +24,12 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.status import HTTP_409_CONFLICT
 
 from plex_manager.adapters.plex.oauth import PlexTvClient
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
-from plex_manager.models import AuthSession
+from plex_manager.models import AuthSession, User
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
@@ -56,7 +57,11 @@ from plex_manager.web.schemas import (
     SettingsResponse,
     SettingsUpdate,
 )
-from plex_manager.web.setup_validation import library_options
+from plex_manager.web.setup_validation import (
+    assert_admin_owns_server,
+    assert_plex_token_authorized,
+    library_options,
+)
 
 __all__ = ["router"]
 
@@ -81,6 +86,10 @@ _CLIENT_ID_SETTING = "plex_oauth_client_identifier"
 _FALLBACK_CLIENT_IDENTIFIER = "plex-manager"
 
 _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
+    403: {
+        "model": ErrorEnvelope,
+        "description": "The signed-in admin does not own the replacement Plex server",
+    },
     502: {
         "model": ErrorEnvelope,
         "description": "The replacement Plex server did not answer the /identity probe",
@@ -340,7 +349,11 @@ async def revoke_app_key_endpoint(
 
 
 async def _verify_plex_repoint(
-    body: SettingsUpdate, store: SettingsStore, client: httpx.AsyncClient
+    body: SettingsUpdate,
+    session: AsyncSession,
+    store: SettingsStore,
+    client: httpx.AsyncClient,
+    context: AuthContext,
 ) -> tuple[bool, str | None]:
     """Detect a Plex repoint and, when verifiable, derive the NEW server's identity.
 
@@ -350,23 +363,43 @@ async def _verify_plex_repoint(
       ``plex_token`` pair (absent/``null`` fields, the masked-secret ``"***"``
       round-trip, and a same-value re-PUT are all NON-changes). No probe is ever
       issued — an ordinary settings save must not pay a live Plex round-trip.
-    * ``(True, machine_id)`` — the identity changes and the EFFECTIVE (post-PUT)
-      url+token pair is complete: the REPLACEMENT server's ``/identity`` was
-      probed live and answered. The effective value of each half is this PUT's
-      submitted value when it carries one, else the currently-stored value — so
-      a masked/omitted token still probes with the STORED real token when only
-      ``plex_url`` changed.
+    * ``(True, machine_id)`` — the identity changes, the EFFECTIVE (post-PUT)
+      url+token pair is complete, and the full verification ladder passed. The
+      effective value of each half is this PUT's submitted value when it
+      carries one, else the currently-stored value — so a masked/omitted token
+      still probes with the STORED real token when only ``plex_url`` changed.
     * ``(True, None)`` — the identity changes but the effective pair is
       INCOMPLETE (a half-configured install, or an explicit clear-to-``""``).
       There is nothing to probe; the caller keeps the settings write but treats
       the repoint as UNVERIFIED (stale-id drop only, no session revocation —
       see :func:`put_settings_endpoint`).
 
-    A probe failure raises the adapter's ``PlexVerifyError`` — rendered as the
-    SAME honest 502 envelope (``server_unreachable_from_backend`` /
-    ``server_identity_failed``) ``/setup/complete`` and ``/setup/validate/plex``
-    use — BEFORE anything is written, so a typo'd-but-parseable url can never
-    commit a broken identity (let alone revoke the sessions that could fix it).
+    The verification ladder, all BEFORE anything is written:
+
+    1. ``/identity`` derive (:meth:`PlexTvClient.fetch_server_identity`) — a
+       transport failure is the same honest 502 envelope
+       (``server_unreachable_from_backend`` / ``server_identity_failed``)
+       ``/setup/complete`` and ``/setup/validate/plex`` use, so a
+       typo'd-but-parseable url can never commit a broken identity (let alone
+       revoke the sessions that could fix it).
+    2. AUTHENTICATED check (:func:`assert_plex_token_authorized`): ``/identity``
+       is unauthenticated, so step 1 alone would bless a reachable server paired
+       with a wrong/revoked token — a committed-but-unusable identity plus a
+       fleet-wide sign-out. A rejected token is the 422 ``plex_token_invalid``
+       envelope, nothing committed.
+    3. OWNERSHIP, for Plex-SESSION callers only
+       (:func:`assert_admin_owns_server`, 403 ``server_not_owned``): the caller
+       has a Plex account with a stored OAuth token, so the derived id is
+       asserted against THEIR OWN plex.tv resources — without this, a session
+       admin repointing to a valid but NON-owned server would commit + revoke
+       everyone, and their next sign-in resolves NON-admin against the new id: a
+       keyless install locked out of Settings (the ADR-0005 violation again). A
+       session admin whose row somehow lost its OAuth token cannot be
+       ownership-checked and FAILS CLOSED (409 ``plex_account_required`` — sign
+       in with Plex again, then retry), never a skipped check. API-KEY (and
+       dev-bypass) callers have no Plex account to assert with, so their bar is
+       steps 1-2 only — see :func:`put_settings_endpoint`'s honest asymmetry
+       note.
     """
     submitted_url = (
         body.plex_url if "plex_url" in body.model_fields_set and body.plex_url is not None else None
@@ -397,7 +430,24 @@ async def _verify_plex_repoint(
         client,
         client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
     )
-    return True, await plex_tv.fetch_server_identity(effective_url, effective_token)
+    machine_identifier = await plex_tv.fetch_server_identity(effective_url, effective_token)
+    # /identity is unauthenticated: prove the EFFECTIVE token is actually
+    # accepted by the replacement server before anything is committed.
+    await assert_plex_token_authorized(client, effective_url, effective_token)
+    if context.method is AuthMethod.plex_session and context.user_id is not None:
+        # Session callers get the wizard's ownership bar (ladder step 3 above).
+        user = await session.get(User, context.user_id)
+        admin_oauth_token = user.encrypted_plex_token if user is not None else None
+        if not admin_oauth_token:
+            raise AppError(
+                status_code=HTTP_409_CONFLICT,
+                code="plex_account_required",
+                message="Repointing Plex needs your Plex sign-in on file.",
+                hint="Sign out, sign back in with Plex, then retry the change.",
+            )
+        resources = await plex_tv.fetch_resources(admin_oauth_token)
+        assert_admin_owns_server(resources, machine_identifier)
+    return True, machine_identifier
 
 
 @router.put("", responses=_PUT_SETTINGS_RESPONSES)
@@ -405,6 +455,7 @@ async def put_settings_endpoint(
     body: SettingsUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+    context: Annotated[AuthContext, Depends(require_admin)],
 ) -> SettingsResponse:
     """Upsert the provided config and return the redacted result.
 
@@ -426,25 +477,37 @@ async def put_settings_endpoint(
     Repointing Plex is VERIFIED before it is committed. The
     ``plex_machine_identifier`` snapshot (:data:`PLEX_MACHINE_ID_SETTING`) is the
     id post-init sign-in trusts to admit users, so when this PUT actually CHANGES
-    the effective ``plex_url``/``plex_token`` the REPLACEMENT server's
-    ``/identity`` is probed live FIRST (:func:`_verify_plex_repoint` — the same
-    code path ``/setup/complete`` and ``/setup/validate/plex`` use, resolving a
-    masked/omitted token to the stored real one). Only a server that answers
-    with a machine id gets committed: the settings are written, the freshly
-    DERIVED id replaces the cached one (better than clearing it — it was just
-    derived, so sign-in never needs a per-request re-probe), and every active
-    browser session is revoked. A probe failure is the same honest 502 envelope
-    as setup's, with NOTHING committed and every session intact — a typo'd
-    (syntactically valid but unreachable/wrong) url must not both break sign-in
-    AND sign everyone out, which would leave a keyless install recoverable only
-    by DB surgery (the exact never-locked-out violation ADR-0005 forbids).
+    the effective ``plex_url``/``plex_token`` the full verification ladder in
+    :func:`_verify_plex_repoint` runs FIRST: the REPLACEMENT server's
+    ``/identity`` derive, then an AUTHENTICATED ``list_sections`` check with the
+    effective token (``/identity`` is unauthenticated, so reachability alone
+    would bless a wrong/revoked token), then — for Plex-SESSION callers — the
+    wizard's ownership assertion. The same code paths ``/setup/complete`` and
+    ``/setup/validate/plex`` use, resolving a masked/omitted token to the stored
+    real one. Only a server that passes gets committed: the settings are
+    written, the freshly DERIVED id replaces the cached one (better than
+    clearing it — it was just derived, so sign-in never needs a per-request
+    re-probe), and every active browser session is revoked. Any verification
+    failure is its honest envelope (502 unreachable, 422 ``plex_token_invalid``,
+    403 ``server_not_owned``) with NOTHING committed and every session intact —
+    a typo'd url or wrong credential must not both break sign-in AND sign
+    everyone out, which would leave a keyless install recoverable only by DB
+    surgery (the exact never-locked-out violation ADR-0005 forbids).
 
-    Ownership is deliberately NOT asserted here, unlike ``/setup/complete``: a
-    PUT caller may be an ``X-Api-Key`` admin with no Plex account, so there is
-    no resource list to assert against — reachability + identity is the right
-    bar for a config write. Ownership continues to gate who can SIGN IN (and
-    who is admin), which the freshly derived machine id now anchors to the NEW
-    server (ADR-0016).
+    OWNERSHIP asymmetry — honestly documented: a Plex-SESSION admin has a Plex
+    account with a stored OAuth token, so the derived id is asserted against
+    their OWN plex.tv resources (403 ``server_not_owned`` otherwise) BEFORE
+    committing/revoking — without it, repointing to a valid but NON-owned server
+    would revoke everyone and the admin's next sign-in resolves NON-admin
+    against the new id: a keyless install locked out of Settings. An
+    ``X-Api-Key`` (or dev-bypass) caller has NO Plex account to assert with, so
+    its bar is reachability + the authenticated-token check ONLY: an api-key
+    repoint to a reachable, token-accepting but non-owned server remains
+    possible. That residual is accepted and recoverable BY CONSTRUCTION — the
+    api key that made the change keeps working (session revocation never touches
+    api-key auth), so the same key can always repoint back. Ownership continues
+    to gate who can SIGN IN (and who is admin), which the freshly derived
+    machine id anchors to the NEW server (ADR-0016).
 
     Why sessions are revoked on a verified repoint: clearing/replacing the id
     alone only changes how FUTURE sign-ins resolve server access; an
@@ -474,8 +537,10 @@ async def put_settings_endpoint(
     await _validate_disk_pressure_pair(body, session)
 
     store = SettingsStore(session)
-    # Probe BEFORE any write: a failed verification must leave nothing behind.
-    plex_identity_changed, machine_identifier = await _verify_plex_repoint(body, store, client)
+    # Verify BEFORE any write: a failed verification must leave nothing behind.
+    plex_identity_changed, machine_identifier = await _verify_plex_repoint(
+        body, session, store, client, context
+    )
 
     for field in body.model_fields_set:
         value = getattr(body, field)

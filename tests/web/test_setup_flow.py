@@ -553,6 +553,43 @@ async def test_complete_rejects_a_server_the_admin_does_not_own(
         assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) is None
 
 
+async def test_complete_rejects_a_reachable_server_that_rejects_the_token(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    """/identity is UNAUTHENTICATED, so the machine-id derivation alone cannot
+    prove a direct API caller's explicit ``plex_token`` override: a reachable
+    server that REJECTS the resolved token must fail /complete with the 422
+    ``plex_token_invalid`` envelope — never a flipped-``initialized`` install
+    whose every later library call fails. The one-shot claim is untouched, so
+    the operator retries with the right token."""
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        path = request.url.path
+        if host == "plex.tv" and path == "/api/v2/resources":
+            return httpx.Response(200, json=[_owned_server()])
+        if path == "/identity":
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
+        if path == "/library/sections":
+            return httpx.Response(401)  # reachable, but the token is refused
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await _use_transport(app, httpx.MockTransport(handler))
+
+    body = {**_complete_body(), "plex_token": "wrong-service-token"}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_CSRF_HEADERS)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "plex_token_invalid"
+    async with sessionmaker_() as session:
+        row = await session.get(SystemSettings, 1)
+        assert row is not None
+        assert row.initialized is False  # the one-shot claim was never consumed
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) is None
+
+
 async def test_complete_unreachable_submitted_server_is_502_and_unclaimed(
     client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
 ) -> None:
