@@ -305,24 +305,28 @@ async def export_logs_endpoint(
     ``since`` through now (``since`` omitted defaults to the last 24h) — when
     both are supplied, ``correlation_id`` wins (a specific id's whole trail is
     the more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal
-    safety cap, not a policy setting) with an honest trailing note when
-    truncated. Rendered OLDEST-first (a coherent top-to-bottom story), unlike
-    the newest-first ``GET /logs`` list. ``Content-Disposition: attachment`` so
-    navigating straight to this URL downloads a file; a caller reading the body
-    via ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+    safety cap, not a policy setting); when the matching window exceeds the
+    cap, the OLDEST rows are kept (the root-cause lead-up survives) and the
+    newest overflow is what's dropped, with an honest trailing note. Rendered
+    OLDEST-first (a coherent top-to-bottom story), unlike the newest-first
+    ``GET /logs`` list. ``Content-Disposition: attachment`` so navigating
+    straight to this URL downloads a file; a caller reading the body via
+    ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
     """
     repo = SqlLogEventRepository(session)
     if correlation_id is not None:
-        page = await repo.list_events(correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS)
+        page = await repo.list_events(
+            correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS, oldest_first=True
+        )
     else:
         window_start = (
             since
             if since is not None
             else datetime.now(UTC) - timedelta(hours=_DEFAULT_EXPORT_WINDOW_HOURS)
         )
-        page = await repo.list_events(since=window_start, limit=_MAX_EXPORT_ROWS)
+        page = await repo.list_events(since=window_start, limit=_MAX_EXPORT_ROWS, oldest_first=True)
 
-    events = list(reversed(page.results))  # newest-first from the repo -> oldest-first
+    events = page.results  # repo already returns oldest-first
     truncated = page.total > len(page.results)
     headers = {"Content-Disposition": f'attachment; filename="{_export_filename(format)}"'}
 
@@ -345,9 +349,10 @@ async def export_logs_endpoint(
 
     lines = [f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {e.message}" for e in events]
     if truncated:
+        dropped = page.total - len(page.results)
         lines.append(
-            f"... truncated: {page.total - len(page.results)} more row(s) not shown "
-            f"(export is capped at {_MAX_EXPORT_ROWS}) ..."
+            f"... truncated: {dropped} newer row(s) not shown "
+            f"(export capped at the {_MAX_EXPORT_ROWS} oldest matching rows) ..."
         )
     return PlainTextResponse("\n".join(lines) + "\n", headers=headers)
 
