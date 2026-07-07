@@ -364,6 +364,59 @@ async def test_get_queue_is_passive_and_does_not_reconcile(
     assert importing is not None and importing.status == "importing"
 
 
+async def test_get_queue_enriches_rows_with_media_title_poster_and_release_title(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The human-legible queue row (issue #134): a GET /queue row carries the owning
+    MediaRequest's title/poster_url alongside the grab's own release_title, so the
+    operator can tell downloads apart without decoding a torrent-hash fragment."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            poster_url="https://image.tmdb.org/poster.jpg",
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash="d" * 40,
+                status="downloading",
+                media_request_id=request.id,
+                release_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+            )
+        )
+        await session.commit()
+
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 200
+    [item] = [i for i in response.json()["queue"] if i["torrent_hash"] == "d" * 40]
+    assert item["title"] == "Some Movie"
+    assert item["poster_url"] == "https://image.tmdb.org/poster.jpg"
+    assert item["release_title"] == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+async def test_get_queue_orphaned_download_still_renders_with_none_title_and_poster(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A download whose owning request was deleted (media_request_id SET NULL) must
+    still render as a queue row (honesty over silence) -- title/poster_url honestly
+    None, degrading to release_title/hash on the frontend, never dropped."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(sessionmaker_, torrent_hash="e" * 40, status="downloading")
+
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 200
+    [item] = [i for i in response.json()["queue"] if i["id"] == download_id]
+    assert item["title"] is None
+    assert item["poster_url"] is None
+    assert item["release_title"] is None
+
+
 async def test_mark_failed_blocklists(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
@@ -588,6 +641,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -620,6 +674,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
             year=year,
             season=season,
             media_type=media_type,
+            release_title=release_title,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -1017,6 +1072,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -1049,6 +1105,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
             year=year,
             season=season,
             media_type=media_type,
+            release_title=release_title,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)

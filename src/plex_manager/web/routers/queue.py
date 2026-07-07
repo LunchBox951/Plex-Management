@@ -14,7 +14,7 @@ from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import (
     correction_service,
@@ -96,6 +96,16 @@ _GRAB_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 
 def _to_item(record: DownloadRecord) -> QueueItem:
+    """Map a download record to the wire ``QueueItem``.
+
+    Accepts either a plain ``DownloadRecord`` (the grab/import/mark-failed
+    mutation endpoints, which never join ``MediaRequest``) or the queue-list's
+    enriched ``QueueRecord`` (a ``DownloadRecord`` subtype) -- ``title`` /
+    ``poster_url`` are only ever populated for the latter; a plain
+    ``DownloadRecord`` renders those two ``None`` (honest degrade, not a lie),
+    while ``release_title`` -- persisted on the download row itself -- is
+    always available regardless of which record type this is.
+    """
     return QueueItem(
         id=record.id,
         torrent_hash=record.torrent_hash,
@@ -107,6 +117,9 @@ def _to_item(record: DownloadRecord) -> QueueItem:
         season=record.season,
         episodes=record.episodes,
         failed_reason=record.failed_reason,
+        title=record.title if isinstance(record, QueueRecord) else None,
+        poster_url=record.poster_url if isinstance(record, QueueRecord) else None,
+        release_title=record.release_title,
     )
 
 

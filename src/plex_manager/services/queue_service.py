@@ -220,7 +220,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.ports.download_client import DownloadClientPort
-    from plex_manager.ports.repositories import DownloadRecord
+    from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 
 __all__ = [
     "InvalidStateTransitionError",
@@ -813,7 +813,7 @@ async def _handle_failed(
     return None
 
 
-async def list_queue(session: AsyncSession) -> list[DownloadRecord]:
+async def list_queue(session: AsyncSession) -> list[QueueRecord]:
     """Read-only snapshot of the active queue — NO reconcile, NO writes.
 
     The background reconcile loop (``web.app._reconcile_loop``) is the single owner
@@ -822,11 +822,16 @@ async def list_queue(session: AsyncSession) -> list[DownloadRecord]:
     reconcile — running ``reconcile_and_list`` concurrently with the loop can clobber
     the importer's CAS-claimed ``importing`` status (the per-download import lock does
     not cover this write path), stranding a placed file until a later cycle. So the
-    read path is passive: it returns the currently persisted ``DownloadRecord`` rows
-    and writes nothing. The loop's frequent refresh keeps the listed progress/status
-    fresh enough for display.
+    read path is passive: it returns the currently persisted rows and writes nothing.
+    The loop's frequent refresh keeps the listed progress/status fresh enough for
+    display.
+
+    Uses ``list_active_for_queue`` (issue #134), NOT ``list_active`` -- the queue view
+    needs the MediaRequest-joined ``title``/``poster_url`` for a human-legible row;
+    ``list_active`` stays untouched, still used by :func:`reconcile_and_list` so the
+    domain/reconcile contract is unaffected by this presentation-only join.
     """
-    return await SqlDownloadRepository(session).list_active()
+    return await SqlDownloadRepository(session).list_active_for_queue()
 
 
 async def reconcile_and_list(

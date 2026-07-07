@@ -100,6 +100,74 @@ async def test_grab_reuses_terminal_row_and_reowns_to_current_request(
     assert row.failed_reason is None  # stale failure reason cleared
 
 
+async def test_grab_persists_the_candidates_release_title(sessionmaker_: SessionMaker) -> None:
+    """A fresh grab persists ``candidate.title`` as ``Download.release_title`` (issue
+    #134) -- the same value already written to ``DownloadHistory.source_title``, so
+    the queue can show a human release name without a join into the history log."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=300, media_type=MediaType.movie, title="C", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=request_id,
+            tmdb_id=300,
+        )
+    assert record.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+async def test_grab_reuse_refreshes_stale_release_title(sessionmaker_: SessionMaker) -> None:
+    """A terminal row reused for a fresh grab must not keep the PRIOR grab's release
+    name -- a resurrected row showing the old release would mislead the queue about
+    which release is actually downloading now (issue #134)."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=400, media_type=MediaType.movie, title="D", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=request_id,
+                tmdb_id=400,
+                release_title="Old.Stale.Release.2019-GROUP",
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=request_id,
+            tmdb_id=400,
+        )
+    assert record.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
 async def test_grab_reuse_clears_stale_first_seen_at_grace_anchor(
     sessionmaker_: SessionMaker,
 ) -> None:

@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
 
-from plex_manager.models import Download, MediaType
-from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.models import Download, MediaRequest, MediaType
+from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,6 +70,7 @@ def _to_record(row: Download) -> DownloadRecord:
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
         download_path=row.download_path,
+        release_title=row.release_title,
     )
 
 
@@ -227,6 +228,34 @@ class SqlDownloadRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
+    async def list_active_for_queue(self) -> list[QueueRecord]:
+        """Active (non-terminal) downloads enriched for the human-legible queue.
+
+        Queue-specific (issue #134): LEFT OUTER JOINs ``MediaRequest`` to pull in
+        ``title``/``poster_url`` without a per-row re-fetch. OUTER (not INNER)
+        because ``media_request_id`` is nullable -- ``MediaRequest``'s
+        ``ondelete="SET NULL"`` orphans a download whose owning request was
+        deleted, and an orphan row must still render (honesty over silence),
+        just with both fields ``None``. Deliberately separate from
+        :meth:`list_active`, which stays untouched and passive-plain for the
+        reconcile loop's domain contract.
+        """
+        stmt = (
+            select(Download, MediaRequest.title, MediaRequest.poster_url)
+            .outerjoin(MediaRequest, Download.media_request_id == MediaRequest.id)
+            .where(Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES))
+            .order_by(Download.id)
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [
+            QueueRecord(
+                **_to_record(download).model_dump(),
+                title=title,
+                poster_url=poster_url,
+            )
+            for download, title, poster_url in rows
+        ]
+
     async def create(
         self,
         *,
@@ -239,6 +268,7 @@ class SqlDownloadRepository:
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -250,6 +280,7 @@ class SqlDownloadRepository:
             season=season,
             episodes_json=episodes,
             media_type=MediaType(media_type) if media_type is not None else None,
+            release_title=release_title,
         )
         self._session.add(row)
         await self._session.flush()
@@ -277,6 +308,7 @@ class SqlDownloadRepository:
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> None:
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -293,14 +325,16 @@ class SqlDownloadRepository:
         if replace_grab_metadata:
             # Rewrite grab metadata UNCONDITIONALLY (not ``is not None`` gates):
             # terminal-row reuse must reflect the CURRENT grab, not stale
-            # magnet/title/season/episode/media-type scope from the previous owner.
-            # This also lets a movie reuse clear stale TV scope back to NULL.
+            # magnet/title/season/episode/media-type/release-title scope from the
+            # previous owner. This also lets a movie reuse clear stale TV scope
+            # back to NULL.
             row.magnet_link = magnet_link
             row.tmdb_id = tmdb_id
             row.year = year
             row.season = season
             row.episodes_json = episodes
             row.media_type = MediaType(media_type) if media_type is not None else None
+            row.release_title = release_title
         if clear_failed_reason:
             # A terminal row being reused for a fresh grab must not carry a stale
             # failure reason (honesty over silence: a Downloading row claiming a
@@ -345,6 +379,7 @@ class SqlDownloadRepository:
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -399,6 +434,7 @@ class SqlDownloadRepository:
             values["season"] = season
             values["episodes_json"] = episodes
             values["media_type"] = MediaType(media_type) if media_type is not None else None
+            values["release_title"] = release_title
         if clear_first_seen_at:
             values["first_seen_at"] = None
         elif first_seen_at is not None:

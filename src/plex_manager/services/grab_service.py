@@ -266,6 +266,7 @@ async def _reuse_terminal_row(
     season: int | None,
     episodes: list[int] | None,
     media_type: str | None,
+    release_title: str | None,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -298,6 +299,10 @@ async def _reuse_terminal_row(
     WRONG episodes while the newly requested season is marked downloading.
     Unconditional (not ``is not None``-gated) so a movie reuse correctly clears
     any stale season/episodes back to ``None`` too.
+
+    ``release_title`` (issue #134) is refreshed the same way: a resurrected row
+    otherwise keeps the PRIOR grab's release name, misleading the queue about
+    which release is actually downloading now.
     """
     claimed = await download_repo.update_status_if_in(
         download_id,
@@ -316,6 +321,7 @@ async def _reuse_terminal_row(
         season=season,
         episodes=episodes,
         media_type=media_type,
+        release_title=release_title,
     )
     if not claimed:
         await session.rollback()
@@ -594,6 +600,7 @@ async def grab(
                 season=season,
                 episodes=episodes,
                 media_type=request_media_type,
+                release_title=candidate.title,
             )
             if not claimed_reuse:
                 if record.status not in _TERMINAL_STATUS_VALUES:
@@ -642,6 +649,7 @@ async def grab(
                 season=season,
                 episodes=episodes,
                 media_type=request_media_type,
+                release_title=candidate.title,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release
@@ -701,6 +709,7 @@ async def grab(
                 season=season,
                 episodes=episodes,
                 media_type=request_media_type,
+                release_title=candidate.title,
             )
             if not claimed_reuse:
                 if record.status not in _TERMINAL_STATUS_VALUES:
