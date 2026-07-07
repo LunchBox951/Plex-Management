@@ -669,14 +669,18 @@ class PlexLibrary:
 
         Always re-pages fresh (never trusts a cached absence, mirroring
         ``present_seasons``): a season that just finished indexing must be seen
-        immediately, not held stale for the cache TTL. Write-through: every
-        resolved id is merged into the shared ``_TV_SEASONS_CACHE`` snapshot
-        (creating one if none is warm yet) so a subsequent ``is_available``/
-        ``present_seasons`` call for the SAME show inside this TTL window sees
-        this fresh read rather than a stale one -- a show NOT among the merged
-        ids simply misses the cache and triggers its own full re-crawl, same as
-        today. A requested id with no matching item anywhere maps to an empty
-        frozenset (still present as a key — never omitted).
+        immediately, not held stale for the cache TTL. Write-through: every id
+        that MATCHED at least one item is merged into the shared
+        ``_TV_SEASONS_CACHE`` snapshot (creating one if none is warm yet) so a
+        subsequent ``is_available``/``present_seasons`` call for the SAME show
+        inside this TTL window sees this fresh read rather than a stale one --
+        a show NOT among the merged ids simply misses the cache and triggers
+        its own full re-crawl, same as today. A requested id with NO matching
+        item anywhere maps to an empty frozenset in the return value (still
+        present as a key — never omitted) but is deliberately NOT written to
+        the cache: ``_is_tv_available`` treats a cached key as "show present"
+        for whole-show checks, so caching the miss would report a
+        never-indexed show as available for the rest of the TTL.
         """
         wanted = set(tmdb_ids)
         if not wanted:
@@ -692,10 +696,22 @@ class PlexLibrary:
             for rating_key in rating_keys_by_tmdb_id.get(tmdb_id, []):
                 seasons |= await self._fetch_present_seasons(rating_key)
             result[tmdb_id] = frozenset(seasons)
-        cached = _TV_SEASONS_CACHE.get(self._cache_key)
-        updated = dict(cached) if cached is not None else {}
-        updated.update(result)
-        _TV_SEASONS_CACHE.set(self._cache_key, updated)
+        # ONLY ids that matched at least one item are merged into the cache:
+        # ``_is_tv_available`` treats a cached KEY as "show present" for
+        # whole-show checks, so writing a no-match id's empty set would poison
+        # the snapshot into answering True for a show Plex hasn't indexed at
+        # all (within the TTL, without re-crawling). The RETURN value still
+        # carries the empty frozenset for that id — only the cache skips it.
+        matched_only = {
+            tmdb_id: seasons
+            for tmdb_id, seasons in result.items()
+            if rating_keys_by_tmdb_id.get(tmdb_id)
+        }
+        if matched_only:
+            cached = _TV_SEASONS_CACHE.get(self._cache_key)
+            updated = dict(cached) if cached is not None else {}
+            updated.update(matched_only)
+            _TV_SEASONS_CACHE.set(self._cache_key, updated)
         return result
 
     async def _collect_target_rating_keys(

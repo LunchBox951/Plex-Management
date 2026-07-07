@@ -545,6 +545,25 @@ async def test_season_presence_empty_for_absent_show() -> None:
     assert not any(path.startswith("/library/metadata/") for path in calls)
 
 
+async def test_season_presence_never_caches_a_no_match_id_as_present() -> None:
+    """Regression: a requested id with NO matching item must not be written to the
+    TV seasons cache. ``_is_tv_available`` treats a cached KEY as "show present"
+    for whole-show checks, so caching the miss's empty set would flip a later
+    ``is_available(tmdb_id, "tv")`` inside the TTL to True for a show Plex has
+    never indexed."""
+    calls: dict[str, int] = {}
+    # The permissive handler: the later ``is_available`` legitimately performs a
+    # full crawl on its cache miss (that miss IS the point of the test).
+    adapter = _adapter(
+        _make_multi_show_handler_all_seasons(calls),
+        base_url="http://season-presence-no-poison:32400",
+    )
+    assert await adapter.season_presence({9999}) == {9999: frozenset()}
+    # Within the cache TTL: the whole-show availability check must still answer
+    # False (fresh re-crawl finding nothing), not True from a poisoned snapshot.
+    assert await adapter.is_available(9999, "tv") is False
+
+
 async def test_season_presence_empty_batch_returns_empty_mapping_without_any_request() -> None:
     """An empty ``tmdb_ids`` collection must short-circuit -- no reason to walk any
     section when nothing was asked for."""
