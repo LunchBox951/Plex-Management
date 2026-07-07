@@ -275,11 +275,11 @@ def test_is_valid_fernet_key_rejects_44_byte_non_base64() -> None:
 def test_generate_key_file_fallback_leaves_no_partial_final_file(
     file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The no-hardlink fallback must make ``secret.key`` visible ONLY via an atomic
-    rename of a fully written temp, so the final file is complete-or-absent, never a
-    zero-byte/partial (the exFAT/SMB window the prior O_EXCL-at-final-path route
-    reopened). Assert the published file is a complete, Fernet-valid key and no
-    lock/temp litter remains."""
+    """The no-hardlink fallback commit is a one-shot ``O_CREAT|O_EXCL`` create +
+    complete write + fsync -- atomic no-overwrite, so a resumed zombie can never
+    replace a published key; readers ride the microsecond create-to-write window
+    with validated retries. After a successful publish the final file is a
+    complete, Fernet-valid key and no lock/temp litter remains."""
 
     def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
@@ -392,6 +392,153 @@ def test_generate_key_file_concurrent_fallback_agrees_on_one_key(
     assert encryption._is_valid_fernet_key(winner)  # pyright: ignore[reportPrivateUsage]
     assert file_backed_key.read_bytes() == winner
     assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+
+
+def test_fallback_resumed_holder_cannot_replace_published_key(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 fencing regression: worker A acquires the publish lock, passes its
+    re-check, then PAUSES past the stale window right before its commit; worker B
+    stale-reaps A's lock and publishes key B. When A resumes, its commit must
+    LOSE (``O_EXCL`` is no-overwrite -- the prior ``os.rename`` commit REPLACED
+    B's published key at exactly this point) and A must converge by adopting B's
+    key BY NAME: both workers return the SAME key and the final file equals it."""
+    key_a = Fernet.generate_key()
+    key_b = Fernet.generate_key()
+    lock_dir = file_backed_key.with_name(file_backed_key.name + ".lock")
+    real_commit = encryption._commit_key_exclusive  # pyright: ignore[reportPrivateUsage]
+    b_returned: list[bytes] = []
+
+    def _paused_then_raced_commit(key_path: Path, key: bytes) -> bool:
+        # Worker A is "paused" here, holding a now-stale lock. The world moves on:
+        monkeypatch.setattr(encryption, "_commit_key_exclusive", real_commit)
+        os.rmdir(lock_dir)  # worker B age-reaps A's stale lock...
+        assert real_commit(key_path, key_b)  # ...and publishes ITS OWN key,
+        b_returned.append(file_backed_key.read_bytes())  # returning it by name.
+        return real_commit(key_path, key)  # A resumes its own commit attempt.
+
+    monkeypatch.setattr(encryption, "_commit_key_exclusive", _paused_then_raced_commit)
+
+    result_a = encryption._publish_key_no_hardlink(  # pyright: ignore[reportPrivateUsage]
+        file_backed_key, key_a
+    )
+
+    assert b_returned == [key_b]  # B returned the key it published
+    assert result_a == key_b  # A converged on the SAME key -- never its own
+    assert result_a != key_a
+    assert file_backed_key.read_bytes() == key_b  # the published key was NOT replaced
+
+
+def test_reap_stale_partial_final_age_and_validity_gates(tmp_path: Path) -> None:
+    """The partial-final reaper fires ONLY on an invalid-shaped file older than
+    the stale bound: a young invalid file (a racer's in-flight commit) is kept,
+    an old invalid file (a crashed committer's partial) is removed, and a VALID
+    key is never touched at any age."""
+    target = tmp_path / "secret.key"
+    old = time.time() - 3600
+
+    # Young invalid: kept (could be a live racer mid-commit).
+    target.write_bytes(b"partial")
+    encryption._reap_stale_partial_final(target)  # pyright: ignore[reportPrivateUsage]
+    assert target.exists()
+
+    # Old invalid: reaped (a crashed committer's partial).
+    os.utime(target, (old, old))
+    encryption._reap_stale_partial_final(target)  # pyright: ignore[reportPrivateUsage]
+    assert not target.exists()
+
+    # Old VALID: never reaped, at any age.
+    key = Fernet.generate_key()
+    target.write_bytes(key)
+    os.utime(target, (old, old))
+    encryption._reap_stale_partial_final(target)  # pyright: ignore[reportPrivateUsage]
+    assert target.read_bytes() == key
+
+
+def test_generate_key_file_fallback_recovers_crashed_partial_final(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash mid-commit (after the ``O_EXCL`` create, before the write finished)
+    leaves an INVALID partial at the final path. Once it is older than the stale
+    bound, the next publish attempt must reap it under the lock and mint a fresh
+    complete key -- recoverable without a terminal (north star #1)."""
+    file_backed_key.write_bytes(b"\x00" * 10)  # a crashed committer's partial
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert encryption._is_valid_fernet_key(result)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == result
+    assert not file_backed_key.with_name(file_backed_key.name + ".lock").exists()
+
+
+def test_fallback_never_reaps_a_young_partial(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YOUNG invalid final (a racer's possibly-in-flight commit) must never be
+    reaped. With the give-up deadline forced to zero the publish loop raises the
+    corrupt-key error instead of ever touching the young file."""
+    file_backed_key.write_bytes(b"in-flight")  # young: mtime ~now
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)
+    monkeypatch.setattr(encryption, "_PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+            file_backed_key
+        )
+
+    assert file_backed_key.read_bytes() == b"in-flight"  # untouched
+
+
+def test_ensure_secret_key_recovers_crashed_partial_on_fallback_fs(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement (c) end-to-end: a crashed fallback commit's stale partial at
+    ``secret.key`` must not brick the NEXT STARTUP. Pre-init (no data under any
+    key), ``ensure_secret_key`` routes the invalid file into the publish path,
+    which age-reaps it and mints a fresh working key."""
+    file_backed_key.write_bytes(b"crashed-partial")
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    fernet = encryption.ensure_secret_key()
+
+    stored = file_backed_key.read_bytes()
+    assert encryption._is_valid_fernet_key(stored)  # pyright: ignore[reportPrivateUsage]
+    # The returned Fernet and the stored key agree (round-trip decrypts).
+    assert Fernet(stored).decrypt(fernet.encrypt(b"payload")) == b"payload"
+
+
+def test_ensure_secret_key_still_rejects_invalid_key_on_hardlink_fs(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a hardlink-CAPABLE filesystem a crash cannot leave a partial final at
+    all (the ``os.link`` publish is complete-bytes-before-visible), so an invalid
+    existing file there is operator-restored garbage: ``ensure_secret_key`` must
+    still fail loudly with the corrupt-key error, never silently replace it."""
+    file_backed_key.write_bytes(b"tooshort")
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)  # keep the retry instant
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption.ensure_secret_key()
+
+    assert file_backed_key.read_bytes() == b"tooshort"
 
 
 def test_reap_stale_key_tempfiles_removes_old_orphans_only(tmp_path: Path) -> None:

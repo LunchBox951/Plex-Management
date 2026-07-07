@@ -63,12 +63,17 @@ _KEY_TEMPFILE_SUFFIX: Final = ".tmp"
 
 # The sibling directory used as the no-hardlink publish mutex, and the age
 # bounds for reaping a crashed publisher's leftovers (see
-# ``_publish_key_no_hardlink``). Both bounds are generous by orders of
-# magnitude: a real publish (write 44 bytes + fsync + rename) is milliseconds,
-# so a LIVE holder's lock/tempfile never looks stale and is never reaped.
+# ``_publish_key_no_hardlink``). All bounds are generous by orders of
+# magnitude: a real publish (create + write 44 bytes + fsync) is milliseconds,
+# so a LIVE holder's lock/tempfile/partial never looks stale and is never reaped.
 _PUBLISH_LOCK_SUFFIX: Final = ".lock"
 _STALE_PUBLISH_LOCK_SECONDS: Final = 30.0
 _STALE_KEY_TEMPFILE_SECONDS: Final = 60.0
+# An INVALID-shaped final (a crashed fallback committer's partial secret.key)
+# may be reaped only once it is at least this old -- and only under the publish
+# lock, with validity re-checked immediately before the unlink. A VALID key is
+# never reaped, at any age (see ``_reap_stale_partial_final``).
+_STALE_PARTIAL_FINAL_SECONDS: Final = 30.0
 # Safety valve: acquisition normally succeeds at once, or recovers within one
 # stale window (~30s). If it makes NO progress for this long the lock is
 # un-removable (a stray non-directory at the path, a permissions fault), so fail
@@ -224,12 +229,13 @@ def _reap_stale_publish_lock(lock_dir: Path) -> None:
     magnitude: a real publish is milliseconds, so a LIVE holder's lock never looks
     stale and is never broken.
 
-    Removing the lock is safe even under a reaper race: the caller only reaps when
-    NO valid key is currently visible (i.e. a fresh install), so at worst two
-    workers re-mint DIFFERENT first-run keys before any data exists to orphan -- an
-    ALREADY-ESTABLISHED key is never reached here (the fast-path and retry reads
-    adopt it first, so the lock is never even contended in that case). Total: never
-    raises.
+    Removing the lock is safe even against a paused-but-alive holder BECAUSE the
+    commit primitive is no-overwrite (:func:`_commit_key_exclusive`): a
+    stale-reaped holder that later resumes cannot replace a key published in the
+    meantime -- its ``O_EXCL`` commit loses and it converges by adopting the
+    published key BY NAME. (The round-3 predecessor committed via ``os.rename``,
+    which overwrites; there a reaped-then-resumed holder silently REPLACED the
+    published key and two workers returned different keys.) Total: never raises.
     """
     try:
         age = time.time() - lock_dir.stat().st_mtime
@@ -241,75 +247,160 @@ def _reap_stale_publish_lock(lock_dir: Path) -> None:
         os.rmdir(os.fspath(lock_dir))
 
 
-def _publish_key_no_hardlink(key_path: Path, key: bytes, tmp_name: str) -> bytes:
-    r"""Publish the first-run key WITHOUT hardlinks (the exFAT/FAT/SMB fallback).
+def _commit_key_exclusive(key_path: Path, key: bytes) -> bool:
+    """COMMIT primitive of the no-hardlink publish: atomically create the FINAL
+    path via ``O_CREAT | O_EXCL`` (atomic + no-overwrite on every filesystem,
+    exFAT/FAT/SMB included) and write the complete key + fsync in one shot
+    before the fd closes.
 
-    ``tmp_name`` already holds ``key`` (written + fsynced by the caller). The final
-    ``key_path`` is made visible ONLY by atomically renaming ``tmp_name`` into
-    place, so a reader NEVER observes a partial final file and a crash can NEVER
-    leave a truncated ``secret.key``. The prior fallback (``O_CREAT|O_EXCL`` AT the
-    final path, then write the bytes) recreated exactly that zero-byte/partial
-    window -- on the very filesystems this fallback serves -- and a crash inside it
-    left a corrupt ``secret.key`` that later startups refuse to replace.
-
-    A sibling directory (``<name>.lock``) is the publish mutex: ``os.mkdir`` is
-    atomic and no-overwrite on EVERY filesystem (including the hardlink-less ones),
-    so exactly one worker publishes at a time and an existing key is NEVER
-    clobbered. A racing loser rides out the winner's in-flight publish with the
-    same bounded, validated read-retry readers use, then adopts the winner's key. A
-    lock left by a CRASHED holder is reaped by age (:func:`_reap_stale_publish_lock`)
-    so a half-finished publish is recoverable on the next startup. Returns the key
-    it published, or an already-present one it adopted.
-
-    Crash matrix (process death / power loss at each step; the next startup
-    recovers cleanly every time -- no partial final file is ever exposed):
-
-    * before ``mkdir``: only an orphan ``.secret.*.tmp`` (swept by age); no lock,
-      no ``key_path`` -> next startup is a clean first-run.
-    * after ``mkdir``, before ``rename``: an empty lock + an orphan tempfile, no
-      ``key_path`` -> next startup reaps the stale lock (age) and the stale
-      tempfile (age), then publishes fresh.
-    * during ``rename``: atomic -> ``key_path`` is either fully present (adopted)
-      or absent (as the previous case). Never partial.
-    * after ``rename``, before ``rmdir``: ``key_path`` is complete + valid; the
-      orphan lock is harmless (the normal load path reads the key directly and
-      never contends for the lock).
+    Returns ``False`` when the path already exists -- a racer (or a prior,
+    possibly crashed, committer) got there first; the caller converges by
+    re-reading the final BY NAME. Unlike an ``os.rename`` commit, a
+    paused-then-resumed holder executing this can never replace an
+    already-published key: ``O_EXCL`` LOSES instead of clobbering (the round-3
+    fencing flaw -- no lock/lease can fence a rename, because rename
+    overwrites). ``key_path`` is briefly visible empty between the create and
+    the write (microseconds); readers ride that out with their bounded
+    validated retries, and a CRASH inside the window leaves an invalid partial
+    that :func:`_reap_stale_partial_final` recovers by age on a later
+    attempt/startup.
     """
-    # Fast path: a complete key already exists -> adopt it, never overwrite, no lock.
-    existing = _read_valid_key_once(key_path)
-    if existing is not None:
-        return existing
+    try:
+        fd = os.open(os.fspath(key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)  # defeat the umask; best-effort on perm-less mounts
+        view = memoryview(key)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _reap_stale_partial_final(key_path: Path) -> None:
+    """Remove a crashed fallback committer's INVALID partial ``secret.key`` --
+    and nothing else. Fires only when the file is BOTH invalid-shaped AND older
+    than :data:`_STALE_PARTIAL_FINAL_SECONDS`; validity is re-checked
+    immediately before the unlink, so the gap to a racing valid commit is a
+    single syscall wide. A VALID key is never reaped, at any age. The caller
+    holds the publish lock, serializing this against other reapers and
+    committers. Safe pre-init only (no data exists under any key yet) -- which
+    is the only phase the publish ever runs in. Total: never raises.
+    """
+    try:
+        if time.time() - key_path.stat().st_mtime <= _STALE_PARTIAL_FINAL_SECONDS:
+            return
+        raw = key_path.read_bytes()
+    except OSError:
+        return
+    if _is_valid_fernet_key(raw):
+        return
+    with contextlib.suppress(OSError):
+        key_path.unlink()
+
+
+def _publish_key_no_hardlink(key_path: Path, key: bytes) -> bytes:
+    """Publish the first-run key WITHOUT hardlinks (the exFAT/FAT/SMB fallback).
+
+    The COMMIT step is :func:`_commit_key_exclusive` -- an atomic NO-OVERWRITE
+    ``O_CREAT|O_EXCL`` create of the final path with the complete key written +
+    fsynced in one shot. The previous design committed via ``os.rename``, which
+    OVERWRITES: a holder paused past the stale-lock window between its re-check
+    and its rename could be stale-reaped, a second worker would publish its own
+    key, and the resumed holder's rename silently REPLACED it -- two workers
+    returning DIFFERENT first-run keys (the round-3 finding). No lock or lease
+    can fence a rename; ``O_EXCL`` loses instead of clobbering, so a zombie
+    writer can never replace a published key.
+
+    Convergence rule: the final BY NAME is the single source of truth. Every
+    writer -- winner, loser, or resumed zombie -- finishes by re-reading and
+    validating ``key_path`` and returning THOSE bytes (never its local buffer),
+    so racers always hand back the one canonical key and an existing complete
+    key is NEVER replaced.
+
+    The sibling ``<name>.lock`` directory (``os.mkdir``: atomic + no-overwrite
+    everywhere) serializes commit attempts and -- more importantly -- the
+    recovery unlink of a crashed committer's INVALID partial
+    (:func:`_reap_stale_partial_final`: age-gated, validity re-checked
+    immediately before the unlink, never a valid key). Readers ride the
+    microsecond create-to-write window with their bounded validated retries.
+
+    Pause/reap/crash matrix (worker death, power loss, or a >stale-window pause
+    at each step; every case converges or is recoverable on the next
+    attempt/startup):
+
+    * crash before ``mkdir``: no lock, no final -> clean first-run next time
+      (an orphaned ``.secret.*.tmp`` from the hardlink route is swept by age).
+    * crash holding the lock, before the commit: stale lock, no final -> the
+      next worker/startup age-reaps the lock and publishes.
+    * crash mid-commit (after the ``O_EXCL`` create, before the write/fsync
+      completes): an INVALID partial final + a stale lock remain -> the next
+      worker/startup age-reaps both and republishes. :func:`ensure_secret_key`
+      routes an existing-but-invalid file back into this recovery (pre-init no
+      data exists under any key, so re-minting is safe).
+    * crash after the commit, before ``rmdir``: the final is complete + valid;
+      the orphan lock is harmless (every path adopts a valid final before ever
+      contending for the lock).
+    * holder PAUSED mid-commit, then stale-reaped: its created-but-still-empty
+      final is age-reaped, a second worker publishes, and the zombie's writes
+      land in its (now unlinked) inode -- harmless; its by-name re-read then
+      adopts the published key. Both workers return the SAME key.
+    * holder paused between the partial-reap and its commit (the round-3
+      choreography): the second worker publishes; the zombie's ``O_EXCL``
+      commit LOSES (``FileExistsError``) and it adopts by name. Same key
+      everywhere -- this is the exact interleaving the rename design broke on.
+    * double-reap: reapers are serialized by the lock and re-validate the file
+      immediately before the unlink. Residual: a reaper paused for a whole
+      stale window exactly between that re-validation and its own unlink,
+      while a second worker reaps AND publishes inside the pause, could still
+      unlink the fresh key -- POSIX has no compare-and-unlink without
+      hardlinks. That window is one syscall wide, only armed after a prior
+      crash left a >=30s-old partial, and confined to pre-init (no encrypted
+      data exists yet); the next read then simply re-mints.
+    * reaper crash while holding the lock, partial already unlinked: no final
+      + a stale lock -> age-reaped and republished next time.
+    """
     lock_dir = key_path.with_name(key_path.name + _PUBLISH_LOCK_SUFFIX)
     deadline = time.monotonic() + _PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS
     while True:
+        # Converge first: adopt a key that is already published and complete.
+        existing = _read_valid_key_once(key_path)
+        if existing is not None:
+            return existing
         try:
             os.mkdir(os.fspath(lock_dir), 0o700)
         except FileExistsError:
-            # A concurrent publisher holds the lock (live), or a crashed one left it.
-            adopted = _read_valid_key(key_path)  # bounded retry: ride out a live publish
+            # A live holder is mid-commit (ride it out and adopt), or a crashed
+            # one left the lock behind (age-reap it, then retry).
+            adopted = _read_valid_key(key_path)  # bounded retry: ride out a live commit
             if adopted is not None:
                 return adopted
-            # No key yet: break the lock ONLY if its holder is demonstrably dead,
-            # then retry acquiring (a live holder's fresh lock is left untouched and
-            # we simply keep waiting for it to publish or age out).
             _reap_stale_publish_lock(lock_dir)
             if time.monotonic() >= deadline:
                 raise _unbreakable_publish_lock_error(key_path, lock_dir) from None
             continue
-        break  # acquired the publish lock
-    try:
-        # Under the lock a prior holder may have JUST published; never clobber it.
-        # No in-flight partial is possible here (publish is atomic-rename), so a
-        # single read settles it -- no retry needed.
-        published = _read_valid_key_once(key_path)
-        if published is not None:
-            return published
-        os.rename(os.fspath(tmp_name), os.fspath(key_path))
-        logger.info("generated new encryption key at %s", key_path)
-        return key
-    finally:
-        with contextlib.suppress(OSError):
-            os.rmdir(os.fspath(lock_dir))
+        try:
+            _reap_stale_partial_final(key_path)
+            if _commit_key_exclusive(key_path, key):
+                logger.info("generated new encryption key at %s", key_path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(os.fspath(lock_dir))
+        # The final BY NAME is the only truth: whether our commit won, lost, or
+        # was zombie-reaped mid-write, validate and return what the name holds
+        # (the bounded retry rides out a racer's in-flight commit).
+        committed = _read_valid_key(key_path)
+        if committed is not None:
+            return committed
+        if time.monotonic() >= deadline:
+            raise _corrupt_key_error(key_path)
+        # Still no valid final: a racer's YOUNG partial we must not reap yet, or
+        # our own commit's file was reaped during a pause. Loop -- age gates
+        # every reap; the deadline bounds the wait.
 
 
 def _generate_key_file(key_path: Path) -> bytes:
@@ -328,12 +419,14 @@ def _generate_key_file(key_path: Path) -> bytes:
 
     On a filesystem that does not support hardlinks at all (exFAT/FAT/SMB —
     ``os.link`` raises ``OSError`` with an errno in ``_KEY_LINK_FALLBACK_ERRNOS``,
-    NOT ``FileExistsError``), delegate to :func:`_publish_key_no_hardlink`, which
-    publishes the fsynced tempfile via a lock-serialized ATOMIC RENAME so the final
-    path is still same-no-overwrite and complete-bytes-before-visible (never a
-    zero-byte/partial ``secret.key``), just without the hardlink. Any other
-    ``OSError`` (e.g. disk full) is a genuine failure and propagates uncaught —
-    it must not be papered over as a race loss.
+    NOT ``FileExistsError``), delegate to :func:`_publish_key_no_hardlink`, whose
+    commit is an atomic no-overwrite ``O_CREAT|O_EXCL`` create of the final path
+    (a rename commit is fencible by a stale-reaped-then-resumed holder: rename
+    OVERWRITES, so a zombie could replace a racer's already-published key — the
+    round-3 finding). The tempfile serves only the hardlink route; the fallback
+    writes the final directly and converges by name. Any other ``OSError``
+    (e.g. disk full) is a genuine failure and propagates uncaught — it must not
+    be papered over as a race loss.
     """
     key = Fernet.generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,7 +453,7 @@ def _generate_key_file(key_path: Path) -> bytes:
         except OSError as exc:
             if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
                 raise
-            return _publish_key_no_hardlink(key_path, key, tmp_name)
+            return _publish_key_no_hardlink(key_path, key)
         logger.info("generated new encryption key at %s", key_path)
         return key
     finally:
@@ -401,6 +494,15 @@ def ensure_secret_key() -> Fernet:
     Use ONLY before the system is initialized (i.e. no encrypted data exists
     yet). On an already-initialized system call :func:`get_fernet`, which refuses
     to paper over a lost key by minting a replacement.
+
+    An existing VALID key is always adopted as-is. An existing INVALID file is
+    routed into :func:`_generate_key_file` rather than rejected outright: on a
+    hardlink-less filesystem it can be a crashed fallback commit's partial, and
+    pre-init no data exists under any key, so the publish path may recover it
+    (adopt a racing writer's completed key, or age-reap the stale partial and
+    re-mint). On a hardlink-capable filesystem a crash cannot leave a partial
+    final at all, so an invalid file there still fails loudly with the
+    corrupt-key error via the ``os.link`` route -- never silently replaced.
     """
     global _fernet
     if _fernet is not None:
@@ -411,13 +513,11 @@ def ensure_secret_key() -> Fernet:
         _fernet = Fernet(override.encode())
         return _fernet
     key_path = secret_key_path(settings)
-    if key_path.exists():
-        raw = _read_valid_key(key_path)
-        if raw is None:
-            raise _corrupt_key_error(key_path)
-        _fernet = Fernet(raw)
-    else:
-        _fernet = Fernet(_generate_key_file(key_path))
+    existing = _read_valid_key_once(key_path)
+    if existing is not None:
+        _fernet = Fernet(existing)
+        return _fernet
+    _fernet = Fernet(_generate_key_file(key_path))
     return _fernet
 
 
