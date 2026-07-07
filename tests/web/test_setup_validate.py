@@ -664,10 +664,23 @@ async def test_validate_prowlarr_accepts_valid_http_and_https(
 # --------------------------------------------------------------------------- #
 # validate/qbittorrent
 # --------------------------------------------------------------------------- #
-async def test_validate_qbittorrent_ok(admin_client: httpx.AsyncClient, app: FastAPI) -> None:
+async def test_validate_qbittorrent_ok(
+    admin_client: httpx.AsyncClient, app: FastAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No live mount in this test process at all: the download-path probe treats
+    # this as "bare metal, no Docker split" (today's every non-Docker install) --
+    # the client-reported default is genuinely visible here (a real directory on
+    # THIS machine), so the probe stays quiet (no note).
+    def _never_a_mount(_path: str) -> bool:
+        return False
+
+    monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_mount)
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
             return httpx.Response(200, text="Ok.")
+        if request.url.path == "/api/v2/app/preferences":
+            return httpx.Response(200, json={"save_path": str(tmp_path)})
         assert request.url.path == "/api/v2/torrents/info"
         return httpx.Response(200, json=[])
 
@@ -677,7 +690,75 @@ async def test_validate_qbittorrent_ok(admin_client: httpx.AsyncClient, app: Fas
         json={"url": "http://qb.local", "username": "admin", "password": "pw"},
         headers=_CSRF_HEADERS,
     )
-    assert response.json()["ok"] is True
+    body = response.json()
+    assert body["ok"] is True
+    assert body["download_path_note"] is None
+
+
+async def test_validate_qbittorrent_notes_an_invisible_default_save_path(
+    admin_client: httpx.AsyncClient, app: FastAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issues #133/#157: a client-reported default save path that is NOT visible
+    inside this container surfaces a NON-blocking, informational note -- ``ok``
+    stays ``True`` (Plex Manager directs every grab's save path explicitly, so
+    the mismatch can no longer strand an import)."""
+    downloads_mount = tmp_path / "downloads"
+    downloads_mount.mkdir()
+    downloads_mount_str = str(downloads_mount)
+
+    def _only_the_downloads_mount(path: str) -> bool:
+        return path == downloads_mount_str
+
+    monkeypatch.setattr(path_visibility, "is_live_mount", _only_the_downloads_mount)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (downloads_mount_str,))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Ok.")
+        if request.url.path == "/api/v2/app/preferences":
+            # A HOST-namespace path guaranteed not to exist on the box running
+            # this test, and not a suffix of the container's download mount.
+            return httpx.Response(
+                200, json={"save_path": "/definitely-not-a-real-host-path/Downloads"}
+            )
+        assert request.url.path == "/api/v2/torrents/info"
+        return httpx.Response(200, json=[])
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/qbittorrent",
+        json={"url": "http://qb.local", "username": "admin", "password": "pw"},
+        headers=_CSRF_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is True
+    assert body["download_path_note"] is not None
+    assert "/definitely-not-a-real-host-path/Downloads" in body["download_path_note"]
+
+
+async def test_validate_qbittorrent_swallows_a_preferences_probe_failure(
+    admin_client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    """The connectivity check already succeeded; a failure of the SECOND,
+    best-effort save-path probe must never flip ``ok`` to ``False``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Ok.")
+        if request.url.path == "/api/v2/app/preferences":
+            return httpx.Response(500, text="boom")
+        assert request.url.path == "/api/v2/torrents/info"
+        return httpx.Response(200, json=[])
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/qbittorrent",
+        json={"url": "http://qb.local", "username": "admin", "password": "pw"},
+        headers=_CSRF_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is True
+    assert body["download_path_note"] is None
 
 
 async def test_validate_qbittorrent_bad_creds(

@@ -1201,6 +1201,93 @@ async def test_server_5xx_raises_qbittorrent_error() -> None:
         await _client(handler).get_all_statuses()
 
 
+async def test_get_default_save_path_reads_app_preferences() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/preferences" and request.method == "GET":
+            return httpx.Response(200, json={"save_path": "/home/lunchbox/Downloads"})
+        return httpx.Response(404, text="unhandled")
+
+    save_path = await _client(handler).get_default_save_path()
+    assert save_path == "/home/lunchbox/Downloads"
+
+
+async def test_get_default_save_path_missing_key_returns_none() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/preferences" and request.method == "GET":
+            return httpx.Response(200, json={})
+        return httpx.Response(404, text="unhandled")
+
+    assert await _client(handler).get_default_save_path() is None
+
+
+async def test_get_default_save_path_error_status_returns_none() -> None:
+    """A read-only diagnostic (issues #133/#157): a failure here must never raise
+    — the caller (setup/health probe) treats it as "could not read it", not a
+    hard failure of the whole qBittorrent check."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/preferences" and request.method == "GET":
+            return httpx.Response(500, text="boom")
+        return httpx.Response(404, text="unhandled")
+
+    assert await _client(handler).get_default_save_path() is None
+
+
+async def test_set_location_posts_hash_and_location() -> None:
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/setLocation" and request.method == "POST":
+            body = dict(httpx.QueryParams(request.content.decode()))
+            calls.append(body)
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).set_location(MAGNET_HASH.upper(), "/home/lunchbox/Downloads")
+    assert calls == [{"hashes": MAGNET_HASH, "location": "/home/lunchbox/Downloads"}]
+
+
+async def test_set_location_error_status_raises_typed_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/setLocation" and request.method == "POST":
+            return httpx.Response(403, text="Forbidden")
+        return httpx.Response(404, text="unhandled")
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).set_location(MAGNET_HASH, "/home/lunchbox/Downloads")
+
+
+async def test_set_location_drops_cached_properties_entry() -> None:
+    """After a relocate, the next ``get_save_path`` must re-read the client rather
+    than serve the pre-move path from the short-lived properties cache."""
+
+    paths = iter(["/downloads/movies", "/home/lunchbox/Downloads"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/setLocation" and request.method == "POST":
+            return httpx.Response(200, text="Ok.")
+        if request.url.path == "/api/v2/torrents/properties" and request.method == "GET":
+            return httpx.Response(200, json={"save_path": next(paths)})
+        return httpx.Response(404, text="unhandled")
+
+    client = _client(handler)
+    assert await client.get_save_path(MAGNET_HASH) == "/downloads/movies"
+    await client.set_location(MAGNET_HASH, "/home/lunchbox/Downloads")
+    assert await client.get_save_path(MAGNET_HASH) == "/home/lunchbox/Downloads"
+
+
 def test_adapter_satisfies_download_client_port() -> None:
     from plex_manager.ports.download_client import DownloadClientPort
 

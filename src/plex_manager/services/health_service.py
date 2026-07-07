@@ -48,6 +48,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.disk_usage import DiskUsage, used_percent
+from plex_manager.services.path_visibility import KNOWN_DOWNLOAD_MOUNTS
 from plex_manager.web.setup_validation import (
     validate_plex,
     validate_prowlarr,
@@ -258,6 +259,13 @@ class SubsystemHealth:
     status: SubsystemState
     detail: str | None
     checked_at: datetime
+    # NON-blocking, informational signal (qBittorrent only, issues #133/#157): the
+    # client's default save path isn't visible inside this container. Distinct from
+    # ``detail``, which carries only FAILURE diagnostics (``None`` whenever
+    # ``status == "ok"``) -- ``note`` can be set even on an ``ok`` subsystem, and
+    # never flips ``status``. ``None`` for every other subsystem, and for
+    # qBittorrent whenever the default path IS visible or could not be read.
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -519,13 +527,18 @@ async def _check_qbittorrent(
         result = await _not_configured("qbittorrent")
     else:
         response = await validate_qbittorrent(
-            client, creds.qbittorrent_url, creds.qbittorrent_username, creds.qbittorrent_password
+            client,
+            creds.qbittorrent_url,
+            creds.qbittorrent_username,
+            creds.qbittorrent_password,
+            download_mounts=KNOWN_DOWNLOAD_MOUNTS,
         )
         result = SubsystemHealth(
             name="qbittorrent",
             status="ok" if response.ok else "down",
             detail=None if response.ok else response.message,
             checked_at=_now(),
+            note=response.download_path_note if response.ok else None,
         )
     cache.set("qbittorrent", result, generation=generation)
     return result

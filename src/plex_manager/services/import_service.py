@@ -74,9 +74,21 @@ if TYPE_CHECKING:
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import DownloadRecord, RequestRecord
 
-__all__ = ["import_download", "run_availability_cycle", "run_import_cycle"]
+__all__ = [
+    "PATH_NOT_VISIBLE_REASON_PREFIX",
+    "import_download",
+    "run_availability_cycle",
+    "run_import_cycle",
+]
 
 _logger = logging.getLogger(__name__)
+
+# The ``failed_reason`` prefix stamped by every "download path not visible inside the
+# container" block (both the movie and TV paths, below) -- issues #133/#157.
+# Exported so a caller (``correction_service``'s relocate verb) can recognise
+# EXACTLY this block reason without re-deriving or loosely substring-matching a
+# duplicated literal, and so the two call sites here can never drift apart.
+PATH_NOT_VISIBLE_REASON_PREFIX: Final = "download path not visible inside the container "
 
 # States ``import_download`` will (re)process: a freshly-completed torrent, an
 # operator retry of a blocked one, and a row left mid-import by a crash — all
@@ -644,8 +656,8 @@ async def _import_download_locked(
             session,
             download_repo,
             download_id,
-            "download path not visible inside the container "
-            f"(check volume mounts / content mismatch): {resolved.path}",
+            PATH_NOT_VISIBLE_REASON_PREFIX
+            + f"(check volume mounts / content mismatch): {resolved.path}",
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
@@ -985,8 +997,8 @@ async def _import_tv_locked(
             session,
             download_repo,
             download_id,
-            "download path not visible inside the container "
-            f"(check volume mounts / content mismatch): {resolved.path}",
+            PATH_NOT_VISIBLE_REASON_PREFIX
+            + f"(check volume mounts / content mismatch): {resolved.path}",
             request_id=request.id,
             season=season,
         )

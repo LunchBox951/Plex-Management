@@ -37,6 +37,7 @@ from plex_manager.web.deps import (
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
+    get_downloads_host_root,
     get_eviction_filesystem,
     get_library,
     get_library_optional,
@@ -292,6 +293,7 @@ async def report_issue_endpoint(
     tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
     anime_movie_root: Annotated[str | None, Depends(get_anime_movie_root_optional)],
     anime_tv_root: Annotated[str | None, Depends(get_anime_tv_root_optional)],
+    downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
 ) -> RequestResponse:
     """Report a bad imported/available movie or TV season (ADR-0014).
 
@@ -342,6 +344,7 @@ async def report_issue_endpoint(
             reason=body.reason,
             season=body.season,
             roots=roots,
+            save_path=downloads_host_root,
         )
     except correction_service.RequestNotFoundError as exc:
         raise HTTPException(

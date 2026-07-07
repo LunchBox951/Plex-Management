@@ -70,6 +70,7 @@ from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
+    Download,
     DownloadHistory,
     DownloadHistoryEvent,
     RequestStatus,
@@ -87,6 +88,7 @@ from plex_manager.services import (
     season_request_service,
 )
 from plex_manager.services.auto_grab_service import MAX_GRAB_ATTEMPTS_PER_SCOPE
+from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
 from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
 
@@ -99,7 +101,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.indexer import IndexerPort
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.parser import ParserPort
-    from plex_manager.ports.repositories import RequestRecord, SeasonRequestRecord
+    from plex_manager.ports.repositories import DownloadRecord, RequestRecord, SeasonRequestRecord
     from plex_manager.services.library_roots import LibraryRoots
 
 __all__ = [
@@ -107,14 +109,18 @@ __all__ = [
     "REPORTABLE_STATUS_VALUES",
     "ActiveDuplicateError",
     "DownloadClientRequiredError",
+    "DownloadNotFoundError",
+    "DownloadsRootUnavailableError",
     "ImportInProgressError",
     "MediaRootUnavailableError",
     "NotCancellableError",
+    "NotRelocatableError",
     "NotReportableError",
     "ReportSeasonRequiredError",
     "RequestNotFoundError",
     "SeasonNotFoundError",
     "cancel_request",
+    "relocate_stranded_download",
     "report_issue",
 ]
 
@@ -398,6 +404,51 @@ class DownloadClientRequiredError(Exception):
         )
 
 
+class DownloadNotFoundError(Exception):
+    """No download exists for the given id (HTTP 404)."""
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(f"download {download_id} does not exist")
+
+
+class NotRelocatableError(Exception):
+    """The download is not an import-blocked, path-invisible row (HTTP 409).
+
+    :func:`relocate_stranded_download` is scoped EXACTLY to the "download path not
+    visible inside the container" block (issues #133/#157) -- never a general-purpose
+    mover. A download in any other state (or ``import_blocked`` for a DIFFERENT
+    reason, e.g. a genuinely bad/wrong-media file) has nothing a relocate would fix,
+    so it is refused rather than silently no-op'd.
+    """
+
+    def __init__(self, download_id: int, status: str) -> None:
+        self.download_id = download_id
+        self.status = status
+        super().__init__(
+            f"download {download_id} (status={status!r}) is not a path-invisible "
+            f"import-blocked row; nothing to relocate"
+        )
+
+
+class DownloadsRootUnavailableError(Exception):
+    """No HOST-namespace downloads root could be derived (HTTP 409).
+
+    The root-guard for :func:`relocate_stranded_download`: it may ONLY ever direct
+    qBittorrent to move a torrent INTO the app's own derived downloads root
+    (``path_visibility.resolve_downloads_host_root``), never a caller-chosen or
+    guessed path. When neither ``PLEX_MANAGER_DOWNLOADS_ROOT`` nor the
+    ``/proc/self/mountinfo`` fallback resolves, there is nothing safe to relocate
+    into -- refuse rather than send qBittorrent an empty/placeholder location.
+    """
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(
+            f"cannot relocate download {download_id}: no downloads host root could be derived"
+        )
+
+
 def _root_is_mounted(root_path: str | None) -> bool:
     """Whether ``root_path`` is a present, non-empty directory (an active mount).
 
@@ -453,8 +504,17 @@ async def report_issue(
     reason: str,
     season: int | None,
     roots: LibraryRoots,
+    save_path: str = "",
 ) -> RequestRecord:
     """Report a bad imported file: blocklist + purge (torrent + library) + re-search.
+
+    ``save_path`` (issues #133/#157) is threaded verbatim into the inline
+    replacement :func:`grab_service.grab` call below: the caller (the report-issue
+    endpoint) resolves the HOST-namespace downloads root once
+    (``path_visibility.resolve_downloads_host_root``) and passes it here, so the
+    replacement torrent lands under the mounted ``/downloads`` bind exactly like a
+    manual grab. ``""`` (the default) leaves qBittorrent's own default in charge,
+    unchanged prior behaviour.
 
     Returns the updated request record (re-read after the inline re-grab, so its
     status reflects ``downloading`` on a successful replacement grab,
@@ -779,6 +839,7 @@ async def report_issue(
                             year=request.year,
                             season=target.season,
                             episodes=None,
+                            save_path=save_path,
                         )
                         park_scope = False
                         break
@@ -1031,4 +1092,88 @@ async def cancel_request(
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
         raise RequestNotFoundError(request_id)
+    return updated
+
+
+async def relocate_stranded_download(
+    session: AsyncSession,
+    qbt: DownloadClientPort,
+    *,
+    download_id: int,
+    downloads_host_root: str,
+) -> DownloadRecord:
+    """Relocate an import-blocked, path-invisible download into the mounted
+    downloads root (issues #133/#157), then leave it retryable so the operator's
+    existing "Retry import" (``POST /queue/{id}/import``) picks it up once
+    qBittorrent settles the (async) move.
+
+    Scoped EXACTLY to the honest "download path not visible inside the container"
+    block :mod:`~plex_manager.services.import_service` stamps when qBittorrent's
+    reported content sits outside every mounted ``/downloads`` bind --
+    :class:`NotRelocatableError` for any other row (including a DIFFERENT
+    ``import_blocked`` reason, e.g. a genuinely bad/wrong-media file, which
+    relocating could never fix).
+
+    Root-guarded: the ONLY destination this function will ever hand qBittorrent is
+    ``downloads_host_root`` -- the app's OWN derived downloads root
+    (``path_visibility.resolve_downloads_host_root``), never an operator- or
+    caller-supplied path (there is no path parameter to override). When that root
+    could not be derived (bare metal, no Docker split, or an unreadable
+    mountinfo), :class:`DownloadsRootUnavailableError` refuses rather than
+    relocating into a guessed/empty location.
+
+    qBittorrent moves content ASYNCHRONOUSLY: :meth:`~plex_manager.ports.
+    download_client.DownloadClientPort.set_location` only REQUESTS the move and
+    returns -- this function does not wait for, or otherwise verify, completion
+    (wait-free, honest: the caller sees the request as ACCEPTED, never as
+    already-imported). A ``QbittorrentError`` from that call propagates UNCAUGHT
+    (never swallowed) so the operator sees the real client failure rather than a
+    falsely "accepted" relocation.
+
+    The row is left ``import_blocked`` -- still retryable by the SAME existing
+    import-retry endpoint (``import_download``'s ``_RESUMABLE`` set already
+    includes ``import_blocked``) -- but its ``failed_reason`` is refreshed to say a
+    relocation was requested, so the operator sees the CURRENT truth instead of the
+    stale pre-relocation "not visible" message while the move is in flight. A retry
+    attempted before the move settles simply re-blocks (honestly) with a fresh "not
+    visible" reason if qBittorrent has not finished moving the content yet.
+    """
+    if not downloads_host_root:
+        raise DownloadsRootUnavailableError(download_id)
+    row = await session.get(Download, download_id)
+    if row is None:
+        raise DownloadNotFoundError(download_id)
+    if row.status != DownloadState.ImportBlocked.value or not (row.failed_reason or "").startswith(
+        PATH_NOT_VISIBLE_REASON_PREFIX
+    ):
+        raise NotRelocatableError(download_id, row.status)
+
+    torrent_hash = row.torrent_hash
+    # qBittorrent errors propagate uncaught (honesty over silence): the operator sees
+    # the real client failure rather than a falsely "accepted" relocation.
+    await qbt.set_location(torrent_hash, downloads_host_root)
+
+    download_repo = SqlDownloadRepository(session)
+    moved = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.ImportBlocked.value,
+        frozenset({DownloadState.ImportBlocked.value}),
+        failed_reason=(
+            f"relocation to {downloads_host_root} requested; retry the import once "
+            "qBittorrent finishes moving the content"
+        ),
+    )
+    if moved:
+        await session.commit()
+    else:
+        # The row moved out from under us (an operator's own retry-import racing
+        # to success/re-block, or a mark-failed, committed while ``qbt.set_location``
+        # was in flight). The relocate already happened on qBittorrent's side --
+        # harmless, the content is simply now under our own downloads root -- so
+        # honor whichever status won rather than overwrite it.
+        await session.rollback()
+
+    updated = await download_repo.get_by_hash(torrent_hash)
+    if updated is None:  # pragma: no cover - just operated on this row
+        raise LookupError(f"download for hash {torrent_hash} vanished mid-relocate")
     return updated

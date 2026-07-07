@@ -404,9 +404,28 @@ async def validate_prowlarr(
 
 
 async def validate_qbittorrent(
-    client: httpx.AsyncClient, url: str, username: str, password: str
+    client: httpx.AsyncClient,
+    url: str,
+    username: str,
+    password: str,
+    *,
+    download_mounts: Sequence[str] = (),
 ) -> ServiceValidateResponse:
-    """Check qBittorrent + credentials by logging in and listing torrents."""
+    """Check qBittorrent + credentials by logging in and listing torrents.
+
+    ``download_mounts`` (default ``()``, no extra probe) opts into a SECOND,
+    best-effort check (issues #133/#157): the client's GLOBAL default save path is
+    read (``get_default_save_path``) and remapped through
+    :func:`~plex_manager.services.path_visibility.remap_to_visible` against
+    ``download_mounts`` (the app's known ``/downloads`` bind(s)). A path that does
+    NOT resolve inside this container sets ``download_path_note`` -- purely
+    INFORMATIONAL, never a failure: Plex Manager directs every grab's ``save_path``
+    explicitly (see ``grab_service.grab``), so a default-path mismatch cannot strand
+    an import the way it could before that fix. Any failure of this SECOND probe
+    (a transport error, an unreadable ``/app/preferences``) is swallowed to "no
+    note" -- the connectivity check above already proved the credentials work, and
+    this extra diagnostic must never turn a working connection into ``ok=False``.
+    """
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
@@ -430,7 +449,23 @@ async def validate_qbittorrent(
         return ServiceValidateResponse(
             ok=False, message="Could not reach qBittorrent.", detail=str(exc)
         )
-    return ServiceValidateResponse(ok=True, message="Connected to qBittorrent.")
+    note: str | None = None
+    if download_mounts:
+        try:
+            default_path = await adapter.get_default_save_path()
+        except QbittorrentError:
+            # Best-effort only: the connectivity check above already succeeded, so
+            # this extra diagnostic failing must never flip ok=False.
+            default_path = None
+        if default_path and remap_to_visible(default_path, download_mounts) is None:
+            note = (
+                f"qBittorrent's default save path ({default_path}) isn't visible "
+                "inside this container; Plex Manager directs each download's save "
+                "path explicitly, so this does not block imports."
+            )
+    return ServiceValidateResponse(
+        ok=True, message="Connected to qBittorrent.", download_path_note=note
+    )
 
 
 async def validate_tmdb(client: httpx.AsyncClient, api_key: str) -> ServiceValidateResponse:

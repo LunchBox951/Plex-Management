@@ -332,7 +332,13 @@ async def validate_qbittorrent_endpoint(
     _context: Annotated[AuthContext, Depends(require_setup_admin)],
 ) -> ServiceValidateResponse:
     """Test candidate qBittorrent credentials."""
-    return await validate_qbittorrent(client, body.url, body.username, body.password)
+    return await validate_qbittorrent(
+        client,
+        body.url,
+        body.username,
+        body.password,
+        download_mounts=path_visibility.KNOWN_DOWNLOAD_MOUNTS,
+    )
 
 
 @router.post("/validate/tmdb", responses=_AUTH_RESPONSES)

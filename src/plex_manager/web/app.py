@@ -57,6 +57,7 @@ from plex_manager.web.deps import (
     get_auto_grab_enabled,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
+    get_downloads_host_root,
     get_eviction_enabled,
     get_eviction_filesystem,
     get_eviction_grace_days,
@@ -318,6 +319,7 @@ async def _autograb_once(app: FastAPI) -> None:
             profile=get_quality_profile(),
             qbt=qbt,
             cooldowns=_get_autograb_cooldowns(app),
+            save_path=get_downloads_host_root(),
         )
     # Surface how many scopes are CURRENTLY in a grab-pipeline cooldown (ADR-0013
     # round-3 #2), independent of the ok/error verdict below: a non-zero count is the
