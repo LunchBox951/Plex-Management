@@ -191,10 +191,36 @@ def _drop_corrupt_setting(out: dict[str, str | None], key: str, value: str) -> N
     out[key] = None
 
 
-def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None]:
-    """Null any stored typed value that would otherwise 500 ``GET /settings``.
+def _save_would_reject(key: str, value: str) -> bool:
+    """Whether ``PUT /settings`` would reject this stored value on the next save.
 
-    A hand-edited or pre-migration-corrupt stored value can fail in two ways
+    Re-validates the raw stored string through the SAME ``SettingsUpdate`` model
+    the write path uses, so the sanitizer's accept set can never drift from the
+    endpoint's own ``ge``/``gt``/``le`` bounds (issue #92). A finite BUT
+    out-of-range stored value passes the shape/finiteness checks above yet is one
+    ``GET`` must NOT echo: e.g. a hand-edited ``eviction_interval_minutes=10081``
+    (past the 7-day ceiling), ``disk_pressure_threshold_percent=150`` (past 100),
+    or ``eviction_grace_days=3651`` (past the ~10-year cap) -- the matching
+    ``web.deps`` getter already degrades each of these to its default at runtime,
+    and ``PUT`` rejects them with a 422, so surfacing the raw number would only
+    make the Settings page display (and re-submit) a value the API refuses the
+    instant the operator saves the otherwise-unchanged form. Validating a
+    single-field ``{key: value}`` dict is safe: the disk-pressure cross-field
+    ``model_validator`` no-ops unless BOTH sides are present, and no other field's
+    validator is triggered. Only ``ValidationError`` is treated as a reject --
+    never swallowing an unexpected error (north star #3).
+    """
+    try:
+        SettingsUpdate.model_validate({key: value})
+    except ValidationError:
+        return True
+    return False
+
+
+def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None]:
+    """Null any stored typed value ``GET /settings`` cannot honestly present.
+
+    A hand-edited or pre-migration-corrupt stored value can fail in three ways
     that ``SettingsResponse.model_validate`` alone does not catch:
 
     * unparsable / wrong-shape (``"abc"`` for a float, ``"1.5"`` for an int,
@@ -205,12 +231,19 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
       allow_nan=False)``, which raises ``ValueError`` on a non-finite float at
       SERIALIZATION time -- after validation has already succeeded, so no
       ``except ValidationError`` here would ever catch it.
+    * finite BUT out-of-range (``"10081"`` for ``eviction_interval_minutes``,
+      ``"150"`` for ``disk_pressure_threshold_percent``, ``"3651"`` for a
+      bounded int) -- coerces and serialises fine, so neither check above
+      catches it, yet the typed ``web.deps`` getter falls back to its default
+      and ``PUT`` 422s it. Nulled via :func:`_save_would_reject` so GET never
+      echoes a value the write path rejects (issue #92).
 
-    Both failure modes would otherwise 500 the whole ``GET /settings``
-    response over a single corrupt field. Degrading just that field to
-    ``None`` (unset) mirrors what the corresponding ``web.deps`` getter
-    already does at runtime (falls back to its default) -- honest, visible
-    (WARNING logged), never a crash.
+    All three failure modes would otherwise either 500 the whole ``GET
+    /settings`` response over a single corrupt field or present a value the API
+    refuses on the next save. Degrading just that field to ``None`` (unset)
+    mirrors what the corresponding ``web.deps`` getter already does at runtime
+    (falls back to its default) -- honest, visible (WARNING logged), never a
+    crash and never a value the operator cannot re-save.
     """
     out = dict(raw)
     for key in _FLOAT_TYPED_SETTING_KEYS:
@@ -222,7 +255,10 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
         except ValidationError:
             _drop_corrupt_setting(out, key, value)
             continue
-        if not math.isfinite(parsed):
+        # ``math.isfinite`` is the serialization-crash guard (kept explicit so a
+        # future UNBOUNDED float field still cannot 500 GET); ``_save_would_reject``
+        # adds the finite out-of-range bounds parity.
+        if not math.isfinite(parsed) or _save_would_reject(key, value):
             _drop_corrupt_setting(out, key, value)
     for key in _INT_TYPED_SETTING_KEYS:
         value = out.get(key)
@@ -231,6 +267,9 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
         try:
             _INT_SETTING_ADAPTER.validate_python(value)
         except ValidationError:
+            _drop_corrupt_setting(out, key, value)
+            continue
+        if _save_would_reject(key, value):
             _drop_corrupt_setting(out, key, value)
     for key in _BOOL_TYPED_SETTING_KEYS:
         value = out.get(key)

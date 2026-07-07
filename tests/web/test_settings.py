@@ -1381,6 +1381,77 @@ async def test_get_settings_preserves_valid_typed_values(
     assert body["log_retention_days"] == 3
 
 
+@pytest.mark.parametrize(
+    ("field", "over_limit"),
+    [
+        # Finite, in-shape, JSON-serialisable -- so the unparsable/non-finite
+        # checks alone all pass it -- yet each is out of the SettingsUpdate bound
+        # the write path enforces, so PUT would 422 it and the getter degrades it.
+        ("eviction_interval_minutes", str(EVICTION_INTERVAL_MAX_MINUTES + 1)),  # past 7-day cap
+        ("eviction_interval_minutes", "0"),  # gt=0 -- exclusive lower bound
+        ("disk_pressure_threshold_percent", "150"),  # past le=100
+        ("disk_pressure_target_percent", "-1"),  # below ge=0
+        ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1)),  # past the ~10-year cap
+        ("log_retention_days", str(LOG_RETENTION_DAYS_MAX + 1)),
+    ],
+)
+async def test_get_settings_nulls_finite_out_of_range_typed_values(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    over_limit: str,
+) -> None:
+    """A finite but out-of-bounds stored value coerces and serialises fine, so
+    the non-finite check alone would let GET echo a number PUT rejects on the
+    next save. It must be degraded to null (unset), matching the typed getter's
+    runtime fallback -- otherwise the Settings page displays (and re-submits) a
+    value the API refuses the instant the operator saves the unchanged form."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set(field, over_limit)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body[field] is None
+    # An unrelated, in-range plaintext field is untouched by the sanitizer.
+    assert body["plex_url"] == "http://plex.example.com:32400"
+
+
+async def test_get_settings_preserves_boundary_typed_values(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The inclusive bounds themselves are valid values PUT accepts -- GET must
+    preserve a stored value sitting exactly AT a ceiling (or the ge=0 floor),
+    never over-null it as if it were out of range."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    boundary: dict[str, str] = {
+        "disk_pressure_threshold_percent": "100",  # le=100, inclusive
+        "disk_pressure_target_percent": "0",  # ge=0, inclusive
+        "eviction_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),  # le, inclusive
+        "eviction_grace_days": str(EVICTION_GRACE_DAYS_MAX),
+        "log_retention_days": str(LOG_RETENTION_DAYS_MAX),
+    }
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        for key, value in boundary.items():
+            await store.set(key, value)
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["disk_pressure_threshold_percent"] == 100.0
+    assert body["disk_pressure_target_percent"] == 0.0
+    assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
+    assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+
+
 def test_typed_setting_key_groups_cover_all_typed_response_fields() -> None:
     """Parity guard (mirrors ``test_every_known_setting_key_has_a_response_and_
     update_field`` above): the union of the three ``_*_TYPED_SETTING_KEYS``
