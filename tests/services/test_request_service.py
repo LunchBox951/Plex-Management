@@ -463,6 +463,10 @@ async def test_create_request_after_eviction_re_grabs_when_plex_still_reports_pr
     assert fresh.id != evicted_id
     # Re-grabbed, NOT minted 'available' over the file the sweep is deleting.
     assert fresh.status == RequestStatus.pending.value
+    # Issue #156's provenance marker: this row exists BECAUSE the eviction guard
+    # fired, distinguishing it from an ordinary/forced request so the eviction
+    # restore's redundant-regrab dedup cancels only its OWN re-grabs.
+    assert fresh.eviction_regrab is True
 
     async with sessionmaker_() as session:
         rows = (
@@ -527,6 +531,10 @@ async def test_create_request_after_whole_show_eviction_re_grabs_when_plex_stale
             .all()
         )
     assert {r.season_number: r.status.value for r in rows} == {1: "pending", 2: "pending"}
+    # Issue #156's provenance marker: both seasons exist BECAUSE the season-level
+    # eviction guard fired (Plex still lists them, but the newest tracked history
+    # per season is 'evicted') -- never for an ordinary season create.
+    assert all(r.eviction_regrab for r in rows)
 
 
 async def test_create_request_never_returns_a_stale_leftover_available_row_in_the_window(
@@ -567,6 +575,7 @@ async def test_create_request_never_returns_a_stale_leftover_available_row_in_th
 
     assert fresh.id != stale_id  # the stale leftover row is NOT handed back
     assert fresh.status == RequestStatus.pending.value  # a real re-grab
+    assert fresh.eviction_regrab is True  # issue #156's provenance marker
     async with sessionmaker_() as session:
         rows = (
             (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 660)))
@@ -2154,6 +2163,11 @@ async def test_force_create_bypasses_in_library_short_circuit_creates_pending(
         )
     assert len(rows) == 1
     assert rows[0].status is RequestStatus.pending
+    # Issue #156: a force re-acquire NEVER carries the eviction-guard provenance
+    # marker -- it deliberately skips ``latest_request_evicted`` entirely (the
+    # ``if not force`` gate), so the eviction restore's redundant-regrab dedup
+    # must never mistake this deliberate operator re-acquire for its own re-grab.
+    assert rows[0].eviction_regrab is False
 
     # Contrast: identical library presence, but no ``force`` -- the normal
     # already-in-library short-circuit still fires.

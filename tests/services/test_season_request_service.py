@@ -266,8 +266,15 @@ async def test_ensure_seasons_rearm_loses_cleanly_to_a_concurrent_recovery_resto
         season_number: int,
         *,
         status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
-        record = await real_ensure(self, media_request_id, season_number, status=status)
+        record = await real_ensure(
+            self,
+            media_request_id,
+            season_number,
+            status=status,
+            eviction_regrab=eviction_regrab,
+        )
         # The stale pre-restore snapshot: this caller read the row as 'evicted'
         # a moment before the recovery restore committed 'available'.
         return record.model_copy(update={"status": RequestStatus.evicted.value})

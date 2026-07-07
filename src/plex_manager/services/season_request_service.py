@@ -399,8 +399,18 @@ async def ensure_seasons(
     # they re-grab ('pending') instead. Only queried when Plex reported SOMETHING
     # present -- otherwise every season is 'pending' regardless, nothing to subtract.
     trusted_present = present
+    # The season-level provenance marker (issue #156): a season present in Plex
+    # but subtracted from ``trusted_present`` because its newest tracked history is
+    # ``evicted`` is exactly this function's OWN eviction-guard re-grab (a NEW
+    # season row created 'pending' instead of a stale-Plex 'available' -- the
+    # wholly-evicted-show shape, tracked under a fresh ``MediaRequest``). A season
+    # simply never in ``present`` at all is an ordinary create, unrelated to
+    # eviction, and must NOT carry the marker.
+    evicted_regrab_seasons: frozenset[int] = frozenset()
     if present:
-        trusted_present = present - await season_repo.evicted_seasons(tmdb_id)
+        evicted_seasons = await season_repo.evicted_seasons(tmdb_id)
+        trusted_present = present - evicted_seasons
+        evicted_regrab_seasons = present & evicted_seasons
     records: list[SeasonRequestRecord] = []
     re_armed_evicted = False
     for season_number in seasons:
@@ -409,7 +419,12 @@ async def ensure_seasons(
             if season_number in trusted_present
             else RequestStatus.pending.value
         )
-        record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
+        record = await season_repo.ensure(
+            media_request_id,
+            season_number,
+            status=initial_status,
+            eviction_regrab=season_number in evicted_regrab_seasons,
+        )
         if record.status == RequestStatus.evicted.value:
             # The re-arm is a CAS from EXACTLY the status ensure() just read --
             # the same write discipline as every other status move in the

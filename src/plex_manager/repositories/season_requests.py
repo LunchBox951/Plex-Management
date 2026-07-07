@@ -48,6 +48,9 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         library_path=row.library_path,
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
+        # NULL (every pre-migration row) reads as ``False`` -- the safe default
+        # (see ``SeasonRequest.eviction_regrab``'s docstring in ``models.py``).
+        eviction_regrab=bool(row.eviction_regrab),
     )
 
 
@@ -324,16 +327,25 @@ class SqlSeasonRequestRepository:
         await self._session.flush()
 
     async def ensure(
-        self, media_request_id: int, season_number: int, *, status: str
+        self,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
         existing = await self._find(media_request_id, season_number)
         if existing is not None:
+            # ``eviction_regrab`` is ONLY the value used on first creation, exactly
+            # like ``status`` above (see the docstring) -- an already-established
+            # season's provenance marker is never retroactively applied here.
             return _to_record(existing, await self._tmdb_id_for(media_request_id))
 
         row = SeasonRequest(
             media_request_id=media_request_id,
             season_number=season_number,
             status=RequestStatus(status),
+            eviction_regrab=eviction_regrab,
         )
         try:
             # A SAVEPOINT (not a full transaction rollback): on IntegrityError only

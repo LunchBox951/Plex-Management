@@ -597,6 +597,16 @@ async def create_request_result(
             raise NoAiredSeasonsError(tmdb_id)
 
     initial_status = RequestStatus.pending.value
+    # Provenance marker (issue #156): set ``True`` ONLY when the ``latest_request_
+    # evicted`` guard below actually fires and this call falls through to a fresh
+    # 'pending' create INSTEAD of trusting Plex's stale 'present' reading -- i.e.
+    # exactly this app's own eviction-guard re-grab, never an ordinary request for
+    # a movie that was simply never in the library, and never a ``force`` (#148)
+    # re-acquire (which skips this guard entirely, see the ``if not force`` branch
+    # below). Threaded into ``repo.create`` so the eviction restore's redundant-
+    # regrab dedup (``eviction_service._cancel_redundant_movie_regrabs``) can tell
+    # its OWN re-grab apart from a deliberate operator re-acquire.
+    movie_eviction_regrab = False
     if (
         library is not None
         and media_type == "movie"
@@ -673,6 +683,7 @@ async def create_request_result(
                     "the eviction delete window",
                     extra={"tmdb_id": safe_int(tmdb_id)},
                 )
+                movie_eviction_regrab = True
             else:
                 in_library = await repo.find_in_library(
                     tmdb_id,
@@ -830,6 +841,7 @@ async def create_request_result(
             user_id=user_id,
             poster_url=detail.poster_url,
             backdrop_url=detail.backdrop_url,
+            eviction_regrab=movie_eviction_regrab,
         )
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.

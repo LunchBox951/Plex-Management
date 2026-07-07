@@ -66,6 +66,11 @@ class RequestRecord(BaseModel):
     # TV mirror lives on ``SeasonRequestRecord``.
     search_attempts: int = 0
     next_search_at: datetime | None = None
+    # Provenance marker (ADR-0012, issue #156): ``True`` only for a row THIS app's
+    # own eviction-guard fall-through created -- never an operator-initiated
+    # request (in particular never a #148 forced re-acquire). See
+    # ``MediaRequest.eviction_regrab``'s docstring for the full rationale.
+    eviction_regrab: bool = False
 
 
 class DownloadRecord(BaseModel):
@@ -117,6 +122,12 @@ class SeasonRequestRecord(BaseModel):
     # per-season, so the backoff ladder is tracked here.
     search_attempts: int = 0
     next_search_at: datetime | None = None
+    # The season-level mirror of ``RequestRecord.eviction_regrab`` (issue #156):
+    # ``True`` only for a season row ``season_request_service.ensure_seasons``
+    # created because Plex reported it present yet its newest tracked history was
+    # ``evicted`` -- the season-level eviction guard's own re-grab. See
+    # ``SeasonRequest.eviction_regrab``'s docstring.
+    eviction_regrab: bool = False
 
 
 class BlocklistRecord(BaseModel):
@@ -292,8 +303,15 @@ class RequestRepository(Protocol):
         user_id: int | None = None,
         poster_url: str | None = None,
         backdrop_url: str | None = None,
+        eviction_regrab: bool = False,
     ) -> RequestRecord:
-        """Insert a new request and return the persisted record."""
+        """Insert a new request and return the persisted record.
+
+        ``eviction_regrab`` (issue #156) stamps the provenance marker: ``True``
+        only when THIS insert is the eviction-guard fall-through (``request_
+        service.create_request``'s ``latest_request_evicted`` branch), never for
+        an ordinary or forced (#148) request.
+        """
         raise NotImplementedError
 
     async def set_status(self, request_id: int, status: str) -> None:
@@ -533,13 +551,20 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def ensure(
-        self, media_request_id: int, season_number: int, *, status: str
+        self,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
         """Idempotently return the ``(media_request_id, season_number)`` row.
 
         Creates it with ``status`` if it does not yet exist; if it already exists,
         returns the EXISTING row unchanged (``status`` is only the value used on
         first creation, never applied to an already-established season).
+        ``eviction_regrab`` (issue #156) is likewise only applied on first
+        creation -- see ``SeasonRequest.eviction_regrab``'s docstring.
 
         Race-safe under the unconditional ``uq_season_requests_media_season``
         unique index: two callers racing to lazily-create the SAME season resolve

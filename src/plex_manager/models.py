@@ -359,6 +359,18 @@ class MediaRequest(Base):
     # the manual grab path never reads or writes them.
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Provenance marker (issue #156): ``True`` ONLY for a movie row this app's OWN
+    # eviction-guard fall-through created (``request_service.create_request``'s
+    # ``latest_request_evicted`` branch, ADR-0012) -- never for an operator-
+    # initiated request, and in particular never for a #148 forced re-acquire
+    # (which explicitly skips that guard). The eviction restore's redundant-regrab
+    # dedup (``eviction_service._cancel_redundant_movie_regrabs``) reads this so it
+    # cancels only regrabs IT ITSELF is responsible for, never a deliberate
+    # operator re-acquire that happens to be pre-grab in the same instant.
+    # Nullable: every pre-existing row (and any row inserted outside this app's own
+    # create path) reads ``NULL`` -- treated as "not an eviction regrab", the safe
+    # default that never triggers an unintended cancel.
+    eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
 
 
 class RequestDedupLock(Base):
@@ -418,6 +430,17 @@ class SeasonRequest(Base):
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
+    # ONLY for a season row ``season_request_service.ensure_seasons`` created because
+    # Plex reported it present yet its newest tracked history was ``evicted`` --
+    # the season-level eviction guard's own re-grab. A season NEWLY created for any
+    # other reason (never before tracked, or a genuinely fresh season not in the
+    # ``evicted_seasons`` set) stays ``NULL``/``False``. The eviction restore's
+    # redundant-sibling-regrab dedup (``eviction_service._cancel_redundant_season_
+    # regrabs``) reads this so it cancels only ITS OWN re-grabs, never an unrelated
+    # concurrent tracked season for the same show. Nullable for the same
+    # backward-compat reason as the movie mirror.
+    eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
 
 
 class Download(Base):

@@ -80,6 +80,10 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         keep_forever=bool(row.keep_forever),
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
+        # NULL (every pre-migration row, or one inserted outside this app's own
+        # create path) reads as ``False`` -- "not an eviction regrab" is the safe
+        # default (see the column's docstring in ``models.py``).
+        eviction_regrab=bool(row.eviction_regrab),
     )
 
 
@@ -465,6 +469,7 @@ class SqlRequestRepository:
         user_id: int | None = None,
         poster_url: str | None = None,
         backdrop_url: str | None = None,
+        eviction_regrab: bool = False,
     ) -> RequestRecord:
         row = MediaRequest(
             tmdb_id=tmdb_id,
@@ -476,6 +481,7 @@ class SqlRequestRepository:
             user_id=user_id,
             poster_url=poster_url,
             backdrop_url=backdrop_url,
+            eviction_regrab=eviction_regrab,
         )
         self._session.add(row)
         await self._session.flush()
