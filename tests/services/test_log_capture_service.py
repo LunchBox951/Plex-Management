@@ -474,6 +474,7 @@ class _FailingRepo:
         correlation_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> LogEventPage:
         raise NotImplementedError
 

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from plex_manager.models import LogEvent
 from plex_manager.ports.repositories import LogEventCreate
@@ -71,6 +72,55 @@ async def test_create_many_is_a_noop_for_an_empty_sequence(session: AsyncSession
     repo = SqlLogEventRepository(session)
     await repo.create_many([])
     assert (await session.execute(select(LogEvent))).scalars().all() == []
+
+
+async def test_create_many_issues_a_single_batched_insert(
+    session: AsyncSession, engine: AsyncEngine
+) -> None:
+    """Regression for #98: the old path (ORM ``add_all`` + flush) issued one
+    INSERT per row. A single Core ``executemany`` must emit exactly one
+    ``log_events`` INSERT statement carrying all rows' parameter sets, not N
+    round trips -- and the rows must still round-trip identically."""
+    repo = SqlLogEventRepository(session)
+    events = [
+        LogEventCreate(
+            created_at=_T0 + timedelta(seconds=i),
+            level="INFO",
+            logger="plex_manager.services.reconciler",
+            message=f"tick {i}",
+            context={"tmdb_id": i} if i else None,
+        )
+        for i in range(3)
+    ]
+
+    insert_calls: list[tuple[bool, int]] = []
+
+    def _capture(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> None:
+        if statement.strip().lower().startswith("insert") and "log_events" in statement.lower():
+            insert_calls.append((executemany, len(list(parameters))))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+    try:
+        await repo.create_many(events)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    assert len(insert_calls) == 1  # one statement, not one per row
+    executemany, param_set_count = insert_calls[0]
+    assert executemany is True
+    assert param_set_count == 3
+
+    page = await repo.list_events(limit=10)
+    ordered = sorted(page.results, key=lambda row: row.message)
+    assert [row.message for row in ordered] == ["tick 0", "tick 1", "tick 2"]
+    assert [row.created_at for row in ordered] == [
+        _T0,
+        _T0 + timedelta(seconds=1),
+        _T0 + timedelta(seconds=2),
+    ]
+    assert [row.context for row in ordered] == [None, {"tmdb_id": 1}, {"tmdb_id": 2}]
 
 
 async def test_list_events_filters_by_level(session: AsyncSession) -> None:
@@ -182,6 +232,25 @@ async def test_list_events_orders_newest_first_and_paginates(session: AsyncSessi
 
     page2 = await repo.list_events(limit=2, offset=2)
     assert [row.message for row in page2.results] == ["m2", "m1"]
+
+
+async def test_list_events_oldest_first_selects_the_earliest_rows(session: AsyncSession) -> None:
+    """The #96 repo-layer selection: with ``oldest_first=True`` a cap smaller
+    than the window keeps the OLDEST N ascending (not the newest) -- the
+    ordering ``GET /ops/logs/export`` relies on to preserve the root-cause
+    lead-up when a window is truncated."""
+    repo = SqlLogEventRepository(session)
+    for i in range(5):
+        await repo.create(
+            level="INFO", logger="a", message=f"m{i}", created_at=_T0 + timedelta(seconds=i)
+        )
+
+    page = await repo.list_events(limit=2, oldest_first=True)
+    assert page.total == 5
+    assert [row.message for row in page.results] == ["m0", "m1"]
+
+    page2 = await repo.list_events(limit=2, offset=2, oldest_first=True)
+    assert [row.message for row in page2.results] == ["m2", "m3"]
 
 
 async def test_prune_older_than_deletes_only_stale_rows_and_returns_count(
