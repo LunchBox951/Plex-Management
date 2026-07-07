@@ -304,11 +304,13 @@ export interface paths {
          *     ``since`` through now (``since`` omitted defaults to the last 24h) — when
          *     both are supplied, ``correlation_id`` wins (a specific id's whole trail is
          *     the more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal
-         *     safety cap, not a policy setting) with an honest trailing note when
-         *     truncated. Rendered OLDEST-first (a coherent top-to-bottom story), unlike
-         *     the newest-first ``GET /logs`` list. ``Content-Disposition: attachment`` so
-         *     navigating straight to this URL downloads a file; a caller reading the body
-         *     via ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+         *     safety cap, not a policy setting); when the matching window exceeds the
+         *     cap, the OLDEST rows are kept (the root-cause lead-up survives) and the
+         *     newest overflow is what's dropped, with an honest trailing note. Rendered
+         *     OLDEST-first (a coherent top-to-bottom story), unlike the newest-first
+         *     ``GET /logs`` list. ``Content-Disposition: attachment`` so navigating
+         *     straight to this URL downloads a file; a caller reading the body via
+         *     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
          */
         get: operations["export_logs_endpoint_api_v1_ops_logs_export_get"];
         put?: never;

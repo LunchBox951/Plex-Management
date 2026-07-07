@@ -34,7 +34,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import ColumnElement, CursorResult, String, delete, func, or_, select
+from sqlalchemy import ColumnElement, CursorResult, String, delete, func, insert, or_, select
 from sqlalchemy import cast as sql_cast
 
 from plex_manager.models import LogEvent
@@ -125,18 +125,20 @@ class SqlLogEventRepository:
     async def create_many(self, events: Sequence[LogEventCreate]) -> None:
         if not events:
             return
-        rows = [
-            LogEvent(
-                created_at=event.created_at,
-                level=event.level,
-                logger=event.logger,
-                message=event.message,
-                context_json=event.context,
-            )
+        # A Core executemany (one statement, driver-batched) instead of N
+        # ORM-tracked inserts -- the drain task's only caller discards the
+        # return, so no per-row RETURNING/refresh is needed (see #98).
+        values: list[dict[str, Any]] = [
+            {
+                "created_at": event.created_at,
+                "level": event.level,
+                "logger": event.logger,
+                "message": event.message,
+                "context_json": event.context,
+            }
             for event in events
         ]
-        self._session.add_all(rows)
-        await self._session.flush()
+        await self._session.execute(insert(LogEvent), values)
 
     async def list_events(
         self,
@@ -147,6 +149,7 @@ class SqlLogEventRepository:
         correlation_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> LogEventPage:
         filters: list[ColumnElement[bool]] = []
         if level is not None:
@@ -166,14 +169,17 @@ class SqlLogEventRepository:
         stmt = select(LogEvent)
         if filters:
             stmt = stmt.where(*filters)
-        # Newest first (a log viewer's default read direction); ``id`` breaks
-        # ties between rows a single batch-insert stamped with the identical
-        # ``created_at`` -- an application-supplied, not DB-assigned, value.
-        stmt = (
-            stmt.order_by(LogEvent.created_at.desc(), LogEvent.id.desc())
-            .limit(limit)
-            .offset(offset)
-        )
+        # Newest first by default (a log viewer's default read direction);
+        # ``oldest_first`` flips both columns for the export endpoint, which
+        # needs the OLDEST matching rows kept when a window exceeds its cap
+        # (#96). Either way ``id`` breaks ties between rows a single
+        # batch-insert stamped with the identical ``created_at`` -- an
+        # application-supplied, not DB-assigned, value.
+        if oldest_first:
+            stmt = stmt.order_by(LogEvent.created_at.asc(), LogEvent.id.asc())
+        else:
+            stmt = stmt.order_by(LogEvent.created_at.desc(), LogEvent.id.desc())
+        stmt = stmt.limit(limit).offset(offset)
         rows = (await self._session.execute(stmt)).scalars().all()
         return LogEventPage(total=total, results=[_to_record(row) for row in rows])
 

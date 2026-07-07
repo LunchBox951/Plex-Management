@@ -695,8 +695,9 @@ class LogEventRepository(Protocol):
         correlation_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> LogEventPage:
-        """Return a page of log records, newest first, optionally filtered.
+        """Return a page of log records, newest first by default, optionally filtered.
 
         ``level`` matches the exact stored level name (e.g. ``"ERROR"``) --
         mirrors the plain-string status filters elsewhere in this module, no
@@ -707,6 +708,12 @@ class LogEventRepository(Protocol):
         -- the same identifiers ``GET /ops/logs/export`` assembles one trail for.
         ``limit``/``offset`` page the (already filtered) result set; ``total`` on
         the returned page is the filtered count, not the whole table's.
+
+        ``oldest_first`` defaults to ``False`` (newest-first, unchanged). When
+        ``True``, rows are ordered ``created_at ASC, id ASC`` instead -- the
+        ordering ``GET /ops/logs/export`` uses so that a window exceeding the
+        export cap keeps the OLDEST matching rows (the root-cause lead-up),
+        not the newest (see issue #96).
         """
         raise NotImplementedError
 
