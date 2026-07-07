@@ -30,6 +30,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
+from plex_manager.services import path_visibility
 from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
@@ -107,20 +108,26 @@ def _low_confidence_mount_root(path: str, mounts: Sequence[str]) -> str | None:
     (issue: a whole-library bind root like ``/srv/plex-data`` -> ``/media`` has no
     component below the mount AND its basename need not equal the mount's, so the
     zero-suffix match -- which requires a basename match to keep ``None`` honest for
-    a typo'd root -- can't accept it). When EXACTLY ONE library mount exists (so
-    WHICH mount is unambiguous) and it is a real directory, that mount root is a
-    plausible target for a Plex-reported (never hand-typed) library location. It is
-    returned as a suggestion the operator must EXPLICITLY confirm, never silently
-    applied -- the write-time gate stays strict, so a hand-typed typo is still
-    rejected. ``None`` when the mount is ambiguous (0 or >1 real dirs) or ``path``
-    is empty.
+    a typo'd root -- can't accept it). When EXACTLY ONE library mount is LIVE (so
+    WHICH mount is unambiguous), that mount root is a plausible target for a
+    Plex-reported (never hand-typed) library location. It is returned as a
+    suggestion the operator must EXPLICITLY confirm, never silently applied -- the
+    write-time gate stays strict, so a hand-typed typo is still rejected. ``None``
+    when the mount is ambiguous (0 or >1 live mounts) or ``path`` is empty.
+
+    A mount counts only under :func:`~plex_manager.services.path_visibility.
+    is_live_mount` (a genuinely MOUNTED volume), never a bare ``isdir``: stock
+    Ubuntu/Debian ship an empty ``/media`` directory on the root filesystem, so an
+    ``isdir`` gate would offer a bogus ``/media`` suggestion for every
+    unresolvable Plex path on a bare-metal (non-Docker) install -- behaviour that
+    silently differs by host distro (the CI-vs-dev-box split that exposed this).
     """
     if not path:
         return None
-    real_mounts = [m for m in mounts if m and os.path.isdir(m)]
-    if len(real_mounts) != 1:
+    live_mounts = [m for m in mounts if m and path_visibility.is_live_mount(m)]
+    if len(live_mounts) != 1:
         return None
-    return real_mounts[0]
+    return live_mounts[0]
 
 
 def library_options(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -171,7 +172,9 @@ async def test_put_remaps_host_root_to_container_path(
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
     # Library roots are remapped under the LIBRARY mounts only (never /downloads).
+    # tmp dirs are never mount points, so relax the live-mount gate (the test seam).
     monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     await seed(initialized=True, app_api_key=_API_KEY)
 
     put = await client.put(

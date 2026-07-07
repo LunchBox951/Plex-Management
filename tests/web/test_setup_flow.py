@@ -19,6 +19,7 @@ object, a ``/resources`` ARRAY), matching ``tests/web/test_auth_plex.py`` and
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -658,7 +659,9 @@ async def test_complete_remaps_a_host_root_to_the_container_path(
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
     # Library roots are remapped under the LIBRARY mounts only (never /downloads).
+    # tmp dirs are never mount points, so relax the live-mount gate (the test seam).
     monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
     await _use_transport(

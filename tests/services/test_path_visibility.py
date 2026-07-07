@@ -1,6 +1,11 @@
 """``remap_to_visible`` -- host-namespace path -> container-visible path
 (issues #131/#132/#133). Table-driven where natural, over real ``tmp_path`` dirs
 so the ``predicate`` probes are genuine, not mocked.
+
+Most tests use plain ``tmp_path`` directories as stand-in mounts, so the autouse
+fixture below relaxes :func:`path_visibility.is_live_mount` to ``os.path.isdir``;
+the "live mount gate" section restores the REAL gate to prove a stock distro's
+plain ``/media``-like directory never counts as a mount.
 """
 
 from __future__ import annotations
@@ -16,6 +21,24 @@ from plex_manager.services.path_visibility import (
     remap_library_root,
     remap_to_visible,
 )
+
+# Captured at import time, BEFORE the autouse fixture patches the module attr, so
+# the live-mount-gate tests below can exercise the real predicate.
+_REAL_IS_LIVE_MOUNT = path_visibility.is_live_mount
+
+
+@pytest.fixture(autouse=True)
+def tmp_dirs_count_as_mounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let plain tmp_path directories stand in as the container mounts.
+
+    Production gates every KNOWN mount on ``is_live_mount`` (isdir AND ismount) so
+    a stock distro's plain ``/media`` directory never counts (the tests-py314 CI
+    regression: Ubuntu runners HAVE a plain ``/media``, the Arch dev box doesn't,
+    so behaviour differed by host). ``tmp_path`` fixtures are ordinary dirs, never
+    mount points, so these unit tests relax the gate to ``isdir`` -- the documented
+    test seam -- and the dedicated live-mount-gate tests restore the real one.
+    """
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
 
 
 def test_returns_original_when_already_visible(tmp_path: Path) -> None:
@@ -240,3 +263,53 @@ def test_remap_library_root_uses_library_mounts_and_the_mount_root(
     monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(download_mount),))
     # Resolves to the LIBRARY mount root, never the same-named subtree of downloads.
     assert remap_library_root("/host/media") == str(library_mount)
+
+
+# --------------------------------------------------------------------------- #
+# live mount gate — a plain directory NEVER counts as one of the app's mounts
+# --------------------------------------------------------------------------- #
+def test_is_live_mount_requires_a_real_mount_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(path_visibility, "is_live_mount", _REAL_IS_LIVE_MOUNT)
+    # ``/`` is the one path guaranteed to be a mount point on every POSIX host.
+    assert path_visibility.is_live_mount("/") is True
+    assert path_visibility.is_live_mount(str(tmp_path)) is False  # plain dir
+    assert path_visibility.is_live_mount(str(tmp_path / "missing")) is False
+
+
+def test_a_plain_directory_never_counts_as_a_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI regression (tests-py314): stock Ubuntu/Debian ship a plain ``/media``
+    DIRECTORY on the root filesystem, so any mount gate based on bare ``isdir``
+    made every remap/suggestion environment-dependent -- the local (Arch, no
+    ``/media``) gates passed while CI failed, and a bare-metal Ubuntu install
+    would have had unresolvable paths remapped onto a directory nothing is
+    mounted at. With the REAL gate, a plain dir -- even with a matching subtree
+    or a matching basename -- never participates in any remap."""
+    monkeypatch.setattr(path_visibility, "is_live_mount", _REAL_IS_LIVE_MOUNT)
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    # Deep-suffix match: the matching subtree exists, but the "mount" is a plain dir.
+    assert remap_to_visible("/host/Media/Movies", [str(mount)]) is None
+    # Zero-suffix bind-root match: basename matches, still a plain dir.
+    assert remap_to_visible("/srv/media", [str(mount)], allow_mount_root=True) is None
+    # Content remap: both the anchored save-dir path and the bind-root fallback.
+    video = mount / "movies" / "Foo.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    assert (
+        remap_download_content(
+            "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", candidate_mounts=(str(mount),)
+        )
+        is None
+    )
+    assert (
+        remap_download_content(
+            "/host/qbt/movies/Foo.mkv", "/host/qbt", candidate_mounts=(str(mount),)
+        )
+        is None
+    )
+    # An already-visible path is untouched by the gate (step 1 needs no mount).
+    assert remap_to_visible(str(mount / "Movies"), [str(mount)]) == str(mount / "Movies")

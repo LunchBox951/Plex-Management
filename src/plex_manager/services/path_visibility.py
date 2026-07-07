@@ -11,8 +11,11 @@ sitting right there, one mount away.
 
 :func:`remap_to_visible` is the single shared fix: try the path as given, then
 suffix-match its trailing path components against the KNOWN container mounts,
-returning the first candidate that satisfies ``predicate``. Lexical + a probe
-only -- no ``realpath``/symlink resolution (the delete-guard's
+returning the first candidate that satisfies ``predicate``. A KNOWN mount
+participates only while it is genuinely a mount point (:func:`is_live_mount`) --
+a stock distro's plain ``/media`` directory never counts, so behaviour cannot
+silently differ between the container topology and a bare-metal host. Lexical +
+a probe only -- no ``realpath``/symlink resolution (the delete-guard's
 ``LocalFileSystem.resolve_guarded`` stays the one symlink-safe authority; this
 module must never be consulted on a delete path).
 """
@@ -29,6 +32,7 @@ __all__ = [
     "KNOWN_CONTAINER_MOUNTS",
     "KNOWN_DOWNLOAD_MOUNTS",
     "KNOWN_LIBRARY_MOUNTS",
+    "is_live_mount",
     "remap_download_content",
     "remap_library_root",
     "remap_to_visible",
@@ -51,6 +55,30 @@ KNOWN_DOWNLOAD_MOUNTS: Final[tuple[str, ...]] = ("/downloads",)
 #: container mount prefixes to strip). Purpose-scoped callers must use the two
 #: lists above, never this union.
 KNOWN_CONTAINER_MOUNTS: Final[tuple[str, ...]] = KNOWN_LIBRARY_MOUNTS + KNOWN_DOWNLOAD_MOUNTS
+
+
+def is_live_mount(path: str) -> bool:
+    """Whether ``path`` counts as one of the app's container mounts RIGHT NOW.
+
+    The ``KNOWN_*`` lists name where docker-compose binds volumes INTO this
+    container; a candidate counts only while it is genuinely a MOUNTED volume
+    (``os.path.ismount``), never merely an existing directory. The distinction is
+    load-bearing for honesty: stock Ubuntu/Debian ship an empty ``/media``
+    directory on the root filesystem, so a bare ``isdir`` gate makes every remap
+    and picker suggestion ENVIRONMENT-dependent -- a bare-metal (non-Docker)
+    install, or a stock CI runner, would treat the distro's empty ``/media`` as
+    the app's library mount and offer/accept bogus remaps into it (e.g. the
+    zero-suffix bind-root match resolving ``/srv/media`` onto a directory nothing
+    is mounted at). In the supported container topology every compose bind/volume
+    IS a real mount point, so this gate changes nothing there while keeping every
+    other host honest. ``isdir`` + ``ismount`` both swallow ``OSError`` (they
+    return ``False``), so an unreadable path is simply not a mount, never a crash.
+
+    Referenced module-qualified by every consumer (including within this module)
+    so tests can ``monkeypatch.setattr(path_visibility, "is_live_mount",
+    os.path.isdir)`` to let plain ``tmp_path`` directories stand in as mounts.
+    """
+    return os.path.isdir(path) and os.path.ismount(path)
 
 
 def remap_to_visible(
@@ -90,6 +118,15 @@ def remap_to_visible(
     4. ``None`` when nothing under any mount satisfies ``predicate`` -- an honest
        "still not visible", never a guess.
 
+    A candidate mount participates in steps 2-3 only while :func:`is_live_mount`
+    holds for it -- a genuinely MOUNTED volume, not merely an existing directory.
+    Without that gate the behaviour is environment-dependent: stock Ubuntu/Debian
+    ship an empty ``/media`` directory, so a bare-metal (non-Docker) install would
+    have its unresolvable paths remapped onto a directory nothing is mounted at
+    (most sharply via the ``allow_mount_root`` case, whose only other bar is a
+    basename match). Step 1 is unaffected: an already-visible path never needed a
+    mount at all.
+
     ``predicate`` defaults to ``os.path.isdir`` (library roots: a fresh root may
     legitimately be empty, so existence is the only bar). Pass
     ``predicate=os.path.exists`` for a download source path (file or dir).
@@ -104,13 +141,17 @@ def remap_to_visible(
         return None
     if probe_original and predicate(path):
         return path
+    # Module-global lookup at CALL time (tests monkeypatch path_visibility.
+    # is_live_mount to let tmp dirs stand in as mounts); probed once per call,
+    # before the per-suffix loop, so each mount costs two stats total.
+    live_mounts = [m for m in candidate_mounts if m and is_live_mount(m)]
+    if not live_mounts:
+        return None
     norm = os.path.normpath(path)
     comps = [c for c in norm.split(os.sep) if c and c not in (".", "..")]
     for length in range(len(comps), 0, -1):
         suffix = comps[-length:]
-        for mount in candidate_mounts:
-            if not mount:
-                continue
+        for mount in live_mounts:
             candidate = os.path.join(mount, *suffix)
             if predicate(candidate):
                 return candidate
@@ -119,9 +160,7 @@ def remap_to_visible(
         # final name matches this path's -- see step 3. Tried only after every
         # deeper suffix so a real subdirectory match always wins first.
         tail = comps[-1]
-        for mount in candidate_mounts:
-            if not mount:
-                continue
+        for mount in live_mounts:
             if os.path.basename(mount.rstrip(os.sep)) == tail and predicate(mount):
                 return mount
     return None
@@ -217,9 +256,11 @@ def remap_download_content(
     # itself BE the download bind-source root (mapped to the mount root, so zero
     # suffix below it). Anchor the remainder under each mount root -- reached ONLY
     # here, AFTER every deeper directory match has failed, so a real category dir is
-    # never bypassed to collapse a deeper file onto a shallow stale one.
+    # never bypassed to collapse a deeper file onto a shallow stale one. The same
+    # is_live_mount gate as remap_to_visible: a stock distro's plain /downloads-like
+    # directory never counts as the app's mount.
     for mount in mounts:
-        if mount and os.path.isdir(mount):
+        if mount and is_live_mount(mount):
             candidate = os.path.join(mount, *remainder)
             if os.path.exists(candidate):
                 return candidate

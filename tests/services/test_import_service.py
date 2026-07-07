@@ -854,7 +854,9 @@ async def test_import_remaps_download_path_under_the_downloads_mount(
     video = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     _make_video(video)
     # Content is remapped under the DOWNLOAD mounts only (never the library mounts).
+    # tmp dirs are never mount points, so relax the live-mount gate (the test seam).
     monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     # qbt (host-side) reports a HOST path with the SAME basename -- the suffix
     # that must remap onto the real file under the mount.
     host_content = Path(
@@ -901,7 +903,10 @@ async def test_import_never_places_a_stale_shorter_suffix_match(
     # shorter-suffix guess would have wrongly matched and placed.
     stale = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     _make_video(stale)
+    # The mount must COUNT for this test to bite (otherwise the block is vacuous):
+    # relax the live-mount gate so the tmp dir stands in as the download mount.
     monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     # qbt (host-side) reports the file under a category save path whose real
     # container mapping (``<mount>/movies/<file>``) does not exist.
     host_content = Path(

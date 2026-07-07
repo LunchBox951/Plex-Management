@@ -10,6 +10,7 @@ admin's plex.tv resources. Every probe is driven through the new admin-session a
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -123,9 +124,13 @@ def test_library_options_probe_flag(tmp_path: Path) -> None:
     assert [o.writable for o in unprobed] == [None, None]
 
 
-def test_library_options_suggests_a_container_remap_for_a_host_path(tmp_path: Path) -> None:
+def test_library_options_suggests_a_container_remap_for_a_host_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
+    # tmp dirs are never mount points: relax the live-mount gate (the test seam).
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     host_section = LibrarySection(
         key="1", title="Movies", type="movie", locations=("/host/Media/Movies",)
     )
@@ -143,7 +148,7 @@ def test_library_options_no_suggestion_when_the_path_already_resolves(tmp_path: 
 
 
 def test_library_options_offers_low_confidence_mount_root_for_a_differing_bind_root(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Finding regression: a whole-library bind root whose basename differs from
     the mount (``PLEX_MANAGER_MEDIA_ROOT=/srv/plex-data`` -> ``/media``, Plex
@@ -154,6 +159,7 @@ def test_library_options_offers_low_confidence_mount_root_for_a_differing_bind_r
     the write gate still stays strict for a hand-typed value."""
     mount = tmp_path / "media"
     mount.mkdir()
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
     bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
     # Pre-init (probe_writable=False): the wizard's own case -- still offered, and
     # never stats the raw caller-supplied path.
@@ -164,13 +170,16 @@ def test_library_options_offers_low_confidence_mount_root_for_a_differing_bind_r
     assert remap_library_root(str(mount)) == str(mount)
 
 
-def test_library_options_no_low_confidence_when_the_mount_is_ambiguous(tmp_path: Path) -> None:
+def test_library_options_no_low_confidence_when_the_mount_is_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Two library mounts: WHICH one the bind root maps to is ambiguous, so no
     # low-confidence guess is offered (the operator must fix mounts / type a path).
     first = tmp_path / "media"
     second = tmp_path / "media2"
     first.mkdir()
     second.mkdir()
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
     bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
     options = library_options(
         [bind_root], probe_writable=False, suggest_mounts=(str(first), str(second))
@@ -179,11 +188,29 @@ def test_library_options_no_low_confidence_when_the_mount_is_ambiguous(tmp_path:
     assert options[0].low_confidence_suggested_path is None
 
 
-def test_library_options_confident_suggestion_suppresses_low_confidence(tmp_path: Path) -> None:
+def test_library_options_no_low_confidence_for_a_plain_unmounted_directory(tmp_path: Path) -> None:
+    """CI regression (tests-py314): stock Ubuntu/Debian ship a plain ``/media``
+    DIRECTORY, so gating the low-confidence suggestion on bare ``isdir`` offered a
+    bogus ``/media`` for every unresolvable Plex path on any non-Docker host --
+    and made the suite's behaviour differ between CI (Ubuntu) and the dev box
+    (Arch). With the REAL ``is_live_mount`` gate (deliberately NOT relaxed here),
+    a plain directory never counts, so no suggestion is offered."""
+    mount = tmp_path / "media"  # a real directory, but nothing is mounted at it
+    mount.mkdir()
+    bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
+    options = library_options([bind_root], probe_writable=False, suggest_mounts=(str(mount),))
+    assert options[0].suggested_path is None
+    assert options[0].low_confidence_suggested_path is None
+
+
+def test_library_options_confident_suggestion_suppresses_low_confidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A real deeper match is CONFIDENT: the low-confidence mount-root fallback is
     # never even computed (a real answer must never be dressed down to a guess).
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
     host_section = LibrarySection(
         key="1", title="Movies", type="movie", locations=("/host/Media/Movies",)
     )
@@ -880,8 +907,10 @@ async def test_validate_plex_attaches_a_container_suggestion_for_a_host_location
     caller-supplied path -- pre-init stays a non-oracle (writable stays UNKNOWN)."""
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
-    # Plex library locations are remapped under the LIBRARY mounts only.
+    # Plex library locations are remapped under the LIBRARY mounts only. tmp dirs
+    # are never mount points, so relax the live-mount gate (the test seam).
     monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     probed: list[str] = []
 
     def spy(path: str) -> bool:
@@ -911,11 +940,22 @@ async def test_validate_plex_attaches_a_container_suggestion_for_a_host_location
 # Settings picker (authenticated) — probes writability, unlike the pre-init step
 # --------------------------------------------------------------------------- #
 async def test_plex_libraries_picker_probes_writability(
-    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The AUTHENTICATED Settings picker uses the operator's OWN stored Plex creds, so
     # the real writability signal is legitimate there and must still be probed — the
     # opposite of the pre-init validate/plex step, which must not touch the filesystem.
+    #
+    # No library mounts: this test asserts the EXACT response JSON, so the remap/
+    # suggestion machinery must be inert regardless of the host — the default
+    # ("/media",) made the expected low_confidence field depend on whether the test
+    # host really has a /media mount (the tests-py314 CI split; a run inside the
+    # actual container would differ too).
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", ())
     await seed(initialized=True, app_api_key=_API_KEY)
     movies_section = LibrarySection(
         key="1", title="Movies", type="movie", locations=(str(tmp_path),)
