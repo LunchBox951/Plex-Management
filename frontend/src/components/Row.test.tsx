@@ -62,7 +62,9 @@ describe('Row quick-request action (issue #42)', () => {
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
     // SHOW is badged, so it gets no Request action of its own.
     expect(screen.queryByRole('button', { name: 'Request Already Requested Show' })).not.toBeInTheDocument()
-    expect(screen.getByText('Requested')).toBeInTheDocument() // the badge on SHOW
+    // The badge on SHOW is now a TileStatusGlyph icon (issue #135), not a text
+    // pill — it still carries the same label via an accessible `role="img"` name.
+    expect(screen.getByRole('img', { name: 'Requested' })).toBeInTheDocument()
   })
 
   it('suppresses the Request action when quickRequestable vetoes, even for a null-state tile', () => {
@@ -177,5 +179,50 @@ describe('Row quick-request action (issue #42)', () => {
     // it — never fires the card's own onSelect.
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
     expect(onSelect).not.toHaveBeenCalled()
+  })
+})
+
+describe('Row quick-request hover-reveal affordance (issue #135)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const REQUEST_MOVIE = 'Request Unbadged Movie'
+
+  it('renders a circular icon button with no visible "Request" text', () => {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    const button = screen.getByRole('button', { name: REQUEST_MOVIE })
+    // The old text pill ("Request") is gone — the accessible name now lives
+    // entirely in aria-label, not in rendered text content.
+    expect(button).toHaveTextContent('')
+  })
+
+  it('stays in the tab order (not `hidden`/`display:none`) while revealed only via opacity', () => {
+    // Solution-1 (issue #135) must not regress keyboard reachability: hiding
+    // the action with `hidden` or `display:none` would drop it from the tab
+    // order entirely. Revealing it via opacity keeps it focusable at all times.
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    const button = screen.getByRole('button', { name: REQUEST_MOVIE })
+    expect(button).not.toHaveAttribute('hidden')
+    expect(button.tabIndex).toBe(0)
+    expect(button).toBeVisible() // jsdom's visibility check: opacity-0 still passes, `hidden` would not
+    // The reveal is opacity-driven, gated on hover OR focus-within — never a
+    // `display`/`visibility` toggle that would also strip it from the tab order.
+    expect(button.className).toContain('opacity-0')
+    expect(button.className).toContain('group-hover:opacity-100')
+    expect(button.className).toContain('group-focus-within:opacity-100')
+  })
+
+  it('can still be focused directly (keyboard users can tab to the hidden-by-default action)', () => {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    const button = screen.getByRole('button', { name: REQUEST_MOVIE })
+    button.focus()
+    expect(button).toHaveFocus()
   })
 })

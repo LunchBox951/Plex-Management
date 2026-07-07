@@ -86,6 +86,21 @@ describe('PosterCard action slot', () => {
  * would only assert today's class spelling, which is brittle theater that
  * breaks on any unrelated Tailwind refactor without catching a regression.
  */
+/**
+ * Issue #135 asked for the status affordance in the bottom-left corner, but
+ * that collides with the title/year caption PosterCard already anchors there
+ * (see the `right-2.5 bottom-2 left-2.5` caption block below) — this
+ * deliberately keeps the badge slot top-left instead (documented tradeoff).
+ */
+describe('PosterCard badge slot placement', () => {
+  it('anchors the badge slot to the top-left corner, not bottom-left', () => {
+    render(<PosterCard title="Movie" badge={<span>●</span>} />)
+    const badgeWrapper = screen.getByText('●').parentElement
+    expect(badgeWrapper).toHaveClass('top-2', 'left-2')
+    expect(badgeWrapper).not.toHaveClass('bottom-2')
+  })
+})
+
 describe('PosterCard details trigger label', () => {
   it('includes the year in the aria-label when provided', () => {
     render(<PosterCard title="Dune" year={2021} onClick={() => {}} />)

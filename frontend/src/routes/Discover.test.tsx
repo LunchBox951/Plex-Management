@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
@@ -210,5 +210,33 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
     ])
     render(<Discover />)
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+  })
+})
+
+describe('Discover — tile status affordance is an icon, not a text pill (issue #135)', () => {
+  it('badges a search-result tile with the icon glyph instead of a visible status pill', async () => {
+    mockRequests([])
+    ;(useDiscoverSearch as unknown as Mock).mockReturnValue({
+      data: { results: [{ ...MOVIE, title: 'Owned Movie', library_state: 'available' }] },
+      isError: false,
+      isFetching: false,
+      dataUpdatedAt: Date.now(),
+    })
+    render(<Discover />)
+
+    fireEvent.change(screen.getByPlaceholderText('Search for a title…'), {
+      target: { value: 'owned' },
+    })
+
+    // The debounced query (300ms) has to land before the search branch renders.
+    await waitFor(
+      () => {
+        expect(screen.getByRole('img', { name: 'In library' })).toBeInTheDocument()
+      },
+      { timeout: 2000 },
+    )
+    // The old StatusBadge rendered the label as visible text — confirm it's gone,
+    // not just that a new element also exists alongside it.
+    expect(screen.queryByText('In library')).not.toBeInTheDocument()
   })
 })
