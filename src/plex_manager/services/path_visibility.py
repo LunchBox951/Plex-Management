@@ -36,6 +36,7 @@ __all__ = [
     "remap_download_content",
     "remap_library_root",
     "remap_to_visible",
+    "resolve_downloads_host_root",
 ]
 
 #: The volumes ``docker-compose.yml`` maps into the container, split BY PURPOSE
@@ -79,6 +80,35 @@ def is_live_mount(path: str) -> bool:
     os.path.isdir)`` to let plain ``tmp_path`` directories stand in as mounts.
     """
     return os.path.isdir(path) and os.path.ismount(path)
+
+
+def resolve_downloads_host_root(configured: str | None) -> str | None:
+    """The HOST-namespace downloads root to direct qBittorrent's ``save_path`` at.
+
+    ``configured`` (``Settings.downloads_root`` / ``PLEX_MANAGER_DOWNLOADS_ROOT`` --
+    the SAME variable docker-compose already uses as the ``/downloads`` bind source;
+    ``env_file: .env`` hands it to this container too, just unread by the app until
+    now) is the ONLY source: the documented deployment's compose file REQUIRES this
+    variable as the ``/downloads`` bind source, so it is always set wherever the
+    container topology (and therefore the host/container split ``save_path``
+    exists to bridge) applies.
+
+    There is deliberately NO ``/proc/self/mountinfo`` fallback. A prior version of
+    this function read mountinfo's ``root`` field (field 4) as a stand-in for the
+    HOST pathname, but that field is the path RELATIVE TO THE MOUNTED FILESYSTEM,
+    not a host-namespace path: for a bind whose source lives on its own disk (the
+    host mounts ``/dev/sdb1`` at ``/mnt/downloads``, then binds
+    ``/mnt/downloads -> /downloads`` into the container), the mount's ``root`` is
+    simply ``/``, since ``/mnt/downloads`` IS that filesystem's root -- and a
+    fallback built on it would have directed qBittorrent to relocate torrents to
+    ``/`` on the host. There is no reliable way to recover the true host-namespace
+    path from inside the container in that topology, so guessing one is worse than
+    not trying: ``None`` here honestly leaves qBittorrent's own default save
+    location in charge (unchanged prior behaviour, never a guessed path), and the
+    setup/health visibility probe still surfaces any resulting mismatch to the
+    operator.
+    """
+    return configured or None
 
 
 def _is_under(norm_path: str, mount: str) -> bool:

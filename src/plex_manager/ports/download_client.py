@@ -89,6 +89,16 @@ class DownloadClientPort(Protocol):
         reported honestly as ``created=False`` so a caller cleaning up after a
         lost grab never removes a pre-existing torrent it did not create (see
         :class:`AddResult`).
+
+        A non-empty ``save_path`` is a DIRECTED path (issues #133/#157) that the
+        implementation must actually honour: an install with global Automatic
+        Torrent Management enabled otherwise ignores the per-add path entirely
+        and places the torrent per its own category/auto rules, silently
+        defeating the direction. Implementations must therefore pin the ADDED
+        torrent to manual management whenever ``save_path`` is non-empty
+        (without touching the client's global AutoTMM setting or any other
+        torrent), and leave the torrent's management mode untouched when
+        ``save_path`` is empty (nothing to direct).
         """
         raise NotImplementedError
 
@@ -118,3 +128,20 @@ class DownloadClientPort(Protocol):
         """Return the torrent's files (relative path + size) so the importer can
         locate the completed video file."""
         raise NotImplementedError
+
+    async def get_default_save_path(self) -> str | None:
+        """Return the client's GLOBAL default save path (``None`` if unreadable).
+
+        Read-only: the port deliberately has no matching setter. This is a
+        DIAGNOSTIC signal (the setup/health visibility probe, issues #133/#157) --
+        never mutate the operator's shared qBittorrent instance's global config.
+        """
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        """Relocate an existing torrent's save directory (qBittorrent moves it
+        asynchronously; this call only requests the move and returns).
+
+        Per-torrent only -- this is the correction verb for a torrent stranded
+        outside the app's visible download mount (issues #133/#157), never a
+        bulk sweep and never the client's global default (see
+        :meth:`get_default_save_path`)."""

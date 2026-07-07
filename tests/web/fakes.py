@@ -198,11 +198,16 @@ class FakeQbittorrent:
         files: dict[str, list[DownloadedFile]] | None = None,
         source_errors: set[str] | None = None,
         pre_existing: set[str] | None = None,
+        default_save_path: str | None = None,
     ) -> None:
         self.statuses = statuses or []
         self.files = files or {}
         self.added: list[tuple[str, str, str]] = []
         self.removed: list[tuple[str, bool]] = []
+        # The client's canned GLOBAL default save path (``get_default_save_path``)
+        # and a recorder of every ``set_location`` call (lowercased hash, target).
+        self.default_save_path = default_save_path
+        self.relocated: list[tuple[str, str]] = []
         # Sources (a magnet/HTTP url) for which ``add`` raises
         # :class:`QbittorrentSourceError`, mirroring the real adapter's honest
         # "HTTP source resolved to neither a magnet nor a hashable .torrent" — the
@@ -251,6 +256,12 @@ class FakeQbittorrent:
 
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         return list(self.files.get(info_hash.lower(), []))
+
+    async def get_default_save_path(self) -> str | None:
+        return self.default_save_path
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        self.relocated.append((info_hash.lower(), save_path))
 
 
 class FakeLibrary:

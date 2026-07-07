@@ -28,7 +28,8 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.web.deps import SettingsStore
+from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
+from plex_manager.web.deps import SettingsStore, get_downloads_host_root
 from tests.web.fakes import (
     FakeLibrary,
     FakeProwlarr,
@@ -55,12 +56,14 @@ async def _insert_download(
     torrent_hash: str,
     status: str,
     first_seen_at: datetime | None = None,
+    failed_reason: str | None = None,
 ) -> int:
     async with sm() as session:
         row = Download(
             torrent_hash=torrent_hash,
             status=status,
             first_seen_at=first_seen_at,
+            failed_reason=failed_reason,
             tmdb_id=603,
         )
         session.add(row)
@@ -123,6 +126,180 @@ async def test_grab_creates_download_and_history_and_is_idempotent(
     assert second.status_code == 201
     assert second.json()["id"] == item["id"]
     assert len(qbt.added) == 1
+
+
+async def test_grab_directs_save_path_to_the_derived_downloads_host_root(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Issues #133/#157: ``grab()`` must no longer be handed ``save_path=""``
+    (which leaves the torrent landing in qBittorrent's own, possibly invisible,
+    default dir) -- the endpoint threads the derived HOST-namespace downloads
+    root through to the client's ``add`` call."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 201
+    assert len(qbt.added) == 1
+    _source, save_path, _category = qbt.added[0]
+    assert save_path == "/home/lunchbox/Downloads"
+
+
+async def test_grab_leaves_qbittorrent_default_in_charge_when_no_root_derivable(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """With no host downloads root derivable (bare metal, no Docker split), the
+    prior behaviour is unchanged: an empty ``save_path`` leaves qBittorrent's own
+    default directory in charge."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    app.dependency_overrides[get_downloads_host_root] = lambda: ""
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 201
+    _source, save_path, _category = qbt.added[0]
+    assert save_path == ""
+
+
+_STRANDED_HASH = "e" * 40
+
+
+async def test_relocate_endpoint_requests_the_move(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): /home/lunchbox/x",
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "import_blocked"
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+
+
+async def test_relocate_endpoint_404s_for_a_missing_download(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, qbt=FakeQbittorrent())
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post("/api/v1/queue/999999/relocate", headers=_HEADERS)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "download_not_found"
+
+
+async def test_relocate_endpoint_409s_for_a_non_relocatable_row(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_, torrent_hash=_STRANDED_HASH, status="downloading"
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "not_relocatable"
+    assert qbt.relocated == []
+
+
+async def test_relocate_endpoint_409s_when_no_downloads_root_derivable(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): x",
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: ""
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "downloads_root_unavailable"
+    assert qbt.relocated == []
+
+
+async def test_relocate_endpoint_409s_when_superseded_by_a_newer_block_reason(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A concurrent Retry Import re-blocking the row with a genuinely different
+    reason while the relocate's own status write is in flight must surface
+    honestly (409 ``relocation_superseded``), never get silently clobbered by
+    the relocate's stale 'relocation requested' message."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): /home/lunchbox/x",
+    )
+
+    newer_reason = "no video file found in the completed torrent"
+
+    class _ReblockingQbt(FakeQbittorrent):
+        async def set_location(self, info_hash: str, save_path: str) -> None:
+            await super().set_location(info_hash, save_path)
+            async with sessionmaker_() as racer_session:
+                row = await racer_session.get(Download, download_id)
+                assert row is not None
+                row.failed_reason = newer_reason
+                await racer_session.commit()
+
+    qbt = _ReblockingQbt()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "relocation_superseded"
+    # The move was still requested of qBittorrent...
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+    # ...but the row keeps the racer's fresher reason, never overwritten.
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        assert row.failed_reason == newer_reason
 
 
 def test_queue_contract_documents_manual_error_bodies(app: FastAPI) -> None:

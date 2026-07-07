@@ -64,6 +64,38 @@ def test_set_optional_bool_env_var_still_parses(monkeypatch: pytest.MonkeyPatch)
     assert settings.auth_cookie_secure is True
 
 
+def test_downloads_root_unset_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PLEX_MANAGER_DOWNLOADS_ROOT", raising=False)
+
+    settings = _settings_no_dotenv()
+
+    assert settings.downloads_root is None
+
+
+def test_downloads_root_reads_the_shared_compose_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issues #133/#157: ``PLEX_MANAGER_DOWNLOADS_ROOT`` is the SAME variable
+    docker-compose already uses as the ``/downloads`` bind source (``env_file:
+    .env`` hands it to the container too) -- the app must read it, not
+    re-derive/duplicate it."""
+    monkeypatch.setenv("PLEX_MANAGER_DOWNLOADS_ROOT", "/home/lunchbox/Downloads")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.downloads_root == "/home/lunchbox/Downloads"
+
+
+def test_downloads_root_blank_env_var_falls_back_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_DOWNLOADS_ROOT", "")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.downloads_root is None
+
+
 def test_uninitialized_boot_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1: a fresh install boots with ZERO auth env vars.
 

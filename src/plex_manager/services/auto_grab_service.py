@@ -494,6 +494,7 @@ async def run_grab_cycle(
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
     cooldowns: CooldownRegistry | None = None,
+    save_path: str = "",
 ) -> AutograbCycleResult:
     """Run one auto-grab pass: search the due scopes and grab / park each.
 
@@ -541,6 +542,15 @@ async def run_grab_cycle(
     cooldown event so a slow cycle schedules from the real event time, not a stale
     cycle-start base (Codex round-3 #3); it defaults to the wall clock. Both are
     injectable for deterministic tests.
+
+    ``save_path`` (issues #133/#157) is threaded verbatim into every
+    :func:`grab_service.grab` call: the caller (``web/app.py``'s ``_autograb_once``)
+    resolves the HOST-namespace downloads root once per cycle
+    (``path_visibility.resolve_downloads_host_root``) and passes it here, so an
+    auto-grabbed torrent lands under the mounted ``/downloads`` bind exactly like a
+    manual grab, rather than qBittorrent's own (possibly invisible) default.
+    ``""`` (the default) leaves qBittorrent's own default in charge, unchanged
+    prior behaviour.
     """
     now = now or datetime.now(UTC)
     # Park + cooldown scheduling read the clock FRESH at each event (round-3 #3); the
@@ -640,6 +650,7 @@ async def run_grab_cycle(
                     year=year,
                     season=scope.season,
                     episodes=None,
+                    save_path=save_path,
                     # The decision's premise rides with the action: this scope
                     # was selected because the season read as DUE at selection
                     # time. If the eviction recovery folds it to 'available'

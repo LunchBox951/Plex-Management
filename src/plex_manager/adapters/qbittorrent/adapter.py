@@ -895,6 +895,18 @@ class QbittorrentClient:
         lost-grab cleanup must never destroy (``delete_files=True``) a torrent
         it merely reused -- its data can back a live library file via hardlink
         (see :class:`~plex_manager.ports.download_client.AddResult`).
+
+        When ``save_path`` is non-empty (a directed path -- issues #133/#157),
+        the request ALSO carries ``autoTMM: "false"``: an install with global
+        Automatic Torrent Management enabled otherwise ignores the per-add
+        ``savepath`` field entirely and lets category/auto rules place the
+        torrent, silently defeating the whole save-path direction. Sending the
+        flag pins this ONE torrent to manual management so ``savepath`` is
+        actually honoured, without touching the client's global AutoTMM
+        setting or any other torrent. When ``save_path`` is empty (nothing to
+        direct), ``autoTMM`` is omitted entirely -- the client's own
+        auto-managed/manual mode for this torrent is left untouched, exactly
+        the prior behaviour.
         """
         urls_value: str | None = None
         torrent_bytes: bytes | None = None
@@ -933,6 +945,13 @@ class QbittorrentClient:
             info_hash = _info_hash_from_magnet(magnet_or_url)
 
         form: dict[str, str] = {"savepath": save_path, "category": category}
+        if save_path:
+            # A directed save path only takes effect when this torrent is NOT
+            # auto-managed -- otherwise a global AutoTMM install silently
+            # relocates it per category/auto rules, ignoring ``savepath``
+            # entirely. Manual-manage just THIS add; omitted (below) when
+            # there is no directed path, leaving the client's own mode alone.
+            form["autoTMM"] = "false"
         files: dict[str, tuple[str, bytes, str]] | None = None
         if urls_value is not None:
             form["urls"] = urls_value
@@ -1058,6 +1077,39 @@ class QbittorrentClient:
                     DownloadedFile(name=_s(entry.get("name")), size_bytes=_i(entry.get("size")))
                 )
         return out
+
+    async def get_default_save_path(self) -> str | None:
+        """Return the client's GLOBAL default save path via ``GET /app/preferences``.
+
+        Read-only diagnostic (setup/health visibility probe, issues #133/#157) --
+        this adapter never posts to ``/app/setPreferences``; there is no matching
+        setter on the port (see :meth:`set_location`'s docstring). A non-2xx
+        response or a missing/blank ``save_path`` key returns ``None`` -- honestly
+        "could not read it", never a guessed path.
+        """
+        response = await self._request("GET", "/app/preferences")
+        if response.status_code != _HTTP_OK:
+            return None
+        payload = _as_dict(_decode_json(response, "/app/preferences"))
+        return _s(payload.get("save_path")) or None
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        """Relocate ``info_hash``'s save directory via ``POST /torrents/setLocation``.
+
+        qBittorrent moves the content asynchronously; this call only requests the
+        move (surfacing a non-2xx as the usual typed :class:`QbittorrentError`) and
+        returns -- it does not wait for, or otherwise confirm, completion. The
+        cached ``/torrents/properties`` entry is dropped so the next
+        :meth:`get_save_path` re-reads the client rather than serving the
+        pre-move path for up to :data:`_PROPERTIES_TTL_SECONDS`.
+        """
+        response = await self._request(
+            "POST",
+            "/torrents/setLocation",
+            data={"hashes": info_hash.lower(), "location": save_path},
+        )
+        self._raise_for_status(response)
+        self._properties_cache.pop(info_hash.lower(), None)
 
     async def _fetch_properties(self, info_hash: str) -> dict[str, object] | None:
         """Fetch ``/torrents/properties`` for ``info_hash``, cached briefly.

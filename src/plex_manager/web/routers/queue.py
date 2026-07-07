@@ -17,6 +17,7 @@ from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import (
+    correction_service,
     grab_service,
     import_service,
     queue_service,
@@ -37,6 +38,7 @@ from plex_manager.web.deps import (
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
+    get_downloads_host_root,
     get_filesystem,
     get_library,
     get_movies_root_optional,
@@ -149,6 +151,7 @@ async def grab_endpoint(
     prowlarr: Annotated[IndexerPort, Depends(get_prowlarr)],
     parser: Annotated[ParserPort, Depends(get_parser)],
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
+    downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
 ) -> QueueItem:
     """Grab a release for a request: a chosen one, or the top accepted pick."""
     request = await request_service.get_request(session, body.request_id)
@@ -246,6 +249,7 @@ async def grab_endpoint(
             year=request.year,
             season=body.season,
             episodes=body.episodes,
+            save_path=downloads_host_root,
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
@@ -380,5 +384,54 @@ async def mark_failed_endpoint(
         # Honest 409; the operator retries once the in-flight call resolves.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="removal_in_progress"
+        ) from exc
+    return _to_item(record)
+
+
+@router.post("/{download_id}/relocate", responses=_QUEUE_ERROR_RESPONSES)
+async def relocate_endpoint(
+    download_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
+    downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
+) -> QueueItem:
+    """Operator correction: relocate an import-blocked, path-invisible download
+    into the mounted downloads root (issues #133/#157).
+
+    Scoped to EXACTLY the honest "download path not visible inside the
+    container" block (409 ``not_relocatable`` for any other row/reason). qBittorrent
+    moves content asynchronously -- this call only REQUESTS the move and returns; the
+    operator retries the import (``POST /queue/{id}/import``, already retryable —
+    ``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:
+    only ever relocates INTO the app's own derived downloads root (409
+    ``downloads_root_unavailable`` when that root cannot be derived — bare metal, no
+    Docker split), never an arbitrary path. If a concurrent Retry Import re-blocks
+    the row with a newer, different reason before this call's own status write
+    lands, the move was still requested but the row's message is left alone (409
+    ``relocation_superseded`` — re-fetch the queue item to see the current reason).
+    """
+    try:
+        record = await correction_service.relocate_stranded_download(
+            session,
+            qbt,
+            download_id=download_id,
+            downloads_host_root=downloads_host_root,
+        )
+    except correction_service.DownloadNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found"
+        ) from exc
+    except correction_service.NotRelocatableError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_relocatable") from exc
+    except correction_service.DownloadsRootUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="downloads_root_unavailable"
+        ) from exc
+    except correction_service.RelocationSupersededError as exc:
+        # The move was still requested of qBittorrent; a concurrent Retry Import
+        # re-blocked the row with a newer, different reason before our own status
+        # write landed -- surface that honestly rather than clobber it silently.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="relocation_superseded"
         ) from exc
     return _to_item(record)

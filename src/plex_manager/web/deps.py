@@ -60,7 +60,7 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.services import log_capture_service
+from plex_manager.services import log_capture_service, path_visibility
 from plex_manager.services.health_service import (
     AutograbStatus,
     ReconcileStatus,
@@ -114,6 +114,7 @@ __all__ = [
     "get_autograb_status",
     "get_disk_pressure_target_percent",
     "get_disk_pressure_threshold_percent",
+    "get_downloads_host_root",
     "get_eviction_enabled",
     "get_eviction_filesystem",
     "get_eviction_grace_days",
@@ -933,6 +934,28 @@ async def get_qbittorrent_optional(
         return await get_qbittorrent(session, client)
     except ServiceNotConfiguredError:
         return None
+
+
+def get_downloads_host_root() -> str:
+    """Resolve the HOST-namespace downloads root ``grab()`` should direct
+    qBittorrent's ``save_path`` to (issues #133/#157).
+
+    ``Settings.downloads_root`` (``PLEX_MANAGER_DOWNLOADS_ROOT`` -- the SAME
+    variable docker-compose already uses as the ``/downloads`` bind source;
+    ``env_file: .env`` hands it to this container too) is the ONLY source (see
+    :func:`~plex_manager.services.path_visibility.resolve_downloads_host_root` for
+    why there is no ``/proc/self/mountinfo`` fallback: that field cannot recover a
+    host-namespace path). ``""`` (never ``None`` -- callers thread this straight
+    into ``grab()``'s ``save_path: str`` parameter) when unset (bare metal, no
+    Docker split): qBittorrent's own default is then left in charge, unchanged
+    prior behaviour, never a guessed path.
+
+    A plain function, not async: the settings read is a cheap synchronous env
+    lookup, the same "no ``asyncio.to_thread`` needed" precedent
+    ``setup_validation``'s own synchronous filesystem probes already set.
+    """
+    settings = get_settings()
+    return path_visibility.resolve_downloads_host_root(settings.downloads_root) or ""
 
 
 def get_filesystem() -> FileSystemPort:
