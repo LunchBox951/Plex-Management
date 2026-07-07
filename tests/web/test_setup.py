@@ -236,7 +236,7 @@ async def test_complete_rejects_empty_string_service_url(
 @pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
 @pytest.mark.parametrize("bad_value", ["key\r\ninjected", "key\x00nul", "kéy-nonascii"])
 async def test_complete_rejects_header_unsafe_credential(
-    client: httpx.AsyncClient, field: str, bad_value: str
+    client: httpx.AsyncClient, field: str, bad_value: str, tmp_path: Path
 ) -> None:
     # A credential that cannot ride its outbound HTTP header (plex_token ->
     # X-Plex-Token, prowlarr_api_key -> X-Api-Key) is rejected at the persistence
@@ -244,7 +244,7 @@ async def test_complete_rejects_header_unsafe_credential(
     # crashes the grab loop) when an adapter sends it as a header. Under dev-bypass
     # the Plex verification ladder is skipped, so the SCHEMA validator is what
     # rejects here, proving the guard is the write-time check itself, not a probe.
-    body = {**_COMPLETE_BODY, field: bad_value}
+    body = {**_complete_body(str(tmp_path)), field: bad_value}
     response = await client.post("/api/v1/setup/complete", json=body)
 
     assert response.status_code == 422
@@ -255,7 +255,7 @@ async def test_complete_rejects_header_unsafe_credential(
 
 @pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
 async def test_complete_422_never_echoes_the_submitted_credential(
-    client: httpx.AsyncClient, field: str
+    client: httpx.AsyncClient, field: str, tmp_path: Path
 ) -> None:
     # north star #3: rejecting a header-unsafe credential (422) must NEVER echo the
     # submitted value back in the error body. FastAPI's DEFAULT RequestValidationError
@@ -264,7 +264,7 @@ async def test_complete_422_never_echoes_the_submitted_credential(
     # scrubs it. Assert on the RAW response text (not just the parsed ``input``), so a
     # leak in any part of the body (msg/ctx/input) is caught.
     sentinel = "leak-SENTINEL-\r\nZZZINJECT"
-    body = {**_COMPLETE_BODY, field: sentinel}
+    body = {**_complete_body(str(tmp_path)), field: sentinel}
 
     response = await client.post("/api/v1/setup/complete", json=body)
 
