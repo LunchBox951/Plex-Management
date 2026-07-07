@@ -788,6 +788,21 @@ class CreateRequestBody(BaseModel):
     # ``_season_numbers``. A repeat POST with a NEW season list GROWS the tracked
     # set rather than being dropped by the request-level dedup.
     seasons: list[int] | None = None
+    # Re-acquire (issue #131): force a fresh grabbable request even when the movie
+    # is still reported present in Plex (its file was deleted/replaced out-of-band),
+    # instead of the normal already-in-library short-circuit that returns a
+    # terminal 'available' row with no grab. MOVIE ONLY -- ignored for a tv
+    # request (per-season re-acquisition is the report-issue verb's job). Same
+    # authZ as any create (``require_api_key``); every dedup/ownership guard still
+    # applies (see ``request_service.create_request_result``).
+    #
+    # Modeled as an optional tri-state (``bool | None``), never omitted/None
+    # meaning "normal create", NOT a bare ``bool = False`` -- mirrors ``seasons``'
+    # own None-default convention. A bare boolean default emits a JSON-schema
+    # ``default`` that openapi-typescript then treats as a REQUIRED client field
+    # (see ``CreateRequestBody`` in the generated ``schema.d.ts``), which would
+    # break every existing caller that omits this field entirely.
+    force: bool | None = None
 
 
 class ReportIssueBody(BaseModel):

@@ -199,6 +199,60 @@ async def test_create_proceeds_when_not_in_plex(
     assert created.json()["status"] == "pending"
 
 
+async def test_create_force_reacquire_returns_pending_201(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # Re-acquire (issue #131): `force=True` bypasses the already-in-library
+    # short-circuit even though Plex still reports the movie present, proving the
+    # endpoint threads `force` through to `create_request_result`. Contrast with the
+    # SAME library state minus `force` (a different tmdb id), which still
+    # short-circuits to `available`.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            movies={
+                603: MovieMetadata(tmdb_id=603, title="The Matrix", year=1999),
+                604: MovieMetadata(tmdb_id=604, title="Dark City", year=1998),
+            }
+        ),
+        library=FakeLibrary(available={603, 604}),
+    )
+
+    forced = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie", "force": True},
+        headers=_HEADERS,
+    )
+    assert forced.status_code == 201
+    assert forced.json()["status"] == "pending"
+
+    not_forced = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 604, "media_type": "movie"}, headers=_HEADERS
+    )
+    assert not_forced.status_code == 201
+    assert not_forced.json()["status"] == "available"
+
+
+async def test_create_force_reacquire_allowed_for_shared_user(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # Same authZ bar as any create (`require_api_key`): a non-admin shared user can
+    # force-reacquire too -- this is NOT an admin-gated verb.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb(), library=FakeLibrary(available={603}))
+    shared_cookies, shared_headers = await _shared_user_cookies(app)
+
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie", "force": True},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["status"] == "pending"
+
+
 async def test_create_unknown_media_is_404(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
