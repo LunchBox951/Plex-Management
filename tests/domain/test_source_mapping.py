@@ -299,13 +299,17 @@ def test_resolve_quality_remux_gated_by_source() -> None:
     assert resolve_quality(QualitySource.BLURAY, Resolution.R720P, Modifier.REMUX) is BLURAY720P
     assert resolve_quality(QualitySource.BLURAY, Resolution.R480P, Modifier.REMUX) is BLURAY480P
     assert resolve_quality(QualitySource.BLURAY, Resolution.UNKNOWN, Modifier.REMUX) is REMUX1080P
-    # Unknown source: the Radarr no-source-remux fallback at 1080p/2160p. At 720p
-    # OR with no resolution at all there is no source signal to assume 1080p, so it
-    # falls through to the conservative UNKNOWN-source guard.
+    # Unknown source: Radarr's no-source-remux branch, cell for cell -- 2160p ->
+    # Remux2160p, 1080p -> Remux1080p, 720p -> Bluray720p, 480p -> Bluray480p.
+    # SD oddballs (576p et al.) and a missing resolution have no cell in that
+    # branch (Radarr resolves them to Unknown), so they fall through to the
+    # conservative UNKNOWN-source guard.
     assert resolve_quality(QualitySource.UNKNOWN, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
     assert resolve_quality(QualitySource.UNKNOWN, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R720P, Modifier.REMUX) is BLURAY720P
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R480P, Modifier.REMUX) is BLURAY480P
     assert (
-        resolve_quality(QualitySource.UNKNOWN, Resolution.R720P, Modifier.REMUX) is UNKNOWN_QUALITY
+        resolve_quality(QualitySource.UNKNOWN, Resolution.R576P, Modifier.REMUX) is UNKNOWN_QUALITY
     )
     assert (
         resolve_quality(QualitySource.UNKNOWN, Resolution.UNKNOWN, Modifier.REMUX)
@@ -374,6 +378,20 @@ _REMUX_TABLE: list[tuple[str, dict[str, object], Quality]] = [
         {"screen_size": "2160p", "other": "Remux", "release_group": "GRP"},
         REMUX2160P,
     ),
+    (
+        # No-source 720p remux: Radarr's no-source-remux branch yields Bluray720p
+        # ("720p remux should fallback as 720p BluRay"), NOT Unknown -- falling to
+        # the UNKNOWN guard here rejected a previously-accepted release.
+        "Movie.2024.720p.REMUX-GRP",
+        {"screen_size": "720p", "other": "Remux", "release_group": "GRP"},
+        BLURAY720P,
+    ),
+    (
+        # No-source 480p remux: the same branch's SD cell -> Bluray480p.
+        "Movie.2024.480p.REMUX-GRP",
+        {"screen_size": "480p", "other": "Remux", "release_group": "GRP"},
+        BLURAY480P,
+    ),
 ]
 
 
@@ -424,9 +442,16 @@ _GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object]]] = [
     # Group token appears on BOTH the release folder and the filename. Import
     # validation parses the full relative PATH, so a suffix-only strip would
     # leave the folder's ``-SCR`` behind to false-reject a clean import. Stripping
-    # every token-bounded occurrence removes both, so this resolves to clean WEBDL.
+    # every attached occurrence removes both, so this resolves to clean WEBDL.
     (
         "Movie.2024.1080p.WEB-DL.x264-SCR/Movie.2024.1080p.WEB-DL.x264-SCR.mkv",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+    ),
+    # Bracket-attached group tag (anime/p2p convention): the strip recognizes
+    # ``[SCR]`` as a group tag too, so a bracketed group named after a reject
+    # token cannot false-trip the net.
+    (
+        "[SCR] Movie 2024 1080p WEB-DL x264",
         {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
     ),
 ]
@@ -463,6 +488,17 @@ def test_real_reject_token_survives_release_group_strip() -> None:
         (
             "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
             {"source": "DVD", "release_group": "SCR"},
+            "DVDSCR",
+        ),
+        # A STANDALONE dot-attached body token colliding with the group name:
+        # ``HC.SCR`` is a genuine hardcoded-screener marker guessit misses (no
+        # ``other`` emitted -- same shape as the ``HC.SCR.WEB`` leak-table row),
+        # while ``-SCR`` is the group tag. The attachment-anchored strip removes
+        # only the hyphen-attached tag; the dot-attached ``SCR`` stays for the
+        # net, so the screener still rejects instead of laundering to WEBDL.
+        (
+            "Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR",
+            {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
             "DVDSCR",
         ),
     ):
@@ -509,9 +545,9 @@ def test_strip_release_group_anchors_to_suffix_not_an_embedded_mention() -> None
     )
 
 
-def test_strip_release_group_removes_all_bounded_occurrences() -> None:
+def test_strip_release_group_removes_every_attached_occurrence() -> None:
     # A duplicated folder/filename relative path where the group name appears as a
-    # whole-token tag on BOTH segments: every token-bounded occurrence is stripped,
+    # hyphen-attached tag on BOTH segments: every attached occurrence is stripped,
     # so nothing is left behind for the reject net to false-trip on. A suffix-only
     # strip would leave the folder's ``-SCR`` and wrongly reject the clean import.
     # Only the ``SCR`` token is removed; the ``-`` separator is not part of it.
@@ -522,14 +558,33 @@ def test_strip_release_group_removes_all_bounded_occurrences() -> None:
         )
         == "Movie.2024.1080p.WEB-DL.x264-/Movie.2024.1080p.WEB-DL.x264-.mkv"
     )
-    # Embedded mentions on both segments survive (``DVDSCR`` is not token-bounded),
-    # so a genuine reject token is never laundered by the strip-all.
+    # Embedded mentions on both segments survive (``DVDSCR`` is not attached),
+    # so a genuine reject token is never laundered by the strip.
     assert (
         _strip_release_group(
             "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
             {"release_group": "SCR"},
         )
         == "Movie.2024.DVDSCR.x264-/Movie.2024.DVDSCR.x264-.mkv"
+    )
+
+
+def test_strip_release_group_only_removes_attached_tags() -> None:
+    # A DOT-attached body token that collides with the group name is NOT a group
+    # tag and must survive the strip: ``HC.SCR`` is a genuine hardcoded-screener
+    # marker; only the hyphen-attached ``-SCR`` suffix is the group tag. A strip
+    # of every token-bounded occurrence (regardless of attachment) would delete
+    # both and launder the screener into an acceptable WEBDL.
+    assert (
+        _strip_release_group("Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR", {"release_group": "SCR"})
+        == "Movie.2024.1080p.HC.SCR.WEB-DL.x264-"
+    )
+    # Bracket attachment (the anime/p2p ``[GROUP]`` convention Radarr's
+    # ReleaseGroupParser also recognizes) is stripped like the hyphen form, so a
+    # bracketed group named after a reject token cannot false-trip the net.
+    assert (
+        _strip_release_group("[SCR] Movie 2024 1080p WEB-DL x264", {"release_group": "SCR"})
+        == "[] Movie 2024 1080p WEB-DL x264"
     )
 
 
