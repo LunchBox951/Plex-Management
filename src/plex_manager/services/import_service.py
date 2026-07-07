@@ -36,6 +36,7 @@ import logging
 import os
 import weakref
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple
 
@@ -115,6 +116,134 @@ _IMPORT_READY_RAW_STATES: frozenset[str] = frozenset(
 # ``failed_reason`` joins together -- a 20+ episode pack where every file is
 # rejected must not produce an unreadably long string.
 _MAX_BLOCK_REASONS: Final = 10
+
+# Bounded Finalizing (issue #158): "Finalizing" ("completed", not yet
+# "available") was previously an UNBOUNDED silent state -- a row whose Plex item
+# carries no (or the wrong) tmdb GUID can never confirm via
+# ``present_ids``/``season_presence`` alone, no matter how long the reconcile
+# cycle waits, and nothing surfaced that. After this many minutes of a completed
+# row confirming via NEITHER tmdb-GUID NOR path (``LibraryPort.confirm_paths``),
+# a WARNING is logged into the durable, in-app console (any ``_logger.warning``
+# call here already reaches ``log_events`` -- see
+# ``services.log_capture_service``) naming the title. The row itself STAYS
+# ``completed`` -- it genuinely is not confirmed, so that is the honest status;
+# this is never a new status enum value, just a visible signal instead of a
+# silent stall (north star: honesty over silence).
+_FINALIZING_WARN_AFTER_MINUTES: Final = 30.0
+# Re-warn at most this often per stuck row rather than every ~15s reconcile
+# tick -- derived PURELY from elapsed-time bucketing (see
+# ``_check_bounded_finalizing``), no new column or timer needed.
+_FINALIZING_WARN_DUTY_CYCLE_MINUTES: Final = 60.0
+
+# In-memory (never persisted -- no schema change) bookkeeping for the bounded-
+# Finalizing warning's duty cycle, keyed by a caller-chosen row identity (see
+# ``_movie_unconfirmed_key``/``_season_unconfirmed_key``). Maps to the elapsed-
+# time BUCKET (see ``_check_bounded_finalizing``) a warning was already emitted
+# for, so a sustained miss logs at most once per duty-cycle window rather than
+# every tick. A restart simply re-arms the next-due warning -- an honest, safe
+# direction: a genuine miss is merely re-measured, never permanently hidden by a
+# lost counter. Entries are dropped the moment a row confirms/promotes, or is no
+# longer in the CURRENT tick's completed set at all (``_forget_unconfirmed``,
+# swept at the end of ``run_availability_cycle``), so this stays bounded to
+# however many rows are ACTUALLY stuck completed right now.
+_unconfirmed_warned_bucket: dict[str, int] = {}
+# First-observed-miss timestamp -- the substitute anchor for "elapsed since
+# completed" for any row with no PERSISTED completion stamp to anchor on. In
+# practice this means every TV season (``SeasonRequest`` carries no per-season
+# mirror of ``MediaRequest.completed_at``, deliberately deferred rather than
+# added here without its own migration -- see ``SqlRequestRepository.
+# heal_completed_at``'s docstring): a movie instead anchors on its real,
+# persisted ``RequestRecord.completed_at`` and only falls through to this dict
+# in the defensive (should-not-happen) case that stamp is somehow unset -- see
+# ``_unconfirmed_anchor``.
+_unconfirmed_since_fallback: dict[str, datetime] = {}
+
+
+def _movie_unconfirmed_key(request_id: int) -> str:
+    return f"movie:{request_id}"
+
+
+def _season_unconfirmed_key(media_request_id: int, season_number: int) -> str:
+    return f"season:{media_request_id}:{season_number}"
+
+
+def reset_unconfirmed_tracking() -> None:
+    """Clear the bounded-Finalizing (issue #158) in-memory bookkeeping.
+
+    Test-isolation helper, not part of any port -- mirrors
+    ``adapters.plex.library.reset_caches``. The dicts are process-global and
+    keyed by request/season id, so a test suite whose fixtures hand out fresh
+    (restarting) ids per test needs a way to wipe stale bookkeeping between
+    tests without reaching into the private dicts directly.
+    """
+    _unconfirmed_warned_bucket.clear()
+    _unconfirmed_since_fallback.clear()
+
+
+def is_movie_unconfirmed_tracked(request_id: int) -> bool:
+    """Whether the bounded-Finalizing bookkeeping still holds ANY entry (a
+    warned duty-cycle bucket, or an in-memory first-seen anchor) for the movie
+    ``request_id``. Test-only accessor -- lets a test assert
+    ``_forget_unconfirmed`` actually cleared a row's state without reaching
+    into the private dicts directly.
+    """
+    key = _movie_unconfirmed_key(request_id)
+    return key in _unconfirmed_warned_bucket or key in _unconfirmed_since_fallback
+
+
+def _forget_unconfirmed(key: str) -> None:
+    """Drop every trace of ``key`` from the bounded-Finalizing bookkeeping.
+
+    Called both when a row just confirmed/promoted (nothing left to warn about)
+    and, at the end of each ``run_availability_cycle`` pass, for any previously-
+    tracked key that is no longer in THIS tick's completed set at all -- an
+    operator re-armed it, a report-issue/correction moved it off ``completed``
+    some other way, or the row was deleted. Idempotent (``dict.pop`` with a
+    default): safe to call on a key that was never tracked.
+    """
+    _unconfirmed_warned_bucket.pop(key, None)
+    _unconfirmed_since_fallback.pop(key, None)
+
+
+def _unconfirmed_anchor(key: str, persisted: datetime | None, *, now: datetime) -> datetime:
+    """The instant elapsed-time for the bounded-Finalizing warning is measured
+    from -- prefers ``persisted`` (a movie's real, restart-safe
+    ``RequestRecord.completed_at``) when available; otherwise the first tick
+    THIS PROCESS observed ``key`` unconfirmed (recorded in
+    ``_unconfirmed_since_fallback`` -- see that dict's docstring).
+    """
+    if persisted is not None:
+        return persisted
+    existing = _unconfirmed_since_fallback.get(key)
+    if existing is not None:
+        return existing
+    _unconfirmed_since_fallback[key] = now
+    return now
+
+
+def _check_bounded_finalizing(key: str, anchor: datetime, title: str, *, now: datetime) -> None:
+    """Log a bounded, low-duty-cycle WARNING once ``key`` has failed both GUID and
+    path confirmation for ``_FINALIZING_WARN_AFTER_MINUTES``. A no-op below that
+    threshold, and a no-op again for the same duty-cycle window once already
+    warned (see the module-level dicts' docstrings). The owning row is left
+    ``completed`` by the caller -- this only makes an already-honest state
+    VISIBLE, never changes it.
+    """
+    elapsed_minutes = (now - anchor).total_seconds() / 60.0
+    if elapsed_minutes < _FINALIZING_WARN_AFTER_MINUTES:
+        return
+    bucket = int(
+        (elapsed_minutes - _FINALIZING_WARN_AFTER_MINUTES) // _FINALIZING_WARN_DUTY_CYCLE_MINUTES
+    )
+    if _unconfirmed_warned_bucket.get(key) == bucket:
+        return  # already warned for this duty-cycle window
+    _unconfirmed_warned_bucket[key] = bucket
+    _logger.warning(
+        "%r imported but not confirmed by Plex — check the library match "
+        "(unconfirmed for %.0f minute(s))",
+        title,
+        elapsed_minutes,
+    )
 
 
 class _UnsafeContentPathError(Exception):
@@ -1345,11 +1474,18 @@ async def run_import_cycle(
                 )
 
 
-async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession) -> None:
+async def run_availability_cycle(
+    *, library: LibraryPort, session: AsyncSession, now: datetime | None = None
+) -> None:
     """Confirm ``completed`` ("Finalizing") movies/seasons are indexed in Plex and
     promote them to ``available``. Depends ONLY on Plex — so an import that already
     triggered a scan still reaches ``available`` even if the download client or the
     Movies/TV root is unavailable afterward. One item failing never aborts the cycle.
+
+    ``now`` is the instant elapsed-time math (the bounded-Finalizing warning,
+    issue #158) is measured against; defaults to ``datetime.now(UTC)`` and exists
+    purely so a test can inject a fixed/advancing clock instead of sleeping real
+    minutes.
 
     BATCHED, not per-row (issue #136): a burst of still-finalizing rows used to cost
     one ``is_available`` call PER row, and the adapter never trusts a cached absence
@@ -1374,7 +1510,30 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
     persistently bad row), only THAT show's pending seasons are skipped for
     retry; every OTHER pending show in the same tick still promotes normally --
     a single bad Plex row must never starve unrelated shows at "Finalizing".
+
+    PATH-BASED CONFIRMATION FALLBACK (issue #158): some titles are matched by
+    Plex's metadata provider to an item carrying no (or the WRONG) tmdb guid --
+    GUID confirmation can then never succeed, no matter how long this cycle
+    waits. For a row the GUID batch above did NOT confirm, and which carries a
+    ``library_path`` breadcrumb (the folder/directory THIS app placed the file
+    into, ADR-0012), a SECOND, still-batched call
+    (:meth:`~plex_manager.ports.library.LibraryPort.confirm_paths`) asks Plex
+    whether the file is there by DIRECTORY-PREFIX instead -- at most one extra
+    section crawl per tick (per media type), never one call per row, and GUID
+    stays primary (path is only ever consulted for a GUID-miss row). A row still
+    unconfirmed by EITHER check stays honestly ``completed`` -- never a new
+    status -- and BOUNDED FINALIZING (:func:`_check_bounded_finalizing`) logs a
+    low-duty-cycle WARNING once it has been stuck long enough, so "Finalizing"
+    can no longer spin silently forever. That warning is only ever raised on a
+    DEFINITIVE double-miss: if either check consulted for a row (the GUID
+    batch, or the path fallback when a ``library_path`` breadcrumb makes it
+    applicable) raised instead of answering -- Plex unreachable, an auth
+    failure, etc. -- the row's bookkeeping is left untouched for the next
+    tick's retry instead. A same-tick transport failure must never be
+    misattributed to a library/GUID mismatch; the "batch availability check
+    failed" warning already logged above names the real cause.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     request_repo = SqlRequestRepository(session)
     completed_movies = [
         request
@@ -1382,23 +1541,83 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
         if request.media_type == "movie"
     ]
     present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]] = frozenset()
+    # Whether the GUID batch actually returned an answer this tick, as opposed
+    # to defaulting to "nothing confirmed" because the call itself raised
+    # (round-5 finding: a transport failure must never be mistaken for a
+    # genuine "Plex doesn't have this" -- the "batch availability check
+    # failed" warning above already surfaces the real cause).
+    present_ids_succeeded = False
     if completed_movies:
         try:
             present_movie_keys = await library.present_ids(
                 [(request.tmdb_id, "movie") for request in completed_movies],
                 refresh_absent=True,
             )
+            present_ids_succeeded = True
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             _logger.warning(
                 "batch availability check failed for %d completed movie(s); will retry next cycle",
                 len(completed_movies),
             )
+
+    # Path-based fallback candidates (issue #158): every GUID-miss movie that
+    # carries a library_path breadcrumb, resolved in ONE extra batched call for
+    # the WHOLE tick -- never one ``confirm_paths`` call per row.
+    movies_needing_path_check: list[tuple[RequestRecord, str]] = []
     for request in completed_movies:
-        if (request.tmdb_id, "movie") not in present_movie_keys:
+        if (request.tmdb_id, "movie") in present_movie_keys:
+            continue
+        if request.library_path:
+            movies_needing_path_check.append((request, request.library_path))
+    path_confirmed_movie_paths: frozenset[str] = frozenset()
+    # Same "did we actually get an answer" tracking as ``present_ids_succeeded``
+    # above, for the path fallback's own transport call.
+    path_check_succeeded = False
+    if movies_needing_path_check:
+        try:
+            path_confirmed_movie_paths = await library.confirm_paths(
+                "movie", [path for _request, path in movies_needing_path_check]
+            )
+            path_check_succeeded = True
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            _logger.warning(
+                "path-based availability check failed for %d completed movie(s) with no "
+                "confirming tmdb GUID; will retry next cycle",
+                len(movies_needing_path_check),
+            )
+
+    for request in completed_movies:
+        key = _movie_unconfirmed_key(request.id)
+        guid_confirmed = (request.tmdb_id, "movie") in present_movie_keys
+        path_confirmed = (
+            not guid_confirmed
+            and request.library_path is not None
+            and request.library_path in path_confirmed_movie_paths
+        )
+        if not (guid_confirmed or path_confirmed):
+            # Only treat this row as DEFINITIVELY unconfirmed -- and eligible
+            # for the bounded-Finalizing warning -- when every confirmation
+            # check consulted for it actually completed rather than raising.
+            # A same-tick transport failure (Plex unreachable, etc.) must
+            # never be misattributed to a library/GUID mismatch; the batch
+            # warning(s) logged above already name the real cause, and this
+            # row's bookkeeping is simply left untouched for the next tick's
+            # retry (round-5 finding).
+            checks_conclusive = present_ids_succeeded and (
+                request.library_path is None or path_check_succeeded
+            )
+            if checks_conclusive:
+                _check_bounded_finalizing(
+                    key,
+                    _unconfirmed_anchor(key, request.completed_at, now=effective_now),
+                    request.title,
+                    now=effective_now,
+                )
             continue
         try:
             await request_repo.mark_available(request.id)
             await session.commit()
+            _forget_unconfirmed(key)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
@@ -1434,25 +1653,109 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
                 len(seasons_by_show),
             )
 
+    # First pass: resolve GUID confirmation per season (unchanged from before
+    # #158) and, for a GUID-miss season with a library_path breadcrumb, collect
+    # it as a path-check candidate -- never per-row, one batched call below.
+    season_guid_confirmed: dict[int, bool] = {}
+    # Whether THIS show's GUID answer is a real, returned result -- as opposed
+    # to a defaulted-empty ``frozenset()`` standing in for either a whole-pass
+    # transport failure or a per-show lookup failure (see below). Either kind
+    # of miss means we genuinely don't know this show's presence, so it must
+    # never be conflated with "Plex was asked and said no" for the bounded-
+    # Finalizing warning (round-5 finding, mirroring ``present_ids_succeeded``
+    # for movies above).
+    season_guid_check_conclusive: dict[int, bool] = {}
+    seasons_needing_path_check: list[tuple[SeasonRequestRecord, str]] = []
     for tmdb_id, season_requests in seasons_by_show.items():
-        if tmdb_id not in present_seasons_by_show:
+        present_seasons = present_seasons_by_show.get(tmdb_id)
+        show_conclusive = present_seasons is not None
+        if present_seasons is None:
             # Distinguish a per-show lookup failure (the batch call SUCCEEDED but
             # omitted this one id -- see ``LibraryPort.season_presence``) from the
             # whole-pass transport failure already warned about above -- only log
             # here when the call itself actually succeeded, so a single bad show
             # is named explicitly without a redundant warning on every pending
             # show when the whole pass failed instead (round 4, #136 review).
-            # Either way, only THIS show's seasons are skipped for retry -- every
-            # OTHER pending show in ``seasons_by_show`` still gets checked below.
+            # Either way, only THIS show's seasons are skipped for GUID
+            # confirmation this tick -- every OTHER pending show still resolves
+            # normally, and the path fallback below still gets a chance.
             if season_presence_succeeded:
                 _logger.warning(
                     "season lookup failed for show; will retry next cycle",
                     extra={"tmdb_id": safe_int(tmdb_id)},
                 )
-            continue
-        present_seasons = present_seasons_by_show[tmdb_id]
+            present_seasons = frozenset[int]()
         for season_request in season_requests:
-            if season_request.season_number not in present_seasons:
+            confirmed = season_request.season_number in present_seasons
+            season_guid_confirmed[season_request.id] = confirmed
+            season_guid_check_conclusive[season_request.id] = show_conclusive
+            if not confirmed and season_request.library_path:
+                seasons_needing_path_check.append((season_request, season_request.library_path))
+
+    path_confirmed_season_paths: frozenset[str] = frozenset()
+    # Same "did we actually get an answer" tracking as the movie path check
+    # above, for TV's own ``confirm_paths`` call.
+    season_path_check_succeeded = False
+    if seasons_needing_path_check:
+        try:
+            path_confirmed_season_paths = await library.confirm_paths(
+                "tv", [path for _season_request, path in seasons_needing_path_check]
+            )
+            season_path_check_succeeded = True
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            _logger.warning(
+                "path-based availability check failed for %d completed season(s) with no "
+                "confirming tmdb GUID; will retry next cycle",
+                len(seasons_needing_path_check),
+            )
+
+    # Cache of media_request_id -> title, populated lazily: only a season that is
+    # STILL unconfirmed after both checks needs its show's title (for the
+    # bounded-Finalizing warning), so a show with every season confirmed never
+    # pays this extra lookup.
+    title_cache: dict[int, str] = {}
+
+    async def _title_for(media_request_id: int) -> str:
+        cached = title_cache.get(media_request_id)
+        if cached is not None:
+            return cached
+        record = await request_repo.get(media_request_id)
+        title = record.title if record is not None else f"request {media_request_id}"
+        title_cache[media_request_id] = title
+        return title
+
+    for season_requests in seasons_by_show.values():
+        for season_request in season_requests:
+            key = _season_unconfirmed_key(
+                season_request.media_request_id, season_request.season_number
+            )
+            guid_confirmed = season_guid_confirmed.get(season_request.id, False)
+            path_confirmed = (
+                not guid_confirmed
+                and season_request.library_path is not None
+                and season_request.library_path in path_confirmed_season_paths
+            )
+            if not (guid_confirmed or path_confirmed):
+                # As with movies above: only warn when THIS show's GUID answer
+                # was conclusive and, if a path check was needed, that check
+                # also actually completed -- never on a same-tick transport
+                # failure (round-5 finding).
+                checks_conclusive = season_guid_check_conclusive.get(season_request.id, False) and (
+                    season_request.library_path is None or season_path_check_succeeded
+                )
+                if checks_conclusive:
+                    title = await _title_for(season_request.media_request_id)
+                    _check_bounded_finalizing(
+                        key,
+                        # SeasonRequest carries no per-season ``completed_at``
+                        # mirror (deliberately deferred -- see the module
+                        # dict's docstring), so the anchor always falls back
+                        # to the in-memory first-observed-miss timestamp for
+                        # TV.
+                        _unconfirmed_anchor(key, None, now=effective_now),
+                        f"{title} season {season_request.season_number}",
+                        now=effective_now,
+                    )
                 continue
             try:
                 await season_request_service.mark_available(
@@ -1461,13 +1764,30 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
                     season_number=season_request.season_number,
                 )
                 await session.commit()
+                _forget_unconfirmed(key)
             except (PlexLibraryError, PlexAuthError, NotImplementedError):
                 await session.rollback()
                 _logger.warning(
                     "availability promotion failed for season %s; will retry next cycle",
                     season_request.season_number,
                     extra={
-                        "tmdb_id": tmdb_id,
+                        "tmdb_id": season_request.tmdb_id,
                         "request_id": season_request.media_request_id,
                     },
                 )
+
+    # Sweep the bounded-Finalizing bookkeeping: forget any previously-tracked row
+    # that is no longer in THIS tick's completed set at all -- promoted through
+    # some other path, re-armed by an operator, or deleted -- so the in-memory
+    # dicts stay bounded to however many rows are ACTUALLY stuck completed now.
+    current_keys = {_movie_unconfirmed_key(request.id) for request in completed_movies}
+    current_keys.update(
+        _season_unconfirmed_key(season_request.media_request_id, season_request.season_number)
+        for season_requests in seasons_by_show.values()
+        for season_request in season_requests
+    )
+    stale_keys = (
+        _unconfirmed_warned_bucket.keys() | _unconfirmed_since_fallback.keys()
+    ) - current_keys
+    for key in stale_keys:
+        _forget_unconfirmed(key)

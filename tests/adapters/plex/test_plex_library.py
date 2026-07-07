@@ -1030,6 +1030,179 @@ async def test_present_ids_propagates_library_error() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# confirm_paths — GUID-independent path-based confirmation fallback (#158)
+# --------------------------------------------------------------------------- #
+# Plex reports its section locations (and every item's file path) in the HOST
+# namespace; the app's own ``library_path`` breadcrumb is the CONTAINER-namespace
+# remap -- mirrors ``SECTIONS_HOST_NAMESPACE`` above.
+CONFIRM_PATHS_SECTIONS: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"path": "/srv/media/Movies"}],
+            },
+            {
+                "key": "2",
+                "title": "TV",
+                "type": "show",
+                "Location": [{"path": "/srv/media/TV"}],
+            },
+        ]
+    }
+}
+
+# A movie item whose guid(s) carry NO tmdb id at all (issue #158's exact bug: the
+# metadata provider matched this file to something with only an imdb guid) --
+# GUID confirmation can never succeed for it; only its file PATH proves it is the
+# app's own import.
+MOVIES_WITH_FILES: dict[str, Any] = {
+    "MediaContainer": {
+        "Metadata": [
+            {
+                "guid": "plex://movie/unrelated",
+                "Guid": [{"id": "imdb://tt3900000"}],
+                "Media": [{"Part": [{"file": "/srv/media/Movies/Obsession (2026)/Obsession.mkv"}]}],
+            }
+        ]
+    }
+}
+
+# Fetched via the section's flat ``type=4`` (episode) listing -- one episode leaf
+# under a season directory, no per-show ``/children``/``allLeaves`` involved.
+EPISODES_WITH_FILES: dict[str, Any] = {
+    "MediaContainer": {
+        "Metadata": [
+            {
+                "Media": [
+                    {
+                        "Part": [
+                            {
+                                "file": (
+                                    "/srv/media/TV/Some Show (2019)/Season 02/"
+                                    "Some Show - S02E01 - Pilot.mkv"
+                                )
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+}
+
+
+def _make_confirm_paths_handler(
+    calls: dict[str, int],
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=CONFIRM_PATHS_SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(200, json=MOVIES_WITH_FILES)
+        if path == "/library/sections/2/all":
+            # Episodes are fetched DIRECTLY from the section's flat listing
+            # (type=4), never one ``/children`` call per show.
+            assert request.url.params.get("type") == "4"
+            return httpx.Response(200, json=EPISODES_WITH_FILES)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_confirm_paths_movie_matches_by_directory_prefix_after_namespace_remap() -> None:
+    # The container library_path (/media/...) sits under the container remap of
+    # the section's HOST location (/srv/media/Movies) -- confirmation must
+    # reverse that host/container split the same way trigger_scan does, then
+    # match the reversed directory as a PREFIX of the reported file, never by
+    # title/year.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-movie:32400")
+    confirmed = await adapter.confirm_paths("movie", ["/media/Movies/Obsession (2026)"])
+    assert confirmed == frozenset({"/media/Movies/Obsession (2026)"})
+
+
+async def test_confirm_paths_movie_no_match_for_an_unrelated_directory() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_confirm_paths_handler(calls), base_url="http://confirm-movie-miss:32400"
+    )
+    confirmed = await adapter.confirm_paths("movie", ["/media/Movies/Some Other Film (1999)"])
+    assert confirmed == frozenset()
+
+
+async def test_confirm_paths_tv_season_matches_an_episode_leaf_under_the_season_dir() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-tv:32400")
+    confirmed = await adapter.confirm_paths("tv", ["/media/TV/Some Show (2019)/Season 02"])
+    assert confirmed == frozenset({"/media/TV/Some Show (2019)/Season 02"})
+    assert calls["/library/sections/2/all"] == 1  # one flat crawl, no per-show fetch
+
+
+async def test_confirm_paths_tv_season_no_match_for_a_different_season() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-tv-miss:32400")
+    confirmed = await adapter.confirm_paths("tv", ["/media/TV/Some Show (2019)/Season 01"])
+    assert confirmed == frozenset()
+
+
+async def test_confirm_paths_batches_many_paths_into_one_crawl_per_media_type() -> None:
+    # Bounded cost (issue #158): however many rows are queried in one call, the
+    # underlying section crawl happens exactly ONCE -- never once per path.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-batch:32400")
+    confirmed = await adapter.confirm_paths(
+        "movie",
+        [
+            "/media/Movies/Obsession (2026)",
+            "/media/Movies/Another One (2021)",
+            "/media/Movies/Yet Another (2022)",
+        ],
+    )
+    assert confirmed == frozenset({"/media/Movies/Obsession (2026)"})
+    assert calls["/library/sections/1/all"] == 1
+
+
+async def test_confirm_paths_empty_input_touches_no_network() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-empty:32400")
+    confirmed = await adapter.confirm_paths("movie", [])
+    assert confirmed == frozenset()
+    assert calls == {}
+
+
+async def test_confirm_paths_no_candidate_section_returns_empty_without_a_crawl() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=ONE_MOVIE_SECTION)  # no show section at all
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://confirm-no-section:32400")
+    confirmed = await adapter.confirm_paths("tv", ["/media/TV/Anything/Season 01"])
+    assert confirmed == frozenset()
+
+
+async def test_confirm_paths_propagates_a_crawl_transport_failure() -> None:
+    # Mirrors present_ids/season_presence: a genuine crawl failure must PROPAGATE
+    # so the caller's own try/except leaves every queried path unconfirmed for
+    # this tick's retry, never swallowed into a false "nothing confirmed".
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=CONFIRM_PATHS_SECTIONS)
+        return httpx.Response(500, json={"error": "boom"})
+
+    adapter = _adapter(handler, base_url="http://confirm-crawl-fail:32400")
+    with pytest.raises(PlexLibraryError):
+        await adapter.confirm_paths("movie", ["/media/Movies/Obsession (2026)"])
+
+
+# --------------------------------------------------------------------------- #
 # is_available — pagination
 # --------------------------------------------------------------------------- #
 ONE_MOVIE_SECTION: dict[str, Any] = {

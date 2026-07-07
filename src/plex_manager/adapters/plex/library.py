@@ -307,6 +307,24 @@ def _container_to_host_scan_path(location: str, path: str) -> str | None:
     return None
 
 
+def _extract_file_paths(item: Mapping[str, object]) -> list[str]:
+    """Every ``Media[].Part[].file`` path Plex reports for one item (HOST namespace).
+
+    A movie item carries one (rarely more, e.g. a multi-part edition) ``Media``
+    entry; an episode item (fetched with ``type=4``, see
+    :meth:`PlexLibrary.confirm_paths`) carries its own. Absent/malformed entries
+    are skipped rather than raising -- a single odd item must never abort the
+    whole crawl.
+    """
+    paths: list[str] = []
+    for media in _as_sequence(item.get("Media")):
+        for part in _as_sequence(_as_mapping(media).get("Part")):
+            file_path = _get_str(_as_mapping(part), "file")
+            if file_path is not None:
+                paths.append(file_path)
+    return paths
+
+
 def _section_scan_path(section: LibrarySection, path: str) -> str | None:
     """The Plex(host)-namespace path to refresh for ``path`` in ``section``, or None.
 
@@ -559,6 +577,79 @@ class PlexLibrary:
             if len(items) < _PAGE_SIZE:
                 break
             start += _PAGE_SIZE
+
+    async def _collect_section_file_paths(
+        self, key: str, paths: list[str], *, extra_params: Mapping[str, str] | None = None
+    ) -> None:
+        """Walk one section's items page-by-page, collecting every file path.
+
+        ``extra_params`` scopes the query -- :meth:`confirm_paths` passes
+        ``{"type": "4"}`` on a SHOW section so this crawls EVERY episode ("leaf")
+        across the whole section directly, in ONE flat paged walk (Plex's numeric
+        type filter: 1=movie, 2=show, 3=season, 4=episode) -- never one
+        ``/children`` fetch per show. Left unset (movie sections), the section's
+        own ``/all`` already lists movie items directly.
+        """
+        start = 0
+        params: dict[str, str] = dict(extra_params or {})
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                params,
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                paths.extend(_extract_file_paths(_as_mapping(item)))
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
+
+    async def confirm_paths(
+        self,
+        media_type: Literal["movie", "tv"],
+        library_paths: Collection[str],
+    ) -> frozenset[str]:
+        """See :meth:`LibraryPort.confirm_paths`.
+
+        ONE crawl of every candidate (movie or show) section for the WHOLE call,
+        regardless of how many ``library_paths`` are queried -- TV episodes are
+        fetched directly via the section's flat ``type=4`` listing (never a
+        per-show ``/children``/``allLeaves`` fetch), so the cost model matches
+        :meth:`present_ids`'s "one crawl, not one per row". Each queried path is
+        confirmed by reversing the section's HOST-namespace location the same way
+        :meth:`trigger_scan` does (:func:`_section_scan_path`) and checking whether
+        any crawled file path sits at/under that reversed directory
+        (:func:`_is_path_prefix`) -- directory-prefix, never title/year.
+        """
+        wanted = frozenset(p for p in library_paths if p)
+        if not wanted:
+            return frozenset()
+        section_type: Literal["movie", "show"] = "movie" if media_type == "movie" else "show"
+        candidate_sections = [s for s in await self.list_sections() if s.type == section_type]
+        if not candidate_sections:
+            return frozenset()
+        file_paths: list[str] = []
+        # Episodes only exist as their own leaf rows (type=4) on a SHOW section --
+        # the section's default ``/all`` lists shows, not episodes.
+        extra_params = {"type": "4"} if media_type == "tv" else None
+        for section in candidate_sections:
+            await self._collect_section_file_paths(
+                section.key, file_paths, extra_params=extra_params
+            )
+        confirmed: set[str] = set()
+        for library_path in wanted:
+            for section in candidate_sections:
+                scan_path = _section_scan_path(section, library_path)
+                if scan_path is not None and any(
+                    _is_path_prefix(scan_path, fp) for fp in file_paths
+                ):
+                    confirmed.add(library_path)
+                    break
+        return frozenset(confirmed)
 
     async def _collect_present_show_ids(self) -> frozenset[int]:
         """Page every SHOW section and gather the tmdb ids of its shows (guid-only).

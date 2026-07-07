@@ -77,6 +77,7 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         poster_url=row.poster_url,
         backdrop_url=row.backdrop_url,
         library_path=row.library_path,
+        completed_at=_as_utc(row.completed_at),
         keep_forever=bool(row.keep_forever),
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),

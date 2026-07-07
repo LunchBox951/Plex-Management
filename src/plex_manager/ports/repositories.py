@@ -57,6 +57,16 @@ class RequestRecord(BaseModel):
     # ``None`` until import/availability time sets it (or for a tv rollup row,
     # where the breadcrumb lives per-season on ``SeasonRequestRecord`` instead).
     library_path: str | None = None
+    # WHEN this request's import finalized (``mark_completed``) / became
+    # watchable (``mark_available``) -- i.e. the instant "Finalizing" began.
+    # ``None`` for a request that has never imported. The bounded-Finalizing
+    # warning (issue #158, ``import_service.run_availability_cycle``) reads this
+    # as the anchor for "elapsed time since completed" -- persisted and exact
+    # (survives a restart), unlike the in-memory fallback anchor a TV
+    # ``SeasonRequestRecord`` must use (it carries no per-season mirror of this
+    # column; see ``SqlRequestRepository.heal_completed_at``'s docstring on why
+    # one is deliberately deferred).
+    completed_at: datetime | None = None
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` must never
     # select this title, regardless of watch state or disk pressure.
     keep_forever: bool = False
