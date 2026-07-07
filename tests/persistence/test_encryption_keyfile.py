@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 import os
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -224,6 +225,190 @@ def test_get_fernet_rejects_truncated_key(file_backed_key: Path) -> None:
         encryption.get_fernet()
 
     assert file_backed_key.read_bytes() == b"tooshort"
+
+
+@pytest.mark.parametrize("trailer", [b"\n", b"\r\n", b"  \n", b"\t", b"\r\n\r\n"])
+def test_get_fernet_loads_key_with_surrounding_whitespace(
+    file_backed_key: Path, trailer: bytes
+) -> None:
+    """A restored ``secret.key`` frequently carries a trailing newline (an editor
+    or ``echo`` adds one) that Fernet ITSELF accepts -- rejecting it on a bare
+    ``len == 44`` shape check turned a previously-working install
+    undecryptable-looking after upgrade. The loader must tolerate surrounding ASCII
+    whitespace/newlines and still decrypt data written under the bare key."""
+    key = Fernet.generate_key()
+    file_backed_key.write_bytes(key + trailer)
+
+    fernet = encryption.get_fernet()
+
+    token = Fernet(key).encrypt(b"payload")
+    assert fernet.decrypt(token) == b"payload"
+
+
+def test_get_fernet_still_rejects_43_byte_truncation(file_backed_key: Path) -> None:
+    """Tolerating surrounding whitespace must NOT weaken the truncation guard: a
+    key one byte short of the 44-char encoding is genuinely corrupt (Fernet rejects
+    it), so the loader must fail loudly and leave the file untouched."""
+    truncated = Fernet.generate_key()[:-1]
+    assert len(truncated) == 43
+    file_backed_key.write_bytes(truncated)
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption.get_fernet()
+
+    assert file_backed_key.read_bytes() == truncated
+
+
+def test_is_valid_fernet_key_rejects_44_byte_non_base64() -> None:
+    """A blob that is EXACTLY 44 bytes but not valid urlsafe-base64 (so Fernet
+    rejects it) must fail validation -- the length gate alone is not enough;
+    Fernet is the authority that catches corrupt-but-right-length content."""
+    corrupt = b"!" * 44  # 44 chars, but '!' is not in the base64 alphabet
+    assert len(corrupt) == 44
+    assert not encryption._is_valid_fernet_key(corrupt)  # pyright: ignore[reportPrivateUsage]
+    # A real 44-char key is accepted, confirming the check is not over-broad.
+    assert encryption._is_valid_fernet_key(  # pyright: ignore[reportPrivateUsage]
+        Fernet.generate_key()
+    )
+
+
+def test_generate_key_file_fallback_leaves_no_partial_final_file(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-hardlink fallback must make ``secret.key`` visible ONLY via an atomic
+    rename of a fully written temp, so the final file is complete-or-absent, never a
+    zero-byte/partial (the exFAT/SMB window the prior O_EXCL-at-final-path route
+    reopened). Assert the published file is a complete, Fernet-valid key and no
+    lock/temp litter remains."""
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    on_disk = file_backed_key.read_bytes()
+    assert on_disk == result
+    assert encryption._is_valid_fernet_key(on_disk)  # pyright: ignore[reportPrivateUsage]
+    # No leftovers: neither the publish lock directory nor an orphan tempfile.
+    assert not file_backed_key.with_name(file_backed_key.name + ".lock").exists()
+    assert list(file_backed_key.parent.glob(".secret.*.tmp")) == []
+
+
+def test_generate_key_file_fallback_recovers_from_crashed_publish_lock(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between acquiring the publish lock and writing the key leaves the
+    sibling ``<name>.lock`` directory behind with NO key. The next startup must reap
+    that stale lock (by age) and complete first-run creation, never deadlock behind
+    it -- north star #1: a lost key is recoverable without a terminal."""
+    stale_lock = file_backed_key.with_name(file_backed_key.name + ".lock")
+    stale_lock.mkdir()
+    old = time.time() - 3600
+    os.utime(stale_lock, (old, old))
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert encryption._is_valid_fernet_key(result)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == result
+    assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+    assert not stale_lock.exists()  # reaped, then released after publish
+
+
+def test_generate_key_file_fresh_lock_is_not_reaped(file_backed_key: Path) -> None:
+    """A FRESH publish lock (a live holder mid-publish) must never be reaped: only a
+    lock older than the stale bound is broken. A young lock with no key yet leaves
+    the reaper waiting, so this asserts the age gate holds (the reap is a no-op)."""
+    fresh_lock = file_backed_key.with_name(file_backed_key.name + ".lock")
+    fresh_lock.mkdir()  # mtime ~now -> well within the stale bound
+
+    encryption._reap_stale_publish_lock(fresh_lock)  # pyright: ignore[reportPrivateUsage]
+
+    assert fresh_lock.exists()  # a live holder's lock is left untouched
+
+
+def test_generate_key_file_fallback_raises_on_unbreakable_lock(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the publish-lock path is occupied by something ``os.rmdir`` cannot clear
+    (a stray FILE here, standing in for a permissions fault), acquisition must fail
+    LOUDLY with an actionable error naming the lock -- never hang forever (north
+    star #3). The stale-age gate still lets the reaper ATTEMPT the removal, which
+    fails on a non-directory; the deadline then converts the non-progress into the
+    error instead of an infinite loop."""
+    lock_path = file_backed_key.with_name(file_backed_key.name + ".lock")
+    lock_path.write_bytes(b"not a directory")
+    old = time.time() - 3600  # old enough that the reaper tries (and fails) to rmdir it
+    os.utime(lock_path, (old, old))
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+    monkeypatch.setattr(encryption, "_PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)  # keep the retry-read instant
+
+    with pytest.raises(RuntimeError, match="publish lock"):
+        encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    # The stray file is untouched (rmdir cannot remove it) and NO key was minted.
+    assert lock_path.read_bytes() == b"not a directory"
+    assert not file_backed_key.exists()
+
+
+def test_generate_key_file_concurrent_fallback_agrees_on_one_key(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a hardlink-refusing filesystem, N racing first-run workers must still
+    agree on ONE complete key: the ``mkdir`` publish-lock serializes them and a
+    loser ADOPTS the winner's key rather than clobbering it (no double-mint)."""
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def _worker() -> bytes:
+        barrier.wait()
+        return encryption._generate_key_file(  # pyright: ignore[reportPrivateUsage]
+            file_backed_key
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker) for _ in range(workers)]
+        results = [future.result() for future in futures]
+
+    assert len(set(results)) == 1  # every worker agrees on ONE key
+    (winner,) = set(results)
+    assert encryption._is_valid_fernet_key(winner)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == winner
+    assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+
+
+def test_reap_stale_key_tempfiles_removes_old_orphans_only(tmp_path: Path) -> None:
+    """The stale-tempfile sweep removes a crashed publish's orphaned
+    ``.secret.*.tmp`` (by age) but never a concurrent live publish's young
+    tempfile."""
+    orphan = tmp_path / ".secret.orphan.tmp"
+    orphan.write_bytes(b"junk")
+    old = time.time() - 3600
+    os.utime(orphan, (old, old))
+    fresh = tmp_path / ".secret.fresh.tmp"
+    fresh.write_bytes(b"new")
+
+    encryption._reap_stale_key_tempfiles(tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert not orphan.exists()
+    assert fresh.exists()
 
 
 def test_secret_override_still_drives_encryption(monkeypatch: pytest.MonkeyPatch) -> None:

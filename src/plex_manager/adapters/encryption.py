@@ -20,8 +20,6 @@ are never logged.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import contextlib
 import errno
 import logging
@@ -55,9 +53,27 @@ logger = logging.getLogger(__name__)
 _fernet: Fernet | None = None
 
 _FERNET_KEY_LENGTH: Final = 44  # urlsafe-b64 of 32 bytes (Fernet.generate_key())
-_FERNET_KEY_RAW_LENGTH: Final = 32
 _KEY_READ_ATTEMPTS: Final = 50
 _KEY_READ_DELAY_SECONDS: Final = 0.02  # ~1s max, rides out an in-flight atomic publish
+
+# Private key tempfile naming (``tempfile.mkstemp``) -- the glob a stale-orphan
+# sweep matches, so it must stay in sync with the mkstemp prefix/suffix below.
+_KEY_TEMPFILE_PREFIX: Final = ".secret."
+_KEY_TEMPFILE_SUFFIX: Final = ".tmp"
+
+# The sibling directory used as the no-hardlink publish mutex, and the age
+# bounds for reaping a crashed publisher's leftovers (see
+# ``_publish_key_no_hardlink``). Both bounds are generous by orders of
+# magnitude: a real publish (write 44 bytes + fsync + rename) is milliseconds,
+# so a LIVE holder's lock/tempfile never looks stale and is never reaped.
+_PUBLISH_LOCK_SUFFIX: Final = ".lock"
+_STALE_PUBLISH_LOCK_SECONDS: Final = 30.0
+_STALE_KEY_TEMPFILE_SECONDS: Final = 60.0
+# Safety valve: acquisition normally succeeds at once, or recovers within one
+# stale window (~30s). If it makes NO progress for this long the lock is
+# un-removable (a stray non-directory at the path, a permissions fault), so fail
+# LOUDLY with an actionable error rather than hang forever (north star #3).
+_PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS: Final = 120.0
 
 # os.link failures that mean "this filesystem does not support hardlinks at
 # all" (exFAT/FAT/SMB mounts are the common self-hosted case: a Pi with
@@ -72,27 +88,47 @@ _KEY_LINK_FALLBACK_ERRNOS: Final = frozenset(
 
 
 def _is_valid_fernet_key(raw: bytes) -> bool:
-    """Whether ``raw`` is a complete, well-shaped Fernet key. Total: never raises."""
-    if len(raw) != _FERNET_KEY_LENGTH:
+    r"""Whether ``raw`` is a complete, well-shaped Fernet key. Total: never raises.
+
+    Surrounding ASCII whitespace/newlines are tolerated (``raw.strip()``): a
+    restored ``secret.key`` often carries a trailing ``\n``/``\r\n`` that Fernet
+    ITSELF accepts (its base64 decode ignores non-alphabet bytes), so rejecting it
+    on a bare ``len(raw) == 44`` check -- as the prior shape validator did -- turned
+    a previously-working install undecryptable-looking after upgrade. Fernet is the
+    authority: the stripped core must be exactly 44 chars AND construct a Fernet
+    without error, so a key Fernet accepts is never rejected, while genuinely
+    truncated/corrupt content (a 43-byte partial, ``tooshort``) still is.
+    """
+    core = raw.strip()
+    if len(core) != _FERNET_KEY_LENGTH:
         return False
     try:
-        return len(base64.urlsafe_b64decode(raw)) == _FERNET_KEY_RAW_LENGTH
-    except (binascii.Error, ValueError):
+        Fernet(core)  # the ultimate authority on acceptance (binascii.Error <: ValueError)
+    except ValueError:
         return False
+    return True
+
+
+def _read_valid_key_once(key_path: Path) -> bytes | None:
+    """Read ``key_path`` ONCE and return its CANONICAL key bytes (surrounding
+    whitespace stripped), or ``None`` if the file is absent or not a complete Fernet
+    key. No retry -- see :func:`_read_valid_key` for the racing-writer retry variant."""
+    try:
+        raw = key_path.read_bytes()
+    except FileNotFoundError:
+        return None
+    return raw.strip() if _is_valid_fernet_key(raw) else None
 
 
 def _read_valid_key(key_path: Path) -> bytes | None:
     """Read a COMPLETE, shape-valid key, retrying briefly to ride out a racing
-    writer's atomic publish (GHSA-7fhf). Returns the key bytes, or ``None`` if
-    none materialized within the bound (absent, or present-but-never-valid).
+    writer's atomic publish (GHSA-7fhf). Returns the canonical key bytes, or
+    ``None`` if none materialized within the bound (absent, or present-but-never-valid).
     """
     for attempt in range(_KEY_READ_ATTEMPTS):
-        try:
-            raw = key_path.read_bytes()
-        except FileNotFoundError:
-            raw = b""
-        if _is_valid_fernet_key(raw):
-            return raw
+        key = _read_valid_key_once(key_path)
+        if key is not None:
+            return key
         if attempt + 1 < _KEY_READ_ATTEMPTS:
             time.sleep(_KEY_READ_DELAY_SECONDS)
     return None
@@ -131,6 +167,19 @@ def secret_key_path(settings: Settings | None = None) -> Path:
     return Path(settings.data_dir) / "secret.key"
 
 
+def _unbreakable_publish_lock_error(key_path: Path, lock_dir: Path) -> RuntimeError:
+    """Build the actionable error raised when the no-hardlink publish lock cannot
+    be acquired (a stray non-directory at ``lock_dir``, or a permissions fault --
+    never a live holder, which either publishes or ages out well inside the
+    timeout). Names the lock so the operator can remove it."""
+    return RuntimeError(
+        f"Could not create the encryption key at {key_path}: the publish lock "
+        f"{lock_dir} could not be acquired and would not clear. Remove it "
+        "(it should be an empty directory) and restart; if a valid secret.key "
+        "already exists it is used as-is and this lock is irrelevant."
+    )
+
+
 def _missing_key_error(key_path: Path) -> RuntimeError:
     """Build the actionable error raised when the key file is gone."""
     return RuntimeError(
@@ -143,22 +192,124 @@ def _missing_key_error(key_path: Path) -> RuntimeError:
     )
 
 
-def _publish_key_exclusive(key_path: Path, key: bytes) -> None:
-    """Create ``key_path`` and write ``key`` to it via an exclusive
-    (``O_CREAT | O_EXCL``) open, flushed and fsynced before the fd closes.
+def _reap_stale_key_tempfiles(key_dir: Path) -> None:
+    """Best-effort removal of orphaned key tempfiles a crashed publish left behind.
 
-    This is the fallback publish route for a filesystem that rejects
-    ``os.link`` outright (see ``_KEY_LINK_FALLBACK_ERRNOS``). Like the
-    ``os.link`` publish it is NEVER overwrite: ``O_EXCL`` raises
-    ``FileExistsError`` if a concurrent winner already published a key, so the
-    caller can fall back to re-reading the winner's key exactly as it does for
-    the ``os.link`` race-loss case.
+    A publish writes the key into a private ``.secret.*.tmp`` and only then makes
+    it visible (hardlink or rename); a crash in between orphans that tempfile.
+    Only files older than :data:`_STALE_KEY_TEMPFILE_SECONDS` are swept, so a
+    concurrent live publish's in-flight tempfile (age ~0) is NEVER removed. Total:
+    never raises -- hygiene must not break startup.
     """
-    fd = os.open(os.fspath(key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(key)
-        handle.flush()
-        os.fsync(handle.fileno())
+    now = time.time()
+    try:
+        candidates = list(key_dir.glob(f"{_KEY_TEMPFILE_PREFIX}*{_KEY_TEMPFILE_SUFFIX}"))
+    except OSError:
+        return
+    for candidate in candidates:
+        try:
+            if now - candidate.stat().st_mtime <= _STALE_KEY_TEMPFILE_SECONDS:
+                continue
+            candidate.unlink()
+        except OSError:
+            continue
+
+
+def _reap_stale_publish_lock(lock_dir: Path) -> None:
+    """Break the no-hardlink publish lock ONLY if its holder is demonstrably dead.
+
+    A crash between ``os.mkdir`` (acquire) and ``os.rmdir`` (release) would leave
+    the lock held forever, so a lock older than :data:`_STALE_PUBLISH_LOCK_SECONDS`
+    is removed to let the next startup recover. The bound is generous by orders of
+    magnitude: a real publish is milliseconds, so a LIVE holder's lock never looks
+    stale and is never broken.
+
+    Removing the lock is safe even under a reaper race: the caller only reaps when
+    NO valid key is currently visible (i.e. a fresh install), so at worst two
+    workers re-mint DIFFERENT first-run keys before any data exists to orphan -- an
+    ALREADY-ESTABLISHED key is never reached here (the fast-path and retry reads
+    adopt it first, so the lock is never even contended in that case). Total: never
+    raises.
+    """
+    try:
+        age = time.time() - lock_dir.stat().st_mtime
+    except OSError:
+        return
+    if age <= _STALE_PUBLISH_LOCK_SECONDS:
+        return
+    with contextlib.suppress(OSError):
+        os.rmdir(os.fspath(lock_dir))
+
+
+def _publish_key_no_hardlink(key_path: Path, key: bytes, tmp_name: str) -> bytes:
+    r"""Publish the first-run key WITHOUT hardlinks (the exFAT/FAT/SMB fallback).
+
+    ``tmp_name`` already holds ``key`` (written + fsynced by the caller). The final
+    ``key_path`` is made visible ONLY by atomically renaming ``tmp_name`` into
+    place, so a reader NEVER observes a partial final file and a crash can NEVER
+    leave a truncated ``secret.key``. The prior fallback (``O_CREAT|O_EXCL`` AT the
+    final path, then write the bytes) recreated exactly that zero-byte/partial
+    window -- on the very filesystems this fallback serves -- and a crash inside it
+    left a corrupt ``secret.key`` that later startups refuse to replace.
+
+    A sibling directory (``<name>.lock``) is the publish mutex: ``os.mkdir`` is
+    atomic and no-overwrite on EVERY filesystem (including the hardlink-less ones),
+    so exactly one worker publishes at a time and an existing key is NEVER
+    clobbered. A racing loser rides out the winner's in-flight publish with the
+    same bounded, validated read-retry readers use, then adopts the winner's key. A
+    lock left by a CRASHED holder is reaped by age (:func:`_reap_stale_publish_lock`)
+    so a half-finished publish is recoverable on the next startup. Returns the key
+    it published, or an already-present one it adopted.
+
+    Crash matrix (process death / power loss at each step; the next startup
+    recovers cleanly every time -- no partial final file is ever exposed):
+
+    * before ``mkdir``: only an orphan ``.secret.*.tmp`` (swept by age); no lock,
+      no ``key_path`` -> next startup is a clean first-run.
+    * after ``mkdir``, before ``rename``: an empty lock + an orphan tempfile, no
+      ``key_path`` -> next startup reaps the stale lock (age) and the stale
+      tempfile (age), then publishes fresh.
+    * during ``rename``: atomic -> ``key_path`` is either fully present (adopted)
+      or absent (as the previous case). Never partial.
+    * after ``rename``, before ``rmdir``: ``key_path`` is complete + valid; the
+      orphan lock is harmless (the normal load path reads the key directly and
+      never contends for the lock).
+    """
+    # Fast path: a complete key already exists -> adopt it, never overwrite, no lock.
+    existing = _read_valid_key_once(key_path)
+    if existing is not None:
+        return existing
+    lock_dir = key_path.with_name(key_path.name + _PUBLISH_LOCK_SUFFIX)
+    deadline = time.monotonic() + _PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS
+    while True:
+        try:
+            os.mkdir(os.fspath(lock_dir), 0o700)
+        except FileExistsError:
+            # A concurrent publisher holds the lock (live), or a crashed one left it.
+            adopted = _read_valid_key(key_path)  # bounded retry: ride out a live publish
+            if adopted is not None:
+                return adopted
+            # No key yet: break the lock ONLY if its holder is demonstrably dead,
+            # then retry acquiring (a live holder's fresh lock is left untouched and
+            # we simply keep waiting for it to publish or age out).
+            _reap_stale_publish_lock(lock_dir)
+            if time.monotonic() >= deadline:
+                raise _unbreakable_publish_lock_error(key_path, lock_dir) from None
+            continue
+        break  # acquired the publish lock
+    try:
+        # Under the lock a prior holder may have JUST published; never clobber it.
+        # No in-flight partial is possible here (publish is atomic-rename), so a
+        # single read settles it -- no retry needed.
+        published = _read_valid_key_once(key_path)
+        if published is not None:
+            return published
+        os.rename(os.fspath(tmp_name), os.fspath(key_path))
+        logger.info("generated new encryption key at %s", key_path)
+        return key
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(os.fspath(lock_dir))
 
 
 def _generate_key_file(key_path: Path) -> bytes:
@@ -177,15 +328,22 @@ def _generate_key_file(key_path: Path) -> bytes:
 
     On a filesystem that does not support hardlinks at all (exFAT/FAT/SMB —
     ``os.link`` raises ``OSError`` with an errno in ``_KEY_LINK_FALLBACK_ERRNOS``,
-    NOT ``FileExistsError``), fall back to the pre-hardlink atomic-exclusive
-    create (:func:`_publish_key_exclusive`): still a same-no-overwrite,
-    complete-bytes-before-visible publish, just without the hardlink. Any other
+    NOT ``FileExistsError``), delegate to :func:`_publish_key_no_hardlink`, which
+    publishes the fsynced tempfile via a lock-serialized ATOMIC RENAME so the final
+    path is still same-no-overwrite and complete-bytes-before-visible (never a
+    zero-byte/partial ``secret.key``), just without the hardlink. Any other
     ``OSError`` (e.g. disk full) is a genuine failure and propagates uncaught —
     it must not be papered over as a race loss.
     """
     key = Fernet.generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=key_path.parent, prefix=".secret.", suffix=".tmp")
+    # Clear tempfiles a crashed publish (this run's or a prior one's) may have
+    # orphaned; the fresh tempfile below is created AFTER this sweep and is far too
+    # young to be caught by its age bound.
+    _reap_stale_key_tempfiles(key_path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=key_path.parent, prefix=_KEY_TEMPFILE_PREFIX, suffix=_KEY_TEMPFILE_SUFFIX
+    )
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(key)
@@ -202,14 +360,7 @@ def _generate_key_file(key_path: Path) -> bytes:
         except OSError as exc:
             if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
                 raise
-            try:
-                _publish_key_exclusive(key_path, key)
-            except FileExistsError:
-                # Lost the race under the fallback route too.
-                existing = _read_valid_key(key_path)
-                if existing is None:
-                    raise _corrupt_key_error(key_path) from None
-                return existing
+            return _publish_key_no_hardlink(key_path, key, tmp_name)
         logger.info("generated new encryption key at %s", key_path)
         return key
     finally:

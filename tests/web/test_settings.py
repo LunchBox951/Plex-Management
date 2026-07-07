@@ -130,6 +130,31 @@ def test_settings_update_rejects_header_unsafe_credential(field: str) -> None:
     SettingsUpdate.model_validate({})
 
 
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+async def test_put_settings_422_never_echoes_the_submitted_credential(
+    client: httpx.AsyncClient, seed: SeedFn, field: str
+) -> None:
+    # north star #3: a header-unsafe credential submitted to PUT /settings is
+    # rejected (422), but the 422 body must NEVER echo the submitted value.
+    # FastAPI's DEFAULT handler returns the raw ``input``; the secret-redacting
+    # RequestValidationError handler scrubs it. Assert on the RAW response text so a
+    # leak anywhere in the body (input/ctx/msg) is caught.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    sentinel = "leak-SENTINEL-\r\nZZZINJECT"
+
+    response = await client.put(
+        "/api/v1/settings", json={field: sentinel}, headers={"X-Api-Key": _API_KEY}
+    )
+
+    assert response.status_code == 422
+    assert "SENTINEL" not in response.text
+    assert "ZZZINJECT" not in response.text
+    # The {"detail": [...]} envelope shape is preserved for the typed client.
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert any(err.get("loc", [])[-1:] == [field] for err in detail)
+
+
 async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})

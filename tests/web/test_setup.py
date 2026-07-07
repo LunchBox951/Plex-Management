@@ -253,6 +253,33 @@ async def test_complete_rejects_header_unsafe_credential(
     assert status["initialized"] is False
 
 
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+async def test_complete_422_never_echoes_the_submitted_credential(
+    client: httpx.AsyncClient, field: str
+) -> None:
+    # north star #3: rejecting a header-unsafe credential (422) must NEVER echo the
+    # submitted value back in the error body. FastAPI's DEFAULT RequestValidationError
+    # handler returns each error's raw ``input`` -- which for these fields is the very
+    # token the guard just refused, undoing the guard. The secret-redacting handler
+    # scrubs it. Assert on the RAW response text (not just the parsed ``input``), so a
+    # leak in any part of the body (msg/ctx/input) is caught.
+    sentinel = "leak-SENTINEL-\r\nZZZINJECT"
+    body = {**_COMPLETE_BODY, field: sentinel}
+
+    response = await client.post("/api/v1/setup/complete", json=body)
+
+    assert response.status_code == 422
+    assert "SENTINEL" not in response.text
+    assert "ZZZINJECT" not in response.text
+    # The standard {"detail": [...]} envelope is preserved so the typed client parses it.
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert any(err.get("loc", [])[-1:] == [field] for err in detail)
+    # And the leak did not sneak through in a different shape (still uninitialized).
+    status = (await client.get("/api/v1/setup/status")).json()
+    assert status["initialized"] is False
+
+
 @pytest.mark.parametrize(
     "good_url",
     [
