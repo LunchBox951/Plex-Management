@@ -185,36 +185,37 @@ def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
     catch those tokens in the *release description*, not in an arbitrary
     group tag. Absent/empty/non-str ``release_group`` -> unchanged behavior.
 
-    Every *attached* occurrence of the group is removed -- a token-bounded match
-    immediately preceded by ``-`` or ``[``, the two positions where a release
-    group is conventionally attached (Radarr's ``ReleaseGroupParser`` recognizes
-    exactly these shapes: the scene ``-GROUP`` suffix and the bracketed
-    ``[GROUP]`` tag). Stripping *all* attached occurrences (not just the last)
-    matters because import validation parses the full relative *path*, so a group
-    whose name appears on BOTH the release folder and the filename -- e.g. group
-    ``SCR`` in ``Movie...x264-SCR/Movie...x264-SCR.mkv`` -- would otherwise leave
-    the folder's ``-SCR`` behind to false-trip the reject net and wrongly reject
-    a clean import.
+    Every *group-tag* occurrence is removed -- a bracketed tag or a hyphen tag at
+    a release-segment boundary. Stripping *all* such occurrences (not just the
+    last) matters because import validation parses the full relative *path*, so a
+    group whose name appears on BOTH the release folder and the filename -- e.g.
+    group ``SCR`` in ``Movie...x264-SCR/Movie...x264-SCR.mkv`` -- would otherwise
+    leave the folder's ``-SCR`` behind to false-trip the reject net and wrongly
+    reject a clean import.
 
-    Anchoring on the attachment character is what keeps a genuine *body token*
-    that collides with the group name intact: in
-    ``Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR`` the hardcoded-screener marker
-    ``HC.SCR`` is dot-attached, so only the ``-SCR`` group tag is stripped and
-    the reject net still sees the real screener token. The right-side
-    not-followed-by-a-word-char flank likewise keeps the group name inside a
-    longer run (``SCR`` in ``DVDSCR``, ``Scr`` in ``Scream``) untouched. This
-    removes only group *tags*, never body mentions; the guessit-native checks
-    remain the primary defense for real reject tokens.
+    Anchoring hyphen tags to segment boundaries is what keeps a genuine *body
+    token* that collides with the group name intact: in
+    ``Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR`` and
+    ``Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR`` the hardcoded-screener marker is
+    in the body, so only the trailing ``-SCR`` group tag is stripped and the reject
+    net still sees the real screener token. The right-side not-followed-by-a-word
+    flank likewise keeps the group name inside a longer run (``SCR`` in
+    ``DVDSCR``, ``Scr`` in ``Scream``) untouched. This removes only group *tags*,
+    never body mentions; the guessit-native checks remain the primary defense for
+    real reject tokens.
     """
     group = fields.get("release_group")
     if not isinstance(group, str) or not group:
         return raw_title
-    # ``(?<=[-\[])`` requires the attachment character and deliberately leaves it
-    # in place (only the group token is removed). ``(?!\w)`` bounds the right
-    # edge to a whole token; ``_`` counts as a word char exactly as the ``\b``
-    # boundaries in the reject nets treat it, so the strip removes precisely the
-    # attached spans a net could otherwise fire on -- and nothing else.
-    pattern = re.compile(rf"(?<=[-\[]){re.escape(group)}(?!\w)", re.IGNORECASE)
+    # The attachment marker is deliberately left in place (only the group token is
+    # removed). Bracket tags are bounded by the closing bracket; hyphen tags must
+    # sit at a segment boundary (end, path separator, or known video extension) so
+    # body markers such as ``HC-SCR.WEB-DL`` are preserved for the reject net.
+    escaped_group = re.escape(group)
+    pattern = re.compile(
+        rf"(?:(?<=\[){escaped_group}(?!\w)|(?<=-){escaped_group}(?=$|/|\.(?:mkv|mp4|m4v|avi|mov)\b))",
+        re.IGNORECASE,
+    )
     return pattern.sub("", raw_title)
 
 

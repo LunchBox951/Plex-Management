@@ -501,6 +501,14 @@ def test_real_reject_token_survives_release_group_strip() -> None:
             {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
             "DVDSCR",
         ),
+        # Same laundering hazard with a hyphen separator: the reject regexes treat
+        # ``HC-SCR`` as a real screener marker, so the group strip must not remove
+        # that body token while removing the trailing ``-SCR`` release group.
+        (
+            "Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR",
+            {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+            "DVDSCR",
+        ),
     ):
         parsed = to_parsed_release(fields, raw_title)
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
@@ -518,7 +526,7 @@ def test_strip_release_group_noop_without_group() -> None:
 def test_strip_release_group_removes_span_case_insensitive() -> None:
     assert _strip_release_group("Movie-scr", {"release_group": "SCR"}) == "Movie-"
     # Regex-special characters in the group name are matched literally.
-    assert _strip_release_group("Movie-R5+X-GRP", {"release_group": "R5+X"}) == "Movie--GRP"
+    assert _strip_release_group("Movie-R5+X", {"release_group": "R5+X"}) == "Movie-"
 
 
 def test_strip_release_group_anchors_to_suffix_not_an_embedded_mention() -> None:
@@ -578,6 +586,10 @@ def test_strip_release_group_only_removes_attached_tags() -> None:
     assert (
         _strip_release_group("Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR", {"release_group": "SCR"})
         == "Movie.2024.1080p.HC.SCR.WEB-DL.x264-"
+    )
+    assert (
+        _strip_release_group("Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR", {"release_group": "SCR"})
+        == "Movie.2024.1080p.HC-SCR.WEB-DL.x264-"
     )
     # Bracket attachment (the anime/p2p ``[GROUP]`` convention Radarr's
     # ReleaseGroupParser also recognizes) is stripped like the hyphen form, so a
