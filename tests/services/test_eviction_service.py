@@ -28,6 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.models import (
@@ -40,8 +41,9 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.library import WatchState
-from plex_manager.ports.metadata import TvMetadata
+from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
+from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import eviction_service, request_service, season_request_service
 from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
@@ -3328,6 +3330,282 @@ async def test_resume_restores_and_cancels_the_regrab_after_a_crash(
         regrab_row = await session.get(MediaRequest, regrab_id)
     assert old_row is not None and old_row.status is RequestStatus.available
     assert regrab_row is not None and regrab_row.status is RequestStatus.cancelled
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-2 findings 1 + 2 (under-stamping): the eviction guard must stamp
+# ``eviction_regrab`` on ANY fresh non-force row it creates whenever the
+# newest tracked history is 'evicted' -- regardless of what THIS call's own
+# Plex probe reported (presence-proven, absent, or erroring) -- or a genuine
+# in-window regrab is invisible to the restore's redundant-regrab dedup.
+# --------------------------------------------------------------------------- #
+
+
+async def test_create_request_regrab_stamped_when_plex_errors_is_cancelled_by_restore(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Composes finding 1 end-to-end: ``create_request`` stamps
+    ``eviction_regrab=True`` on a fresh movie row even though THIS call's own
+    Plex probe ERRORED (never proving presence) -- and once stamped, a
+    DIFFERENT eviction's failed-delete restore correctly recognizes + cancels
+    it as its own redundant duplicate. Before the fix the row was created
+    UNMARKED (the guard never ran outside the ``force or _already_in_library``
+    branch), so the restore's dedup skipped it and left both the restored file
+    AND this redundant re-download standing."""
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=900,
+        title="Erroring Plex Movie",
+        library_path=None,
+        status=RequestStatus.evicted,  # the claim, mid-window
+    )
+
+    tmdb = FakeTmdb(
+        movies={900: MovieMetadata(tmdb_id=900, title="Erroring Plex Movie", year=2022)}
+    )
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=900, media_type="movie", library=library
+        )
+    assert fresh.id != request_id
+    assert fresh.status == RequestStatus.pending.value
+    assert fresh.eviction_regrab is True  # finding-1 fix
+
+    # A DIFFERENT eviction's failed-delete restore (``_restore_after_failed_
+    # delete``'s reconciliation) must recognize this fresh row as its own
+    # redundant re-grab and cancel it.
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=900, size_bytes=None
+    )
+    async with sessionmaker_() as session:
+        await eviction_service._restore_after_failed_delete(  # pyright: ignore[reportPrivateUsage]
+            session, pending
+        )
+
+    async with sessionmaker_() as session:
+        old_row = await session.get(MediaRequest, request_id)
+        regrab_row = await session.get(MediaRequest, fresh.id)
+    assert old_row is not None and old_row.status is RequestStatus.available  # restored
+    assert regrab_row is not None and regrab_row.status is RequestStatus.cancelled
+
+
+async def test_ensure_seasons_regrab_stamped_when_plex_crawl_errors_is_cancelled_by_restore(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV twin of the test above (finding 2): ``ensure_seasons`` stamps a
+    fresh season's ``eviction_regrab=True`` even though THIS call's own Plex
+    crawl (``_present_seasons``) ERRORED and returned an empty set -- never
+    proving the season present -- because the season is still in
+    ``evicted_seasons`` (the DB-only signal). Before the fix,
+    ``evicted_regrab_seasons`` was only ever ``present & evicted_seasons``, so
+    an erroring crawl (empty ``present``) left the fresh season unmarked, and
+    the restore's sibling dedup would have skipped the exact duplicate it
+    exists to catch."""
+    old_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=901, title="Erroring Plex Show", seasons={1: None}
+    )
+    async with sessionmaker_() as session:
+        old_season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == old_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        old_season.status = RequestStatus.evicted  # the committed claim
+        old_show = await session.get(MediaRequest, old_show_id)
+        assert old_show is not None
+        old_show.status = RequestStatus.evicted  # rollup: wholly evicted
+        await session.commit()
+        old_season_id = old_season.id
+
+    # A fresh show tracking the same season, created while Plex's season crawl
+    # ERRORS (mirrors ``request_service.create_request``'s wholly-evicted-show
+    # re-request path calling straight into ``ensure_seasons``).
+    async with sessionmaker_() as session:
+        new_show = MediaRequest(
+            tmdb_id=901,
+            media_type=MediaType.tv,
+            title="Erroring Plex Show",
+            status=RequestStatus.pending,
+        )
+        session.add(new_show)
+        await session.commit()
+        new_show_id = new_show.id
+
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+    async with sessionmaker_() as session:
+        records = await season_request_service.ensure_seasons(
+            session, library, media_request_id=new_show_id, tmdb_id=901, seasons=[1]
+        )
+        await session.commit()
+
+    assert len(records) == 1
+    assert records[0].status == RequestStatus.pending.value
+    assert records[0].eviction_regrab is True  # finding-2 fix
+    new_season_id = records[0].id
+
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=old_show_id,
+        season_request_id=old_season_id,
+        season_number=1,
+        tmdb_id=901,
+        size_bytes=None,
+    )
+    async with sessionmaker_() as session:
+        await eviction_service._restore_after_failed_delete(  # pyright: ignore[reportPrivateUsage]
+            session, pending
+        )
+
+    async with sessionmaker_() as session:
+        old_season = await session.get(SeasonRequest, old_season_id)
+        new_season = await session.get(SeasonRequest, new_season_id)
+        new_show = await session.get(MediaRequest, new_show_id)
+    assert old_season is not None and old_season.status is RequestStatus.available  # restored
+    assert new_season is not None and new_season.status is RequestStatus.cancelled
+    assert new_show is not None and new_show.status is RequestStatus.cancelled
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-2 findings 3 + 4 (stale markers): ``eviction_regrab`` must be
+# retired the moment a row stops being "some eviction's own in-flight regrab"
+# -- confirmed available, or re-armed by an operator (report-issue) for a
+# brand-new search -- or a LATER, UNRELATED eviction's restore can cancel a row
+# that has nothing to do with it anymore.
+# --------------------------------------------------------------------------- #
+
+
+async def test_operator_rearmed_former_regrab_movie_survives_an_unrelated_restore(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A movie row that WAS some eviction's own regrab, since re-armed by the
+    operator (report-issue) for a brand-new search, must survive a DIFFERENT
+    eviction's failed-delete restore untouched -- the marker was retired the
+    moment ``reset_for_research`` re-armed it (finding 3), so the restore's
+    dedup no longer recognizes it as a redundant duplicate of ITS OWN regrab.
+    Before the fix the stale marker would have let the restore cancel the
+    operator's live re-search."""
+    # The row this test's (unrelated) eviction restores; only its id/tmdb_id
+    # matter to ``_cancel_redundant_movie_regrabs`` (it excludes this id).
+    restored_id = await _movie(sessionmaker_, tmdb_id=902, title="Rearmed Movie", library_path=None)
+
+    # A PAST eviction regrab for the SAME movie, under a different request.
+    async with sessionmaker_() as session:
+        rearmed = MediaRequest(
+            tmdb_id=902,
+            media_type=MediaType.movie,
+            title="Rearmed Movie",
+            status=RequestStatus.pending,
+            eviction_regrab=True,  # this row WAS some eviction's own regrab
+        )
+        session.add(rearmed)
+        await session.commit()
+        rearmed_id = rearmed.id
+
+    # report-issue's re-arm verb -- the fix clears the marker here.
+    async with sessionmaker_() as session:
+        await SqlRequestRepository(session).reset_for_research(rearmed_id)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, rearmed_id)
+        assert row is not None
+        assert row.status is RequestStatus.searching
+        assert row.eviction_regrab is False  # cleared by the fix (finding 3)
+
+    # A DIFFERENT eviction's failed-delete restore now runs its redundant-regrab
+    # dedup against this movie.
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=restored_id, tmdb_id=902, size_bytes=None
+    )
+    async with sessionmaker_() as session:
+        await eviction_service._cancel_redundant_movie_regrabs(  # pyright: ignore[reportPrivateUsage]
+            session, pending
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, rearmed_id)
+    assert row is not None
+    assert row.status is RequestStatus.searching  # NOT cancelled
+
+
+async def test_operator_rearmed_former_regrab_season_survives_an_unrelated_restore(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The TV twin of the test above: a season that WAS some eviction's own
+    regrab, since re-armed by report-issue for a brand-new search, must survive
+    a DIFFERENT eviction's failed-delete restore untouched."""
+    restored_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=903, title="Rearmed Show", seasons={1: None}
+    )
+    async with sessionmaker_() as session:
+        restored_season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == restored_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        restored_season_id = restored_season.id
+
+    # A PAST eviction regrab for the SAME show/season, under a different request.
+    async with sessionmaker_() as session:
+        rearmed_show = MediaRequest(
+            tmdb_id=903,
+            media_type=MediaType.tv,
+            title="Rearmed Show",
+            status=RequestStatus.pending,
+        )
+        session.add(rearmed_show)
+        await session.flush()
+        rearmed_season = SeasonRequest(
+            media_request_id=rearmed_show.id,
+            season_number=1,
+            status=RequestStatus.pending,
+            eviction_regrab=True,  # this season WAS some eviction's own regrab
+        )
+        session.add(rearmed_season)
+        await session.commit()
+        rearmed_show_id, rearmed_season_id = rearmed_show.id, rearmed_season.id
+
+    # report-issue's re-arm verb -- the fix clears the marker here.
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=rearmed_show_id, season_number=1
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, rearmed_season_id)
+        assert season is not None
+        assert season.status is RequestStatus.searching
+        assert season.eviction_regrab is False  # cleared by the fix (finding 3)
+
+    # A DIFFERENT eviction's failed-delete restore now runs its redundant-regrab
+    # dedup against this show's season.
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=restored_show_id,
+        season_request_id=restored_season_id,
+        season_number=1,
+        tmdb_id=903,
+        size_bytes=None,
+    )
+    async with sessionmaker_() as session:
+        await eviction_service._cancel_redundant_season_regrabs(  # pyright: ignore[reportPrivateUsage]
+            session, pending
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, rearmed_season_id)
+    assert season is not None
+    assert season.status is RequestStatus.searching  # NOT cancelled
 
 
 # --------------------------------------------------------------------------- #

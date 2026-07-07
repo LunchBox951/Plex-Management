@@ -597,94 +597,106 @@ async def create_request_result(
             raise NoAiredSeasonsError(tmdb_id)
 
     initial_status = RequestStatus.pending.value
-    # Provenance marker (issue #156): set ``True`` ONLY when the ``latest_request_
-    # evicted`` guard below actually fires and this call falls through to a fresh
-    # 'pending' create INSTEAD of trusting Plex's stale 'present' reading -- i.e.
-    # exactly this app's own eviction-guard re-grab, never an ordinary request for
-    # a movie that was simply never in the library, and never a ``force`` (#148)
-    # re-acquire (which skips this guard entirely, see the ``if not force`` branch
-    # below). Threaded into ``repo.create`` so the eviction restore's redundant-
-    # regrab dedup (``eviction_service._cancel_redundant_movie_regrabs``) can tell
-    # its OWN re-grab apart from a deliberate operator re-acquire.
+    # Provenance marker (issue #156; hardened by the Codex round-2 finding below):
+    # ``True`` whenever THIS movie's own eviction guard (``repo.
+    # latest_request_evicted``) is the reason a fresh 'pending' row is about to be
+    # created -- i.e. the newest tracked history for this ``(tmdb_id, media_type)``
+    # is 'evicted' -- never for an ordinary request for a movie that was simply
+    # never in the library, and never a ``force`` (#148) re-acquire (which skips
+    # this guard entirely, see the ``if not force`` branch below). Threaded into
+    # ``repo.create`` so the eviction restore's redundant-regrab dedup
+    # (``eviction_service._cancel_redundant_movie_regrabs``) can tell its OWN
+    # re-grab apart from a deliberate operator re-acquire.
+    #
+    # Checked UNCONDITIONALLY below for every non-force movie request -- NOT only
+    # when this call's own Plex probe proves presence. During the eviction
+    # claim/delete window Plex can just as easily ERROR (``_already_in_library``'s
+    # best-effort 'no') or correctly report the file already gone as it can still
+    # report it present; in every one of those shapes the fresh row this call
+    # creates is STILL an in-window eviction regrab, and under-stamping it would
+    # leave a genuine duplicate invisible to the restore's dedup (the P2 this
+    # closes: a failed purge would then leave BOTH the restored file and a
+    # redundant active re-download standing).
     movie_eviction_regrab = False
-    if (
-        library is not None
-        and media_type == "movie"
-        and (force or await _already_in_library(library, tmdb_id))
-    ):
-        # Dedup the available short-circuit: if this movie is already recorded as
-        # in-library, return that row rather than accumulating duplicate 'available'
-        # rows (the active-dedup partial index excludes terminal statuses, so it
-        # would not catch this). Acquire a per-media DB lock first so PostgreSQL MVCC
-        # cannot let two concurrent transactions both miss each other's uncommitted
-        # terminal row. A movie REMOVED from Plex reads not-available above and falls
-        # through to a normal pending request, so re-requests still work.
-        #
+    if library is not None and media_type == "movie":
         # ``force`` (issue #131, re-acquire): still SKIPS the Plex round-trip in
-        # ``_already_in_library`` (the ``force or`` short-circuit above -- an operator
-        # who already knows the file is gone shouldn't pay for, or risk racing, a
-        # presence check whose answer they are about to override) and NEVER mints an
-        # 'available' row (the eviction guard + terminal in-library dedup below are
-        # gated ``not force``). But it MUST participate in the SAME per-media lock and
-        # the SAME under-lock active re-read as the normal short-circuit: without them
-        # a forced re-acquire inserts its 'pending' row OUTSIDE this lock, so a
-        # concurrent normal create can take the lock, MISS the still-uncommitted forced
-        # row (its 'pending' is not yet visible, and available/completed-only
-        # find_in_library never matches a 'pending'), and mint a terminal 'available'
-        # row -- which, being outside ``uq_media_requests_active``, does not collide
-        # with the forced 'pending' -- handing the caller a false in-library answer
-        # while a fresh re-acquire is active. Taking the lock here serializes the two:
-        # the normal create either sees the committed forced 'pending' under the lock
-        # and dedups onto it, or wins the lock first (a legitimate ordering -- the
-        # forced re-acquire simply lands after and creates its own 'pending').
-        await repo.acquire_media_lock(tmdb_id, media_type)
-        # Re-read the ACTIVE row UNDER the lock: our find_active at the top ran before
-        # the lock, so a concurrent re-request for the same movie may have committed an
-        # active 'pending' re-grab in the meantime (the evicted-guard branch below, or
-        # a concurrent forced re-acquire, mints exactly that -- which find_in_library,
-        # available/completed only, would NOT catch). Dedup onto it so two racing
-        # re-requests never leave a second row, and in particular never let one mint
-        # 'available' over a file another is already re-acquiring just because the
-        # newest row is now that concurrent 'pending' one.
-        existing_active = await repo.find_active(tmdb_id, media_type)
-        if existing_active is not None:
-            if _owned_by_another_user(existing_active, user_id, actor_is_admin):
-                raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
-            existing_active = await _claim_dedup_winner_if_unowned(
-                session, repo, existing_active, user_id, actor_is_admin
-            )
-            return CreateRequestResult(record=existing_active, created=False)
+        # ``_already_in_library`` (the ``force or`` short-circuit -- an operator who
+        # already knows the file is gone shouldn't pay for, or risk racing, a
+        # presence check whose answer they are about to override).
+        plex_present = force or await _already_in_library(library, tmdb_id)
+        if plex_present:
+            # Dedup the available short-circuit: if this movie is already recorded as
+            # in-library, return that row rather than accumulating duplicate 'available'
+            # rows (the active-dedup partial index excludes terminal statuses, so it
+            # would not catch this). Acquire a per-media DB lock first so PostgreSQL MVCC
+            # cannot let two concurrent transactions both miss each other's uncommitted
+            # terminal row. A movie REMOVED from Plex reads not-available above and falls
+            # through to a normal pending request, so re-requests still work.
+            #
+            # ``force`` NEVER mints an 'available' row (the eviction guard + terminal
+            # in-library dedup below are gated ``not force``). But it MUST participate in
+            # the SAME per-media lock and the SAME under-lock active re-read as the normal
+            # short-circuit: without them a forced re-acquire inserts its 'pending' row
+            # OUTSIDE this lock, so a concurrent normal create can take the lock, MISS the
+            # still-uncommitted forced row (its 'pending' is not yet visible, and
+            # available/completed-only find_in_library never matches a 'pending'), and
+            # mint a terminal 'available' row -- which, being outside
+            # ``uq_media_requests_active``, does not collide with the forced 'pending' --
+            # handing the caller a false in-library answer while a fresh re-acquire is
+            # active. Taking the lock here serializes the two: the normal create either
+            # sees the committed forced 'pending' under the lock and dedups onto it, or
+            # wins the lock first (a legitimate ordering -- the forced re-acquire simply
+            # lands after and creates its own 'pending').
+            await repo.acquire_media_lock(tmdb_id, media_type)
+            # Re-read the ACTIVE row UNDER the lock: our find_active at the top ran before
+            # the lock, so a concurrent re-request for the same movie may have committed an
+            # active 'pending' re-grab in the meantime (the evicted-guard branch below, or
+            # a concurrent forced re-acquire, mints exactly that -- which find_in_library,
+            # available/completed only, would NOT catch). Dedup onto it so two racing
+            # re-requests never leave a second row, and in particular never let one mint
+            # 'available' over a file another is already re-acquiring just because the
+            # newest row is now that concurrent 'pending' one.
+            existing_active = await repo.find_active(tmdb_id, media_type)
+            if existing_active is not None:
+                if _owned_by_another_user(existing_active, user_id, actor_is_admin):
+                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                existing_active = await _claim_dedup_winner_if_unowned(
+                    session, repo, existing_active, user_id, actor_is_admin
+                )
+                return CreateRequestResult(record=existing_active, created=False)
         if not force:
-            # ``force`` holds the lock and falls through to a fresh 'pending' create
-            # below: it never consults the eviction guard nor dedups onto a terminal
+            # ``force`` never consults the eviction guard nor dedups onto a terminal
             # in-library row (the operator is deliberately re-acquiring a title Plex
             # still shows present), and its ``initial_status`` stays 'pending'. Only the
-            # NON-force short-circuit reads the eviction guard and can mint 'available'.
+            # NON-force path reads the eviction guard and can mint 'available'.
             if await repo.latest_request_evicted(tmdb_id, media_type):
                 # The disk-pressure sweep (ADR-0012) most recently reclaimed this
                 # movie's file: the row is 'evicted' and either mid-delete or awaiting
-                # the post-delete Plex refresh, so Plex's fresh 'present' reading is
-                # STALE. Trusting it would mint an 'available' row over a file the sweep
-                # is about to (or just did) delete -- leaving a fresh request marked
-                # available with nothing on disk and nothing queued to grab (the P1 this
-                # closes). Checked BEFORE the find_in_library return below, not after:
-                # a media can carry an OLDER stale 'available' row alongside the
-                # just-evicted one (the removed-then-reacquired leftover keeps BOTH
-                # available rows; the sweep claims only the one it evicts), and
-                # returning that leftover here would hand back an in-library answer
-                # for content the sweep is deleting -- bypassing this guard entirely.
-                # The guard must gate EVERY path that can answer 'available' off Plex
-                # presence. Fall through to a normal 'pending' re-grab instead:
-                # honesty over silence, and symmetric with the eviction crash-recovery
-                # self-heal (``eviction_service``: "a re-request re-grabs it fresh").
+                # the post-delete Plex refresh, so trusting THIS call's own Plex
+                # reading (present, absent, or erroring -- see above) would be wrong
+                # either way: 'present' is STALE and would mint an 'available' row over
+                # a file the sweep is about to (or just did) delete (the P1 this
+                # closes); 'absent'/erroring still means a fresh re-grab is exactly
+                # right, but the row must still carry the marker so a later failed
+                # purge's dedup recognizes it as ITS OWN re-grab. Checked BEFORE the
+                # find_in_library return below, not after: a media can carry an OLDER
+                # stale 'available' row alongside the just-evicted one (the
+                # removed-then-reacquired leftover keeps BOTH available rows; the
+                # sweep claims only the one it evicts), and returning that leftover
+                # here would hand back an in-library answer for content the sweep is
+                # deleting -- bypassing this guard entirely. The guard must gate EVERY
+                # path that can answer 'available' off Plex presence. Fall through to
+                # a normal 'pending' re-grab instead: honesty over silence, and
+                # symmetric with the eviction crash-recovery self-heal
+                # (``eviction_service``: "a re-request re-grabs it fresh").
                 _logger.info(
-                    "movie reads in-Plex but its most-recent request is 'evicted'; "
-                    "re-grabbing rather than trusting a stale in-library reading during "
-                    "the eviction delete window",
+                    "movie's most-recent request is 'evicted'; re-grabbing as this "
+                    "eviction's own in-window regrab rather than trusting this call's "
+                    "own Plex reading during the eviction delete window",
                     extra={"tmdb_id": safe_int(tmdb_id)},
                 )
                 movie_eviction_regrab = True
-            else:
+            elif plex_present:
                 in_library = await repo.find_in_library(
                     tmdb_id,
                     media_type,

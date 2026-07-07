@@ -572,7 +572,18 @@ class SqlRequestRepository:
         await self._session.flush()
 
     async def mark_available(self, request_id: int) -> None:
-        """Set ``available`` + stamp ``library_verified_at`` (Plex-confirmed)."""
+        """Set ``available`` + stamp ``library_verified_at`` (Plex-confirmed).
+
+        Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2):
+        the marker means "this row is THIS eviction's own still-in-flight regrab",
+        and a row that has now genuinely imported and been confirmed watchable is
+        no longer in flight -- it is exactly as settled as any other available
+        request. Leaving the marker set past this point would let a LATER,
+        UNRELATED eviction's failed-delete restore
+        (``eviction_service._cancel_redundant_movie_regrabs``) cancel this row
+        purely because it once was a regrab, even though its own content is now
+        the genuinely watchable copy.
+        """
         row = await self._session.get(MediaRequest, request_id)
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
@@ -581,6 +592,7 @@ class SqlRequestRepository:
         row.library_verified_at = now
         if row.completed_at is None:
             row.completed_at = now
+        row.eviction_regrab = False
         await self._session.flush()
 
     async def claim_if_unowned(self, request_id: int, user_id: int) -> bool:
@@ -664,6 +676,15 @@ class SqlRequestRepository:
         disk): the breadcrumb is then PRESERVED as the only handle a later retry /
         eviction has to reclaim the orphan (honesty over silence -- never strand a bad
         file with no way to purge it).
+
+        Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2):
+        the operator re-arming this row for a BRAND-NEW search is the row leaving
+        "THIS eviction's own in-flight regrab" behind -- it is now the operator's
+        own deliberate re-search, whatever its provenance was before. Without this,
+        a stale marker on a row that later got re-armed here (report-issue) could
+        let a DIFFERENT, unrelated eviction's failed-delete restore
+        (``eviction_service._cancel_redundant_movie_regrabs``) cancel the
+        operator's live re-search purely because of the row's old history.
         """
         row = await self._session.get(MediaRequest, request_id)
         if row is None:
@@ -678,6 +699,7 @@ class SqlRequestRepository:
         # not the fresh search, so a later re-park starts the ladder over.
         row.search_attempts = 0
         row.next_search_at = None
+        row.eviction_regrab = False
         await self._session.flush()
 
     async def heal_completed_at(self, request_id: int) -> None:
