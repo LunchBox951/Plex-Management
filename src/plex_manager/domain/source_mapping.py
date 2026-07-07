@@ -20,6 +20,20 @@ release to an acceptable quality. Every value they return is rejected by the
 default profile, so classifying *down* into them is always safe and classifying
 *up* is impossible. Both invariants are asserted at import time.
 
+NO RELEASE-GROUP STRIPPING (deliberate, matches Radarr): the reject nets run
+over the UNMODIFIED raw title. A release group literally named after a reject
+token (``-SCR``, ``-R5``, ``-HQCAM``) therefore false-rejects an otherwise
+clean release — a documented, intent-pinned limitation. Stripping the group
+tag first was attempted and refined through five review rounds (embedded
+titles -> path duplicates -> dot-attached markers -> hyphen-attached markers
+-> segment-end/bracketed body markers); every refinement produced a new
+laundering counterexample, because the strip only changes net behavior when
+the group name collides with a reject token — which is exactly the case where
+removal can hide a genuine marker. Radarr's ``QualityParser`` runs its source
+regexes over the full name with no group exclusion and accepts the same
+false-positive class. Failing toward rejection is visible and retryable;
+laundering a CAM/screener into the library is silent and unbounded.
+
 Pure domain: stdlib (``re``) + pydantic DTOs + the local quality model. No I/O,
 no guessit import here.
 """
@@ -175,50 +189,6 @@ def _as_str_list(value: object) -> list[str]:
     return [str(value)]
 
 
-def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
-    """Remove the guessit-identified release-group span from ``raw_title``.
-
-    Feeds only the two raw-title reject nets (:func:`_reject_net`,
-    :func:`_reject_modifier_net`); the guessit-native ``other`` checks in
-    :func:`map_source`/:func:`map_modifier` are untouched. A group named e.g.
-    ``SCR``/``R5``/``HQCAM`` would otherwise false-trip a reject net meant to
-    catch those tokens in the *release description*, not in an arbitrary
-    group tag. Absent/empty/non-str ``release_group`` -> unchanged behavior.
-
-    Every *group-tag* occurrence is removed -- a bracketed tag or a hyphen tag at
-    a release-segment boundary. Stripping *all* such occurrences (not just the
-    last) matters because import validation parses the full relative *path*, so a
-    group whose name appears on BOTH the release folder and the filename -- e.g.
-    group ``SCR`` in ``Movie...x264-SCR/Movie...x264-SCR.mkv`` -- would otherwise
-    leave the folder's ``-SCR`` behind to false-trip the reject net and wrongly
-    reject a clean import.
-
-    Anchoring hyphen tags to segment boundaries is what keeps a genuine *body
-    token* that collides with the group name intact: in
-    ``Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR`` and
-    ``Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR`` the hardcoded-screener marker is
-    in the body, so only the trailing ``-SCR`` group tag is stripped and the reject
-    net still sees the real screener token. The right-side not-followed-by-a-word
-    flank likewise keeps the group name inside a longer run (``SCR`` in
-    ``DVDSCR``, ``Scr`` in ``Scream``) untouched. This removes only group *tags*,
-    never body mentions; the guessit-native checks remain the primary defense for
-    real reject tokens.
-    """
-    group = fields.get("release_group")
-    if not isinstance(group, str) or not group:
-        return raw_title
-    # The attachment marker is deliberately left in place (only the group token is
-    # removed). Bracket tags are bounded by the closing bracket; hyphen tags must
-    # sit at a segment boundary (end, path separator, or known video extension) so
-    # body markers such as ``HC-SCR.WEB-DL`` are preserved for the reject net.
-    escaped_group = re.escape(group)
-    pattern = re.compile(
-        rf"(?:(?<=\[){escaped_group}(?!\w)|(?<=-){escaped_group}(?=$|/|\.(?:mkv|mp4|m4v|avi|mov)\b))",
-        re.IGNORECASE,
-    )
-    return pattern.sub("", raw_title)
-
-
 def _reject_net(raw_title: str) -> QualitySource | None:
     """Return a reject-tier source if a pirate-cam keyword is present, else None.
 
@@ -258,7 +228,10 @@ def map_source(fields: Mapping[str, object], raw_title: str) -> QualitySource:
         else:
             base = _SOURCE_MAP.get(raw_source, QualitySource.UNKNOWN)
 
-    forced = _reject_net(_strip_release_group(raw_title, fields))
+    # The net runs over the UNMODIFIED title -- deliberately no release-group
+    # stripping (see the module docstring): a group named after a reject token
+    # false-rejects, which is the safe, visible direction.
+    forced = _reject_net(raw_title)
     if forced is not None:
         return forced
     return base
@@ -292,7 +265,9 @@ def map_modifier(fields: Mapping[str, object], raw_title: str) -> Modifier:
         return Modifier.SCREENER
     if any("region" in other for other in others):
         return Modifier.REGIONAL
-    forced = _reject_modifier_net(_strip_release_group(raw_title, fields))
+    # As in map_source, the net sees the UNMODIFIED title -- no release-group
+    # stripping (see the module docstring for the rationale).
+    forced = _reject_modifier_net(raw_title)
     if forced is not None:
         return forced
     if "remux" in others:

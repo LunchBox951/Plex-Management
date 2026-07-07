@@ -11,6 +11,7 @@ from plex_manager.domain.quality import (
     BLURAY480P,
     BLURAY720P,
     BLURAY1080P,
+    CAM,
     DVDR,
     DVDSCR,
     HDTV1080P,
@@ -35,7 +36,6 @@ from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.source_mapping import (
     _coerce_episode,  # pyright: ignore[reportPrivateUsage]
-    _strip_release_group,  # pyright: ignore[reportPrivateUsage]
     map_modifier,
     map_source,
     resolve_quality,
@@ -404,110 +404,129 @@ def test_remux_classification_by_source_end_to_end() -> None:
         assert check_quality(quality, profile).accepted is True, raw_title
 
 
-# -- reject nets ignore the release-group suffix (#108) -------------------------
-
-# (raw_title, recorded guessit 4.1.0 fields) for release-group names that
-# collide with a reject-net token. Pre-#108 these all false-rejected; post-#108
-# they must resolve to the clean WEBDL1080P classification the title implies.
-_GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object]]] = [
+# -- KNOWN LIMITATION (intent-pinning, #108 wontfix): reject-token group names --
+#
+# A release group literally named after a reject token (SCR, R5, R6, HQCAM, ...)
+# FALSE-REJECTS an otherwise clean release, because the reject nets run over the
+# UNMODIFIED raw title -- deliberately, matching Radarr's posture (its
+# QualityParser applies the source regexes to the full name with no group
+# exclusion). Stripping the group tag first was attempted and refined through
+# five review rounds (embedded titles -> path duplicates -> dot-attached ->
+# hyphen-attached -> segment-end/bracketed body markers); every refinement
+# produced a new laundering counterexample, because the strip only changes net
+# behavior in exactly the colliding case it cannot make safe. Failing toward
+# rejection is visible and retryable; laundering a CAM/screener into the library
+# is silent. See the module docstring of source_mapping.py and issue #108.
+#
+# These rows PIN that behavior: (raw_title, recorded guessit 4.1.0 fields,
+# expected reject quality). If a future change makes any of these accept, that
+# change is reversing a considered decision and must say so explicitly.
+_GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object], Quality]] = [
     (
         "Movie.2024.1080p.WEB-DL.x264-SCR",
         {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
     ),
     (
         "Movie.2024.1080p.WEB-DL.x264-R5",
         {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
+        REGIONAL,
     ),
     (
         "Movie.2024.1080p.WEB-DL.x264-R6",
         {"source": "Web", "screen_size": "1080p", "release_group": "R6"},
+        REGIONAL,
     ),
     (
         "Movie.2024.1080p.WEB-DL.x264-HQCAM",
         {"source": "Web", "screen_size": "1080p", "release_group": "HQCAM"},
+        CAM,
     ),
-    # Group token ALSO embedded earlier in the title. An unanchored first-match
-    # strip deletes the ``Scr`` of ``Scream`` and leaves the genuine ``-SCR``
-    # suffix behind to false-trip the reject-modifier net (regression guard).
+    # The group name also appearing inside a legitimate title word changes
+    # nothing: the suffix tag alone trips the net.
     (
         "Scream.2024.1080p.WEB-DL.x264-SCR",
         {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
     ),
-    # ``R5`` embedded in the title word ``Barr5`` (contrived but exercises the
-    # same "token appears before its suffix occurrence" hazard for the R-code).
     (
         "Barr5.2024.1080p.WEB-DL.x264-R5",
         {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
+        REGIONAL,
     ),
-    # Group token appears on BOTH the release folder and the filename. Import
-    # validation parses the full relative PATH, so a suffix-only strip would
-    # leave the folder's ``-SCR`` behind to false-reject a clean import. Stripping
-    # every attached occurrence removes both, so this resolves to clean WEBDL.
+    # Import validation parses the full relative path; the folder tag trips the
+    # net just as the filename tag does.
     (
         "Movie.2024.1080p.WEB-DL.x264-SCR/Movie.2024.1080p.WEB-DL.x264-SCR.mkv",
         {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
     ),
-    # Bracket-attached group tag (anime/p2p convention): the strip recognizes
-    # ``[SCR]`` as a group tag too, so a bracketed group named after a reject
-    # token cannot false-trip the net.
+    # Bracketed (anime/p2p) group tags false-reject the same way.
     (
         "[SCR] Movie 2024 1080p WEB-DL x264",
         {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
     ),
 ]
 
 
-def test_reject_nets_ignore_release_group_suffix() -> None:
+def test_reject_token_group_names_false_reject_by_design() -> None:
+    # NOT a bug guard -- an intent pin. Flipping any of these to accepted means
+    # re-introducing a release-group strip (or equivalent), which five review
+    # rounds showed cannot be done without laundering genuine reject markers.
     profile = default_profile()
-    for raw_title, fields in _GROUP_COLLISION_TABLE:
+    for raw_title, fields, expected in _GROUP_COLLISION_TABLE:
         parsed = to_parsed_release(fields, raw_title)
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
-        assert quality is WEBDL1080P, f"{raw_title} -> {quality.name}"
-        assert check_quality(quality, profile).accepted is True, raw_title
+        assert quality is expected, f"{raw_title} -> {quality.name}, expected {expected.name}"
+        assert check_quality(quality, profile).accepted is False, raw_title
 
 
-def test_real_reject_token_survives_release_group_strip() -> None:
-    # The group happens to collide with a reject token too (or share a real
-    # reject source): the guessit-native source classification still wins, so
-    # stripping the group must not launder a genuine CAM release.
+def test_genuine_reject_markers_reject_despite_colliding_group_names() -> None:
+    # THE invariant the no-strip posture protects: a genuine reject marker in the
+    # title body must classify into its reject tier even when the release group
+    # shares its name. Every one of these was a laundering counterexample against
+    # some refinement of the (since-removed) release-group strip; with the nets
+    # reading the unmodified title they all reject trivially and must stay so.
     profile = default_profile()
     for raw_title, fields, reject_name in (
         ("Movie.2024.HDCAM.x264-RARBG", {"source": "HD Camera", "release_group": "RARBG"}, "CAM"),
         ("Movie.2024.HDCAM.x264-CAM", {"source": "HD Camera", "release_group": "CAM"}, "CAM"),
-        # Genuine embedded reject token that the raw-title net must still catch
-        # AFTER the group strip. guessit missed the screener flag (no ``other``),
-        # so classification leans on the net: stripping the ``-SCR`` suffix group
-        # tag must leave the ``SCR`` embedded in ``DVDSCR`` intact so the release
-        # still rejects as a screener rather than laundering to acceptable DVD.
+        # guessit missed the screener flag (no ``other``), so classification
+        # leans entirely on the raw-title net seeing the ``DVDSCR`` body token.
         ("Movie.2024.DVDSCR.x264-SCR", {"source": "DVD", "release_group": "SCR"}, "DVDSCR"),
-        # Strip-all guard on a duplicated relative path: a genuine ``DVDSCR``
-        # token on BOTH the folder and the filename, with the group ALSO named
-        # ``SCR``. Removing every ``-SCR`` group tag must still leave both
-        # embedded ``DVDSCR`` tokens intact, so the release rejects as a screener
-        # rather than laundering to an acceptable DVD.
+        # Duplicated relative path: the body token on both segments still rejects.
         (
             "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
             {"source": "DVD", "release_group": "SCR"},
             "DVDSCR",
         ),
-        # A STANDALONE dot-attached body token colliding with the group name:
-        # ``HC.SCR`` is a genuine hardcoded-screener marker guessit misses (no
-        # ``other`` emitted -- same shape as the ``HC.SCR.WEB`` leak-table row),
-        # while ``-SCR`` is the group tag. The attachment-anchored strip removes
-        # only the hyphen-attached tag; the dot-attached ``SCR`` stays for the
-        # net, so the screener still rejects instead of laundering to WEBDL.
+        # Dot-attached standalone body marker (round-3 counterexample): ``HC.SCR``
+        # is a hardcoded-screener marker guessit misses (no ``other`` emitted).
         (
             "Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR",
             {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
             "DVDSCR",
         ),
-        # Same laundering hazard with a hyphen separator: the reject regexes treat
-        # ``HC-SCR`` as a real screener marker, so the group strip must not remove
-        # that body token while removing the trailing ``-SCR`` release group.
+        # Hyphen-attached body marker (round-4 counterexample).
         (
             "Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR",
             {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
             "DVDSCR",
+        ),
+        # Segment-ending body marker (round-5 counterexample): the folder ends in
+        # ``HD-CAM``, which a boundary-anchored strip mistook for a group tag.
+        (
+            "Movie.2024.HD-CAM/Movie.2024.1080p.WEB-DL.x264-CAM.mkv",
+            {"source": "Web", "screen_size": "1080p", "release_group": "CAM"},
+            "CAM",
+        ),
+        # Bracketed body marker (round-5 counterexample): ``[HQCAM]`` in the body
+        # is a reject marker, not an anime-style group tag.
+        (
+            "Movie.2024.[HQCAM].1080p.WEB-DL.x264-HQCAM",
+            {"source": "Web", "screen_size": "1080p", "release_group": "HQCAM"},
+            "CAM",
         ),
     ):
         parsed = to_parsed_release(fields, raw_title)
@@ -516,92 +535,18 @@ def test_real_reject_token_survives_release_group_strip() -> None:
         assert check_quality(quality, profile).accepted is False, raw_title
 
 
-def test_strip_release_group_noop_without_group() -> None:
-    title = "Movie.2024.1080p.WEB-DL.x264-SCR"
-    assert _strip_release_group(title, {}) == title
-    assert _strip_release_group(title, {"release_group": None}) == title
-    assert _strip_release_group(title, {"release_group": ""}) == title
-
-
-def test_strip_release_group_removes_span_case_insensitive() -> None:
-    assert _strip_release_group("Movie-scr", {"release_group": "SCR"}) == "Movie-"
-    # Regex-special characters in the group name are matched literally.
-    assert _strip_release_group("Movie-R5+X", {"release_group": "R5+X"}) == "Movie-"
-
-
-def test_strip_release_group_anchors_to_suffix_not_an_embedded_mention() -> None:
-    # The group token also appears earlier in the title (inside a longer word).
-    # The strip must remove the *suffix* group tag, never the embedded mention:
-    # deleting the ``Scr`` of ``Scream`` would leave the genuine ``-SCR`` suffix
-    # to false-trip the reject net.
-    assert (
-        _strip_release_group("Scream.2024.1080p.WEB-DL.x264-SCR", {"release_group": "SCR"})
-        == "Scream.2024.1080p.WEB-DL.x264-"
+def test_release_group_field_never_feeds_the_nets() -> None:
+    # The ``release_group`` field is metadata only: classification never consults
+    # it (no stripping, no matching). Identical titles with different recorded
+    # groups classify identically, and the guessit-native ``other`` path is
+    # likewise independent of it.
+    title = "Movie.2024.1080p.WEB-DL.x264-GRP"
+    with_group = to_parsed_release(
+        {"source": "Web", "screen_size": "1080p", "release_group": "GRP"}, title
     )
-    # Word-boundary flanks: a group token that is a substring of a longer
-    # alphanumeric run (``SCR`` inside ``DVDSCR``) is left intact, so a genuine
-    # reject token is never laundered by the group strip.
-    assert (
-        _strip_release_group("Movie.2024.DVDSCR.x264-SCR", {"release_group": "SCR"})
-        == "Movie.2024.DVDSCR.x264-"
-    )
-    # No whole-token occurrence -> nothing is stripped (the group name only
-    # appears as a substring of a larger word).
-    assert (
-        _strip_release_group("Scream.2024.1080p.WEB-DL.x264", {"release_group": "SCR"})
-        == "Scream.2024.1080p.WEB-DL.x264"
-    )
-
-
-def test_strip_release_group_removes_every_attached_occurrence() -> None:
-    # A duplicated folder/filename relative path where the group name appears as a
-    # hyphen-attached tag on BOTH segments: every attached occurrence is stripped,
-    # so nothing is left behind for the reject net to false-trip on. A suffix-only
-    # strip would leave the folder's ``-SCR`` and wrongly reject the clean import.
-    # Only the ``SCR`` token is removed; the ``-`` separator is not part of it.
-    assert (
-        _strip_release_group(
-            "Movie.2024.1080p.WEB-DL.x264-SCR/Movie.2024.1080p.WEB-DL.x264-SCR.mkv",
-            {"release_group": "SCR"},
-        )
-        == "Movie.2024.1080p.WEB-DL.x264-/Movie.2024.1080p.WEB-DL.x264-.mkv"
-    )
-    # Embedded mentions on both segments survive (``DVDSCR`` is not attached),
-    # so a genuine reject token is never laundered by the strip.
-    assert (
-        _strip_release_group(
-            "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
-            {"release_group": "SCR"},
-        )
-        == "Movie.2024.DVDSCR.x264-/Movie.2024.DVDSCR.x264-.mkv"
-    )
-
-
-def test_strip_release_group_only_removes_attached_tags() -> None:
-    # A DOT-attached body token that collides with the group name is NOT a group
-    # tag and must survive the strip: ``HC.SCR`` is a genuine hardcoded-screener
-    # marker; only the hyphen-attached ``-SCR`` suffix is the group tag. A strip
-    # of every token-bounded occurrence (regardless of attachment) would delete
-    # both and launder the screener into an acceptable WEBDL.
-    assert (
-        _strip_release_group("Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR", {"release_group": "SCR"})
-        == "Movie.2024.1080p.HC.SCR.WEB-DL.x264-"
-    )
-    assert (
-        _strip_release_group("Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR", {"release_group": "SCR"})
-        == "Movie.2024.1080p.HC-SCR.WEB-DL.x264-"
-    )
-    # Bracket attachment (the anime/p2p ``[GROUP]`` convention Radarr's
-    # ReleaseGroupParser also recognizes) is stripped like the hyphen form, so a
-    # bracketed group named after a reject token cannot false-trip the net.
-    assert (
-        _strip_release_group("[SCR] Movie 2024 1080p WEB-DL x264", {"release_group": "SCR"})
-        == "[] Movie 2024 1080p WEB-DL x264"
-    )
-
-
-def test_strip_release_group_leaves_guessit_native_other_intact() -> None:
-    # The guessit-native `other` path is untouched by the strip.
+    without_group = to_parsed_release({"source": "Web", "screen_size": "1080p"}, title)
+    assert with_group.source is without_group.source
+    assert with_group.modifier is without_group.modifier
     assert (
         map_modifier({"other": "Screener", "release_group": "GRP"}, "Movie.DVDSCR-GRP")
         is Modifier.SCREENER
