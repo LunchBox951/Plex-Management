@@ -289,18 +289,27 @@ def test_map_modifier_does_not_fire_on_clean_titles() -> None:
 
 
 def test_resolve_quality_remux_gated_by_source() -> None:
-    # BluRay: remux tier only at 1080p/2160p; below that, no remux tier exists
-    # so the token is ignored and the source+resolution lookup wins.
+    # BluRay: remux tier at 2160p/1080p. A KNOWN resolution below 1080p has no
+    # remux tier, so the token is ignored and the source+resolution lookup wins
+    # (720p -> Bluray720p, 480p -> Bluray480p). A BluRay remux with NO parseable
+    # resolution takes Radarr's bluray-branch assumption of Remux1080p rather than
+    # falling through to the source-only Bluray-480p fallback (#107 regression).
     assert resolve_quality(QualitySource.BLURAY, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
     assert resolve_quality(QualitySource.BLURAY, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
     assert resolve_quality(QualitySource.BLURAY, Resolution.R720P, Modifier.REMUX) is BLURAY720P
     assert resolve_quality(QualitySource.BLURAY, Resolution.R480P, Modifier.REMUX) is BLURAY480P
-    # Unknown source: the Radarr no-source-remux fallback at 1080p/2160p; below
-    # that it falls through to the conservative UNKNOWN-source guard.
+    assert resolve_quality(QualitySource.BLURAY, Resolution.UNKNOWN, Modifier.REMUX) is REMUX1080P
+    # Unknown source: the Radarr no-source-remux fallback at 1080p/2160p. At 720p
+    # OR with no resolution at all there is no source signal to assume 1080p, so it
+    # falls through to the conservative UNKNOWN-source guard.
     assert resolve_quality(QualitySource.UNKNOWN, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
     assert resolve_quality(QualitySource.UNKNOWN, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
     assert (
         resolve_quality(QualitySource.UNKNOWN, Resolution.R720P, Modifier.REMUX) is UNKNOWN_QUALITY
+    )
+    assert (
+        resolve_quality(QualitySource.UNKNOWN, Resolution.UNKNOWN, Modifier.REMUX)
+        is UNKNOWN_QUALITY
     )
     # DVD: conservative in-tier choice, regardless of resolution.
     assert resolve_quality(QualitySource.DVD, Resolution.R480P, Modifier.REMUX) is DVDR
@@ -351,9 +360,14 @@ _REMUX_TABLE: list[tuple[str, dict[str, object], Quality]] = [
         REMUX1080P,
     ),
     (
-        "Movie.2024.720p.BluRay.REMUX-GRP",  # remux ignored below 1080p
+        "Movie.2024.720p.BluRay.REMUX-GRP",  # remux ignored at known 720p
         {"source": "Blu-ray", "screen_size": "720p", "other": "Remux", "release_group": "GRP"},
         BLURAY720P,
+    ),
+    (
+        "Movie.BluRay.REMUX.x264-GRP",  # BluRay remux, NO parseable resolution
+        {"source": "Blu-ray", "other": "Remux", "release_group": "GRP"},
+        REMUX1080P,
     ),
     (
         "Movie.2024.2160p.REMUX-GRP",  # no-source 2160p
@@ -407,6 +421,14 @@ _GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object]]] = [
         "Barr5.2024.1080p.WEB-DL.x264-R5",
         {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
     ),
+    # Group token appears on BOTH the release folder and the filename. Import
+    # validation parses the full relative PATH, so a suffix-only strip would
+    # leave the folder's ``-SCR`` behind to false-reject a clean import. Stripping
+    # every token-bounded occurrence removes both, so this resolves to clean WEBDL.
+    (
+        "Movie.2024.1080p.WEB-DL.x264-SCR/Movie.2024.1080p.WEB-DL.x264-SCR.mkv",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+    ),
 ]
 
 
@@ -433,6 +455,16 @@ def test_real_reject_token_survives_release_group_strip() -> None:
         # tag must leave the ``SCR`` embedded in ``DVDSCR`` intact so the release
         # still rejects as a screener rather than laundering to acceptable DVD.
         ("Movie.2024.DVDSCR.x264-SCR", {"source": "DVD", "release_group": "SCR"}, "DVDSCR"),
+        # Strip-all guard on a duplicated relative path: a genuine ``DVDSCR``
+        # token on BOTH the folder and the filename, with the group ALSO named
+        # ``SCR``. Removing every ``-SCR`` group tag must still leave both
+        # embedded ``DVDSCR`` tokens intact, so the release rejects as a screener
+        # rather than laundering to an acceptable DVD.
+        (
+            "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
+            {"source": "DVD", "release_group": "SCR"},
+            "DVDSCR",
+        ),
     ):
         parsed = to_parsed_release(fields, raw_title)
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
@@ -474,6 +506,30 @@ def test_strip_release_group_anchors_to_suffix_not_an_embedded_mention() -> None
     assert (
         _strip_release_group("Scream.2024.1080p.WEB-DL.x264", {"release_group": "SCR"})
         == "Scream.2024.1080p.WEB-DL.x264"
+    )
+
+
+def test_strip_release_group_removes_all_bounded_occurrences() -> None:
+    # A duplicated folder/filename relative path where the group name appears as a
+    # whole-token tag on BOTH segments: every token-bounded occurrence is stripped,
+    # so nothing is left behind for the reject net to false-trip on. A suffix-only
+    # strip would leave the folder's ``-SCR`` and wrongly reject the clean import.
+    # Only the ``SCR`` token is removed; the ``-`` separator is not part of it.
+    assert (
+        _strip_release_group(
+            "Movie.2024.1080p.WEB-DL.x264-SCR/Movie.2024.1080p.WEB-DL.x264-SCR.mkv",
+            {"release_group": "SCR"},
+        )
+        == "Movie.2024.1080p.WEB-DL.x264-/Movie.2024.1080p.WEB-DL.x264-.mkv"
+    )
+    # Embedded mentions on both segments survive (``DVDSCR`` is not token-bounded),
+    # so a genuine reject token is never laundered by the strip-all.
+    assert (
+        _strip_release_group(
+            "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
+            {"release_group": "SCR"},
+        )
+        == "Movie.2024.DVDSCR.x264-/Movie.2024.DVDSCR.x264-.mkv"
     )
 
 

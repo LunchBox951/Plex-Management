@@ -183,17 +183,22 @@ def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
     catch those tokens in the *release description*, not in an arbitrary
     group tag. Absent/empty/non-str ``release_group`` -> unchanged behavior.
 
-    The strip is anchored to the group's *suffix* occurrence: the group token
-    is matched only as a whole word (word-boundary flanks, so it is never a
-    substring of a longer alphanumeric run) and the **last** such occurrence is
-    removed. An unanchored first-match removal strips the wrong span when the
-    group name also appears earlier in the title -- e.g. group ``SCR`` in
-    ``Scream.2024.1080p.WEB-DL.x264-SCR`` would delete the ``Scr`` of
-    ``Scream`` and leave the genuine ``-SCR`` suffix behind to false-trip the
-    reject net. Word-boundary matching also keeps a real reject token embedded
-    in a larger run (e.g. ``SCR`` inside ``DVDSCR``) intact so it still rejects.
-    This removes only the group tag, not every mention of the group name; the
-    guessit-native checks remain the primary defense for real reject tokens.
+    *Every* token-bounded occurrence of the group is removed: the group token is
+    matched only as a whole word (word-boundary flanks, so it is never a substring
+    of a longer alphanumeric run) and *all* such occurrences are stripped.
+    Removing only the last (suffix) occurrence is not enough: import validation
+    parses the full relative *path*, so a group whose name appears on BOTH the
+    release folder and the filename -- e.g. group ``SCR`` in
+    ``Movie...WEB-DL.x264-SCR/Movie...WEB-DL.x264-SCR.mkv`` -- would leave the
+    folder's ``-SCR`` behind to false-trip the reject net and wrongly reject a
+    clean import. Stripping every occurrence removes both.
+
+    The word-boundary flanks keep an *embedded* mention intact, so genuine reject
+    tokens are never laundered: ``Scr`` inside ``Scream`` (followed by a word char)
+    and ``SCR`` inside ``DVDSCR`` (preceded by a word char) are not token-bounded,
+    so they survive the strip and still classify/reject. This removes only
+    whole-token group tags, not every mention of the group name; the guessit-native
+    checks remain the primary defense for real reject tokens.
     """
     group = fields.get("release_group")
     if not isinstance(group, str) or not group:
@@ -202,13 +207,9 @@ def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
     # the group's own edge characters (unlike ``\b``, which breaks for a group
     # that starts/ends in punctuation). ``_`` counts as a word char here, exactly
     # as the ``\b`` boundaries in the reject nets treat it, so the strip removes
-    # precisely the spans a net could otherwise fire on.
+    # precisely the spans a net could otherwise fire on -- and only those.
     pattern = re.compile(rf"(?<!\w){re.escape(group)}(?!\w)", re.IGNORECASE)
-    matches = list(pattern.finditer(raw_title))
-    if not matches:
-        return raw_title
-    last = matches[-1]
-    return raw_title[: last.start()] + raw_title[last.end() :]
+    return pattern.sub("", raw_title)
 
 
 def _reject_net(raw_title: str) -> QualitySource | None:
@@ -425,8 +426,19 @@ def resolve_quality(source: QualitySource, resolution: Resolution, modifier: Mod
                 return REMUX2160P
             if resolution == Resolution.R1080P:
                 return REMUX1080P
-            # No remux tier below 1080p: fall through to the source+resolution
-            # lookup (BluRay -> BLURAY720P/480P; UNKNOWN -> UNKNOWN below).
+            if source == QualitySource.BLURAY and resolution == Resolution.UNKNOWN:
+                # A BluRay remux with no parseable resolution: mirror Radarr's
+                # QualityParser bluray branch, which after its resolution-specific
+                # returns treats a still-unresolved sourced remux as Remux1080p
+                # ("Treat a remux without a source as 1080p, not 720p; 720p remux
+                # should fallback as 720p BluRay"). Without this, a clear BluRay
+                # remux fell through to the source-only fallback (Bluray-480p),
+                # under-ranking it below plain 720p/1080p.
+                return REMUX1080P
+            # No remux tier for a *known* BluRay resolution below 1080p (720p ->
+            # BLURAY720P, 576p/540p/480p/360p -> BLURAY576P/480P), nor for an
+            # UNKNOWN source lacking a resolution: fall through to the
+            # source+resolution lookup (UNKNOWN source -> UNKNOWN below).
         elif source == QualitySource.DVD:
             # Conservative in-tier choice (documented divergence from Radarr,
             # which yields plain DVD for a remux word and reserves DVD-R for
