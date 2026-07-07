@@ -878,6 +878,58 @@ async def test_import_remaps_download_path_under_the_downloads_mount(
     assert request is not None and request.status == RequestStatus.completed
 
 
+async def test_import_never_places_a_stale_shorter_suffix_match(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding regression: a content remap must ANCHOR on save_path, never keep
+    shortening the suffix. qBittorrent reports ``/host/qbt/movies/<file>`` whose
+    real container location ``<mount>/movies/<file>`` is MISSING, while a STALE,
+    unrelated file with the SAME basename sits at the mount ROOT
+    (``<mount>/<file>``). The old free suffix search would shorten to the bare
+    basename, match the stale file, and validate/PLACE the wrong source. The
+    anchored remap requires the file at its exact position under the (remapped)
+    save directory, so it blocks honestly and NEVER touches the stale file."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    mount = tmp_path / "dl"
+    # The real category directory exists (qBittorrent saved other torrents here),
+    # but THIS torrent's file is absent under it.
+    (mount / "movies").mkdir(parents=True)
+    # A stale, unrelated file with the SAME basename at the mount ROOT -- what the
+    # shorter-suffix guess would have wrongly matched and placed.
+    stale = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(stale)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    # qbt (host-side) reports the file under a category save path whose real
+    # container mapping (``<mount>/movies/<file>``) does not exist.
+    host_content = Path(
+        "/definitely-not-a-real-host-path/qbt/movies/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    )
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(host_content), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "download path not visible inside the container" in record.failed_reason
+    # The decisive assertions: the stale file was neither validated nor placed.
+    assert not any(movies_root.iterdir())
+    assert library.scanned == []
+    # The stale source itself is untouched (never hardlinked out).
+    assert stale.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status == RequestStatus.import_blocked
+
+
 async def test_import_retry_after_creating_the_root_heals(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -1001,7 +1053,11 @@ def test_resolve_content_prefers_live_save_path_name_over_library_breadcrumb(
         status, str(stale_library_file)
     )
 
-    assert resolved == str(live_release)
+    assert resolved is not None
+    assert resolved.path == str(live_release)
+    # The live save_path rides along as the remap ANCHOR (finding: a content remap
+    # must be anchored on save_path, never a free suffix search).
+    assert resolved.save_path == str(downloads)
 
 
 async def test_import_is_idempotent_on_an_already_imported_row(

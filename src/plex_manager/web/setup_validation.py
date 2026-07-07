@@ -100,6 +100,29 @@ def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
     return "tv" if kind == "show" else "movie"
 
 
+def _low_confidence_mount_root(path: str, mounts: Sequence[str]) -> str | None:
+    """The single library mount root, as a LOW-confidence suggestion for ``path``.
+
+    Offered only when the strict :func:`remap_to_visible` can't resolve ``path``
+    (issue: a whole-library bind root like ``/srv/plex-data`` -> ``/media`` has no
+    component below the mount AND its basename need not equal the mount's, so the
+    zero-suffix match -- which requires a basename match to keep ``None`` honest for
+    a typo'd root -- can't accept it). When EXACTLY ONE library mount exists (so
+    WHICH mount is unambiguous) and it is a real directory, that mount root is a
+    plausible target for a Plex-reported (never hand-typed) library location. It is
+    returned as a suggestion the operator must EXPLICITLY confirm, never silently
+    applied -- the write-time gate stays strict, so a hand-typed typo is still
+    rejected. ``None`` when the mount is ambiguous (0 or >1 real dirs) or ``path``
+    is empty.
+    """
+    if not path:
+        return None
+    real_mounts = [m for m in mounts if m and os.path.isdir(m)]
+    if len(real_mounts) != 1:
+        return None
+    return real_mounts[0]
+
+
 def library_options(
     sections: Sequence[LibrarySection],
     *,
@@ -133,6 +156,14 @@ def library_options(
     stat the raw path first. ``allow_mount_root`` is on: a whole-media-root Plex
     library (the bind SOURCE root, e.g. ``/srv/media`` -> ``/media``) maps to the
     mount root itself, which the suffix-only match could never reach.
+
+    When that confident remap still can't resolve a Plex-reported location AND
+    exactly one library mount exists, the mount root is additionally offered as a
+    ``low_confidence_suggested_path`` -- a guess the operator must explicitly
+    confirm (see :func:`_low_confidence_mount_root`): a bind root like
+    ``/srv/plex-data`` -> ``/media`` whose basename differs from the mount's is
+    unreachable by the strict remap, but is still a plausible target the picker can
+    surface without the write gate ever silently accepting a hand-typed typo.
     """
     options: list[PlexLibraryOption] = []
     for section in sections:
@@ -147,7 +178,15 @@ def library_options(
                 if suggest_mounts
                 else None
             )
-            effective = suggested or path
+            # A low-confidence mount-root fallback ONLY when the confident remap
+            # found nothing -- a real match always wins, and a typo'd root the write
+            # gate would reject is never dressed up as a confident answer.
+            low_confidence = (
+                _low_confidence_mount_root(path, suggest_mounts)
+                if (suggest_mounts and suggested is None)
+                else None
+            )
+            effective = suggested or low_confidence or path
             options.append(
                 PlexLibraryOption(
                     section_key=section.key,
@@ -156,6 +195,9 @@ def library_options(
                     section_type=_section_type(section.type),
                     writable=_is_writable(effective) if probe_writable else None,
                     suggested_path=suggested if (suggested and suggested != path) else None,
+                    low_confidence_suggested_path=(
+                        low_confidence if (low_confidence and low_confidence != path) else None
+                    ),
                 )
             )
     return options

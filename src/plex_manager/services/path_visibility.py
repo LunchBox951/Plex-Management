@@ -29,6 +29,7 @@ __all__ = [
     "KNOWN_CONTAINER_MOUNTS",
     "KNOWN_DOWNLOAD_MOUNTS",
     "KNOWN_LIBRARY_MOUNTS",
+    "remap_download_content",
     "remap_library_root",
     "remap_to_visible",
 ]
@@ -123,6 +124,105 @@ def remap_to_visible(
                 continue
             if os.path.basename(mount.rstrip(os.sep)) == tail and predicate(mount):
                 return mount
+    return None
+
+
+def _relative_components(path: str, base: str) -> list[str] | None:
+    """``path``'s path components strictly BELOW ``base``, or ``None``.
+
+    ``None`` when ``path`` is not a STRICT descendant of ``base`` -- equal to it, a
+    ``..``-escape, or an unrelated tree -- so the caller never anchors a remap on a
+    path that isn't actually inside the save directory. Any ``.``/``..`` segment is
+    dropped structurally (mirroring :func:`remap_to_visible`) so a crafted remainder
+    can never climb back out via ``os.path.join``.
+    """
+    rel = os.path.relpath(os.path.normpath(path), os.path.normpath(base))
+    if (
+        rel == os.curdir
+        or rel == os.pardir
+        or rel.startswith(os.pardir + os.sep)
+        or os.path.isabs(rel)
+    ):
+        return None
+    return [c for c in rel.split(os.sep) if c and c not in (".", "..")]
+
+
+def remap_download_content(
+    content: str | None,
+    save_path: str | None,
+    *,
+    candidate_mounts: Sequence[str] | None = None,
+) -> str | None:
+    """Container-visible remap for a download's CONTENT path, ANCHORED on save_path.
+
+    Unlike :func:`remap_to_visible`'s free longest-first suffix search, this never
+    shortens the file's path INDEPENDENTLY of its download directory. The bug that
+    forces the anchor: a HOST content ``/srv/qbt/movies/Foo.mkv`` whose real
+    container location ``/downloads/movies/Foo.mkv`` is MISSING would, under a free
+    suffix search, keep shortening the suffix until the bare ``Foo.mkv`` matched a
+    STALE, unrelated ``/downloads/Foo.mkv`` -- validating and PLACING the wrong
+    source. A torrent's file position WITHIN its save directory is invariant across
+    the host->container bind (docker preserves the subtree below the bind source),
+    so only the ``save_path`` prefix may be remapped, never the file below it:
+
+    1. return ``content`` unchanged when it already exists here;
+    2. otherwise remap the torrent's ``save_path`` ONCE to a container-visible
+       download directory -- its DEEPEST existing suffix under a mount (so a real
+       category dir like ``/downloads/movies`` always wins over the mount root and
+       the mount-root guess is never reached while a deeper directory exists), or,
+       only when NO suffix is a real directory (``save_path`` itself IS the
+       download bind-source root, mapped to the mount root with zero suffix), the
+       mount root -- and require ``<that dir>/<remainder>`` to exist VERBATIM, where
+       ``remainder`` is ``content``'s path below ``save_path``. If it does not
+       exist, return ``None`` (an honest, retryable "not visible" block), NEVER a
+       shorter-suffix guess.
+
+    Without a ``save_path`` anchor (a stored crash-resume breadcrumb, or a client
+    status that carried no save path) there is nothing to anchor to, so ONLY the
+    verbatim ``content`` counts (step 1) -- a free suffix search would reintroduce
+    exactly the stale-match hazard, so it is deliberately not attempted.
+
+    Download mounts only (never the library mounts): a completed torrent and an old
+    library file can share a basename, and content must never place from ``/media``.
+    The remainder is always >= 1 component (the caller guarantees ``content`` is
+    strictly under ``save_path``), so a torrent never resolves onto the bare
+    ``/downloads`` tree. Pure ``exists``/``isdir`` probes (sync); async callers
+    offload via ``asyncio.to_thread``.
+    """
+    if not content:
+        return None
+    if os.path.exists(content):
+        return content
+    if not save_path:
+        return None
+    remainder = _relative_components(content, save_path)
+    if not remainder:
+        # ``content`` is not strictly under ``save_path`` (equal to it, or an
+        # escape): refuse to remap rather than resolve a torrent onto the bare
+        # mount tree or an unrelated location.
+        return None
+    # Read the module global at CALL time (never a def-time default) so a test's
+    # ``monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", ...)`` takes
+    # effect, matching this module's documented call-site convention.
+    mounts = KNOWN_DOWNLOAD_MOUNTS if candidate_mounts is None else candidate_mounts
+    # Remap the save DIRECTORY once: the deepest suffix that is a real directory
+    # under a mount. allow_mount_root stays OFF -- that path's basename guard is
+    # for library roots; here the mount-root case is handled below with the
+    # remainder anchored, so a bare torrent tree is never the answer.
+    save_dir = remap_to_visible(save_path, mounts, predicate=os.path.isdir, probe_original=False)
+    if save_dir is not None:
+        candidate = os.path.join(save_dir, *remainder)
+        return candidate if os.path.exists(candidate) else None
+    # No suffix of ``save_path`` is a real directory under a mount: ``save_path`` may
+    # itself BE the download bind-source root (mapped to the mount root, so zero
+    # suffix below it). Anchor the remainder under each mount root -- reached ONLY
+    # here, AFTER every deeper directory match has failed, so a real category dir is
+    # never bypassed to collapse a deeper file onto a shallow stale one.
+    for mount in mounts:
+        if mount and os.path.isdir(mount):
+            candidate = os.path.join(mount, *remainder)
+            if os.path.exists(candidate):
+                return candidate
     return None
 
 

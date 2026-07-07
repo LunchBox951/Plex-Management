@@ -1200,6 +1200,17 @@
       "PlexLibraryOption": {
         "description": "One movie- OR tv-library folder Plex reports, with whether the app can write to it.\n\n``path`` is a Plex library location (from Plex's own ``/library/sections``), so\nchoosing it for ``movies_root`` / ``tv_root`` avoids a typed path entirely (and\nthe path\u2194section mismatch that breaks a targeted scan). ``section_type`` tags\nwhich root this option is for (``\"movie\"`` -> ``movies_root``, ``\"tv\"`` ->\n``tv_root``) so a single generalized list can drive both pickers. ``writable``\nis the app's own check (``None`` when not probed \u2014 see the field): a\nknown-not-writable location is the split-mount signal \u2014 surfaced, not hidden.",
         "properties": {
+          "low_confidence_suggested_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Low Confidence Suggested Path"
+          },
           "path": {
             "title": "Path",
             "type": "string"

@@ -77,3 +77,30 @@ export type EvictResponse = Schemas['EvictResponse']
 
 /** `media_type` is a free string in the contract; the UI only ever sets these. */
 export type MediaType = 'movie' | 'tv'
+
+/**
+ * The value a library-root picker `<option>` stores when selected. Prefers a
+ * CONFIDENT container remap (`suggested_path`), then a LOW-confidence mount-root
+ * suggestion (`low_confidence_suggested_path`) the operator is confirming BY
+ * selecting it, then the raw Plex path. Selecting the option is what submits the
+ * container path to the strict write-time gate — the UI never silently rewrites.
+ */
+export function libraryOptionValue(lib: PlexLibraryOption): string {
+  return lib.suggested_path ?? lib.low_confidence_suggested_path ?? lib.path
+}
+
+/**
+ * The trailing " · in-container…" note for a library-root `<option>`. A confident
+ * suggestion reads plainly; a low-confidence mount-root suggestion is marked
+ * "confirm" so choosing it is a deliberate operator decision, never a silent
+ * remap (honesty over silence).
+ */
+export function libraryOptionNote(lib: PlexLibraryOption): string {
+  if (lib.suggested_path && lib.suggested_path !== lib.path) {
+    return ` · in-container: ${lib.suggested_path}`
+  }
+  if (lib.low_confidence_suggested_path && lib.low_confidence_suggested_path !== lib.path) {
+    return ` · in-container? confirm: ${lib.low_confidence_suggested_path}`
+  }
+  return ''
+}

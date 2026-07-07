@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from plex_manager.services import path_visibility
-from plex_manager.services.path_visibility import remap_library_root, remap_to_visible
+from plex_manager.services.path_visibility import (
+    remap_download_content,
+    remap_library_root,
+    remap_to_visible,
+)
 
 
 def test_returns_original_when_already_visible(tmp_path: Path) -> None:
@@ -129,6 +133,99 @@ def test_a_deeper_suffix_always_beats_the_mount_root(tmp_path: Path) -> None:
     assert remap_to_visible("/host/media", [str(mount)], allow_mount_root=True) == str(
         mount / "media"
     )
+
+
+# --------------------------------------------------------------------------- #
+# remap_download_content — ANCHORED on save_path, never a shorter-suffix guess
+# --------------------------------------------------------------------------- #
+def test_download_content_returns_verbatim_when_visible(tmp_path: Path) -> None:
+    video = tmp_path / "dl" / "movies" / "Foo.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    # Already visible: returned unchanged (save_path irrelevant on the fast path).
+    assert remap_download_content(str(video), str(video.parent)) == str(video)
+
+
+def test_download_content_anchors_under_the_remapped_save_dir(tmp_path: Path) -> None:
+    mount = tmp_path / "dl"
+    video = mount / "movies" / "Foo.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    # HOST save_path ``/host/qbt/movies`` -> ``<mount>/movies``; the file's position
+    # under it (``Foo.mkv``) is preserved verbatim.
+    assert remap_download_content(
+        "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", candidate_mounts=(str(mount),)
+    ) == str(video)
+
+
+def test_download_content_never_matches_a_stale_shorter_suffix(tmp_path: Path) -> None:
+    # THE finding: the real file ``<mount>/movies/Foo.mkv`` is MISSING (only its
+    # category dir exists), and a stale, unrelated ``<mount>/Foo.mkv`` sits at the
+    # mount root. A free suffix search would shorten to ``Foo.mkv`` and match the
+    # stale file; the anchored remap must return None (honest block) instead.
+    mount = tmp_path / "dl"
+    (mount / "movies").mkdir(parents=True)
+    (mount / "Foo.mkv").write_bytes(b"stale")
+    assert (
+        remap_download_content(
+            "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", candidate_mounts=(str(mount),)
+        )
+        is None
+    )
+
+
+def test_download_content_maps_the_save_path_bind_root(tmp_path: Path) -> None:
+    # save_path IS the download bind-source root (``/host/qbt`` -> ``<mount>``): no
+    # suffix of it is a dir under the mount, so the mount root is used and the FULL
+    # remainder (``Foo/Foo.mkv``) is anchored under it.
+    mount = tmp_path / "dl"
+    video = mount / "Foo" / "Foo.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    assert remap_download_content(
+        "/host/qbt/Foo/Foo.mkv", "/host/qbt", candidate_mounts=(str(mount),)
+    ) == str(video)
+
+
+def test_download_content_without_a_save_path_anchor_is_verbatim_only(tmp_path: Path) -> None:
+    # No save_path (a stored crash-resume breadcrumb): only the verbatim path counts
+    # -- a free suffix search is deliberately NOT attempted (it would reintroduce
+    # the stale-match hazard). A missing path stays an honest None.
+    mount = tmp_path / "dl"
+    mount.mkdir()
+    (mount / "Foo.mkv").write_bytes(b"stale")
+    assert remap_download_content("/host/qbt/Foo.mkv", None, candidate_mounts=(str(mount),)) is None
+    real = tmp_path / "already" / "Foo.mkv"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"x")
+    assert remap_download_content(str(real), None, candidate_mounts=(str(mount),)) == str(real)
+
+
+def test_download_content_refuses_a_path_not_under_save_path(tmp_path: Path) -> None:
+    mount = tmp_path / "dl"
+    mount.mkdir()
+    (mount / "Foo.mkv").write_bytes(b"x")
+    # content escapes save_path via ``..`` -> no honest anchor -> None (never the
+    # bare mount tree, never a sibling).
+    assert (
+        remap_download_content(
+            "/host/qbt/../other/Foo.mkv", "/host/qbt", candidate_mounts=(str(mount),)
+        )
+        is None
+    )
+
+
+def test_download_content_reads_module_mounts_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # candidate_mounts=None resolves KNOWN_DOWNLOAD_MOUNTS at CALL time, so a
+    # monkeypatch takes effect (the import-service call site relies on this).
+    mount = tmp_path / "dl"
+    video = mount / "movies" / "Foo.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    assert remap_download_content("/host/qbt/movies/Foo.mkv", "/host/qbt/movies") == str(video)
 
 
 def test_remap_library_root_uses_library_mounts_and_the_mount_root(

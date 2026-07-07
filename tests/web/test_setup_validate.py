@@ -23,6 +23,7 @@ from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibrarySection
 from plex_manager.services import path_visibility
+from plex_manager.services.path_visibility import remap_library_root
 from plex_manager.web import setup_validation
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
@@ -139,6 +140,56 @@ def test_library_options_no_suggestion_when_the_path_already_resolves(tmp_path: 
     )
     options = library_options([already_visible], suggest_mounts=("/media",))
     assert options[0].suggested_path is None
+
+
+def test_library_options_offers_low_confidence_mount_root_for_a_differing_bind_root(
+    tmp_path: Path,
+) -> None:
+    """Finding regression: a whole-library bind root whose basename differs from
+    the mount (``PLEX_MANAGER_MEDIA_ROOT=/srv/plex-data`` -> ``/media``, Plex
+    reporting ``/srv/plex-data``) can't be resolved by the strict remap (no
+    component below the mount, basename ``plex-data`` != ``media``). With exactly
+    ONE library mount the picker offers that mount root as a LOW-confidence
+    suggestion the operator confirms -- never a confident ``suggested_path``, so
+    the write gate still stays strict for a hand-typed value."""
+    mount = tmp_path / "media"
+    mount.mkdir()
+    bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
+    # Pre-init (probe_writable=False): the wizard's own case -- still offered, and
+    # never stats the raw caller-supplied path.
+    options = library_options([bind_root], probe_writable=False, suggest_mounts=(str(mount),))
+    assert options[0].suggested_path is None
+    assert options[0].low_confidence_suggested_path == str(mount)
+    # The confirmed container path is exactly what the strict write gate accepts.
+    assert remap_library_root(str(mount)) == str(mount)
+
+
+def test_library_options_no_low_confidence_when_the_mount_is_ambiguous(tmp_path: Path) -> None:
+    # Two library mounts: WHICH one the bind root maps to is ambiguous, so no
+    # low-confidence guess is offered (the operator must fix mounts / type a path).
+    first = tmp_path / "media"
+    second = tmp_path / "media2"
+    first.mkdir()
+    second.mkdir()
+    bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
+    options = library_options(
+        [bind_root], probe_writable=False, suggest_mounts=(str(first), str(second))
+    )
+    assert options[0].suggested_path is None
+    assert options[0].low_confidence_suggested_path is None
+
+
+def test_library_options_confident_suggestion_suppresses_low_confidence(tmp_path: Path) -> None:
+    # A real deeper match is CONFIDENT: the low-confidence mount-root fallback is
+    # never even computed (a real answer must never be dressed down to a guess).
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    host_section = LibrarySection(
+        key="1", title="Movies", type="movie", locations=("/host/Media/Movies",)
+    )
+    options = library_options([host_section], suggest_mounts=(str(mount),))
+    assert options[0].suggested_path == str(mount / "Movies")
+    assert options[0].low_confidence_suggested_path is None
 
 
 def test_library_options_suggestion_probe_original_mirrors_probe_writable(
@@ -883,6 +934,7 @@ async def test_plex_libraries_picker_probes_writability(
             "section_type": "movie",
             "writable": True,
             "suggested_path": None,
+            "low_confidence_suggested_path": None,
         },
         {
             "section_key": "2",
@@ -891,5 +943,6 @@ async def test_plex_libraries_picker_probes_writability(
             "section_type": "tv",
             "writable": False,
             "suggested_path": None,
+            "low_confidence_suggested_path": None,
         },
     ]

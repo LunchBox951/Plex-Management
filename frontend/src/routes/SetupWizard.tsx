@@ -7,6 +7,7 @@ import {
   useValidateService,
 } from '../api/hooks'
 import type { PlexLibraryOption, SetupCompleteRequest } from '../api/types'
+import { libraryOptionNote, libraryOptionValue } from '../api/types'
 import { clearSetupToken, getSetupToken, setSetupToken } from '../lib/apiKey'
 import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { cn } from '../lib/cn'
@@ -550,13 +551,11 @@ function RootPicker({
           {libraries.map((lib) => (
             <option
               key={`${lib.section_key}:${lib.path}`}
-              value={lib.suggested_path ?? lib.path}
+              value={libraryOptionValue(lib)}
               disabled={lib.writable === false}
             >
               {lib.title} — {lib.path}
-              {lib.suggested_path && lib.suggested_path !== lib.path
-                ? ` · in-container: ${lib.suggested_path}`
-                : ''}
+              {libraryOptionNote(lib)}
               {lib.writable === false ? ' · not writable by the app' : ''}
             </option>
           ))}

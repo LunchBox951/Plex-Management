@@ -8,6 +8,7 @@ import {
   useUpdateSettings,
 } from '../api/hooks'
 import type { SettingsResponse, SettingsUpdate } from '../api/types'
+import { libraryOptionNote, libraryOptionValue } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { AuthErrorCard } from '../components/AuthErrorCard'
 import { Button } from '../components/ui/Button'
@@ -603,13 +604,11 @@ export function Settings() {
                   {movieLibraries.map((lib) => (
                     <option
                       key={`${lib.section_key}:${lib.path}`}
-                      value={lib.suggested_path ?? lib.path}
+                      value={libraryOptionValue(lib)}
                       disabled={lib.writable === false}
                     >
                       {lib.title} — {lib.path}
-                      {lib.suggested_path && lib.suggested_path !== lib.path
-                        ? ` · in-container: ${lib.suggested_path}`
-                        : ''}
+                      {libraryOptionNote(lib)}
                       {lib.writable === false ? ' · not writable by the app' : ''}
                     </option>
                   ))}
@@ -669,13 +668,11 @@ export function Settings() {
                   {tvLibraries.map((lib) => (
                     <option
                       key={`${lib.section_key}:${lib.path}`}
-                      value={lib.suggested_path ?? lib.path}
+                      value={libraryOptionValue(lib)}
                       disabled={lib.writable === false}
                     >
                       {lib.title} — {lib.path}
-                      {lib.suggested_path && lib.suggested_path !== lib.path
-                        ? ` · in-container: ${lib.suggested_path}`
-                        : ''}
+                      {libraryOptionNote(lib)}
                       {lib.writable === false ? ' · not writable by the app' : ''}
                     </option>
                   ))}
@@ -744,13 +741,11 @@ export function Settings() {
                     {movieLibraries.map((lib) => (
                       <option
                         key={`${lib.section_key}:${lib.path}`}
-                        value={lib.suggested_path ?? lib.path}
+                        value={libraryOptionValue(lib)}
                         disabled={lib.writable === false}
                       >
                         {lib.title} — {lib.path}
-                        {lib.suggested_path && lib.suggested_path !== lib.path
-                          ? ` · in-container: ${lib.suggested_path}`
-                          : ''}
+                        {libraryOptionNote(lib)}
                         {lib.writable === false ? ' · not writable by the app' : ''}
                       </option>
                     ))}
@@ -801,13 +796,11 @@ export function Settings() {
                     {tvLibraries.map((lib) => (
                       <option
                         key={`${lib.section_key}:${lib.path}`}
-                        value={lib.suggested_path ?? lib.path}
+                        value={libraryOptionValue(lib)}
                         disabled={lib.writable === false}
                       >
                         {lib.title} — {lib.path}
-                        {lib.suggested_path && lib.suggested_path !== lib.path
-                          ? ` · in-container: ${lib.suggested_path}`
-                          : ''}
+                        {libraryOptionNote(lib)}
                         {lib.writable === false ? ' · not writable by the app' : ''}
                       </option>
                     ))}

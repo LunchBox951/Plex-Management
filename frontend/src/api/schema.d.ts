@@ -1662,6 +1662,8 @@ export interface components {
          *     known-not-writable location is the split-mount signal — surfaced, not hidden.
          */
         PlexLibraryOption: {
+            /** Low Confidence Suggested Path */
+            low_confidence_suggested_path?: string | null;
             /** Path */
             path: string;
             /** Section Key */
