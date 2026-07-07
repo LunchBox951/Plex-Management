@@ -48,6 +48,11 @@ def _parsed(title: str, year: int | None = None) -> ParsedRelease:
         (_parsed("Amelie", 2001), "Amélie", 2001, 0, 0, True),
         (_parsed("Leon The Professional", 1994), "Léon: The Professional", 1994, 0, 0, True),
         (_parsed("Pokemon Detective Pikachu", 2019), "Pokémon Detective Pikachu", 2019, 0, 0, True),
+        # Non-decomposable Latin letters (no canonical NFKD decomposition) are
+        # transliterated rather than silently stripped, so a foreign metadata
+        # title still matches its ASCII release name (#109).
+        (_parsed("Aeon Flux", 2005), "Æon Flux", 2005, 0, 0, True),
+        (_parsed("Soren", 2006), "Søren", 2006, 0, 0, True),
         # Folding does not collapse genuinely different titles.
         (_parsed("It Follows", 2014), "It", 2017, 0, 0, False),
         # Empty expected title can never match (no oracle to compare against).
@@ -144,3 +149,27 @@ def test_normalize_title_folds_diacritics_to_ascii() -> None:
         "Pokemon Detective Pikachu"
     )
     assert normalize_title("Cidade de Deus") == "cidadededeus"
+
+
+def test_normalize_title_transliterates_nondecomposable_latin() -> None:
+    # Æ/ø/ł/đ/þ/œ/ð/ħ/ŋ/ŧ and the Turkish dotless i have NO canonical NFKD
+    # decomposition, so without an explicit transliteration table they survive
+    # NFKD unchanged and are then DELETED by the alnum strip -- silently
+    # mangling foreign/anime titles into something that no longer matches
+    # their ASCII release name (#109).
+    assert normalize_title("Æon") == normalize_title("Aeon") == "aeon"
+    assert normalize_title("Søren") == normalize_title("Soren") == "soren"
+    # Łódź also proves the decomposable ó/ź on the SAME word still fold via NFKD
+    # alongside the table-driven ł.
+    assert normalize_title("Łódź") == normalize_title("Lodz") == "lodz"
+    # Per-letter coverage so a dropped table row is caught immediately.
+    assert normalize_title("Þór") == "thor"
+    assert normalize_title("Œuvre") == "oeuvre"
+    assert normalize_title("Ðjango") == "django"
+    assert normalize_title("Đorđe") == "dorde"
+    assert normalize_title("Ħal") == "hal"
+    assert normalize_title("Ŋombe") == "nombe"
+    assert normalize_title("Ŧrain") == "train"
+    assert normalize_title("Diyarbakır") == "diyarbakir"  # noqa: RUF001 -- Turkish dotless i
+    # Pin that the table-driven path coexists with the existing NFKD path.
+    assert normalize_title("Amélie") == "amelie"

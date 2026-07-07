@@ -26,8 +26,10 @@ never falls back to accepting a blocked or rejected source.
 
 Ranking among allowed releases uses :func:`compare_by_profile` as the primary key
 (profile order, not raw resolution), then seeders descending, then size as a
-stable final tiebreak. The numeric :attr:`ScoredRelease.score` encodes the same
-ordering for display.
+stable final tiebreak. The numeric :attr:`ScoredRelease.score` is assigned AFTER
+that sort as a strictly-decreasing projection of each release's final rank (best
+= highest), so it can never contradict the accepted order -- ``_compare``, not
+the score, is the sole ordering authority.
 
 Pure domain: ports Protocols + the local quality/release model + stdlib.
 """
@@ -75,18 +77,6 @@ BlocklistCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 # the pure ``matches_media`` helper; the engine stays pure and only sees the hook.
 MediaMatchCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 
-# Weighting so the composite score reproduces the comparator ordering: profile
-# index dominates the season-pack scope preference, which dominates seeders,
-# which dominates size. The gaps are far larger than any realistic field value
-# (seeders < 1e9, size < 1e15 bytes => contribution < 1e6).
-_INDEX_WEIGHT = 1e12
-# Only ever added when the caller opts in via ``prefer_season_pack`` (see
-# :func:`decide`); with the default ``prefer_season_pack=False`` every candidate's
-# contribution is 0, so the score is BYTE-IDENTICAL to the pre-season-pack engine.
-_SCOPE_WEIGHT = 1e9
-_SEEDER_WEIGHT = 1e3
-_SIZE_WEIGHT = 1e-9
-
 
 @dataclass(frozen=True)
 class DecisionResult:
@@ -100,17 +90,6 @@ class DecisionResult:
     accepted: list[ScoredRelease]
     rejected: list[tuple[CandidateRelease, RejectionReason]]
     no_acceptable_release: bool
-
-
-def _score(profile_index: int, candidate: CandidateRelease, *, is_season_pack: bool) -> float:
-    seeders = candidate.seeders or 0
-    scope_bonus = _SCOPE_WEIGHT if is_season_pack else 0.0
-    return (
-        profile_index * _INDEX_WEIGHT
-        + scope_bonus
-        + seeders * _SEEDER_WEIGHT
-        + candidate.size_bytes * _SIZE_WEIGHT
-    )
 
 
 def decide(
@@ -167,14 +146,13 @@ def decide(
         # The quality passed the gate, so it is present in the profile.
         index = profile.get_index(quality.id)
         profile_index = index if index is not None else -1
-        is_season_pack = prefer_season_pack and classify_release_scope(parsed) in _PACK_SCOPES
         accepted.append(
             ScoredRelease(
                 candidate=candidate,
                 parsed=parsed,
                 quality=quality,
                 profile_index=profile_index,
-                score=_score(profile_index, candidate, is_season_pack=is_season_pack),
+                score=0.0,  # placeholder; real value is a post-sort rank projection (#105)
             )
         )
 
@@ -196,8 +174,16 @@ def decide(
         return (left_size > right_size) - (left_size < right_size)
 
     accepted.sort(key=cmp_to_key(_compare), reverse=True)
+    # score is a DISPLAY projection of the comparator's final rank, never an
+    # input to it: assign strictly-decreasing by position so score order ==
+    # accepted order by construction (#105). The comparator, not the score, is
+    # the sole ordering authority.
+    ranked = [
+        scored.model_copy(update={"score": float(len(accepted) - position)})
+        for position, scored in enumerate(accepted)
+    ]
     return DecisionResult(
-        accepted=accepted,
+        accepted=ranked,
         rejected=rejected,
-        no_acceptable_release=len(accepted) == 0,
+        no_acceptable_release=not ranked,
     )

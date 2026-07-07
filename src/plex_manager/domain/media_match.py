@@ -24,12 +24,38 @@ from plex_manager.domain.release import ParsedRelease
 
 __all__ = ["matches_media", "normalize_title"]
 
-# Collapse a title to a comparison key: casefold, fold diacritics to their base
-# ASCII letter, then drop everything that is not an ASCII letter or digit
-# (punctuation, separators, whitespace). So "Spider-Man: No Way Home" and
-# "spider man no way home" compare equal, and the accented TMDB title "Amélie"
-# matches the ASCII scene/p2p release "Amelie".
+# Collapse a title to a comparison key: casefold, transliterate non-decomposable
+# Latin letters, fold decomposable diacritics to their base ASCII letter, then
+# drop everything that is not an ASCII letter or digit (punctuation, separators,
+# whitespace). So "Spider-Man: No Way Home" and "spider man no way home" compare
+# equal, and the accented TMDB title "Amélie" matches the ASCII scene/p2p
+# release "Amelie".
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+# Latin letters with NO canonical NFKD decomposition (Æ/ø/ł/đ/þ/œ/ð/ħ/ŋ/ŧ and the
+# Turkish dotless i): NFKD leaves them intact and the _NON_ALNUM strip above
+# would DELETE them, silently mangling foreign/anime titles (Æon -> "on",
+# Søren -> "sren") into WRONG_MEDIA rejects. Fold them to their ASCII
+# transliteration first (Sonarr's Diacritical-table semantics, stdlib-only --
+# no unidecode). casefold() runs first and lowercases every uppercase form, so
+# only lowercase keys are needed here -- do NOT add uppercase keys. ss (from
+# casefold()) is already handled; decomposable accents (é, ö, å, ...) are still
+# handled by NFKD below.
+_TRANSLITERATION = str.maketrans(
+    {
+        "æ": "ae",
+        "ø": "o",
+        "ł": "l",
+        "đ": "d",
+        "þ": "th",
+        "œ": "oe",
+        "ð": "d",
+        "ħ": "h",
+        "ŋ": "n",
+        "ŧ": "t",
+        "ı": "i",  # noqa: RUF001 -- Turkish dotless i, the transliteration source
+    }
+)
 
 # Releases routinely name a movie a year off from the metadata's release year
 # (festival vs. wide release, regional dates), so an exact year match is too
@@ -40,11 +66,14 @@ _YEAR_TOLERANCE = 1
 def normalize_title(title: str) -> str:
     """Return the punctuation/whitespace-insensitive, casefolded comparison key.
 
-    Diacritics are folded to their base ASCII letter (NFKD-decompose, drop
-    combining marks) *before* stripping, so an accented metadata title and its
-    ASCII release name compare equal instead of normalizing to different keys.
+    Non-decomposable Latin letters (Æ/ø/ł/đ/þ/œ/ð/ħ/ŋ/ŧ and the Turkish dotless
+    i) are transliterated via an explicit table (:data:`_TRANSLITERATION`);
+    decomposable accents are folded to their base ASCII letter via
+    NFKD-decompose + drop-combining. Both run *before* stripping, so an
+    accented or foreign-lettered metadata title and its ASCII release name
+    compare equal instead of normalizing to different keys.
     """
-    folded = unicodedata.normalize("NFKD", title.casefold())
+    folded = unicodedata.normalize("NFKD", title.casefold().translate(_TRANSLITERATION))
     stripped = "".join(c for c in folded if not unicodedata.combining(c))
     return _NON_ALNUM.sub("", stripped)
 
