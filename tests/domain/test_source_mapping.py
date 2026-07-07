@@ -394,6 +394,19 @@ _GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object]]] = [
         "Movie.2024.1080p.WEB-DL.x264-HQCAM",
         {"source": "Web", "screen_size": "1080p", "release_group": "HQCAM"},
     ),
+    # Group token ALSO embedded earlier in the title. An unanchored first-match
+    # strip deletes the ``Scr`` of ``Scream`` and leaves the genuine ``-SCR``
+    # suffix behind to false-trip the reject-modifier net (regression guard).
+    (
+        "Scream.2024.1080p.WEB-DL.x264-SCR",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+    ),
+    # ``R5`` embedded in the title word ``Barr5`` (contrived but exercises the
+    # same "token appears before its suffix occurrence" hazard for the R-code).
+    (
+        "Barr5.2024.1080p.WEB-DL.x264-R5",
+        {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
+    ),
 ]
 
 
@@ -411,13 +424,19 @@ def test_real_reject_token_survives_release_group_strip() -> None:
     # reject source): the guessit-native source classification still wins, so
     # stripping the group must not launder a genuine CAM release.
     profile = default_profile()
-    for raw_title, fields in (
-        ("Movie.2024.HDCAM.x264-RARBG", {"source": "HD Camera", "release_group": "RARBG"}),
-        ("Movie.2024.HDCAM.x264-CAM", {"source": "HD Camera", "release_group": "CAM"}),
+    for raw_title, fields, reject_name in (
+        ("Movie.2024.HDCAM.x264-RARBG", {"source": "HD Camera", "release_group": "RARBG"}, "CAM"),
+        ("Movie.2024.HDCAM.x264-CAM", {"source": "HD Camera", "release_group": "CAM"}, "CAM"),
+        # Genuine embedded reject token that the raw-title net must still catch
+        # AFTER the group strip. guessit missed the screener flag (no ``other``),
+        # so classification leans on the net: stripping the ``-SCR`` suffix group
+        # tag must leave the ``SCR`` embedded in ``DVDSCR`` intact so the release
+        # still rejects as a screener rather than laundering to acceptable DVD.
+        ("Movie.2024.DVDSCR.x264-SCR", {"source": "DVD", "release_group": "SCR"}, "DVDSCR"),
     ):
         parsed = to_parsed_release(fields, raw_title)
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
-        assert quality.name == "CAM", f"{raw_title} -> {quality.name}"
+        assert quality.name == reject_name, f"{raw_title} -> {quality.name}"
         assert check_quality(quality, profile).accepted is False, raw_title
 
 
@@ -432,6 +451,30 @@ def test_strip_release_group_removes_span_case_insensitive() -> None:
     assert _strip_release_group("Movie-scr", {"release_group": "SCR"}) == "Movie-"
     # Regex-special characters in the group name are matched literally.
     assert _strip_release_group("Movie-R5+X-GRP", {"release_group": "R5+X"}) == "Movie--GRP"
+
+
+def test_strip_release_group_anchors_to_suffix_not_an_embedded_mention() -> None:
+    # The group token also appears earlier in the title (inside a longer word).
+    # The strip must remove the *suffix* group tag, never the embedded mention:
+    # deleting the ``Scr`` of ``Scream`` would leave the genuine ``-SCR`` suffix
+    # to false-trip the reject net.
+    assert (
+        _strip_release_group("Scream.2024.1080p.WEB-DL.x264-SCR", {"release_group": "SCR"})
+        == "Scream.2024.1080p.WEB-DL.x264-"
+    )
+    # Word-boundary flanks: a group token that is a substring of a longer
+    # alphanumeric run (``SCR`` inside ``DVDSCR``) is left intact, so a genuine
+    # reject token is never laundered by the group strip.
+    assert (
+        _strip_release_group("Movie.2024.DVDSCR.x264-SCR", {"release_group": "SCR"})
+        == "Movie.2024.DVDSCR.x264-"
+    )
+    # No whole-token occurrence -> nothing is stripped (the group name only
+    # appears as a substring of a larger word).
+    assert (
+        _strip_release_group("Scream.2024.1080p.WEB-DL.x264", {"release_group": "SCR"})
+        == "Scream.2024.1080p.WEB-DL.x264"
+    )
 
 
 def test_strip_release_group_leaves_guessit_native_other_intact() -> None:

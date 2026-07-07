@@ -174,7 +174,7 @@ def _as_str_list(value: object) -> list[str]:
 
 
 def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
-    """Remove the guessit-identified release-group span from ``raw_title`` once.
+    """Remove the guessit-identified release-group span from ``raw_title``.
 
     Feeds only the two raw-title reject nets (:func:`_reject_net`,
     :func:`_reject_modifier_net`); the guessit-native ``other`` checks in
@@ -182,14 +182,33 @@ def _strip_release_group(raw_title: str, fields: Mapping[str, object]) -> str:
     ``SCR``/``R5``/``HQCAM`` would otherwise false-trip a reject net meant to
     catch those tokens in the *release description*, not in an arbitrary
     group tag. Absent/empty/non-str ``release_group`` -> unchanged behavior.
-    This is a first-occurrence removal, not a full scan for every mention of
-    the group name; the guessit-native checks remain the primary defense for
-    real reject tokens.
+
+    The strip is anchored to the group's *suffix* occurrence: the group token
+    is matched only as a whole word (word-boundary flanks, so it is never a
+    substring of a longer alphanumeric run) and the **last** such occurrence is
+    removed. An unanchored first-match removal strips the wrong span when the
+    group name also appears earlier in the title -- e.g. group ``SCR`` in
+    ``Scream.2024.1080p.WEB-DL.x264-SCR`` would delete the ``Scr`` of
+    ``Scream`` and leave the genuine ``-SCR`` suffix behind to false-trip the
+    reject net. Word-boundary matching also keeps a real reject token embedded
+    in a larger run (e.g. ``SCR`` inside ``DVDSCR``) intact so it still rejects.
+    This removes only the group tag, not every mention of the group name; the
+    guessit-native checks remain the primary defense for real reject tokens.
     """
     group = fields.get("release_group")
     if not isinstance(group, str) or not group:
         return raw_title
-    return re.sub(re.escape(group), "", raw_title, count=1, flags=re.IGNORECASE)
+    # ``(?<!\w) ... (?!\w)`` bounds the match to a whole token without relying on
+    # the group's own edge characters (unlike ``\b``, which breaks for a group
+    # that starts/ends in punctuation). ``_`` counts as a word char here, exactly
+    # as the ``\b`` boundaries in the reject nets treat it, so the strip removes
+    # precisely the spans a net could otherwise fire on.
+    pattern = re.compile(rf"(?<!\w){re.escape(group)}(?!\w)", re.IGNORECASE)
+    matches = list(pattern.finditer(raw_title))
+    if not matches:
+        return raw_title
+    last = matches[-1]
+    return raw_title[: last.start()] + raw_title[last.end() :]
 
 
 def _reject_net(raw_title: str) -> QualitySource | None:
