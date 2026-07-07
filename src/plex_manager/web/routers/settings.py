@@ -17,14 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
@@ -37,6 +35,14 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
+    AUTO_GRAB_ENABLED_DEFAULT,
+    DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+    DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+    EVICTION_ENABLED_DEFAULT,
+    EVICTION_GRACE_DAYS_DEFAULT,
+    EVICTION_INTERVAL_MINUTES_DEFAULT,
+    EVICTION_PROACTIVE_ENABLED_DEFAULT,
+    LOG_RETENTION_DAYS_DEFAULT,
     PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
@@ -52,6 +58,11 @@ from plex_manager.web.deps import (
     get_library,
     load_system_settings,
     require_admin,
+    resolve_bool_setting,
+    resolve_disk_pressure_percents,
+    resolve_eviction_grace_days,
+    resolve_eviction_interval_minutes,
+    resolve_log_retention_days,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
@@ -153,132 +164,134 @@ _rotate_lock = asyncio.Lock()
 
 
 # Which typed ``KNOWN_SETTING_KEYS`` entries ``SettingsResponse`` coerces to
-# which non-``str`` Python type -- used ONLY by ``_sanitize_typed_settings``
-# below to re-validate a raw stored string with the SAME accept/reject rule
-# ``SettingsResponse.model_validate`` itself applies, so the sanitizer's
-# accept/reject set can never drift from the response model's own coercion
-# (issue #92, parity guard: ``test_typed_setting_key_groups_cover_all_typed_
-# response_fields``). Every one of these is non-secret plaintext config (see
-# ``SECRET_SETTING_KEYS``) so logging a corrupt raw value below is logsafe.
+# which non-``str`` Python type -- the keys ``_sanitize_typed_settings`` below
+# resolves through the SHARED ``web.deps`` resolvers before the response model
+# coerces them (issue #92, parity guard: ``test_typed_setting_key_groups_cover_
+# all_typed_response_fields``). Every one of these is non-secret plaintext
+# config (see ``SECRET_SETTING_KEYS``) so the resolvers' corrupt-raw-value
+# WARNINGs are logsafe.
 _FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "disk_pressure_threshold_percent",
     "disk_pressure_target_percent",
     "eviction_interval_minutes",
 )
 _INT_TYPED_SETTING_KEYS: tuple[str, ...] = ("eviction_grace_days", "log_retention_days")
-_BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = (
-    "eviction_enabled",
-    "eviction_proactive_enabled",
-    "auto_grab_enabled",
-)
-_FLOAT_SETTING_ADAPTER: TypeAdapter[float] = TypeAdapter(float)
-_INT_SETTING_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
-_BOOL_SETTING_ADAPTER: TypeAdapter[bool] = TypeAdapter(bool)
+# The default each boolean key degrades to on an unrecognized stored value --
+# threaded into ``resolve_bool_setting`` so its WARNING names the actual
+# fallback the matching runtime getter uses. ``_BOOL_TYPED_SETTING_KEYS`` is
+# DERIVED from it so the sanitizer's bool loop and the parity-guard tuple can
+# never name different key sets.
+_BOOL_SETTING_DEFAULTS: dict[str, bool] = {
+    "eviction_enabled": EVICTION_ENABLED_DEFAULT,
+    "eviction_proactive_enabled": EVICTION_PROACTIVE_ENABLED_DEFAULT,
+    "auto_grab_enabled": AUTO_GRAB_ENABLED_DEFAULT,
+}
+_BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
 
 
-def _drop_corrupt_setting(out: dict[str, str | None], key: str, value: str) -> None:
-    """Null a stored value ``GET /settings`` cannot honestly show (issue #92).
+def _present_effective(
+    raw: str | None, effective: float | int, default: float | int, honored: bool
+) -> str | None:
+    """The value ``GET /settings`` presents for one resolved typed setting.
 
-    Logged as a WARNING naming the key (never silent -- north star #3); the
-    value itself is safe to log because every key routed through this helper
-    is plain, non-secret config (never one of ``SECRET_SETTING_KEYS``).
+    The display contract (PR #142 round 3): the page must show exactly what the
+    runtime getter is using --
+
+    * raw value HONORED -> echo the raw stored string verbatim (display
+      fidelity: ``"88.5"`` stays ``88.5``).
+    * degraded to the DEFAULT -> ``None`` (unset), which the page renders as
+      the default -- the same value the getter returns, so null is truthful.
+    * degraded to anything ELSE (an upper-bound CLAMP, or the disk-pressure
+      pair rule) -> the EFFECTIVE value itself. Nulling here would make the
+      page claim the default (e.g. a 30-day grace) while the runtime runs the
+      clamped MAX (3650 days) -- the exact page-vs-runtime lie this exists to
+      prevent. The clamped value is always within ``SettingsUpdate``'s bounds,
+      so re-saving the displayed form persists it verbatim (self-healing).
     """
-    _logger.warning(
-        "stored setting %r has an invalid value %r; presenting it as unset in GET /settings",
-        key,
-        value,
-    )
-    out[key] = None
-
-
-def _save_would_reject(key: str, value: str) -> bool:
-    """Whether ``PUT /settings`` would reject this stored value on the next save.
-
-    Re-validates the raw stored string through the SAME ``SettingsUpdate`` model
-    the write path uses, so the sanitizer's accept set can never drift from the
-    endpoint's own ``ge``/``gt``/``le`` bounds (issue #92). A finite BUT
-    out-of-range stored value passes the shape/finiteness checks above yet is one
-    ``GET`` must NOT echo: e.g. a hand-edited ``eviction_interval_minutes=10081``
-    (past the 7-day ceiling), ``disk_pressure_threshold_percent=150`` (past 100),
-    or ``eviction_grace_days=3651`` (past the ~10-year cap) -- the matching
-    ``web.deps`` getter already degrades each of these to its default at runtime,
-    and ``PUT`` rejects them with a 422, so surfacing the raw number would only
-    make the Settings page display (and re-submit) a value the API refuses the
-    instant the operator saves the otherwise-unchanged form. Validating a
-    single-field ``{key: value}`` dict is safe: the disk-pressure cross-field
-    ``model_validator`` no-ops unless BOTH sides are present, and no other field's
-    validator is triggered. Only ``ValidationError`` is treated as a reject --
-    never swallowing an unexpected error (north star #3).
-    """
-    try:
-        SettingsUpdate.model_validate({key: value})
-    except ValidationError:
-        return True
-    return False
+    if raw is not None and honored:
+        return raw
+    if effective == default:
+        return None
+    return str(effective)
 
 
 def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None]:
-    """Null any stored typed value ``GET /settings`` cannot honestly present.
+    """Present every stored typed value as the EFFECTIVE value the runtime uses.
 
-    A hand-edited or pre-migration-corrupt stored value can fail in three ways
-    that ``SettingsResponse.model_validate`` alone does not catch:
+    Each typed key is resolved through the SAME ``web.deps`` resolver its
+    runtime getter uses (``resolve_eviction_grace_days``,
+    ``resolve_disk_pressure_percents``, ...), then displayed per
+    :func:`_present_effective` -- raw when honored, the effective value when
+    clamped/pair-adjusted, ``None`` when the default applies. One resolution
+    path means the page and the eviction/auto-grab/log-retention loops can
+    never disagree about a corrupt stored value (issue #92, north star #3).
 
-    * unparsable / wrong-shape (``"abc"`` for a float, ``"1.5"`` for an int,
-      ``"maybe"`` for a bool) -- raises ``pydantic.ValidationError`` at
-      ``model_validate``.
-    * ``"inf"`` / ``"nan"`` -- pydantic ACCEPTS these as a valid ``float``, but
-      Starlette's ``JSONResponse`` renders with ``json.dumps(...,
-      allow_nan=False)``, which raises ``ValueError`` on a non-finite float at
-      SERIALIZATION time -- after validation has already succeeded, so no
-      ``except ValidationError`` here would ever catch it.
-    * finite BUT out-of-range (``"10081"`` for ``eviction_interval_minutes``,
-      ``"150"`` for ``disk_pressure_threshold_percent``, ``"3651"`` for a
-      bounded int) -- coerces and serialises fine, so neither check above
-      catches it, yet the typed ``web.deps`` getter falls back to its default
-      and ``PUT`` 422s it. Nulled via :func:`_save_would_reject` so GET never
-      echoes a value the write path rejects (issue #92).
+    This also keeps ``GET`` from ever 500ing or echoing a value ``PUT``
+    rejects: unparsable and non-finite raws (which would crash Starlette's
+    ``json.dumps(..., allow_nan=False)`` at serialization time) resolve to the
+    default (``None`` here), and every clamped value lies within
+    ``SettingsUpdate``'s own bounds, so the displayed form always re-saves
+    cleanly.
 
-    All three failure modes would otherwise either 500 the whole ``GET
-    /settings`` response over a single corrupt field or present a value the API
-    refuses on the next save. Degrading just that field to ``None`` (unset)
-    mirrors what the corresponding ``web.deps`` getter already does at runtime
-    (falls back to its default) -- honest, visible (WARNING logged), never a
-    crash and never a value the operator cannot re-save.
+    The disk-pressure pair is resolved TOGETHER (never per-side): a half-corrupt
+    pair degrades to a workable ``target <= threshold`` pair (see
+    ``resolve_disk_pressure_percents``), and whatever the pair rule substitutes
+    is displayed -- including for a side that is UNSET in storage (e.g. an unset
+    target whose effective value is pulled down to a low stored threshold), so
+    the page never implies a default the sweep is not actually using.
+
+    Boolean raws are normalized to their stripped form when honored: the
+    resolver accepts a whitespace-padded ``" false "`` (the pre-#142 parser's
+    contract), but ``SettingsResponse``'s own bool coercion would reject the
+    padded literal at ``model_validate`` -- the stripped token is the same
+    recognized value, minus the crash.
     """
     out = dict(raw)
-    for key in _FLOAT_TYPED_SETTING_KEYS:
-        value = out.get(key)
+
+    pair = resolve_disk_pressure_percents(
+        raw.get("disk_pressure_threshold_percent"), raw.get("disk_pressure_target_percent")
+    )
+    out["disk_pressure_threshold_percent"] = _present_effective(
+        raw.get("disk_pressure_threshold_percent"),
+        pair.threshold,
+        DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+        pair.threshold_honored,
+    )
+    out["disk_pressure_target_percent"] = _present_effective(
+        raw.get("disk_pressure_target_percent"),
+        pair.target,
+        DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+        pair.target_honored,
+    )
+
+    interval, interval_honored = resolve_eviction_interval_minutes(
+        raw.get("eviction_interval_minutes")
+    )
+    out["eviction_interval_minutes"] = _present_effective(
+        raw.get("eviction_interval_minutes"),
+        interval,
+        EVICTION_INTERVAL_MINUTES_DEFAULT,
+        interval_honored,
+    )
+
+    grace, grace_honored = resolve_eviction_grace_days(raw.get("eviction_grace_days"))
+    out["eviction_grace_days"] = _present_effective(
+        raw.get("eviction_grace_days"), grace, EVICTION_GRACE_DAYS_DEFAULT, grace_honored
+    )
+
+    retention, retention_honored = resolve_log_retention_days(raw.get("log_retention_days"))
+    out["log_retention_days"] = _present_effective(
+        raw.get("log_retention_days"), retention, LOG_RETENTION_DAYS_DEFAULT, retention_honored
+    )
+
+    for key, default in _BOOL_SETTING_DEFAULTS.items():
+        value = raw.get(key)
         if value is None:
             continue
-        try:
-            parsed = _FLOAT_SETTING_ADAPTER.validate_python(value)
-        except ValidationError:
-            _drop_corrupt_setting(out, key, value)
-            continue
-        # ``math.isfinite`` is the serialization-crash guard (kept explicit so a
-        # future UNBOUNDED float field still cannot 500 GET); ``_save_would_reject``
-        # adds the finite out-of-range bounds parity.
-        if not math.isfinite(parsed) or _save_would_reject(key, value):
-            _drop_corrupt_setting(out, key, value)
-    for key in _INT_TYPED_SETTING_KEYS:
-        value = out.get(key)
-        if value is None:
-            continue
-        try:
-            _INT_SETTING_ADAPTER.validate_python(value)
-        except ValidationError:
-            _drop_corrupt_setting(out, key, value)
-            continue
-        if _save_would_reject(key, value):
-            _drop_corrupt_setting(out, key, value)
-    for key in _BOOL_TYPED_SETTING_KEYS:
-        value = out.get(key)
-        if value is None:
-            continue
-        try:
-            _BOOL_SETTING_ADAPTER.validate_python(value)
-        except ValidationError:
-            _drop_corrupt_setting(out, key, value)
+        _effective, honored = resolve_bool_setting(key, value, default)
+        # Honored -> the stripped token (see the docstring); unrecognized -> the
+        # default applies at runtime, so unset (None) is the truthful display.
+        out[key] = value.strip() if honored else None
     return out
 
 

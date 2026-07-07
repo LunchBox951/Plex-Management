@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.domain.eviction import EvictionCandidate, select_evictions
 from plex_manager.models import AuthSession, Setting, User
 from plex_manager.web.deps import (
     AUTO_GRAB_ENABLED_DEFAULT,
@@ -1232,14 +1233,19 @@ async def test_get_eviction_interval_minutes_falls_back_on_non_finite_stored_val
 @pytest.mark.parametrize(
     ("stored", "expected"),
     [
+        # Non-positive: an EXCLUSIVE lower bound with no safe floor to clamp to
+        # (a zero/negative sleep hot-spins the loop) -> the default.
         ("0", EVICTION_INTERVAL_MINUTES_DEFAULT),
         ("-5", EVICTION_INTERVAL_MINUTES_DEFAULT),
-        (str(EVICTION_INTERVAL_MAX_MINUTES + 1), EVICTION_INTERVAL_MINUTES_DEFAULT),
+        # Above the cap: CLAMPED to it (round 3) -- a pre-bounds huge interval
+        # meant "sweep almost never"; degrading it to the 30-minute default
+        # would make sweeps orders of magnitude more frequent on upgrade.
+        (str(EVICTION_INTERVAL_MAX_MINUTES + 1), EVICTION_INTERVAL_MAX_MINUTES),
         ("45", 45.0),
         (str(EVICTION_INTERVAL_MAX_MINUTES), EVICTION_INTERVAL_MAX_MINUTES),
     ],
 )
-async def test_get_eviction_interval_minutes_falls_back_on_out_of_range_stored_value(
+async def test_get_eviction_interval_minutes_degrades_out_of_range_stored_value(
     sessionmaker_: SessionMaker, stored: str, expected: float
 ) -> None:
     async with sessionmaker_() as session:
@@ -1251,19 +1257,25 @@ async def test_get_eviction_interval_minutes_falls_back_on_out_of_range_stored_v
 
 
 @pytest.mark.parametrize(
-    ("stored", "expected"),
+    ("stored", "expected", "degraded"),
     [
-        ("-1", EVICTION_GRACE_DAYS_DEFAULT),
-        (str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_DEFAULT),
-        ("14", 14),
-        ("abc", EVICTION_GRACE_DAYS_DEFAULT),
+        # Negative: the floor (0 = immediately evictable) is the DESTRUCTIVE
+        # end of the scale, so never a floor-clamp -> the safe default.
+        ("-1", EVICTION_GRACE_DAYS_DEFAULT, True),
+        # Above the cap: CLAMPED (round 3) -- a pre-bounds huge grace was a
+        # legitimate "never age-evict"; the 30-day default would suddenly make
+        # month-old titles evictable on upgrade (data-destructive).
+        (str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX, True),
+        ("14", 14, False),
+        ("abc", EVICTION_GRACE_DAYS_DEFAULT, True),
     ],
 )
-async def test_get_eviction_grace_days_falls_back_on_negative_or_overflow(
+async def test_get_eviction_grace_days_degrades_negative_or_overflow(
     sessionmaker_: SessionMaker,
     caplog: pytest.LogCaptureFixture,
     stored: str,
     expected: int,
+    degraded: bool,
 ) -> None:
     async with sessionmaker_() as session:
         await SettingsStore(session).set("eviction_grace_days", stored)
@@ -1274,24 +1286,29 @@ async def test_get_eviction_grace_days_falls_back_on_negative_or_overflow(
             value = await get_eviction_grace_days(session)
 
     assert value == expected
-    if expected == EVICTION_GRACE_DAYS_DEFAULT:
+    if degraded:
         assert "eviction_grace_days" in caplog.text
 
 
 @pytest.mark.parametrize(
-    ("stored", "expected"),
+    ("stored", "expected", "degraded"),
     [
-        ("-1", LOG_RETENTION_DAYS_DEFAULT),
-        (str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_DEFAULT),
-        ("14", 14),
-        ("abc", LOG_RETENTION_DAYS_DEFAULT),
+        # Negative -> default (a future cutoff would wholesale-delete logs; the
+        # 0 floor would retain nothing -- both destructive, never clamped to).
+        ("-1", LOG_RETENTION_DAYS_DEFAULT, True),
+        # Above the cap: CLAMPED (round 3) -- a pre-bounds huge retention meant
+        # "keep everything"; the 7-day default would delete logs on upgrade.
+        (str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_MAX, True),
+        ("14", 14, False),
+        ("abc", LOG_RETENTION_DAYS_DEFAULT, True),
     ],
 )
-async def test_get_log_retention_days_falls_back_on_negative_or_overflow(
+async def test_get_log_retention_days_degrades_negative_or_overflow(
     sessionmaker_: SessionMaker,
     caplog: pytest.LogCaptureFixture,
     stored: str,
     expected: int,
+    degraded: bool,
 ) -> None:
     async with sessionmaker_() as session:
         await SettingsStore(session).set("log_retention_days", stored)
@@ -1302,7 +1319,7 @@ async def test_get_log_retention_days_falls_back_on_negative_or_overflow(
             value = await get_log_retention_days(session)
 
     assert value == expected
-    if expected == LOG_RETENTION_DAYS_DEFAULT:
+    if degraded:
         assert "log_retention_days" in caplog.text
 
 
@@ -1387,42 +1404,52 @@ async def test_get_settings_preserves_valid_typed_values(
 
 
 @pytest.mark.parametrize(
-    ("field", "over_limit"),
+    ("field", "stored", "expected"),
     [
         # Finite, in-shape, JSON-serialisable -- so the unparsable/non-finite
         # checks alone all pass it -- yet each is out of the SettingsUpdate bound
-        # the write path enforces, so PUT would 422 it and the getter degrades it.
-        ("eviction_interval_minutes", str(EVICTION_INTERVAL_MAX_MINUTES + 1)),  # past 7-day cap
-        ("eviction_interval_minutes", "0"),  # gt=0 -- exclusive lower bound
-        ("disk_pressure_threshold_percent", "150"),  # past le=100
-        ("disk_pressure_target_percent", "-1"),  # below ge=0
-        ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1)),  # past the ~10-year cap
-        ("log_retention_days", str(LOG_RETENTION_DAYS_MAX + 1)),
+        # the write path enforces. GET must present the EFFECTIVE value the
+        # runtime getter resolves it to (round 3): a CLAMPED upper-bound value
+        # is displayed (nulling it would make the page claim the default while
+        # the loop runs the clamped MAX), a value degraded to the DEFAULT is
+        # null (the page then displays that same default). Either way the
+        # displayed value is one PUT accepts, so the form always re-saves.
+        (
+            "eviction_interval_minutes",
+            str(EVICTION_INTERVAL_MAX_MINUTES + 1),
+            EVICTION_INTERVAL_MAX_MINUTES,
+        ),
+        ("eviction_interval_minutes", "0", None),  # gt=0 -- exclusive bound, no floor to clamp to
+        ("disk_pressure_threshold_percent", "150", 100.0),  # clamp: stored >100 meant "never trip"
+        ("disk_pressure_target_percent", "-1", None),  # default 80 (<= default threshold 90)
+        ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX),
+        ("log_retention_days", str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_MAX),
     ],
 )
-async def test_get_settings_nulls_finite_out_of_range_typed_values(
+async def test_get_settings_presents_finite_out_of_range_typed_values_as_effective(
     client: httpx.AsyncClient,
     seed: SeedFn,
     sessionmaker_: SessionMaker,
     field: str,
-    over_limit: str,
+    stored: str,
+    expected: float | None,
 ) -> None:
-    """A finite but out-of-bounds stored value coerces and serialises fine, so
-    the non-finite check alone would let GET echo a number PUT rejects on the
-    next save. It must be degraded to null (unset), matching the typed getter's
-    runtime fallback -- otherwise the Settings page displays (and re-submits) a
-    value the API refuses the instant the operator saves the unchanged form."""
+    """GET presents the same effective value the runtime getter resolves an
+    out-of-range stored value to: the clamped bound for upper-bound violations
+    (upgrade-safe -- see the ``web.deps`` resolver policy), null (-> the default
+    the page renders) when the fallback IS the default. Never the raw
+    out-of-range number PUT would 422 on the next save."""
     await seed(initialized=True, app_api_key=_API_KEY)
     async with sessionmaker_() as session:
         store = SettingsStore(session)
-        await store.set(field, over_limit)
+        await store.set(field, stored)
         await store.set("plex_url", "http://plex.example.com:32400")
         await session.commit()
 
     got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
     assert got.status_code == 200
     body = got.json()
-    assert body[field] is None
+    assert body[field] == expected
     # An unrelated, in-range plaintext field is untouched by the sanitizer.
     assert body["plex_url"] == "http://plex.example.com:32400"
 
@@ -1458,63 +1485,242 @@ async def test_get_settings_preserves_boundary_typed_values(
 
 
 # --------------------------------------------------------------------------- #
-# Getter <-> GET sanitizer agreement on a corrupt stored value (round-2 P2s).
+# Getter <-> GET sanitizer agreement on a corrupt stored value (rounds 2-3).
 # For EVERY typed setting the runtime getter (what the eviction/auto-grab loops
 # read), the GET /settings sanitizer (what the page shows), and the PUT validator
 # must agree on what an out-of-range / unrecognized stored value means -- the page
 # must never claim a state the running service isn't in (honesty over silence).
+# Round 3 adds the DIRECTIONAL policy: upper-bound violations CLAMP (and GET
+# shows the clamped value); lower-bound violations and garbage DEFAULT (and GET
+# shows null, which the page renders as that same default).
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("stored", ["150", "-1"])
 @pytest.mark.parametrize(
-    ("field", "getter", "default"),
+    ("field", "getter", "stored", "expected_value", "expected_get"),
     [
+        # >100 CLAMPS to 100 (a pre-bounds 150 meant "never trip"; the default
+        # 90 would START evicting at 90% on upgrade) -- and GET shows 100.0,
+        # never null (null would render as the default the sweep is NOT using).
         (
             "disk_pressure_threshold_percent",
             get_disk_pressure_threshold_percent,
-            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+            "150",
+            100.0,
+            100.0,
         ),
+        # <0 defaults (the 0 floor = permanently "under pressure") -- GET null.
+        (
+            "disk_pressure_threshold_percent",
+            get_disk_pressure_threshold_percent,
+            "-1",
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+            None,
+        ),
+        # Target >100 clamps to 100, then the PAIR rule pulls it down to the
+        # (defaulted, unset-threshold) 90 -- displayed as 90, the exact value
+        # select_evictions runs with.
         (
             "disk_pressure_target_percent",
             get_disk_pressure_target_percent,
+            "150",
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+        ),
+        # Target <0 defaults to 80, which sits below the default threshold 90 --
+        # the effective value IS the default, so GET's null is truthful.
+        (
+            "disk_pressure_target_percent",
+            get_disk_pressure_target_percent,
+            "-1",
             DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+            None,
         ),
     ],
 )
-async def test_corrupt_disk_pressure_percent_getter_and_get_agree_on_default(
+async def test_corrupt_disk_pressure_percent_getter_and_get_agree(
     client: httpx.AsyncClient,
     seed: SeedFn,
     sessionmaker_: SessionMaker,
     caplog: pytest.LogCaptureFixture,
     field: str,
     getter: Callable[[AsyncSession], Awaitable[float]],
-    default: float,
     stored: str,
+    expected_value: float,
+    expected_get: float | None,
 ) -> None:
-    """Finding 1: an out-of-``[0, 100]`` stored disk-pressure percent (``150`` past
-    ``le=100``, ``-1`` below ``ge=0``) had NO runtime range guard, so the eviction
-    sweep read the corrupt value while ``GET /settings`` already nulled it (→ the
-    page showed the default). The getter must now degrade to the SAME default the
-    GET sanitizer implies -- asserted together here so the two can never drift: the
-    getter returns the default (with a WARNING naming the key) AND GET nulls the
-    field."""
+    """Round-2 finding 1 + round-3 finding 1: an out-of-``[0, 100]`` stored
+    disk-pressure percent degrades DIRECTIONALLY (clamp high / default low), and
+    the runtime getter and ``GET /settings`` are asserted together on the same
+    stored value so they can never drift: the getter returns the effective value
+    (with a WARNING naming the key) AND GET presents exactly that state (the
+    clamped number, or null when the effective value IS the default)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     async with sessionmaker_() as session:
         await SettingsStore(session).set(field, stored)
         await session.commit()
 
-    # Runtime getter (what _eviction_tick reads): the default, plus a WARNING.
+    # Runtime getter (what _eviction_tick reads): the effective value + WARNING.
     async with sessionmaker_() as session:
         with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
             value = await getter(session)
-    assert value == default
+    assert value == expected_value
     assert field in caplog.text
 
-    # GET /settings (what the page shows): the same corrupt value is nulled, so the
-    # UI falls back to the EXACT default the getter just returned -- agreement, not
-    # a page that claims a percentage the sweep isn't actually using.
+    # GET /settings (what the page shows) presents the SAME state the getter
+    # resolved -- agreement, never a page claiming a percentage the sweep isn't
+    # actually using.
     got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
     assert got.status_code == 200
-    assert got.json()[field] is None
+    assert got.json()[field] == expected_get
+
+
+async def test_over_cap_grace_days_clamps_instead_of_defaulting(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-3 P1: a stored ``eviction_grace_days`` past the cap (``3651`` -- a
+    legitimate pre-bounds way to effectively DISABLE age-based eviction) must
+    CLAMP to ``EVICTION_GRACE_DAYS_MAX``, not fall back to the 30-day default:
+    the default would suddenly make every watched title older than 30 days
+    eviction-eligible on upgrade (data-destructive). GET presents the clamped
+    value -- nulling it would make the page claim a 30-day grace while
+    ``_eviction_tick`` runs the 3650-day MAX."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    over_cap = str(EVICTION_GRACE_DAYS_MAX + 1)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_grace_days", over_cap)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_eviction_grace_days(session)
+    assert value == EVICTION_GRACE_DAYS_MAX  # the safer LONGER grace, not the default
+    assert value != EVICTION_GRACE_DAYS_DEFAULT
+    assert "eviction_grace_days" in caplog.text
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
+
+
+async def test_corrupt_target_with_valid_threshold_degrades_to_workable_pair(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-3 finding 2: a valid stored ``threshold=50`` with a corrupt
+    ``target=-1`` must NOT resolve per-side to the inverted pair ``(50, 80)`` --
+    ``select_evictions`` starts ``projected = used_pct`` and stops the moment
+    ``projected <= target``, so any used%% in the 50-80 band would trip the
+    sweep yet select NOTHING (a silent dead band the form cannot even re-save).
+    The pair rule clamps the substituted target down to the threshold:
+    ``(50, 50)`` -- the minimal eviction consistent with the operator's own
+    threshold -- and getter/GET agree on that exact pair."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("disk_pressure_threshold_percent", "50")
+        await store.set("disk_pressure_target_percent", "-1")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            threshold = await get_disk_pressure_threshold_percent(session)
+            target = await get_disk_pressure_target_percent(session)
+    assert threshold == 50.0  # the valid stored side is preserved
+    assert target == 50.0  # pair-clamped, never the inverted default 80
+    assert "disk_pressure_target_percent" in caplog.text
+
+    # The resolved pair is genuinely WORKABLE: at 60% used (inside what would
+    # have been the dead band), select_evictions actually selects the eligible
+    # candidate instead of stopping instantly on projected <= target.
+    candidate = EvictionCandidate(
+        request_id=1,
+        media_type="movie",
+        title="Stale Movie",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=datetime.now(UTC) - timedelta(days=365),
+        keep_forever=False,
+        in_flight=False,
+        library_path="/library/movies/stale.mkv",
+        size_percent=15.0,
+    )
+    selected = select_evictions(
+        [candidate],
+        used_pct=60.0,
+        threshold_pct=threshold,
+        target_pct=target,
+        grace_cutoff=datetime.now(UTC) - timedelta(days=30),
+    )
+    assert selected == [candidate]
+
+    # GET presents the SAME effective pair the sweep runs with -- and (50, 50)
+    # is a pair the form can re-save (target <= threshold passes PUT).
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["disk_pressure_threshold_percent"] == 50.0
+    assert body["disk_pressure_target_percent"] == 50.0
+
+
+@pytest.mark.parametrize("stored", [" false ", "False", "FALSE", "false\n"])
+@pytest.mark.parametrize(
+    ("field", "getter"),
+    [
+        ("eviction_enabled", get_eviction_enabled),
+        ("auto_grab_enabled", get_auto_grab_enabled),
+    ],
+)
+async def test_padded_or_cased_false_bool_still_disables(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    getter: Callable[[AsyncSession], Awaitable[bool]],
+    stored: str,
+) -> None:
+    """Round-3 finding 3: the pre-#142 parser compared ``raw.strip().lower()``,
+    so a persisted whitespace-padded/case-variant ``false`` meant DISABLED. The
+    ``TypeAdapter`` path must preserve that contract (strip + case-insensitive
+    tokens) -- otherwise ``" false "`` becomes "unrecognized" and the ``True``
+    default silently re-enables eviction/auto-grab on upgrade. GET agrees:
+    the page shows ``false``, never null (which would render the enabled
+    default)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await getter(session) is False  # still disabled, not defaulted to True
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()[field] is False
+
+
+async def test_padded_true_bool_still_enables_proactive(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The strip/case contract cuts both ways: a padded ``" TRUE "`` stored for
+    a default-FALSE setting (proactive eviction) keeps meaning enabled -- and
+    GET shows ``true`` rather than null (which would render the disabled
+    default)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_proactive_enabled", " TRUE ")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_proactive_enabled(session) is True
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["eviction_proactive_enabled"] is True
 
 
 @pytest.mark.parametrize(

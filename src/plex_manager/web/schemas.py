@@ -449,12 +449,17 @@ class SettingsResponse(BaseModel):
     anime_movie_root: str | None = None
     anime_tv_root: str | None = None
     # Operability beta (ADR-0012) — the eviction/log-retention knobs from
-    # ``web.deps.KNOWN_SETTING_KEYS``. ``None`` means "unset" (the typed getters
-    # in ``web.deps`` — e.g. ``get_eviction_grace_days`` — fall back to their own
-    # safe default in that case; this response mirrors what is actually STORED,
-    # not the effective fallback, matching ``movies_root``/``tv_root`` above).
+    # ``web.deps.KNOWN_SETTING_KEYS``. ``None`` means "unset OR degraded to the
+    # default" (the typed getters in ``web.deps`` — e.g.
+    # ``get_eviction_grace_days`` — resolve to their safe default in that
+    # case). A VALID stored value is mirrored verbatim; a corrupt/out-of-range
+    # one is presented as the EFFECTIVE value the runtime resolves it to (a
+    # clamped bound, the disk-pressure pair rule) or ``None`` when that
+    # effective value IS the default — see ``web.routers.settings.
+    # _sanitize_typed_settings``, which shares the ``web.deps`` resolvers so
+    # this response can never claim a state the running loops aren't in.
     # Stored as plain-text ``settings.value`` strings; pydantic coerces the
-    # stored string into the typed field below on the way out.
+    # (sanitized) string into the typed field below on the way out.
     disk_pressure_threshold_percent: float | None = None
     disk_pressure_target_percent: float | None = None
     eviction_grace_days: int | None = None
