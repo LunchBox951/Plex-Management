@@ -1552,10 +1552,32 @@
             ],
             "title": "Media Request Id"
           },
+          "poster_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster Url"
+          },
           "progress": {
             "default": 0.0,
             "title": "Progress",
             "type": "number"
+          },
+          "release_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Title"
           },
           "season": {
             "anyOf": [
@@ -1576,6 +1598,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
           },
           "tmdb_id": {
             "anyOf": [

@@ -442,6 +442,35 @@ describe('SetupWizard — service validation flow', () => {
       await Promise.all([prowlarrPending.promise, qbPending.promise])
     })
   })
+
+  it('renders qBittorrent\'s download_path_note as a non-blocking caution (issues #133/#157)', async () => {
+    h.validate.mockResolvedValue({
+      ok: true,
+      message: 'qbittorrent ok',
+      download_path_note: "the client's default save path isn't visible inside this container",
+    } satisfies ServiceValidateResponse)
+    await reachServices()
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    fireEvent.click(testButtons[1]!) // qbittorrent card
+
+    expect(await screen.findByText('qbittorrent ok')).toBeInTheDocument()
+    expect(
+      await screen.findByText(/default save path isn't visible inside this container/),
+    ).toBeInTheDocument()
+    // Non-blocking: the card still counts as verified.
+    expect(screen.getByText('1/3 verified')).toBeInTheDocument()
+  })
+
+  it('renders no note line for a service whose validation carries none', async () => {
+    h.validate.mockResolvedValue({ ok: true, message: 'prowlarr ok' } satisfies ServiceValidateResponse)
+    await reachServices()
+
+    fireEvent.click(screen.getAllByRole('button', { name: /test connection/i })[0]!)
+
+    expect(await screen.findByText('prowlarr ok')).toBeInTheDocument()
+    expect(screen.queryByText(/⚠/)).not.toBeInTheDocument()
+  })
 })
 
 describe('SetupWizard — setup token (pre-init hardening)', () => {

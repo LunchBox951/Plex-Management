@@ -43,6 +43,7 @@ from plex_manager.ports.repositories import (
     LogEventPage,
     LogEventRecord,
     LogEventRepository,
+    QueueRecord,
     RequestRecord,
     RequestRepository,
 )
@@ -72,7 +73,24 @@ def test_repository_records_construct() -> None:
     assert request.library_path is None
     assert request.keep_forever is False
     assert DownloadRecord(id=1, torrent_hash="h", status="downloading").progress == 0.0
+    assert DownloadRecord(id=1, torrent_hash="h", status="downloading").release_title is None
     assert BlocklistRecord(id=1, source_title="t", reason="failed").torrent_hash is None
+
+
+def test_queue_record_extends_download_record_with_title_and_poster() -> None:
+    """``QueueRecord`` (issue #134) is a ``DownloadRecord`` plus the two
+    ``MediaRequest``-only fields the queue view needs; both default honestly to
+    ``None`` for an orphaned/unenriched row."""
+    record = QueueRecord(id=1, torrent_hash="h", status="downloading")
+    assert isinstance(record, DownloadRecord)
+    assert record.title is None
+    assert record.poster_url is None
+
+    enriched = QueueRecord(
+        id=1, torrent_hash="h", status="downloading", title="Some Movie", poster_url="p.jpg"
+    )
+    assert enriched.title == "Some Movie"
+    assert enriched.poster_url == "p.jpg"
 
 
 def test_log_event_dtos_construct() -> None:

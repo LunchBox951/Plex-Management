@@ -41,6 +41,11 @@ function SubsystemCard({ subsystem }: { subsystem: SubsystemHealthItem }) {
         <Dot tone={SUBSYSTEM_TONE[subsystem.status]} label={SUBSYSTEM_LABEL[subsystem.status]} />
       </div>
       {subsystem.detail ? <p className="mt-2 text-xs text-muted">{subsystem.detail}</p> : null}
+      {/* Non-blocking, informational — distinct from `detail` (which only ever
+          carries FAILURE diagnostics). E.g. qBittorrent's default save path not
+          being visible inside this container (issues #133/#157); never flips
+          `status`, so it renders even on an otherwise-healthy subsystem. */}
+      {subsystem.note ? <p className="mt-2 text-xs text-searching">⚠ {subsystem.note}</p> : null}
       <p className="mt-2 font-mono text-[10px] text-faint">
         checked {formatTimestamp(subsystem.checked_at)}
       </p>

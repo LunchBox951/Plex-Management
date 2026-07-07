@@ -30,6 +30,7 @@ __all__ = [
     "LogEventPage",
     "LogEventRecord",
     "LogEventRepository",
+    "QueueRecord",
     "RequestRecord",
     "RequestRepository",
     "SeasonRequestRecord",
@@ -96,6 +97,29 @@ class DownloadRecord(BaseModel):
     failed_reason: str | None = None
     first_seen_at: datetime | None = None
     download_path: str | None = None
+    # The release ("download") title the grab decision picked -- the same value
+    # already written to ``DownloadHistory.source_title`` at grab time and used
+    # for blocklisting (``blocklist_service.source_title_for``). Denormalized
+    # onto the row itself (issue #134) so the queue can show it without a join
+    # into the append-only history log. ``None`` for a pre-migration row with no
+    # backfillable history.
+    release_title: str | None = None
+
+
+class QueueRecord(DownloadRecord):
+    """``DownloadRecord`` enriched with the two ``MediaRequest``-only fields the
+    live queue view needs to render a human-legible row (issue #134): the media
+    ``title`` and its ``poster_url``. Sourced by
+    ``SqlDownloadRepository.list_active_for_queue``'s LEFT OUTER JOIN against
+    ``MediaRequest`` -- OUTER because ``media_request_id`` is nullable (SET NULL
+    when the owning request is deleted), so an orphaned download still produces a
+    row here, just with both fields ``None`` (honesty over silence: the row
+    always renders). Deliberately NOT used by ``list_active`` / the reconciler --
+    that domain-facing read stays on the plain ``DownloadRecord`` contract.
+    """
+
+    title: str | None = None
+    poster_url: str | None = None
 
 
 class SeasonRequestRecord(BaseModel):
@@ -432,12 +456,15 @@ class DownloadRepository(Protocol):
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         """Insert a new download and return the persisted record.
 
         ``episodes`` (TV only) persists to ``Download.episodes_json``: ``None``
         means import every valid video file found for the season; an explicit list
-        scopes the import to those episode numbers only.
+        scopes the import to those episode numbers only. ``release_title`` is the
+        grab decision's release name (issue #134) -- the same value the caller
+        already writes to ``DownloadHistory.source_title``.
         """
         raise NotImplementedError
 

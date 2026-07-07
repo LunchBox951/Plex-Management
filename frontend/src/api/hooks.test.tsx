@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useEvict,
   useMarkFailed,
+  useRelocateDownload,
   useRequestsInvalidated,
   useRevokeAppKey,
   useRotateAppKey,
@@ -162,6 +163,36 @@ describe('useMarkFailed', () => {
 
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests }))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue })
+  })
+})
+
+describe('useRelocateDownload', () => {
+  it('invalidates the queue but NOT requests (nothing about the owning request changes yet)', async () => {
+    const item: QueueItem = {
+      id: 9,
+      media_request_id: 4,
+      progress: 0,
+      seed_ratio: 0,
+      status: 'import_blocked',
+      failed_reason: 'download path not visible inside the container /downloads/movie',
+      tmdb_id: 603,
+      torrent_hash: 'deadbeef',
+    }
+    ;(client.POST as unknown as Mock).mockResolvedValue({ data: item, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useRelocateDownload(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync(9)
+
+    expect(client.POST).toHaveBeenCalledWith('/api/v1/queue/{download_id}/relocate', {
+      params: { path: { download_id: 9 } },
+    })
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue }))
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.requests })
   })
 })
 

@@ -526,6 +526,29 @@ export function useImportDownload() {
   })
 }
 
+/**
+ * Operator correction: relocate an import-blocked, path-invisible download into
+ * the app's derived downloads root (issues #133/#157). This only REQUESTS the
+ * move from qBittorrent and returns — the operator retries the import
+ * separately (`useImportDownload`) once qBittorrent settles it, so this hook
+ * only invalidates the queue (never `requests`: nothing about the owning
+ * request changes yet).
+ */
+export function useRelocateDownload() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (downloadId: number): Promise<QueueItem> =>
+      unwrap(
+        await client.POST('/api/v1/queue/{download_id}/relocate', {
+          params: { path: { download_id: downloadId } },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+    },
+  })
+}
+
 /* -------------------------------------------------------------- blocklist -- */
 
 export function useBlocklist(tmdbId?: number) {

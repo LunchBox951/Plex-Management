@@ -174,6 +174,120 @@ async def test_list_active_excludes_terminal_states(session: AsyncSession) -> No
     assert {d.torrent_hash for d in active} == {"h_dl", "h_search"}
 
 
+async def test_create_persists_release_title(session: AsyncSession) -> None:
+    """``release_title`` (issue #134) round-trips through ``create``/``get_by_hash``
+    exactly like every other grab-time field."""
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(
+        torrent_hash="rt1",
+        status="downloading",
+        release_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+    )
+    assert created.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+    fetched = await repo.get_by_hash("rt1")
+    assert fetched is not None
+    assert fetched.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+async def test_create_release_title_defaults_to_none(session: AsyncSession) -> None:
+    """A caller that never passes ``release_title`` gets an honest ``None``, not a
+    fabricated placeholder -- the queue's fallback chain (title -> release_title ->
+    short hash) depends on this being genuinely absent."""
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(torrent_hash="rt_none", status="downloading")
+    assert created.release_title is None
+
+
+async def test_list_active_for_queue_joins_media_request_title_and_poster(
+    session: AsyncSession,
+) -> None:
+    """The queue-specific read (issue #134) enriches each row with the OWNING
+    ``MediaRequest``'s ``title``/``poster_url``, alongside the row's own
+    ``release_title`` -- exactly the three fields the human-legible queue row
+    needs."""
+    request = MediaRequest(
+        tmdb_id=900,
+        media_type=MediaType.movie,
+        title="Some Movie",
+        status=RequestStatus.downloading,
+        poster_url="https://image.tmdb.org/poster.jpg",
+    )
+    session.add(request)
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    await repo.create(
+        torrent_hash="q1",
+        status="downloading",
+        media_request_id=request.id,
+        release_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+    )
+
+    [row] = await repo.list_active_for_queue()
+    assert row.title == "Some Movie"
+    assert row.poster_url == "https://image.tmdb.org/poster.jpg"
+    assert row.release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+async def test_list_active_for_queue_orphan_download_renders_with_none_title_and_poster(
+    session: AsyncSession,
+) -> None:
+    """A download whose owning request was deleted (``media_request_id`` SET NULL)
+    must still render in the queue -- honesty over silence, never dropped -- with
+    ``title``/``poster_url`` honestly ``None`` rather than the read failing or the
+    row vanishing. The LEFT OUTER JOIN (not INNER) is what makes this possible."""
+    repo = SqlDownloadRepository(session)
+    await repo.create(
+        torrent_hash="orphan",
+        status="downloading",
+        media_request_id=None,
+        release_title="Orphaned.Release.2020-GROUP",
+    )
+
+    [row] = await repo.list_active_for_queue()
+    assert row.title is None
+    assert row.poster_url is None
+    assert row.release_title == "Orphaned.Release.2020-GROUP"
+
+
+async def test_list_active_for_queue_excludes_terminal_states(session: AsyncSession) -> None:
+    """Mirrors :meth:`SqlDownloadRepository.list_active`'s terminal exclusion -- the
+    enriched queue read must not surface finished downloads either."""
+    repo = SqlDownloadRepository(session)
+    await repo.create(torrent_hash="q_dl", status="downloading")
+    await repo.create(torrent_hash="q_imp", status="imported")
+
+    active = await repo.list_active_for_queue()
+    assert {d.torrent_hash for d in active} == {"q_dl"}
+
+
+async def test_update_status_if_in_replace_grab_metadata_refreshes_release_title(
+    session: AsyncSession,
+) -> None:
+    """The terminal-row-reuse CAS (``replace_grab_metadata=True``) must overwrite a
+    stale ``release_title`` from a prior grab, exactly like it already does for
+    ``magnet_link``/``tmdb_id``/``season`` -- a resurrected row otherwise keeps
+    reporting the OLD release as what's currently downloading (issue #134)."""
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(
+        torrent_hash="reuse1", status="failed", release_title="Old.Release-GROUP"
+    )
+
+    claimed = await repo.update_status_if_in(
+        created.id,
+        "downloading",
+        frozenset({"failed"}),
+        replace_grab_metadata=True,
+        release_title="New.Release-GROUP",
+    )
+    assert claimed is True
+
+    fetched = await repo.get_by_hash("reuse1")
+    assert fetched is not None
+    assert fetched.release_title == "New.Release-GROUP"
+
+
 async def test_update_status_sets_optional_fields(session: AsyncSession) -> None:
     repo = SqlDownloadRepository(session)
     created = await repo.create(torrent_hash="upd", status="downloading")
