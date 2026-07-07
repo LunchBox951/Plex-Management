@@ -1447,7 +1447,7 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
             if season_presence_succeeded:
                 _logger.warning(
                     "season lookup failed for show; will retry next cycle",
-                    extra={"tmdb_id": tmdb_id},
+                    extra={"tmdb_id": safe_int(tmdb_id)},
                 )
             continue
         present_seasons = present_seasons_by_show[tmdb_id]

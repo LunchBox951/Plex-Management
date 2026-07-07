@@ -35,6 +35,7 @@ from typing import Final, Literal, cast
 import httpx
 
 from plex_manager.headersafe import header_value_error
+from plex_manager.logsafe import safe_int
 from plex_manager.ports.library import LibrarySection, WatchState
 from plex_manager.services import path_visibility
 
@@ -720,7 +721,7 @@ class PlexLibrary:
                     _logger.warning(
                         "season lookup failed for show tmdb_id=%s; omitting it from this "
                         "batch's result (%s)",
-                        tmdb_id,
+                        safe_int(tmdb_id),
                         exc,
                     )
                     failed = True
