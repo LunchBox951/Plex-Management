@@ -35,6 +35,9 @@ data/
 # Brainstorming visual companion (scratch)
 .superpowers/
 
+# Local linked worktrees for isolated Codex tasks.
+.worktrees/
+
 # Frontend (ADR-0009): the SPA source lives in frontend/; its build OUTPUT lands
 # in src/plex_manager/web/static and is a build artifact (produced by CI/Docker's
 # Node stage), so it is ignored here. hatchling force-includes it into the wheel
