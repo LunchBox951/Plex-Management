@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DiscoverResult } from '../api/types'
 import type { StatusPresentation } from '../lib/status'
 import { PosterCard } from './ui/PosterCard'
-import { StatusBadge } from './ui/StatusBadge'
+import { TileStatusGlyph } from './ui/TileStatusGlyph'
 import { QuickRequestButton } from './QuickRequestButton'
 
 interface RowProps {
@@ -117,7 +117,7 @@ export function Row({
                       posterUrl={item.poster_url ?? null}
                       seed={item.tmdb_id}
                       onClick={() => onSelect(item)}
-                      badge={state ? <StatusBadge status={state} /> : undefined}
+                      badge={state ? <TileStatusGlyph status={state} /> : undefined}
                       action={
                         state === null && (quickRequestable?.(item) ?? true) ? (
                           <QuickRequestButton item={item} />
