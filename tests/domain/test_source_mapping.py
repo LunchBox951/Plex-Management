@@ -9,9 +9,14 @@ from __future__ import annotations
 
 from plex_manager.domain.quality import (
     BLURAY480P,
+    BLURAY720P,
     BLURAY1080P,
+    CAM,
+    DVDR,
     DVDSCR,
+    HDTV1080P,
     REGIONAL,
+    REMUX1080P,
     REMUX2160P,
     SDTV,
     TELESYNC,
@@ -278,6 +283,274 @@ def test_map_modifier_does_not_fire_on_clean_titles() -> None:
         assert map_modifier({}, title) is Modifier.NONE, title
     # Remux is still recognised and is NOT overridden by the reject net.
     assert map_modifier({"other": "Remux"}, "Movie.2024.2160p.BluRay.REMUX.x265") is Modifier.REMUX
+
+
+# -- resolve_quality REMUX gating by source (#107) ------------------------------
+
+
+def test_resolve_quality_remux_gated_by_source() -> None:
+    # BluRay: remux tier at 2160p/1080p. A KNOWN resolution below 1080p has no
+    # remux tier, so the token is ignored and the source+resolution lookup wins
+    # (720p -> Bluray720p, 480p -> Bluray480p). A BluRay remux with NO parseable
+    # resolution takes Radarr's bluray-branch assumption of Remux1080p rather than
+    # falling through to the source-only Bluray-480p fallback (#107 regression).
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R720P, Modifier.REMUX) is BLURAY720P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.R480P, Modifier.REMUX) is BLURAY480P
+    assert resolve_quality(QualitySource.BLURAY, Resolution.UNKNOWN, Modifier.REMUX) is REMUX1080P
+    # Unknown source: Radarr's no-source-remux branch, cell for cell -- 2160p ->
+    # Remux2160p, 1080p -> Remux1080p, 720p -> Bluray720p, 480p -> Bluray480p.
+    # SD oddballs (576p et al.) and a missing resolution have no cell in that
+    # branch (Radarr resolves them to Unknown), so they fall through to the
+    # conservative UNKNOWN-source guard.
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R2160P, Modifier.REMUX) is REMUX2160P
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R1080P, Modifier.REMUX) is REMUX1080P
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R720P, Modifier.REMUX) is BLURAY720P
+    assert resolve_quality(QualitySource.UNKNOWN, Resolution.R480P, Modifier.REMUX) is BLURAY480P
+    assert (
+        resolve_quality(QualitySource.UNKNOWN, Resolution.R576P, Modifier.REMUX) is UNKNOWN_QUALITY
+    )
+    assert (
+        resolve_quality(QualitySource.UNKNOWN, Resolution.UNKNOWN, Modifier.REMUX)
+        is UNKNOWN_QUALITY
+    )
+    # DVD: conservative in-tier choice, regardless of resolution.
+    assert resolve_quality(QualitySource.DVD, Resolution.R480P, Modifier.REMUX) is DVDR
+    assert resolve_quality(QualitySource.DVD, Resolution.R1080P, Modifier.REMUX) is DVDR
+    # WEBDL/WEBRIP/TV: the modifier is ignored; source+resolution lookup wins.
+    assert resolve_quality(QualitySource.WEBDL, Resolution.R1080P, Modifier.REMUX) is WEBDL1080P
+    assert resolve_quality(QualitySource.WEBRIP, Resolution.R1080P, Modifier.REMUX) is WEBRIP1080P
+    assert resolve_quality(QualitySource.TV, Resolution.R1080P, Modifier.REMUX) is HDTV1080P
+
+
+# (raw_title, recorded guessit 4.1.0 field mapping, expected quality) for the
+# source-gated REMUX table above, fed through the full to_parsed_release ->
+# resolve_quality pipeline.
+_REMUX_TABLE: list[tuple[str, dict[str, object], Quality]] = [
+    (
+        "Movie.2024.1080p.WEB-DL.REMUX-GRP",
+        {"source": "Web", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        WEBDL1080P,
+    ),
+    (
+        "Movie.2024.1080p.WEBRip.REMUX-GRP",
+        {
+            "source": "Web",
+            "screen_size": "1080p",
+            "other": ["Rip", "Remux"],
+            "release_group": "GRP",
+        },
+        WEBRIP1080P,
+    ),
+    (
+        "Movie.2024.1080p.HDTV.REMUX-GRP",
+        {"source": "HDTV", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        HDTV1080P,
+    ),
+    (
+        "Movie.2024.1080p.DVD.REMUX-GRP",
+        {"source": "DVD", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        DVDR,
+    ),
+    (
+        "Movie.2024.1080p.REMUX-GRP",  # no source
+        {"screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        REMUX1080P,
+    ),
+    (
+        "Movie.2024.1080p.BluRay.REMUX-GRP",  # unchanged
+        {"source": "Blu-ray", "screen_size": "1080p", "other": "Remux", "release_group": "GRP"},
+        REMUX1080P,
+    ),
+    (
+        "Movie.2024.720p.BluRay.REMUX-GRP",  # remux ignored at known 720p
+        {"source": "Blu-ray", "screen_size": "720p", "other": "Remux", "release_group": "GRP"},
+        BLURAY720P,
+    ),
+    (
+        "Movie.BluRay.REMUX.x264-GRP",  # BluRay remux, NO parseable resolution
+        {"source": "Blu-ray", "other": "Remux", "release_group": "GRP"},
+        REMUX1080P,
+    ),
+    (
+        "Movie.2024.2160p.REMUX-GRP",  # no-source 2160p
+        {"screen_size": "2160p", "other": "Remux", "release_group": "GRP"},
+        REMUX2160P,
+    ),
+    (
+        # No-source 720p remux: Radarr's no-source-remux branch yields Bluray720p
+        # ("720p remux should fallback as 720p BluRay"), NOT Unknown -- falling to
+        # the UNKNOWN guard here rejected a previously-accepted release.
+        "Movie.2024.720p.REMUX-GRP",
+        {"screen_size": "720p", "other": "Remux", "release_group": "GRP"},
+        BLURAY720P,
+    ),
+    (
+        # No-source 480p remux: the same branch's SD cell -> Bluray480p.
+        "Movie.2024.480p.REMUX-GRP",
+        {"screen_size": "480p", "other": "Remux", "release_group": "GRP"},
+        BLURAY480P,
+    ),
+]
+
+
+def test_remux_classification_by_source_end_to_end() -> None:
+    profile = default_profile()
+    for raw_title, fields, expected in _REMUX_TABLE:
+        parsed = to_parsed_release(fields, raw_title)
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        assert quality is expected, f"{raw_title} -> {quality.name}, expected {expected.name}"
+        assert check_quality(quality, profile).accepted is True, raw_title
+
+
+# -- KNOWN LIMITATION (intent-pinning, #108 wontfix): reject-token group names --
+#
+# A release group literally named after a reject token (SCR, R5, R6, HQCAM, ...)
+# FALSE-REJECTS an otherwise clean release, because the reject nets run over the
+# UNMODIFIED raw title -- deliberately, matching Radarr's posture (its
+# QualityParser applies the source regexes to the full name with no group
+# exclusion). Stripping the group tag first was attempted and refined through
+# five review rounds (embedded titles -> path duplicates -> dot-attached ->
+# hyphen-attached -> segment-end/bracketed body markers); every refinement
+# produced a new laundering counterexample, because the strip only changes net
+# behavior in exactly the colliding case it cannot make safe. Failing toward
+# rejection is visible and retryable; laundering a CAM/screener into the library
+# is silent. See the module docstring of source_mapping.py and issue #108.
+#
+# These rows PIN that behavior: (raw_title, recorded guessit 4.1.0 fields,
+# expected reject quality). If a future change makes any of these accept, that
+# change is reversing a considered decision and must say so explicitly.
+_GROUP_COLLISION_TABLE: list[tuple[str, dict[str, object], Quality]] = [
+    (
+        "Movie.2024.1080p.WEB-DL.x264-SCR",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
+    ),
+    (
+        "Movie.2024.1080p.WEB-DL.x264-R5",
+        {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
+        REGIONAL,
+    ),
+    (
+        "Movie.2024.1080p.WEB-DL.x264-R6",
+        {"source": "Web", "screen_size": "1080p", "release_group": "R6"},
+        REGIONAL,
+    ),
+    (
+        "Movie.2024.1080p.WEB-DL.x264-HQCAM",
+        {"source": "Web", "screen_size": "1080p", "release_group": "HQCAM"},
+        CAM,
+    ),
+    # The group name also appearing inside a legitimate title word changes
+    # nothing: the suffix tag alone trips the net.
+    (
+        "Scream.2024.1080p.WEB-DL.x264-SCR",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
+    ),
+    (
+        "Barr5.2024.1080p.WEB-DL.x264-R5",
+        {"source": "Web", "screen_size": "1080p", "release_group": "R5"},
+        REGIONAL,
+    ),
+    # Import validation parses the full relative path; the folder tag trips the
+    # net just as the filename tag does.
+    (
+        "Movie.2024.1080p.WEB-DL.x264-SCR/Movie.2024.1080p.WEB-DL.x264-SCR.mkv",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
+    ),
+    # Bracketed (anime/p2p) group tags false-reject the same way.
+    (
+        "[SCR] Movie 2024 1080p WEB-DL x264",
+        {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+        DVDSCR,
+    ),
+]
+
+
+def test_reject_token_group_names_false_reject_by_design() -> None:
+    # NOT a bug guard -- an intent pin. Flipping any of these to accepted means
+    # re-introducing a release-group strip (or equivalent), which five review
+    # rounds showed cannot be done without laundering genuine reject markers.
+    profile = default_profile()
+    for raw_title, fields, expected in _GROUP_COLLISION_TABLE:
+        parsed = to_parsed_release(fields, raw_title)
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        assert quality is expected, f"{raw_title} -> {quality.name}, expected {expected.name}"
+        assert check_quality(quality, profile).accepted is False, raw_title
+
+
+def test_genuine_reject_markers_reject_despite_colliding_group_names() -> None:
+    # THE invariant the no-strip posture protects: a genuine reject marker in the
+    # title body must classify into its reject tier even when the release group
+    # shares its name. Every one of these was a laundering counterexample against
+    # some refinement of the (since-removed) release-group strip; with the nets
+    # reading the unmodified title they all reject trivially and must stay so.
+    profile = default_profile()
+    for raw_title, fields, reject_name in (
+        ("Movie.2024.HDCAM.x264-RARBG", {"source": "HD Camera", "release_group": "RARBG"}, "CAM"),
+        ("Movie.2024.HDCAM.x264-CAM", {"source": "HD Camera", "release_group": "CAM"}, "CAM"),
+        # guessit missed the screener flag (no ``other``), so classification
+        # leans entirely on the raw-title net seeing the ``DVDSCR`` body token.
+        ("Movie.2024.DVDSCR.x264-SCR", {"source": "DVD", "release_group": "SCR"}, "DVDSCR"),
+        # Duplicated relative path: the body token on both segments still rejects.
+        (
+            "Movie.2024.DVDSCR.x264-SCR/Movie.2024.DVDSCR.x264-SCR.mkv",
+            {"source": "DVD", "release_group": "SCR"},
+            "DVDSCR",
+        ),
+        # Dot-attached standalone body marker (round-3 counterexample): ``HC.SCR``
+        # is a hardcoded-screener marker guessit misses (no ``other`` emitted).
+        (
+            "Movie.2024.1080p.HC.SCR.WEB-DL.x264-SCR",
+            {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+            "DVDSCR",
+        ),
+        # Hyphen-attached body marker (round-4 counterexample).
+        (
+            "Movie.2024.1080p.HC-SCR.WEB-DL.x264-SCR",
+            {"source": "Web", "screen_size": "1080p", "release_group": "SCR"},
+            "DVDSCR",
+        ),
+        # Segment-ending body marker (round-5 counterexample): the folder ends in
+        # ``HD-CAM``, which a boundary-anchored strip mistook for a group tag.
+        (
+            "Movie.2024.HD-CAM/Movie.2024.1080p.WEB-DL.x264-CAM.mkv",
+            {"source": "Web", "screen_size": "1080p", "release_group": "CAM"},
+            "CAM",
+        ),
+        # Bracketed body marker (round-5 counterexample): ``[HQCAM]`` in the body
+        # is a reject marker, not an anime-style group tag.
+        (
+            "Movie.2024.[HQCAM].1080p.WEB-DL.x264-HQCAM",
+            {"source": "Web", "screen_size": "1080p", "release_group": "HQCAM"},
+            "CAM",
+        ),
+    ):
+        parsed = to_parsed_release(fields, raw_title)
+        quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+        assert quality.name == reject_name, f"{raw_title} -> {quality.name}"
+        assert check_quality(quality, profile).accepted is False, raw_title
+
+
+def test_release_group_field_never_feeds_the_nets() -> None:
+    # The ``release_group`` field is metadata only: classification never consults
+    # it (no stripping, no matching). Identical titles with different recorded
+    # groups classify identically, and the guessit-native ``other`` path is
+    # likewise independent of it.
+    title = "Movie.2024.1080p.WEB-DL.x264-GRP"
+    with_group = to_parsed_release(
+        {"source": "Web", "screen_size": "1080p", "release_group": "GRP"}, title
+    )
+    without_group = to_parsed_release({"source": "Web", "screen_size": "1080p"}, title)
+    assert with_group.source is without_group.source
+    assert with_group.modifier is without_group.modifier
+    assert (
+        map_modifier({"other": "Screener", "release_group": "GRP"}, "Movie.DVDSCR-GRP")
+        is Modifier.SCREENER
+    )
 
 
 # -- resolve_quality conservative source-only fallback (no over-promotion) ------
