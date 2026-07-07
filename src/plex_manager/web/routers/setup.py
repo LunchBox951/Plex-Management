@@ -49,7 +49,6 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import SystemSettings, User
 from plex_manager.services import path_visibility
-from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.deps import (
     PLEX_MACHINE_ID_SETTING,
     AuthContext,
@@ -115,9 +114,29 @@ _PLEX_VALIDATE_RESPONSES: dict[int | str, dict[str, Any]] = {
 _COMPLETE_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_AUTH_RESPONSES,
     409: {"model": ErrorDetail, "description": "Setup already initialized"},
+    # This status code has TWO distinct producers, so BOTH shapes are documented
+    # (mirroring settings.py's ``_PUT_SETTINGS_RESPONSES`` anyOf): FastAPI's own
+    # request-body validation (``HTTPValidationError`` -- a malformed body still
+    # 422s here) and this endpoint's ``AppError`` (``ErrorEnvelope``: an
+    # unreachable library root ``library_root_unreachable`` or a rejected Plex
+    # token ``plex_token_invalid``). Declaring only ``ErrorEnvelope`` would
+    # silently OVERWRITE FastAPI's auto-generated validation-error entry, so the
+    # generated TS client would mis-model an ordinary body-validation failure.
     422: {
-        "model": ErrorEnvelope,
-        "description": "A submitted library folder isn't visible to this server",
+        "description": (
+            "Request body validation failed, or a submitted library folder / the "
+            "Plex token was rejected"
+        ),
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {"$ref": "#/components/schemas/ErrorEnvelope"},
+                    ]
+                }
+            }
+        },
     },
     502: {"model": ErrorEnvelope, "description": "The Plex server was unreachable"},
 }
@@ -147,16 +166,17 @@ async def _resolve_submitted_roots(body: SetupCompleteRequest) -> dict[str, str]
     or its container-visible remap (issue #132's Docker host/container split) --
     never the raw host path, which would otherwise pass a probe-free write and
     fail every later disk/import/purge probe against a tree this container can't
-    see.
+    see. Resolution goes through
+    :func:`~plex_manager.services.path_visibility.remap_library_root`, so a library
+    root only ever resolves under the LIBRARY mounts (never ``/downloads``) and a
+    whole-media-root library maps to the mount root itself.
     """
     resolved: dict[str, str] = {}
     for field in _ROOT_FIELDS:
         value = getattr(body, field)
         if not value:
             continue
-        visible = await asyncio.to_thread(
-            remap_to_visible, value, path_visibility.KNOWN_CONTAINER_MOUNTS
-        )
+        visible = await asyncio.to_thread(path_visibility.remap_library_root, value)
         if visible is None:
             raise AppError(
                 status_code=422,
@@ -286,7 +306,7 @@ async def validate_plex_endpoint(
         body.url,
         body.token or admin_token,
         identity_client=plex_tv,
-        suggest_mounts=path_visibility.KNOWN_CONTAINER_MOUNTS,
+        suggest_mounts=path_visibility.KNOWN_LIBRARY_MOUNTS,
     )
     if not result.ok or result.machine_identifier is None:
         return result

@@ -147,12 +147,22 @@ def test_library_options_suggestion_probe_original_mirrors_probe_writable(
     """Pre-init (probe_writable=False) must never stat the RAW, caller-supplied
     path even to compute a suggestion -- the same pre-auth-oracle guard
     ``probe_writable`` already enforces for writability. Ties the wiring
-    (``probe_original=probe_writable``), not ``remap_to_visible``'s own
-    behavior (covered by ``tests/services/test_path_visibility.py``)."""
+    (``probe_original=probe_writable``, and ``allow_mount_root`` always on for a
+    library location), not ``remap_to_visible``'s own behavior (covered by
+    ``tests/services/test_path_visibility.py``)."""
     seen: list[bool] = []
+    mount_root_flags: list[bool] = []
 
-    def spy(path: str, mounts: object, *, predicate: object = None, probe_original: bool = True):  # type: ignore[no-untyped-def]
+    def spy(  # type: ignore[no-untyped-def]
+        path: str,
+        mounts: object,
+        *,
+        predicate: object = None,
+        probe_original: bool = True,
+        allow_mount_root: bool = False,
+    ):
         seen.append(probe_original)
+        mount_root_flags.append(allow_mount_root)
         return None
 
     monkeypatch.setattr(setup_validation, "remap_to_visible", spy)
@@ -162,6 +172,7 @@ def test_library_options_suggestion_probe_original_mirrors_probe_writable(
     library_options([section], probe_writable=True, suggest_mounts=("/media",))
 
     assert seen == [False, True]
+    assert mount_root_flags == [True, True]  # a whole-media-root library can map to the mount root
 
 
 # --------------------------------------------------------------------------- #
@@ -818,7 +829,8 @@ async def test_validate_plex_attaches_a_container_suggestion_for_a_host_location
     caller-supplied path -- pre-init stays a non-oracle (writable stays UNKNOWN)."""
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
-    monkeypatch.setattr(path_visibility, "KNOWN_CONTAINER_MOUNTS", (str(mount),))
+    # Plex library locations are remapped under the LIBRARY mounts only.
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
     probed: list[str] = []
 
     def spy(path: str) -> bool:

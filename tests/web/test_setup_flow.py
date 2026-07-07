@@ -657,7 +657,8 @@ async def test_complete_remaps_a_host_root_to_the_container_path(
 ) -> None:
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
-    monkeypatch.setattr(path_visibility, "KNOWN_CONTAINER_MOUNTS", (str(mount),))
+    # Library roots are remapped under the LIBRARY mounts only (never /downloads).
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
     await _seed_admin_session(sessionmaker_)
     _authenticate(client)
     await _use_transport(

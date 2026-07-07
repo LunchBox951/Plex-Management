@@ -33,7 +33,6 @@ from plex_manager.models import AuthSession, User
 from plex_manager.ports.library import LibraryPort
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
-from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     AUTO_GRAB_ENABLED_DEFAULT,
@@ -318,7 +317,10 @@ async def _resolve_root_writes(body: SettingsUpdate) -> dict[str, str]:
     untouched. Raises the same ``library_root_unreachable`` 422 as
     ``routers.setup._resolve_submitted_roots`` when a non-empty root doesn't
     resolve here (issue #132) -- checked BEFORE the write loop, so nothing is
-    committed on a rejected root.
+    committed on a rejected root. Resolution goes through the shared
+    :func:`~plex_manager.services.path_visibility.remap_library_root`, so a library
+    root only ever resolves under the LIBRARY mounts (never ``/downloads``) and a
+    whole-media-root library maps to the mount root itself.
     """
     resolved: dict[str, str] = {}
     for field in _ROOT_FIELDS:
@@ -327,9 +329,7 @@ async def _resolve_root_writes(body: SettingsUpdate) -> dict[str, str]:
         value = getattr(body, field)
         if value is None or value == "":
             continue
-        visible = await asyncio.to_thread(
-            remap_to_visible, value, path_visibility.KNOWN_CONTAINER_MOUNTS
-        )
+        visible = await asyncio.to_thread(path_visibility.remap_library_root, value)
         if visible is None:
             raise AppError(
                 status_code=422,
@@ -393,7 +393,7 @@ async def plex_libraries_endpoint(
     return library_options(
         await library.list_sections(use_cache=False),
         probe_writable=True,
-        suggest_mounts=path_visibility.KNOWN_CONTAINER_MOUNTS,
+        suggest_mounts=path_visibility.KNOWN_LIBRARY_MOUNTS,
     )
 
 

@@ -123,19 +123,27 @@ def library_options(
     call ``_is_writable`` / ``os.access`` on an attacker-chosen path.
 
     ``suggest_mounts`` (default ``()``, no remap attempted) is the set of KNOWN,
-    app-owned mounts (:data:`~plex_manager.services.path_visibility.
-    KNOWN_CONTAINER_MOUNTS`) to suffix-match a Plex-reported HOST path against
-    (issue #132). ``probe_original`` mirrors ``probe_writable`` -- the SAME
+    app-owned LIBRARY mounts (:data:`~plex_manager.services.path_visibility.
+    KNOWN_LIBRARY_MOUNTS`) to suffix-match a Plex-reported HOST path against (issue
+    #132) -- library locations only ever remap under ``/media``, never
+    ``/downloads``. ``probe_original`` mirrors ``probe_writable`` -- the SAME
     pre-auth-oracle guard: pre-init (``probe_writable=False``) never stats the
     raw, caller-supplied path, only candidate suffixes under the app's OWN
     mounts; post-init (``probe_writable=True``, the operator's own creds) may
-    stat the raw path first.
+    stat the raw path first. ``allow_mount_root`` is on: a whole-media-root Plex
+    library (the bind SOURCE root, e.g. ``/srv/media`` -> ``/media``) maps to the
+    mount root itself, which the suffix-only match could never reach.
     """
     options: list[PlexLibraryOption] = []
     for section in sections:
         for path in section.locations:
             suggested = (
-                remap_to_visible(path, suggest_mounts, probe_original=probe_writable)
+                remap_to_visible(
+                    path,
+                    suggest_mounts,
+                    probe_original=probe_writable,
+                    allow_mount_root=True,
+                )
                 if suggest_mounts
                 else None
             )

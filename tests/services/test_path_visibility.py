@@ -8,7 +8,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from plex_manager.services.path_visibility import remap_to_visible
+import pytest
+
+from plex_manager.services import path_visibility
+from plex_manager.services.path_visibility import remap_library_root, remap_to_visible
 
 
 def test_returns_original_when_already_visible(tmp_path: Path) -> None:
@@ -85,3 +88,58 @@ def test_ties_break_by_mount_order(tmp_path: Path) -> None:
     (first / "Movies").mkdir(parents=True)
     (second / "Movies").mkdir(parents=True)
     assert remap_to_visible("/host/Movies", [str(first), str(second)]) == str(first / "Movies")
+
+
+# --------------------------------------------------------------------------- #
+# allow_mount_root — a HOST bind-SOURCE root maps to the container mount ROOT
+# --------------------------------------------------------------------------- #
+def test_allow_mount_root_maps_the_bind_source_root(tmp_path: Path) -> None:
+    # docker-compose ``PLEX_MANAGER_MEDIA_ROOT=/srv/media`` -> ``/media``, with Plex
+    # reporting the WHOLE media root as one library at ``/srv/media``: no trailing
+    # component below the mount, so only the mount root itself can be the answer.
+    mount = tmp_path / "media"
+    mount.mkdir()
+    host_root = "/definitely-not-a-real-host-path/media"  # final name matches the mount
+    assert remap_to_visible(host_root, [str(mount)], allow_mount_root=True) == str(mount)
+
+
+def test_mount_root_is_off_by_default(tmp_path: Path) -> None:
+    # Without allow_mount_root the zero-suffix case is never tried -- the bind-root
+    # path is honestly unresolved (the pre-fix behaviour, kept for content remaps).
+    mount = tmp_path / "media"
+    mount.mkdir()
+    assert remap_to_visible("/x/media", [str(mount)]) is None
+
+
+def test_allow_mount_root_rejects_a_differently_named_root(tmp_path: Path) -> None:
+    # The mount root ALWAYS exists, so an unconstrained fallback would collapse
+    # every unresolved path onto it. A path whose final name differs from the
+    # mount's stays an honest None (the operator must fix their mounts / pick again).
+    mount = tmp_path / "media"
+    mount.mkdir()
+    assert remap_to_visible("/host/tank/library", [str(mount)], allow_mount_root=True) is None
+    assert remap_to_visible("/host/typo", [str(mount)], allow_mount_root=True) is None
+
+
+def test_a_deeper_suffix_always_beats_the_mount_root(tmp_path: Path) -> None:
+    # A real subdirectory match must win over the zero-suffix mount-root fallback,
+    # even when the path's final component equals the mount's own name.
+    mount = tmp_path / "media"
+    (mount / "media").mkdir(parents=True)
+    assert remap_to_visible("/host/media", [str(mount)], allow_mount_root=True) == str(
+        mount / "media"
+    )
+
+
+def test_remap_library_root_uses_library_mounts_and_the_mount_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The shared library-root policy: LIBRARY mounts only, mount-root allowed.
+    library_mount = tmp_path / "media"
+    library_mount.mkdir()
+    download_mount = tmp_path / "downloads"
+    (download_mount / "media").mkdir(parents=True)  # a same-named tree under downloads
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(library_mount),))
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(download_mount),))
+    # Resolves to the LIBRARY mount root, never the same-named subtree of downloads.
+    assert remap_library_root("/host/media") == str(library_mount)

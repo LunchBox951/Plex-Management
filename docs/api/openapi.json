@@ -4571,11 +4571,18 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorEnvelope"
+                    }
+                  ]
                 }
               }
             },
-            "description": "A submitted library folder isn't visible to this server"
+            "description": "Request body validation failed, or a submitted library folder / the Plex token was rejected"
           },
           "502": {
             "content": {

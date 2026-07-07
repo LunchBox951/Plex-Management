@@ -160,12 +160,15 @@ def _resolve_visible_content(content: str) -> str | None:
     can be a HOST-namespace path this container cannot see (issue #133) -- e.g.
     ``/home/lunchbox/Downloads/.plex_manager/...`` when the real, mounted
     location is ``/downloads/...``. Returns ``content`` unchanged when it
-    already exists here; else suffix-remaps it under the known download mounts
-    (see :mod:`~plex_manager.services.path_visibility`). Pure ``exists()``
-    probes (sync); callers offload via ``asyncio.to_thread``.
+    already exists here; else suffix-remaps it under the DOWNLOAD mounts ONLY
+    (never the library mounts): a completed torrent and an old library file can
+    share a trailing basename (``/downloads/Foo.mkv`` vs ``/media/Foo.mkv``), and
+    remapping content against ``/media`` too would let the importer validate and
+    place the WRONG source. See :mod:`~plex_manager.services.path_visibility`.
+    Pure ``exists()`` probes (sync); callers offload via ``asyncio.to_thread``.
     """
     return path_visibility.remap_to_visible(
-        content, path_visibility.KNOWN_CONTAINER_MOUNTS, predicate=os.path.exists
+        content, path_visibility.KNOWN_DOWNLOAD_MOUNTS, predicate=os.path.exists
     )
 
 

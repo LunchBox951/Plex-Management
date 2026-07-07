@@ -3312,13 +3312,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description A submitted library folder isn't visible to this server */
+            /** @description Request body validation failed, or a submitted library folder / the Plex token was rejected */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorEnvelope"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description The Plex server was unreachable */

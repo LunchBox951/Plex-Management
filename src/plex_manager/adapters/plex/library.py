@@ -35,6 +35,7 @@ from typing import Final, Literal, cast
 import httpx
 
 from plex_manager.ports.library import LibrarySection, WatchState
+from plex_manager.services import path_visibility
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
 
@@ -257,11 +258,6 @@ def _season_watch_state_from_entry(entry: Mapping[str, object]) -> WatchState:
     return WatchState(watched=watched, last_viewed_at=last_viewed_at)
 
 
-def _section_covers(section: LibrarySection, path: str) -> bool:
-    """Whether any of the section's locations is a path-prefix of ``path``."""
-    return any(_is_path_prefix(location, path) for location in section.locations)
-
-
 def _is_path_prefix(prefix: str, path: str) -> bool:
     """True if ``prefix`` is ``path`` or a parent directory of it (segment-aware).
 
@@ -269,6 +265,61 @@ def _is_path_prefix(prefix: str, path: str) -> bool:
     """
     norm = prefix.rstrip("/")
     return path == norm or path.startswith(f"{norm}/")
+
+
+def _container_to_host_scan_path(location: str, path: str) -> str | None:
+    """Reverse a Docker host->container remap: the HOST path Plex should scan.
+
+    ``path`` is a CONTAINER path the importer/eviction placed into (e.g.
+    ``/media/Movies/Title (Year)``); ``location`` is a section location as Plex
+    reported it, in the HOST namespace (e.g. ``/srv/media/Movies``). After a Docker
+    host/container split the container path never prefix-matches the host location,
+    so a plain ``_is_path_prefix`` check always misses and every remapped root
+    would fall back to a full-library refresh.
+
+    Reverse the mapping the SAME way :func:`path_visibility.remap_to_visible` built
+    it forward: strip a known container mount prefix from ``path``, align the
+    location's trailing components against what remains, and re-anchor the leftover
+    tail on the HOST ``location``. Purely lexical (no filesystem probe); anchoring on
+    the known mount prefix keeps it precise -- a section whose location merely shares
+    a trailing name but doesn't sit under the same mount does not spuriously match.
+    Returns ``None`` when ``path`` isn't under any known mount, or shares no
+    directory with ``location`` below it (e.g. a whole-media-root/mount-root remap,
+    which has no shared component to anchor on and honestly falls back to a full
+    refresh).
+    """
+    path_comps = [c for c in path.split("/") if c]
+    loc_comps = [c for c in location.split("/") if c]
+    for mount in path_visibility.KNOWN_CONTAINER_MOUNTS:
+        mount_comps = [c for c in mount.split("/") if c]
+        if not mount_comps or path_comps[: len(mount_comps)] != mount_comps:
+            continue
+        below = path_comps[len(mount_comps) :]
+        # Longest run where the location's tail meets the path's head below the
+        # mount -- longest first so the deepest shared directory wins.
+        for k in range(min(len(loc_comps), len(below)), 0, -1):
+            if loc_comps[-k:] == below[:k]:
+                tail = below[k:]
+                host = "/" + "/".join(loc_comps)
+                return f"{host}/{'/'.join(tail)}" if tail else host
+    return None
+
+
+def _section_scan_path(section: LibrarySection, path: str) -> str | None:
+    """The Plex(host)-namespace path to refresh for ``path`` in ``section``, or None.
+
+    Prefers a direct prefix match (no host/container split, or Plex itself sees the
+    container paths) so ``path`` is refreshed verbatim; otherwise reverses the
+    Docker remap via :func:`_container_to_host_scan_path`. ``None`` when this
+    section does not cover ``path`` at all.
+    """
+    for location in section.locations:
+        if _is_path_prefix(location, path):
+            return path
+        host = _container_to_host_scan_path(location, path)
+        if host is not None:
+            return host
+    return None
 
 
 class PlexLibrary:
@@ -640,28 +691,42 @@ class PlexLibrary:
         and show sections for TV, so a TV season folder is never matched against a
         movie section (or vice versa).
 
-        The section whose location is a parent of ``path`` gets a partial refresh
-        of just that path. If NO section covers it (a path-mapping difference
-        between the app and Plex, or Plex didn't report locations), we do a real
-        FULL refresh of each candidate section instead — heavier, but it actually
-        indexes the new file, unlike refreshing with a path Plex does not own (a
-        silent no-op that would strand the request at "Finalizing"). With no
-        candidate section at all, raise so the import blocks honestly. A 2xx
-        (possibly empty body) is success. After scanning, the presence cache for
-        ``media_type`` is invalidated so the availability check re-pages Plex
-        instead of returning a pre-import snapshot.
+        ``path`` arrives in the CONTAINER namespace (the importer/eviction placed
+        into a container-visible root), while Plex reports its section locations in
+        the HOST namespace, so after a Docker host/container split the two never
+        prefix-match directly. :func:`_section_scan_path` reverses that remap from
+        the section's own locations + the same suffix logic
+        :mod:`~plex_manager.services.path_visibility` uses forward, translating the
+        container path back to the HOST path Plex actually knows -- so a targeted
+        partial refresh of just that path still works instead of a full-library
+        refresh. If NO section covers it (a genuine path-mapping difference, a
+        mount-root remap with no shared directory to anchor on, or Plex not
+        reporting locations), we do a real FULL refresh of each candidate section
+        instead — heavier, but it actually indexes the new file, unlike refreshing
+        with a path Plex does not own (a silent no-op that would strand the request
+        at "Finalizing"). With no candidate section at all, raise so the import
+        blocks honestly. A 2xx (possibly empty body) is success. After scanning, the
+        presence cache for ``media_type`` is invalidated so the availability check
+        re-pages Plex instead of returning a pre-import snapshot.
         """
         section_type: Literal["movie", "show"] = "movie" if media_type == "movie" else "show"
         candidate_sections = [s for s in await self.list_sections() if s.type == section_type]
         if not candidate_sections:
             raise PlexLibraryError(f"no Plex {section_type} library section to scan into")
-        matched = [s for s in candidate_sections if _section_covers(s, path)]
+        matched = [
+            (section, scan_path)
+            for section in candidate_sections
+            if (scan_path := _section_scan_path(section, path)) is not None
+        ]
         try:
             if matched:
-                # The raw path is handed to httpx as a query param so it is
-                # percent-encoded exactly once (pre-quoting here would double-encode).
-                for section in matched:
-                    await self._request(f"/library/sections/{section.key}/refresh", {"path": path})
+                # The reverse-mapped HOST path is handed to httpx as a query param so
+                # it is percent-encoded exactly once (pre-quoting here would double-
+                # encode).
+                for section, scan_path in matched:
+                    await self._request(
+                        f"/library/sections/{section.key}/refresh", {"path": scan_path}
+                    )
             else:
                 _logger.warning(
                     "import path is not under any Plex %s section location; "

@@ -853,7 +853,8 @@ async def test_import_remaps_download_path_under_the_downloads_mount(
     mount = tmp_path / "dl"
     video = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     _make_video(video)
-    monkeypatch.setattr(path_visibility, "KNOWN_CONTAINER_MOUNTS", (str(mount),))
+    # Content is remapped under the DOWNLOAD mounts only (never the library mounts).
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
     # qbt (host-side) reports a HOST path with the SAME basename -- the suffix
     # that must remap onto the real file under the mount.
     host_content = Path(
