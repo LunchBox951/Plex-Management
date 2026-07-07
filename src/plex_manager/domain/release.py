@@ -137,7 +137,9 @@ class ScoredRelease(BaseModel):
     """A candidate that passed the gates, with its resolved quality and score.
 
     ``profile_index`` is the candidate's position in the quality profile (the
-    comparison key); ``score`` ranks among same-or-grouped qualities.
+    comparison key). ``score`` is a display-only projection of the engine's
+    final rank (higher = ranked earlier); it never drives selection and must
+    not be used to re-sort or compare across separate decision runs.
     """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
