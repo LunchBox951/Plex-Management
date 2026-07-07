@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useCreateRequest } from '../api/hooks'
 import type { CreateRequestBody, DiscoverResult } from '../api/types'
+import { cn } from '../lib/cn'
 import type { ApiError } from '../lib/errors'
-import { Button } from './ui/Button'
 import { useToast } from './ui/toast'
 
 interface QuickRequestButtonProps {
@@ -18,6 +18,21 @@ function asApiError(error: unknown): ApiError {
  * caller has already determined the tile is unbadged/requestable
  * (`deriveTileState(...) === null`) — this component never re-derives that
  * state itself.
+ *
+ * Presented as a circular "+" (issue #135: no text pills on cards), hidden
+ * with `opacity-0` and revealed on `group-hover`/`group-focus-within` (the
+ * `group` class lives on `PosterCard`'s root, see PosterCard.tsx) — NEVER
+ * `hidden`/`display:none`, which would drop it from the tab order and make
+ * the one-click Request keyboard-unreachable. A keyboard user tabbing onto
+ * the button lands inside the group, so `group-focus-within` reveals it at
+ * the same moment it gains focus.
+ *
+ * While invisible it is also `pointer-events-none`: opacity alone leaves the
+ * button hit-testable, and on touch/coarse-pointer devices (no hover reveal)
+ * a tap on the card's top-right corner would silently submit a request
+ * instead of opening details. Pointer events return with the reveal
+ * (`group-hover`/`group-focus-within`); keyboard focus and activation are
+ * unaffected by pointer-events, so the tab-order guarantee above holds.
  *
  * Reuses the SAME `useCreateRequest()` mutation `TitleDetailModal` uses; there
  * is only one create-request code path. For a tv title this always omits
@@ -70,12 +85,14 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
   }
 
   return (
-    <Button
-      size="sm"
+    <button
+      type="button"
       // Every tile's action reads "Request" — give assistive tech the title so a
       // screen-reader user isn't left with a grid of identical "Request" buttons.
+      // Kept even while invisible: this is a REVEAL (opacity), not a hide, so
+      // the accessible name must stay meaningful the moment it gets focus.
       aria-label={`Request ${item.title}`}
-      loading={createRequest.isPending}
+      disabled={createRequest.isPending}
       onClick={(e) => {
         // Resolve the sibling PosterCard details trigger synchronously (before the
         // async mutation unmounts this button) so `onRequest` can restore focus.
@@ -83,8 +100,32 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
         const trigger = card?.querySelector<HTMLElement>('[data-poster-card-trigger]') ?? null
         void onRequest(trigger)
       }}
+      className={cn(
+        'flex size-8 items-center justify-center rounded-full',
+        'bg-gold text-gold-ink ring-1 ring-inset ring-black/10',
+        'pointer-events-none opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100',
+        'hover:bg-gold/90 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60',
+        'disabled:cursor-not-allowed disabled:opacity-100 disabled:hover:bg-gold',
+      )}
     >
-      Request
-    </Button>
+      {createRequest.isPending ? (
+        <span
+          aria-hidden
+          className="size-3.5 animate-spin rounded-full border-2 border-current border-t-transparent"
+        />
+      ) : (
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2.5}
+          strokeLinecap="round"
+          aria-hidden
+          className="size-4"
+        >
+          <path d="M12 5v14M5 12h14" />
+        </svg>
+      )}
+    </button>
   )
 }

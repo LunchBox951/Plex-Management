@@ -8,7 +8,7 @@ import {
 import type { DiscoverResult } from '../api/types'
 import { deriveTileState } from '../lib/tileState'
 import { PosterCard } from '../components/ui/PosterCard'
-import { StatusBadge } from '../components/ui/StatusBadge'
+import { TileStatusGlyph } from '../components/ui/TileStatusGlyph'
 import { QuickRequestButton } from '../components/QuickRequestButton'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { TitleDetailModal } from '../components/TitleDetailModal'
@@ -179,7 +179,7 @@ export function Discover() {
                 posterUrl={title.poster_url ?? null}
                 seed={title.tmdb_id}
                 onClick={() => openTitle(title)}
-                badge={state ? <StatusBadge status={state} /> : undefined}
+                badge={state ? <TileStatusGlyph status={state} /> : undefined}
                 action={
                   state === null && quickRequestable(title) ? (
                     <QuickRequestButton item={title} />
