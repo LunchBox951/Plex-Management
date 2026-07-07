@@ -158,7 +158,7 @@ class FakeTmdb:
 
     @staticmethod
     def _page(items: list[MediaSearchResult]) -> MediaPage:
-        return MediaPage(page=1, total_pages=1, total_results=len(items), results=list(items))
+        return MediaPage(page=1, total_pages=1, total_results=len(items), results=tuple(items))
 
     async def trending_movies(self, page: int = 1) -> MediaPage:
         return self._page(self.trending)

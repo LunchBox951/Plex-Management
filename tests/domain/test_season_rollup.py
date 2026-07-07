@@ -195,3 +195,28 @@ def test_cancelled_mixed_with_failed_and_no_done_season_is_failed() -> None:
 def test_cancelled_and_evicted_mixed_with_no_done_season_is_failed() -> None:
     # Both "gone" statuses together, nothing watchable and nothing pending -> failed.
     assert rollup_status(["cancelled", "evicted"]) == "failed"
+
+
+# -- issue #79: parent-only / unknown season statuses are rejected, never folded
+# silently into "failed" -----------------------------------------------------
+
+
+def test_parent_only_partially_available_status_raises() -> None:
+    # The regression this guards: before the fix, a lone "partially_available"
+    # season status fell through every branch to a false, settled "failed" --
+    # "partially_available" is this function's own OUTPUT, never a legitimate
+    # value a single season's own status column can hold.
+    with pytest.raises(ValueError, match="unknown or parent-only"):
+        rollup_status(["partially_available"])
+
+
+def test_parent_only_status_mixed_with_a_real_status_raises() -> None:
+    with pytest.raises(ValueError, match="unknown or parent-only"):
+        rollup_status(["available", "partially_available"])
+
+
+def test_unknown_future_status_value_raises() -> None:
+    # A typo, a migration gap, or a future RequestStatus member not yet added to
+    # the allowlist must fail loudly, never silently resolve to "failed".
+    with pytest.raises(ValueError, match="unknown or parent-only"):
+        rollup_status(["totally_not_a_real_status"])

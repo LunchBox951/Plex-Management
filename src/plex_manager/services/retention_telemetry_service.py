@@ -502,15 +502,38 @@ async def _classify_candidates(
     NOWHERE else, so no downstream metric re-derives its own filter and the
     watch-activity count, idle-age buckets and per-title intervals can never again
     disagree about which rows belong to the time-to-watch dataset.
+
+    Rule 0 (issue #104) -- duplicate ``library_path`` collapse, applied BEFORE rule
+    1. Two distinct rows (e.g. a re-request that lands on a title already imported
+    at the same path) can carry the identical breadcrumb; both axes must count that
+    physical file exactly ONCE, or the eligible/would-evict totals and the
+    watch-activity count/idle-age buckets overstate reality for a single title. A
+    ``None`` breadcrumb is NEVER collapsed this way (rule 1 below excludes every
+    no-path row individually; ``None == None`` would otherwise wrongly fold every
+    breadcrumb-less row into one).
     """
+    # Rule 0 -- duplicate-path collapse (issue #104): first-seen-wins per distinct
+    # ``library_path``, leaving every ``None``-path row untouched (each counted
+    # separately by rule 1 below). Applied before path_bearing/no_path_count so
+    # every downstream metric on both axes sees each physical file once.
+    seen_paths: set[str] = set()
+    deduplicated: list[EvictionCandidate] = []
+    for candidate in candidates:
+        path = candidate.library_path
+        if path is not None:
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+        deduplicated.append(candidate)
+
     # Rule 1 -- no-path total exclusion, applied first. A None breadcrumb means
     # nothing of ours is on disk (eviction can never touch it) and ``completed_at``
     # is not an import time (no post-import interval), so the row feeds NEITHER axis
     # and is only counted. The two axes are then classified independently over the
     # surviving path-bearing rows (orthogonal, not one global bucket -- see the
     # dataclass docstring).
-    path_bearing = [candidate for candidate in candidates if candidate.library_path is not None]
-    no_path_count = len(candidates) - len(path_bearing)
+    path_bearing = [candidate for candidate in deduplicated if candidate.library_path is not None]
+    no_path_count = len(deduplicated) - len(path_bearing)
 
     # Disk-space axis. ``eligible`` is the FULL policy-evictable set at the real
     # grace cutoff (pre-import views INCLUDED: a previously-watched title is still

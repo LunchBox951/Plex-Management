@@ -228,6 +228,22 @@ async def test_search_year_filters_mixed_year_results() -> None:
     assert [(r.tmdb_id, r.media_type, r.year) for r in results] == [(27205, "movie", 2010)]
 
 
+async def test_search_cache_hit_returns_a_copy_never_the_cached_reference() -> None:
+    """Issue #106: ``_TtlCache.get`` used to hand back the SAME list object on
+    every hit within the TTL -- a caller mutating its own result (append/sort/
+    clear) would silently corrupt what every LATER cache hit returns. The cache
+    entry must now be immutable and every ``search`` call must get its own list."""
+    adapter = _adapter()
+    first = await adapter.search("inception")
+    assert len(first) == 2
+    first.append(first[0])  # a careless caller mutates the returned list in place
+    first.clear()  # ...and even empties it
+
+    second = await adapter.search("inception")  # served from the (still warm) cache
+    assert len(second) == 2  # completely unaffected by the first call's mutation
+    assert second is not first
+
+
 async def test_get_movie_maps_imdb_and_year() -> None:
     movie = await _adapter().get_movie(27205)
     assert movie is not None

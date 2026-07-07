@@ -79,3 +79,14 @@ def test_dvdr_allowed_by_default() -> None:
     index = profile.get_index(DVDR.id)
     assert index is not None
     assert profile.items[index].allowed is True
+
+
+def test_items_is_an_immutable_tuple_not_a_mutable_list() -> None:
+    """Issue #106: ``frozen=True`` on ``QualityProfile`` blocks reassigning
+    ``profile.items`` but never stopped a plain list from being mutated IN
+    PLACE -- which would corrupt every other holder of the same (shared)
+    profile instance. ``items`` must be an immutable tuple, so there is no
+    ``.append``/``.sort`` surface left to exploit."""
+    profile = default_profile()
+    assert isinstance(profile.items, tuple)
+    assert not hasattr(profile.items, "append")

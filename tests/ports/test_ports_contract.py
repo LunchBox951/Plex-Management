@@ -28,6 +28,7 @@ from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState
 from plex_manager.ports.metadata import (
+    MediaPage,
     MediaSearchResult,
     MetadataPort,
     MovieMetadata,
@@ -67,6 +68,29 @@ def test_metadata_and_library_dtos_construct() -> None:
     assert WatchState(watched=False).last_viewed_at is None
 
 
+def test_watch_state_normalizes_a_naive_last_viewed_at_to_utc() -> None:
+    """Issue #82: a naive ``last_viewed_at`` (e.g. a careless adapter/fake) must
+    not slip past the DTO boundary as-is -- eviction/retention-telemetry subtract
+    it against UTC-aware cutoffs, and a naive value would raise ``TypeError``
+    deep inside that arithmetic instead of at construction time."""
+    naive = datetime(2024, 1, 1, 12, 0, 0)
+    state = WatchState(watched=True, last_viewed_at=naive)
+    assert state.last_viewed_at is not None
+    assert state.last_viewed_at.tzinfo is not None
+    assert state.last_viewed_at == naive.replace(tzinfo=UTC)
+
+
+def test_watch_state_preserves_an_already_aware_last_viewed_at() -> None:
+    """A tz-aware ``last_viewed_at`` in a non-UTC offset is passed through
+    untouched -- normalization only re-attaches UTC to a NAIVE value, it never
+    overwrites an already-honest offset."""
+    from datetime import timedelta, timezone
+
+    aware = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+    state = WatchState(watched=True, last_viewed_at=aware)
+    assert state.last_viewed_at == aware
+
+
 def test_repository_records_construct() -> None:
     request = RequestRecord(id=1, tmdb_id=5, media_type="movie", title="x", status="pending")
     assert request.is_anime is False
@@ -100,7 +124,25 @@ def test_log_event_dtos_construct() -> None:
     assert record.context is None
     created = LogEventCreate(created_at=_EPOCH, level="INFO", logger="plex_manager.x", message="hi")
     assert created.context is None
-    assert LogEventPage(total=0, results=[]).results == []
+    assert LogEventPage(total=0, results=()).results == ()
+
+
+def test_media_page_results_is_an_immutable_tuple() -> None:
+    """Issue #106: the TMDB adapter's page cache hands the SAME ``MediaPage``
+    back on every hit within its TTL -- a mutable ``results`` list would let one
+    caller's in-place mutation corrupt what every later cache hit sees. A
+    ``list`` input is coerced to a tuple, and the source list's later mutation
+    must never leak into the constructed page."""
+    source = [MediaSearchResult(tmdb_id=1, media_type="movie", title="x")]
+    page = MediaPage(
+        page=1,
+        total_pages=1,
+        total_results=1,
+        results=source,  # pyright: ignore[reportArgumentType]
+    )
+    assert isinstance(page.results, tuple)
+    source.append(MediaSearchResult(tmdb_id=2, media_type="movie", title="y"))
+    assert len(page.results) == 1  # unaffected by the source list's later mutation
 
 
 class _FakeParser:

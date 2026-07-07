@@ -421,7 +421,7 @@ class ProwlarrIndexer:
             publish_date=_parse_publish_date(row.get("publishDate")),
             imdb_id=_get_int(row, "imdbId"),
             tmdb_id=_get_int(row, "tmdbId"),
-            categories=_categories(row),
+            categories=tuple(_categories(row)),
             protocol=protocol,
         )
 

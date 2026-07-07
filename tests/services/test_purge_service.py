@@ -50,6 +50,32 @@ async def test_purge_refuses_a_path_outside_every_configured_root(tmp_path: Path
     assert outside.exists()  # never touched
 
 
+async def test_purge_refuses_an_outside_root_symlink_entry_pointing_inside_the_root(
+    tmp_path: Path,
+) -> None:
+    """Issue #141, purge-level: a symlink ENTRY outside every configured root
+    whose target resolves inside one must refuse -- ``delete_guard_refuses``
+    (the same predicate ``purge_library_path`` checks up front) must not be
+    fooled into treating the dereferenced target's containment as clearance to
+    unlink the outside-root entry itself."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    real_target = root / "movie.mkv"
+    real_target.write_bytes(b"x" * 100)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_link = outside / "link.mkv"
+    outside_link.symlink_to(real_target)
+    fs = LocalFileSystem(library_roots=[str(root)])
+
+    result = await purge_service.purge_library_path(fs, str(outside_link))
+
+    assert result.outcome is PurgeOutcome.refused
+    assert result.freed_bytes == 0
+    assert outside_link.is_symlink()  # untouched
+    assert real_target.exists()  # untouched
+
+
 class _RecordingReclaimFileSystem(LocalFileSystem):
     """A :class:`LocalFileSystem` that records every ``reclaimable_bytes`` call, so a
     test can prove the (potentially huge, recursive) measurement is SKIPPED for an

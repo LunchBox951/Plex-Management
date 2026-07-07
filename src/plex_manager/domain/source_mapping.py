@@ -380,7 +380,7 @@ def to_parsed_release(fields: Mapping[str, object], raw_title: str) -> ParsedRel
         modifier=modifier,
         revision=revision,
         release_group=_coerce_str(fields.get("release_group")),
-        languages=_as_str_list(fields.get("language")),
+        languages=tuple(_as_str_list(fields.get("language"))),
         edition=_coerce_str(fields.get("edition")),
         hardcoded_subs=None,
     )

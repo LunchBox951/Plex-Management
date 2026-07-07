@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -124,7 +125,7 @@ def _to_item(record: DownloadRecord) -> QueueItem:
 
 
 def _select_release(
-    accepted: list[ScoredRelease],
+    accepted: Sequence[ScoredRelease],
     grab: GrabRequest,
 ) -> ScoredRelease:
     """Pick the operator's chosen release, or the top-ranked one if none given."""
