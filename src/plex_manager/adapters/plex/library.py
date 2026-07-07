@@ -711,24 +711,35 @@ class PlexLibrary:
             await self._collect_target_rating_keys(section.key, wanted, rating_keys_by_tmdb_id)
         result: dict[int, frozenset[int]] = {}
         failed_ids: set[int] = set()
+        incomplete_ids: set[int] = set()
         for tmdb_id in wanted:
             seasons: set[int] = set()
-            failed = False
+            any_failed = False
             for rating_key in rating_keys_by_tmdb_id.get(tmdb_id, []):
                 try:
                     seasons |= await self._fetch_present_seasons(rating_key)
                 except (PlexLibraryError, PlexAuthError) as exc:
                     _logger.warning(
-                        "season lookup failed for show tmdb_id=%s; omitting it from this "
-                        "batch's result (%s)",
+                        "season lookup failed for a show entry tmdb_id=%s (%s)",
                         safe_int(tmdb_id),
                         exc,
                     )
-                    failed = True
-                    break
-            if failed:
+                    any_failed = True
+                    # Keep going: a LATER duplicate entry may still confirm
+                    # seasons — positive evidence must not be discarded because
+                    # a stale/broken duplicate errored first (or vice versa).
+            if any_failed and not seasons:
+                # No positive evidence at all — state unknown, omit the id so
+                # the caller retries next cycle.
                 failed_ids.add(tmdb_id)
                 continue
+            if any_failed:
+                # PARTIAL union: some duplicate(s) failed but at least one
+                # confirmed seasons. Confirmed presence is sound to promote on
+                # (a season Plex reports IS present), so it goes in the RETURN
+                # value — but the union may be incomplete, so it must never be
+                # written through to the cache snapshot.
+                incomplete_ids.add(tmdb_id)
             result[tmdb_id] = frozenset(seasons)
         # ONLY ids that matched at least one item (and resolved successfully) are
         # merged into the cache: ``_is_tv_available`` treats a cached KEY as "show
@@ -741,13 +752,16 @@ class PlexLibrary:
         # frozenset for a no-match id — only the cache treats it as an eviction.
         # A FAILED id is excluded from both ``matched_only`` and ``unmatched``: it
         # is not evicted (it DID match a rating key -- its state is unknown, not
-        # absent) and nothing about it is written to the cache either.
+        # absent) and nothing about it is written to the cache either. An
+        # INCOMPLETE id (partial duplicate failure, positive union returned) is
+        # likewise returned to the caller but never cached -- its union may be
+        # missing seasons that only lived on the failed duplicate.
         matched_only = {
             tmdb_id: seasons
             for tmdb_id, seasons in result.items()
-            if rating_keys_by_tmdb_id.get(tmdb_id)
+            if rating_keys_by_tmdb_id.get(tmdb_id) and tmdb_id not in incomplete_ids
         }
-        unmatched = wanted - matched_only.keys() - failed_ids
+        unmatched = wanted - matched_only.keys() - failed_ids - incomplete_ids
         cached = _TV_SEASONS_CACHE.get(self._cache_key)
         if matched_only or (cached is not None and unmatched & cached.keys()):
             updated = dict(cached) if cached is not None else {}

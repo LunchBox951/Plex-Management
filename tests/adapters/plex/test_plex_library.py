@@ -666,6 +666,43 @@ async def test_season_presence_unions_seasons_across_duplicate_show_entries() ->
     assert result == {7000: frozenset({1, 2})}
 
 
+async def test_season_presence_returns_partial_union_when_one_duplicate_fails() -> None:
+    """(round 6, #136 review) When duplicates exist and one entry's ``/children``
+    fails while another CONFIRMS seasons, the confirmed partial union must be
+    RETURNED (positive evidence is sound to promote on — omitting the id would
+    strand a Plex-confirmed season at 'Finalizing' behind a broken duplicate)
+    but must NOT be written through to the cache: the union may be missing
+    seasons that only live on the failed duplicate, so a later season-scoped
+    check re-crawls fresh instead of trusting an incomplete snapshot."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS_TWO_SHOW)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=TV_SHOWS_WITH_DUP)
+        if path == "/library/sections/5/all":
+            return httpx.Response(200, json=ANIME_SHOWS_WITH_DUP)
+        if path == "/library/metadata/500/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_500)
+        if path == "/library/metadata/600/children":
+            return httpx.Response(500, json={})  # the broken duplicate
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://season-presence-partial-dup:32400")
+    # The healthy "TV Shows" duplicate confirmed season 1 — returned despite the
+    # broken "Anime" duplicate erroring.
+    assert await adapter.season_presence({7000}) == {7000: frozenset({1})}
+    # The incomplete union was NOT cached: a season-scoped check for season 2
+    # (which lives only on the failed duplicate) re-crawls fresh rather than
+    # answering False from a partial snapshot. The fresh crawl in this handler
+    # errors on 600's children too, so the honest outcome is the adapter's own
+    # error — NOT a confident False produced by an incomplete cache entry.
+    with pytest.raises(PlexLibraryError):
+        await adapter.is_available(7000, "tv", season=2)
+
+
 async def test_season_presence_isolates_a_single_show_failure_in_the_same_batch() -> None:
     """(round 4, #136 review) One show's ``/children`` fetch returning a 500 inside
     an otherwise-successful batch call must not abort the OTHER show's lookup.
