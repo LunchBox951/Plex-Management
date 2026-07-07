@@ -684,6 +684,56 @@ async def test_report_issue_without_breadcrumb_falls_back_to_the_anime_root_for_
     assert updated.status == RequestStatus.downloading.value
 
 
+async def test_report_issue_presence_only_no_culprit_proceeds_despite_unmounted_root(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # Issue #131 relaxation: a row with NEITHER a library_path breadcrumb NOR a
+    # culprit download is purely presence-derived (recorded available straight
+    # from Plex -- no download of ours ever placed it). There is nothing to
+    # blocklist (culprit is None) and nothing to purge (no breadcrumb), so an
+    # unmounted fallback root protects no file of ours: the mount check must be
+    # SKIPPED and the verb must proceed to the honest re-arm + re-search, not
+    # 409 `media_root_unavailable` -- the exact dead-end reported in #131.
+    #
+    # Seeded directly (NOT via `_seed_available_movie`, which always adds a
+    # culprit `Download` row): this row has neither.
+    missing_root = tmp_path / "movies"  # never created -> unmounted
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            year=2020,
+            status=RequestStatus.available,
+            library_path=None,
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        updated = await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(missing_root)]),
+            FakeLibrary(),
+            FakeProwlarr([candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER", info_hash=_ALT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=None,
+            roots=LibraryRoots(movies=str(missing_root)),
+        )
+
+    assert updated.status == RequestStatus.downloading.value
+    assert qbt.removed == []  # nothing of ours to remove -- no culprit torrent
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert blocklist == []  # nothing to blocklist -- culprit was None
+
+
 async def test_report_issue_rejects_a_not_reportable_movie(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:

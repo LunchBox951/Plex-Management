@@ -174,6 +174,13 @@ async def create_request_endpoint(
     to ``request_service.create_request``, which tracks each named season as its
     own ``SeasonRequest`` row -- including on the dedup path, where a repeat POST
     with a NEW season list grows the tracked set rather than being dropped.
+
+    Re-acquire (issue #131): ``body.force`` (movie-only) bypasses the
+    already-in-library short-circuit so a title Plex still reports present -- but
+    whose file was deleted/replaced out-of-band -- yields a fresh, grabbable
+    ``pending`` request instead of a terminal ``available`` one. Same authZ as any
+    create; same response map (no new status codes) -- every dedup/ownership
+    guard below still applies unchanged.
     """
     try:
         result = await request_service.create_request_result(
@@ -183,6 +190,7 @@ async def create_request_endpoint(
             media_type=body.media_type,
             library=library,
             seasons=body.seasons,
+            force=bool(body.force),
             user_id=auth.user_id,
             actor_is_admin=auth.is_admin,
         )
