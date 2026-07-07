@@ -28,7 +28,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Final, Literal, cast
 
@@ -648,44 +648,94 @@ class PlexLibrary:
         _TV_SEASONS_CACHE.set(self._cache_key, present)
         return present.get(tmdb_id, frozenset())
 
-    async def season_presence(self, tmdb_id: int) -> frozenset[int]:
-        """The seasons present for ONE show — a TARGETED lookup, not a library crawl.
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        """The seasons present for EVERY show in ``tmdb_ids`` — ONE targeted
+        page-walk, not a per-show library crawl.
 
-        Composes ``_find_section_item`` (page each show section until the show
-        matching ``tmdb_id`` is found) with ``_fetch_present_seasons`` (that show's
-        ``/children`` only) — ~2 HTTP calls total for one show, regardless of how
-        many titles the library holds, unlike ``present_seasons``/
-        ``_collect_present_tv_seasons`` which page EVERY show section's full ``/all``
-        listing to answer for any show. Exists so the availability reconcile cycle
-        (``import_service.run_availability_cycle``) can resolve M distinct pending
-        shows per tick at O(M) cost instead of paying a whole-library crawl per
-        pending season.
+        Walks each show section's ``/all`` listing EXACTLY ONCE (never once per
+        requested id), recording the ``ratingKey`` of every item whose guid(s)
+        resolve to a requested tmdb id — see ``_collect_target_rating_keys``. A
+        given tmdb id can match MORE than one item (the same show catalogued in
+        two show sections, e.g. a separate "TV Shows" and "Anime" library, or a
+        duplicate entry within one section), so every matched item's ``/children``
+        is fetched and the resulting season sets are UNIONed per tmdb id — using
+        only the first match would under-report a season only present on a later
+        duplicate. Cost model: one page-walk across all show sections, plus one
+        ``/children`` fetch per MATCHED item (>= the number of requested ids that
+        are actually present, never more sections walked). Exists so the
+        availability reconcile cycle (``import_service.run_availability_cycle``)
+        can resolve every distinct pending show in a tick from a single
+        whole-library page-walk, instead of paying one page-walk per show.
 
         Always re-pages fresh (never trusts a cached absence, mirroring
         ``present_seasons``): a season that just finished indexing must be seen
-        immediately, not held stale for the cache TTL. On a hit, write-through the
-        result into the shared ``_TV_SEASONS_CACHE`` snapshot (when one is already
-        warm) so a subsequent ``is_available``/``present_seasons`` call for the SAME
-        show inside this TTL window sees this fresh read rather than a stale one.
-        Returns an empty frozenset when the show is absent from the library.
+        immediately, not held stale for the cache TTL. Write-through: every
+        resolved id is merged into the shared ``_TV_SEASONS_CACHE`` snapshot
+        (creating one if none is warm yet) so a subsequent ``is_available``/
+        ``present_seasons`` call for the SAME show inside this TTL window sees
+        this fresh read rather than a stale one -- a show NOT among the merged
+        ids simply misses the cache and triggers its own full re-crawl, same as
+        today. A requested id with no matching item anywhere maps to an empty
+        frozenset (still present as a key — never omitted).
         """
+        wanted = set(tmdb_ids)
+        if not wanted:
+            return {}
+        rating_keys_by_tmdb_id: dict[int, list[str]] = {}
         for section in await self.list_sections():
             if section.type != "show":
                 continue
-            item = await self._find_section_item(section.key, tmdb_id)
-            if item is None:
-                continue
-            rating_key = _get_str(item, "ratingKey")
-            if rating_key is None:
-                return frozenset()
-            seasons = await self._fetch_present_seasons(rating_key)
-            cached = _TV_SEASONS_CACHE.get(self._cache_key)
-            if cached is not None:
-                updated = dict(cached)
-                updated[tmdb_id] = seasons
-                _TV_SEASONS_CACHE.set(self._cache_key, updated)
-            return seasons
-        return frozenset()
+            await self._collect_target_rating_keys(section.key, wanted, rating_keys_by_tmdb_id)
+        result: dict[int, frozenset[int]] = {}
+        for tmdb_id in wanted:
+            seasons: set[int] = set()
+            for rating_key in rating_keys_by_tmdb_id.get(tmdb_id, []):
+                seasons |= await self._fetch_present_seasons(rating_key)
+            result[tmdb_id] = frozenset(seasons)
+        cached = _TV_SEASONS_CACHE.get(self._cache_key)
+        updated = dict(cached) if cached is not None else {}
+        updated.update(result)
+        _TV_SEASONS_CACHE.set(self._cache_key, updated)
+        return result
+
+    async def _collect_target_rating_keys(
+        self, key: str, wanted: set[int], rating_keys_by_tmdb_id: dict[int, list[str]]
+    ) -> None:
+        """Walk one show section's items page-by-page, recording the ``ratingKey``
+        of every item whose guid(s) resolve to a tmdb id in ``wanted``.
+
+        A single item can only match one requested tmdb id per its own guid(s), but
+        a requested id can accumulate MULTIPLE rating keys across calls (this
+        section holding a duplicate entry, or a later section holding the same
+        show) — see :meth:`season_presence` on why every match's seasons must be
+        unioned rather than only the first.
+        """
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                entry = _as_mapping(item)
+                ids: set[int] = set()
+                _collect_item_tmdb_ids(entry, ids)
+                matched_ids = ids & wanted
+                if not matched_ids:
+                    continue
+                rating_key = _get_str(entry, "ratingKey")
+                if rating_key is None:
+                    continue
+                for tmdb_id in matched_ids:
+                    rating_keys_by_tmdb_id.setdefault(tmdb_id, []).append(rating_key)
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
 
     async def _collect_present_tv_seasons(self) -> dict[int, frozenset[int]]:
         """Page every show section and gather each show's present seasons.

@@ -7,7 +7,7 @@ wiring is a drop-in later. All methods are async.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
@@ -84,23 +84,38 @@ class LibraryPort(Protocol):
 
         NOTE: this crawls EVERY show section's full ``/all`` listing to build the
         whole-library season map (see the adapter's ``_collect_present_tv_seasons``).
-        A caller that only needs ONE show's seasons should use
-        :meth:`season_presence` instead — it costs O(1) shows, not O(library size).
+        A caller that only needs a KNOWN set of shows' seasons should use
+        :meth:`season_presence` instead — it still costs exactly one page-walk, but
+        answers only the requested ids rather than the whole library's map.
         """
         raise NotImplementedError
 
-    async def season_presence(self, tmdb_id: int) -> frozenset[int]:
-        """Return the season numbers present for ONE show, via a TARGETED lookup.
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        """Return the season numbers present for EACH show in ``tmdb_ids``, via ONE
+        BATCH-shaped targeted lookup.
 
         Unlike :meth:`present_seasons` (which crawls every show section's FULL
-        listing to answer for ANY show), this resolves only the one show identified
-        by ``tmdb_id`` and costs O(1) HTTP calls regardless of library size — the
-        batch availability reconcile (``import_service.run_availability_cycle``)
-        depends on this to check N distinct pending shows without N whole-library
-        crawls. Always reads FRESH (like ``present_seasons`` — never trusts a
-        cached absence): a season that just finished indexing must be seen on the
-        very next check, not held stale for a cache TTL. Empty when the show is
-        absent from the library or has no indexed season.
+        listing to answer for ANY one show, repeated per caller), this resolves
+        ALL of ``tmdb_ids`` from a SINGLE page-walk across every show section —
+        cost model: one page-walk total, plus one ``/children`` fetch per matched
+        item (not per requested id — a show may have more than one matching item,
+        see below) — the batch availability reconcile
+        (``import_service.run_availability_cycle``) depends on this to check every
+        distinct pending show in a tick without re-paging the library once per
+        show. A tmdb id absent from every show section maps to an empty
+        ``frozenset`` (never omitted from the returned mapping).
+
+        A show can legitimately have MORE THAN ONE matching item across (or within)
+        show sections — e.g. the same title catalogued in both a "TV Shows" and an
+        "Anime" section, or a duplicate entry in one section — so an implementation
+        MUST union the present seasons across every item matching a given tmdb id,
+        never just the first match. Returning only the first hit's seasons can
+        under-report a season that is actually present on a later duplicate,
+        stranding it at "Finalizing" forever.
+
+        Always reads FRESH (like ``present_seasons`` — never trusts a cached
+        absence): a season that just finished indexing must be seen on the very
+        next check, not held stale for a cache TTL.
         """
         raise NotImplementedError
 

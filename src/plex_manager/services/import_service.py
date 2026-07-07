@@ -35,6 +35,7 @@ import hashlib
 import logging
 import os
 import weakref
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple
 
@@ -1360,10 +1361,14 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
     granularity) -- a warmed snapshot missing one of this tick's pending movies
     triggers one fresh crawl before answering, so a movie is promoted on the tick
     after it actually finishes indexing in Plex, not held for the rest of the
-    presence-cache TTL. TV seasons are grouped by show and cost exactly one
-    targeted ``season_presence`` lookup PER DISTINCT pending show (never one per
-    season, never a whole-library crawl, always fresh) -- see
-    ``LibraryPort.season_presence``.
+    presence-cache TTL. TV seasons are grouped by show and resolved with exactly
+    ONE batch ``season_presence`` call for the WHOLE tick's distinct pending shows
+    (never one call per show, never a whole-library ``/children`` crawl, always
+    fresh) -- see ``LibraryPort.season_presence``. Because that one call now
+    covers every pending show, a transport failure fails the WHOLE TV pass for
+    this tick (mirroring the movie batch's failure posture just above): every
+    pending season stays ``completed`` for the next tick's retry rather than
+    promoting on a partial/guessed result.
     """
     request_repo = SqlRequestRepository(session)
     completed_movies = [
@@ -1399,25 +1404,32 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
     # SeasonRequest rows -- a show's OTHER seasons may still be mid-flight while
     # one season is ready to confirm, so this is never gated on the parent's
-    # (computed rollup) status. GROUPED by show so each distinct pending show pays
-    # exactly ONE targeted ``season_presence`` lookup, regardless of how many of its
-    # seasons are pending -- never one lookup per season, never ``is_available``.
+    # (computed rollup) status. GROUPED by show so the WHOLE tick's distinct
+    # pending shows pay exactly ONE batch ``season_presence`` call, regardless of
+    # how many shows or seasons are pending -- never one lookup per show, never
+    # ``is_available``.
     season_repo = SqlSeasonRequestRepository(session)
     seasons_by_show: dict[int, list[SeasonRequestRecord]] = {}
     for season_request in await season_repo.list_by_status(RequestStatus.completed.value):
         seasons_by_show.setdefault(season_request.tmdb_id, []).append(season_request)
 
-    for tmdb_id, season_requests in seasons_by_show.items():
+    present_seasons_by_show: Mapping[int, frozenset[int]] = {}
+    if seasons_by_show:
         try:
-            present_seasons = await library.season_presence(tmdb_id)
+            present_seasons_by_show = await library.season_presence(seasons_by_show.keys())
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
-            # Per-show isolation: THIS show's lookup failing must never block the
-            # other distinct shows in the same tick from being checked.
+            # ONE batch call now covers every distinct pending show, so a failure
+            # here is a whole-pass transport failure (mirroring the movie batch's
+            # failure posture above) -- every pending season honestly stays
+            # ``completed`` for the next tick's retry rather than promoting on a
+            # partial/guessed result.
             _logger.warning(
-                "availability check failed for show; will retry next cycle",
-                extra={"tmdb_id": tmdb_id},
+                "batch availability check failed for %d pending show(s); will retry next cycle",
+                len(seasons_by_show),
             )
-            continue
+
+    for tmdb_id, season_requests in seasons_by_show.items():
+        present_seasons = present_seasons_by_show.get(tmdb_id, frozenset())
         for season_request in season_requests:
             if season_request.season_number not in present_seasons:
                 continue

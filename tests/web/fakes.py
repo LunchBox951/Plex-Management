@@ -9,7 +9,7 @@ faked.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -292,11 +292,16 @@ class FakeLibrary:
     :meth:`present_ids` call (``present_ids_refresh_absent_calls`` records the
     ``refresh_absent`` flag passed to each one, so a test can assert the reconcile
     cycle asks for the never-trust-a-cached-absence contract), and
-    ``season_presence_calls`` records every ``tmdb_id`` passed to
-    :meth:`season_presence` (one entry per call, duplicates included) -- a caller
-    asserts against these to prove a batch/reconcile pass makes AT MOST one
-    ``present_ids`` call and one ``season_presence`` call per distinct show, never
-    one ``is_available`` call per row.
+    ``season_presence_calls`` counts every :meth:`season_presence` call (a whole
+    BATCH of tmdb ids per call, mirroring ``PlexLibrary``'s one-page-walk-per-call
+    shape) -- ``season_presence_call_ids`` additionally records the ``frozenset``
+    of ids requested by each call, so a test can assert BOTH "exactly one call for
+    the whole tick" (``season_presence_calls == 1``) and "that one call named every
+    distinct pending show" (``season_presence_call_ids == [frozenset({...})]``). A
+    caller asserts against these to prove a reconcile pass makes AT MOST one
+    ``present_ids`` call and exactly ONE ``season_presence`` call per tick --
+    never one ``season_presence`` call per show, never one ``is_available`` call
+    per row.
     """
 
     def __init__(
@@ -322,14 +327,19 @@ class FakeLibrary:
         # request_service._already_in_library / _present_seasons_or_empty,
         # season_request_service._present_seasons).
         self.raises = raises
-        # Per-show override of ``raises`` for ``season_presence`` ONLY -- lets a
-        # test prove per-show error isolation (one show's lookup raising must not
-        # block another distinct show's lookup in the same reconcile pass).
+        # Per-show override for ``season_presence`` ONLY -- since the real
+        # ``PlexLibrary.season_presence`` is now BATCH-shaped (one page-walk covers
+        # every requested show), a real transport failure would fail the WHOLE
+        # batch, not just the one show whose entry happens to trip it. The fake
+        # mirrors that honestly: if ANY id in a given call's batch is a key here,
+        # the WHOLE call raises that id's exception -- there is no partial-batch
+        # success to model, matching the adapter's single HTTP page-walk.
         self.raises_for_shows = raises_for_shows or {}
         self.is_available_calls = 0
         self.present_ids_calls = 0
         self.present_ids_refresh_absent_calls: list[bool] = []
-        self.season_presence_calls: list[int] = []
+        self.season_presence_calls = 0
+        self.season_presence_call_ids: list[frozenset[int]] = []
 
     async def is_available(
         self,
@@ -357,18 +367,24 @@ class FakeLibrary:
         # crawl); empty for an absent show, matching the real adapter.
         return self.available_tv_seasons.get(tmdb_id, frozenset())
 
-    async def season_presence(self, tmdb_id: int) -> frozenset[int]:
-        self.season_presence_calls.append(tmdb_id)
-        if tmdb_id in self.raises_for_shows:
-            raise self.raises_for_shows[tmdb_id]
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        wanted = frozenset(tmdb_ids)
+        self.season_presence_calls += 1
+        self.season_presence_call_ids.append(wanted)
+        # A transport failure is whole-batch, never per-show (see ``raises_for_shows``'s
+        # docstring in ``__init__``) -- if any requested id is a configured failure,
+        # the ENTIRE call raises rather than partially answering.
+        for tmdb_id in wanted:
+            if tmdb_id in self.raises_for_shows:
+                raise self.raises_for_shows[tmdb_id]
         if self.raises is not None:
             raise self.raises
-        # A TARGETED lookup for ONE show -- mirrors PlexLibrary.season_presence's
-        # contract (fresh, ~O(1) cost regardless of library size); the fake answers
-        # it from the same seasons map ``present_seasons`` uses, just scoped to one
-        # show and separately counted so a test can prove it is called AT MOST once
-        # per distinct show, never once per pending season.
-        return self.available_tv_seasons.get(tmdb_id, frozenset())
+        # A BATCH lookup for every requested show in ONE call -- mirrors
+        # ``PlexLibrary.season_presence``'s contract (fresh, one page-walk
+        # regardless of how many shows are requested); the fake answers it from the
+        # same seasons map ``present_seasons`` uses. Every requested id is present
+        # as a key (empty frozenset when the show is untracked), never omitted.
+        return {tmdb_id: self.available_tv_seasons.get(tmdb_id, frozenset()) for tmdb_id in wanted}
 
     async def present_ids(
         self,

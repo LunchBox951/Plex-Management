@@ -367,7 +367,7 @@ async def test_present_seasons_resolves_every_season_in_a_single_crawl() -> None
 
 
 # --------------------------------------------------------------------------- #
-# season_presence — targeted per-show lookup, NOT a whole-library crawl (#136)
+# season_presence — BATCH targeted lookup, NOT a whole-library crawl (#136)
 # --------------------------------------------------------------------------- #
 # Three shows in the SAME show section (ratingKeys 100/200/300); the target
 # (tmdb 2000) sits in the MIDDLE so a test proves the lookup actually matches by
@@ -383,6 +383,10 @@ SHOWS_ALL_MULTI: dict[str, Any] = {
     }
 }
 
+SEASONS_FOR_SHOW_100_MULTI: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 1, "leafCount": 5}]}
+}
+
 SEASONS_FOR_SHOW_200: dict[str, Any] = {
     "MediaContainer": {
         "size": 2,
@@ -393,11 +397,18 @@ SEASONS_FOR_SHOW_200: dict[str, Any] = {
     }
 }
 
+SEASONS_FOR_SHOW_300: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 1, "leafCount": 4}]}
+}
+
 
 def _make_multi_show_handler(calls: dict[str, int]) -> Callable[[httpx.Request], httpx.Response]:
     """Serves 3 shows in one section, each with its OWN ``/children`` endpoint, so
-    a test can prove ``season_presence`` fetches ONLY the target show's children --
-    never the other shows' -- unlike a whole-library season crawl."""
+    a test can prove ``season_presence`` fetches ONLY the requested shows'
+    children -- never a show that was NOT part of the request -- unlike a
+    whole-library season crawl. Only ratingKey 200 (tmdb 2000) has a real
+    ``/children`` response wired here; 100/300's fetch hard-fails, so a test that
+    requests ONLY {2000} proves those two are never touched."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers.get("X-Plex-Token") == TOKEN
@@ -417,10 +428,111 @@ def _make_multi_show_handler(calls: dict[str, int]) -> Callable[[httpx.Request],
     return handler
 
 
+def _make_multi_show_handler_all_seasons(
+    calls: dict[str, int],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Same 3-show section as :func:`_make_multi_show_handler`, but ALL THREE
+    shows' ``/children`` are real (no hard-fail) -- used by tests that
+    deliberately request all three ids in one batch call."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/100/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_100_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        if path == "/library/metadata/300/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_300)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+# Two show sections ("TV Shows" + "Anime") each holding a DIFFERENT item that
+# resolves to the SAME tmdb id (7000) -- a show catalogued in both a normal TV
+# library and a separate Anime library, or duplicated within one section, is the
+# exact scenario finding 1 (#136 review) requires a union over, not a first-match.
+SECTIONS_TWO_SHOW: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 3,
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"id": 1, "path": "/data/movies"}],
+            },
+            {
+                "key": "2",
+                "title": "TV Shows",
+                "type": "show",
+                "Location": [{"id": 3, "path": "/data/tv"}],
+            },
+            {
+                "key": "5",
+                "title": "Anime",
+                "type": "show",
+                "Location": [{"id": 6, "path": "/data/anime"}],
+            },
+        ],
+    }
+}
+
+TV_SHOWS_WITH_DUP: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {"ratingKey": "500", "guid": "plex://show/dup-tv", "Guid": [{"id": "tmdb://7000"}]},
+        ],
+    }
+}
+
+ANIME_SHOWS_WITH_DUP: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {"ratingKey": "600", "guid": "plex://show/dup-anime", "Guid": [{"id": "tmdb://7000"}]},
+        ],
+    }
+}
+
+SEASONS_FOR_SHOW_500: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 1, "leafCount": 3}]}
+}
+
+SEASONS_FOR_SHOW_600: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 2, "leafCount": 5}]}
+}
+
+
+def _duplicate_show_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    assert TOKEN not in str(request.url)
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_TWO_SHOW)
+    if path == "/library/sections/2/all":
+        return httpx.Response(200, json=TV_SHOWS_WITH_DUP)
+    if path == "/library/sections/5/all":
+        return httpx.Response(200, json=ANIME_SHOWS_WITH_DUP)
+    if path == "/library/metadata/500/children":
+        return httpx.Response(200, json=SEASONS_FOR_SHOW_500)
+    if path == "/library/metadata/600/children":
+        return httpx.Response(200, json=SEASONS_FOR_SHOW_600)
+    return httpx.Response(404, json={})
+
+
 async def test_season_presence_returns_seasons_for_the_target_show() -> None:
     calls: dict[str, int] = {}
     adapter = _adapter(_make_multi_show_handler(calls), base_url="http://season-presence:32400")
-    assert await adapter.season_presence(2000) == frozenset({1})
+    assert await adapter.season_presence({2000}) == {2000: frozenset({1})}
 
 
 async def test_season_presence_empty_for_absent_show() -> None:
@@ -428,20 +540,33 @@ async def test_season_presence_empty_for_absent_show() -> None:
     adapter = _adapter(
         _make_multi_show_handler(calls), base_url="http://season-presence-absent:32400"
     )
-    assert await adapter.season_presence(9999) == frozenset()
+    assert await adapter.season_presence({9999}) == {9999: frozenset()}
     # No show matched -- ``/children`` is never touched at all.
     assert not any(path.startswith("/library/metadata/") for path in calls)
 
 
+async def test_season_presence_empty_batch_returns_empty_mapping_without_any_request() -> None:
+    """An empty ``tmdb_ids`` collection must short-circuit -- no reason to walk any
+    section when nothing was asked for."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_multi_show_handler(calls), base_url="http://season-presence-empty:32400"
+    )
+    assert await adapter.season_presence([]) == {}
+    assert calls == {}
+
+
 async def test_season_presence_does_not_crawl_the_whole_library() -> None:
-    """The proof this exists for (#136): resolving ONE show's seasons must cost
-    O(1) HTTP calls (sections + the owning show section's listing + that show's OWN
-    ``/children``) -- never one ``/children`` fetch per show in the library, which is
-    what ``present_seasons``/``is_available`` pay to answer for ANY show."""
+    """The proof this exists for (#136): resolving a small requested subset of
+    shows' seasons must cost O(1) HTTP calls (sections + the owning show
+    section's listing, walked ONCE, + only the REQUESTED shows' OWN
+    ``/children``) -- never one ``/children`` fetch per show in the library
+    (which is what ``present_seasons``/``is_available`` pay to answer for ANY
+    show), and never a fetch for a show that was not part of the request."""
     calls: dict[str, int] = {}
     adapter = _adapter(_make_multi_show_handler(calls), base_url="http://season-presence-o1:32400")
-    seasons = await adapter.season_presence(2000)
-    assert seasons == frozenset({1})
+    seasons = await adapter.season_presence({2000})
+    assert seasons == {2000: frozenset({1})}
     assert calls["/library/sections"] == 1
     assert calls["/library/sections/2/all"] == 1
     assert calls["/library/metadata/200/children"] == 1
@@ -451,6 +576,41 @@ async def test_season_presence_does_not_crawl_the_whole_library() -> None:
     assert "/library/metadata/300/children" not in calls
     # Movie section untouched -- this is a TV-only targeted lookup.
     assert "/library/sections/1/all" not in calls
+
+
+async def test_season_presence_one_page_walk_for_n_shows() -> None:
+    """(#136 review finding 2) A batch call naming N distinct target shows must
+    still walk the show section's ``/all`` listing EXACTLY ONCE -- never once per
+    requested id -- regardless of N. All three shows in the section are
+    requested here (N=3) and the page-walk count must stay 1, not 3."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_multi_show_handler_all_seasons(calls), base_url="http://season-presence-batch:32400"
+    )
+    result = await adapter.season_presence({1000, 2000, 3000})
+    assert result == {
+        1000: frozenset({1}),
+        2000: frozenset({1}),
+        3000: frozenset({1}),
+    }
+    assert calls["/library/sections/2/all"] == 1
+    # One /children fetch per MATCHED show -- three requested ids, three matches.
+    assert calls["/library/metadata/100/children"] == 1
+    assert calls["/library/metadata/200/children"] == 1
+    assert calls["/library/metadata/300/children"] == 1
+
+
+async def test_season_presence_unions_seasons_across_duplicate_show_entries() -> None:
+    """(#136 review finding 1) The same tmdb id catalogued in TWO show sections
+    (a separate 'TV Shows' and 'Anime' library is a real deployment shape) must
+    have its present seasons UNIONED across every matching item. Returning only
+    the first match's seasons would under-report a season present only on the
+    OTHER duplicate, stalling that season at 'Finalizing' forever."""
+    adapter = _adapter(_duplicate_show_handler, base_url="http://season-presence-dup:32400")
+    result = await adapter.season_presence({7000})
+    # Season 1 comes from the "TV Shows" entry (ratingKey 500), season 2 from the
+    # "Anime" entry (ratingKey 600) -- the union of both, not just one.
+    assert result == {7000: frozenset({1, 2})}
 
 
 async def test_season_presence_is_never_cached_absence() -> None:
@@ -468,7 +628,7 @@ async def test_season_presence_is_never_cached_absence() -> None:
     assert await adapter.present_seasons(1399) == frozenset({0, 1})
     warmed_calls = calls["n"]
     # season_presence re-pages fresh rather than trusting the warm (absent) cache.
-    assert await adapter.season_presence(1399) == frozenset({0, 1})
+    assert await adapter.season_presence({1399}) == {1399: frozenset({0, 1})}
     assert calls["n"] > warmed_calls
 
 

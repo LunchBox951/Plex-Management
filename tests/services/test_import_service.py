@@ -2410,12 +2410,12 @@ async def test_run_availability_cycle_movie_batch_failure_leaves_all_completed_f
     assert b is not None and b.status == RequestStatus.completed
 
 
-async def test_run_availability_cycle_groups_seasons_by_show_one_lookup_per_show(
+async def test_run_availability_cycle_groups_seasons_by_show_one_batch_call_total(
     sessionmaker_: SessionMaker,
 ) -> None:
     """Two distinct shows, three pending seasons total (two on one show) -> exactly
-    TWO ``season_presence`` calls (one per distinct show, never one per season) and
-    ZERO ``is_available`` calls."""
+    ONE ``season_presence`` call for the WHOLE tick (never one per show, never one
+    per season) naming both distinct shows, and ZERO ``is_available`` calls."""
     show_a = await _seed_show_request(sessionmaker_, tmdb_id=1001)
     season_a1 = await _seed_season(sessionmaker_, media_request_id=show_a, season_number=1)
     season_a2 = await _seed_season(sessionmaker_, media_request_id=show_a, season_number=2)
@@ -2427,7 +2427,8 @@ async def test_run_availability_cycle_groups_seasons_by_show_one_lookup_per_show
     async with sessionmaker_() as session:
         await run_availability_cycle(library=library, session=session)
 
-    assert sorted(library.season_presence_calls) == [1001, 2002]
+    assert library.season_presence_calls == 1
+    assert library.season_presence_call_ids == [frozenset({1001, 2002})]
     assert library.is_available_calls == 0
 
     async with sessionmaker_() as session:
@@ -2439,11 +2440,24 @@ async def test_run_availability_cycle_groups_seasons_by_show_one_lookup_per_show
     assert b1 is not None and b1.status.value == "available"
 
 
-async def test_run_availability_cycle_isolates_one_shows_lookup_failure_from_another(
+async def test_run_availability_cycle_no_completed_seasons_skips_season_presence_entirely(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """One show's ``season_presence`` lookup raising must never block a DIFFERENT
-    show's lookup in the same tick (per-show isolation)."""
+    """No completed seasons pending -> not even one ``season_presence`` call is made."""
+    library = FakeLibrary()
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+    assert library.season_presence_calls == 0
+
+
+async def test_run_availability_cycle_tv_batch_failure_leaves_all_pending_seasons_for_retry(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The single batch ``season_presence`` call failing must not crash the cycle,
+    and must leave EVERY distinct show's pending seasons -- not just the one whose
+    id happens to trip the failure -- ``completed`` for the next tick's retry. A
+    real Plex transport failure fails the WHOLE page-walk, not one show in
+    isolation, so there is no partial-batch success to preserve here."""
     show_a = await _seed_show_request(sessionmaker_, tmdb_id=1001)
     season_a1 = await _seed_season(sessionmaker_, media_request_id=show_a, season_number=1)
     show_b = await _seed_show_request(sessionmaker_, tmdb_id=2002)
@@ -2460,10 +2474,11 @@ async def test_run_availability_cycle_isolates_one_shows_lookup_failure_from_ano
     async with sessionmaker_() as session:
         a1 = await session.get(SeasonRequest, season_a1)
         b1 = await session.get(SeasonRequest, season_b1)
-    # Show A's lookup raised -> its season stays completed, retried next cycle.
+    # Show A's id tripped the failure -- its season stays completed, retried next cycle.
     assert a1 is not None and a1.status.value == "completed"
-    # Show B is UNAFFECTED by show A's failure -- the whole point of per-show isolation.
-    assert b1 is not None and b1.status.value == "available"
+    # Show B is NOT isolated from show A's failure: one batch call covers both, so a
+    # transport failure honestly fails the whole TV pass for this tick.
+    assert b1 is not None and b1.status.value == "completed"
 
 
 # --------------------------------------------------------------------------- #
