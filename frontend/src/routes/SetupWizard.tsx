@@ -112,6 +112,11 @@ const EMPTY_ROOTS: LibraryRoots = {
 interface TestResult {
   ok: boolean
   message: string
+  // qBittorrent only (issues #133/#157): a NON-blocking, informational note —
+  // e.g. the client's default save path isn't visible inside this container.
+  // Never flips `ok`; `undefined` for every other service and whenever the
+  // backend didn't set one.
+  note?: string
 }
 
 type ResultsState = Record<ServiceKey, TestResult | null>
@@ -267,7 +272,10 @@ export function SetupWizard() {
     try {
       const res = await validate.mutateAsync({ service, body: bodyFor(service, form) })
       if (validationGen.current[service] !== gen) return // fields changed; ignore stale result
-      setResults((prev) => ({ ...prev, [service]: { ok: res.ok, message: res.message } }))
+      setResults((prev) => ({
+        ...prev,
+        [service]: { ok: res.ok, message: res.message, note: res.download_path_note ?? undefined },
+      }))
     } catch (error) {
       if (validationGen.current[service] !== gen) return
       setResults((prev) => ({
@@ -403,6 +411,11 @@ export function SetupWizard() {
                   <span className="text-sm text-available">{result.message}</span>
                 ) : null}
               </div>
+              {result?.note ? (
+                // Non-blocking, informational — this never gates `allVerified`
+                // (the check above only ever reads `result.ok`).
+                <p className="mt-2 text-xs text-searching">⚠ {result.note}</p>
+              ) : null}
             </section>
           )
         })}

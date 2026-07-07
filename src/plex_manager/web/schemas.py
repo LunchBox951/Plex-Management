@@ -970,6 +970,16 @@ class QueueItem(BaseModel):
     season: int | None = None
     episodes: list[int] | None = None
     failed_reason: str | None = None
+    # Human-legible identity (issue #134): all three degrade honestly to
+    # ``None`` rather than swallowing a missing join/backfill -- an orphaned
+    # download (its request deleted), a pre-migration row with no backfillable
+    # history, or a hashless/legacy row all still render, just without these.
+    # ``title``/``poster_url`` come from the owning ``MediaRequest`` (``None``
+    # for an orphan); ``release_title`` is the grab decision's own release name
+    # persisted at grab time, independent of the request link.
+    title: str | None = None
+    poster_url: str | None = None
+    release_title: str | None = None
 
 
 class QueueResponse(BaseModel):

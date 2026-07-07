@@ -1862,11 +1862,15 @@ export interface components {
             id: number;
             /** Media Request Id */
             media_request_id?: number | null;
+            /** Poster Url */
+            poster_url?: string | null;
             /**
              * Progress
              * @default 0
              */
             progress: number;
+            /** Release Title */
+            release_title?: string | null;
             /** Season */
             season?: number | null;
             /**
@@ -1876,6 +1880,8 @@ export interface components {
             seed_ratio: number;
             /** Status */
             status: string;
+            /** Title */
+            title?: string | null;
             /** Tmdb Id */
             tmdb_id?: number | null;
             /** Torrent Hash */

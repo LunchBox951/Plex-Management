@@ -40,6 +40,12 @@ const DETAIL_MESSAGES: Record<string, string> = {
     'That library folder isn’t visible to Plex Manager. Pick a folder under a mounted volume (usually /media), or fix the container’s volume mounts.',
   not_reportable: 'This title can’t be reported right now — it isn’t imported or available yet.',
   active_duplicate: 'A newer request for this title already exists. Act on that one instead.',
+  not_relocatable:
+    'This download isn’t a path-invisible import-blocked row — there’s nothing to relocate.',
+  downloads_root_unavailable:
+    'No downloads root could be derived for this server. Fix the Docker volume mounts (or set the downloads root) and try again.',
+  relocation_superseded:
+    'The move was requested, but this row was already re-blocked with a different reason — refresh to see the current status.',
 
   // --- Plex sign-in / setup / access (auth error-honesty layer) ---
   plex_tv_unreachable_browser:

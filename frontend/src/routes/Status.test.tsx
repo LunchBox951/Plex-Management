@@ -112,6 +112,45 @@ describe('Status', () => {
     expect(screen.getByText('Not configured')).toBeInTheDocument()
   })
 
+  it('renders a subsystem\'s non-blocking note under its detail, distinct from a failure detail (issues #133/#157)', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        subsystems: [
+          {
+            name: 'qbittorrent',
+            status: 'ok',
+            detail: null,
+            note: "the client's default save path isn't visible inside this container",
+            checked_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    // Still reads "Healthy" -- the note never flips status -- but the caution
+    // is surfaced, not swallowed.
+    expect(screen.getByText('Healthy')).toBeInTheDocument()
+    expect(
+      screen.getByText(/default save path isn't visible inside this container/),
+    ).toBeInTheDocument()
+  })
+
+  it('renders no note line when a subsystem has none', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.queryByText(/⚠/)).not.toBeInTheDocument()
+  })
+
   it('renders the disk usage bar and eviction-candidate preview per root', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })

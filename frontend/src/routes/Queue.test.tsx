@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   queue: [] as QueueItem[],
   markFailed: vi.fn(),
   importDownload: vi.fn(),
+  relocateDownload: vi.fn(),
   toast: vi.fn(),
 }))
 
@@ -25,6 +26,7 @@ vi.mock('../api/hooks', () => ({
   }),
   useMarkFailed: () => ({ mutateAsync: h.markFailed, isPending: false }),
   useImportDownload: () => ({ mutateAsync: h.importDownload, isPending: false }),
+  useRelocateDownload: () => ({ mutateAsync: h.relocateDownload, isPending: false }),
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -48,6 +50,7 @@ describe('Queue — tv season/episode badge', () => {
     h.queue = []
     h.markFailed.mockReset()
     h.importDownload.mockReset()
+    h.relocateDownload.mockReset()
     h.toast.mockReset()
   })
 
@@ -84,11 +87,89 @@ describe('Queue — tv season/episode badge', () => {
   })
 })
 
+describe('Queue — human-legible identity (issue #134)', () => {
+  beforeEach(() => {
+    h.queue = []
+    h.markFailed.mockReset()
+    h.importDownload.mockReset()
+    h.relocateDownload.mockReset()
+    h.toast.mockReset()
+  })
+
+  it('shows the media title as the heading, with release_title as a secondary line', () => {
+    h.queue = [
+      queueItem({
+        title: 'Some Movie',
+        release_title: 'Some.Movie.2020.1080p.WEB-DL.x264-GROUP',
+        poster_url: null,
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.getByText('Some Movie')).toBeInTheDocument()
+    expect(screen.getByText('Some.Movie.2020.1080p.WEB-DL.x264-GROUP')).toBeInTheDocument()
+  })
+
+  it('falls back to release_title as the heading when title is absent, without repeating it', () => {
+    h.queue = [
+      queueItem({
+        title: null,
+        release_title: 'Some.Movie.2020.1080p.WEB-DL.x264-GROUP',
+        poster_url: null,
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(
+      screen.getAllByText('Some.Movie.2020.1080p.WEB-DL.x264-GROUP'),
+    ).toHaveLength(1)
+  })
+
+  it('falls back to a short hash heading when title and release_title are both absent (orphan row)', () => {
+    h.queue = [
+      queueItem({
+        title: null,
+        release_title: null,
+        poster_url: null,
+        torrent_hash: 'abc123def4567890',
+      }),
+    ]
+
+    const { container } = render(<Queue />)
+
+    // Still renders — honesty over silence — with the short hash as the heading.
+    const heading = container.querySelector('p.font-display')
+    expect(heading).toHaveTextContent('abc123def456')
+  })
+
+  it('renders the poster image when poster_url is present', () => {
+    h.queue = [
+      queueItem({ title: 'Some Movie', poster_url: 'https://image.tmdb.org/poster.jpg' }),
+    ]
+
+    const { container } = render(<Queue />)
+
+    const img = container.querySelector('img')
+    expect(img).toHaveAttribute('src', 'https://image.tmdb.org/poster.jpg')
+  })
+
+  it('renders a placeholder (no img) when poster_url is absent', () => {
+    h.queue = [queueItem({ title: 'Some Movie', poster_url: null })]
+
+    const { container } = render(<Queue />)
+
+    expect(container.querySelector('img')).not.toBeInTheDocument()
+  })
+})
+
 describe('Queue actions', () => {
   beforeEach(() => {
     h.queue = []
     h.markFailed.mockReset()
     h.importDownload.mockReset()
+    h.relocateDownload.mockReset()
     h.toast.mockReset()
   })
 
@@ -133,6 +214,7 @@ describe('Queue — Retry import (import_blocked only)', () => {
     h.queue = []
     h.markFailed.mockReset()
     h.importDownload.mockReset()
+    h.relocateDownload.mockReset()
     h.toast.mockReset()
   })
 
@@ -169,6 +251,90 @@ describe('Queue — Retry import (import_blocked only)', () => {
     await waitFor(() =>
       expect(h.toast).toHaveBeenCalledWith(
         expect.objectContaining({ intent: 'error', description: 'still locked' }),
+      ),
+    )
+  })
+})
+
+describe('Queue — Relocate & retry (path-not-visible import_blocked rows, issues #133/#157)', () => {
+  beforeEach(() => {
+    h.queue = []
+    h.markFailed.mockReset()
+    h.importDownload.mockReset()
+    h.relocateDownload.mockReset()
+    h.toast.mockReset()
+  })
+
+  it('shows Relocate & retry for an import_blocked row with the path-not-visible reason, and calls it', () => {
+    h.relocateDownload.mockResolvedValue(queueItem({ id: 11, status: 'import_blocked' }))
+    h.queue = [
+      queueItem({
+        id: 11,
+        status: 'import_blocked',
+        failed_reason: 'download path not visible inside the container /downloads/movie',
+      }),
+    ]
+
+    render(<Queue />)
+
+    fireEvent.click(screen.getByRole('button', { name: /relocate & retry/i }))
+    expect(h.relocateDownload).toHaveBeenCalledWith(11)
+    // The operator still needs to retry the import once qBittorrent settles.
+    expect(screen.getByRole('button', { name: /retry import/i })).toBeInTheDocument()
+  })
+
+  it('does not show Relocate & retry for an import_blocked row with a different reason', () => {
+    h.queue = [
+      queueItem({
+        status: 'import_blocked',
+        failed_reason: 'no video file found in the completed torrent',
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.queryByRole('button', { name: /relocate & retry/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /retry import/i })).toBeInTheDocument()
+  })
+
+  it('does not show Relocate & retry for a non-import_blocked row', () => {
+    h.queue = [
+      queueItem({
+        status: 'downloading',
+        failed_reason: null,
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.queryByRole('button', { name: /relocate & retry/i })).not.toBeInTheDocument()
+  })
+
+  it('surfaces the newer reason honestly on a 409 relocation_superseded', async () => {
+    const apiError: ApiError = {
+      code: 'relocation_superseded',
+      message:
+        'The move was requested, but this row was already re-blocked with a different reason — refresh to see the current status.',
+      status: 409,
+    }
+    h.relocateDownload.mockRejectedValue(apiError)
+    h.queue = [
+      queueItem({
+        status: 'import_blocked',
+        failed_reason: 'download path not visible inside the container /downloads/movie',
+      }),
+    ]
+
+    render(<Queue />)
+
+    fireEvent.click(screen.getByRole('button', { name: /relocate & retry/i }))
+    await waitFor(() =>
+      expect(h.toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          intent: 'error',
+          description:
+            'The move was requested, but this row was already re-blocked with a different reason — refresh to see the current status.',
+        }),
       ),
     )
   })

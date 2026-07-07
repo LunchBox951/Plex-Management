@@ -527,6 +527,15 @@ class Download(Base):
     torrent_attempt: Mapped[int] = mapped_column(default=1, server_default=sa.text("1"))
     scored_releases_json: Mapped[list[dict[str, Any]] | None] = mapped_column(sa.JSON)
     download_path: Mapped[str | None] = mapped_column(String)
+    # The release ("download") title the grab decision picked -- the same value
+    # already written to ``DownloadHistory.source_title`` at grab time (issue
+    # #134). Denormalized here (rather than joined from ``download_history`` on
+    # every queue poll) so the hot 2s queue read stays a plain SELECT and the
+    # release name survives even if history is ever pruned. ``None`` for rows
+    # created before this column existed (backfilled best-effort by the adding
+    # migration) -- the queue UI degrades honestly (title -> release_title ->
+    # short hash).
+    release_title: Mapped[str | None] = mapped_column(String)
 
 
 class DownloadHistory(Base):

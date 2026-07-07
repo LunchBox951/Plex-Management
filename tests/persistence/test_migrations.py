@@ -216,3 +216,140 @@ def test_import_blocked_status_migration_rejects_legacy_duplicate_completed_rows
 
     with pytest.raises(RuntimeError, match="duplicate media_requests"):
         _upgrade(db_path, "41d427bd38e6", monkeypatch)
+
+
+def test_release_title_migration_backfills_from_download_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``release_title`` column-adding migration (issue #134) backfills EXISTING
+    rows from ``download_history.source_title`` -- an operator upgrading mid-download
+    must see a human release name in the queue, not a hole this migration leaves."""
+    db_path = tmp_path / "backfill.db"
+    # Pre-migration head: a downloads row with no release_title column yet, and a
+    # matching grabbed history event carrying the release's source_title.
+    _upgrade(db_path, "7bcbce2c2e2b", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO downloads (torrent_hash, status, progress, seed_ratio,
+                        target_seed_ratio, retry_count, torrent_attempt)
+                    VALUES ('aa1', 'downloading', 0, 0, 1, 0, 1)
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO download_history (torrent_hash, event_type, source_title)
+                    VALUES ('aa1', 'grabbed', 'Some.Movie.2020.1080p.WEB-DL.x264-GROUP')
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "head", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            release_title = conn.execute(
+                text("SELECT release_title FROM downloads WHERE torrent_hash = 'aa1'")
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert release_title == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+def test_release_title_migration_backfill_prefers_the_newest_history_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hash re-grabbed across a terminal-row reuse has MULTIPLE history rows; the
+    backfill must pick the NEWEST ``source_title`` -- the one that actually owns the
+    row's current download -- not an arbitrary or oldest match."""
+    db_path = tmp_path / "backfill-latest.db"
+    _upgrade(db_path, "7bcbce2c2e2b", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO downloads (torrent_hash, status, progress, seed_ratio,
+                        target_seed_ratio, retry_count, torrent_attempt)
+                    VALUES ('reused_hash', 'downloading', 0, 0, 1, 0, 1)
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO download_history (torrent_hash, event_type, source_title)
+                    VALUES ('reused_hash', 'grabbed', 'Old.Release-GROUP')
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO download_history (torrent_hash, event_type, source_title)
+                    VALUES ('reused_hash', 'grabbed', 'New.Release-GROUP')
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "head", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            release_title = conn.execute(
+                text("SELECT release_title FROM downloads WHERE torrent_hash = 'reused_hash'")
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert release_title == "New.Release-GROUP"
+
+
+def test_release_title_migration_leaves_unmatched_rows_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A downloads row with no corresponding ``download_history`` event (e.g. a
+    hashless legacy row) is left honestly ``NULL`` -- the backfill never fabricates
+    a release name."""
+    db_path = tmp_path / "backfill-none.db"
+    _upgrade(db_path, "7bcbce2c2e2b", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO downloads (torrent_hash, status, progress, seed_ratio,
+                        target_seed_ratio, retry_count, torrent_attempt)
+                    VALUES ('no_history', 'downloading', 0, 0, 1, 0, 1)
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "head", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            release_title = conn.execute(
+                text("SELECT release_title FROM downloads WHERE torrent_hash = 'no_history'")
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert release_title is None
