@@ -22,6 +22,7 @@ from plex_manager.adapters.prowlarr.adapter import IndexerError, IndexerRateLimi
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Blocklist,
     Download,
@@ -36,6 +37,7 @@ from plex_manager.ports.download_client import AddResult
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import correction_service, season_request_service
+from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
 from plex_manager.services.library_roots import LibraryRoots
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate
 
@@ -1928,3 +1930,210 @@ async def test_report_issue_leaves_scope_searching_when_the_regrab_leaves_an_unt
     assert len(blocklist) == 1
     # The failed re-grab created no new active download row -- only the terminal culprit.
     assert {d.status for d in downloads} == {"imported"}
+
+
+# --------------------------------------------------------------------------- #
+# relocate_stranded_download (issues #133/#157) -- the operator correction verb
+# for a torrent whose reported content sits outside every visible /downloads
+# mount: relocate it INTO the app's own derived downloads root, then leave it
+# retryable for the existing import-retry endpoint.
+# --------------------------------------------------------------------------- #
+_STRANDED_HASH = "b" * 40
+
+
+async def _seed_import_blocked_download(
+    sm: SessionMaker,
+    *,
+    torrent_hash: str = _STRANDED_HASH,
+    reason: str = PATH_NOT_VISIBLE_REASON_PREFIX
+    + "(check volume mounts / content mismatch): /downloads/x",
+    status: str = DownloadState.ImportBlocked.value,
+) -> int:
+    async with sm() as session:
+        row = Download(
+            torrent_hash=torrent_hash,
+            status=status,
+            failed_reason=reason,
+            tmdb_id=_TMDB,
+            year=2020,
+        )
+        session.add(row)
+        await session.commit()
+        return row.id
+
+
+async def test_relocate_stranded_download_requests_the_move_and_stays_retryable(
+    sessionmaker_: SessionMaker,
+) -> None:
+    download_id = await _seed_import_blocked_download(sessionmaker_)
+    qbt = FakeQbittorrent()
+
+    async with sessionmaker_() as session:
+        updated = await correction_service.relocate_stranded_download(
+            session,
+            qbt,
+            download_id=download_id,
+            downloads_host_root="/home/lunchbox/Downloads",
+        )
+
+    # The ONLY destination ever handed to qBittorrent is the app's own derived root.
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+    # Left retryable (import_blocked), same state the existing "Retry import"
+    # endpoint already resumes from -- but the reason now reflects the relocate.
+    assert updated.status == DownloadState.ImportBlocked.value
+    assert updated.failed_reason is not None
+    assert "/home/lunchbox/Downloads" in updated.failed_reason
+    assert "retry the import" in updated.failed_reason
+
+
+async def test_relocate_stranded_download_rejects_a_missing_download(
+    sessionmaker_: SessionMaker,
+) -> None:
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.DownloadNotFoundError):
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=999_999,
+                downloads_host_root="/home/lunchbox/Downloads",
+            )
+    # Nothing was sent to qBittorrent for a download that does not exist.
+    assert qbt.relocated == []
+
+
+async def test_relocate_stranded_download_rejects_a_non_import_blocked_row(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # e.g. still 'downloading' -- nothing stranded to relocate yet.
+    download_id = await _seed_import_blocked_download(
+        sessionmaker_, status=DownloadState.Downloading.value, reason=""
+    )
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.NotRelocatableError):
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=download_id,
+                downloads_host_root="/home/lunchbox/Downloads",
+            )
+    assert qbt.relocated == []
+
+
+async def test_relocate_stranded_download_rejects_a_different_import_blocked_reason(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Scoped EXACTLY to the path-not-visible block -- a DIFFERENT import_blocked
+    reason (e.g. a genuinely bad/wrong-media file) has nothing a relocate would
+    fix, so it must be refused rather than silently no-op'd."""
+    download_id = await _seed_import_blocked_download(
+        sessionmaker_, reason="no video file found in the completed torrent"
+    )
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.NotRelocatableError):
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=download_id,
+                downloads_host_root="/home/lunchbox/Downloads",
+            )
+    assert qbt.relocated == []
+
+
+async def test_relocate_stranded_download_refuses_without_a_derivable_root(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Root-guard: with no host downloads root derivable (bare metal, no Docker
+    split), there is nothing safe to relocate into -- refuse rather than send
+    qBittorrent an empty/placeholder location."""
+    download_id = await _seed_import_blocked_download(sessionmaker_)
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.DownloadsRootUnavailableError):
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=download_id,
+                downloads_host_root="",
+            )
+    assert qbt.relocated == []
+
+
+async def test_relocate_stranded_download_propagates_qbittorrent_errors(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Honesty over silence: a qBittorrent failure during the relocate request
+    must surface, never be swallowed into a falsely 'accepted' relocation."""
+
+    class _FailingQbt(FakeQbittorrent):
+        async def set_location(self, info_hash: str, save_path: str) -> None:
+            raise QbittorrentError("qbittorrent unreachable")
+
+    download_id = await _seed_import_blocked_download(sessionmaker_)
+    qbt = _FailingQbt()
+    async with sessionmaker_() as session:
+        with pytest.raises(QbittorrentError):
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=download_id,
+                downloads_host_root="/home/lunchbox/Downloads",
+            )
+    # The row is left untouched (still the original path-not-visible reason) --
+    # no falsely 'accepted' relocation was recorded.
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        assert row.status == DownloadState.ImportBlocked.value
+        assert row.failed_reason is not None
+        assert row.failed_reason.startswith(PATH_NOT_VISIBLE_REASON_PREFIX)
+
+
+_NEWER_BLOCK_REASON = "no video file found in the completed torrent"
+
+
+async def test_relocate_stranded_download_surfaces_a_newer_block_reason(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-trip of the CAS fix: a concurrent 'Retry Import' re-blocks the row
+    with a NEWER, genuinely different reason in the gap between
+    ``relocate_stranded_download`` observing the row and its own terminal write
+    landing. The relocate must not clobber that fresher diagnostic with its stale
+    "relocation requested" message -- it must surface the newer truth instead."""
+
+    class _ReblockingQbt(FakeQbittorrent):
+        """Models a concurrent Retry Import committing a DIFFERENT block reason
+        for this same row while ``set_location`` is in flight."""
+
+        async def set_location(self, info_hash: str, save_path: str) -> None:
+            await super().set_location(info_hash, save_path)
+            async with sessionmaker_() as racer_session:
+                row = await racer_session.get(Download, download_id)
+                assert row is not None
+                row.failed_reason = _NEWER_BLOCK_REASON
+                await racer_session.commit()
+
+    download_id = await _seed_import_blocked_download(sessionmaker_)
+    qbt = _ReblockingQbt()
+
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.RelocationSupersededError) as exc_info:
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=download_id,
+                downloads_host_root="/home/lunchbox/Downloads",
+            )
+    assert exc_info.value.current_reason == _NEWER_BLOCK_REASON
+
+    # The relocation WAS still issued to qBittorrent...
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+    # ...but the row keeps the racer's fresher, genuinely different reason --
+    # never overwritten by relocate's stale "relocation requested" text.
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        assert row.status == DownloadState.ImportBlocked.value
+        assert row.failed_reason == _NEWER_BLOCK_REASON

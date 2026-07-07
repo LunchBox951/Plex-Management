@@ -257,7 +257,15 @@ class ServiceValidateResponse(BaseModel):
     a failed Plex check). ``machine_identifier`` is the probed Plex server's
     ``machineIdentifier`` (from its ``/identity``) — set only when the caller asked
     for the ownership-verifying variant of the Plex probe, so setup can assert
-    ownership and store the id; ``None`` otherwise."""
+    ownership and store the id; ``None`` otherwise.
+
+    ``download_path_note`` (qBittorrent only, issues #133/#157) is a NON-blocking,
+    informational message: set only on an ``ok=True`` qBittorrent check whose
+    client-reported default save path is NOT visible inside this container. It never
+    flips ``ok`` to ``False`` -- Plex Manager directs every grab's ``save_path``
+    explicitly (never relies on this default), so the mismatch is honestly
+    surfaced but does not block setup/health. ``None`` for every other service, and
+    for qBittorrent whenever the default path IS visible or could not be read."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -266,6 +274,7 @@ class ServiceValidateResponse(BaseModel):
     detail: str | None = None
     libraries: list[PlexLibraryOption] | None = None
     machine_identifier: str | None = None
+    download_path_note: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1064,13 +1073,19 @@ class QualityProfileResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 class SubsystemHealthItem(BaseModel):
     """One upstream's reachability, as ``services.health_service.SubsystemHealth``
-    reports it. ``not_configured`` is honest -- never confused with ``down``."""
+    reports it. ``not_configured`` is honest -- never confused with ``down``.
+
+    ``note`` (qBittorrent only, issues #133/#157) is a NON-blocking, informational
+    signal -- e.g. the client's default save path isn't visible inside this
+    container -- distinct from ``detail`` (which carries only FAILURE diagnostics,
+    ``None`` whenever ``status == "ok"``). ``None`` for every other subsystem."""
 
     model_config = ConfigDict(frozen=True)
 
     name: str
     status: Literal["ok", "degraded", "down", "not_configured"]
     detail: str | None = None
+    note: str | None = None
     checked_at: datetime
 
 

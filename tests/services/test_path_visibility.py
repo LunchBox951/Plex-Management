@@ -20,6 +20,7 @@ from plex_manager.services.path_visibility import (
     remap_download_content,
     remap_library_root,
     remap_to_visible,
+    resolve_downloads_host_root,
 )
 
 # Captured at import time, BEFORE the autouse fixture patches the module attr, so
@@ -450,3 +451,23 @@ def test_a_plain_directory_never_counts_as_a_mount(
     )
     # An already-visible path is untouched by the gate (step 1 needs no mount).
     assert remap_to_visible(str(mount / "Movies"), [str(mount)]) == str(mount / "Movies")
+
+
+# --------------------------------------------------------------------------- #
+# resolve_downloads_host_root (issues #133/#157 -- deriving the HOST-namespace
+# downloads root that directs qBittorrent's per-add ``save_path``).
+#
+# There is deliberately NO ``/proc/self/mountinfo`` fallback: mountinfo's
+# ``root`` field is the path relative to the MOUNTED FILESYSTEM, not a
+# host-namespace pathname (for a bind whose source is its own disk, ``root``
+# is just ``/``), so it cannot recover the host path and a prior fallback
+# built on it is gone. ``Settings.downloads_root`` /
+# ``PLEX_MANAGER_DOWNLOADS_ROOT`` is the only source now.
+# --------------------------------------------------------------------------- #
+def test_resolve_downloads_host_root_prefers_configured() -> None:
+    assert resolve_downloads_host_root("/configured/root") == "/configured/root"
+
+
+def test_resolve_downloads_host_root_none_when_unconfigured() -> None:
+    assert resolve_downloads_host_root(None) is None
+    assert resolve_downloads_host_root("") is None

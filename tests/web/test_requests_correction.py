@@ -26,6 +26,7 @@ from plex_manager.models import (
     RequestStatus,
     Setting,
 )
+from plex_manager.web.deps import get_downloads_host_root
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -108,6 +109,7 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
             ]
         ),
     )
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
 
     response = await client.post(
         f"/api/v1/requests/{request_id}/report-issue",
@@ -124,6 +126,11 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
         downloads = (await session.execute(select(Download))).scalars().all()
     assert len(blocklist) == 1
     assert {d.torrent_hash for d in downloads if d.status != "imported"} == {_ALT}
+    # Issues #133/#157: the inline re-grab directs the replacement torrent at
+    # the derived HOST-namespace downloads root, not qBittorrent's own default.
+    assert len(qbt.added) == 1
+    _source, save_path, _category = qbt.added[0]
+    assert save_path == "/home/lunchbox/Downloads"
 
 
 async def test_report_issue_endpoint_purges_anime_content_under_the_anime_root(

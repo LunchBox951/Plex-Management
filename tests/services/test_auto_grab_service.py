@@ -229,6 +229,7 @@ async def _run(
     now: datetime = _NOW,
     clock: Callable[[], datetime] | None = None,
     cooldowns: auto_grab_service.CooldownRegistry | None = None,
+    save_path: str = "",
 ) -> auto_grab_service.AutograbCycleResult:
     async with sessionmaker_() as session:
         return await auto_grab_service.run_grab_cycle(
@@ -244,6 +245,7 @@ async def _run(
             # clock test injects an advancing clock instead.
             clock=clock or (lambda: now),
             cooldowns=cooldowns,
+            save_path=save_path,
         )
 
 
@@ -418,6 +420,9 @@ async def test_movie_grab_success_moves_to_downloading(sessionmaker_: SessionMak
 
     assert result.grabbed == 1
     assert len(qbt.added) == 1  # exactly one torrent handed to the client
+    # Default (no save_path passed): qBittorrent's own default dir stays in
+    # charge, unchanged prior behaviour.
+    assert qbt.added[0][1] == ""
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
         assert row is not None
@@ -430,6 +435,21 @@ async def test_movie_grab_success_moves_to_downloading(sessionmaker_: SessionMak
             await session.execute(select(Download).where(Download.media_request_id == request_id))
         ).scalar_one()
         assert download.status == "downloading"
+
+
+async def test_auto_grab_directs_save_path_when_supplied(sessionmaker_: SessionMaker) -> None:
+    """Issues #133/#157: an auto-grabbed torrent is directed at the caller's
+    resolved HOST-namespace downloads root exactly like a manual grab, rather
+    than landing in qBittorrent's own (possibly invisible) default dir."""
+    await _seed_movie(sessionmaker_, tmdb_id=603)
+    qbt = FakeQbittorrent()
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+
+    result = await _run(sessionmaker_, prowlarr, qbt, save_path="/home/lunchbox/Downloads")
+
+    assert result.grabbed == 1
+    assert len(qbt.added) == 1
+    assert qbt.added[0][1] == "/home/lunchbox/Downloads"
 
 
 # --------------------------------------------------------------------------- #

@@ -12,6 +12,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from plex_manager.services import path_visibility
 from plex_manager.services.health_service import ReconcileStatus
 from plex_manager.web.deps import SettingsStore
 
@@ -97,6 +98,45 @@ async def test_prowlarr_reports_ok_then_down_once_configured(
     down_body = {s["name"]: s for s in down_response.json()["subsystems"]}
     assert down_body["prowlarr"]["status"] == "down"
     assert down_body["prowlarr"]["detail"] is not None
+
+
+async def test_qbittorrent_carries_a_note_when_its_default_save_path_is_invisible(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issues #133/#157: the ``/ops/health`` surface carries the SAME
+    non-blocking save-path-visibility signal setup validation does."""
+
+    def _never_a_mount(_path: str) -> bool:
+        return False
+
+    monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_mount)
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://qb.local")
+        await store.set("qbittorrent_username", "admin")
+        await store.set("qbittorrent_password", "pw")
+        await session.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/torrents/info":
+            return httpx.Response(200, json=[])
+        if path == "/api/v2/app/preferences":
+            return httpx.Response(
+                200, json={"save_path": "/definitely-not-a-real-host-path/Downloads"}
+            )
+        raise AssertionError(f"unexpected path {path}")  # pragma: no cover
+
+    await _use_transport(app, handler)
+    response = await client.get("/api/v1/ops/health", headers=_HEADERS)
+    by_name = {s["name"]: s for s in response.json()["subsystems"]}
+    assert by_name["qbittorrent"]["status"] == "ok"
+    assert by_name["qbittorrent"]["note"] is not None
+    assert "/definitely-not-a-real-host-path/Downloads" in by_name["qbittorrent"]["note"]
 
 
 async def test_subsystem_probe_is_ttl_cached_across_requests(

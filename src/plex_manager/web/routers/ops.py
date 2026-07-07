@@ -171,7 +171,11 @@ async def health_endpoint(
     return HealthResponse(
         subsystems=[
             SubsystemHealthItem(
-                name=s.name, status=s.status, detail=s.detail, checked_at=s.checked_at
+                name=s.name,
+                status=s.status,
+                detail=s.detail,
+                checked_at=s.checked_at,
+                note=s.note,
             )
             for s in snapshot.subsystems
         ],

@@ -1975,7 +1975,7 @@
         "type": "object"
       },
       "ServiceValidateResponse": {
-        "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.\n\nFor Plex, ``libraries`` carries the movie AND tv library folders (each tagged\nby ``section_type``) so the UI can offer pick-lists for ``movies_root`` /\n``tv_root`` instead of a typed path. ``None`` for every other service (and for\na failed Plex check). ``machine_identifier`` is the probed Plex server's\n``machineIdentifier`` (from its ``/identity``) \u2014 set only when the caller asked\nfor the ownership-verifying variant of the Plex probe, so setup can assert\nownership and store the id; ``None`` otherwise.",
+        "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.\n\nFor Plex, ``libraries`` carries the movie AND tv library folders (each tagged\nby ``section_type``) so the UI can offer pick-lists for ``movies_root`` /\n``tv_root`` instead of a typed path. ``None`` for every other service (and for\na failed Plex check). ``machine_identifier`` is the probed Plex server's\n``machineIdentifier`` (from its ``/identity``) \u2014 set only when the caller asked\nfor the ownership-verifying variant of the Plex probe, so setup can assert\nownership and store the id; ``None`` otherwise.\n\n``download_path_note`` (qBittorrent only, issues #133/#157) is a NON-blocking,\ninformational message: set only on an ``ok=True`` qBittorrent check whose\nclient-reported default save path is NOT visible inside this container. It never\nflips ``ok`` to ``False`` -- Plex Manager directs every grab's ``save_path``\nexplicitly (never relies on this default), so the mismatch is honestly\nsurfaced but does not block setup/health. ``None`` for every other service, and\nfor qBittorrent whenever the default path IS visible or could not be read.",
         "properties": {
           "detail": {
             "anyOf": [
@@ -1987,6 +1987,17 @@
               }
             ],
             "title": "Detail"
+          },
+          "download_path_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Path Note"
           },
           "libraries": {
             "anyOf": [
@@ -2667,7 +2678,7 @@
         "type": "object"
       },
       "SubsystemHealthItem": {
-        "description": "One upstream's reachability, as ``services.health_service.SubsystemHealth``\nreports it. ``not_configured`` is honest -- never confused with ``down``.",
+        "description": "One upstream's reachability, as ``services.health_service.SubsystemHealth``\nreports it. ``not_configured`` is honest -- never confused with ``down``.\n\n``note`` (qBittorrent only, issues #133/#157) is a NON-blocking, informational\nsignal -- e.g. the client's default save path isn't visible inside this\ncontainer -- distinct from ``detail`` (which carries only FAILURE diagnostics,\n``None`` whenever ``status == \"ok\"``). ``None`` for every other subsystem.",
         "properties": {
           "checked_at": {
             "format": "date-time",
@@ -2688,6 +2699,17 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
           },
           "status": {
             "enum": [
@@ -3838,6 +3860,78 @@
           }
         ],
         "summary": "Mark Failed Endpoint",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
+    "/api/v1/queue/{download_id}/relocate": {
+      "post": {
+        "description": "Operator correction: relocate an import-blocked, path-invisible download\ninto the mounted downloads root (issues #133/#157).\n\nScoped to EXACTLY the honest \"download path not visible inside the\ncontainer\" block (409 ``not_relocatable`` for any other row/reason). qBittorrent\nmoves content asynchronously -- this call only REQUESTS the move and returns; the\noperator retries the import (``POST /queue/{id}/import``, already retryable \u2014\n``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:\nonly ever relocates INTO the app's own derived downloads root (409\n``downloads_root_unavailable`` when that root cannot be derived \u2014 bare metal, no\nDocker split), never an arbitrary path. If a concurrent Retry Import re-blocks\nthe row with a newer, different reason before this call's own status write\nlands, the move was still requested but the row's message is left alone (409\n``relocation_superseded`` \u2014 re-fetch the queue item to see the current reason).",
+        "operationId": "relocate_endpoint_api_v1_queue__download_id__relocate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "download_id",
+            "required": true,
+            "schema": {
+              "title": "Download Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Referenced queue resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Queue action conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Relocate Endpoint",
         "tags": [
           "queue"
         ]

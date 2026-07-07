@@ -468,6 +468,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/queue/{download_id}/relocate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Relocate Endpoint
+         * @description Operator correction: relocate an import-blocked, path-invisible download
+         *     into the mounted downloads root (issues #133/#157).
+         *
+         *     Scoped to EXACTLY the honest "download path not visible inside the
+         *     container" block (409 ``not_relocatable`` for any other row/reason). qBittorrent
+         *     moves content asynchronously -- this call only REQUESTS the move and returns; the
+         *     operator retries the import (``POST /queue/{id}/import``, already retryable —
+         *     ``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:
+         *     only ever relocates INTO the app's own derived downloads root (409
+         *     ``downloads_root_unavailable`` when that root cannot be derived — bare metal, no
+         *     Docker split), never an arbitrary path. If a concurrent Retry Import re-blocks
+         *     the row with a newer, different reason before this call's own status write
+         *     lands, the move was still requested but the row's message is left alone (409
+         *     ``relocation_superseded`` — re-fetch the queue item to see the current reason).
+         */
+        post: operations["relocate_endpoint_api_v1_queue__download_id__relocate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/requests": {
         parameters: {
             query?: never;
@@ -2014,10 +2047,20 @@ export interface components {
          *     ``machineIdentifier`` (from its ``/identity``) — set only when the caller asked
          *     for the ownership-verifying variant of the Plex probe, so setup can assert
          *     ownership and store the id; ``None`` otherwise.
+         *
+         *     ``download_path_note`` (qBittorrent only, issues #133/#157) is a NON-blocking,
+         *     informational message: set only on an ``ok=True`` qBittorrent check whose
+         *     client-reported default save path is NOT visible inside this container. It never
+         *     flips ``ok`` to ``False`` -- Plex Manager directs every grab's ``save_path``
+         *     explicitly (never relies on this default), so the mismatch is honestly
+         *     surfaced but does not block setup/health. ``None`` for every other service, and
+         *     for qBittorrent whenever the default path IS visible or could not be read.
          */
         ServiceValidateResponse: {
             /** Detail */
             detail?: string | null;
+            /** Download Path Note */
+            download_path_note?: string | null;
             /** Libraries */
             libraries?: components["schemas"]["PlexLibraryOption"][] | null;
             /** Machine Identifier */
@@ -2212,6 +2255,11 @@ export interface components {
          * SubsystemHealthItem
          * @description One upstream's reachability, as ``services.health_service.SubsystemHealth``
          *     reports it. ``not_configured`` is honest -- never confused with ``down``.
+         *
+         *     ``note`` (qBittorrent only, issues #133/#157) is a NON-blocking, informational
+         *     signal -- e.g. the client's default save path isn't visible inside this
+         *     container -- distinct from ``detail`` (which carries only FAILURE diagnostics,
+         *     ``None`` whenever ``status == "ok"``). ``None`` for every other subsystem.
          */
         SubsystemHealthItem: {
             /**
@@ -2223,6 +2271,8 @@ export interface components {
             detail?: string | null;
             /** Name */
             name: string;
+            /** Note */
+            note?: string | null;
             /**
              * Status
              * @enum {string}
@@ -2792,6 +2842,55 @@ export interface operations {
                 blocklist?: boolean;
                 remove_torrent?: boolean;
             };
+            header?: never;
+            path: {
+                download_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueueItem"];
+                };
+            };
+            /** @description Referenced queue resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Queue action conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    relocate_endpoint_api_v1_queue__download_id__relocate_post: {
+        parameters: {
+            query?: never;
             header?: never;
             path: {
                 download_id: number;

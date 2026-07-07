@@ -63,6 +63,21 @@ class Settings(BaseSettings):
     # owner sign-in.
     setup_token: SecretStr | None = None
 
+    # The HOST-namespace directory docker-compose binds to this container's
+    # /downloads (docker-compose.yml's ``PLEX_MANAGER_DOWNLOADS_ROOT`` bind
+    # source — ``env_file: .env`` hands the SAME variable to the container, so
+    # it is already sitting in the environment, just unread until now). Used to
+    # DIRECT qBittorrent's per-add ``save_path`` (issues #133/#157): qBittorrent
+    # runs on the HOST, so torrents must be told to land under a path this
+    # container's ``/downloads`` mount actually backs, rather than qBittorrent's
+    # own (unknown, possibly host-default) save directory. ``None`` (unset,
+    # bare metal / no Docker split) leaves qBittorrent's own default in charge —
+    # unchanged prior behaviour, never a guessed path. There is deliberately no
+    # ``/proc/self/mountinfo`` fallback: see
+    # ``path_visibility.resolve_downloads_host_root`` for why that field cannot
+    # recover a host-namespace path.
+    downloads_root: str | None = None
+
     # Override auth-cookie Secure handling for TLS-terminating reverse proxies.
     # ``None`` means infer from the request scheme.
     auth_cookie_secure: bool | None = None
