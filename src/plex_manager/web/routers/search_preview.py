@@ -134,6 +134,23 @@ async def run_preview(
 ) -> DecisionResult:
     """Resolve the descriptor and run the decision engine (shared with grab)."""
     tmdb_id, title, media_type, year, season, episodes = await _resolve_descriptor(body, session)
+    # Branch on the resolved media's ACTUAL type, never on whether ``season``
+    # happens to be set -- mirrors the grab endpoint's exact scope guard
+    # (queue.py's tv_grab_requires_season / movie_grab_rejects_season) so an
+    # invalid combination is rejected up front, BEFORE the indexer is ever
+    # queried: a tv preview with no season would search an unscoped season and
+    # return misleading accepted/rejected releases instead of surfacing the
+    # invalid request; a movie preview carrying a season/episodes would
+    # masquerade as a scoped tv search.
+    if media_type == "tv":
+        if season is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+            )
+    elif season is not None or episodes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
+        )
     return await decision_service.preview(
         prowlarr,
         parser,

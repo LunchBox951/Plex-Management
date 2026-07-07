@@ -217,21 +217,31 @@ def _reuse_conflicts(
 
     - a DIFFERENT ``season`` always conflicts (a different ``SeasonRequest``);
     - same season, the active row's EPISODE scope must cover the request:
-      ``episodes_json is None`` imports the whole season -> covers any request; a
-      whole-season request (``episodes is None``) is covered ONLY by a whole-season
-      active row; otherwise the request's episodes must be a SUBSET of the active
-      row's episodes.
+      ``episodes_json is None`` (or empty -- see below) imports the whole season ->
+      covers any request; a whole-season request (``episodes`` ``None``/empty) is
+      covered ONLY by a whole-season active row; otherwise the request's episodes
+      must be a SUBSET of the active row's episodes.
 
     Movies (both seasons ``None``, both episode lists ``None``) always cover -> the
     reuse stays an idempotent no-op, unchanged.
+
+    Both ``existing.episodes`` and ``episodes`` are truthy-checked (``or None``),
+    not identity-checked (``is None``): the schema layer normalizes an incoming
+    ``episodes: []`` to ``None`` before it ever reaches here (issue #102), but this
+    is still a domain-boundary backstop -- a stored row from BEFORE that fix
+    shipped, or any future internal caller that bypasses the pydantic schema, must
+    not defeat these checks by carrying a literal ``[]`` instead of ``None``: both
+    already mean "whole season" per the documented contract.
     """
     if existing.season != season:
         return True
-    if existing.episodes is None:
+    existing_episodes = existing.episodes or None
+    episodes = episodes or None
+    if existing_episodes is None:
         return False
     if episodes is None:
         return True
-    return not set(episodes).issubset(set(existing.episodes))
+    return not set(episodes).issubset(set(existing_episodes))
 
 
 class TorrentAlreadyTrackedError(Exception):
@@ -516,10 +526,22 @@ async def grab(
     # Parallel-grab guard: if this request already has an active (non-terminal)
     # download for a DIFFERENT release, refuse rather than create a second active
     # row. The known-hash precheck above already returned for the SAME release, so
-    # an active download whose hash differs (or that we can't yet match because the
-    # indexer gave no hash) is a genuine second grab. Checked BEFORE handing the
-    # torrent to the client, so nothing is added on rejection.
-    if request_id is not None:
+    # an active download whose hash differs is a genuine second grab. Checked
+    # BEFORE handing the torrent to the client, so nothing is added on rejection.
+    #
+    # Gated on ``known_hash is not None``: when the indexer omitted info_hash we
+    # cannot yet tell whether ``active`` IS this same release (its real hash is
+    # only known after ``qbt.add`` returns) or genuinely a different one -- and
+    # ``active.torrent_hash != known_hash`` (``None``) is trivially true for EVERY
+    # active row, so a hashless candidate would always fail this guard and 409 a
+    # legitimate same-release re-grab (a UI double-click retry) before the client
+    # even had a chance to resolve the hash and let the post-add reconciliation
+    # below (``existing = get_by_hash(torrent_hash)``) recognize it as a no-op.
+    # Deferring here is safe: a genuinely different release still active for this
+    # request is caught just as honestly after the add, via the
+    # ``uq_downloads_active_request`` partial unique index raising IntegrityError
+    # (handled below), which resolves to the same ``AlreadyDownloadingError``.
+    if request_id is not None and known_hash is not None:
         active = await download_repo.find_active_for_request(request_id, season=season)
         if active is not None and active.torrent_hash != known_hash:
             raise AlreadyDownloadingError(request_id)

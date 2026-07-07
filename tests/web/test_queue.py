@@ -1119,6 +1119,94 @@ async def test_grab_threads_season_and_episodes_into_search_and_queue_item(
     assert prowlarr.searched[-1].episode == "5"
 
 
+async def test_grab_empty_episodes_persists_none_whole_season_scope(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #102: a hand-crafted ``episodes: []`` body must persist ``None``
+    (whole-season), not an empty scoped list -- the schema boundary normalizes
+    it BEFORE it ever reaches ``episodes_json``, so it can't later defeat
+    ``_reuse_conflicts``' strict ``is None`` identity checks."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="6" * 40)]
+        ),
+        qbt=FakeQbittorrent(),
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2, "episodes": []},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 201
+    assert response.json()["episodes"] is None
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == "6" * 40))
+        ).scalar_one()
+    assert row.episodes_json is None  # never persisted as []
+
+
+async def test_grab_empty_episodes_then_whole_season_regrab_is_idempotent(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #102 end-to-end: a first grab with a hand-crafted ``episodes: []``
+    normalizes to ``None`` on persist, so a LATER legitimate whole-season
+    re-grab of the SAME release (``episodes`` omitted) is recognized as the
+    same scope -- an idempotent no-op, not a spurious
+    ``DownloadScopeConflictError`` (409)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    release = candidate("Some.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="6" * 40)
+    override_adapters(app, prowlarr=FakeProwlarr([release]), qbt=FakeQbittorrent())
+
+    first = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2, "episodes": []},
+        headers=_HEADERS,
+    )
+    assert first.status_code == 201
+
+    override_adapters(app, prowlarr=FakeProwlarr([release]), qbt=FakeQbittorrent())
+    second = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert second.status_code == 201  # not a 409 download_scope_conflict
+    assert second.json()["id"] == first.json()["id"]
+
+
 async def test_grab_tv_without_season_rejected_422_and_adds_nothing(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:

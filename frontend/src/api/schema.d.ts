@@ -1953,9 +1953,16 @@ export interface components {
          * SearchPreviewRequest
          * @description Preview by ``request_id`` OR by an explicit media descriptor.
          *
-         *     When ``request_id`` is set the other fields are ignored (resolved from the
-         *     stored request). Otherwise ``tmdb_id``, ``media_type`` and ``title`` are
-         *     required.
+         *     When ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are
+         *     resolved from the stored request and any values passed for them are ignored;
+         *     ``season``/``episodes`` always come from THIS body regardless -- a stored
+         *     request carries no per-search season/episode scoping of its own. Otherwise
+         *     (no ``request_id``) ``tmdb_id``, ``media_type`` and ``title`` are required.
+         *
+         *     Every TV preview is per-season: the endpoint REJECTS (422) a tv media type
+         *     previewed with no ``season``, and REJECTS (422) a non-tv (movie) media type
+         *     previewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's
+         *     scope guard exactly, so an invalid combination never reaches the indexer.
          */
         SearchPreviewRequest: {
             /** Episodes */

@@ -1835,7 +1835,7 @@
         "type": "object"
       },
       "SearchPreviewRequest": {
-        "description": "Preview by ``request_id`` OR by an explicit media descriptor.\n\nWhen ``request_id`` is set the other fields are ignored (resolved from the\nstored request). Otherwise ``tmdb_id``, ``media_type`` and ``title`` are\nrequired.",
+        "description": "Preview by ``request_id`` OR by an explicit media descriptor.\n\nWhen ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are\nresolved from the stored request and any values passed for them are ignored;\n``season``/``episodes`` always come from THIS body regardless -- a stored\nrequest carries no per-search season/episode scoping of its own. Otherwise\n(no ``request_id``) ``tmdb_id``, ``media_type`` and ``title`` are required.\n\nEvery TV preview is per-season: the endpoint REJECTS (422) a tv media type\npreviewed with no ``season``, and REJECTS (422) a non-tv (movie) media type\npreviewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's\nscope guard exactly, so an invalid combination never reaches the indexer.",
         "properties": {
           "episodes": {
             "anyOf": [
