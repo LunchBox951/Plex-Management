@@ -868,9 +868,16 @@ class RequestListResponse(BaseModel):
 class SearchPreviewRequest(BaseModel):
     """Preview by ``request_id`` OR by an explicit media descriptor.
 
-    When ``request_id`` is set the other fields are ignored (resolved from the
-    stored request). Otherwise ``tmdb_id``, ``media_type`` and ``title`` are
-    required.
+    When ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are
+    resolved from the stored request and any values passed for them are ignored;
+    ``season``/``episodes`` always come from THIS body regardless -- a stored
+    request carries no per-search season/episode scoping of its own. Otherwise
+    (no ``request_id``) ``tmdb_id``, ``media_type`` and ``title`` are required.
+
+    Every TV preview is per-season: the endpoint REJECTS (422) a tv media type
+    previewed with no ``season``, and REJECTS (422) a non-tv (movie) media type
+    previewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's
+    scope guard exactly, so an invalid combination never reaches the indexer.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -885,6 +892,17 @@ class SearchPreviewRequest(BaseModel):
     # empty means "the whole season" -- this is also what makes ``decision_service.
     # preview`` prefer a season-pack release over an equivalent single episode.
     episodes: list[int] | None = None
+
+    @field_validator("episodes")
+    @classmethod
+    def _normalize_empty_episodes(cls, value: list[int] | None) -> list[int] | None:
+        """Coerce ``[]`` to ``None`` (issue #102): both mean "whole season", but
+        only ``None`` is what ``_reuse_conflicts``' strict ``is None`` identity
+        checks (grab_service.py) recognize as such. Normalizing here -- at the
+        schema boundary -- means an unnormalized ``[]`` can never reach a stored
+        ``episodes_json`` or a reuse/import scope check in the first place.
+        """
+        return value or None
 
 
 class AcceptedRelease(BaseModel):
@@ -973,6 +991,17 @@ class GrabRequest(BaseModel):
     guid: str | None = None
     season: int | None = None
     episodes: list[int] | None = None
+
+    @field_validator("episodes")
+    @classmethod
+    def _normalize_empty_episodes(cls, value: list[int] | None) -> list[int] | None:
+        """Coerce ``[]`` to ``None`` (issue #102): both mean "whole season", but
+        only ``None`` is what ``_reuse_conflicts``' strict ``is None`` identity
+        checks (grab_service.py) recognize as such. Normalizing here -- at the
+        schema boundary -- means an unnormalized ``[]`` can never reach a stored
+        ``episodes_json`` or a reuse/import scope check in the first place.
+        """
+        return value or None
 
 
 # --------------------------------------------------------------------------- #

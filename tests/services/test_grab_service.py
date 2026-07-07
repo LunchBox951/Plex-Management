@@ -1710,3 +1710,242 @@ async def test_grab_proceeds_when_the_callers_premise_holds(
         season_row = await session.get(SeasonRequest, season_id)
     assert season_row is not None
     assert season_row.status is RequestStatus.downloading
+
+
+# --------------------------------------------------------------------------- #
+# Issue #103: same-release re-grab must be idempotent when the indexer omits
+# ``info_hash`` -- the pre-add parallel-grab guard is gated on
+# ``known_hash is not None`` so a hashless candidate cannot 409 a legitimate
+# same-release UI retry before ``qbt.add`` resolves the real hash.
+# --------------------------------------------------------------------------- #
+
+
+def _scored_hashless(
+    magnet_url: str, title: str = "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+) -> ScoredRelease:
+    """A :class:`ScoredRelease` whose candidate carries NO ``info_hash`` (the
+    indexer omitted it) but resolves to a deterministic hash via ``magnet_url``
+    once ``qbt.add`` parses it -- mirrors a real hashless Prowlarr result."""
+    cand = candidate(title, info_hash=None).model_copy(update={"magnet_url": magnet_url})
+    parsed = ParsedRelease(
+        raw_title=cand.title, clean_title="Some Movie", source=QualitySource.WEBDL
+    )
+    return ScoredRelease(
+        candidate=cand, parsed=parsed, quality=WEBDL1080P, profile_index=19, score=1.0
+    )
+
+
+async def test_grab_hashless_same_release_retry_is_idempotent_not_409(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A hashless candidate for the SAME release, re-grabbed for the SAME
+    request (a UI double-click retry), must NOT 409 -- it should resolve to the
+    existing active row once ``qbt.add`` reports the real (matching) hash, not
+    raise ``AlreadyDownloadingError`` before the client is even asked."""
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.searching
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        await session.commit()
+
+    magnet = "magnet:?xt=urn:btih:" + "c" * 40
+    first_qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            first_qbt,
+            session,
+            scored=_scored_hashless(magnet),
+            request_id=req_id,
+            tmdb_id=100,
+        )
+    assert first.status == "downloading"
+    assert first.torrent_hash == "c" * 40
+
+    # The retry: qBittorrent now reports the SAME hash as already present
+    # (created=False), exactly the real client's 409-on-duplicate-add behavior.
+    retry_qbt = FakeQbittorrent(pre_existing={"c" * 40})
+    async with sessionmaker_() as session:
+        again = await grab_service.grab(
+            retry_qbt,
+            session,
+            scored=_scored_hashless(magnet),
+            request_id=req_id,
+            tmdb_id=100,
+        )
+    assert again.id == first.id  # same row returned -- no spurious 409
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.media_request_id == req_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # no second row was ever created
+
+
+async def test_grab_hashless_different_release_still_rejected(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A hashless candidate for a GENUINELY DIFFERENT release than the one
+    already active for this request is still refused honestly -- deferring the
+    pre-add guard does not let a second concurrent release through. Caught
+    post-add via the ``uq_downloads_active_request`` backstop, which removes
+    the torrent this call just added before raising ``AlreadyDownloadingError``.
+    """
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.searching
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        await session.commit()
+
+    first_magnet = "magnet:?xt=urn:btih:" + "d" * 40
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_hashless(first_magnet, "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"),
+            request_id=req_id,
+            tmdb_id=100,
+        )
+    assert first.status == "downloading"
+
+    second_magnet = "magnet:?xt=urn:btih:" + "e" * 40
+    second_qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                second_qbt,
+                session,
+                scored=_scored_hashless(second_magnet, "Some.Movie.2020.2160p.WEB-DL.x264-GROUP"),
+                request_id=req_id,
+                tmdb_id=100,
+            )
+
+    # The just-added (losing) torrent was cleaned up rather than left orphaned.
+    assert second_qbt.removed == [("e" * 40, True)]
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.media_request_id == req_id)))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].torrent_hash == "d" * 40  # only the original release is tracked
+
+
+# --------------------------------------------------------------------------- #
+# Issue #102: ``episodes=[]`` and ``episodes=None`` both mean "whole season" --
+# the ``_reuse_conflicts`` guard (exercised here through the public ``grab()``
+# API, matching this module's convention of testing private helpers via their
+# only callers rather than importing them directly) must treat the two
+# identically in BOTH directions, whether the empty list originates from the
+# ACTIVE row or the REQUESTED scope (e.g. a row persisted by a caller that
+# bypasses the pydantic schema layer's ``[]`` -> ``None`` normalization -- as
+# calling ``grab_service.grab`` directly, below, does).
+# --------------------------------------------------------------------------- #
+
+
+async def test_reuse_same_hash_active_episodes_empty_vs_requested_none_non_conflicting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Direction 1: the ACTIVE row persisted ``episodes=[]`` (a caller that
+    bypassed the schema-layer normalization) and the SAME-hash re-grab requests
+    whole-season (``episodes=None``) -- must be an idempotent no-op, not a
+    ``DownloadScopeConflictError``."""
+    request_id = await _make_tv_request(sessionmaker_)
+    h = "9" * 40
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[],
+        )
+    assert first.episodes == []
+
+    async with sessionmaker_() as session:
+        again = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=None,
+        )
+    assert again.id == first.id
+
+
+async def test_reuse_same_hash_active_episodes_none_vs_requested_empty_non_conflicting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Direction 2 (the reverse): the ACTIVE row is whole-season (``None``) and
+    the SAME-hash re-grab carries an unnormalized ``episodes=[]`` -- must also
+    be a non-conflicting no-op."""
+    request_id = await _make_tv_request(sessionmaker_)
+    h = "a" * 40
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=None,
+        )
+    assert first.episodes is None
+
+    async with sessionmaker_() as session:
+        again = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[],
+        )
+    assert again.id == first.id
+
+
+async def test_reuse_same_hash_active_episodes_empty_both_sides_non_conflicting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Both the active row and the re-grab request carry an unnormalized
+    ``[]`` -- still non-conflicting (whole-season covers whole-season)."""
+    request_id = await _make_tv_request(sessionmaker_)
+    h = "b" * 40
+    async with sessionmaker_() as session:
+        first = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[],
+        )
+    assert first.episodes == []
+
+    async with sessionmaker_() as session:
+        again = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[],
+        )
+    assert again.id == first.id
