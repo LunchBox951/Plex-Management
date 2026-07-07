@@ -16,7 +16,6 @@ OAuth-deferral analysis).
 from __future__ import annotations
 
 import asyncio
-import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -80,8 +79,6 @@ from plex_manager.web.setup_validation import (
 )
 
 __all__ = ["router"]
-
-_logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/settings",
@@ -163,30 +160,16 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
 _rotate_lock = asyncio.Lock()
 
 
-# Which typed ``KNOWN_SETTING_KEYS`` entries ``SettingsResponse`` coerces to
-# which non-``str`` Python type -- the keys ``_sanitize_typed_settings`` below
-# resolves through the SHARED ``web.deps`` resolvers before the response model
-# coerces them (issue #92, parity guard: ``test_typed_setting_key_groups_cover_
-# all_typed_response_fields``). Every one of these is non-secret plaintext
-# config (see ``SECRET_SETTING_KEYS``) so the resolvers' corrupt-raw-value
-# WARNINGs are logsafe.
-_FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
-    "disk_pressure_threshold_percent",
-    "disk_pressure_target_percent",
-    "eviction_interval_minutes",
-)
-_INT_TYPED_SETTING_KEYS: tuple[str, ...] = ("eviction_grace_days", "log_retention_days")
 # The default each boolean key degrades to on an unrecognized stored value --
 # threaded into ``resolve_bool_setting`` so its WARNING names the actual
-# fallback the matching runtime getter uses. ``_BOOL_TYPED_SETTING_KEYS`` is
-# DERIVED from it so the sanitizer's bool loop and the parity-guard tuple can
+# fallback the matching runtime getter uses. The parity-guard test derives its
+# bool key set from this mapping so the sanitizer's loop and the guard can
 # never name different key sets.
 _BOOL_SETTING_DEFAULTS: dict[str, bool] = {
     "eviction_enabled": EVICTION_ENABLED_DEFAULT,
     "eviction_proactive_enabled": EVICTION_PROACTIVE_ENABLED_DEFAULT,
     "auto_grab_enabled": AUTO_GRAB_ENABLED_DEFAULT,
 }
-_BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
 
 
 def _present_effective(

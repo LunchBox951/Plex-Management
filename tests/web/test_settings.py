@@ -51,11 +51,22 @@ from plex_manager.web.deps import (
     require_api_key,
 )
 from plex_manager.web.routers.settings import (
-    _BOOL_TYPED_SETTING_KEYS,  # pyright: ignore[reportPrivateUsage]
-    _FLOAT_TYPED_SETTING_KEYS,  # pyright: ignore[reportPrivateUsage]
-    _INT_TYPED_SETTING_KEYS,  # pyright: ignore[reportPrivateUsage]
+    _BOOL_SETTING_DEFAULTS,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
+
+# The float/int typed-key groups MIRROR the explicit per-key resolver branches in
+# ``_sanitize_typed_settings`` (each key has its own resolver + default, so the
+# router has no generic tuple to import). The parity guard below asserts these
+# groups cover every non-str ``SettingsResponse`` field -- a new typed field
+# fails the guard until BOTH the sanitizer branch and this mirror are extended.
+_FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
+    "disk_pressure_threshold_percent",
+    "disk_pressure_target_percent",
+    "eviction_interval_minutes",
+)
+_INT_TYPED_SETTING_KEYS: tuple[str, ...] = ("eviction_grace_days", "log_retention_days")
+_BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
