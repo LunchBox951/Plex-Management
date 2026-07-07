@@ -17,7 +17,6 @@ import pytest
 
 from plex_manager.services import path_visibility
 from plex_manager.services.path_visibility import (
-    host_downloads_root_from_mountinfo,
     remap_download_content,
     remap_library_root,
     remap_to_visible,
@@ -455,149 +454,20 @@ def test_a_plain_directory_never_counts_as_a_mount(
 
 
 # --------------------------------------------------------------------------- #
-# host_downloads_root_from_mountinfo / resolve_downloads_host_root
-# (issues #133/#157 -- deriving the HOST-namespace downloads root that directs
-# qBittorrent's per-add ``save_path``)
+# resolve_downloads_host_root (issues #133/#157 -- deriving the HOST-namespace
+# downloads root that directs qBittorrent's per-add ``save_path``).
+#
+# There is deliberately NO ``/proc/self/mountinfo`` fallback: mountinfo's
+# ``root`` field is the path relative to the MOUNTED FILESYSTEM, not a
+# host-namespace pathname (for a bind whose source is its own disk, ``root``
+# is just ``/``), so it cannot recover the host path and a prior fallback
+# built on it is gone. ``Settings.downloads_root`` /
+# ``PLEX_MANAGER_DOWNLOADS_ROOT`` is the only source now.
 # --------------------------------------------------------------------------- #
-def _fake_mountinfo_open(monkeypatch: pytest.MonkeyPatch, lines: list[str]) -> None:
-    """Make ``open("/proc/self/mountinfo", ...)`` inside ``path_visibility`` yield
-    ``lines`` (each already newline-terminated), any other path uses real ``open``.
-
-    Injecting a module-global ``open`` works because CPython resolves an
-    unqualified ``open(...)`` call against the DEFINING module's globals before
-    falling back to builtins -- the same seam other tests in this suite use for
-    ``is_live_mount``.
-    """
-    real_open = open
-    content = "".join(lines)
-
-    def fake_open(file: object, *args: object, **kwargs: object) -> object:
-        if file == "/proc/self/mountinfo":
-            import io
-
-            return io.StringIO(content)
-        return real_open(file, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(path_visibility, "open", fake_open, raising=False)
-
-
-def test_host_downloads_root_from_mountinfo_matches_mount_point(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-    _fake_mountinfo_open(
-        monkeypatch,
-        [
-            "37 30 0:29 /docker/volumes/downloads/_data "
-            f"{downloads} rw,relatime master:1 - ext4 /dev/sda1 rw\n",
-        ],
-    )
-    assert host_downloads_root_from_mountinfo(str(downloads)) == ("/docker/volumes/downloads/_data")
-
-
-def test_host_downloads_root_from_mountinfo_last_match_wins(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Mount stacking: a later bind at the same point shadows an earlier one, and
-    mountinfo lists mounts in mount order -- the LAST match is the current one."""
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-    _fake_mountinfo_open(
-        monkeypatch,
-        [
-            f"10 1 0:1 /old {downloads} rw - ext4 /dev/sda1 rw\n",
-            f"20 1 0:2 /new {downloads} rw - ext4 /dev/sda2 rw\n",
-        ],
-    )
-    assert host_downloads_root_from_mountinfo(str(downloads)) == "/new"
-
-
-def test_host_downloads_root_from_mountinfo_decodes_octal_escapes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-    # The kernel escapes a space in the root field as \040.
-    _fake_mountinfo_open(
-        monkeypatch,
-        [f"1 1 0:1 /My\\040Downloads {downloads} rw - ext4 /dev/sda1 rw\n"],
-    )
-    assert host_downloads_root_from_mountinfo(str(downloads)) == "/My Downloads"
-
-
-def test_host_downloads_root_from_mountinfo_skips_malformed_lines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-    _fake_mountinfo_open(
-        monkeypatch,
-        [
-            "not enough fields here\n",  # no "-" terminator at all
-            f"1 1 0:1 /real {downloads} rw - ext4 /dev/sda1 rw\n",
-        ],
-    )
-    assert host_downloads_root_from_mountinfo(str(downloads)) == "/real"
-
-
-def test_host_downloads_root_from_mountinfo_no_match_returns_none(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-    _fake_mountinfo_open(
-        monkeypatch, [f"1 1 0:1 /elsewhere {tmp_path / 'other'} rw - ext4 /dev/sda1 rw\n"]
-    )
-    assert host_downloads_root_from_mountinfo(str(downloads)) is None
-
-
-def test_host_downloads_root_from_mountinfo_requires_a_live_mount(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Gated on :func:`is_live_mount`: a non-mounted target returns ``None``
-    WITHOUT even opening ``/proc/self/mountinfo`` (bare metal, no Docker split)."""
-
-    def _never_a_mount(_path: str) -> bool:
-        return False
-
-    monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_mount)
-
-    def _boom(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("must not open mountinfo when not a live mount")
-
-    monkeypatch.setattr(path_visibility, "open", _boom, raising=False)
-    assert host_downloads_root_from_mountinfo(str(tmp_path)) is None
-
-
-def test_host_downloads_root_from_mountinfo_swallows_oserror(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def _raise_oserror(*_args: object, **_kwargs: object) -> object:
-        raise OSError("permission denied")
-
-    monkeypatch.setattr(path_visibility, "open", _raise_oserror, raising=False)
-    assert host_downloads_root_from_mountinfo(str(tmp_path)) is None
-
-
-def test_resolve_downloads_host_root_prefers_configured(tmp_path: Path) -> None:
-    # ``configured`` (Settings.downloads_root) wins outright -- never even
-    # consults the mountinfo fallback.
+def test_resolve_downloads_host_root_prefers_configured() -> None:
     assert resolve_downloads_host_root("/configured/root") == "/configured/root"
 
 
-def test_resolve_downloads_host_root_falls_back_to_mountinfo(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        path_visibility, "host_downloads_root_from_mountinfo", lambda: "/from/mountinfo"
-    )
-    assert resolve_downloads_host_root(None) == "/from/mountinfo"
-    assert resolve_downloads_host_root("") == "/from/mountinfo"
-
-
-def test_resolve_downloads_host_root_none_when_neither_resolves(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(path_visibility, "host_downloads_root_from_mountinfo", lambda: None)
+def test_resolve_downloads_host_root_none_when_unconfigured() -> None:
     assert resolve_downloads_host_root(None) is None
+    assert resolve_downloads_host_root("") is None

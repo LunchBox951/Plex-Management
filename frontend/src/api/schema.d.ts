@@ -489,7 +489,10 @@ export interface paths {
          *     ``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:
          *     only ever relocates INTO the app's own derived downloads root (409
          *     ``downloads_root_unavailable`` when that root cannot be derived — bare metal, no
-         *     Docker split), never an arbitrary path.
+         *     Docker split), never an arbitrary path. If a concurrent Retry Import re-blocks
+         *     the row with a newer, different reason before this call's own status write
+         *     lands, the move was still requested but the row's message is left alone (409
+         *     ``relocation_superseded`` — re-fetch the queue item to see the current reason).
          */
         post: operations["relocate_endpoint_api_v1_queue__download_id__relocate_post"];
         delete?: never;

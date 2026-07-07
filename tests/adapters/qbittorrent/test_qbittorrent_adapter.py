@@ -135,6 +135,49 @@ async def test_add_magnet_returns_derived_hash() -> None:
     assert result.created is True  # a genuine new add -- the grab owns it
 
 
+async def test_add_with_directed_save_path_disables_autotmm() -> None:
+    """A non-empty ``save_path`` (issues #133/#157) must ALSO pin the torrent to
+    manual management -- otherwise a global-AutoTMM install ignores ``savepath``
+    entirely and places the torrent per its own category/auto rules."""
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add" and request.method == "POST":
+            calls.append(dict(httpx.QueryParams(request.content.decode())))
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).add(MAGNET, "/downloads/movies", "plex-manager")
+    assert calls == [
+        {
+            "savepath": "/downloads/movies",
+            "category": "plex-manager",
+            "autoTMM": "false",
+            "urls": MAGNET,
+        }
+    ]
+
+
+async def test_add_with_no_save_path_omits_autotmm() -> None:
+    """An empty ``save_path`` means nothing to direct -- ``autoTMM`` must be left
+    out entirely so the client's own auto-managed/manual mode is untouched."""
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add" and request.method == "POST":
+            calls.append(dict(httpx.QueryParams(request.content.decode())))
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).add(MAGNET, "", "plex-manager")
+    assert calls == [{"savepath": "", "category": "plex-manager", "urls": MAGNET}]
+    assert "autoTMM" not in calls[0]
+
+
 async def test_add_409_already_present_is_success() -> None:
     client = _client(_router(add_status=409))
     result = await client.add(MAGNET, "/downloads/movies", "plex-manager")

@@ -2089,3 +2089,51 @@ async def test_relocate_stranded_download_propagates_qbittorrent_errors(
         assert row.status == DownloadState.ImportBlocked.value
         assert row.failed_reason is not None
         assert row.failed_reason.startswith(PATH_NOT_VISIBLE_REASON_PREFIX)
+
+
+_NEWER_BLOCK_REASON = "no video file found in the completed torrent"
+
+
+async def test_relocate_stranded_download_surfaces_a_newer_block_reason(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Round-trip of the CAS fix: a concurrent 'Retry Import' re-blocks the row
+    with a NEWER, genuinely different reason in the gap between
+    ``relocate_stranded_download`` observing the row and its own terminal write
+    landing. The relocate must not clobber that fresher diagnostic with its stale
+    "relocation requested" message -- it must surface the newer truth instead."""
+
+    class _ReblockingQbt(FakeQbittorrent):
+        """Models a concurrent Retry Import committing a DIFFERENT block reason
+        for this same row while ``set_location`` is in flight."""
+
+        async def set_location(self, info_hash: str, save_path: str) -> None:
+            await super().set_location(info_hash, save_path)
+            async with sessionmaker_() as racer_session:
+                row = await racer_session.get(Download, download_id)
+                assert row is not None
+                row.failed_reason = _NEWER_BLOCK_REASON
+                await racer_session.commit()
+
+    download_id = await _seed_import_blocked_download(sessionmaker_)
+    qbt = _ReblockingQbt()
+
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.RelocationSupersededError) as exc_info:
+            await correction_service.relocate_stranded_download(
+                session,
+                qbt,
+                download_id=download_id,
+                downloads_host_root="/home/lunchbox/Downloads",
+            )
+    assert exc_info.value.current_reason == _NEWER_BLOCK_REASON
+
+    # The relocation WAS still issued to qBittorrent...
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+    # ...but the row keeps the racer's fresher, genuinely different reason --
+    # never overwritten by relocate's stale "relocation requested" text.
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        assert row.status == DownloadState.ImportBlocked.value
+        assert row.failed_reason == _NEWER_BLOCK_REASON

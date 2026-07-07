@@ -70,11 +70,12 @@ class Settings(BaseSettings):
     # DIRECT qBittorrent's per-add ``save_path`` (issues #133/#157): qBittorrent
     # runs on the HOST, so torrents must be told to land under a path this
     # container's ``/downloads`` mount actually backs, rather than qBittorrent's
-    # own (unknown, possibly host-default) save directory. ``None`` (unset) falls
-    # back to a best-effort ``/proc/self/mountinfo`` lookup
-    # (``path_visibility.host_downloads_root_from_mountinfo``); when neither
-    # resolves (bare metal, no Docker split), qBittorrent's own default is left in
-    # charge — unchanged prior behaviour, never a guessed path.
+    # own (unknown, possibly host-default) save directory. ``None`` (unset,
+    # bare metal / no Docker split) leaves qBittorrent's own default in charge —
+    # unchanged prior behaviour, never a guessed path. There is deliberately no
+    # ``/proc/self/mountinfo`` fallback: see
+    # ``path_visibility.resolve_downloads_host_root`` for why that field cannot
+    # recover a host-namespace path.
     downloads_root: str | None = None
 
     # Override auth-cookie Secure handling for TLS-terminating reverse proxies.

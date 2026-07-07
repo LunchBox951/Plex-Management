@@ -942,18 +942,17 @@ def get_downloads_host_root() -> str:
 
     ``Settings.downloads_root`` (``PLEX_MANAGER_DOWNLOADS_ROOT`` -- the SAME
     variable docker-compose already uses as the ``/downloads`` bind source;
-    ``env_file: .env`` hands it to this container too) wins when set, else a
-    best-effort ``/proc/self/mountinfo`` fallback
-    (:func:`~plex_manager.services.path_visibility.host_downloads_root_from_mountinfo`).
-    ``""`` (never ``None`` -- callers thread this straight into ``grab()``'s
-    ``save_path: str`` parameter) when neither resolves (bare metal, no Docker
-    split): qBittorrent's own default is then left in charge, unchanged prior
-    behaviour, never a guessed path.
+    ``env_file: .env`` hands it to this container too) is the ONLY source (see
+    :func:`~plex_manager.services.path_visibility.resolve_downloads_host_root` for
+    why there is no ``/proc/self/mountinfo`` fallback: that field cannot recover a
+    host-namespace path). ``""`` (never ``None`` -- callers thread this straight
+    into ``grab()``'s ``save_path: str`` parameter) when unset (bare metal, no
+    Docker split): qBittorrent's own default is then left in charge, unchanged
+    prior behaviour, never a guessed path.
 
-    A plain function, not async: both the settings read and the mountinfo parse
-    are cheap synchronous calls (an env lookup + at most one small file read), the
-    same "no ``asyncio.to_thread`` needed" precedent ``setup_validation``'s own
-    synchronous filesystem probes already set.
+    A plain function, not async: the settings read is a cheap synchronous env
+    lookup, the same "no ``asyncio.to_thread`` needed" precedent
+    ``setup_validation``'s own synchronous filesystem probes already set.
     """
     settings = get_settings()
     return path_visibility.resolve_downloads_host_root(settings.downloads_root) or ""

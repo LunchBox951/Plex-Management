@@ -895,6 +895,18 @@ class QbittorrentClient:
         lost-grab cleanup must never destroy (``delete_files=True``) a torrent
         it merely reused -- its data can back a live library file via hardlink
         (see :class:`~plex_manager.ports.download_client.AddResult`).
+
+        When ``save_path`` is non-empty (a directed path -- issues #133/#157),
+        the request ALSO carries ``autoTMM: "false"``: an install with global
+        Automatic Torrent Management enabled otherwise ignores the per-add
+        ``savepath`` field entirely and lets category/auto rules place the
+        torrent, silently defeating the whole save-path direction. Sending the
+        flag pins this ONE torrent to manual management so ``savepath`` is
+        actually honoured, without touching the client's global AutoTMM
+        setting or any other torrent. When ``save_path`` is empty (nothing to
+        direct), ``autoTMM`` is omitted entirely -- the client's own
+        auto-managed/manual mode for this torrent is left untouched, exactly
+        the prior behaviour.
         """
         urls_value: str | None = None
         torrent_bytes: bytes | None = None
@@ -933,6 +945,13 @@ class QbittorrentClient:
             info_hash = _info_hash_from_magnet(magnet_or_url)
 
         form: dict[str, str] = {"savepath": save_path, "category": category}
+        if save_path:
+            # A directed save path only takes effect when this torrent is NOT
+            # auto-managed -- otherwise a global AutoTMM install silently
+            # relocates it per category/auto rules, ignoring ``savepath``
+            # entirely. Manual-manage just THIS add; omitted (below) when
+            # there is no directed path, leaving the client's own mode alone.
+            form["autoTMM"] = "false"
         files: dict[str, tuple[str, bytes, str]] | None = None
         if urls_value is not None:
             form["urls"] = urls_value

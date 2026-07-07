@@ -405,7 +405,10 @@ async def relocate_endpoint(
     ``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:
     only ever relocates INTO the app's own derived downloads root (409
     ``downloads_root_unavailable`` when that root cannot be derived — bare metal, no
-    Docker split), never an arbitrary path.
+    Docker split), never an arbitrary path. If a concurrent Retry Import re-blocks
+    the row with a newer, different reason before this call's own status write
+    lands, the move was still requested but the row's message is left alone (409
+    ``relocation_superseded`` — re-fetch the queue item to see the current reason).
     """
     try:
         record = await correction_service.relocate_stranded_download(
@@ -423,5 +426,12 @@ async def relocate_endpoint(
     except correction_service.DownloadsRootUnavailableError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="downloads_root_unavailable"
+        ) from exc
+    except correction_service.RelocationSupersededError as exc:
+        # The move was still requested of qBittorrent; a concurrent Retry Import
+        # re-blocked the row with a newer, different reason before our own status
+        # write landed -- surface that honestly rather than clobber it silently.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="relocation_superseded"
         ) from exc
     return _to_item(record)

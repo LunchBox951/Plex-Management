@@ -116,6 +116,7 @@ __all__ = [
     "NotCancellableError",
     "NotRelocatableError",
     "NotReportableError",
+    "RelocationSupersededError",
     "ReportSeasonRequiredError",
     "RequestNotFoundError",
     "SeasonNotFoundError",
@@ -437,15 +438,43 @@ class DownloadsRootUnavailableError(Exception):
     The root-guard for :func:`relocate_stranded_download`: it may ONLY ever direct
     qBittorrent to move a torrent INTO the app's own derived downloads root
     (``path_visibility.resolve_downloads_host_root``), never a caller-chosen or
-    guessed path. When neither ``PLEX_MANAGER_DOWNLOADS_ROOT`` nor the
-    ``/proc/self/mountinfo`` fallback resolves, there is nothing safe to relocate
-    into -- refuse rather than send qBittorrent an empty/placeholder location.
+    guessed path. When ``PLEX_MANAGER_DOWNLOADS_ROOT`` is unset, there is nothing
+    safe to relocate into -- refuse rather than send qBittorrent an
+    empty/placeholder location.
     """
 
     def __init__(self, download_id: int) -> None:
         self.download_id = download_id
         super().__init__(
             f"cannot relocate download {download_id}: no downloads host root could be derived"
+        )
+
+
+class RelocationSupersededError(Exception):
+    """The row was re-blocked with a NEWER, different reason while the
+    relocation was in flight (HTTP 409).
+
+    :func:`relocate_stranded_download` observes the row's ``failed_reason`` up
+    front and issues the (async) ``qbt.set_location`` request; a concurrent
+    "Retry import" can re-block the SAME (still ``import_blocked``) row with a
+    genuinely different diagnosis (e.g. "no video file found") in the gap
+    before this function's own terminal write. The terminal write is a
+    compare-and-swap gated on BOTH the status AND the exact ``failed_reason``
+    observed at entry, so a losing CAS here means a fresher block reason
+    already won -- overwriting it would silently discard that newer diagnosis
+    (the bug this guards against). The relocation request was still issued to
+    qBittorrent (this is only about which message the row now carries); the
+    operator sees the newer, truthful reason rather than a stale "relocation
+    requested" message that no longer matches reality.
+    """
+
+    def __init__(self, download_id: int, current_reason: str | None) -> None:
+        self.download_id = download_id
+        self.current_reason = current_reason
+        super().__init__(
+            f"download {download_id} was re-blocked with a newer reason "
+            f"({current_reason!r}) while its relocation was in flight; the move "
+            "was still requested, but the row's message was left as-is"
         )
 
 
@@ -1118,8 +1147,8 @@ async def relocate_stranded_download(
     ``downloads_host_root`` -- the app's OWN derived downloads root
     (``path_visibility.resolve_downloads_host_root``), never an operator- or
     caller-supplied path (there is no path parameter to override). When that root
-    could not be derived (bare metal, no Docker split, or an unreadable
-    mountinfo), :class:`DownloadsRootUnavailableError` refuses rather than
+    could not be derived (``PLEX_MANAGER_DOWNLOADS_ROOT`` unset -- bare metal, no
+    Docker split), :class:`DownloadsRootUnavailableError` refuses rather than
     relocating into a guessed/empty location.
 
     qBittorrent moves content ASYNCHRONOUSLY: :meth:`~plex_manager.ports.
@@ -1137,6 +1166,16 @@ async def relocate_stranded_download(
     stale pre-relocation "not visible" message while the move is in flight. A retry
     attempted before the move settles simply re-blocks (honestly) with a fresh "not
     visible" reason if qBittorrent has not finished moving the content yet.
+
+    The terminal write is a compare-and-swap gated on BOTH the row's status
+    still being ``import_blocked`` AND its ``failed_reason`` still being the
+    EXACT value observed at entry (:class:`RelocationSupersededError` on a
+    miss). Gating on status alone would let a concurrent "Retry import" that
+    re-blocks the row -- still ``import_blocked``, but with a NEWER, different
+    diagnosis (e.g. "no video file found") -- get silently clobbered by this
+    function's stale "relocation requested" message, discarding the fresher,
+    truthful reason. The relocation is still requested of qBittorrent either
+    way; only which message the row ends up carrying is at stake.
     """
     if not downloads_host_root:
         raise DownloadsRootUnavailableError(download_id)
@@ -1149,6 +1188,7 @@ async def relocate_stranded_download(
         raise NotRelocatableError(download_id, row.status)
 
     torrent_hash = row.torrent_hash
+    observed_reason = row.failed_reason
     # qBittorrent errors propagate uncaught (honesty over silence): the operator sees
     # the real client failure rather than a falsely "accepted" relocation.
     await qbt.set_location(torrent_hash, downloads_host_root)
@@ -1162,17 +1202,23 @@ async def relocate_stranded_download(
             f"relocation to {downloads_host_root} requested; retry the import once "
             "qBittorrent finishes moving the content"
         ),
+        require_failed_reason=observed_reason,
     )
-    if moved:
-        await session.commit()
-    else:
-        # The row moved out from under us (an operator's own retry-import racing
-        # to success/re-block, or a mark-failed, committed while ``qbt.set_location``
-        # was in flight). The relocate already happened on qBittorrent's side --
-        # harmless, the content is simply now under our own downloads root -- so
-        # honor whichever status won rather than overwrite it.
+    if not moved:
+        # The row was re-blocked (or otherwise changed) with a DIFFERENT reason
+        # than the one observed at entry while ``qbt.set_location`` was in
+        # flight -- e.g. a concurrent Retry Import's fresher, genuinely
+        # different diagnosis. The relocate already happened on qBittorrent's
+        # side, but overwriting the row's message now would clobber that newer
+        # truth with our stale "relocation requested" text -- surface it
+        # honestly instead of silently accepting whichever state won.
         await session.rollback()
+        current = await session.get(Download, download_id)
+        raise RelocationSupersededError(
+            download_id, current.failed_reason if current is not None else None
+        )
 
+    await session.commit()
     updated = await download_repo.get_by_hash(torrent_hash)
     if updated is None:  # pragma: no cover - just operated on this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-relocate")

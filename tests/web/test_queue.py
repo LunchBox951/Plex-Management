@@ -258,6 +258,50 @@ async def test_relocate_endpoint_409s_when_no_downloads_root_derivable(
     assert qbt.relocated == []
 
 
+async def test_relocate_endpoint_409s_when_superseded_by_a_newer_block_reason(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A concurrent Retry Import re-blocking the row with a genuinely different
+    reason while the relocate's own status write is in flight must surface
+    honestly (409 ``relocation_superseded``), never get silently clobbered by
+    the relocate's stale 'relocation requested' message."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): /home/lunchbox/x",
+    )
+
+    newer_reason = "no video file found in the completed torrent"
+
+    class _ReblockingQbt(FakeQbittorrent):
+        async def set_location(self, info_hash: str, save_path: str) -> None:
+            await super().set_location(info_hash, save_path)
+            async with sessionmaker_() as racer_session:
+                row = await racer_session.get(Download, download_id)
+                assert row is not None
+                row.failed_reason = newer_reason
+                await racer_session.commit()
+
+    qbt = _ReblockingQbt()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "relocation_superseded"
+    # The move was still requested of qBittorrent...
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+    # ...but the row keeps the racer's fresher reason, never overwritten.
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        assert row.failed_reason == newer_reason
+
+
 def test_queue_contract_documents_manual_error_bodies(app: FastAPI) -> None:
     paths = app.openapi()["paths"]
 

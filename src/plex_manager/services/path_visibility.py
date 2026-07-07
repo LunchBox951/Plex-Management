@@ -23,7 +23,6 @@ module must never be consulted on a delete path).
 from __future__ import annotations
 
 import os
-import re
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -33,7 +32,6 @@ __all__ = [
     "KNOWN_CONTAINER_MOUNTS",
     "KNOWN_DOWNLOAD_MOUNTS",
     "KNOWN_LIBRARY_MOUNTS",
-    "host_downloads_root_from_mountinfo",
     "is_live_mount",
     "remap_download_content",
     "remap_library_root",
@@ -84,85 +82,33 @@ def is_live_mount(path: str) -> bool:
     return os.path.isdir(path) and os.path.ismount(path)
 
 
-# Linux's ``/proc/*/mountinfo`` octal-escapes space/tab/backslash/newline inside the
-# ``root`` and ``mount point`` fields (the same convention as ``/proc/mounts``), so a
-# bind source containing one of those bytes round-trips correctly instead of being
-# read as a truncated/garbled path.
-_MOUNTINFO_OCTAL_ESCAPE: Final = re.compile(r"\\([0-7]{3})")
-
-
-def _unescape_mountinfo_field(value: str) -> str:
-    return _MOUNTINFO_OCTAL_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), value)
-
-
-def host_downloads_root_from_mountinfo(container_mount: str = "/downloads") -> str | None:
-    """Best-effort HOST-namespace directory backing ``container_mount``.
-
-    The fallback source (design order #2, after ``PLEX_MANAGER_DOWNLOADS_ROOT``) for
-    the value handed to qBittorrent's ``save_path`` on ``add`` (issues #133/#157):
-    qBittorrent runs on the HOST, so the value must stay in the HOST namespace -- the
-    one function in this module that does NOT resolve to a container-visible path;
-    every other helper here answers "what can THIS process see", this one answers
-    "what does the HOST call the directory THIS process sees at ``container_mount``".
-
-    Reads THIS process's own ``/proc/self/mountinfo`` and returns the ``root`` field
-    (the path within the mount's source filesystem that corresponds to
-    ``container_mount``) of the LAST line whose mount point matches -- mount stacking
-    means a later bind at the same point shadows an earlier one, and mountinfo lists
-    mounts in mount order, so the last match is the CURRENT one. Octal escapes in
-    either field are decoded (the kernel escapes space/tab/backslash/newline in both).
-
-    Gated on :func:`is_live_mount`: a bare-metal (non-Docker) process has no
-    ``/downloads`` mount at all, so this returns ``None`` without even opening
-    ``/proc/self/mountinfo`` -- the same "only ever act on a genuinely mounted
-    volume" honesty the rest of the module holds to. Any I/O failure (missing
-    ``/proc``, permission, an unparsable line) is swallowed to ``None`` -- an honest
-    "could not derive", never a crash or a guessed path; callers fall back to
-    qBittorrent's own default (unchanged prior behaviour).
-    """
-    if not is_live_mount(container_mount):
-        return None
-    norm_target = os.path.normpath(container_mount)
-    best: str | None = None
-    try:
-        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                fields = line.split(" ")
-                try:
-                    separator_index = fields.index("-")
-                except ValueError:
-                    continue  # malformed line (no optional-fields terminator): skip
-                # Fields, in order: mount ID, parent ID, major:minor, root, mount
-                # point, mount options, then >=0 optional fields, then "-". The
-                # terminator can therefore never appear before index 6.
-                if separator_index < 6:
-                    continue
-                root, mount_point = fields[3], fields[4]
-                if not root or not mount_point:
-                    continue
-                if os.path.normpath(_unescape_mountinfo_field(mount_point)) == norm_target:
-                    best = _unescape_mountinfo_field(root)
-    except OSError:
-        return None
-    return best or None
-
-
 def resolve_downloads_host_root(configured: str | None) -> str | None:
     """The HOST-namespace downloads root to direct qBittorrent's ``save_path`` at.
 
     ``configured`` (``Settings.downloads_root`` / ``PLEX_MANAGER_DOWNLOADS_ROOT`` --
     the SAME variable docker-compose already uses as the ``/downloads`` bind source;
     ``env_file: .env`` hands it to this container too, just unread by the app until
-    now) wins when set -- computed by the operator's own compose file, never
-    operator-typed a second time. Falls back to
-    :func:`host_downloads_root_from_mountinfo` (source order #2) when unset.
-    ``None`` when NEITHER resolves (bare metal, no Docker split, or a container whose
-    mountinfo can't be read): callers then leave qBittorrent's own default in
-    charge -- an honest "could not derive", never a guessed path.
+    now) is the ONLY source: the documented deployment's compose file REQUIRES this
+    variable as the ``/downloads`` bind source, so it is always set wherever the
+    container topology (and therefore the host/container split ``save_path``
+    exists to bridge) applies.
+
+    There is deliberately NO ``/proc/self/mountinfo`` fallback. A prior version of
+    this function read mountinfo's ``root`` field (field 4) as a stand-in for the
+    HOST pathname, but that field is the path RELATIVE TO THE MOUNTED FILESYSTEM,
+    not a host-namespace path: for a bind whose source lives on its own disk (the
+    host mounts ``/dev/sdb1`` at ``/mnt/downloads``, then binds
+    ``/mnt/downloads -> /downloads`` into the container), the mount's ``root`` is
+    simply ``/``, since ``/mnt/downloads`` IS that filesystem's root -- and a
+    fallback built on it would have directed qBittorrent to relocate torrents to
+    ``/`` on the host. There is no reliable way to recover the true host-namespace
+    path from inside the container in that topology, so guessing one is worse than
+    not trying: ``None`` here honestly leaves qBittorrent's own default save
+    location in charge (unchanged prior behaviour, never a guessed path), and the
+    setup/health visibility probe still surfaces any resulting mismatch to the
+    operator.
     """
-    if configured:
-        return configured
-    return host_downloads_root_from_mountinfo()
+    return configured or None
 
 
 def _is_under(norm_path: str, mount: str) -> bool:
