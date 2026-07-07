@@ -1567,6 +1567,91 @@ async def test_cancel_refuses_when_an_older_imported_seed_hides_under_a_newer_ro
     assert qbt.removed == []
 
 
+async def test_cancel_cannot_settle_a_post_eviction_regrab_season_to_cancelled(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #129 regression: the stale-Plex eviction guard (``evicted_seasons``,
+    keyed on the newest NON-``cancelled`` row per season) vs. a cancel landing
+    AFTER the eviction's finalize while Plex's post-delete scan is still
+    pending/failed.
+
+    The disk-truth flip (``eviction_service``'s finalize / recovery: cancelled ->
+    evicted) only fires when the in-window same-row re-grab was ALREADY
+    'cancelled' at finalize time. If that re-grab is instead still ACTIVE (e.g.
+    'downloading') when finalize runs, and the operator cancels it only
+    afterward -- while Plex still lists the just-deleted file present -- no code
+    path performs that flip for this row. If the cancel could actually settle the
+    season to 'cancelled' here, ``evicted_seasons()`` would then see NO
+    non-cancelled row left for this season at all (not 'evicted'), so a
+    subsequent re-request could mint a stale-Plex 'available' over the deleted
+    file -- the exact race the issue describes.
+
+    Nothing needs to change to prevent it: the eviction sweep only ever reclaims
+    a season that was previously imported, and eviction never mutates the
+    downloads table -- so the season's ORIGINAL imported ``Download`` row always
+    still exists underneath the newer re-grab attempt. ``cancel_request``'s
+    belt-and-suspenders imported-download probe (``find_latest_imported_for_
+    request``, scoped to the imported row specifically, not merely the newest
+    attempt) refuses the WHOLE cancel outright on exactly that evidence -- so
+    this season can never actually reach 'cancelled' through this path in the
+    first place. This test is the permanent guard against ever relaxing that
+    probe without addressing this race some other way."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1450,
+            media_type=MediaType.tv,
+            title="Race Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(show)
+        await session.flush()
+        # The season the eviction sweep reclaimed, whose same-row re-grab
+        # (``season_request_service.ensure_seasons``'s re-arm) is still ACTIVE
+        # ('downloading') at finalize -- never 'cancelled', so the finalize's
+        # disk-truth flip never had reason to fire for this row.
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id, season_number=1, status=RequestStatus.downloading
+            )
+        )
+        # The ORIGINAL pre-eviction import: eviction deletes the library FILE but
+        # never mutates the downloads aggregate, so this row survives the sweep
+        # untouched underneath the newer in-window re-grab attempt above.
+        session.add(
+            Download(
+                torrent_hash=_ALT,
+                status="imported",
+                media_request_id=show.id,
+                tmdb_id=1450,
+                season=1,
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.NotCancellableError):
+        async with sessionmaker_() as session:
+            await correction_service.cancel_request(session, qbt, request_id=request_id)
+    assert qbt.removed == []
+
+    # The season truly never reached 'cancelled' -- proving evicted_seasons()'s
+    # newest-non-cancelled read is never left without ANY row to subtract for
+    # this season, which is exactly what would let a subsequent re-request mint
+    # a stale-Plex 'available' over the deleted file.
+    async with sessionmaker_() as session:
+        season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+    assert season.status is RequestStatus.downloading
+
+
 async def test_reset_for_research_resets_autograb_backoff(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:

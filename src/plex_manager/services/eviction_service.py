@@ -41,6 +41,11 @@ trigger) is expected to call it once per configured root. Per call:
    file. A candidate missing its ``library_path`` breadcrumb, or one the
    filesystem guard refuses, is skipped + logged — NEVER guessed at, never a
    silent no-op, and never lets one bad candidate abort the rest of the sweep.
+   Between the claim commit and the delete, a shared-breadcrumb TWIN (#155) --
+   another live row also carrying this exact ``library_path`` -- is likewise
+   released back to ``available`` rather than deleted out from under it (the
+   same finalized-vs-interrupted discriminator step 0.5's crash recovery uses,
+   reused here before any crash is even in the picture).
 
 Step 0.5 (before the pressure pre-check, after the root's disk stat): recover
 claimed-but-not-finalized evictions -- :func:`_resume_interrupted_evictions` --
@@ -553,13 +558,25 @@ async def _restore_after_failed_delete(session: AsyncSession, pending: _Pending)
 
 
 async def _cancel_redundant_movie_regrabs(session: AsyncSession, pending: _MoviePending) -> None:
-    """Cancel every OTHER pre-grab request row for this movie (see
-    :func:`_restore_after_failed_delete`'s re-grab reconciliation). Flush-only;
-    the caller owns the commit, so restore + reconciliation land atomically."""
+    """Cancel every OTHER pre-grab request row for this movie THIS APP'S OWN
+    eviction guard re-grabbed (see :func:`_restore_after_failed_delete`'s re-grab
+    reconciliation). Flush-only; the caller owns the commit, so restore +
+    reconciliation land atomically.
+
+    Issue #156: scoped to :attr:`~plex_manager.ports.repositories.RequestRecord.
+    eviction_regrab` rows ONLY -- a pre-grab row that exists for some OTHER reason
+    (most notably a deliberate #148 forced re-acquire, which explicitly bypasses
+    the eviction guard that stamps this marker) must never be silently cancelled
+    just because it happens to share this movie and a pre-grab status. Skipping a
+    non-eviction-regrab row here is not a leak: it is exactly the operator's own
+    request, left standing precisely because the restored copy never left disk.
+    """
     repo = SqlRequestRepository(session)
     for row in await repo.list_for_media(pending.tmdb_id, "movie", _PRE_GRAB_STATUSES):
         if row.id == pending.media_request_id:
             continue  # the restored row itself (defensive; it is 'available' now)
+        if not row.eviction_regrab:
+            continue  # not THIS eviction's own re-grab -- e.g. an operator re-acquire
         cancelled = await repo.set_status_if_in(
             row.id, RequestStatus.cancelled.value, _PRE_GRAB_STATUSES
         )
@@ -585,9 +602,15 @@ async def _cancel_redundant_movie_regrabs(session: AsyncSession, pending: _Movie
 
 
 async def _cancel_redundant_season_regrabs(session: AsyncSession, pending: _SeasonPending) -> None:
-    """Cancel this season's pre-grab duplicates under OTHER requests (see
-    :func:`_restore_after_failed_delete`'s re-grab reconciliation), recomputing
-    each affected parent's rollup. Flush-only; the caller owns the commit."""
+    """Cancel this season's pre-grab duplicates under OTHER requests THIS APP'S
+    OWN eviction guard re-grabbed (see :func:`_restore_after_failed_delete`'s
+    re-grab reconciliation), recomputing each affected parent's rollup.
+    Flush-only; the caller owns the commit.
+
+    Issue #156: scoped to :attr:`~plex_manager.ports.repositories.
+    SeasonRequestRecord.eviction_regrab` siblings ONLY -- see the movie twin's
+    docstring (:func:`_cancel_redundant_movie_regrabs`) for the full rationale.
+    """
     season_repo = SqlSeasonRequestRepository(session)
     request_repo = SqlRequestRepository(session)
     siblings = await season_repo.list_sibling_seasons(
@@ -597,6 +620,8 @@ async def _cancel_redundant_season_regrabs(session: AsyncSession, pending: _Seas
         exclude_id=pending.season_request_id,
     )
     for sibling in siblings:
+        if not sibling.eviction_regrab:
+            continue  # not THIS eviction's own re-grab -- e.g. an operator re-acquire
         cancelled = await season_request_service.set_status_if_in(
             session,
             media_request_id=sibling.media_request_id,
@@ -1241,6 +1266,17 @@ async def _evict_one(
        post-add status move is itself a CAS that refuses a cancelled row,
        removes the just-added torrent, and raises the honest
        ``RequestNotActiveError`` (see ``_GRABBABLE_*_STATUS_VALUES`` there).
+    7. A shared breadcrumb NEVER gets deleted out from under its OTHER live owner
+       (#155, "twins"): two ``available`` rows can legitimately share one exact
+       ``library_path`` (remove-then-reacquire's pre-existing leftover, or the
+       #148 force-reacquire shape), and the CLAIM above only compares THIS row's
+       own status/pin -- it has no way to see the sibling. After the claim
+       commits but BEFORE the delete, :func:`_path_claimed_by_another_row`
+       (the same check crash-recovery already runs) is consulted; a live sibling
+       claim releases the claim back to ``available`` (the ordinary
+       purge-refused restore path) instead of deleting, so BOTH rows are decided
+       fresh by later sweeps rather than one twin's delete silently orphaning
+       the other.
 
     Full lifecycle state table, from the moment the claim COMMITS (row
     ``evicted``, breadcrumb set, file on disk); every permutation of
@@ -1289,6 +1325,10 @@ async def _evict_one(
     claims the same path                      completed re-import): breadcrumb
                                               released, NOTHING restored -- the
                                               newer row keeps sole path ownership
+    THIS claim's own path is ALSO claimed by   restored ``available`` (+ TV rollup);
+    another live (available/in-flight) row --  breadcrumb kept; NOTHING deleted --
+    the shared-breadcrumb twins shape (#155)   invariant #7; the sibling is decided
+                                              fresh by its own later sweep pass
     ========================================  =======================================
     """
     library_path = candidate.library_path
@@ -1397,6 +1437,35 @@ async def _evict_one(
     # ``latest_request_evicted`` / ``evicted_seasons`` and re-grabbing instead (see
     # invariant #4 above; ``request_service`` / ``season_request_service``).
     await session.commit()
+
+    # Shared-breadcrumb-twins guard (#155): the claim above only compares THIS
+    # row's own status/pin -- it does nothing to notice that some OTHER live
+    # (available/in-flight) row ALSO carries this exact ``library_path``
+    # breadcrumb (reachable via remove-then-reacquire, or one click away via the
+    # #148 force re-acquire leaving the old row's breadcrumb untouched while the
+    # new row's import stamps the same deterministic path). Deleting now would
+    # rip the file out from under that other row's still-live claim, leaving it
+    # dishonestly ``available`` until a later sweep's own candidate assembly
+    # notices the file is gone and self-heals it -- exactly the crash-recovery
+    # pass's finalized-vs-interrupted discriminator
+    # (:func:`_path_claimed_by_another_row`), reused here BEFORE the delete
+    # instead of only after a crash. Caught, this claim is simply released the
+    # same way a refused/erroring delete is: restored to 'available' (+ the
+    # normal re-grab reconciliation, a no-op here since nothing re-grabbed) so
+    # THIS row is never stranded 'evicted' over a file that never left, and the
+    # sibling's own next sweep pass decides it fresh.
+    if await _path_claimed_by_another_row(session, library_path, pending):
+        await _restore_after_failed_delete(session, pending)
+        _logger.warning(
+            "skipping eviction of %r%s: another live row already claims this exact "
+            "library_path (%s) -- restored to 'available' rather than deleting a "
+            "file a sibling row still owns",
+            candidate.title,
+            season_note,
+            library_path,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return None
 
     # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are
     # both done by the shared ``purge_service.purge_library_path`` primitive

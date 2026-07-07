@@ -463,6 +463,10 @@ async def test_create_request_after_eviction_re_grabs_when_plex_still_reports_pr
     assert fresh.id != evicted_id
     # Re-grabbed, NOT minted 'available' over the file the sweep is deleting.
     assert fresh.status == RequestStatus.pending.value
+    # Issue #156's provenance marker: this row exists BECAUSE the eviction guard
+    # fired, distinguishing it from an ordinary/forced request so the eviction
+    # restore's redundant-regrab dedup cancels only its OWN re-grabs.
+    assert fresh.eviction_regrab is True
 
     async with sessionmaker_() as session:
         rows = (
@@ -527,6 +531,10 @@ async def test_create_request_after_whole_show_eviction_re_grabs_when_plex_stale
             .all()
         )
     assert {r.season_number: r.status.value for r in rows} == {1: "pending", 2: "pending"}
+    # Issue #156's provenance marker: both seasons exist BECAUSE the season-level
+    # eviction guard fired (Plex still lists them, but the newest tracked history
+    # per season is 'evicted') -- never for an ordinary season create.
+    assert all(r.eviction_regrab for r in rows)
 
 
 async def test_create_request_never_returns_a_stale_leftover_available_row_in_the_window(
@@ -567,6 +575,7 @@ async def test_create_request_never_returns_a_stale_leftover_available_row_in_th
 
     assert fresh.id != stale_id  # the stale leftover row is NOT handed back
     assert fresh.status == RequestStatus.pending.value  # a real re-grab
+    assert fresh.eviction_regrab is True  # issue #156's provenance marker
     async with sessionmaker_() as session:
         rows = (
             (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 660)))
@@ -574,6 +583,102 @@ async def test_create_request_never_returns_a_stale_leftover_available_row_in_th
             .all()
         )
     assert sorted(r.status.value for r in rows) == ["available", "evicted", "pending"]
+
+
+async def test_create_request_stamps_eviction_regrab_when_plex_errors_in_the_window(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 finding 1: the eviction guard (``latest_request_evicted``)
+    reads the DB alone, so it must fire -- and stamp ``eviction_regrab`` -- even
+    when THIS call's own Plex probe ERRORS instead of (falsely) proving
+    presence. Before the fix, ``movie_eviction_regrab`` was only ever set INSIDE
+    the ``force or _already_in_library(...)`` branch, so an erroring probe (which
+    ``_already_in_library`` treats as an honest 'no') skipped the eviction guard
+    entirely and created an unmarked fresh row -- indistinguishable from an
+    ordinary request to the restore's redundant-regrab dedup."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=9100,
+            media_type=MediaType.movie,
+            title="Erroring Plex",
+            status=RequestStatus.evicted,
+        )
+        session.add(evicted)
+        await session.commit()
+        evicted_id = evicted.id
+
+    tmdb = FakeTmdb(movies={9100: MovieMetadata(tmdb_id=9100, title="Erroring Plex", year=2021)})
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=9100, media_type="movie", library=library
+        )
+
+    assert fresh.id != evicted_id
+    assert fresh.status == RequestStatus.pending.value
+    assert fresh.eviction_regrab is True  # stamped despite the Plex error
+
+
+async def test_create_request_never_stamps_eviction_regrab_for_a_forced_reacquire(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A ``force`` (#148) re-acquire must NEVER carry the marker, regardless of
+    whether the movie's most recent request happens to be 'evicted' -- it
+    deliberately bypasses the eviction guard entirely (kept passing by the
+    finding-1 fix, which only widened WHEN the guard is consulted, never
+    weakened the ``not force`` gate around it)."""
+    async with sessionmaker_() as session:
+        evicted = MediaRequest(
+            tmdb_id=9101,
+            media_type=MediaType.movie,
+            title="Forced Reacquire",
+            status=RequestStatus.evicted,
+        )
+        session.add(evicted)
+        await session.commit()
+        evicted_id = evicted.id
+
+    tmdb = FakeTmdb(movies={9101: MovieMetadata(tmdb_id=9101, title="Forced Reacquire", year=2021)})
+    library = FakeLibrary(raises=PlexLibraryError("plex is down"))
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session, tmdb, tmdb_id=9101, media_type="movie", library=library, force=True
+        )
+
+    assert fresh.id != evicted_id
+    assert fresh.status == RequestStatus.pending.value
+    assert fresh.eviction_regrab is False  # force never stamps, even during a stale window
+
+
+async def test_mark_available_clears_the_eviction_regrab_marker(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 finding 3: once a movie regrab genuinely imports and Plex
+    confirms it watchable, it is exactly as settled as any other available
+    request -- the marker must retire, or a LATER, unrelated eviction's restore
+    could read a settled row as still "in flight" off nothing but stale
+    history."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=9102,
+            media_type=MediaType.movie,
+            title="Imported Regrab",
+            status=RequestStatus.completed,
+            eviction_regrab=True,  # this row WAS an eviction's own regrab
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        await SqlRequestRepository(session).mark_available(request_id)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.available
+    assert row.eviction_regrab is False  # cleared by the fix
 
 
 async def test_create_request_tv_skips_in_library_dedup_for_just_evicted_seasons(
@@ -2154,6 +2259,11 @@ async def test_force_create_bypasses_in_library_short_circuit_creates_pending(
         )
     assert len(rows) == 1
     assert rows[0].status is RequestStatus.pending
+    # Issue #156: a force re-acquire NEVER carries the eviction-guard provenance
+    # marker -- it deliberately skips ``latest_request_evicted`` entirely (the
+    # ``if not force`` gate), so the eviction restore's redundant-regrab dedup
+    # must never mistake this deliberate operator re-acquire for its own re-grab.
+    assert rows[0].eviction_regrab is False
 
     # Contrast: identical library presence, but no ``force`` -- the normal
     # already-in-library short-circuit still fires.
