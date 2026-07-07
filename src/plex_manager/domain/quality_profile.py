@@ -53,7 +53,11 @@ class QualityProfile(BaseModel):
     id: int
     name: str
     cutoff_quality_id: int
-    items: list[QualityProfileItem] = Field(default_factory=list[QualityProfileItem])
+    # Immutable tuple (issue #106): a frozen model blocks reassigning
+    # ``profile.items`` but not appending to a plain list in place, which would
+    # corrupt every holder of a shared profile (e.g. the cached default profile
+    # returned by :func:`default_profile`). A ``list`` input is coerced by pydantic.
+    items: tuple[QualityProfileItem, ...] = Field(default_factory=tuple)
     min_format_score: int = 0
     upgrade_allowed: bool = True
 
@@ -72,13 +76,13 @@ def default_profile() -> QualityProfile:
     DVDSCR/REGIONAL and Unknown are disallowed (permanent reject); everything
     >= SDTV is allowed. The upgrade cutoff is WEBDL-1080p.
     """
-    items = [
+    items = tuple(
         QualityProfileItem(
             quality_id=quality.id,
             allowed=quality.id not in DISALLOWED_BY_DEFAULT_IDS,
         )
         for quality in ALL_QUALITIES
-    ]
+    )
     return QualityProfile(
         id=1,
         name="Default",

@@ -112,11 +112,18 @@ _ROWS: tuple[tuple[DiscoverCategory, str], ...] = (
 
 
 class HomeRow(NamedTuple):
-    """One composed row: its open ``row_type``, display ``title``, and items."""
+    """One composed row: its open ``row_type``, display ``title``, and items.
+
+    ``items`` is an immutable tuple (issue #106): it is sourced directly from
+    ``MediaPage.results`` (itself a tuple for the same reason -- the TMDB
+    adapter's page cache hands the same object back on every hit within its
+    TTL), and a ``NamedTuple`` field being un-reassignable does not stop a
+    mutable list held in it from being mutated in place.
+    """
 
     row_type: str
     title: str
-    items: list[MediaSearchResult]
+    items: tuple[MediaSearchResult, ...]
 
 
 class HomeFeed(NamedTuple):
@@ -182,7 +189,7 @@ async def home(tmdb: MetadataPort) -> HomeFeed:
             # result is an expected TMDB error here; log the actual exception (not
             # just the type) so a flaky row is diagnosable.
             _logger.warning("discover row %r unavailable: %s", category, result)
-            items = []
+            items = ()
         rows.append(HomeRow(row_type=category, title=title, items=items))
         if spotlight is None:
             spotlight = next((item for item in items if item.backdrop_url), None)

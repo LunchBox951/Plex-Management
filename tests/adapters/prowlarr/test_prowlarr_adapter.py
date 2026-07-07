@@ -120,7 +120,7 @@ async def test_search_maps_and_dedupes_by_guid() -> None:
     assert first.size_bytes == 8589934592
     assert first.seeders == 120
     assert first.leechers == 8
-    assert first.categories == [2000, 2040]
+    assert first.categories == (2000, 2040)
     assert first.imdb_id == 1375666
     assert first.tmdb_id == 27205
     assert first.publish_date.year == 2023
@@ -219,8 +219,8 @@ async def test_search_builds_expected_query_params() -> None:
             imdb_id="944947",
             season=2,
             episode="5",
-            categories=[5000, 5040],
-            indexer_ids=[7],
+            categories=(5000, 5040),
+            indexer_ids=(7,),
         )
     )
     params = dict(captured["params"])

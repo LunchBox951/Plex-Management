@@ -768,6 +768,37 @@ def test_delete_rejects_symlink_escaping_the_configured_root(tmp_path: Path) -> 
     assert secret.exists()  # the real target outside the root is untouched
 
 
+def test_delete_rejects_outside_root_symlink_entry_pointing_inside_the_root(
+    tmp_path: Path,
+) -> None:
+    """Issue #141: a symlink ENTRY located OUTSIDE every configured root, whose
+    TARGET resolves INSIDE one, must be refused -- the mirror image of
+    ``test_delete_rejects_symlink_escaping_the_configured_root``. Before the fix,
+    ``resolve_guarded`` checked only the fully-dereferenced target's containment
+    (``/library/movie.mkv`` -- inside the root), so the guard passed; ``delete``
+    then unlinked the symlink ENTRY (``path`` itself, never its target, per its
+    own no-dereference contract for a final symlink) -- deleting an entry outside
+    every configured root."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    real_target = root / "movie.mkv"
+    real_target.write_bytes(b"x" * 100)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_link = outside / "link.mkv"
+    os.symlink(real_target, outside_link)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    assert fs.delete_guard_refuses(os.fspath(outside_link)) is True
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        fs.delete(os.fspath(outside_link))
+
+    assert outside_link.is_symlink()  # the outside-root symlink entry is untouched
+    assert real_target.exists()  # and the in-root target is untouched too
+    assert real_target.read_bytes() == b"x" * 100
+
+
 def test_delete_guard_refuses_agrees_with_delete_on_a_symlink_escaping_the_root(
     tmp_path: Path,
 ) -> None:

@@ -148,7 +148,7 @@ def test_no_acceptable_release_when_all_candidates_are_prerelease() -> None:
     ]
     result = decide(candidates, FakeParser(), default_profile(), _always_media, _never_blocklisted)
 
-    assert result.accepted == []
+    assert result.accepted == ()
     assert result.no_acceptable_release is True
     assert len(result.rejected) == 2
 
@@ -177,9 +177,9 @@ def test_blocklisted_candidate_is_filtered_after_quality_gate() -> None:
 
 def test_empty_candidate_set_surfaces_no_acceptable_release() -> None:
     result = decide([], FakeParser(), default_profile(), _always_media, _never_blocklisted)
-    assert result.accepted == []
+    assert result.accepted == ()
     assert result.no_acceptable_release is True
-    assert result.rejected == []
+    assert result.rejected == ()
 
 
 def test_prefer_season_pack_default_is_byte_identical_to_no_season_pack_ranking() -> None:
@@ -273,7 +273,7 @@ def test_multi_season_pack_rejected_even_without_prefer_season_pack() -> None:
     # a plain unscoped search).
     multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP")
     result = decide([multi], FakeParser(), default_profile(), _always_media, _never_blocklisted)
-    assert result.accepted == []
+    assert result.accepted == ()
     assert result.no_acceptable_release is True
     assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
 
@@ -293,7 +293,7 @@ def test_single_season_pack_still_classified_and_preferred() -> None:
         prefer_season_pack=True,
     )
     assert result.accepted[0].candidate.title == "Show.S02.1080p.WEB-DL.x264-GRP"
-    assert result.rejected == []
+    assert result.rejected == ()
 
 
 def test_prefer_season_pack_never_beats_a_higher_quality_release() -> None:
@@ -334,3 +334,17 @@ def test_wrong_media_is_rejected_before_quality_even_if_top_quality() -> None:
 
     assert [s.candidate.title for s in result.accepted] == ["Movie.2024.720p.WEB-DL.x264-GRP"]
     assert (wrong, RejectionReason.WRONG_MEDIA) in result.rejected
+
+
+def test_decision_result_accepted_and_rejected_are_immutable_tuples() -> None:
+    """Issue #106: a frozen ``DecisionResult`` blocks reassigning ``.accepted``/
+    ``.rejected`` but never stopped a plain list from being mutated in place --
+    which would corrupt every other holder of the same (shared) result. Both
+    fields must be tuples, with no ``.append``/``.sort`` surface left."""
+    candidates = [_candidate("Movie.2024.1080p.WEB-DL.x264-A")]
+    result = decide(candidates, FakeParser(), default_profile(), _always_media, _never_blocklisted)
+
+    assert isinstance(result.accepted, tuple)
+    assert isinstance(result.rejected, tuple)
+    assert not hasattr(result.accepted, "append")
+    assert not hasattr(result.rejected, "append")
