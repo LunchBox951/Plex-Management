@@ -31,8 +31,8 @@ Repo root: `/home/Projects/Plex-Management`.
 - Tests: normal, multi-ep, specials (Season 00), colon title, year=None.
 
 ## 4. Scoping model
-- No new tables. `SeasonRequest` created lazily/idempotently at grab time (like `Download`). `Download.episodes_json`: None = import all valid; `[4,5,6]` = only those, skip rest silently. No FK Download→SeasonRequest; pairing = tuple `(media_request_id, season)`.
-- **`domain/season_rollup.py`** (new, pure): `rollup_status(season_statuses) -> str`. Precedence `("import_blocked","downloading","searching","no_acceptable_release","completed")` wins outright; else all-available→available; mix-with-available→partially_available; any-pending→pending; all-failed→failed. Bare string literals.
+- Add `season_requests` as the per-season lifecycle table. `SeasonRequest` rows are created lazily/idempotently for tracked seasons; `Download.episodes_json`: None = import all valid; `[4,5,6]` = only those, skip rest silently. No FK Download→SeasonRequest; pairing = tuple `(media_request_id, season)`.
+- **`domain/season_rollup.py`** (new, pure): `rollup_status(season_statuses) -> str`. Precedence `("import_blocked","downloading","searching","no_acceptable_release")` wins outright; `completed` is a done state folded with `available`, so a completed season plus pending/failed siblings rolls up as partial rather than masking unfinished work. Bare string literals.
 - **`RequestStatus.partially_available = "partially_available"`** in models.py. No CHECK migration. Include in `uq_media_requests_active` predicate (still in-flight, blocks dup). Keep OUT of `TERMINAL_REQUEST_STATUS_VALUES` (`request_service.py:47-49`) and `_SETTLED_REQUEST_STATUSES` (`repositories/requests.py:23-25`).
 - **`ports/repositories.py`**: add `SeasonRequestRecord`(id, media_request_id, season_number, status, tmdb_id denormalized) + `SeasonRequestRepository` Protocol: get, list_for_request, list_by_status, ensure(idempotent IntegrityError-safe), set_status, mark_completed, mark_available.
 - **`repositories/season_requests.py`** (new): `SqlSeasonRequestRepository` mirrors `SqlRequestRepository` incl. ensure() IntegrityError-catch-and-reread.

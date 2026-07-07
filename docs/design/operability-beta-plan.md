@@ -65,9 +65,9 @@ terminal-free north star).
     handler; the queue+drain decouples them and avoids reentrancy/event-loop blocking.
   - wire `config.log_level` (currently defined but UNUSED) to actually set the root
     logger level at startup.
-- **Retention:** the drain task (or a sibling) periodically prunes `log_events`
-  older than `log_retention_days` (web-editable, default 7) and/or beyond a max row
-  count — bounded growth.
+- **Retention:** the drain task periodically prunes `log_events` older than
+  `log_retention_days` (web-editable, default 7). A max-row cap for bounded
+  high-volume growth still needs acceptance criteria (issue #152).
 - **Endpoints** (authenticated `ops` router):
   - `GET /api/v1/ops/logs` — paginated, filter by `level`/`since`/`logger`/
     correlation id, from `log_events`.
@@ -177,4 +177,7 @@ autogenerate sees them (tests build schema via `Base.metadata.create_all`).
 - The log capture must never block the event loop or recurse (sync handler → queue →
   async drain), and must be resilient (a DB write failure in the drain must not kill
   logging or the app).
-- Every new magic number is a web-editable setting.
+- Operator policy knobs are web-editable settings. Internal safety/backpressure
+  constants for the log pipeline (ring size, queue size, drain/prune cadence) and
+  the beta telemetry retention floor remain code constants unless a later issue
+  defines an operator-facing contract for them.

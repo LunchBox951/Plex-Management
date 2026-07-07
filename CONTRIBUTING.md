@@ -32,8 +32,10 @@ make check    # backend + frontend gates — run this before pushing
 make run      # run the app locally (http://localhost:8000)
 ```
 
-`make run` starts the real first-run-capable server, so it requires a bootstrap
-token unless you explicitly enable the development bypass:
+`make run` starts the real first-run-capable server. First-run setup is claimed
+by the first Plex server owner to sign in; the bootstrap token is optional
+hardening, not a startup requirement. Set it only when you want setup to also
+require `X-Setup-Token`:
 
 ```bash
 python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_urlsafe(32))" >> .env
@@ -42,8 +44,10 @@ PLEX_MANAGER_DEV_AUTH_BYPASS=true make run
 ```
 
 After completing setup, the `/api/v1/setup/complete` response reveals the
-`app_api_key` once. Use it as `X-Api-Key` for protected API calls; `/docs` shows
-the same security scheme.
+install status only. Setup mints no app key. Browser access uses Plex sign-in
+plus session cookies; generate the optional recovery/automation `X-Api-Key` from
+Settings -> Access (`POST /api/v1/settings/app-key/rotate`) when you need API
+automation or a break-glass credential.
 
 CI runs the same gates (`make check`), so green locally ≈ green in CI. The `ruff`
 and `pyright` versions are pinned exactly in `pyproject.toml` and mirrored in
