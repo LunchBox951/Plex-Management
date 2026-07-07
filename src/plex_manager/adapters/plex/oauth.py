@@ -20,6 +20,8 @@ from typing import Final, cast
 
 import httpx
 
+from plex_manager.headersafe import is_header_safe
+
 __all__ = [
     "PlexAccount",
     "PlexConnection",
@@ -92,6 +94,24 @@ class PlexResource:
     owned: bool
     provides: tuple[str, ...]
     connections: tuple[PlexConnection, ...]
+
+
+def _require_header_safe_token(token: str, host: str) -> None:
+    """Reject a token that cannot be sent as an ``X-Plex-Token`` header value
+    BEFORE any request.
+
+    httpx raises on such a value: CR/LF/NUL echo the RAW token in ``str(exc)``
+    (a credential leak if that ever reached a message/log via the chained
+    cause); non-ASCII makes httpx's ASCII header encoder raise an uncaught
+    ``UnicodeEncodeError`` (a 500). Fail fast with a credential-free
+    :class:`PlexVerifyError` instead of ever reaching either failure mode.
+    """
+    if not is_header_safe(token):
+        raise PlexVerifyError(
+            _CODE_TOKEN_INVALID,
+            "Plex token is not a valid credential value",
+            diagnostics={"host": host},
+        )
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -215,6 +235,7 @@ class PlexTvClient:
         return f"PlexTvClient(client_identifier={self._client_identifier!r})"
 
     async def fetch_account(self, auth_token: str) -> PlexAccount:
+        _require_header_safe_token(auth_token, _PLEX_TV_HOST)
         payload = await self._request_json(
             "GET",
             f"{_PLEX_TV_BASE_URL}/api/v2/user",
@@ -226,6 +247,7 @@ class PlexTvClient:
         return self.parse_account(payload)
 
     async def fetch_resources(self, auth_token: str) -> list[PlexResource]:
+        _require_header_safe_token(auth_token, _PLEX_TV_HOST)
         payload = await self._request_json(
             "GET",
             f"{_PLEX_TV_BASE_URL}/api/v2/resources",
@@ -239,6 +261,7 @@ class PlexTvClient:
 
     async def fetch_server_identity(self, base_url: str, service_token: str) -> str:
         url = f"{base_url.rstrip('/')}/identity"
+        _require_header_safe_token(service_token, httpx.URL(url).host)
         payload = await self._request_json(
             "GET",
             url,

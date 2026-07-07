@@ -34,6 +34,7 @@ from typing import Final, Literal, cast
 
 import httpx
 
+from plex_manager.headersafe import header_value_error
 from plex_manager.ports.library import LibrarySection, WatchState
 from plex_manager.services import path_visibility
 
@@ -356,6 +357,19 @@ class PlexLibrary:
         and the status only — httpx's own error embeds the URL, so it must never
         escape. JSON is NOT decoded here (refresh returns an empty body).
         """
+        if header_value_error(self._token) is not None:
+            # A stored token that cannot ride the ``X-Plex-Token`` header: a
+            # CR/LF/NUL value would make httpx echo the RAW token in ``str(exc)``
+            # (a credential leak through a chained transport error), and a non-ASCII
+            # value would raise an uncaught ``UnicodeEncodeError`` (a 500). Fail as a
+            # surfaced ``PlexAuthError`` -- the token is not a usable credential --
+            # WITHOUT ever placing it in a header. Defense-in-depth for a token that
+            # bypassed the write-time header-safety check (a ``dev_auth_bypass``
+            # install, or a legacy row); the ``oauth.py`` adapter guards its own
+            # plex.tv/identity sinks the same way (``_require_header_safe_token``).
+            raise PlexAuthError(
+                "Plex rejected the request: the stored token is not a valid credential value"
+            )
         request_headers: dict[str, str] = {
             "X-Plex-Token": self._token,
             "Accept": "application/json",

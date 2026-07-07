@@ -40,6 +40,7 @@ from typing import Final, cast
 import httpx
 
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.headersafe import header_value_error
 
 __all__ = ["IndexerError", "IndexerRateLimitError", "ProwlarrIndexer"]
 
@@ -212,6 +213,23 @@ class ProwlarrIndexer:
     def __repr__(self) -> str:  # pragma: no cover - trivial, redacts the key
         return f"ProwlarrIndexer(base_url={self._base_url!r}, api_key=<redacted>)"
 
+    def _auth_headers(self) -> dict[str, str]:
+        """Return the ``X-Api-Key`` header, refusing a header-unsafe key up front.
+
+        Defense-in-depth for a stored key that bypassed the write-time header-safety
+        check (a ``dev_auth_bypass`` install, a legacy row written before that check
+        existed, or a hand-edited DB): an unsafe key would otherwise make httpx echo
+        the RAW key in ``str(exc)`` -- leaked by :meth:`_indexer_priorities`' priority
+        warning log for a CR/LF/NUL key -- or raise an uncaught ``UnicodeEncodeError``
+        (a 500) for a non-ASCII key. Fail fast with a credential-free
+        :class:`IndexerError` (a genuine config error, like the malformed-base-URL
+        branch below -- NOT the best-effort empty-map degradation) so the key never
+        rides, and is never echoed by, a failing request.
+        """
+        if header_value_error(self._api_key) is not None:
+            raise IndexerError("Prowlarr api key is not a valid credential value")
+        return {"X-Api-Key": self._api_key}
+
     def _build_params(self, request: IndexerSearchRequest) -> list[_QueryParam]:
         """Translate a domain search request into Prowlarr query params.
 
@@ -246,11 +264,14 @@ class ProwlarrIndexer:
     async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
         """Run ``request`` and return de-duplicated candidate releases."""
         priorities = await self._indexer_priorities()
+        # Guard THIS request's key too: a cached-priority hit skips
+        # _indexer_priorities' own guard, so the search path must not assume it ran.
+        headers = self._auth_headers()
         try:
             response = await self._client.get(
                 f"{self._base_url}{_SEARCH_PATH}",
                 params=self._build_params(request),
-                headers={"X-Api-Key": self._api_key},
+                headers=headers,
                 timeout=self._search_timeout,
             )
         except httpx.InvalidURL as exc:
@@ -312,10 +333,16 @@ class ProwlarrIndexer:
         cached = self._priority_cache
         if cached is not None and (now - cached[0]).total_seconds() < _PRIORITY_TTL_SECONDS:
             return cached[1]
+        # A header-unsafe key is a genuine config error (every call fails
+        # identically), so -- like the malformed-URL branch below -- it raises
+        # IndexerError rather than degrading to the best-effort empty map, and does
+        # so BEFORE the request so httpx never echoes the raw key into the warning
+        # log's ``str(exc)``.
+        headers = self._auth_headers()
         try:
             response = await self._client.get(
                 f"{self._base_url}{_INDEXER_PATH}",
-                headers={"X-Api-Key": self._api_key},
+                headers=headers,
             )
         except httpx.InvalidURL as exc:
             # A malformed stored base URL (issue #88): unlike a transient network

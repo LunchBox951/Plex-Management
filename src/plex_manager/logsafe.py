@@ -43,9 +43,19 @@ def safe_int(value: int) -> int:
     return int(value)
 
 
+#: Every boundary ``str.splitlines()`` honors -- collapsed to a space so a
+#: request-derived value cannot forge a second log record. ``\r\n`` stays two
+#: chars (two spaces), preserving the pre-existing collapse behavior. Ten
+#: chars: ``\n \r \v(0x0b) \f(0x0c) \x1c \x1d \x1e \x85(NEL) \u2028(LS)
+#: \u2029(PS)``. ``safe_guid``'s allowlist is unchanged -- it admits none of
+#: these.
+_LINE_BOUNDARY_RE: Final = re.compile("[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
 def safe_text(value: str) -> str:
-    """Collapse CR/LF so a request-derived string cannot forge log records."""
-    return value.replace("\r", " ").replace("\n", " ")
+    """Collapse every Unicode line boundary to a space so a request-derived
+    string cannot forge a log record."""
+    return _LINE_BOUNDARY_RE.sub(" ", value)
 
 
 def safe_guid(value: str) -> str:

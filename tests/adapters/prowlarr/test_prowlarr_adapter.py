@@ -270,6 +270,32 @@ async def test_rate_limit_error_excludes_api_key() -> None:
         pytest.fail("expected IndexerRateLimitError")
 
 
+@pytest.mark.parametrize("bad_key", ["key\r\ninjected", "key\x00nul", "kéy-nonascii"])
+async def test_header_unsafe_api_key_raises_without_echoing(bad_key: str) -> None:
+    """Defense-in-depth: a stored key that cannot ride the ``X-Api-Key`` header (a
+    dev-bypass / legacy row that skipped the write-time check) must fail as a
+    credential-free ``IndexerError`` -- never echo the RAW key via httpx's
+    ``str(exc)`` in ``_indexer_priorities``' warning log (CR/LF/NUL), never crash
+    with an uncaught ``UnicodeEncodeError`` (non-ASCII). The key never rides a
+    request at all."""
+    sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        nonlocal sent
+        sent += 1
+        return httpx.Response(200, json=[])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ProwlarrIndexer(client, BASE_URL, bad_key)
+    try:
+        with pytest.raises(IndexerError) as exc_info:
+            await adapter.search(IndexerSearchRequest(query="x"))
+        assert bad_key not in str(exc_info.value)
+        assert sent == 0
+    finally:
+        await client.aclose()
+
+
 async def test_transport_outage_raises_indexer_error() -> None:
     """Prowlarr unreachable surfaces a wrapped, retryable IndexerError — never an
     opaque httpx error -> 500. (The priority pre-fetch failing is swallowed; the
