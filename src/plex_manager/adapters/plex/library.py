@@ -28,13 +28,14 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Final, Literal, cast
 
 import httpx
 
 from plex_manager.headersafe import header_value_error
+from plex_manager.logsafe import safe_int
 from plex_manager.ports.library import LibrarySection, WatchState
 from plex_manager.services import path_visibility
 
@@ -578,7 +579,10 @@ class PlexLibrary:
         return frozenset(present)
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         """The batch presence accessor — see :meth:`LibraryPort.present_ids`.
 
@@ -587,23 +591,36 @@ class PlexLibrary:
         crawl), TV shows from ``_PRESENT_SHOW_TMDB_CACHE`` (one show-section guid
         crawl, no per-show ``/children``). A section type is crawled ONLY when a key
         of that type is present, so a movie-only page never touches the show sections
-        (and vice versa). Cached-presence-only, like the other tile-facing reads: a
-        warmed snapshot is trusted (tiles tolerate the short TTL); a miss pages Plex
-        once and warms the cache for the next page-load.
+        (and vice versa).
+
+        With ``refresh_absent=False`` (tile decoration's default): cached-presence-
+        only, like the other tile-facing reads — a warmed snapshot is trusted as-is
+        (tiles tolerate the short TTL); a miss pages Plex once and warms the cache
+        for the next page-load.
+
+        With ``refresh_absent=True`` (the availability reconcile cycle): a warmed
+        snapshot is trusted ONLY if it already confirms every requested id of that
+        media type as present; otherwise one fresh crawl runs before answering —
+        still at most one crawl per media type, never one per key. This mirrors
+        ``is_available``'s "trust cached presence, never cached absence" contract:
+        a partial scan's cache invalidation (``trigger_scan``) fires before Plex
+        finishes indexing, so the very next crawl can cache a still-pending title as
+        absent; without this, that stale absence would be trusted for the rest of
+        the TTL instead of self-correcting on the next reconcile tick.
         """
         movie_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "movie"}
         show_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "tv"}
         present_movies: frozenset[int] = frozenset()
         if movie_ids:
             cached_movies = _PRESENT_TMDB_CACHE.get(self._cache_key)
-            if cached_movies is None:
+            if cached_movies is None or (refresh_absent and not movie_ids.issubset(cached_movies)):
                 cached_movies = await self._collect_present_tmdb_ids()
                 _PRESENT_TMDB_CACHE.set(self._cache_key, cached_movies)
             present_movies = cached_movies
         present_shows: frozenset[int] = frozenset()
         if show_ids:
             cached_shows = _PRESENT_SHOW_TMDB_CACHE.get(self._cache_key)
-            if cached_shows is None:
+            if cached_shows is None or (refresh_absent and not show_ids.issubset(cached_shows)):
                 cached_shows = await self._collect_present_show_ids()
                 _PRESENT_SHOW_TMDB_CACHE.set(self._cache_key, cached_shows)
             present_shows = cached_shows
@@ -631,6 +648,167 @@ class PlexLibrary:
         present = await self._collect_present_tv_seasons()
         _TV_SEASONS_CACHE.set(self._cache_key, present)
         return present.get(tmdb_id, frozenset())
+
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        """The seasons present for EVERY show in ``tmdb_ids`` — ONE targeted
+        page-walk, not a per-show library crawl.
+
+        Walks each show section's ``/all`` listing EXACTLY ONCE (never once per
+        requested id), recording the ``ratingKey`` of every item whose guid(s)
+        resolve to a requested tmdb id — see ``_collect_target_rating_keys``. A
+        given tmdb id can match MORE than one item (the same show catalogued in
+        two show sections, e.g. a separate "TV Shows" and "Anime" library, or a
+        duplicate entry within one section), so every matched item's ``/children``
+        is fetched and the resulting season sets are UNIONed per tmdb id — using
+        only the first match would under-report a season only present on a later
+        duplicate. Cost model: one page-walk across all show sections, plus one
+        ``/children`` fetch per MATCHED item (>= the number of requested ids that
+        are actually present, never more sections walked). Exists so the
+        availability reconcile cycle (``import_service.run_availability_cycle``)
+        can resolve every distinct pending show in a tick from a single
+        whole-library page-walk, instead of paying one page-walk per show.
+
+        The SECTION page-walk itself is all-or-nothing: a failure walking a show
+        section's ``/all`` listing is a genuine whole-pass transport failure and
+        is allowed to propagate (``PlexLibraryError``/``PlexAuthError``) — the
+        caller's whole-pass try/except handles that. But each MATCHED show's own
+        ``/children`` union (see ``_fetch_present_seasons``) is isolated in its
+        own try/except (round 4, #136 review): one show's metadata row being
+        deleted between the page-walk and this lookup, or persistently
+        returning a 404/500, must not abort every OTHER pending show's lookup in
+        the same batch. On a per-show failure, a warning is logged naming the
+        tmdb id and that id is OMITTED FROM THE RETURNED MAPPING ENTIRELY —
+        never mapped to an empty frozenset, which would dishonestly claim "no
+        seasons present" for a show whose presence is actually unknown. The
+        caller (``run_availability_cycle``) must treat a missing key as
+        "retry next cycle", not "not yet available".
+
+        Always re-pages fresh (never trusts a cached absence, mirroring
+        ``present_seasons``): a season that just finished indexing must be seen
+        immediately, not held stale for the cache TTL. Write-through: every id
+        that MATCHED at least one item AND resolved successfully is merged into
+        the shared ``_TV_SEASONS_CACHE`` snapshot (creating one if none is warm
+        yet) so a subsequent ``is_available``/``present_seasons`` call for the
+        SAME show inside this TTL window sees this fresh read rather than a
+        stale one -- a show NOT among the merged ids simply misses the cache and
+        triggers its own full re-crawl, same as today. A requested id with NO
+        matching item anywhere maps to an empty frozenset in the return value
+        (still present as a key — never omitted) but is deliberately NOT written
+        to the cache: ``_is_tv_available`` treats a cached key as "show present"
+        for whole-show checks, so caching the miss would report a
+        never-indexed show as available for the rest of the TTL. A requested id
+        whose lookup FAILED touches the cache in NEITHER direction: it DID match
+        a rating key, so it is never added to the unmatched/eviction set (its
+        state is unknown, not absent) and nothing is written for it either.
+        """
+        wanted = set(tmdb_ids)
+        if not wanted:
+            return {}
+        rating_keys_by_tmdb_id: dict[int, list[str]] = {}
+        for section in await self.list_sections():
+            if section.type != "show":
+                continue
+            await self._collect_target_rating_keys(section.key, wanted, rating_keys_by_tmdb_id)
+        result: dict[int, frozenset[int]] = {}
+        failed_ids: set[int] = set()
+        incomplete_ids: set[int] = set()
+        for tmdb_id in wanted:
+            seasons: set[int] = set()
+            any_failed = False
+            for rating_key in rating_keys_by_tmdb_id.get(tmdb_id, []):
+                try:
+                    seasons |= await self._fetch_present_seasons(rating_key)
+                except (PlexLibraryError, PlexAuthError) as exc:
+                    _logger.warning(
+                        "season lookup failed for a show entry tmdb_id=%s (%s)",
+                        safe_int(tmdb_id),
+                        exc,
+                    )
+                    any_failed = True
+                    # Keep going: a LATER duplicate entry may still confirm
+                    # seasons — positive evidence must not be discarded because
+                    # a stale/broken duplicate errored first (or vice versa).
+            if any_failed and not seasons:
+                # No positive evidence at all — state unknown, omit the id so
+                # the caller retries next cycle.
+                failed_ids.add(tmdb_id)
+                continue
+            if any_failed:
+                # PARTIAL union: some duplicate(s) failed but at least one
+                # confirmed seasons. Confirmed presence is sound to promote on
+                # (a season Plex reports IS present), so it goes in the RETURN
+                # value — but the union may be incomplete, so it must never be
+                # written through to the cache snapshot.
+                incomplete_ids.add(tmdb_id)
+            result[tmdb_id] = frozenset(seasons)
+        # ONLY ids that matched at least one item (and resolved successfully) are
+        # merged into the cache: ``_is_tv_available`` treats a cached KEY as "show
+        # present" for whole-show checks, so a no-match id must never be WRITTEN
+        # as an empty present key (a never-indexed show would answer True within
+        # the TTL) -- and, symmetrically, a fresh no-match read must EVICT any
+        # stale cached entry for that id (a show REMOVED from Plex since the
+        # snapshot warmed would otherwise keep answering True from the old entry
+        # for the rest of the TTL). The RETURN value still carries the empty
+        # frozenset for a no-match id — only the cache treats it as an eviction.
+        # A FAILED id is excluded from both ``matched_only`` and ``unmatched``: it
+        # is not evicted (it DID match a rating key -- its state is unknown, not
+        # absent) and nothing about it is written to the cache either. An
+        # INCOMPLETE id (partial duplicate failure, positive union returned) is
+        # likewise returned to the caller but never cached -- its union may be
+        # missing seasons that only lived on the failed duplicate.
+        matched_only = {
+            tmdb_id: seasons
+            for tmdb_id, seasons in result.items()
+            if rating_keys_by_tmdb_id.get(tmdb_id) and tmdb_id not in incomplete_ids
+        }
+        unmatched = wanted - matched_only.keys() - failed_ids - incomplete_ids
+        cached = _TV_SEASONS_CACHE.get(self._cache_key)
+        if matched_only or (cached is not None and unmatched & cached.keys()):
+            updated = dict(cached) if cached is not None else {}
+            for tmdb_id in unmatched:
+                updated.pop(tmdb_id, None)
+            updated.update(matched_only)
+            _TV_SEASONS_CACHE.set(self._cache_key, updated)
+        return result
+
+    async def _collect_target_rating_keys(
+        self, key: str, wanted: set[int], rating_keys_by_tmdb_id: dict[int, list[str]]
+    ) -> None:
+        """Walk one show section's items page-by-page, recording the ``ratingKey``
+        of every item whose guid(s) resolve to a tmdb id in ``wanted``.
+
+        A single item can only match one requested tmdb id per its own guid(s), but
+        a requested id can accumulate MULTIPLE rating keys across calls (this
+        section holding a duplicate entry, or a later section holding the same
+        show) — see :meth:`season_presence` on why every match's seasons must be
+        unioned rather than only the first.
+        """
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                entry = _as_mapping(item)
+                ids: set[int] = set()
+                _collect_item_tmdb_ids(entry, ids)
+                matched_ids = ids & wanted
+                if not matched_ids:
+                    continue
+                rating_key = _get_str(entry, "ratingKey")
+                if rating_key is None:
+                    continue
+                for tmdb_id in matched_ids:
+                    rating_keys_by_tmdb_id.setdefault(tmdb_id, []).append(rating_key)
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
 
     async def _collect_present_tv_seasons(self) -> dict[int, frozenset[int]]:
         """Page every show section and gather each show's present seasons.

@@ -35,8 +35,9 @@ import hashlib
 import logging
 import os
 import weakref
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Final, NamedTuple
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
@@ -72,7 +73,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.parser import ParserPort
-    from plex_manager.ports.repositories import DownloadRecord, RequestRecord
+    from plex_manager.ports.repositories import DownloadRecord, RequestRecord, SeasonRequestRecord
 
 __all__ = [
     "PATH_NOT_VISIBLE_REASON_PREFIX",
@@ -1349,45 +1350,124 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
     promote them to ``available``. Depends ONLY on Plex — so an import that already
     triggered a scan still reaches ``available`` even if the download client or the
     Movies/TV root is unavailable afterward. One item failing never aborts the cycle.
+
+    BATCHED, not per-row (issue #136): a burst of still-finalizing rows used to cost
+    one ``is_available`` call PER row, and the adapter never trusts a cached absence
+    -- so N pending movies meant N full movie-library crawls, and M pending seasons
+    meant M whole-library ``/children`` crawls, every 15s tick. Movies now cost AT
+    MOST one ``present_ids`` batch call for the whole tick, passed
+    ``refresh_absent=True`` so it NEVER trusts a cached absence for a still-pending
+    movie (mirroring the old per-row ``is_available``'s contract at batch
+    granularity) -- a warmed snapshot missing one of this tick's pending movies
+    triggers one fresh crawl before answering, so a movie is promoted on the tick
+    after it actually finishes indexing in Plex, not held for the rest of the
+    presence-cache TTL. TV seasons are grouped by show and resolved with exactly
+    ONE batch ``season_presence`` call for the WHOLE tick's distinct pending shows
+    (never one call per show, never a whole-library ``/children`` crawl, always
+    fresh) -- see ``LibraryPort.season_presence``. A genuine TRANSPORT failure
+    (the call itself raising) fails the WHOLE TV pass for this tick (mirroring
+    the movie batch's failure posture just above): every pending season stays
+    ``completed`` for the next tick's retry rather than promoting on a
+    partial/guessed result. But when the call SUCCEEDS and merely OMITS one
+    show's id from its returned mapping (round 4, #136 review -- that show's own
+    ``/children`` lookup failed, e.g. a metadata row deleted mid-cycle or a
+    persistently bad row), only THAT show's pending seasons are skipped for
+    retry; every OTHER pending show in the same tick still promotes normally --
+    a single bad Plex row must never starve unrelated shows at "Finalizing".
     """
     request_repo = SqlRequestRepository(session)
-    for request in await request_repo.list_by_status(RequestStatus.completed.value):
-        if request.media_type != "movie":
+    completed_movies = [
+        request
+        for request in await request_repo.list_by_status(RequestStatus.completed.value)
+        if request.media_type == "movie"
+    ]
+    present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]] = frozenset()
+    if completed_movies:
+        try:
+            present_movie_keys = await library.present_ids(
+                [(request.tmdb_id, "movie") for request in completed_movies],
+                refresh_absent=True,
+            )
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            _logger.warning(
+                "batch availability check failed for %d completed movie(s); will retry next cycle",
+                len(completed_movies),
+            )
+    for request in completed_movies:
+        if (request.tmdb_id, "movie") not in present_movie_keys:
             continue
         try:
-            if await library.is_available(request.tmdb_id, "movie"):
-                await request_repo.mark_available(request.id)
-                await session.commit()
+            await request_repo.mark_available(request.id)
+            await session.commit()
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
-                "availability check failed; will retry next cycle",
+                "availability promotion failed; will retry next cycle",
                 extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
             )
 
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
     # SeasonRequest rows -- a show's OTHER seasons may still be mid-flight while
     # one season is ready to confirm, so this is never gated on the parent's
-    # (computed rollup) status.
+    # (computed rollup) status. GROUPED by show so the WHOLE tick's distinct
+    # pending shows pay exactly ONE batch ``season_presence`` call, regardless of
+    # how many shows or seasons are pending -- never one lookup per show, never
+    # ``is_available``.
     season_repo = SqlSeasonRequestRepository(session)
+    seasons_by_show: dict[int, list[SeasonRequestRecord]] = {}
     for season_request in await season_repo.list_by_status(RequestStatus.completed.value):
+        seasons_by_show.setdefault(season_request.tmdb_id, []).append(season_request)
+
+    present_seasons_by_show: Mapping[int, frozenset[int]] = {}
+    season_presence_succeeded = False
+    if seasons_by_show:
         try:
-            if await library.is_available(
-                season_request.tmdb_id, "tv", season=season_request.season_number
-            ):
+            present_seasons_by_show = await library.season_presence(seasons_by_show.keys())
+            season_presence_succeeded = True
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            # A whole-pass TRANSPORT failure (mirroring the movie batch's failure
+            # posture above) -- every pending season honestly stays ``completed``
+            # for the next tick's retry rather than promoting on a
+            # partial/guessed result.
+            _logger.warning(
+                "batch availability check failed for %d pending show(s); will retry next cycle",
+                len(seasons_by_show),
+            )
+
+    for tmdb_id, season_requests in seasons_by_show.items():
+        if tmdb_id not in present_seasons_by_show:
+            # Distinguish a per-show lookup failure (the batch call SUCCEEDED but
+            # omitted this one id -- see ``LibraryPort.season_presence``) from the
+            # whole-pass transport failure already warned about above -- only log
+            # here when the call itself actually succeeded, so a single bad show
+            # is named explicitly without a redundant warning on every pending
+            # show when the whole pass failed instead (round 4, #136 review).
+            # Either way, only THIS show's seasons are skipped for retry -- every
+            # OTHER pending show in ``seasons_by_show`` still gets checked below.
+            if season_presence_succeeded:
+                _logger.warning(
+                    "season lookup failed for show; will retry next cycle",
+                    extra={"tmdb_id": safe_int(tmdb_id)},
+                )
+            continue
+        present_seasons = present_seasons_by_show[tmdb_id]
+        for season_request in season_requests:
+            if season_request.season_number not in present_seasons:
+                continue
+            try:
                 await season_request_service.mark_available(
                     session,
                     media_request_id=season_request.media_request_id,
                     season_number=season_request.season_number,
                 )
                 await session.commit()
-        except (PlexLibraryError, PlexAuthError, NotImplementedError):
-            await session.rollback()
-            _logger.warning(
-                "availability check failed for season %s; will retry next cycle",
-                season_request.season_number,
-                extra={
-                    "tmdb_id": season_request.tmdb_id,
-                    "request_id": season_request.media_request_id,
-                },
-            )
+            except (PlexLibraryError, PlexAuthError, NotImplementedError):
+                await session.rollback()
+                _logger.warning(
+                    "availability promotion failed for season %s; will retry next cycle",
+                    season_request.season_number,
+                    extra={
+                        "tmdb_id": tmdb_id,
+                        "request_id": season_request.media_request_id,
+                    },
+                )

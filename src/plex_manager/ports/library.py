@@ -7,7 +7,7 @@ wiring is a drop-in later. All methods are async.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
@@ -81,22 +81,93 @@ class LibraryPort(Protocol):
         SINGLE library crawl instead of one per season. Always reflects the library
         as it is NOW (like ``is_available(use_cache=False)`` — never trusts a cached
         absence); empty when the show is absent or has no indexed season.
+
+        NOTE: this crawls EVERY show section's full ``/all`` listing to build the
+        whole-library season map (see the adapter's ``_collect_present_tv_seasons``).
+        A caller that only needs a KNOWN set of shows' seasons should use
+        :meth:`season_presence` instead — it still costs exactly one page-walk, but
+        answers only the requested ids rather than the whole library's map.
+        """
+        raise NotImplementedError
+
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        """Return the season numbers present for EACH show in ``tmdb_ids``, via ONE
+        BATCH-shaped targeted lookup.
+
+        Unlike :meth:`present_seasons` (which crawls every show section's FULL
+        listing to answer for ANY one show, repeated per caller), this resolves
+        ALL of ``tmdb_ids`` from a SINGLE page-walk across every show section —
+        cost model: one page-walk total, plus one ``/children`` fetch per matched
+        item (not per requested id — a show may have more than one matching item,
+        see below) — the batch availability reconcile
+        (``import_service.run_availability_cycle``) depends on this to check every
+        distinct pending show in a tick without re-paging the library once per
+        show. A tmdb id absent from every show section maps to an empty
+        ``frozenset`` (never omitted from the returned mapping).
+
+        A show can legitimately have MORE THAN ONE matching item across (or within)
+        show sections — e.g. the same title catalogued in both a "TV Shows" and an
+        "Anime" section, or a duplicate entry in one section — so an implementation
+        MUST union the present seasons across every item matching a given tmdb id,
+        never just the first match. Returning only the first hit's seasons can
+        under-report a season that is actually present on a later duplicate,
+        stranding it at "Finalizing" forever.
+
+        Always reads FRESH (like ``present_seasons`` — never trusts a cached
+        absence): a season that just finished indexing must be seen on the very
+        next check, not held stale for a cache TTL.
+
+        Failure isolation (round 4, #136 review): a requested id is present as a
+        KEY in the returned mapping only when its lookup SUCCEEDED — an empty
+        ``frozenset`` genuinely means "no seasons present", while an id OMITTED
+        from the mapping means its lookup FAILED and the caller must treat it as
+        unknown/retry-next-cycle, never as "not yet available". This matters
+        because one show's underlying metadata lookup can fail independently
+        (e.g. a row deleted between an earlier crawl and this lookup, or a
+        persistently bad row returning 404/500) without that being a genuine
+        whole-batch transport failure — an implementation MUST isolate a single
+        show's lookup failure from the rest of the batch rather than letting it
+        abort every other requested id. A whole-batch transport failure (the
+        page-walk itself failing) is still allowed to raise
+        ``PlexLibraryError``/``PlexAuthError`` — the caller's own try/except
+        around the whole call handles that, leaving every requested id
+        unresolved for that tick.
         """
         raise NotImplementedError
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         """Return the subset of ``(tmdb_id, media_type)`` pairs present in the library.
 
-        The BATCH presence accessor for tile decoration (Discover/Search): a whole
-        page's keys are answered from AT MOST one movie crawl plus one show crawl
-        total -- never one library read per title (the prototype's "20 tiles = 20
-        crawls" anti-pattern). Cache-backed (``use_cache=True`` semantics): tiles are
-        HINTS and tolerate the short presence-cache staleness, so this reads the
-        warmed full-crawl snapshot rather than re-paging Plex per page-load. The
-        authoritative fresh dedup decision stays on the create path
-        (``is_available(use_cache=False)``), never here.
+        The BATCH presence accessor for tile decoration (Discover/Search) AND for
+        the availability reconcile cycle: a whole page's (or tick's) keys are
+        answered from AT MOST one movie crawl plus one show crawl total -- never
+        one library read per title (the prototype's "20 tiles = 20 crawls"
+        anti-pattern).
+
+        ``refresh_absent=False`` (the default, used by tile decoration): trusts a
+        warmed snapshot as-is, even if it does not contain one of the queried keys
+        -- tiles are HINTS and tolerate the short presence-cache staleness, so a
+        miss pages Plex once and warms the cache for the next page-load, but a hit
+        is never re-verified. The authoritative fresh dedup decision stays on the
+        create path (``is_available(use_cache=False)``), never here.
+
+        ``refresh_absent=True`` (used by the availability reconcile cycle,
+        ``import_service.run_availability_cycle``): trusts a cached PRESENCE but
+        never a cached ABSENCE for a queried key, mirroring ``is_available``'s
+        contract at batch granularity -- a warmed snapshot that does not confirm
+        EVERY queried key as present triggers exactly one fresh crawl before
+        answering (never per-key, never more than one crawl per call). This
+        matters because a Plex partial scan is asynchronous: the scan-triggered
+        cache invalidation (``trigger_scan``) can be followed by a reconcile tick
+        that pages Plex BEFORE indexing finishes, caching that miss; without
+        ``refresh_absent`` a subsequent tick would trust that stale absence for
+        the rest of the cache TTL instead of promoting the title on the very next
+        tick after it actually finishes indexing.
 
         Presence is SHOW-LEVEL for TV (the show is in the library), the granularity
         a tile needs -- per-season detail stays in the title modal. Only ever yields
