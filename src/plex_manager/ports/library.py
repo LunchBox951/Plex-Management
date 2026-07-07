@@ -178,6 +178,45 @@ class LibraryPort(Protocol):
         """
         raise NotImplementedError
 
+    async def confirm_paths(
+        self,
+        media_type: Literal["movie", "tv"],
+        library_paths: Collection[str],
+    ) -> frozenset[str]:
+        """GUID-INDEPENDENT fallback: confirm ``library_paths`` by DIRECTORY-PREFIX
+        match against the file path(s) Plex reports for its indexed items (issue
+        #158).
+
+        Some titles are matched by Plex's metadata provider to an item that carries
+        no ``tmdb://`` (or even a WRONG/unrelated) guid -- new/obscure releases, or a
+        provider mismatch -- so GUID-based confirmation (:meth:`present_ids`)
+        can never succeed for them, no matter how long the import cycle waits.
+        This is the app's OWN fallback: it knows exactly which folder it placed a
+        completed download's file(s) into (the ``library_path`` breadcrumb,
+        ADR-0012), so it can ask "did Plex index a file *there*", independent of
+        which (or whether any) guid Plex's provider assigned.
+
+        ``library_paths`` are CONTAINER-namespace directories (a movie's folder, or
+        a TV season's directory) -- never a bare file. Each is confirmed when SOME
+        item's reported file path, after translating the section's own
+        HOST-namespace location the same way :meth:`trigger_scan` reverses it, sits
+        AT or BELOW that directory. Matching is PURELY by path -- never by title or
+        year -- so a same-title/same-year but genuinely different file can never
+        false-confirm.
+
+        Batched like :meth:`present_ids`/:meth:`season_presence`: every requested
+        path is answered from ONE crawl of the relevant (movie or show) sections,
+        never one crawl per path -- a caller with many pending rows in one tick
+        still costs a single pass. Returns the SUBSET of ``library_paths`` that
+        confirmed; a path with no match (including one under no known section at
+        all) is simply absent from the result, never raised. A genuine crawl
+        failure (the section walk itself failing) is allowed to raise
+        ``PlexLibraryError``/``PlexAuthError`` -- the caller's own try/except
+        handles that exactly like :meth:`present_ids`'s batch failure, leaving
+        every queried path unconfirmed for this tick's retry.
+        """
+        raise NotImplementedError
+
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         """Ask the media server to scan ``path`` (partial-scan when supported).
 

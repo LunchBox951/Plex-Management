@@ -9,7 +9,9 @@ real bytes.
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -54,6 +56,24 @@ SessionMaker = async_sessionmaker[AsyncSession]
 
 _TMDB_ID = 603
 _HASH = "deadbeef01"
+
+
+@pytest.fixture(autouse=True)
+def reset_bounded_finalizing_state() -> Iterator[None]:
+    """Clear the bounded-Finalizing (#158) in-memory bookkeeping between tests.
+
+    ``import_service``'s duty-cycle/first-seen bookkeeping is process-GLOBAL,
+    keyed by a request/season id -- and each test's in-memory DB
+    (``tests/services/conftest.py``'s ``engine`` fixture) is FRESH, so
+    autoincrement ids restart at 1 every test. Without this reset, a duty-cycle
+    bucket (or a first-observed-miss anchor) recorded by one test would leak
+    into an unrelated later test that happens to reuse the same id. Mirrors
+    ``adapters.plex.library``'s ``reset_caches`` fixture pattern
+    (``tests/adapters/plex/test_plex_library.py``).
+    """
+    import_service.reset_unconfirmed_tracking()
+    yield
+    import_service.reset_unconfirmed_tracking()
 
 
 def _make_video(path: Path, size_bytes: int = 60 * 1024 * 1024) -> None:
@@ -2300,10 +2320,18 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
 
 
 async def _seed_movie_request(
-    sessionmaker_: SessionMaker, *, tmdb_id: int, status: RequestStatus = RequestStatus.completed
+    sessionmaker_: SessionMaker,
+    *,
+    tmdb_id: int,
+    status: RequestStatus = RequestStatus.completed,
+    library_path: str | None = None,
+    completed_at: datetime | None = None,
 ) -> int:
     """Insert a bare movie request row (no download) -- the availability cycle
-    reads only ``MediaRequest``, so a batching test needs nothing else."""
+    reads only ``MediaRequest``, so a batching test needs nothing else.
+    ``library_path``/``completed_at`` (issue #158) let a path-confirmation-fallback
+    or bounded-Finalizing test control the exact breadcrumb / elapsed-time anchor
+    without needing a full import run."""
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=tmdb_id,
@@ -2311,6 +2339,8 @@ async def _seed_movie_request(
             title=f"Movie {tmdb_id}",
             year=2020,
             status=status,
+            library_path=library_path,
+            completed_at=completed_at,
         )
         session.add(request)
         await session.commit()
@@ -2340,11 +2370,17 @@ async def _seed_season(
     media_request_id: int,
     season_number: int,
     status: str = "completed",
+    library_path: str | None = None,
 ) -> int:
-    """Insert one tracked season row for an already-seeded show request."""
+    """Insert one tracked season row for an already-seeded show request.
+    ``library_path`` (issue #158) lets a path-confirmation-fallback test control
+    the exact breadcrumb without a full import run."""
     async with sessionmaker_() as session:
         season_row = SeasonRequest(
-            media_request_id=media_request_id, season_number=season_number, status=status
+            media_request_id=media_request_id,
+            season_number=season_number,
+            status=status,
+            library_path=library_path,
         )
         session.add(season_row)
         await session.commit()
@@ -2510,6 +2546,391 @@ async def test_run_availability_cycle_isolates_per_show_season_lookup_failure(
     assert a1 is not None and a1.status.value == "completed"
     # Show B is ISOLATED from show A's failure -- it still promotes this tick.
     assert b1 is not None and b1.status.value == "available"
+
+
+# --------------------------------------------------------------------------- #
+# run_availability_cycle — path-based confirmation fallback + bounded
+# Finalizing (issue #158)
+# --------------------------------------------------------------------------- #
+_IMPORT_SERVICE_LOGGER = "plex_manager.services.import_service"
+
+
+async def test_run_availability_cycle_path_confirms_a_guid_miss_movie(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The exact live bug (issue #158): Plex's metadata provider matched the
+    imported file to an item carrying no tmdb guid at all -- GUID confirmation
+    (``present_ids``) can never succeed. The app's own ``library_path``
+    breadcrumb lets ``confirm_paths`` confirm it anyway, by directory prefix."""
+    library_path = "/media/Movies/Obsession (2026)"
+    request_id = await _seed_movie_request(sessionmaker_, tmdb_id=999999, library_path=library_path)
+    library = FakeLibrary(movie_file_paths=[f"{library_path}/Obsession.mkv"])
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.available
+    assert library.confirm_paths_calls == [("movie", frozenset({library_path}))]
+
+
+async def test_run_availability_cycle_movie_path_miss_stays_completed_no_warning_yet(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """GUID-miss AND path-miss: the request honestly stays ``completed`` -- never
+    a new status -- and, before the bounded-Finalizing threshold, no warning."""
+    library_path = "/media/Movies/Obsession (2026)"
+    request_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=999999,
+        library_path=library_path,
+        completed_at=datetime.now(UTC),
+    )
+    library = FakeLibrary(movie_file_paths=["/media/Movies/Some Unrelated Film (2020)/file.mkv"])
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.completed
+
+
+async def test_run_availability_cycle_movie_bounded_finalizing_warns_after_threshold(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """After ``_FINALIZING_WARN_AFTER_MINUTES`` of failing BOTH GUID and path
+    confirmation, a WARNING names the title -- 'Finalizing' can no longer spin
+    silently forever (time-mocked: no real sleeping)."""
+    library_path = "/media/Movies/Obsession (2026)"
+    completed_at = datetime.now(UTC) - timedelta(minutes=45)
+    request_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=999999, library_path=library_path, completed_at=completed_at
+    )
+    library = FakeLibrary(movie_file_paths=[])
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session, now=datetime.now(UTC))
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.completed  # never a new status
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("not confirmed by Plex" in r.getMessage() for r in warnings)
+    assert any("Movie 999999" in r.getMessage() for r in warnings)
+
+
+async def test_run_availability_cycle_movie_bounded_finalizing_respects_duty_cycle(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning repeats at a LOW duty cycle (once per hour per row), never on
+    every ~15s reconcile tick -- derived purely from elapsed-time bucketing."""
+    library_path = "/media/Movies/Obsession (2026)"
+    completed_at = datetime.now(UTC) - timedelta(minutes=45)
+    await _seed_movie_request(
+        sessionmaker_, tmdb_id=999999, library_path=library_path, completed_at=completed_at
+    )
+    library = FakeLibrary(movie_file_paths=[])
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=library, session=session, now=completed_at + timedelta(minutes=45)
+            )
+        # A second tick a minute later -- still the SAME duty-cycle window --
+        # must NOT re-warn.
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=library, session=session, now=completed_at + timedelta(minutes=46)
+            )
+    same_window_warnings = [r for r in caplog.records if "not confirmed by Plex" in r.getMessage()]
+    assert len(same_window_warnings) == 1
+
+    caplog.clear()
+    # A third tick, over an hour after the FIRST warning -- the duty cycle has
+    # elapsed, so it re-warns exactly once more.
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=library, session=session, now=completed_at + timedelta(minutes=110)
+            )
+    later_warnings = [r for r in caplog.records if "not confirmed by Plex" in r.getMessage()]
+    assert len(later_warnings) == 1
+
+
+async def test_run_availability_cycle_movie_bounded_finalizing_suppressed_on_guid_batch_failure(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-5 finding: a completed movie's ``completed_at`` is already past the
+    bounded-Finalizing threshold, but the GUID batch (and, since it defaults to
+    "nothing confirmed", the path fallback too) both raise -- a Plex OUTAGE, not
+    a genuine library/GUID mismatch. The 'not confirmed by Plex' warning must NOT
+    fire; only the existing 'batch availability check failed' warnings (which
+    already name the real cause) may appear, and the row's bookkeeping must be
+    left alone so a LATER, successful tick can still warn once it genuinely
+    fails both checks."""
+    library_path = "/media/Movies/Obsession (2026)"
+    completed_at = datetime.now(UTC) - timedelta(minutes=45)
+    request_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=999999, library_path=library_path, completed_at=completed_at
+    )
+    library = FakeLibrary(raises=PlexLibraryError("plex unreachable"))
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session, now=datetime.now(UTC))
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.completed
+    assert not any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+    assert not import_service.is_movie_unconfirmed_tracked(request_id)
+    assert any("batch availability check failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_run_availability_cycle_season_bounded_finalizing_suppressed_on_transport_failure(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """TV mirror of the movie case above: the whole-batch ``season_presence`` call
+    is a genuine transport failure (Plex unreachable), so every season's GUID
+    answer is inconclusive -- even though the path fallback ALSO independently
+    misses (no matching file path), the bounded-Finalizing warning must stay
+    suppressed since the row was never conclusively checked."""
+    show_id = await _seed_show_request(sessionmaker_, tmdb_id=777778)
+    library_path = "/media/TV/Some Show (2019)/Season 02"
+    await _seed_season(
+        sessionmaker_, media_request_id=show_id, season_number=2, library_path=library_path
+    )
+    library = FakeLibrary(
+        tv_file_paths=[],  # path fallback would miss too, if it were even trustworthy
+        season_presence_raises=PlexLibraryError("plex unreachable"),
+    )
+    t0 = datetime.now(UTC)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session, now=t0)
+        # A later tick, well past the 30-minute threshold -- still suppressed,
+        # since ``season_presence`` keeps failing every tick.
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=library, session=session, now=t0 + timedelta(minutes=45)
+            )
+
+    assert not any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+    assert any("batch availability check failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_run_availability_cycle_season_bounded_finalizing_suppressed_on_per_show_omission(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A per-show lookup failure (the batch call SUCCEEDS but OMITS this one
+    show's id -- see ``LibraryPort.season_presence``) is just as inconclusive for
+    THIS show as a whole-batch transport failure: the bounded-Finalizing warning
+    must stay suppressed for its seasons even though every OTHER pending show
+    resolves normally."""
+    bad_show = await _seed_show_request(sessionmaker_, tmdb_id=888889)
+    await _seed_season(sessionmaker_, media_request_id=bad_show, season_number=1)
+    good_show = await _seed_show_request(sessionmaker_, tmdb_id=999990)
+    good_season = await _seed_season(sessionmaker_, media_request_id=good_show, season_number=1)
+
+    library = FakeLibrary(
+        available_tv_seasons={999990: frozenset({1})},
+        raises_for_shows={888889: PlexLibraryError("this show's lookup failed")},
+    )
+    t0 = datetime.now(UTC)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session, now=t0)
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=library, session=session, now=t0 + timedelta(minutes=45)
+            )
+
+    assert not any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+    async with sessionmaker_() as session:
+        good = await session.get(SeasonRequest, good_season)
+    assert good is not None and good.status.value == "available"  # unaffected show still resolves
+
+
+async def test_run_availability_cycle_movie_path_confirmation_never_uses_title_or_year(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Two GUID-miss movies share the SAME title/year but sit at DIFFERENT
+    folders; only the one whose actual file path matches gets confirmed -- path
+    confirmation must never fall back to title/year (a generic-title collision
+    must never false-confirm the wrong request)."""
+    path_a = "/media/Movies/Same Title (2020)"
+    path_b = "/media/Movies/Same Title (2020) (2)"
+    request_a = await _seed_movie_request(sessionmaker_, tmdb_id=1111, library_path=path_a)
+    request_b = await _seed_movie_request(sessionmaker_, tmdb_id=2222, library_path=path_b)
+    async with sessionmaker_() as session:
+        for rid in (request_a, request_b):
+            row = await session.get(MediaRequest, rid)
+            assert row is not None
+            row.title = "Same Title"
+            row.year = 2020
+        await session.commit()
+
+    library = FakeLibrary(movie_file_paths=[f"{path_a}/movie.mkv"])
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, request_a)
+        b = await session.get(MediaRequest, request_b)
+    assert a is not None and a.status is RequestStatus.available
+    assert b is not None and b.status is RequestStatus.completed  # NOT confirmed by title/year
+
+
+async def test_run_availability_cycle_movie_without_library_path_skips_path_check(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A legacy row with no ``library_path`` breadcrumb can never be
+    path-confirmed -- ``confirm_paths`` must not even be asked about it (an
+    empty/``None`` breadcrumb is never a wildcard match)."""
+    await _seed_movie_request(sessionmaker_, tmdb_id=555555, library_path=None)
+    library = FakeLibrary(movie_file_paths=["/media/Movies/Anything (2020)/x.mkv"])
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    assert library.confirm_paths_calls == []
+
+
+async def test_run_availability_cycle_path_confirms_a_guid_miss_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """TV mirror of the movie path-confirmation fallback: a season's own file
+    path confirms it even when its show's tmdb guid never matches at all."""
+    show_id = await _seed_show_request(sessionmaker_, tmdb_id=888888)
+    library_path = "/media/TV/Some Show (2019)/Season 02"
+    season_id = await _seed_season(
+        sessionmaker_, media_request_id=show_id, season_number=2, library_path=library_path
+    )
+    library = FakeLibrary(
+        available_tv_seasons={},  # the show's guid never matches -- #158's exact bug
+        tv_file_paths=[f"{library_path}/Some Show - S02E01 - Pilot.mkv"],
+    )
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None and season_row.status.value == "available"
+    assert library.confirm_paths_calls == [("tv", frozenset({library_path}))]
+
+
+async def test_run_availability_cycle_season_path_miss_stays_completed_and_bounded_warns(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """GUID-miss + path-miss for a TV season: stays honestly ``completed`` and,
+    since ``SeasonRequest`` carries no per-season ``completed_at`` mirror, the
+    bounded-Finalizing anchor is the in-memory first-observed-miss timestamp --
+    exercised here across two ticks (time-mocked, no real sleeping)."""
+    show_id = await _seed_show_request(sessionmaker_, tmdb_id=777777)
+    library_path = "/media/TV/Some Show (2019)/Season 02"
+    season_id = await _seed_season(
+        sessionmaker_, media_request_id=show_id, season_number=2, library_path=library_path
+    )
+    library = FakeLibrary(available_tv_seasons={}, tv_file_paths=[])
+    t0 = datetime.now(UTC)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        # First tick: establishes the in-memory anchor at t0 -- too soon to warn.
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session, now=t0)
+    assert not any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        # Second tick, 31 minutes later: past the threshold -- warns exactly once.
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=library, session=session, now=t0 + timedelta(minutes=31)
+            )
+    warnings = [r for r in caplog.records if "not confirmed by Plex" in r.getMessage()]
+    assert len(warnings) == 1
+    assert any("Show 777777 season 2" in r.getMessage() for r in warnings)
+
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None and season_row.status.value == "completed"  # never a new status
+
+
+async def test_run_availability_cycle_season_path_confirmation_never_uses_title_or_year(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Two shows share the SAME title/year but sit at DIFFERENT season folders;
+    only the one whose file path matches gets confirmed."""
+    show_a = await _seed_show_request(sessionmaker_, tmdb_id=3333)
+    show_b = await _seed_show_request(sessionmaker_, tmdb_id=4444)
+    async with sessionmaker_() as session:
+        for sid in (show_a, show_b):
+            row = await session.get(MediaRequest, sid)
+            assert row is not None
+            row.title = "Same Show"
+            row.year = 2020
+        await session.commit()
+    path_a = "/media/TV/Same Show (2020)/Season 01"
+    path_b = "/media/TV/Same Show (2020) (2)/Season 01"
+    season_a = await _seed_season(
+        sessionmaker_, media_request_id=show_a, season_number=1, library_path=path_a
+    )
+    season_b = await _seed_season(
+        sessionmaker_, media_request_id=show_b, season_number=1, library_path=path_b
+    )
+
+    library = FakeLibrary(
+        available_tv_seasons={}, tv_file_paths=[f"{path_a}/Same Show - S01E01.mkv"]
+    )
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(SeasonRequest, season_a)
+        b = await session.get(SeasonRequest, season_b)
+    assert a is not None and a.status.value == "available"
+    assert b is not None and b.status.value == "completed"  # NOT confirmed by title/year
+
+
+async def test_run_availability_cycle_forgets_stale_bounded_finalizing_state_once_resolved(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once a row is no longer in the completed set at all (an operator re-armed
+    it, here simulated by flipping it back to ``searching``), its bounded-
+    Finalizing bookkeeping is forgotten -- a LATER, unrelated row that happens to
+    reuse the same id must never inherit a stale duty-cycle bucket."""
+    library_path = "/media/Movies/Obsession (2026)"
+    completed_at = datetime.now(UTC) - timedelta(minutes=45)
+    request_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=999999, library_path=library_path, completed_at=completed_at
+    )
+    library = FakeLibrary(movie_file_paths=[])
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session, now=datetime.now(UTC))
+    assert any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+    assert import_service.is_movie_unconfirmed_tracked(request_id)
+
+    # The operator re-arms the request away from ``completed`` some other way.
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.status = RequestStatus.searching
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    assert not import_service.is_movie_unconfirmed_tracked(request_id)
 
 
 # --------------------------------------------------------------------------- #

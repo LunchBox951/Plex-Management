@@ -301,7 +301,12 @@ class FakeLibrary:
     caller asserts against these to prove a reconcile pass makes AT MOST one
     ``present_ids`` call and exactly ONE ``season_presence`` call per tick --
     never one ``season_presence`` call per show, never one ``is_available`` call
-    per row.
+    per row. ``confirm_paths_calls`` (issue #158) mirrors the same discipline for
+    the GUID-independent path-based fallback: each entry is the
+    ``(media_type, frozenset(library_paths))`` one :meth:`confirm_paths` call was
+    asked to resolve, so a test can assert the reconcile cycle batches every
+    distinct GUID-miss row's path check into ONE call per media type per tick,
+    never one per row.
     """
 
     def __init__(
@@ -314,10 +319,26 @@ class FakeLibrary:
         raises: Exception | None = None,
         raises_for_shows: dict[int, Exception] | None = None,
         season_presence_raises: Exception | None = None,
+        movie_file_paths: Collection[str] | None = None,
+        tv_file_paths: Collection[str] | None = None,
+        confirm_paths_raises: Exception | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
         self.sections = sections or []
+        # Path-based confirmation fallback (issue #158): every file path Plex
+        # "knows about" for movies/tv, INDEPENDENT of the guid-keyed
+        # ``available_ids``/``available_tv_seasons`` above -- lets a test model a
+        # GUID-miss row (absent from those) that is still confirmable by path, the
+        # whole point of the fallback. Plain strings, no host/container remap
+        # simulated here (that translation is exercised against the real
+        # ``PlexLibrary`` adapter in ``tests/adapters/plex/test_plex_library.py``);
+        # callers here pass paths already in whatever single namespace the test
+        # wants both sides compared in.
+        self.movie_file_paths = list(movie_file_paths or ())
+        self.tv_file_paths = list(tv_file_paths or ())
+        self.confirm_paths_raises = confirm_paths_raises
+        self.confirm_paths_calls: list[tuple[str, frozenset[str]]] = []
         self.scanned: list[str] = []
         self.scan_calls: list[tuple[str, str]] = []
         self.watch_states = watch_states or {}
@@ -426,6 +447,22 @@ class FakeLibrary:
             for key in keys
             if (key[1] == "movie" and key[0] in self.available_ids)
             or (key[1] == "tv" and key[0] in self.available_tv_seasons)
+        )
+
+    async def confirm_paths(
+        self, media_type: Literal["movie", "tv"], library_paths: Collection[str]
+    ) -> frozenset[str]:
+        wanted = frozenset(p for p in library_paths if p)
+        self.confirm_paths_calls.append((media_type, wanted))
+        if self.confirm_paths_raises is not None:
+            raise self.confirm_paths_raises
+        if self.raises is not None:
+            raise self.raises
+        known = self.movie_file_paths if media_type == "movie" else self.tv_file_paths
+        return frozenset(
+            library_path
+            for library_path in wanted
+            if any(fp == library_path or fp.startswith(f"{library_path}/") for fp in known)
         )
 
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
