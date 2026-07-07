@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -38,6 +39,7 @@ from typing import Annotated, cast
 import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,20 +68,32 @@ from plex_manager.services.health_service import (
     TtlCache,
 )
 from plex_manager.web.errors import AppError
+from plex_manager.web.settings_bounds import (
+    DISK_PRESSURE_PERCENT_MAX,
+    DISK_PRESSURE_PERCENT_MIN,
+    EVICTION_GRACE_DAYS_MAX,
+    EVICTION_INTERVAL_MAX_MINUTES,
+    LOG_RETENTION_DAYS_MAX,
+)
 
 __all__ = [
     "API_KEY_HEADER_NAME",
     "AUTO_GRAB_ENABLED_DEFAULT",
     "CSRF_COOKIE_NAME",
     "CSRF_HEADER_NAME",
+    "DISK_PRESSURE_PERCENT_MAX",
+    "DISK_PRESSURE_PERCENT_MIN",
     "DISK_PRESSURE_TARGET_PERCENT_DEFAULT",
     "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
     "EVICTION_ENABLED_DEFAULT",
     "EVICTION_GRACE_DAYS_DEFAULT",
+    "EVICTION_GRACE_DAYS_MAX",
+    "EVICTION_INTERVAL_MAX_MINUTES",
     "EVICTION_INTERVAL_MINUTES_DEFAULT",
     "EVICTION_PROACTIVE_ENABLED_DEFAULT",
     "KNOWN_SETTING_KEYS",
     "LOG_RETENTION_DAYS_DEFAULT",
+    "LOG_RETENTION_DAYS_MAX",
     "PLEX_MACHINE_ID_SETTING",
     "SECRET_MASK",
     "SECRET_SETTING_KEYS",
@@ -87,6 +101,7 @@ __all__ = [
     "SETUP_TOKEN_HEADER_NAME",
     "AuthContext",
     "AuthMethod",
+    "DiskPressurePercents",
     "ServiceNotConfiguredError",
     "SettingsStore",
     "api_key_matches",
@@ -129,6 +144,11 @@ __all__ = [
     "require_admin",
     "require_api_key",
     "require_setup_admin",
+    "resolve_bool_setting",
+    "resolve_disk_pressure_percents",
+    "resolve_eviction_grace_days",
+    "resolve_eviction_interval_minutes",
+    "resolve_log_retention_days",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -1125,98 +1145,416 @@ LOG_RETENTION_DAYS_DEFAULT: int = 7
 # default; an operator can turn it off from Settings without touching a terminal.
 AUTO_GRAB_ENABLED_DEFAULT: bool = True
 
-# Values that parse as boolean-true; anything else (including unset/unparsable)
-# is false. Matches the plain-string ``settings.value`` storage -- there is no
-# dedicated boolean column type here (mirrors ``is_secret``'s own dialect-portable
-# boolean handling being a DIFFERENT, ORM-level concern from this string parse).
-_TRUE_STRINGS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+# Upper bounds for the three settings above that feed directly into a sleep
+# duration or a timedelta cutoff (issue #92) live in ``web.settings_bounds``,
+# a dependency-free leaf module both this module AND ``web.schemas`` import --
+# see that module's docstring for why (a real, verified circular import if
+# ``web.schemas`` imported these from here instead). Re-exported via
+# ``__all__`` above so callers/tests reach them the same way as every other
+# operability constant, via ``web.deps``.
+
+# Parses a stored boolean setting. ``TypeAdapter(bool)`` accepts the
+# case-insensitive token set pydantic recognizes (``true``/``false``/``1``/``0``/
+# ``yes``/``no``/``on``/``off``/``t``/``f``/``y``/``n``); the plain-string
+# ``settings.value`` column has no dedicated boolean type, so this string parse
+# (inside :func:`resolve_bool_setting`, which also strips surrounding whitespace)
+# is the single boolean gate shared by the runtime getters below AND ``GET
+# /settings``'s ``_sanitize_typed_settings`` -- one rule, so the page and the
+# loops can never disagree on which stored string is a valid bool.
+_BOOL_SETTING_ADAPTER: TypeAdapter[bool] = TypeAdapter(bool)
 
 
-async def _get_float_setting(session: AsyncSession, key: str, default: float) -> float:
-    """Return ``key`` parsed as ``float``, or ``default`` if unset/unparsable.
+# --------------------------------------------------------------------------- #
+# Shared raw-value resolvers (PR #142): the ONE place a stored typed setting's
+# raw string becomes the EFFECTIVE runtime value. Used by BOTH the typed
+# getters below (what the eviction / auto-grab / log-retention loops read) and
+# ``GET /settings``'s ``_sanitize_typed_settings`` (what the page presents), so
+# the two can never disagree on what a corrupt stored value means -- the page
+# must never claim a state the running service isn't in (north star #3).
+#
+# Directional degradation policy, chosen per what is SAFER for existing data
+# when a stored value violates a bound (upgrade compatibility: a value that
+# predates the bounds, or a hand-edit, must never silently become MORE
+# destructive than what it meant when it was written):
+#
+# * ABOVE an upper bound -> CLAMP to the bound. A pre-bounds huge
+#   ``eviction_grace_days`` / ``log_retention_days`` was a legitimate way to
+#   effectively disable age-based eviction / log expiry; substituting the
+#   default (30 / 7 days) on upgrade would suddenly evict month-old titles or
+#   delete week-old logs. Same for ``eviction_interval_minutes`` (the MAX
+#   already guarantees a weekly wake-up) and the disk-pressure percents (a
+#   stored >100 threshold meant "never trip"; clamping to 100 = only-when-full
+#   is the closest safe meaning, where the default 90 would START evicting at
+#   90% used on upgrade).
+# * BELOW a lower bound -> DEFAULT, never a floor-clamp. Every floor here is
+#   the DESTRUCTIVE end of the scale: grace/retention 0 = evict/expire
+#   immediately, threshold 0 = permanently "under pressure", a sub-zero target
+#   = evict everything, interval <= 0 = a hot-spinning loop. The default is
+#   the safe, tested value; clamping to the floor would maximize the damage.
+# * Unparsable / non-finite -> DEFAULT (nothing to clamp toward).
+#
+# Every resolver returns ``(effective, honored)``: ``honored`` is True only
+# when the effective value IS the raw stored value (so the GET sanitizer can
+# echo the raw string verbatim); every degradation is logged at WARNING naming
+# the key, never silent.
+def _parse_finite_float(raw: str) -> float | None:
+    """``float(raw)`` narrowed to finite, or ``None`` (unparsable / ``inf`` / ``nan``).
 
-    A parse failure is logged (never silent) but never raises -- a malformed
-    stored value must not crash the reconcile / eviction / log-retention loops
-    that read these; it falls back to the safe default instead (honesty over
-    silence: the fallback is visible in the log, not just silently applied).
+    ``float()`` happily parses ``"inf"``/``"nan"`` without raising -- a stored
+    non-finite value would otherwise sail through and hang whichever loop feeds
+    it into ``asyncio.sleep`` (issue #92) -- so non-finite folds into the same
+    ``None`` (= degrade to default) a genuinely unparsable string gets.
     """
-    raw = await SettingsStore(session).get(key)
-    if raw is None:
-        return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
-        _logger.warning(
-            "setting %r has an unparsable value %r; using default %s", key, raw, default
-        )
-        return default
+        return None
+    return value if math.isfinite(value) else None
 
 
-async def _get_int_setting(session: AsyncSession, key: str, default: int) -> int:
-    """Return ``key`` parsed as ``int``, or ``default`` if unset/unparsable."""
-    raw = await SettingsStore(session).get(key)
-    if raw is None:
-        return default
+def _parse_int(raw: str) -> int | None:
+    """``int(raw)``, or ``None`` when unparsable."""
     try:
         return int(raw)
     except ValueError:
+        return None
+
+
+def _resolve_disk_pressure_percent(key: str, raw: str | None, default: float) -> tuple[float, bool]:
+    """Individually resolve ONE disk-pressure percent to ``[0, 100]`` (no pair logic)."""
+    if raw is None:
+        return default, True
+    parsed = _parse_finite_float(raw)
+    if parsed is None:
+        _logger.warning(
+            "setting %r has an unparsable or non-finite value %r; using default %s",
+            key,
+            raw,
+            default,
+        )
+        return default, False
+    if parsed > DISK_PRESSURE_PERCENT_MAX:
+        _logger.warning(
+            "setting %r is %s, above %s; clamping to %s",
+            key,
+            parsed,
+            DISK_PRESSURE_PERCENT_MAX,
+            DISK_PRESSURE_PERCENT_MAX,
+        )
+        return DISK_PRESSURE_PERCENT_MAX, False
+    if parsed < DISK_PRESSURE_PERCENT_MIN:
+        _logger.warning(
+            "setting %r is %s, below %s; using default %s",
+            key,
+            parsed,
+            DISK_PRESSURE_PERCENT_MIN,
+            default,
+        )
+        return default, False
+    return parsed, True
+
+
+@dataclass(frozen=True)
+class DiskPressurePercents:
+    """The EFFECTIVE (post-resolution) disk-pressure pair the sweep runs with.
+
+    ``threshold``/``target`` are always a WORKABLE pair (``target <= threshold``)
+    -- see :func:`resolve_disk_pressure_percents`. Each ``*_honored`` is True only
+    when that side's effective value is exactly the raw stored value (used by the
+    ``GET /settings`` sanitizer to decide raw-echo vs effective-value display).
+    """
+
+    threshold: float
+    target: float
+    threshold_honored: bool
+    target_honored: bool
+
+
+def resolve_disk_pressure_percents(
+    raw_threshold: str | None, raw_target: str | None
+) -> DiskPressurePercents:
+    """Resolve the stored disk-pressure pair to the effective, WORKABLE pair.
+
+    Each side is first resolved individually (clamp above 100, default below 0
+    or on garbage -- see the policy comment above). Then the PAIR invariant is
+    re-validated: per-side substitution can manufacture an inverted pair from a
+    half-corrupt store -- e.g. a valid stored ``threshold=50`` with a corrupt
+    ``target=-1`` would substitute the default target 80, and ``(50, 80)`` makes
+    ``select_evictions``'s ``projected <= target`` stop condition select NOTHING
+    anywhere in the 50-80% used band: a sweep that trips but never relieves
+    pressure, while the Settings form cannot even re-save the pair it displays.
+    An inverted resolved pair therefore clamps the TARGET down to the resolved
+    threshold (with a WARNING): the threshold -- WHEN eviction starts -- is the
+    operator-meaningful side and is preserved, and ``target == threshold`` is
+    the MINIMAL eviction consistent with it (never more eviction than any pair
+    the operator could legitimately have stored with that threshold, and never
+    a dead band). The threshold itself is never changed by the pair rule.
+    """
+    threshold, threshold_honored = _resolve_disk_pressure_percent(
+        "disk_pressure_threshold_percent", raw_threshold, DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT
+    )
+    target, target_honored = _resolve_disk_pressure_percent(
+        "disk_pressure_target_percent", raw_target, DISK_PRESSURE_TARGET_PERCENT_DEFAULT
+    )
+    if target > threshold:
+        _logger.warning(
+            "disk_pressure_target_percent resolved to %s, above disk_pressure_threshold_percent"
+            " %s; using %s so the pressure sweep has a workable (non-inverted) pair",
+            target,
+            threshold,
+            threshold,
+        )
+        target = threshold
+        target_honored = False
+    return DiskPressurePercents(
+        threshold=threshold,
+        target=target,
+        threshold_honored=threshold_honored,
+        target_honored=target_honored,
+    )
+
+
+def resolve_eviction_interval_minutes(raw: str | None) -> tuple[float, bool]:
+    """Resolve the sweep interval to ``(0, EVICTION_INTERVAL_MAX_MINUTES]``.
+
+    Above the MAX clamps to it: a pre-bounds huge interval meant "sweep almost
+    never", the MAX already guarantees at least a weekly wake-up, and the
+    30-minute default would make sweeps orders of magnitude more frequent on
+    upgrade. At/below zero -- an EXCLUSIVE bound with no safe floor to clamp to
+    (a zero/negative sleep hot-spins ``_eviction_loop``) -- and garbage fall
+    back to the default.
+    """
+    if raw is None:
+        return EVICTION_INTERVAL_MINUTES_DEFAULT, True
+    parsed = _parse_finite_float(raw)
+    if parsed is None:
+        _logger.warning(
+            "setting 'eviction_interval_minutes' has an unparsable or non-finite value %r;"
+            " using default %s",
+            raw,
+            EVICTION_INTERVAL_MINUTES_DEFAULT,
+        )
+        return EVICTION_INTERVAL_MINUTES_DEFAULT, False
+    if parsed > EVICTION_INTERVAL_MAX_MINUTES:
+        _logger.warning(
+            "setting 'eviction_interval_minutes' is %s, above %s; clamping to %s",
+            parsed,
+            EVICTION_INTERVAL_MAX_MINUTES,
+            EVICTION_INTERVAL_MAX_MINUTES,
+        )
+        return EVICTION_INTERVAL_MAX_MINUTES, False
+    if parsed <= 0:
+        _logger.warning(
+            "setting 'eviction_interval_minutes' is %s, not above 0; using default %s",
+            parsed,
+            EVICTION_INTERVAL_MINUTES_DEFAULT,
+        )
+        return EVICTION_INTERVAL_MINUTES_DEFAULT, False
+    return parsed, True
+
+
+def _resolve_bounded_days(
+    key: str, raw: str | None, default: int, maximum: int
+) -> tuple[int, bool]:
+    """Resolve a day-count setting to ``[0, maximum]`` (grace / log retention).
+
+    Above ``maximum`` clamps to it: a pre-bounds huge value was a legitimate
+    "effectively never evict / never expire" configuration, and substituting the
+    default on upgrade would be data-destructive (a 30-day grace suddenly makes
+    month-old titles evictable; a 7-day retention deletes logs the operator
+    meant to keep). NEGATIVE values fall back to the default, never a clamp to
+    0 -- a 0-day grace/retention is the DESTRUCTIVE end of the scale
+    (immediately evictable / nothing retained), the opposite of what a corrupt
+    value should degrade to; negative values also push the ``timedelta`` cutoff
+    into the future (over-evicting / wholesale log deletion), and a huge value
+    overflows ``timedelta`` (its own limit is 999,999,999 days).
+    """
+    if raw is None:
+        return default, True
+    parsed = _parse_int(raw)
+    if parsed is None:
         _logger.warning(
             "setting %r has an unparsable value %r; using default %s", key, raw, default
         )
-        return default
+        return default, False
+    if parsed > maximum:
+        _logger.warning("setting %r is %s, above %s; clamping to %s", key, parsed, maximum, maximum)
+        return maximum, False
+    if parsed < 0:
+        _logger.warning("setting %r is %s, negative; using default %s", key, parsed, default)
+        return default, False
+    return parsed, True
 
 
-async def _get_bool_setting(session: AsyncSession, key: str, default: bool) -> bool:
-    """Return ``key`` parsed as ``bool`` (case-insensitive ``1``/``true``/``yes``/``on``)."""
-    raw = await SettingsStore(session).get(key)
+def resolve_eviction_grace_days(raw: str | None) -> tuple[int, bool]:
+    """Resolve ``eviction_grace_days`` -- policy in :func:`_resolve_bounded_days`."""
+    return _resolve_bounded_days(
+        "eviction_grace_days", raw, EVICTION_GRACE_DAYS_DEFAULT, EVICTION_GRACE_DAYS_MAX
+    )
+
+
+def resolve_log_retention_days(raw: str | None) -> tuple[int, bool]:
+    """Resolve ``log_retention_days`` -- policy in :func:`_resolve_bounded_days`."""
+    return _resolve_bounded_days(
+        "log_retention_days", raw, LOG_RETENTION_DAYS_DEFAULT, LOG_RETENTION_DAYS_MAX
+    )
+
+
+def resolve_bool_setting(key: str, raw: str | None, default: bool) -> tuple[bool, bool]:
+    """Resolve a stored boolean: recognized token -> its value, else the default.
+
+    The raw value is ``strip()``-ed first, preserving the pre-#142 parser's
+    contract (it compared ``raw.strip().lower()``), so a persisted
+    whitespace-padded ``" false "`` keeps meaning ``False`` on upgrade instead
+    of becoming "unrecognized" and silently re-enabling a loop via the ``True``
+    default. The recognized token set is pydantic's own case-insensitive
+    coercion set (``true``/``false``/``1``/``0``/``yes``/``no``/``on``/``off``/
+    ``t``/``f``/``y``/``n`` -- so ``"False"``/``"TRUE"`` work exactly as they
+    did before). An UNRECOGNIZED value (e.g. ``"maybe"``) is NOT silently
+    coerced to ``False`` -- it falls back to ``default`` with a WARNING naming
+    the key, matching the numeric resolvers' corrupt-value posture, so the loop
+    and the Settings page (which presents the same fallback) always agree
+    (issue #92).
+    """
     if raw is None:
-        return default
-    return raw.strip().lower() in _TRUE_STRINGS
+        return default, True
+    try:
+        return _BOOL_SETTING_ADAPTER.validate_python(raw.strip()), True
+    except ValidationError:
+        _logger.warning(
+            "setting %r has an unrecognized boolean value %r; using default %s", key, raw, default
+        )
+        return default, False
 
 
 async def get_disk_pressure_threshold_percent(session: AsyncSession) -> float:
-    """Used% at/above which a root's disk-pressure eviction sweep fires (default 90)."""
-    return await _get_float_setting(
-        session, "disk_pressure_threshold_percent", DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT
+    """Used% at/above which a root's disk-pressure eviction sweep fires (default 90).
+
+    Resolved through :func:`resolve_disk_pressure_percents` -- the SAME
+    resolution ``GET /settings`` presents -- so a corrupt stored value degrades
+    identically for the page and for ``_eviction_tick``: above 100 clamps to
+    100 (a pre-bounds ``150`` meant "never trip"; the default 90 would START
+    evicting at 90% on upgrade), below 0 / garbage falls back to the default,
+    every degradation logged at WARNING. Reads both halves of the pair because
+    resolution is pair-aware (see the resolver), though the threshold itself is
+    never changed by the pair rule.
+    """
+    store = SettingsStore(session)
+    resolved = resolve_disk_pressure_percents(
+        await store.get("disk_pressure_threshold_percent"),
+        await store.get("disk_pressure_target_percent"),
     )
+    return resolved.threshold
 
 
 async def get_disk_pressure_target_percent(session: AsyncSession) -> float:
-    """Used% the sweep evicts stalest-first candidates down towards (default 80)."""
-    return await _get_float_setting(
-        session, "disk_pressure_target_percent", DISK_PRESSURE_TARGET_PERCENT_DEFAULT
+    """Used% the sweep evicts stalest-first candidates down towards (default 80).
+
+    Resolved through :func:`resolve_disk_pressure_percents` -- the SAME
+    resolution ``GET /settings`` presents. Individually: above 100 clamps to
+    100, below 0 / garbage falls back to the default. Then the PAIR rule
+    applies: if the resolved target sits ABOVE the resolved threshold (a
+    half-corrupt store after per-side substitution), it clamps down to the
+    threshold so ``select_evictions`` always gets a workable, non-inverted
+    pair -- see the resolver's docstring for why that beats substituting the
+    default pair.
+    """
+    store = SettingsStore(session)
+    resolved = resolve_disk_pressure_percents(
+        await store.get("disk_pressure_threshold_percent"),
+        await store.get("disk_pressure_target_percent"),
     )
+    return resolved.target
 
 
 async def get_eviction_grace_days(session: AsyncSession) -> int:
-    """Minimum days since ``last_viewed_at`` before a watched title is evictable (default 30)."""
-    return await _get_int_setting(session, "eviction_grace_days", EVICTION_GRACE_DAYS_DEFAULT)
+    """Minimum days since ``last_viewed_at`` before a watched title is evictable (default 30).
+
+    Resolved through :func:`resolve_eviction_grace_days` (shared with the ``GET
+    /settings`` sanitizer): a stored value ABOVE ``EVICTION_GRACE_DAYS_MAX``
+    CLAMPS to the MAX rather than defaulting -- a pre-bounds huge value (e.g.
+    ``3651``) was a legitimate way to effectively disable age-based eviction,
+    and degrading it to the 30-day default on upgrade would suddenly make
+    month-old titles eviction-eligible (data-destructive). A NEGATIVE value
+    (which would push ``eviction_service``'s ``grace_cutoff`` into the FUTURE,
+    over-evicting titles still within grace) and garbage fall back to the
+    default. Every degradation is a WARNING naming the key.
+    """
+    value, _honored = resolve_eviction_grace_days(
+        await SettingsStore(session).get("eviction_grace_days")
+    )
+    return value
 
 
 async def get_eviction_enabled(session: AsyncSession) -> bool:
-    """Whether the pressure-triggered eviction sweep may run at all (default true)."""
-    return await _get_bool_setting(session, "eviction_enabled", EVICTION_ENABLED_DEFAULT)
+    """Whether the pressure-triggered eviction sweep may run at all (default true).
+
+    Parsed by :func:`resolve_bool_setting` (shared with ``GET /settings``):
+    whitespace-padded/case-variant ``true``/``false`` tokens are honored;
+    an unrecognized stored value degrades to the default with a WARNING.
+    """
+    value, _honored = resolve_bool_setting(
+        "eviction_enabled",
+        await SettingsStore(session).get("eviction_enabled"),
+        EVICTION_ENABLED_DEFAULT,
+    )
+    return value
 
 
 async def get_eviction_proactive_enabled(session: AsyncSession) -> bool:
-    """Whether past-grace watched+unpinned content evicts even without pressure (default false)."""
-    return await _get_bool_setting(
-        session, "eviction_proactive_enabled", EVICTION_PROACTIVE_ENABLED_DEFAULT
+    """Whether past-grace watched+unpinned content evicts even without pressure (default false).
+
+    Same :func:`resolve_bool_setting` parse as :func:`get_eviction_enabled`.
+    """
+    value, _honored = resolve_bool_setting(
+        "eviction_proactive_enabled",
+        await SettingsStore(session).get("eviction_proactive_enabled"),
+        EVICTION_PROACTIVE_ENABLED_DEFAULT,
     )
+    return value
 
 
 async def get_eviction_interval_minutes(session: AsyncSession) -> float:
-    """How often the eviction sweep's own periodic task runs (default 30 minutes)."""
-    return await _get_float_setting(
-        session, "eviction_interval_minutes", EVICTION_INTERVAL_MINUTES_DEFAULT
+    """How often the eviction sweep's own periodic task runs (default 30 minutes).
+
+    Resolved through :func:`resolve_eviction_interval_minutes` (shared with the
+    ``GET /settings`` sanitizer): a finite-huge stored value (e.g. a hand-edited
+    ``"999999"``) CLAMPS to ``EVICTION_INTERVAL_MAX_MINUTES`` -- the weekly
+    wake-up the bound exists to guarantee -- rather than defaulting to a
+    30-minute cadence the operator never asked for; non-positive, non-finite,
+    and unparsable values fall back to the default (a zero/negative sleep would
+    hot-spin ``_eviction_loop``). Every degradation is a WARNING naming the key.
+    """
+    value, _honored = resolve_eviction_interval_minutes(
+        await SettingsStore(session).get("eviction_interval_minutes")
     )
+    return value
 
 
 async def get_log_retention_days(session: AsyncSession) -> int:
-    """How many days of captured ``log_events`` rows the retention sweep keeps (default 7)."""
-    return await _get_int_setting(session, "log_retention_days", LOG_RETENTION_DAYS_DEFAULT)
+    """How many days of captured ``log_events`` rows the retention sweep keeps (default 7).
+
+    Resolved through :func:`resolve_log_retention_days` (shared with the ``GET
+    /settings`` sanitizer), with the same directional policy as
+    :func:`get_eviction_grace_days`: above the MAX clamps (a pre-bounds huge
+    value meant "keep everything" -- defaulting to 7 days would delete logs the
+    operator meant to keep); negative (a future cutoff = wholesale log
+    deletion) and garbage fall back to the default.
+    """
+    value, _honored = resolve_log_retention_days(
+        await SettingsStore(session).get("log_retention_days")
+    )
+    return value
 
 
 async def get_auto_grab_enabled(session: AsyncSession) -> bool:
-    """Whether the background auto-grab worker may run at all (default true, ADR-0013)."""
-    return await _get_bool_setting(session, "auto_grab_enabled", AUTO_GRAB_ENABLED_DEFAULT)
+    """Whether the background auto-grab worker may run at all (default true, ADR-0013).
+
+    Same :func:`resolve_bool_setting` parse as :func:`get_eviction_enabled`.
+    """
+    value, _honored = resolve_bool_setting(
+        "auto_grab_enabled",
+        await SettingsStore(session).get("auto_grab_enabled"),
+        AUTO_GRAB_ENABLED_DEFAULT,
+    )
+    return value
