@@ -33,7 +33,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.services import (
@@ -95,7 +95,13 @@ async def _seed(
         return download.id, request.id
 
 
-def _qbt(content_path: Path) -> FakeQbittorrent:
+def _qbt(content_path: Path, *, files: list[DownloadedFile] | None = None) -> FakeQbittorrent:
+    """Fake client reporting ``content_path`` under its parent as save_path.
+
+    ``files`` (save-path-relative name + exact size) is the torrent's own file
+    list, the PROOF a host->container content remap must exhibit on disk (round
+    3); tests that exercise the remap must supply it, same as the real client.
+    """
     return FakeQbittorrent(
         statuses=[
             DownloadStatus(
@@ -106,7 +112,8 @@ def _qbt(content_path: Path) -> FakeQbittorrent:
                 save_path=str(content_path.parent),
                 content_path=str(content_path),
             )
-        ]
+        ],
+        files={_HASH: files} if files is not None else None,
     )
 
 
@@ -858,9 +865,14 @@ async def test_import_remaps_download_path_under_the_downloads_mount(
     monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
     monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
     # qbt (host-side) reports a HOST path with the SAME basename -- the suffix
-    # that must remap onto the real file under the mount.
+    # that must remap onto the real file under the mount, PROVEN by the torrent's
+    # own file list (exact relative name + exact size).
     host_content = Path(
         "/definitely-not-a-real-host-path/downloads/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    )
+    qbt = _qbt(
+        host_content,
+        files=[DownloadedFile(name=host_content.name, size_bytes=60 * 1024 * 1024)],
     )
     download_id, request_id = await _seed(
         sessionmaker_,
@@ -869,7 +881,7 @@ async def test_import_remaps_download_path_under_the_downloads_mount(
     )
     library = FakeLibrary()
 
-    record = await _import(sessionmaker_, download_id, movies_root, _qbt(host_content), library)
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, library)
 
     assert record is not None
     assert record.status == DownloadState.Imported.value
@@ -902,7 +914,7 @@ async def test_import_never_places_a_stale_shorter_suffix_match(
     # A stale, unrelated file with the SAME basename at the mount ROOT -- what the
     # shorter-suffix guess would have wrongly matched and placed.
     stale = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
-    _make_video(stale)
+    _make_video(stale)  # same name AND same size as the real torrent file
     # The mount must COUNT for this test to bite (otherwise the block is vacuous):
     # relax the live-mount gate so the tmp dir stands in as the download mount.
     monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
@@ -912,6 +924,10 @@ async def test_import_never_places_a_stale_shorter_suffix_match(
     host_content = Path(
         "/definitely-not-a-real-host-path/qbt/movies/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
     )
+    qbt = _qbt(
+        host_content,
+        files=[DownloadedFile(name=host_content.name, size_bytes=60 * 1024 * 1024)],
+    )
     download_id, request_id = await _seed(
         sessionmaker_,
         request_status=RequestStatus.downloading,
@@ -919,7 +935,7 @@ async def test_import_never_places_a_stale_shorter_suffix_match(
     )
     library = FakeLibrary()
 
-    record = await _import(sessionmaker_, download_id, movies_root, _qbt(host_content), library)
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, library)
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
@@ -930,6 +946,53 @@ async def test_import_never_places_a_stale_shorter_suffix_match(
     assert library.scanned == []
     # The stale source itself is untouched (never hardlinked out).
     assert stale.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_import_blocks_a_same_name_wrong_size_stale_at_the_bind_root(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 regression: the bind-root content remap (save_path IS the bind
+    source, mapped to the download mount root) must demand name+size PROOF from
+    the torrent's own file list -- a same-named stale file with a DIFFERENT size
+    at the expected location is a disproof, so the import blocks honestly and
+    the stale file is never validated, placed, or touched."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    mount = tmp_path / "dl"
+    mount.mkdir()
+    stale = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(stale)  # 60 MiB on disk...
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    host_content = Path(
+        "/definitely-not-a-real-host-path/qbt/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    )
+    # ...but the torrent's OWN file is a different size: same name, wrong file.
+    qbt = _qbt(
+        host_content,
+        files=[DownloadedFile(name=host_content.name, size_bytes=60 * 1024 * 1024 + 1)],
+    )
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "download path not visible inside the container" in record.failed_reason
+    assert not any(movies_root.iterdir())
+    assert library.scanned == []
+    assert stale.exists()  # never touched
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
     assert request is not None and request.status == RequestStatus.import_blocked

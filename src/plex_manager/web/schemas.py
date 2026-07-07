@@ -195,19 +195,14 @@ class PlexLibraryOption(BaseModel):
     # selecting it round-trips a path the write-time gate (setup/settings) accepts
     # without a second remap.
     suggested_path: str | None = None
-    # A LOW-CONFIDENCE mount-root suggestion, offered ONLY when ``suggested_path``
-    # is ``None`` yet exactly one library mount exists: a whole-library bind root
-    # like ``/srv/plex-data`` -> ``/media`` has NO component below the mount and its
-    # basename need not equal the mount's, so the strict write-time remap can't
-    # resolve it (it keeps ``None`` honest for a typo'd root). Because the picker's
-    # paths come from Plex (never hand-typed) and WHICH mount is unambiguous, the
-    # mount root is surfaced here as a guess the operator must EXPLICITLY confirm by
-    # selecting it -- the picker only, never the write gate, which stays strict so a
-    # hand-typed typo is never silently accepted as ``/media`` (honesty over
-    # silence: a remap must never guess wrong silently). ``None`` when a confident
-    # ``suggested_path`` exists, when the mount is ambiguous (0 or >1), or when the
-    # path already resolves.
-    low_confidence_suggested_path: str | None = None
+    # NOTE (PR #147 round 3, maintainer decision): a short-lived
+    # ``low_confidence_suggested_path`` mount-root GUESS briefly lived here within
+    # this PR and was removed before release -- an unresolvable Plex location must
+    # never be dressed up as a pickable ``/media``, even flagged low-confidence (a
+    # child section like ``/srv/plex-data/Movies`` would misroute to the bare mount
+    # root). The rare arbitrary-bind-root topology is served by manual entry plus
+    # the wizard's visibility hint instead. The field never shipped in a release,
+    # so removing it breaks no released client.
 
 
 ProbeStatusField = Literal["ok", "unreachable"]

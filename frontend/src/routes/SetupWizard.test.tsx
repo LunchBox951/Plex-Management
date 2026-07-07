@@ -221,29 +221,6 @@ describe('SetupWizard — services (library roots + completion)', () => {
     expect(option.value).toBe('/media/Movies')
   })
 
-  it('offers a low-confidence mount-root suggestion the operator confirms', async () => {
-    // A whole-library bind root the backend can only guess at (differing basename)
-    // arrives as low_confidence_suggested_path. The picker must offer it, labelled
-    // "confirm", and selecting it stores the container path — never silently.
-    const bindRoot: PlexLibraryOption = {
-      path: '/srv/plex-data',
-      suggested_path: null,
-      low_confidence_suggested_path: '/media',
-      section_key: '3',
-      section_type: 'movie',
-      title: 'Movies',
-      writable: null,
-    }
-    h.validatePlex.mockResolvedValue(plexVerifyOk([bindRoot, tvLibrary]))
-    await reachServices()
-
-    const movieSelect = screen.getByLabelText('Movies library folder')
-    const option = within(movieSelect).getByText(
-      /Movies — \/srv\/plex-data · in-container\? confirm: \/media/,
-    ) as HTMLOptionElement
-    expect(option.value).toBe('/media')
-  })
-
   it('never requires a tv library folder to be chosen (tv_root is optional)', async () => {
     await reachServices()
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {

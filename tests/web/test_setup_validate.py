@@ -24,7 +24,6 @@ from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibrarySection
 from plex_manager.services import path_visibility
-from plex_manager.services.path_visibility import remap_library_root
 from plex_manager.web import setup_validation
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
@@ -147,76 +146,66 @@ def test_library_options_no_suggestion_when_the_path_already_resolves(tmp_path: 
     assert options[0].suggested_path is None
 
 
-def test_library_options_offers_low_confidence_mount_root_for_a_differing_bind_root(
+def test_library_options_no_guess_for_an_unresolvable_bind_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Finding regression: a whole-library bind root whose basename differs from
-    the mount (``PLEX_MANAGER_MEDIA_ROOT=/srv/plex-data`` -> ``/media``, Plex
-    reporting ``/srv/plex-data``) can't be resolved by the strict remap (no
-    component below the mount, basename ``plex-data`` != ``media``). With exactly
-    ONE library mount the picker offers that mount root as a LOW-confidence
-    suggestion the operator confirms -- never a confident ``suggested_path``, so
-    the write gate still stays strict for a hand-typed value."""
+    """Round-3 regression (maintainer decision): an unresolvable Plex location
+    gets NO suggestion of any kind -- the short-lived low-confidence mount-root
+    guess was removed because a child section like ``/srv/plex-data/Movies``
+    would misroute to the bare mount root. Both the whole-bind-root and the
+    child-section shapes stay raw; the operator types a container path manually
+    (plus the wizard's visibility hint) for exotic bind topologies."""
     mount = tmp_path / "media"
     mount.mkdir()
     monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
-    bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
-    # Pre-init (probe_writable=False): the wizard's own case -- still offered, and
-    # never stats the raw caller-supplied path.
-    options = library_options([bind_root], probe_writable=False, suggest_mounts=(str(mount),))
-    assert options[0].suggested_path is None
-    assert options[0].low_confidence_suggested_path == str(mount)
-    # The confirmed container path is exactly what the strict write gate accepts.
-    assert remap_library_root(str(mount)) == str(mount)
+    sections = [
+        LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",)),
+        LibrarySection(key="2", title="Kids", type="movie", locations=("/srv/plex-data/Movies",)),
+    ]
+    options = library_options(sections, probe_writable=False, suggest_mounts=(str(mount),))
+    assert [o.suggested_path for o in options] == [None, None]
+    # And the schema carries no other suggestion field to smuggle a guess through.
+    assert "low_confidence_suggested_path" not in type(options[0]).model_fields
 
 
-def test_library_options_no_low_confidence_when_the_mount_is_ambiguous(
+def test_library_options_under_mount_location_is_never_suffix_probed_deeper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Two library mounts: WHICH one the bind root maps to is ambiguous, so no
-    # low-confidence guess is offered (the operator must fix mounts / type a path).
-    first = tmp_path / "media"
-    second = tmp_path / "media2"
-    first.mkdir()
-    second.mkdir()
-    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
-    bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
-    options = library_options(
-        [bind_root], probe_writable=False, suggest_mounts=(str(first), str(second))
-    )
-    assert options[0].suggested_path is None
-    assert options[0].low_confidence_suggested_path is None
-
-
-def test_library_options_no_low_confidence_for_a_plain_unmounted_directory(tmp_path: Path) -> None:
-    """CI regression (tests-py314): stock Ubuntu/Debian ship a plain ``/media``
-    DIRECTORY, so gating the low-confidence suggestion on bare ``isdir`` offered a
-    bogus ``/media`` for every unresolvable Plex path on any non-Docker host --
-    and made the suite's behaviour differ between CI (Ubuntu) and the dev box
-    (Arch). With the REAL ``is_live_mount`` gate (deliberately NOT relaxed here),
-    a plain directory never counts, so no suggestion is offered."""
-    mount = tmp_path / "media"  # a real directory, but nothing is mounted at it
-    mount.mkdir()
-    bind_root = LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",))
-    options = library_options([bind_root], probe_writable=False, suggest_mounts=(str(mount),))
-    assert options[0].suggested_path is None
-    assert options[0].low_confidence_suggested_path is None
-
-
-def test_library_options_confident_suggestion_suppresses_low_confidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A real deeper match is CONFIDENT: the low-confidence mount-root fallback is
-    # never even computed (a real answer must never be dressed down to a guess).
+    """Round-3 regression: a Plex location ALREADY under the app's own mount
+    (Docker setups where Plex sees the container paths) must be kept as-is --
+    never suffix-remapped DEEPER onto a nested twin like ``/media/media/Movies``
+    (which Plex does not watch), even pre-init where the raw-path probe is off
+    (probing our OWN mounts is not a remote-server oracle)."""
     mount = tmp_path / "media"
     (mount / "Movies").mkdir(parents=True)
+    # The nesting trap the longest-suffix-first search would otherwise pick.
+    (mount / "media" / "Movies").mkdir(parents=True)
     monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
-    host_section = LibrarySection(
-        key="1", title="Movies", type="movie", locations=("/host/Media/Movies",)
+    section = LibrarySection(
+        key="1", title="Movies", type="movie", locations=(str(mount / "Movies"),)
     )
-    options = library_options([host_section], suggest_mounts=(str(mount),))
+    options = library_options([section], probe_writable=False, suggest_mounts=(str(mount),))
+    # As-is: no suggestion needed, and emphatically not the nested trap.
+    assert options[0].suggested_path is None
+
+
+def test_library_options_prefers_the_mounted_twin_over_a_phantom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 regression: a pre-fix install can have a PHANTOM host-shaped tree
+    inside this container (the old importer ``os.makedirs``-ed e.g.
+    ``/home/Media/Movies``) beside the real bind at ``/media/Movies``. The picker
+    must suggest the MOUNTED twin, not treat the phantom as authoritative."""
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    phantom = tmp_path / "phantom" / "Media" / "Movies"
+    phantom.mkdir(parents=True)
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
+    section = LibrarySection(key="1", title="Movies", type="movie", locations=(str(phantom),))
+    # probe_writable=True (the authenticated Settings picker): the raw path IS
+    # probed and exists -- exactly the shape where the phantom used to win.
+    options = library_options([section], probe_writable=True, suggest_mounts=(str(mount),))
     assert options[0].suggested_path == str(mount / "Movies")
-    assert options[0].low_confidence_suggested_path is None
 
 
 def test_library_options_suggestion_probe_original_mirrors_probe_writable(
@@ -974,7 +963,6 @@ async def test_plex_libraries_picker_probes_writability(
             "section_type": "movie",
             "writable": True,
             "suggested_path": None,
-            "low_confidence_suggested_path": None,
         },
         {
             "section_key": "2",
@@ -983,6 +971,5 @@ async def test_plex_libraries_picker_probes_writability(
             "section_type": "tv",
             "writable": False,
             "suggested_path": None,
-            "low_confidence_suggested_path": None,
         },
     ]

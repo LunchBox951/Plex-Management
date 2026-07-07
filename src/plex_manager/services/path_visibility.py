@@ -81,6 +81,12 @@ def is_live_mount(path: str) -> bool:
     return os.path.isdir(path) and os.path.ismount(path)
 
 
+def _is_under(norm_path: str, mount: str) -> bool:
+    """Whether normalized ``norm_path`` lexically equals or sits under ``mount``."""
+    norm_mount = os.path.normpath(mount)
+    return norm_path == norm_mount or norm_path.startswith(norm_mount + os.sep)
+
+
 def remap_to_visible(
     path: str | None,
     candidate_mounts: Sequence[str],
@@ -91,17 +97,32 @@ def remap_to_visible(
 ) -> str | None:
     """Return a path THIS process can see that corresponds to ``path``, or ``None``.
 
-    1. When ``probe_original`` (the default) and ``predicate(path)`` already
-       holds, ``path`` is returned UNCHANGED (the exact string the operator/
-       client supplied) -- it is already visible, nothing to remap.
-    2. Otherwise, ``path``'s components (after ``normpath``, dropping any ``.``/
+    1. A ``path`` already lexically UNDER one of the live mounts is treated as a
+       mounted path AS-IS: returned unchanged when ``predicate(path)`` holds,
+       ``None`` when it doesn't -- NEVER suffix-probed deeper. Without this, an
+       already-container-visible ``/media/Movies`` would enter the longest-first
+       suffix search and could resolve to a nested ``/media/media/Movies`` when
+       one happens to exist. This probe runs even with ``probe_original=False``:
+       probing a path under the app's OWN mounts is never a remote-server
+       oracle -- the pre-auth guard below is only about ARBITRARY raw paths.
+    2. When ``probe_original`` (the default) and ``predicate(path)`` already
+       holds, ``path`` is accepted (the exact string the operator/client
+       supplied) -- but a visible path lying OUTSIDE every live mount can be a
+       pre-fix PHANTOM (the old importer ``os.makedirs``-ed host-shaped trees
+       like ``/home/Media/Movies`` inside this container), so when the same
+       suffix ALSO resolves inside a live mount, the MOUNTED candidate is
+       preferred (steps 3-4 run first and win); the outside-mount original is
+       returned only when no mounted candidate exists (an operator's legitimate
+       EXTRA volume at a custom path). With ZERO live mounts (bare metal, no
+       Docker split) the original is accepted as-is, unchanged.
+    3. Otherwise, ``path``'s components (after ``normpath``, dropping any ``.``/
        ``..`` segment -- so a crafted path can never lexically escape a mount via
-       ``os.path.join``) are tried as a suffix under each of ``candidate_mounts``,
-       LONGEST suffix first, then in ``candidate_mounts`` order for ties: the
-       first candidate satisfying ``predicate`` wins. This is what lets
+       ``os.path.join``) are tried as a suffix under each live mount, LONGEST
+       suffix first, then in ``candidate_mounts`` order for ties: the first
+       candidate satisfying ``predicate`` wins. This is what lets
        ``/home/Media/Movies`` resolve to ``/media/Movies`` when ``/media`` is the
        configured mount.
-    3. With ``allow_mount_root`` (library roots only), the ZERO-suffix case is
+    4. With ``allow_mount_root`` (library roots only), the ZERO-suffix case is
        also tried LAST: a HOST path that IS the bind SOURCE root maps to the
        container mount ROOT itself (docker-compose ``PLEX_MANAGER_MEDIA_ROOT=
        /srv/media`` -> ``/media``, with Plex reporting the whole media root as one
@@ -115,39 +136,45 @@ def remap_to_visible(
        typo'd root still resolves to ``None``. Deliberately OFF by default and
        never enabled for download-content remapping: a torrent must never resolve
        to the whole ``/downloads`` tree.
-    4. ``None`` when nothing under any mount satisfies ``predicate`` -- an honest
-       "still not visible", never a guess.
+    5. ``None`` when nothing matched -- an honest "still not visible", never a
+       guess.
 
-    A candidate mount participates in steps 2-3 only while :func:`is_live_mount`
-    holds for it -- a genuinely MOUNTED volume, not merely an existing directory.
-    Without that gate the behaviour is environment-dependent: stock Ubuntu/Debian
-    ship an empty ``/media`` directory, so a bare-metal (non-Docker) install would
-    have its unresolvable paths remapped onto a directory nothing is mounted at
-    (most sharply via the ``allow_mount_root`` case, whose only other bar is a
-    basename match). Step 1 is unaffected: an already-visible path never needed a
-    mount at all.
+    A candidate mount participates only while :func:`is_live_mount` holds for it
+    -- a genuinely MOUNTED volume, not merely an existing directory. Without that
+    gate the behaviour is environment-dependent: stock Ubuntu/Debian ship an
+    empty ``/media`` directory, so a bare-metal (non-Docker) install would have
+    its unresolvable paths remapped onto a directory nothing is mounted at (most
+    sharply via the ``allow_mount_root`` case, whose only other bar is a
+    basename match).
 
     ``predicate`` defaults to ``os.path.isdir`` (library roots: a fresh root may
     legitimately be empty, so existence is the only bar). Pass
     ``predicate=os.path.exists`` for a download source path (file or dir).
-    ``probe_original=False`` skips the step-1 probe of the RAW path -- required
-    pre-init, where the path can come from an unauthenticated, caller-supplied
-    Plex server and probing it would be a pre-auth local-FS existence oracle.
+    ``probe_original=False`` skips the step-2 probe of an arbitrary RAW path --
+    required pre-init, where the path can come from an unauthenticated,
+    caller-supplied Plex server and probing it would be a pre-auth local-FS
+    existence oracle (step 1's under-OUR-OWN-mount probe is exempt, see above).
 
     Synchronous (``os.path`` stat calls); every async caller offloads via
     ``asyncio.to_thread``.
     """
     if not path:
         return None
-    if probe_original and predicate(path):
-        return path
     # Module-global lookup at CALL time (tests monkeypatch path_visibility.
     # is_live_mount to let tmp dirs stand in as mounts); probed once per call,
     # before the per-suffix loop, so each mount costs two stats total.
     live_mounts = [m for m in candidate_mounts if m and is_live_mount(m)]
-    if not live_mounts:
-        return None
     norm = os.path.normpath(path)
+    # Step 1: already under one of OUR mounts -> a mounted path as-is, never
+    # suffix-probed deeper (no /media/media/Movies nesting).
+    for mount in live_mounts:
+        if _is_under(norm, mount):
+            return path if predicate(path) else None
+    original_visible = probe_original and predicate(path)
+    if not live_mounts:
+        # Bare metal (no Docker split): the visible path is the truth, and with
+        # no mounts there is nothing to remap against.
+        return path if original_visible else None
     comps = [c for c in norm.split(os.sep) if c and c not in (".", "..")]
     for length in range(len(comps), 0, -1):
         suffix = comps[-length:]
@@ -157,12 +184,17 @@ def remap_to_visible(
                 return candidate
     if allow_mount_root and comps:
         # Zero-suffix (bind-source-root) match, constrained to the mount whose own
-        # final name matches this path's -- see step 3. Tried only after every
+        # final name matches this path's -- see step 4. Tried only after every
         # deeper suffix so a real subdirectory match always wins first.
         tail = comps[-1]
         for mount in live_mounts:
             if os.path.basename(mount.rstrip(os.sep)) == tail and predicate(mount):
                 return mount
+    if original_visible:
+        # Visible, outside every live mount, and no mounted candidate shadows it:
+        # honestly accept it (an operator's extra volume at a custom path). A
+        # phantom that DID have a mounted twin was preferred away above (step 2).
+        return path
     return None
 
 
@@ -186,47 +218,90 @@ def _relative_components(path: str, base: str) -> list[str] | None:
     return [c for c in rel.split(os.sep) if c and c not in (".", "..")]
 
 
+def _proves_content(
+    anchor_dir: str,
+    remainder: Sequence[str],
+    expected_files: Sequence[tuple[str, int]],
+) -> bool:
+    """PROOF that ``anchor_dir`` really is this torrent's remapped save directory.
+
+    ``expected_files`` is the torrent's OWN file list from the download client
+    (each entry: path relative to the save path + exact byte size). The candidate
+    interpretation is proven only when, among the entries under ``remainder``
+    (the content's own subtree), at least ONE exists at its exact relative
+    location with its EXACT size -- and NONE exists there with a DIFFERENT size
+    (a same-name-different-size file is a stale/unrelated tree, an immediate
+    disproof). An absent entry is neutral: a deselected (priority-0) torrent file
+    legitimately never materializes on disk, so absence is neither proof nor
+    contradiction. No entries under ``remainder`` at all -> not proven.
+
+    This is what lets the bind-source-root save-path topology keep working
+    (``save_path`` IS the bind source, so the mount root is the correct
+    interpretation) WITHOUT guessing: the mount root qualifies only by exhibiting
+    the torrent's own named-and-sized payload, never by mere existence of a
+    same-named file.
+    """
+    witnessed = False
+    for name, size in expected_files:
+        comps = [c for c in name.split("/") if c and c not in (".", "..")]
+        if not comps or comps[: len(remainder)] != list(remainder):
+            continue  # a torrent file outside the resolved content subtree
+        try:
+            actual = os.path.getsize(os.path.join(anchor_dir, *comps))
+        except OSError:
+            continue  # absent (e.g. a deselected file): neutral, keep looking
+        if actual != size:
+            return False  # same name, wrong size: a stale/unrelated tree
+        witnessed = True
+    return witnessed
+
+
 def remap_download_content(
     content: str | None,
     save_path: str | None,
+    expected_files: Sequence[tuple[str, int]],
     *,
     candidate_mounts: Sequence[str] | None = None,
 ) -> str | None:
-    """Container-visible remap for a download's CONTENT path, ANCHORED on save_path.
+    """Container-visible remap for a download's CONTENT path: anchored + PROVEN.
 
     Unlike :func:`remap_to_visible`'s free longest-first suffix search, this never
-    shortens the file's path INDEPENDENTLY of its download directory. The bug that
-    forces the anchor: a HOST content ``/srv/qbt/movies/Foo.mkv`` whose real
-    container location ``/downloads/movies/Foo.mkv`` is MISSING would, under a free
-    suffix search, keep shortening the suffix until the bare ``Foo.mkv`` matched a
-    STALE, unrelated ``/downloads/Foo.mkv`` -- validating and PLACING the wrong
-    source. A torrent's file position WITHIN its save directory is invariant across
-    the host->container bind (docker preserves the subtree below the bind source),
-    so only the ``save_path`` prefix may be remapped, never the file below it:
+    shortens the file's path INDEPENDENTLY of its download directory, and it never
+    accepts a remapped candidate on bare existence. The bugs that force this: a
+    HOST content ``/srv/qbt/movies/Foo.mkv`` whose real container location
+    ``/downloads/movies/Foo.mkv`` is MISSING would, under a free suffix search,
+    keep shortening the suffix until the bare ``Foo.mkv`` matched a STALE,
+    unrelated ``/downloads/Foo.mkv`` -- validating and PLACING the wrong source;
+    and an existence-only bind-root fallback could do the same whenever no deeper
+    save directory matched. A torrent's file position WITHIN its save directory is
+    invariant across the host->container bind (docker preserves the subtree below
+    the bind source), so only the ``save_path`` prefix may be remapped, never the
+    file below it -- and the winning interpretation must carry PROOF:
 
-    1. return ``content`` unchanged when it already exists here;
+    1. return ``content`` unchanged when it already exists here (the
+       same-namespace fast path -- no remap happened, so no proof is needed);
     2. otherwise remap the torrent's ``save_path`` ONCE to a container-visible
-       download directory -- its DEEPEST existing suffix under a mount (so a real
-       category dir like ``/downloads/movies`` always wins over the mount root and
-       the mount-root guess is never reached while a deeper directory exists), or,
-       only when NO suffix is a real directory (``save_path`` itself IS the
-       download bind-source root, mapped to the mount root with zero suffix), the
-       mount root -- and require ``<that dir>/<remainder>`` to exist VERBATIM, where
-       ``remainder`` is ``content``'s path below ``save_path``. If it does not
-       exist, return ``None`` (an honest, retryable "not visible" block), NEVER a
-       shorter-suffix guess.
+       download directory -- its DEEPEST existing suffix under a live mount (a
+       real category dir like ``/downloads/movies`` always wins over the mount
+       root), or, only when NO suffix is a real directory, the mount root itself
+       (``save_path`` IS the download bind-source root -- the documented compose
+       topology). Either interpretation is accepted ONLY on
+       :func:`_proves_content`: the torrent's own file list (relative path +
+       exact size, from the download client) must be exhibited at the candidate
+       location. No proof -> ``None`` (an honest, retryable "not visible /
+       content mismatch" block), NEVER an existence-only guess.
 
     Without a ``save_path`` anchor (a stored crash-resume breadcrumb, or a client
     status that carried no save path) there is nothing to anchor to, so ONLY the
     verbatim ``content`` counts (step 1) -- a free suffix search would reintroduce
     exactly the stale-match hazard, so it is deliberately not attempted.
 
-    Download mounts only (never the library mounts): a completed torrent and an old
-    library file can share a basename, and content must never place from ``/media``.
-    The remainder is always >= 1 component (the caller guarantees ``content`` is
+    Download mounts only (never the library mounts): a completed torrent and an
+    old library file can share a basename, and content must never place from
+    ``/media``. The remainder is always >= 1 component (``content`` must be
     strictly under ``save_path``), so a torrent never resolves onto the bare
-    ``/downloads`` tree. Pure ``exists``/``isdir`` probes (sync); async callers
-    offload via ``asyncio.to_thread``.
+    ``/downloads`` tree. Pure stat probes (sync); async callers offload via
+    ``asyncio.to_thread``.
     """
     if not content:
         return None
@@ -245,25 +320,26 @@ def remap_download_content(
     # effect, matching this module's documented call-site convention.
     mounts = KNOWN_DOWNLOAD_MOUNTS if candidate_mounts is None else candidate_mounts
     # Remap the save DIRECTORY once: the deepest suffix that is a real directory
-    # under a mount. allow_mount_root stays OFF -- that path's basename guard is
-    # for library roots; here the mount-root case is handled below with the
-    # remainder anchored, so a bare torrent tree is never the answer.
+    # under a live mount. allow_mount_root stays OFF -- the bind-root case is the
+    # separate, proof-gated interpretation below, so a bare torrent tree can never
+    # be the direct answer of this search.
     save_dir = remap_to_visible(save_path, mounts, predicate=os.path.isdir, probe_original=False)
     if save_dir is not None:
-        candidate = os.path.join(save_dir, *remainder)
-        return candidate if os.path.exists(candidate) else None
-    # No suffix of ``save_path`` is a real directory under a mount: ``save_path`` may
-    # itself BE the download bind-source root (mapped to the mount root, so zero
-    # suffix below it). Anchor the remainder under each mount root -- reached ONLY
-    # here, AFTER every deeper directory match has failed, so a real category dir is
-    # never bypassed to collapse a deeper file onto a shallow stale one. The same
-    # is_live_mount gate as remap_to_visible: a stock distro's plain /downloads-like
-    # directory never counts as the app's mount.
+        # The deepest-directory interpretation is the ONLY one tried when it
+        # exists -- no fallthrough to the bind-root guess on a failed proof, so a
+        # same-named (even same-sized) stray at the mount root can never shadow a
+        # genuinely-missing file under the real category directory.
+        if _proves_content(save_dir, remainder, expected_files):
+            return os.path.join(save_dir, *remainder)
+        return None
+    # No suffix of ``save_path`` is a real directory under a live mount: the one
+    # remaining legitimate topology is that ``save_path`` IS the download
+    # bind-source root (mapped to the mount root, zero suffix below it). That
+    # interpretation must PROVE itself via the torrent's own file list -- never
+    # mere existence of a same-named file (the round-3 finding).
     for mount in mounts:
-        if mount and is_live_mount(mount):
-            candidate = os.path.join(mount, *remainder)
-            if os.path.exists(candidate):
-                return candidate
+        if mount and is_live_mount(mount) and _proves_content(mount, remainder, expected_files):
+            return os.path.join(mount, *remainder)
     return None
 
 

@@ -30,7 +30,6 @@ from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
-from plex_manager.services import path_visibility
 from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
@@ -101,35 +100,6 @@ def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
     return "tv" if kind == "show" else "movie"
 
 
-def _low_confidence_mount_root(path: str, mounts: Sequence[str]) -> str | None:
-    """The single library mount root, as a LOW-confidence suggestion for ``path``.
-
-    Offered only when the strict :func:`remap_to_visible` can't resolve ``path``
-    (issue: a whole-library bind root like ``/srv/plex-data`` -> ``/media`` has no
-    component below the mount AND its basename need not equal the mount's, so the
-    zero-suffix match -- which requires a basename match to keep ``None`` honest for
-    a typo'd root -- can't accept it). When EXACTLY ONE library mount is LIVE (so
-    WHICH mount is unambiguous), that mount root is a plausible target for a
-    Plex-reported (never hand-typed) library location. It is returned as a
-    suggestion the operator must EXPLICITLY confirm, never silently applied -- the
-    write-time gate stays strict, so a hand-typed typo is still rejected. ``None``
-    when the mount is ambiguous (0 or >1 live mounts) or ``path`` is empty.
-
-    A mount counts only under :func:`~plex_manager.services.path_visibility.
-    is_live_mount` (a genuinely MOUNTED volume), never a bare ``isdir``: stock
-    Ubuntu/Debian ship an empty ``/media`` directory on the root filesystem, so an
-    ``isdir`` gate would offer a bogus ``/media`` suggestion for every
-    unresolvable Plex path on a bare-metal (non-Docker) install -- behaviour that
-    silently differs by host distro (the CI-vs-dev-box split that exposed this).
-    """
-    if not path:
-        return None
-    live_mounts = [m for m in mounts if m and path_visibility.is_live_mount(m)]
-    if len(live_mounts) != 1:
-        return None
-    return live_mounts[0]
-
-
 def library_options(
     sections: Sequence[LibrarySection],
     *,
@@ -164,13 +134,12 @@ def library_options(
     library (the bind SOURCE root, e.g. ``/srv/media`` -> ``/media``) maps to the
     mount root itself, which the suffix-only match could never reach.
 
-    When that confident remap still can't resolve a Plex-reported location AND
-    exactly one library mount exists, the mount root is additionally offered as a
-    ``low_confidence_suggested_path`` -- a guess the operator must explicitly
-    confirm (see :func:`_low_confidence_mount_root`): a bind root like
-    ``/srv/plex-data`` -> ``/media`` whose basename differs from the mount's is
-    unreachable by the strict remap, but is still a plausible target the picker can
-    surface without the write gate ever silently accepting a hand-typed typo.
+    A location the remap can't resolve is offered with NO suggestion -- the raw
+    Plex path plus the wizard/Settings visibility hint. Deliberately no guessing
+    (PR #147 round 3, maintainer decision): a short-lived "low-confidence
+    mount-root" suggestion was removed because a child section like
+    ``/srv/plex-data/Movies`` would misroute to the bare mount root; the rare
+    arbitrary-bind-root topology is served by manual entry instead.
     """
     options: list[PlexLibraryOption] = []
     for section in sections:
@@ -185,15 +154,7 @@ def library_options(
                 if suggest_mounts
                 else None
             )
-            # A low-confidence mount-root fallback ONLY when the confident remap
-            # found nothing -- a real match always wins, and a typo'd root the write
-            # gate would reject is never dressed up as a confident answer.
-            low_confidence = (
-                _low_confidence_mount_root(path, suggest_mounts)
-                if (suggest_mounts and suggested is None)
-                else None
-            )
-            effective = suggested or low_confidence or path
+            effective = suggested or path
             options.append(
                 PlexLibraryOption(
                     section_key=section.key,
@@ -202,9 +163,6 @@ def library_options(
                     section_type=_section_type(section.type),
                     writable=_is_writable(effective) if probe_writable else None,
                     suggested_path=suggested if (suggested and suggested != path) else None,
-                    low_confidence_suggested_path=(
-                        low_confidence if (low_confidence and low_confidence != path) else None
-                    ),
                 )
             )
     return options

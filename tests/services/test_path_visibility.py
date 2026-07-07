@@ -159,14 +159,69 @@ def test_a_deeper_suffix_always_beats_the_mount_root(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# remap_download_content — ANCHORED on save_path, never a shorter-suffix guess
+# under-mount short-circuit + phantom preference (round 3)
+# --------------------------------------------------------------------------- #
+def test_under_mount_path_is_never_suffix_probed_deeper(tmp_path: Path) -> None:
+    # An already-container-visible /media/Movies must be kept as-is even when a
+    # nested twin /media/media/Movies exists (the longest-suffix-first search
+    # would otherwise prefer it) -- and even pre-init (probe_original=False):
+    # probing our OWN mounts is never a remote-server oracle.
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    (mount / "media" / "Movies").mkdir(parents=True)  # the nesting trap
+    target = str(mount / "Movies")
+    assert remap_to_visible(target, [str(mount)]) == target
+    assert remap_to_visible(target, [str(mount)], probe_original=False) == target
+
+
+def test_under_mount_path_that_does_not_exist_is_none(tmp_path: Path) -> None:
+    # Under our mount but nonexistent: an honest None (the write gate 422s),
+    # never a deeper suffix guess.
+    mount = tmp_path / "media"
+    (mount / "media" / "Movies").mkdir(parents=True)  # trap only, no real target
+    assert remap_to_visible(str(mount / "Movies"), [str(mount)]) is None
+
+
+def test_prefers_the_mounted_twin_over_an_outside_mount_phantom(tmp_path: Path) -> None:
+    # Round-3 finding: a pre-fix PHANTOM (e.g. /home/Media/Movies the old importer
+    # os.makedirs-ed inside this container) exists, but the same suffix also
+    # resolves under the live mount: the MOUNTED candidate wins, so settings/
+    # setup remaps land where Plex can actually see the files.
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    phantom = tmp_path / "phantom" / "Media" / "Movies"
+    phantom.mkdir(parents=True)
+    assert remap_to_visible(str(phantom), [str(mount)]) == str(mount / "Movies")
+
+
+def test_outside_mount_original_kept_when_no_mounted_twin(tmp_path: Path) -> None:
+    # Visible, outside the mounts, and nothing under a mount matches: honestly
+    # accepted as-is (an operator's legitimate EXTRA volume at a custom path).
+    mount = tmp_path / "media"
+    mount.mkdir()
+    extra = tmp_path / "extra" / "Anime"
+    extra.mkdir(parents=True)
+    assert remap_to_visible(str(extra), [str(mount)]) == str(extra)
+
+
+def test_original_kept_when_no_live_mounts(tmp_path: Path) -> None:
+    # Bare metal (zero live mounts): the visible original is the truth, as-is.
+    real = tmp_path / "Movies"
+    real.mkdir()
+    assert remap_to_visible(str(real), [str(tmp_path / "nonexistent-mount")]) == str(real)
+
+
+# --------------------------------------------------------------------------- #
+# remap_download_content — anchored on save_path AND proven by the torrent's
+# own file list (relative path + exact byte size); never an existence-only guess
 # --------------------------------------------------------------------------- #
 def test_download_content_returns_verbatim_when_visible(tmp_path: Path) -> None:
     video = tmp_path / "dl" / "movies" / "Foo.mkv"
     video.parent.mkdir(parents=True)
     video.write_bytes(b"x")
-    # Already visible: returned unchanged (save_path irrelevant on the fast path).
-    assert remap_download_content(str(video), str(video.parent)) == str(video)
+    # Already visible: returned unchanged. No remap happened, so no proof is
+    # needed -- an empty file list must not block the same-namespace fast path.
+    assert remap_download_content(str(video), str(video.parent), []) == str(video)
 
 
 def test_download_content_anchors_under_the_remapped_save_dir(tmp_path: Path) -> None:
@@ -175,39 +230,105 @@ def test_download_content_anchors_under_the_remapped_save_dir(tmp_path: Path) ->
     video.parent.mkdir(parents=True)
     video.write_bytes(b"x")
     # HOST save_path ``/host/qbt/movies`` -> ``<mount>/movies``; the file's position
-    # under it (``Foo.mkv``) is preserved verbatim.
+    # under it (``Foo.mkv``) is preserved verbatim and PROVEN by name + exact size.
     assert remap_download_content(
-        "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", candidate_mounts=(str(mount),)
+        "/host/qbt/movies/Foo.mkv",
+        "/host/qbt/movies",
+        [("Foo.mkv", 1)],
+        candidate_mounts=(str(mount),),
     ) == str(video)
 
 
 def test_download_content_never_matches_a_stale_shorter_suffix(tmp_path: Path) -> None:
-    # THE finding: the real file ``<mount>/movies/Foo.mkv`` is MISSING (only its
-    # category dir exists), and a stale, unrelated ``<mount>/Foo.mkv`` sits at the
-    # mount root. A free suffix search would shorten to ``Foo.mkv`` and match the
-    # stale file; the anchored remap must return None (honest block) instead.
+    # Round-2 finding, now stronger: the real ``<mount>/movies/Foo.mkv`` is
+    # MISSING (only its category dir exists) while a stale ``<mount>/Foo.mkv``
+    # sits at the mount root with the SAME name and even the SAME size. The
+    # category-directory interpretation wins (deepest existing save-dir suffix)
+    # and its failed proof is FINAL -- no fallthrough to the bind-root guess, so
+    # the stale file can never shadow the genuinely-missing real one.
     mount = tmp_path / "dl"
     (mount / "movies").mkdir(parents=True)
-    (mount / "Foo.mkv").write_bytes(b"stale")
+    (mount / "Foo.mkv").write_bytes(b"x")  # same 1-byte size as the torrent's file
     assert (
         remap_download_content(
-            "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", candidate_mounts=(str(mount),)
+            "/host/qbt/movies/Foo.mkv",
+            "/host/qbt/movies",
+            [("Foo.mkv", 1)],
+            candidate_mounts=(str(mount),),
         )
         is None
     )
 
 
-def test_download_content_maps_the_save_path_bind_root(tmp_path: Path) -> None:
-    # save_path IS the download bind-source root (``/host/qbt`` -> ``<mount>``): no
-    # suffix of it is a dir under the mount, so the mount root is used and the FULL
-    # remainder (``Foo/Foo.mkv``) is anchored under it.
+def test_download_content_maps_the_save_path_bind_root_with_proof(tmp_path: Path) -> None:
+    # save_path IS the download bind-source root (``/host/qbt`` -> ``<mount>``,
+    # the live deployment's shape): no suffix of it is a real dir under the
+    # mount, so the bind-root interpretation applies -- accepted ONLY because the
+    # torrent's own file is exhibited at its exact relative location with its
+    # exact size, never on mere existence.
     mount = tmp_path / "dl"
     video = mount / "Foo" / "Foo.mkv"
     video.parent.mkdir(parents=True)
     video.write_bytes(b"x")
     assert remap_download_content(
-        "/host/qbt/Foo/Foo.mkv", "/host/qbt", candidate_mounts=(str(mount),)
+        "/host/qbt/Foo/Foo.mkv",
+        "/host/qbt",
+        [("Foo/Foo.mkv", 1)],
+        candidate_mounts=(str(mount),),
     ) == str(video)
+
+
+def test_download_content_bind_root_rejects_a_same_name_wrong_size_stale(
+    tmp_path: Path,
+) -> None:
+    # Round-3 finding: the bind-root interpretation must PROVE itself. A
+    # same-named file with a DIFFERENT size at the expected location is an
+    # immediate disproof (a stale/unrelated tree) -> honest None.
+    mount = tmp_path / "dl"
+    mount.mkdir()
+    (mount / "Foo.mkv").write_bytes(b"stale")  # 5 bytes; the torrent's file is 1
+    assert (
+        remap_download_content(
+            "/host/qbt/Foo.mkv",
+            "/host/qbt",
+            [("Foo.mkv", 1)],
+            candidate_mounts=(str(mount),),
+        )
+        is None
+    )
+
+
+def test_download_content_requires_a_witness_not_just_existence(tmp_path: Path) -> None:
+    # No expected file materializes at the candidate location -> not proven ->
+    # None, even though the mount root itself exists; and an EMPTY file list
+    # (the client reported nothing) can never prove anything either.
+    mount = tmp_path / "dl"
+    mount.mkdir()
+    assert (
+        remap_download_content(
+            "/host/qbt/Foo.mkv", "/host/qbt", [("Foo.mkv", 1)], candidate_mounts=(str(mount),)
+        )
+        is None
+    )
+    (mount / "Foo.mkv").write_bytes(b"x")
+    assert (
+        remap_download_content("/host/qbt/Foo.mkv", "/host/qbt", [], candidate_mounts=(str(mount),))
+        is None
+    )
+
+
+def test_download_content_deselected_files_are_neutral(tmp_path: Path) -> None:
+    # A multi-file pack with a deselected (never-downloaded) file: its absence is
+    # neutral -- the present file's exact name+size still proves the
+    # interpretation, and the content DIRECTORY resolves.
+    mount = tmp_path / "dl"
+    release = mount / "Release"
+    release.mkdir(parents=True)
+    (release / "main.mkv").write_bytes(b"xx")
+    expected = [("Release/main.mkv", 2), ("Release/extra.mkv", 7)]  # extra absent
+    assert remap_download_content(
+        "/host/qbt/Release", "/host/qbt", expected, candidate_mounts=(str(mount),)
+    ) == str(release)
 
 
 def test_download_content_without_a_save_path_anchor_is_verbatim_only(tmp_path: Path) -> None:
@@ -216,12 +337,17 @@ def test_download_content_without_a_save_path_anchor_is_verbatim_only(tmp_path: 
     # the stale-match hazard). A missing path stays an honest None.
     mount = tmp_path / "dl"
     mount.mkdir()
-    (mount / "Foo.mkv").write_bytes(b"stale")
-    assert remap_download_content("/host/qbt/Foo.mkv", None, candidate_mounts=(str(mount),)) is None
+    (mount / "Foo.mkv").write_bytes(b"x")
+    assert (
+        remap_download_content(
+            "/host/qbt/Foo.mkv", None, [("Foo.mkv", 1)], candidate_mounts=(str(mount),)
+        )
+        is None
+    )
     real = tmp_path / "already" / "Foo.mkv"
     real.parent.mkdir(parents=True)
     real.write_bytes(b"x")
-    assert remap_download_content(str(real), None, candidate_mounts=(str(mount),)) == str(real)
+    assert remap_download_content(str(real), None, [], candidate_mounts=(str(mount),)) == str(real)
 
 
 def test_download_content_refuses_a_path_not_under_save_path(tmp_path: Path) -> None:
@@ -229,10 +355,13 @@ def test_download_content_refuses_a_path_not_under_save_path(tmp_path: Path) -> 
     mount.mkdir()
     (mount / "Foo.mkv").write_bytes(b"x")
     # content escapes save_path via ``..`` -> no honest anchor -> None (never the
-    # bare mount tree, never a sibling).
+    # bare mount tree, never a sibling), no matter what the file list says.
     assert (
         remap_download_content(
-            "/host/qbt/../other/Foo.mkv", "/host/qbt", candidate_mounts=(str(mount),)
+            "/host/qbt/../other/Foo.mkv",
+            "/host/qbt",
+            [("Foo.mkv", 1)],
+            candidate_mounts=(str(mount),),
         )
         is None
     )
@@ -248,7 +377,9 @@ def test_download_content_reads_module_mounts_when_unset(
     video.parent.mkdir(parents=True)
     video.write_bytes(b"x")
     monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
-    assert remap_download_content("/host/qbt/movies/Foo.mkv", "/host/qbt/movies") == str(video)
+    assert remap_download_content(
+        "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", [("Foo.mkv", 1)]
+    ) == str(video)
 
 
 def test_remap_library_root_uses_library_mounts_and_the_mount_root(
@@ -301,13 +432,19 @@ def test_a_plain_directory_never_counts_as_a_mount(
     video.write_bytes(b"x")
     assert (
         remap_download_content(
-            "/host/qbt/movies/Foo.mkv", "/host/qbt/movies", candidate_mounts=(str(mount),)
+            "/host/qbt/movies/Foo.mkv",
+            "/host/qbt/movies",
+            [("Foo.mkv", 1)],
+            candidate_mounts=(str(mount),),
         )
         is None
     )
     assert (
         remap_download_content(
-            "/host/qbt/movies/Foo.mkv", "/host/qbt", candidate_mounts=(str(mount),)
+            "/host/qbt/movies/Foo.mkv",
+            "/host/qbt",
+            [("movies/Foo.mkv", 1)],
+            candidate_mounts=(str(mount),),
         )
         is None
     )

@@ -1662,8 +1662,6 @@ export interface components {
          *     known-not-writable location is the split-mount signal — surfaced, not hidden.
          */
         PlexLibraryOption: {
-            /** Low Confidence Suggested Path */
-            low_confidence_suggested_path?: string | null;
             /** Path */
             path: string;
             /** Section Key */
@@ -3032,6 +3030,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Request or season not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Not reportable in its current state, an active duplicate exists, or the title's library folder isn't reachable from the app */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Validation Error */
