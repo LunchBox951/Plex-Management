@@ -116,6 +116,22 @@ class LibraryPort(Protocol):
         Always reads FRESH (like ``present_seasons`` — never trusts a cached
         absence): a season that just finished indexing must be seen on the very
         next check, not held stale for a cache TTL.
+
+        Failure isolation (round 4, #136 review): a requested id is present as a
+        KEY in the returned mapping only when its lookup SUCCEEDED — an empty
+        ``frozenset`` genuinely means "no seasons present", while an id OMITTED
+        from the mapping means its lookup FAILED and the caller must treat it as
+        unknown/retry-next-cycle, never as "not yet available". This matters
+        because one show's underlying metadata lookup can fail independently
+        (e.g. a row deleted between an earlier crawl and this lookup, or a
+        persistently bad row returning 404/500) without that being a genuine
+        whole-batch transport failure — an implementation MUST isolate a single
+        show's lookup failure from the rest of the batch rather than letting it
+        abort every other requested id. A whole-batch transport failure (the
+        page-walk itself failing) is still allowed to raise
+        ``PlexLibraryError``/``PlexAuthError`` — the caller's own try/except
+        around the whole call handles that, leaving every requested id
+        unresolved for that tick.
         """
         raise NotImplementedError
 

@@ -1364,11 +1364,16 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
     presence-cache TTL. TV seasons are grouped by show and resolved with exactly
     ONE batch ``season_presence`` call for the WHOLE tick's distinct pending shows
     (never one call per show, never a whole-library ``/children`` crawl, always
-    fresh) -- see ``LibraryPort.season_presence``. Because that one call now
-    covers every pending show, a transport failure fails the WHOLE TV pass for
-    this tick (mirroring the movie batch's failure posture just above): every
-    pending season stays ``completed`` for the next tick's retry rather than
-    promoting on a partial/guessed result.
+    fresh) -- see ``LibraryPort.season_presence``. A genuine TRANSPORT failure
+    (the call itself raising) fails the WHOLE TV pass for this tick (mirroring
+    the movie batch's failure posture just above): every pending season stays
+    ``completed`` for the next tick's retry rather than promoting on a
+    partial/guessed result. But when the call SUCCEEDS and merely OMITS one
+    show's id from its returned mapping (round 4, #136 review -- that show's own
+    ``/children`` lookup failed, e.g. a metadata row deleted mid-cycle or a
+    persistently bad row), only THAT show's pending seasons are skipped for
+    retry; every OTHER pending show in the same tick still promotes normally --
+    a single bad Plex row must never starve unrelated shows at "Finalizing".
     """
     request_repo = SqlRequestRepository(session)
     completed_movies = [
@@ -1414,14 +1419,15 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
         seasons_by_show.setdefault(season_request.tmdb_id, []).append(season_request)
 
     present_seasons_by_show: Mapping[int, frozenset[int]] = {}
+    season_presence_succeeded = False
     if seasons_by_show:
         try:
             present_seasons_by_show = await library.season_presence(seasons_by_show.keys())
+            season_presence_succeeded = True
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
-            # ONE batch call now covers every distinct pending show, so a failure
-            # here is a whole-pass transport failure (mirroring the movie batch's
-            # failure posture above) -- every pending season honestly stays
-            # ``completed`` for the next tick's retry rather than promoting on a
+            # A whole-pass TRANSPORT failure (mirroring the movie batch's failure
+            # posture above) -- every pending season honestly stays ``completed``
+            # for the next tick's retry rather than promoting on a
             # partial/guessed result.
             _logger.warning(
                 "batch availability check failed for %d pending show(s); will retry next cycle",
@@ -1429,7 +1435,22 @@ async def run_availability_cycle(*, library: LibraryPort, session: AsyncSession)
             )
 
     for tmdb_id, season_requests in seasons_by_show.items():
-        present_seasons = present_seasons_by_show.get(tmdb_id, frozenset())
+        if tmdb_id not in present_seasons_by_show:
+            # Distinguish a per-show lookup failure (the batch call SUCCEEDED but
+            # omitted this one id -- see ``LibraryPort.season_presence``) from the
+            # whole-pass transport failure already warned about above -- only log
+            # here when the call itself actually succeeded, so a single bad show
+            # is named explicitly without a redundant warning on every pending
+            # show when the whole pass failed instead (round 4, #136 review).
+            # Either way, only THIS show's seasons are skipped for retry -- every
+            # OTHER pending show in ``seasons_by_show`` still gets checked below.
+            if season_presence_succeeded:
+                _logger.warning(
+                    "season lookup failed for show; will retry next cycle",
+                    extra={"tmdb_id": tmdb_id},
+                )
+            continue
+        present_seasons = present_seasons_by_show[tmdb_id]
         for season_request in season_requests:
             if season_request.season_number not in present_seasons:
                 continue

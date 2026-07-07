@@ -667,20 +667,38 @@ class PlexLibrary:
         can resolve every distinct pending show in a tick from a single
         whole-library page-walk, instead of paying one page-walk per show.
 
+        The SECTION page-walk itself is all-or-nothing: a failure walking a show
+        section's ``/all`` listing is a genuine whole-pass transport failure and
+        is allowed to propagate (``PlexLibraryError``/``PlexAuthError``) — the
+        caller's whole-pass try/except handles that. But each MATCHED show's own
+        ``/children`` union (see ``_fetch_present_seasons``) is isolated in its
+        own try/except (round 4, #136 review): one show's metadata row being
+        deleted between the page-walk and this lookup, or persistently
+        returning a 404/500, must not abort every OTHER pending show's lookup in
+        the same batch. On a per-show failure, a warning is logged naming the
+        tmdb id and that id is OMITTED FROM THE RETURNED MAPPING ENTIRELY —
+        never mapped to an empty frozenset, which would dishonestly claim "no
+        seasons present" for a show whose presence is actually unknown. The
+        caller (``run_availability_cycle``) must treat a missing key as
+        "retry next cycle", not "not yet available".
+
         Always re-pages fresh (never trusts a cached absence, mirroring
         ``present_seasons``): a season that just finished indexing must be seen
         immediately, not held stale for the cache TTL. Write-through: every id
-        that MATCHED at least one item is merged into the shared
-        ``_TV_SEASONS_CACHE`` snapshot (creating one if none is warm yet) so a
-        subsequent ``is_available``/``present_seasons`` call for the SAME show
-        inside this TTL window sees this fresh read rather than a stale one --
-        a show NOT among the merged ids simply misses the cache and triggers
-        its own full re-crawl, same as today. A requested id with NO matching
-        item anywhere maps to an empty frozenset in the return value (still
-        present as a key — never omitted) but is deliberately NOT written to
-        the cache: ``_is_tv_available`` treats a cached key as "show present"
+        that MATCHED at least one item AND resolved successfully is merged into
+        the shared ``_TV_SEASONS_CACHE`` snapshot (creating one if none is warm
+        yet) so a subsequent ``is_available``/``present_seasons`` call for the
+        SAME show inside this TTL window sees this fresh read rather than a
+        stale one -- a show NOT among the merged ids simply misses the cache and
+        triggers its own full re-crawl, same as today. A requested id with NO
+        matching item anywhere maps to an empty frozenset in the return value
+        (still present as a key — never omitted) but is deliberately NOT written
+        to the cache: ``_is_tv_available`` treats a cached key as "show present"
         for whole-show checks, so caching the miss would report a
-        never-indexed show as available for the rest of the TTL.
+        never-indexed show as available for the rest of the TTL. A requested id
+        whose lookup FAILED touches the cache in NEITHER direction: it DID match
+        a rating key, so it is never added to the unmatched/eviction set (its
+        state is unknown, not absent) and nothing is written for it either.
         """
         wanted = set(tmdb_ids)
         if not wanted:
@@ -691,26 +709,44 @@ class PlexLibrary:
                 continue
             await self._collect_target_rating_keys(section.key, wanted, rating_keys_by_tmdb_id)
         result: dict[int, frozenset[int]] = {}
+        failed_ids: set[int] = set()
         for tmdb_id in wanted:
             seasons: set[int] = set()
+            failed = False
             for rating_key in rating_keys_by_tmdb_id.get(tmdb_id, []):
-                seasons |= await self._fetch_present_seasons(rating_key)
+                try:
+                    seasons |= await self._fetch_present_seasons(rating_key)
+                except (PlexLibraryError, PlexAuthError) as exc:
+                    _logger.warning(
+                        "season lookup failed for show tmdb_id=%s; omitting it from this "
+                        "batch's result (%s)",
+                        tmdb_id,
+                        exc,
+                    )
+                    failed = True
+                    break
+            if failed:
+                failed_ids.add(tmdb_id)
+                continue
             result[tmdb_id] = frozenset(seasons)
-        # ONLY ids that matched at least one item are merged into the cache:
-        # ``_is_tv_available`` treats a cached KEY as "show present" for
-        # whole-show checks, so a no-match id must never be WRITTEN as an empty
-        # present key (a never-indexed show would answer True within the TTL)
-        # -- and, symmetrically, a fresh no-match read must EVICT any stale
-        # cached entry for that id (a show REMOVED from Plex since the snapshot
-        # warmed would otherwise keep answering True from the old entry for the
-        # rest of the TTL). The RETURN value still carries the empty frozenset
-        # for a no-match id — only the cache treats it as an eviction.
+        # ONLY ids that matched at least one item (and resolved successfully) are
+        # merged into the cache: ``_is_tv_available`` treats a cached KEY as "show
+        # present" for whole-show checks, so a no-match id must never be WRITTEN
+        # as an empty present key (a never-indexed show would answer True within
+        # the TTL) -- and, symmetrically, a fresh no-match read must EVICT any
+        # stale cached entry for that id (a show REMOVED from Plex since the
+        # snapshot warmed would otherwise keep answering True from the old entry
+        # for the rest of the TTL). The RETURN value still carries the empty
+        # frozenset for a no-match id — only the cache treats it as an eviction.
+        # A FAILED id is excluded from both ``matched_only`` and ``unmatched``: it
+        # is not evicted (it DID match a rating key -- its state is unknown, not
+        # absent) and nothing about it is written to the cache either.
         matched_only = {
             tmdb_id: seasons
             for tmdb_id, seasons in result.items()
             if rating_keys_by_tmdb_id.get(tmdb_id)
         }
-        unmatched = wanted - matched_only.keys()
+        unmatched = wanted - matched_only.keys() - failed_ids
         cached = _TV_SEASONS_CACHE.get(self._cache_key)
         if matched_only or (cached is not None and unmatched & cached.keys()):
             updated = dict(cached) if cached is not None else {}

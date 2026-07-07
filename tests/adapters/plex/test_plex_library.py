@@ -666,6 +666,61 @@ async def test_season_presence_unions_seasons_across_duplicate_show_entries() ->
     assert result == {7000: frozenset({1, 2})}
 
 
+async def test_season_presence_isolates_a_single_show_failure_in_the_same_batch() -> None:
+    """(round 4, #136 review) One show's ``/children`` fetch returning a 500 inside
+    an otherwise-successful batch call must not abort the OTHER show's lookup.
+    The failed show is OMITTED from the returned mapping entirely (never mapped
+    to an empty frozenset -- that would dishonestly claim "no seasons present"
+    for a show whose presence is actually unknown); the healthy show's entry is
+    still cached from this same call; and a subsequent check for the FAILED show
+    still re-crawls fresh once the underlying fault clears -- it was poisoned
+    neither as present nor as absent by the earlier failure."""
+    calls: dict[str, int] = {}
+    show_100_should_fail = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/100/children":
+            if show_100_should_fail:
+                return httpx.Response(500, json={})
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_100_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        if path == "/library/metadata/300/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_300)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://season-presence-isolate:32400")
+    result = await adapter.season_presence({1000, 2000})
+    # The healthy show (2000) resolves; the failing show (1000) is omitted
+    # entirely -- never present as a key with a dishonest empty frozenset.
+    assert result == {2000: frozenset({1})}
+    assert 1000 not in result
+
+    # The healthy show's entry was written through to the cache by that same
+    # call: a season-scoped availability check must not need another
+    # ``/children`` fetch.
+    children_200_calls = calls["/library/metadata/200/children"]
+    assert await adapter.is_available(2000, "tv", season=1) is True
+    assert calls["/library/metadata/200/children"] == children_200_calls
+
+    # The failed show (1000) was cached in NEITHER direction. Once the
+    # underlying fault clears, a fresh check must see it as present -- not
+    # stuck absent from a poisoned miss...
+    show_100_should_fail = False
+    assert await adapter.is_available(1000, "tv", season=1) is True
+    # ...and re-running the batch lookup for it must actually re-crawl (not
+    # trust a stale cached absence either).
+    assert await adapter.season_presence({1000}) == {1000: frozenset({1})}
+
+
 async def test_season_presence_is_never_cached_absence() -> None:
     """Mirrors ``present_seasons``'/``is_available``'s "never trust a cached
     absence" contract: a season that just finished indexing must be seen on the

@@ -313,6 +313,7 @@ class FakeLibrary:
         watch_states: dict[tuple[int, str, int | None], WatchState] | None = None,
         raises: Exception | None = None,
         raises_for_shows: dict[int, Exception] | None = None,
+        season_presence_raises: Exception | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
@@ -327,14 +328,21 @@ class FakeLibrary:
         # request_service._already_in_library / _present_seasons_or_empty,
         # season_request_service._present_seasons).
         self.raises = raises
-        # Per-show override for ``season_presence`` ONLY -- since the real
-        # ``PlexLibrary.season_presence`` is now BATCH-shaped (one page-walk covers
-        # every requested show), a real transport failure would fail the WHOLE
-        # batch, not just the one show whose entry happens to trip it. The fake
-        # mirrors that honestly: if ANY id in a given call's batch is a key here,
-        # the WHOLE call raises that id's exception -- there is no partial-batch
-        # success to model, matching the adapter's single HTTP page-walk.
+        # Per-show override for ``season_presence`` ONLY (round 4, #136 review):
+        # mirrors the real adapter's per-show isolation -- a tmdb id that is a key
+        # here has its OWN ``/children``-equivalent lookup fail, so it is OMITTED
+        # from the returned mapping entirely (never raised, never mapped to an
+        # empty frozenset). Every OTHER requested id in the same call still
+        # resolves normally -- see ``LibraryPort.season_presence``'s contract.
+        # Use ``season_presence_raises`` below to model a genuine WHOLE-BATCH
+        # transport failure instead (the page-walk itself failing).
         self.raises_for_shows = raises_for_shows or {}
+        # Whole-batch transport-failure knob for ``season_presence`` ONLY: the
+        # real ``PlexLibrary.season_presence``'s section page-walk is
+        # all-or-nothing, so a genuine transport failure fails the ENTIRE call
+        # (every requested id unresolved), unlike ``raises_for_shows`` above
+        # which isolates a single id's own lookup.
+        self.season_presence_raises = season_presence_raises
         self.is_available_calls = 0
         self.present_ids_calls = 0
         self.present_ids_refresh_absent_calls: list[bool] = []
@@ -371,20 +379,28 @@ class FakeLibrary:
         wanted = frozenset(tmdb_ids)
         self.season_presence_calls += 1
         self.season_presence_call_ids.append(wanted)
-        # A transport failure is whole-batch, never per-show (see ``raises_for_shows``'s
-        # docstring in ``__init__``) -- if any requested id is a configured failure,
-        # the ENTIRE call raises rather than partially answering.
-        for tmdb_id in wanted:
-            if tmdb_id in self.raises_for_shows:
-                raise self.raises_for_shows[tmdb_id]
+        # A genuine whole-batch transport failure (the section page-walk itself
+        # failing) -- the ENTIRE call raises, matching the real adapter's
+        # all-or-nothing page-walk posture. See ``season_presence_raises``'s
+        # docstring in ``__init__``.
+        if self.season_presence_raises is not None:
+            raise self.season_presence_raises
         if self.raises is not None:
             raise self.raises
         # A BATCH lookup for every requested show in ONE call -- mirrors
         # ``PlexLibrary.season_presence``'s contract (fresh, one page-walk
         # regardless of how many shows are requested); the fake answers it from the
         # same seasons map ``present_seasons`` uses. Every requested id is present
-        # as a key (empty frozenset when the show is untracked), never omitted.
-        return {tmdb_id: self.available_tv_seasons.get(tmdb_id, frozenset()) for tmdb_id in wanted}
+        # as a key (empty frozenset when the show is untracked) EXCEPT one whose
+        # id is in ``raises_for_shows`` -- that id's own lookup "failed" and is
+        # OMITTED from the mapping entirely, mirroring the real adapter's
+        # per-show isolation (round 4, #136 review) rather than raising the
+        # whole call.
+        return {
+            tmdb_id: self.available_tv_seasons.get(tmdb_id, frozenset())
+            for tmdb_id in wanted
+            if tmdb_id not in self.raises_for_shows
+        }
 
     async def present_ids(
         self,
