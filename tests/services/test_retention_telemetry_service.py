@@ -1144,6 +1144,59 @@ async def test_classify_partitions_every_candidate_into_exactly_one_bucket_set(
     assert f"preexisting_watch={partition.preexisting_watch_count}" in aggregate
 
 
+async def test_classify_deduplicates_two_candidate_rows_sharing_a_library_path(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """Issue #104: two DISTINCT raw candidates (e.g. a re-request landing on a
+    title already imported at the same path) that share an identical
+    ``library_path`` must count as ONE title everywhere -- ``eligible``,
+    ``would_evict``, and the watch-activity/idle-age dataset alike -- never
+    double-counted just because two separate request rows point at the same
+    physical file."""
+    library_path = _movie_file(tmp_path, "Duplicate.mkv")
+    id_a = await _movie(
+        sessionmaker_,
+        tmdb_id=901,
+        title="Duplicate A",
+        library_path=library_path,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    id_b = await _movie(
+        sessionmaker_,
+        tmdb_id=902,
+        title="Duplicate B",
+        library_path=library_path,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    duplicate_a = _partition_candidate(
+        request_id=id_a, name="Duplicate A", library_path=library_path
+    )
+    duplicate_b = _partition_candidate(
+        request_id=id_b, name="Duplicate B", library_path=library_path
+    )
+    fs = _MappedReclaimFileSystem({})
+    grace_cutoff = _NOW - timedelta(days=_GRACE_DAYS)
+
+    async with sessionmaker_() as session:
+        partition = await _classify_candidates(
+            session=session,
+            fs=fs,
+            candidates=[duplicate_a, duplicate_b],
+            grace_cutoff=grace_cutoff,
+            threshold_pct=_THRESHOLD,
+            target_pct=_TARGET,
+            total_bytes=1000,
+        )
+
+    # The duplicate is collapsed to ONE row on every metric -- disk-space axis...
+    assert len(partition.eligible) == 1
+    assert len(partition.would_evict) == 1
+    # ...and time-to-watch axis (both candidates are watched+stale, same path).
+    assert len(partition.watch_metric_eligible) == 1
+    assert partition.no_path_count == 0
+
+
 async def test_per_title_row_is_deduped_until_last_viewed_advances(
     sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

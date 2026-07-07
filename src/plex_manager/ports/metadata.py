@@ -44,7 +44,12 @@ class MediaPage(BaseModel):
     page: int
     total_pages: int
     total_results: int
-    results: list[MediaSearchResult]
+    # Immutable tuple (issue #106): the TMDB adapter's ``_page_cache`` stores this
+    # exact ``MediaPage`` instance and hands it back BY REFERENCE on every cache
+    # hit within the TTL -- a mutable ``results`` list would let one caller's
+    # in-place mutation (``.append``/``.sort``/...) corrupt what every later cache
+    # hit sees. A ``list`` input is coerced by pydantic.
+    results: tuple[MediaSearchResult, ...]
 
 
 class MovieMetadata(BaseModel):

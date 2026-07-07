@@ -181,7 +181,7 @@ class SqlLogEventRepository:
             stmt = stmt.order_by(LogEvent.created_at.desc(), LogEvent.id.desc())
         stmt = stmt.limit(limit).offset(offset)
         rows = (await self._session.execute(stmt)).scalars().all()
-        return LogEventPage(total=total, results=[_to_record(row) for row in rows])
+        return LogEventPage(total=total, results=tuple(_to_record(row) for row in rows))
 
     async def prune_older_than(
         self,

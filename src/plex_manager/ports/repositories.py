@@ -219,7 +219,10 @@ class LogEventPage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     total: int
-    results: list[LogEventRecord]
+    # Immutable tuple (issue #106): a frozen model blocks reassigning
+    # ``page.results`` but not appending to a plain list in place. A ``list``
+    # input is coerced by pydantic.
+    results: tuple[LogEventRecord, ...]
 
 
 @runtime_checkable

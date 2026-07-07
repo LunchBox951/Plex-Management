@@ -85,10 +85,16 @@ class DecisionResult:
     ``accepted`` is sorted best-first. ``rejected`` pairs each discarded candidate
     with its (surfaced, never-swallowed) reason. ``no_acceptable_release`` is True
     iff ``accepted`` is empty.
+
+    Both collections are immutable tuples (issue #106): a frozen dataclass blocks
+    reassigning ``result.accepted`` but NOT mutating a plain list in place, and a
+    caller appending/sorting a shared ``DecisionResult`` (e.g. across the several
+    read sites in ``auto_grab_service``/``correction_service``/``queue.py``) would
+    silently corrupt every other holder of the same result.
     """
 
-    accepted: list[ScoredRelease]
-    rejected: list[tuple[CandidateRelease, RejectionReason]]
+    accepted: tuple[ScoredRelease, ...]
+    rejected: tuple[tuple[CandidateRelease, RejectionReason], ...]
     no_acceptable_release: bool
 
 
@@ -183,7 +189,7 @@ def decide(
         for position, scored in enumerate(accepted)
     ]
     return DecisionResult(
-        accepted=ranked,
-        rejected=rejected,
+        accepted=tuple(ranked),
+        rejected=tuple(rejected),
         no_acceptable_release=not ranked,
     )

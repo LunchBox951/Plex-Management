@@ -64,7 +64,7 @@ async def test_preview_skips_blocklisted_release(sessionmaker_: SessionMaker) ->
         )
 
     # The good release is now blocklisted (by hash) -> nothing acceptable remains.
-    assert result.accepted == []
+    assert result.accepted == ()
     assert result.no_acceptable_release is True
     reasons = {reason.value for _, reason in result.rejected}
     assert "blocklisted" in reasons
@@ -110,7 +110,7 @@ async def test_preview_does_not_cross_blocklist_movie_and_tv_with_same_tmdb_id(
         )
 
     assert [s.candidate.title for s in result.accepted] == ["Some.Show.S01.1080p.WEB-DL.x264-GROUP"]
-    assert result.rejected == []
+    assert result.rejected == ()
 
 
 async def test_preview_rejects_wrong_title_even_at_top_quality(
@@ -169,7 +169,7 @@ async def test_preview_accepts_tv_episode_despite_series_year(
         "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP"
     ]
     assert result.no_acceptable_release is False
-    assert result.rejected == []
+    assert result.rejected == ()
 
 
 async def test_preview_prefers_season_pack_when_whole_season_requested(
@@ -350,7 +350,7 @@ async def test_preview_episode_scoped_multi_season_pack_surfaces_multi_season_no
             episodes=[4],
         )
 
-    assert result.accepted == []
+    assert result.accepted == ()
     assert result.no_acceptable_release is True
     rejected = {c.title: reason for c, reason in result.rejected}
     assert (
@@ -510,7 +510,7 @@ async def test_preview_rejects_mismatched_tmdb_id(sessionmaker_: SessionMaker) -
             year=2020,
         )
 
-    assert result.accepted == []
+    assert result.accepted == ()
     assert result.no_acceptable_release is True
     assert [reason for _, reason in result.rejected] == [RejectionReason.WRONG_MEDIA]
 

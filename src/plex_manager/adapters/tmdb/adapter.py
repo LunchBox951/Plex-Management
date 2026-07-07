@@ -170,7 +170,13 @@ class TmdbMetadata:
         self._base_url = base_url.rstrip("/")
         self._movie_cache: _TtlCache[MovieMetadata] = _TtlCache(cache_ttl_seconds)
         self._tv_cache: _TtlCache[TvMetadata] = _TtlCache(cache_ttl_seconds)
-        self._search_cache: _TtlCache[list[MediaSearchResult]] = _TtlCache(cache_ttl_seconds)
+        # Stored as an immutable tuple (issue #106), not the mutable ``list`` the
+        # ``MetadataPort.search`` return type uses: ``_TtlCache.get`` hands back the
+        # SAME object on every hit within the TTL, so a plain cached list would let
+        # one caller's in-place mutation (``.append``/``.sort``/...) corrupt what
+        # every later hit sees. ``search`` copies the tuple back into a fresh list
+        # per call (see below), so the cache entry itself can never be mutated.
+        self._search_cache: _TtlCache[tuple[MediaSearchResult, ...]] = _TtlCache(cache_ttl_seconds)
         self._page_cache: _TtlCache[MediaPage] = _TtlCache(cache_ttl_seconds)
 
     async def _get(
@@ -228,7 +234,10 @@ class TmdbMetadata:
         cache_key = f"{query}\x00{year if year is not None else ''}"
         cached = self._search_cache.get(cache_key)
         if cached is not None:
-            return cached
+            # A fresh list per call (issue #106): the cached tuple itself is
+            # immutable, but the caller's own return type is ``list`` and must not
+            # be the SAME list object handed to a previous caller.
+            return list(cached)
 
         params = {"query": query, "include_adult": "false"}
         if year is not None:
@@ -244,7 +253,7 @@ class TmdbMetadata:
                     if year is not None and parsed.year != year:
                         continue
                     results.append(parsed)
-        self._search_cache.set(cache_key, results)
+        self._search_cache.set(cache_key, tuple(results))
         return results
 
     @staticmethod
@@ -383,7 +392,7 @@ class TmdbMetadata:
             page=_get_int(fields, "page") or clamped,
             total_pages=_get_int(fields, "total_pages") or 0,
             total_results=_get_int(fields, "total_results") or 0,
-            results=results,
+            results=tuple(results),
         )
         self._page_cache.set(cache_key, media_page)
         return media_page

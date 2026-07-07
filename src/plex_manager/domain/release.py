@@ -70,7 +70,11 @@ class ParsedRelease(BaseModel):
     modifier: Modifier = Modifier.NONE
     revision: Revision = Field(default_factory=Revision)
     release_group: str | None = None
-    languages: list[str] = Field(default_factory=list[str])
+    # Immutable tuple (issue #106): a frozen model blocks reassigning
+    # ``parsed.languages`` but not appending to a plain list in place, which would
+    # corrupt every holder of a shared ``ParsedRelease``. A ``list[str]`` input
+    # (e.g. ``source_mapping._as_str_list``'s return) is coerced by pydantic.
+    languages: tuple[str, ...] = Field(default_factory=tuple)
     edition: str | None = None
     hardcoded_subs: str | None = None
 
@@ -108,7 +112,9 @@ class CandidateRelease(BaseModel):
     publish_date: datetime
     imdb_id: int = 0
     tmdb_id: int = 0
-    categories: list[int] = Field(default_factory=list[int])
+    # Immutable tuple (issue #106) -- see ``ParsedRelease.languages`` for the
+    # same rationale (a frozen model does not stop in-place list mutation).
+    categories: tuple[int, ...] = Field(default_factory=tuple)
     protocol: Protocol = "torrent"
 
 
@@ -129,8 +135,9 @@ class IndexerSearchRequest(BaseModel):
     year: int | None = None
     season: int | None = None
     episode: str | None = None
-    categories: list[int] = Field(default_factory=list[int])
-    indexer_ids: list[int] = Field(default_factory=list[int])
+    # Immutable tuples (issue #106) -- see ``ParsedRelease.languages``.
+    categories: tuple[int, ...] = Field(default_factory=tuple)
+    indexer_ids: tuple[int, ...] = Field(default_factory=tuple)
 
 
 class ScoredRelease(BaseModel):

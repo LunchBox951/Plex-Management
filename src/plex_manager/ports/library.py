@@ -8,10 +8,10 @@ wiring is a drop-in later. All methods are async.
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 __all__ = ["LibraryPort", "LibrarySection", "WatchState"]
 
@@ -36,12 +36,34 @@ class WatchState(BaseModel):
     (``domain/eviction.py``) treats a missing timestamp as never-eligible
     regardless of ``watched``, so this keeps the two signals honestly aligned at
     the source.
+
+    ``last_viewed_at`` is always tz-AWARE once constructed (issue #82): eviction
+    and retention-telemetry both subtract it against UTC-aware cutoffs
+    (``domain/eviction.py``, ``services/retention_telemetry_service.py``'s own
+    ``_as_utc``), and a naive value straight off a careless adapter/fake would
+    raise ``TypeError`` deep inside that arithmetic instead of at this boundary.
+    A naive input is NORMALIZED by re-attaching UTC -- mirroring the identically
+    named ``_as_utc`` idiom already used at every other naive-datetime boundary in
+    this codebase (``repositories/downloads.py``, ``repositories/log_events.py``,
+    ``repositories/requests.py``, ``repositories/season_requests.py``,
+    ``services/retention_telemetry_service.py``) -- rather than rejected: every one
+    of those precedents treats "naive but was always meant as UTC" as the honest
+    normalization, never a hard failure over a timezone a well-behaved caller
+    simply forgot to attach.
     """
 
     model_config = ConfigDict(frozen=True)
 
     watched: bool
     last_viewed_at: datetime | None = None
+
+    @field_validator("last_viewed_at")
+    @classmethod
+    def _normalize_naive_to_utc(cls, value: datetime | None) -> datetime | None:
+        """Re-attach UTC to a naive ``last_viewed_at`` (see class docstring)."""
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 @runtime_checkable

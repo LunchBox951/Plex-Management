@@ -677,7 +677,7 @@ async def test_prune_once_thirty_day_cap_applies_to_decision_and_auto_grab_rows(
         assert removed == 2
 
         remaining = await repo.list_events(limit=10)
-    assert remaining.results == []
+    assert remaining.results == ()
 
 
 async def test_prune_once_eventually_prunes_telemetry_rows_past_their_own_retention(
@@ -704,7 +704,7 @@ async def test_prune_once_eventually_prunes_telemetry_rows_past_their_own_retent
         assert removed == 1
 
         remaining = await repo.list_events(limit=10)
-    assert remaining.results == []
+    assert remaining.results == ()
 
 
 async def test_prune_once_telemetry_retention_never_shorter_than_the_operator_window(
