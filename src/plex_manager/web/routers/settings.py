@@ -34,6 +34,14 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
+    AUTO_GRAB_ENABLED_DEFAULT,
+    DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+    DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+    EVICTION_ENABLED_DEFAULT,
+    EVICTION_GRACE_DAYS_DEFAULT,
+    EVICTION_INTERVAL_MINUTES_DEFAULT,
+    EVICTION_PROACTIVE_ENABLED_DEFAULT,
+    LOG_RETENTION_DAYS_DEFAULT,
     PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
@@ -49,6 +57,11 @@ from plex_manager.web.deps import (
     get_library,
     load_system_settings,
     require_admin,
+    resolve_bool_setting,
+    resolve_disk_pressure_percents,
+    resolve_eviction_grace_days,
+    resolve_eviction_interval_minutes,
+    resolve_log_retention_days,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
@@ -147,8 +160,126 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
 _rotate_lock = asyncio.Lock()
 
 
+# The default each boolean key degrades to on an unrecognized stored value --
+# threaded into ``resolve_bool_setting`` so its WARNING names the actual
+# fallback the matching runtime getter uses. The parity-guard test derives its
+# bool key set from this mapping so the sanitizer's loop and the guard can
+# never name different key sets.
+_BOOL_SETTING_DEFAULTS: dict[str, bool] = {
+    "eviction_enabled": EVICTION_ENABLED_DEFAULT,
+    "eviction_proactive_enabled": EVICTION_PROACTIVE_ENABLED_DEFAULT,
+    "auto_grab_enabled": AUTO_GRAB_ENABLED_DEFAULT,
+}
+
+
+def _present_effective(
+    raw: str | None, effective: float | int, default: float | int, honored: bool
+) -> str | None:
+    """The value ``GET /settings`` presents for one resolved typed setting.
+
+    The display contract (PR #142 round 3): the page must show exactly what the
+    runtime getter is using --
+
+    * raw value HONORED -> echo the raw stored string verbatim (display
+      fidelity: ``"88.5"`` stays ``88.5``).
+    * degraded to the DEFAULT -> ``None`` (unset), which the page renders as
+      the default -- the same value the getter returns, so null is truthful.
+    * degraded to anything ELSE (an upper-bound CLAMP, or the disk-pressure
+      pair rule) -> the EFFECTIVE value itself. Nulling here would make the
+      page claim the default (e.g. a 30-day grace) while the runtime runs the
+      clamped MAX (3650 days) -- the exact page-vs-runtime lie this exists to
+      prevent. The clamped value is always within ``SettingsUpdate``'s bounds,
+      so re-saving the displayed form persists it verbatim (self-healing).
+    """
+    if raw is not None and honored:
+        return raw
+    if effective == default:
+        return None
+    return str(effective)
+
+
+def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None]:
+    """Present every stored typed value as the EFFECTIVE value the runtime uses.
+
+    Each typed key is resolved through the SAME ``web.deps`` resolver its
+    runtime getter uses (``resolve_eviction_grace_days``,
+    ``resolve_disk_pressure_percents``, ...), then displayed per
+    :func:`_present_effective` -- raw when honored, the effective value when
+    clamped/pair-adjusted, ``None`` when the default applies. One resolution
+    path means the page and the eviction/auto-grab/log-retention loops can
+    never disagree about a corrupt stored value (issue #92, north star #3).
+
+    This also keeps ``GET`` from ever 500ing or echoing a value ``PUT``
+    rejects: unparsable and non-finite raws (which would crash Starlette's
+    ``json.dumps(..., allow_nan=False)`` at serialization time) resolve to the
+    default (``None`` here), and every clamped value lies within
+    ``SettingsUpdate``'s own bounds, so the displayed form always re-saves
+    cleanly.
+
+    The disk-pressure pair is resolved TOGETHER (never per-side): a half-corrupt
+    pair degrades to a workable ``target <= threshold`` pair (see
+    ``resolve_disk_pressure_percents``), and whatever the pair rule substitutes
+    is displayed -- including for a side that is UNSET in storage (e.g. an unset
+    target whose effective value is pulled down to a low stored threshold), so
+    the page never implies a default the sweep is not actually using.
+
+    Boolean raws are normalized to their stripped form when honored: the
+    resolver accepts a whitespace-padded ``" false "`` (the pre-#142 parser's
+    contract), but ``SettingsResponse``'s own bool coercion would reject the
+    padded literal at ``model_validate`` -- the stripped token is the same
+    recognized value, minus the crash.
+    """
+    out = dict(raw)
+
+    pair = resolve_disk_pressure_percents(
+        raw.get("disk_pressure_threshold_percent"), raw.get("disk_pressure_target_percent")
+    )
+    out["disk_pressure_threshold_percent"] = _present_effective(
+        raw.get("disk_pressure_threshold_percent"),
+        pair.threshold,
+        DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+        pair.threshold_honored,
+    )
+    out["disk_pressure_target_percent"] = _present_effective(
+        raw.get("disk_pressure_target_percent"),
+        pair.target,
+        DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+        pair.target_honored,
+    )
+
+    interval, interval_honored = resolve_eviction_interval_minutes(
+        raw.get("eviction_interval_minutes")
+    )
+    out["eviction_interval_minutes"] = _present_effective(
+        raw.get("eviction_interval_minutes"),
+        interval,
+        EVICTION_INTERVAL_MINUTES_DEFAULT,
+        interval_honored,
+    )
+
+    grace, grace_honored = resolve_eviction_grace_days(raw.get("eviction_grace_days"))
+    out["eviction_grace_days"] = _present_effective(
+        raw.get("eviction_grace_days"), grace, EVICTION_GRACE_DAYS_DEFAULT, grace_honored
+    )
+
+    retention, retention_honored = resolve_log_retention_days(raw.get("log_retention_days"))
+    out["log_retention_days"] = _present_effective(
+        raw.get("log_retention_days"), retention, LOG_RETENTION_DAYS_DEFAULT, retention_honored
+    )
+
+    for key, default in _BOOL_SETTING_DEFAULTS.items():
+        value = raw.get(key)
+        if value is None:
+            continue
+        _effective, honored = resolve_bool_setting(key, value, default)
+        # Honored -> the stripped token (see the docstring); unrecognized -> the
+        # default applies at runtime, so unset (None) is the truthful display.
+        out[key] = value.strip() if honored else None
+    return out
+
+
 async def _redacted(store: SettingsStore) -> SettingsResponse:
-    return SettingsResponse.model_validate(await store.redacted())
+    return SettingsResponse.model_validate(_sanitize_typed_settings(await store.redacted()))
 
 
 # Which ``SettingsUpdate`` fields feed each subsystem's health probe (issue #93):
@@ -172,10 +303,10 @@ def _to_stored_string(value: object) -> str:
     :meth:`SettingsStore.set` persists (``settings.value`` has no typed columns).
 
     Booleans render lowercase (``"true"``/``"false"``) to match this codebase's
-    own convention for the setting (see ``web.deps._TRUE_STRINGS`` and the
+    own convention for the setting (see ``web.deps._get_bool_setting`` and the
     eviction tests that seed ``store.set("eviction_enabled", "true")`` directly)
     rather than Python's capitalized ``str(True)`` -- both round-trip correctly
-    through ``web.deps``'s case-insensitive parse, but the lowercase form is
+    through ``web.deps``'s case-insensitive bool parse, but the lowercase form is
     the one actually written elsewhere, so a raw DB read stays consistent
     regardless of which path wrote the value.
     """
