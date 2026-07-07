@@ -20,10 +20,23 @@ own, so both sides can depend on it with no ordering hazard, mirroring
 from __future__ import annotations
 
 __all__ = [
+    "DISK_PRESSURE_PERCENT_MAX",
+    "DISK_PRESSURE_PERCENT_MIN",
     "EVICTION_GRACE_DAYS_MAX",
     "EVICTION_INTERVAL_MAX_MINUTES",
     "LOG_RETENTION_DAYS_MAX",
 ]
+
+# The disk-pressure trigger threshold and target are a USED-DISK PERCENT, so both
+# sit on the closed ``[0, 100]`` scale. Shared here so the write-time
+# ``Field(ge=..., le=...)`` on ``SettingsUpdate`` (``web.schemas``) and the
+# read-time range guard on ``get_disk_pressure_threshold_percent`` /
+# ``get_disk_pressure_target_percent`` (``web.deps``) reject the EXACT same
+# out-of-range value -- a stored ``150`` / ``-1`` that ``PUT`` refuses is the same
+# value the runtime getter degrades to its default, so ``GET /settings`` (which
+# nulls it) and the eviction sweep can never disagree on the effective percentage.
+DISK_PRESSURE_PERCENT_MIN: float = 0.0
+DISK_PRESSURE_PERCENT_MAX: float = 100.0
 
 # The three settings that feed directly into a sleep duration or a timedelta
 # cutoff. Without a ceiling, a stored/submitted finite-but-huge value is just

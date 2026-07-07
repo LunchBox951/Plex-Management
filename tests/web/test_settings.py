@@ -17,6 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import AuthSession, Setting, User
 from plex_manager.web.deps import (
+    AUTO_GRAB_ENABLED_DEFAULT,
+    DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+    DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+    EVICTION_ENABLED_DEFAULT,
     EVICTION_GRACE_DAYS_DEFAULT,
     EVICTION_GRACE_DAYS_MAX,
     EVICTION_INTERVAL_MAX_MINUTES,
@@ -31,6 +35,7 @@ from plex_manager.web.deps import (
     SettingsStore,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
+    get_auto_grab_enabled,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_eviction_enabled,
@@ -1450,6 +1455,121 @@ async def test_get_settings_preserves_boundary_typed_values(
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+
+
+# --------------------------------------------------------------------------- #
+# Getter <-> GET sanitizer agreement on a corrupt stored value (round-2 P2s).
+# For EVERY typed setting the runtime getter (what the eviction/auto-grab loops
+# read), the GET /settings sanitizer (what the page shows), and the PUT validator
+# must agree on what an out-of-range / unrecognized stored value means -- the page
+# must never claim a state the running service isn't in (honesty over silence).
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("stored", ["150", "-1"])
+@pytest.mark.parametrize(
+    ("field", "getter", "default"),
+    [
+        (
+            "disk_pressure_threshold_percent",
+            get_disk_pressure_threshold_percent,
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+        ),
+        (
+            "disk_pressure_target_percent",
+            get_disk_pressure_target_percent,
+            DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+        ),
+    ],
+)
+async def test_corrupt_disk_pressure_percent_getter_and_get_agree_on_default(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    getter: Callable[[AsyncSession], Awaitable[float]],
+    default: float,
+    stored: str,
+) -> None:
+    """Finding 1: an out-of-``[0, 100]`` stored disk-pressure percent (``150`` past
+    ``le=100``, ``-1`` below ``ge=0``) had NO runtime range guard, so the eviction
+    sweep read the corrupt value while ``GET /settings`` already nulled it (→ the
+    page showed the default). The getter must now degrade to the SAME default the
+    GET sanitizer implies -- asserted together here so the two can never drift: the
+    getter returns the default (with a WARNING naming the key) AND GET nulls the
+    field."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, stored)
+        await session.commit()
+
+    # Runtime getter (what _eviction_tick reads): the default, plus a WARNING.
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await getter(session)
+    assert value == default
+    assert field in caplog.text
+
+    # GET /settings (what the page shows): the same corrupt value is nulled, so the
+    # UI falls back to the EXACT default the getter just returned -- agreement, not
+    # a page that claims a percentage the sweep isn't actually using.
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()[field] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "getter", "default"),
+    [
+        ("eviction_enabled", get_eviction_enabled, EVICTION_ENABLED_DEFAULT),
+        ("auto_grab_enabled", get_auto_grab_enabled, AUTO_GRAB_ENABLED_DEFAULT),
+    ],
+)
+async def test_unrecognized_bool_getter_and_get_agree_on_default(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    getter: Callable[[AsyncSession], Awaitable[bool]],
+    default: bool,
+) -> None:
+    """Finding 2: an UNRECOGNIZED stored boolean (``"maybe"``) used to be silently
+    read as ``False`` by the loop while ``GET /settings`` nulled it (→ the page
+    showed the default ``True``) -- the loop was OFF while the page said ON. The
+    getter must now fall back to the default (with a WARNING) for an unrecognized
+    token, matching the GET sanitizer's null (→ default display) exactly."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, "maybe")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await getter(session)
+    assert value is default
+    assert field in caplog.text
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()[field] is None
+
+
+async def test_bool_getter_honors_explicit_stored_false(sessionmaker_: SessionMaker) -> None:
+    """The unrecognized-value fallback must NOT swallow a legitimately stored
+    ``"false"``: it is a recognized token, so an operator who turned a loop OFF
+    keeps it OFF (``False``), never resurrected to the ``True`` default. Guards the
+    fix from over-degrading a valid negative into the enabled default."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("eviction_enabled", "false")
+        await store.set("auto_grab_enabled", "false")
+        await store.set("eviction_proactive_enabled", "false")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_enabled(session) is False
+        assert await get_auto_grab_enabled(session) is False
+        assert await get_eviction_proactive_enabled(session) is False
 
 
 def test_typed_setting_key_groups_cover_all_typed_response_fields() -> None:

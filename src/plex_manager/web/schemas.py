@@ -14,6 +14,8 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from plex_manager.web.settings_bounds import (
+    DISK_PRESSURE_PERCENT_MAX,
+    DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
     EVICTION_INTERVAL_MAX_MINUTES,
     LOG_RETENTION_DAYS_MAX,
@@ -554,8 +556,12 @@ class SettingsUpdate(BaseModel):
     # fails ``le``; ``-inf`` fails ``ge``/``gt``), so a would-be
     # ``mode="after"`` isfinite check would be unreachable dead code -- these
     # bounds ARE the finiteness guard.
-    disk_pressure_threshold_percent: float | None = Field(default=None, ge=0, le=100)
-    disk_pressure_target_percent: float | None = Field(default=None, ge=0, le=100)
+    disk_pressure_threshold_percent: float | None = Field(
+        default=None, ge=DISK_PRESSURE_PERCENT_MIN, le=DISK_PRESSURE_PERCENT_MAX
+    )
+    disk_pressure_target_percent: float | None = Field(
+        default=None, ge=DISK_PRESSURE_PERCENT_MIN, le=DISK_PRESSURE_PERCENT_MAX
+    )
     eviction_grace_days: int | None = Field(default=None, ge=0, le=EVICTION_GRACE_DAYS_MAX)
     eviction_enabled: bool | None = Field(default=None)
     eviction_proactive_enabled: bool | None = Field(default=None)

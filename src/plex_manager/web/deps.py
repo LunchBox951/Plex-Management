@@ -39,6 +39,7 @@ from typing import Annotated, cast
 import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +69,8 @@ from plex_manager.services.health_service import (
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.settings_bounds import (
+    DISK_PRESSURE_PERCENT_MAX,
+    DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
     EVICTION_INTERVAL_MAX_MINUTES,
     LOG_RETENTION_DAYS_MAX,
@@ -78,6 +81,8 @@ __all__ = [
     "AUTO_GRAB_ENABLED_DEFAULT",
     "CSRF_COOKIE_NAME",
     "CSRF_HEADER_NAME",
+    "DISK_PRESSURE_PERCENT_MAX",
+    "DISK_PRESSURE_PERCENT_MIN",
     "DISK_PRESSURE_TARGET_PERCENT_DEFAULT",
     "DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT",
     "EVICTION_ENABLED_DEFAULT",
@@ -1142,11 +1147,19 @@ AUTO_GRAB_ENABLED_DEFAULT: bool = True
 # ``__all__`` above so callers/tests reach them the same way as every other
 # operability constant, via ``web.deps``.
 
-# Values that parse as boolean-true; anything else (including unset/unparsable)
-# is false. Matches the plain-string ``settings.value`` storage -- there is no
-# dedicated boolean column type here (mirrors ``is_secret``'s own dialect-portable
-# boolean handling being a DIFFERENT, ORM-level concern from this string parse).
-_TRUE_STRINGS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+# Parses a stored boolean setting with the SAME accept/reject rule ``GET
+# /settings``'s ``_sanitize_typed_settings`` bool branch applies (via its own
+# ``web.routers.settings._BOOL_SETTING_ADAPTER``). BOTH are ``TypeAdapter(bool)``,
+# so the runtime getter below and the GET sanitizer can never disagree on which
+# stored string is a valid bool versus a corrupt one that must degrade to the
+# default -- an UNRECOGNIZED value the sanitizer nulls (→ default display) is the
+# exact value ``_get_bool_setting`` falls back to the default for (issue #92:
+# honesty over silence -- the page never shows ``enabled`` while the loop reads
+# the stored value as disabled). Accepts the case-insensitive token set pydantic
+# recognizes (``true``/``false``/``1``/``0``/``yes``/``no``/``on``/``off``/
+# ``t``/``f``/``y``/``n``); the plain-string ``settings.value`` column has no
+# dedicated boolean type, so this string parse is the single boolean gate.
+_BOOL_SETTING_ADAPTER: TypeAdapter[bool] = TypeAdapter(bool)
 
 
 async def _get_float_setting(session: AsyncSession, key: str, default: float) -> float:
@@ -1194,24 +1207,90 @@ async def _get_int_setting(session: AsyncSession, key: str, default: int) -> int
 
 
 async def _get_bool_setting(session: AsyncSession, key: str, default: bool) -> bool:
-    """Return ``key`` parsed as ``bool`` (case-insensitive ``1``/``true``/``yes``/``on``)."""
+    """Return ``key`` parsed as ``bool``, or ``default`` if unset/unrecognized.
+
+    Recognizes the same true/false token set pydantic's ``bool`` coercion accepts
+    (case-insensitive ``true``/``false``/``1``/``0``/``yes``/``no``/``on``/``off``/
+    ``t``/``f``/``y``/``n``), so a legitimately stored ``"false"`` is honored as
+    ``False``. An UNRECOGNIZED stored value (e.g. a hand-edited ``"maybe"``) is NOT
+    silently coerced to ``False`` -- it falls back to ``default`` with a WARNING
+    naming the key, exactly matching the numeric getters' corrupt-value posture
+    (issue #92). This keeps the runtime getter in lock-step with ``GET
+    /settings``'s ``_sanitize_typed_settings`` bool branch, which nulls (→ default
+    display) that same unrecognized value via its OWN ``TypeAdapter(bool)`` -- so
+    the Settings page can never show a loop ``enabled`` while it is actually
+    reading the stored value as disabled (honesty over silence, north star #3).
+    """
     raw = await SettingsStore(session).get(key)
     if raw is None:
         return default
-    return raw.strip().lower() in _TRUE_STRINGS
+    try:
+        return _BOOL_SETTING_ADAPTER.validate_python(raw)
+    except ValidationError:
+        _logger.warning(
+            "setting %r has an unrecognized boolean value %r; using default %s", key, raw, default
+        )
+        return default
+
+
+def _guard_disk_pressure_percent(key: str, value: float, default: float) -> float:
+    """Degrade an out-of-``[0, 100]`` disk-pressure percent to ``default`` + WARNING.
+
+    Shared by both disk-pressure getters so the ``[DISK_PRESSURE_PERCENT_MIN,
+    DISK_PRESSURE_PERCENT_MAX]`` range check is written once. ``value`` is already
+    finite here (``_get_float_setting`` degrades ``inf``/``nan``/unparsable to the
+    finite default before this runs), so this only rejects a finite-but-off-scale
+    stored value -- the same closed band ``SettingsUpdate`` enforces on write, so
+    the getter, the ``GET /settings`` sanitizer, and the ``PUT`` validator agree on
+    what an out-of-range stored percentage means.
+    """
+    if not DISK_PRESSURE_PERCENT_MIN <= value <= DISK_PRESSURE_PERCENT_MAX:
+        _logger.warning(
+            "setting %r resolved to %s, outside [%s, %s]; using default %s",
+            key,
+            value,
+            DISK_PRESSURE_PERCENT_MIN,
+            DISK_PRESSURE_PERCENT_MAX,
+            default,
+        )
+        return default
+    return value
 
 
 async def get_disk_pressure_threshold_percent(session: AsyncSession) -> float:
-    """Used% at/above which a root's disk-pressure eviction sweep fires (default 90)."""
-    return await _get_float_setting(
+    """Used% at/above which a root's disk-pressure eviction sweep fires (default 90).
+
+    Range-guarded to ``[DISK_PRESSURE_PERCENT_MIN, DISK_PRESSURE_PERCENT_MAX]``
+    (``[0, 100]``, the same closed scale ``SettingsUpdate`` enforces via
+    ``ge``/``le``): a corrupt stored value outside that band -- a hand-edited
+    ``150`` or ``-1`` -- would otherwise drive ``_eviction_tick`` off a percentage
+    that can never trip (``150``) or trips constantly (``-1``), while ``PUT``
+    rejects it and ``GET /settings`` already nulls it. Falls back to the default
+    (with a WARNING naming the key) instead, so the getter, the GET sanitizer, and
+    the PUT validator all agree on what an out-of-range stored value means (issue
+    #92).
+    """
+    value = await _get_float_setting(
         session, "disk_pressure_threshold_percent", DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT
+    )
+    return _guard_disk_pressure_percent(
+        "disk_pressure_threshold_percent", value, DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT
     )
 
 
 async def get_disk_pressure_target_percent(session: AsyncSession) -> float:
-    """Used% the sweep evicts stalest-first candidates down towards (default 80)."""
-    return await _get_float_setting(
+    """Used% the sweep evicts stalest-first candidates down towards (default 80).
+
+    Range-guarded to ``[0, 100]`` for the same reason (and against the same
+    shared bounds) as :func:`get_disk_pressure_threshold_percent` -- a corrupt
+    stored percentage falls back to the default rather than skewing the sweep's
+    target, keeping the getter aligned with the GET sanitizer and PUT validator.
+    """
+    value = await _get_float_setting(
         session, "disk_pressure_target_percent", DISK_PRESSURE_TARGET_PERCENT_DEFAULT
+    )
+    return _guard_disk_pressure_percent(
+        "disk_pressure_target_percent", value, DISK_PRESSURE_TARGET_PERCENT_DEFAULT
     )
 
 
