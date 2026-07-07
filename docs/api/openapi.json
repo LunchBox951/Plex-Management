@@ -373,6 +373,17 @@
       "CreateRequestBody": {
         "description": "Create a media request by tmdb id + media type.",
         "properties": {
+          "force": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Force"
+          },
           "media_type": {
             "enum": [
               "movie",
@@ -3862,7 +3873,7 @@
         ]
       },
       "post": {
-        "description": "Create a request (or return the existing active one for this media).\n\nIf Plex is configured and the movie is already in the library, the request is\nrecorded directly as ``available`` (no needless search/grab). For a tv\nrequest, ``body.seasons`` (omitted/empty = the whole aired series) is threaded\nto ``request_service.create_request``, which tracks each named season as its\nown ``SeasonRequest`` row -- including on the dedup path, where a repeat POST\nwith a NEW season list grows the tracked set rather than being dropped.",
+        "description": "Create a request (or return the existing active one for this media).\n\nIf Plex is configured and the movie is already in the library, the request is\nrecorded directly as ``available`` (no needless search/grab). For a tv\nrequest, ``body.seasons`` (omitted/empty = the whole aired series) is threaded\nto ``request_service.create_request``, which tracks each named season as its\nown ``SeasonRequest`` row -- including on the dedup path, where a repeat POST\nwith a NEW season list grows the tracked set rather than being dropped.\n\nRe-acquire (issue #131): ``body.force`` (movie-only) bypasses the\nalready-in-library short-circuit so a title Plex still reports present -- but\nwhose file was deleted/replaced out-of-band -- yields a fresh, grabbable\n``pending`` request instead of a terminal ``available`` one. Same authZ as any\ncreate; same response map (no new status codes) -- every dedup/ownership\nguard below still applies unchanged.",
         "operationId": "create_request_endpoint_api_v1_requests_post",
         "requestBody": {
           "content": {

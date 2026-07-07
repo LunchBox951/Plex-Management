@@ -247,6 +247,88 @@ def test_hardlinkless_publish_still_refuses_existing_destination(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["copied.mkv", "src.mkv"]
 
 
+def test_hardlinkless_publish_refuses_dangling_symlink_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-8fj8: ``Path.exists()`` follows symlinks, so a DANGLING symlink at
+    dst used to read as "absent" -- the copy-fallback publish would then
+    silently replace the symlink entry via ``os.rename``. A dangling symlink
+    must refuse exactly like a real existing file, and must be left untouched
+    (not resolved, not replaced)."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    target = tmp_path / "gone.mkv"  # never created -- dst is a DANGLING symlink
+    dst.symlink_to(target)
+    assert dst.is_symlink()
+    assert not dst.exists()  # confirms the dangling shape this test exercises
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.is_symlink()
+    assert os.readlink(dst) == os.fspath(target)
+    assert not target.exists()  # no real file was ever created at the target
+
+
+def test_move_refuses_dangling_symlink_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same GHSA-8fj8 guard, exercised through ``move`` instead of ``hardlink_or_copy``."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    target = tmp_path / "gone.mkv"
+    dst.symlink_to(target)
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().move(src, dst)
+
+    assert dst.is_symlink()
+    assert os.readlink(dst) == os.fspath(target)
+    assert not target.exists()
+    assert src.exists()  # move must not have consumed src on a refused publish
+
+
+def test_publish_lock_refuses_dangling_symlink_under_stale_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercises the OTHER GHSA-8fj8 site: the lock-contention early-exit in
+    ``_publish_lock`` (line ~114). A stale (dead-pid) lock is reclaimed, and the
+    dangling-symlink dst underneath it must still refuse, not be silently
+    replaced."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    target = tmp_path / "gone.mkv"
+    dst.symlink_to(target)
+
+    lock_path = tmp_path / f".{dst.name}.publish.lock"
+    lock_path.write_text("999999999")  # a pid that cannot be running -- reclaimable
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.is_symlink()
+    assert os.readlink(dst) == os.fspath(target)
+    assert not target.exists()
+
+
 def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

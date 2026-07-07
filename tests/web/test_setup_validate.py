@@ -31,7 +31,7 @@ from plex_manager.web.deps import (
     SESSION_COOKIE_NAME,
     hash_session_token,
 )
-from plex_manager.web.setup_validation import library_options
+from plex_manager.web.setup_validation import library_options, validate_plex
 from tests.web.fakes import FakeLibrary, override_adapters
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -438,6 +438,49 @@ async def test_validate_prowlarr_rejects_status_200_without_version(
     assert body["message"] == "Unexpected response from Prowlarr."
 
 
+@pytest.mark.parametrize("bad_key", ["pk\r\ninject", "pk\x00", "kéy"])
+async def test_validate_prowlarr_rejects_unsafe_api_key(
+    admin_client: httpx.AsyncClient, app: FastAPI, bad_key: str
+) -> None:
+    # A header-unsafe api key (GHSA-qv47) is rejected BEFORE the outbound probe --
+    # httpx would otherwise either echo the raw key via str(exc) (CR/LF/NUL) or
+    # crash with an uncaught UnicodeEncodeError (non-ASCII).
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for an unsafe api key")
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://prowlarr.local", "api_key": bad_key},
+        headers=_CSRF_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert "Prowlarr API key" in body["message"]
+    assert "inject" not in response.text
+    assert "kéy" not in response.text
+
+
+async def test_validate_prowlarr_transport_error_never_leaks_the_key(
+    admin_client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    # Regression pin for GHSA-qv47: a header-unsafe key used to reach httpx, which
+    # raised LocalProtocolError with str(exc) == "Illegal header value b'...'" --
+    # echoing the raw credential into the response. The pre-check above must stop
+    # it, and this asserts the leaked fragment never appears even if it regresses.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for an unsafe api key")
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/prowlarr",
+        json={"url": "http://prowlarr.local", "api_key": "pk\r\ninjected"},
+        headers=_CSRF_HEADERS,
+    )
+    assert "Illegal header value" not in response.text
+    assert "injected" not in response.text
+
+
 @pytest.mark.parametrize(
     "bad_url",
     [
@@ -721,6 +764,45 @@ async def test_validate_plex_rejects_non_http_url(
     body = response.json()
     assert body["ok"] is False
     assert body["message"] == "Enter a valid http(s) URL."
+
+
+@pytest.mark.parametrize("bad_token", ["tok\r\ninject", "tök"])
+async def test_validate_plex_rejects_unsafe_token(
+    admin_client: httpx.AsyncClient, app: FastAPI, bad_token: str
+) -> None:
+    # A header-unsafe token (GHSA-qv47) is rejected BEFORE the identity probe or
+    # section list -- no outbound request is ever attempted.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not issue an outbound request for an unsafe token")
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400", "token": bad_token},
+        headers=_CSRF_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert "Plex token" in body["message"]
+    assert "inject" not in response.text
+    assert "tök" not in response.text
+
+
+async def test_validate_plex_empty_token_still_probes() -> None:
+    # An empty token is a LEGITIMATE value the header-safety pre-check must NOT
+    # reject (e.g. the health-card path calling with no stored token yet). Drives
+    # ``validate_plex`` directly -- through the endpoint, an empty string falls
+    # back to the admin's stored token before it ever reaches this function
+    # (``body.token or admin_token``), which would not actually exercise the
+    # empty-string pre-check.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Plex-Token"] == ""
+        return httpx.Response(200, json={"MediaContainer": {"Directory": [_MOVIE_SECTION]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await validate_plex(http, "http://plex.local:32400", "")
+
+    assert result.ok is True
 
 
 # --------------------------------------------------------------------------- #

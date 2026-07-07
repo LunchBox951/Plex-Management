@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from plex_manager.headersafe import HEADER_VALUE_MESSAGE, header_value_error
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
@@ -397,6 +398,30 @@ class SetupCompleteRequest(BaseModel):
             raise ValueError(message)
         return value
 
+    @field_validator("plex_token", "prowlarr_api_key")
+    @classmethod
+    def _validate_header_safe_credential(cls, value: str | None) -> str | None:
+        """Reject a credential that cannot ride its outbound HTTP header BEFORE it
+        is persisted (the header-safety persistence bypass).
+
+        ``plex_token`` rides ``X-Plex-Token`` and ``prowlarr_api_key`` rides
+        ``X-Api-Key``. A CR/LF/NUL value makes httpx echo the RAW credential in
+        ``str(exc)`` (a secret leak through any adapter that logs a chained
+        transport error -- e.g. ``ProwlarrIndexer._indexer_priorities``' priority
+        warning), and a non-ASCII value makes httpx's ASCII header encoder raise an
+        uncaught ``UnicodeEncodeError`` (a 500). The wizard's live "Test connection"
+        probes already reject such a value up front
+        (:func:`~plex_manager.web.setup_validation._require_header_safe_credential`);
+        enforcing the SAME predicate here -- shared verbatim with ``SettingsUpdate``
+        -- closes the direct-API / keyless-token bypass so a header-unsafe credential
+        can never be stored and then leaked (or crash the grab loop) when an adapter
+        later sends it as a header. ``None`` (an omitted ``plex_token``) is
+        header-safe and passes untouched.
+        """
+        if value and header_value_error(value) is not None:
+            raise ValueError(HEADER_VALUE_MESSAGE)
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def require_at_least_one_library_root(cls, data: Any) -> Any:
@@ -612,6 +637,24 @@ class SettingsUpdate(BaseModel):
             raise ValueError(message)
         return value
 
+    @field_validator("plex_token", "prowlarr_api_key")
+    @classmethod
+    def _validate_header_safe_credential(cls, value: str | None) -> str | None:
+        """Reject a header-unsafe credential at write time (the persistence bypass).
+
+        The write-time twin of ``SetupCompleteRequest._validate_header_safe_credential``
+        (see its docstring for the two failure modes -- a ``str(exc)`` credential
+        leak and an uncaught ``UnicodeEncodeError``/500 -- that a header-unsafe
+        ``plex_token`` / ``prowlarr_api_key`` triggers once an adapter sends it as a
+        header). ``None`` (leave unchanged) and the ``"***"`` redaction mask are both
+        header-safe and pass untouched, so the FE's mask round-trip and partial
+        updates are unaffected; only a genuinely header-unsafe NEW value is rejected
+        (422) before it is ever stored.
+        """
+        if value and header_value_error(value) is not None:
+            raise ValueError(HEADER_VALUE_MESSAGE)
+        return value
+
     @field_validator(*_LIBRARY_ROOT_FIELDS)
     @classmethod
     def _blank_root_clears_to_unset(cls, value: str | None) -> str | None:
@@ -745,6 +788,21 @@ class CreateRequestBody(BaseModel):
     # ``_season_numbers``. A repeat POST with a NEW season list GROWS the tracked
     # set rather than being dropped by the request-level dedup.
     seasons: list[int] | None = None
+    # Re-acquire (issue #131): force a fresh grabbable request even when the movie
+    # is still reported present in Plex (its file was deleted/replaced out-of-band),
+    # instead of the normal already-in-library short-circuit that returns a
+    # terminal 'available' row with no grab. MOVIE ONLY -- ignored for a tv
+    # request (per-season re-acquisition is the report-issue verb's job). Same
+    # authZ as any create (``require_api_key``); every dedup/ownership guard still
+    # applies (see ``request_service.create_request_result``).
+    #
+    # Modeled as an optional tri-state (``bool | None``), never omitted/None
+    # meaning "normal create", NOT a bare ``bool = False`` -- mirrors ``seasons``'
+    # own None-default convention. A bare boolean default emits a JSON-schema
+    # ``default`` that openapi-typescript then treats as a REQUIRED client field
+    # (see ``CreateRequestBody`` in the generated ``schema.d.ts``), which would
+    # break every existing caller that omits this field entirely.
+    force: bool | None = None
 
 
 class ReportIssueBody(BaseModel):

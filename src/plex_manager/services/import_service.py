@@ -281,7 +281,10 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     to resolve, so a re-import never silently overwrites someone else's file.
     """
     os.makedirs(dst.parent, exist_ok=True)
-    if dst.exists():
+    # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
+    # absent, which would let hardlink_or_copy's rename fallback silently replace
+    # the symlink entry (GHSA-8fj8) instead of surfacing the conflict below.
+    if os.path.lexists(os.fspath(dst)):
         if _same_file_content(src, dst):
             return False  # already fully imported here — idempotent skip; not ours
         # A differently-sized file is already at the destination: a user's
@@ -294,10 +297,10 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     except FileExistsError:
         # Lost a placement race: a concurrent import (the reconcile loop racing the
         # operator's POST /queue/{id}/import retry) created ``dst`` between the
-        # exists() check above and this link. Same content (same size) is an
+        # lexists check above and this link. Same content (same size) is an
         # idempotent win for the other attempt, NOT a failure to block on; a
         # different size is a genuine conflict, surfaced like the pre-existing case.
-        if dst.exists() and _same_file_content(src, dst):
+        if os.path.lexists(os.fspath(dst)) and _same_file_content(src, dst):
             return False  # the race winner's file — not ours to roll back
         raise FileExistsError(f"destination already exists with different content: {dst}") from None
     return True  # we created dst; a later failure may roll it back
@@ -317,7 +320,14 @@ def _same_file_content(src: str, dst: Path) -> bool:
     with contextlib.suppress(OSError):
         if os.path.samefile(src, dst):
             return True
-    if dst.stat().st_size != os.path.getsize(src):
+    try:
+        dst_size = dst.stat().st_size
+    except OSError:
+        # A dangling symlink (or dst vanished between the lexists check and here)
+        # is NOT our identical file -- never raise FileNotFoundError out of a
+        # content check; the caller surfaces this as an honest conflict instead.
+        return False
+    if dst_size != os.path.getsize(src):
         return False
     return _file_digest(src) == _file_digest(dst)
 

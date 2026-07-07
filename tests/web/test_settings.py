@@ -110,6 +110,51 @@ def test_settings_update_rejects_target_above_threshold() -> None:
     SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=70.0)
 
 
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+def test_settings_update_rejects_header_unsafe_credential(field: str) -> None:
+    # A header-sink credential (plex_token -> X-Plex-Token, prowlarr_api_key ->
+    # X-Api-Key) that cannot ride its HTTP header is rejected at write time, before
+    # it can be stored and then leaked via httpx's str(exc) / crash the grab loop
+    # when an adapter sends it. CR/LF/NUL (a str(exc) leak) and non-ASCII (an
+    # uncaught UnicodeEncodeError/500) are the two closed failure modes.
+    from pydantic import ValidationError
+
+    for bad in ("key\r\ninjected", "key\x00nul", "kéy-nonascii"):
+        with pytest.raises(ValidationError):
+            SettingsUpdate.model_validate({field: bad})
+    # Header-safe inputs pass untouched so partial updates and the FE mask
+    # round-trip are unaffected: a plain ASCII key, the "***" redaction mask, and
+    # an absent field are all accepted.
+    SettingsUpdate.model_validate({field: "plain-ascii-key"})
+    SettingsUpdate.model_validate({field: "***"})
+    SettingsUpdate.model_validate({})
+
+
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+async def test_put_settings_422_never_echoes_the_submitted_credential(
+    client: httpx.AsyncClient, seed: SeedFn, field: str
+) -> None:
+    # north star #3: a header-unsafe credential submitted to PUT /settings is
+    # rejected (422), but the 422 body must NEVER echo the submitted value.
+    # FastAPI's DEFAULT handler returns the raw ``input``; the secret-redacting
+    # RequestValidationError handler scrubs it. Assert on the RAW response text so a
+    # leak anywhere in the body (input/ctx/msg) is caught.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    sentinel = "leak-SENTINEL-\r\nZZZINJECT"
+
+    response = await client.put(
+        "/api/v1/settings", json={field: sentinel}, headers={"X-Api-Key": _API_KEY}
+    )
+
+    assert response.status_code == 422
+    assert "SENTINEL" not in response.text
+    assert "ZZZINJECT" not in response.text
+    # The {"detail": [...]} envelope shape is preserved for the typed client.
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert any(err.get("loc", [])[-1:] == [field] for err in detail)
+
+
 async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})

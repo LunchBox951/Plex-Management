@@ -1128,6 +1128,39 @@ def test_resolve_content_prefers_live_save_path_name_over_library_breadcrumb(
     assert resolved.save_path == str(downloads)
 
 
+def test_place_file_refuses_dangling_symlink_destination(tmp_path: Path) -> None:
+    """GHSA-8fj8: a dangling symlink at dst reads as "absent" under ``exists()``
+    -- ``_place_file`` must refuse it (lexists semantics) as an honest conflict,
+    never silently publish through/over it."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "dst.mkv"
+    target = tmp_path / "gone.mkv"  # never created
+    dst.symlink_to(target)
+
+    with pytest.raises(FileExistsError):
+        import_service._place_file(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(), str(src), dst
+        )
+
+    assert dst.is_symlink()
+    assert not target.exists()
+
+
+def test_same_file_content_false_for_dangling_symlink(tmp_path: Path) -> None:
+    """``_same_file_content`` must not raise ``FileNotFoundError`` on a dangling
+    symlink dst -- it is honestly NOT the same content as a real src file."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    dst.symlink_to(tmp_path / "gone.mkv")
+
+    assert (
+        import_service._same_file_content(str(src), dst)  # pyright: ignore[reportPrivateUsage]
+        is False
+    )
+
+
 async def test_import_is_idempotent_on_an_already_imported_row(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

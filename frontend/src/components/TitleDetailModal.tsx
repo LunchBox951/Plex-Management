@@ -250,6 +250,9 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const [reportReason, setReportReason] = useState<ReportReason>('bad_quality')
   // The confirm dialog for cancelling a not-yet-imported request (ADR-0014).
   const [cancelFor, setCancelFor] = useState<{ requestId: number } | null>(null)
+  // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
+  // fresh grabbable request even though the title still reads present in Plex.
+  const [reacquireOpen, setReacquireOpen] = useState(false)
 
   // Reset the per-title flow whenever a different title is opened. Keyed on
   // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
@@ -271,6 +274,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     setReportIssueFor(null)
     setReportReason('bad_quality')
     setCancelFor(null)
+    setReacquireOpen(false)
   }, [titleKey])
 
   // The live request for this exact title (media_type + tmdb_id), if any. /requests
@@ -484,6 +488,38 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     }
   }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin])
 
+  // Re-acquire (issue #131), movie-only: force-create a fresh grabbable request
+  // even though Plex still reports the title present (its file was deleted or
+  // replaced out-of-band). Modeled on `onRequest`, but force-flagged and
+  // season-free -- a movie request never carries `seasons`.
+  const onReacquire = useCallback(async () => {
+    if (!title || title.media_type !== 'movie') return
+    const startedKey = `${title.media_type}:${title.tmdb_id}`
+    const titleName = title.title
+    try {
+      const created = await createRequest.mutateAsync({
+        tmdb_id: title.tmdb_id,
+        media_type: 'movie',
+        force: true,
+      })
+      if (latestTitleKey.current !== startedKey) return
+      setRequestId(created.id)
+      setCreatedSeasons(created.seasons ?? null)
+      const grabbable = isSeasonGrabbable(created, null)
+      setCreatedGrabbable(grabbable)
+      setReacquireOpen(false)
+      toast({ title: `Re-acquiring ${titleName}`, intent: 'success' })
+      if (grabbable && isAdmin) {
+        await runPreview(created.id, null)
+      } else {
+        setPreview(null)
+      }
+    } catch (error) {
+      if (latestTitleKey.current !== startedKey) return
+      toast({ title: 'Re-acquire failed', description: asApiError(error).message, intent: 'error' })
+    }
+  }, [title, createRequest, toast, runPreview, isAdmin])
+
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
       // Need a grabbable (non-terminal) request; never fire a second grab in flight.
@@ -613,6 +649,14 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
 
+  // Owned but no visible request (issue #131): the title is present in Plex per
+  // the discovery projection, yet there is no tracked request row at all -- Plex
+  // hasn't rescanned since the operator deleted the file out-of-band. "Request"
+  // would be misleading here (it just short-circuits back to an `available` row
+  // with no grab); Re-acquire is the honest verb. Movie-only, since a tv title's
+  // per-season presence is surfaced through its own tracked seasons instead.
+  const presenceOnly = title.media_type === 'movie' && title.library_state === 'available'
+
   // tv only: before any request exists, let the operator name a single season (and
   // whether to track just it or the whole series); once seasons are tracked,
   // enumerate them in a picker that also drives which one is searched/grabbed/shown.
@@ -716,6 +760,17 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       </Button>
     ) : null
 
+  // Re-acquire (issue #131), movie-only: the title reads present in Plex but its
+  // file was deleted/replaced out-of-band. Opens a confirm dialog, then
+  // force-creates a fresh grabbable request (see `onReacquire`). NOT admin-gated:
+  // POST /requests (force included) is at the same authZ bar as any create.
+  const reacquireButton =
+    title.media_type === 'movie' ? (
+      <Button variant="secondary" onClick={() => setReacquireOpen(true)}>
+        Re-acquire
+      </Button>
+    ) : null
+
   // Cancel the whole request (ADR-0014) — only while it is genuinely not-yet-imported.
   // Gated on the PARENT request status (for tv the rollup), so a partially_available
   // show never offers a wholesale cancel that the backend would 409.
@@ -768,9 +823,16 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     case 'none':
       actionZone = (
         <div className="flex flex-wrap gap-2">
-          <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
-            Request
-          </Button>
+          {/* Owned movie with no tracked request (issue #131): "Request" would just
+              short-circuit back to a terminal `available` row with no grab, so the
+              honest verb here is Re-acquire (force-create). */}
+          {presenceOnly ? (
+            reacquireButton
+          ) : (
+            <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
+              Request
+            </Button>
+          )}
           {/* Preview drives admin-only /search-preview: request-only for shared users. */}
           {isAdmin ? (
             <Button
@@ -879,8 +941,15 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
               ✓ In your library
             </span>
           </div>
-          {reportIssueButton ? (
-            <div className="flex flex-wrap gap-2">{reportIssueButton}</div>
+          {/* Re-acquire (issue #131) sits beside report-issue for a movie: a shared
+              user sees only Re-acquire (report-issue is admin-only), an admin sees
+              both; tv shows only report-issue (reacquireButton is null for tv —
+              per-season re-acquisition is the report-issue verb's job). */}
+          {reportIssueButton || reacquireButton ? (
+            <div className="flex flex-wrap gap-2">
+              {reacquireButton}
+              {reportIssueButton}
+            </div>
           ) : null}
         </div>
       )
@@ -1075,6 +1144,33 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             </Button>
             <Button variant="danger" loading={cancelRequest.isPending} onClick={() => void runCancel()}>
               Cancel request
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
+
+      {/* Re-acquire confirm (issue #131): the only guard against the accepted
+          duplicate-on-wrong-assertion tradeoff — the operator asserts the file is
+          really gone before we force a fresh grab. */}
+      {reacquireOpen ? (
+        <Dialog
+          open
+          onOpenChange={(next) => {
+            if (!next) setReacquireOpen(false)
+          }}
+          title="Re-acquire this title?"
+          description="Re-download this title because its file is missing or was replaced. This makes a fresh request and searches for it again."
+        >
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setReacquireOpen(false)}
+              disabled={createRequest.isPending}
+            >
+              Cancel
+            </Button>
+            <Button loading={createRequest.isPending} onClick={() => void onReacquire()}>
+              Re-acquire
             </Button>
           </div>
         </Dialog>
