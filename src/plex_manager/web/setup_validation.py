@@ -30,6 +30,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
+from plex_manager.services.path_visibility import remap_to_visible
 from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
 from plex_manager.web.url_validation import url_shape_error
@@ -100,7 +101,10 @@ def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
 
 
 def library_options(
-    sections: Sequence[LibrarySection], *, probe_writable: bool = True
+    sections: Sequence[LibrarySection],
+    *,
+    probe_writable: bool = True,
+    suggest_mounts: Sequence[str] = (),
 ) -> list[PlexLibraryOption]:
     """Map Plex's movie AND show sections to pickable library folders + writability.
 
@@ -117,18 +121,51 @@ def library_options(
     turn this into a pre-auth local-FS existence/writability oracle. With it False
     we report ``writable=None`` (UNKNOWN) — honest, never a faked bool — and never
     call ``_is_writable`` / ``os.access`` on an attacker-chosen path.
+
+    ``suggest_mounts`` (default ``()``, no remap attempted) is the set of KNOWN,
+    app-owned LIBRARY mounts (:data:`~plex_manager.services.path_visibility.
+    KNOWN_LIBRARY_MOUNTS`) to suffix-match a Plex-reported HOST path against (issue
+    #132) -- library locations only ever remap under ``/media``, never
+    ``/downloads``. ``probe_original`` mirrors ``probe_writable`` -- the SAME
+    pre-auth-oracle guard: pre-init (``probe_writable=False``) never stats the
+    raw, caller-supplied path, only candidate suffixes under the app's OWN
+    mounts; post-init (``probe_writable=True``, the operator's own creds) may
+    stat the raw path first. ``allow_mount_root`` is on: a whole-media-root Plex
+    library (the bind SOURCE root, e.g. ``/srv/media`` -> ``/media``) maps to the
+    mount root itself, which the suffix-only match could never reach.
+
+    A location the remap can't resolve is offered with NO suggestion -- the raw
+    Plex path plus the wizard/Settings visibility hint. Deliberately no guessing
+    (PR #147 round 3, maintainer decision): a short-lived "low-confidence
+    mount-root" suggestion was removed because a child section like
+    ``/srv/plex-data/Movies`` would misroute to the bare mount root; the rare
+    arbitrary-bind-root topology is served by manual entry instead.
     """
-    return [
-        PlexLibraryOption(
-            section_key=section.key,
-            title=section.title,
-            path=path,
-            section_type=_section_type(section.type),
-            writable=_is_writable(path) if probe_writable else None,
-        )
-        for section in sections
-        for path in section.locations
-    ]
+    options: list[PlexLibraryOption] = []
+    for section in sections:
+        for path in section.locations:
+            suggested = (
+                remap_to_visible(
+                    path,
+                    suggest_mounts,
+                    probe_original=probe_writable,
+                    allow_mount_root=True,
+                )
+                if suggest_mounts
+                else None
+            )
+            effective = suggested or path
+            options.append(
+                PlexLibraryOption(
+                    section_key=section.key,
+                    title=section.title,
+                    path=path,
+                    section_type=_section_type(section.type),
+                    writable=_is_writable(effective) if probe_writable else None,
+                    suggested_path=suggested if (suggested and suggested != path) else None,
+                )
+            )
+    return options
 
 
 def assert_admin_owns_server(resources: Sequence[PlexResource], machine_identifier: str) -> None:
@@ -197,6 +234,7 @@ async def validate_plex(
     token: str,
     *,
     identity_client: PlexTvClient | None = None,
+    suggest_mounts: Sequence[str] = (),
 ) -> ServiceValidateResponse:
     """Validate Plex + token AND return the movie/tv library folders to pick from.
 
@@ -219,6 +257,13 @@ async def validate_plex(
     generic ``ok=False`` — an unreachable candidate is an honest, retryable upstream
     state. Left ``None`` (the health-card path) skips the probe entirely, so that
     path issues no extra request and ``machine_identifier`` stays ``None``.
+
+    ``suggest_mounts`` (default ``()``) is forwarded to :func:`library_options` for
+    each reported library location — the setup wizard passes the known container
+    mounts so a HOST-shaped Plex location comes back with a container-visible
+    ``suggested_path``; :func:`~plex_manager.services.health_service._check_plex`
+    calls this with no ``suggest_mounts``, so the ~15s health poll adds no extra
+    filesystem probes.
     """
     rejection = _require_http_url(url)
     if rejection is not None:
@@ -242,7 +287,7 @@ async def validate_plex(
     # caller-supplied Plex server, so never touch the local filesystem here (no
     # pre-auth existence/writability oracle). Writability is reported UNKNOWN
     # (None); the authenticated Settings picker fills in the real signal later.
-    libraries = library_options(sections, probe_writable=False)
+    libraries = library_options(sections, probe_writable=False, suggest_mounts=suggest_mounts)
     if not libraries:
         # Connectivity + token are fine, but an install with NEITHER a Movie NOR a
         # TV library cannot import anything (every scan would raise "no Plex

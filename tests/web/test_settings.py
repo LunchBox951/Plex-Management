@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.eviction import EvictionCandidate, select_evictions
 from plex_manager.models import AuthSession, Setting, User
+from plex_manager.services import path_visibility
 from plex_manager.web.deps import (
     AUTO_GRAB_ENABLED_DEFAULT,
     DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
@@ -123,20 +126,86 @@ async def test_get_starts_with_tv_root_unset(client: httpx.AsyncClient, seed: Se
 
 
 async def test_put_tv_root_round_trips_independently_of_movies_root(
-    client: httpx.AsyncClient, seed: SeedFn
+    client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
 ) -> None:
     # tv_root is a plain (non-secret) path, just like movies_root, and settable
     # without touching movies_root -- the two roots are independently optional.
     await seed(initialized=True, app_api_key=_API_KEY)
+    root = tmp_path / "tv"
+    root.mkdir()
     put = await client.put(
-        "/api/v1/settings", json={"tv_root": "/library/tv"}, headers={"X-Api-Key": _API_KEY}
+        "/api/v1/settings", json={"tv_root": str(root)}, headers={"X-Api-Key": _API_KEY}
     )
     assert put.status_code == 200
-    assert put.json()["tv_root"] == "/library/tv"
+    assert put.json()["tv_root"] == str(root)
     assert put.json()["movies_root"] is None
 
     got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
-    assert got["tv_root"] == "/library/tv"
+    assert got["tv_root"] == str(root)
+
+
+async def test_put_root_not_visible_is_422(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "/nope"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 422
+    assert put.json()["detail"] == "library_root_unreachable"
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.json()["movies_root"] is None  # nothing was written
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") is None
+
+
+async def test_put_remaps_host_root_to_container_path(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    # Library roots are remapped under the LIBRARY mounts only (never /downloads).
+    # tmp dirs are never mount points, so relax the live-mount gate (the test seam).
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "/definitely-not-a-real-host-path/Media/Movies"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    assert put.json()["movies_root"] == str(mount / "Movies")
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.json()["movies_root"] == str(mount / "Movies")
+
+
+async def test_put_blank_root_clears_without_probing(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Whitespace normalizes to "" (SettingsUpdate._blank_root_clears_to_unset) BEFORE
+    # the root-visibility gate ever runs -- a clear must never probe or 422.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "   "},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    assert put.json()["movies_root"] == ""
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == ""
+        assert await get_movies_root_optional(session) is None
 
 
 async def test_put_round_trips_and_redacts(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -546,7 +615,11 @@ async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
 
 
 async def test_put_non_plex_fields_keep_sessions_active(
-    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
 ) -> None:
     """A PUT that touches no Plex identity field is NOT a repoint: nobody is
     signed out — and no live /identity probe fires — over a library-root or
@@ -555,10 +628,12 @@ async def test_put_non_plex_fields_keep_sessions_active(
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     cookies, csrf = await _admin_session_cookies(app, plex_id=9203, tag="non-plex")
     await _use_transport(app, _no_probe_transport())
+    root = tmp_path / "tv"
+    root.mkdir()
 
     put = await client.put(
         "/api/v1/settings",
-        json={"tv_root": "/library/tv", "prowlarr_url": "http://prowlarr.local:9696"},
+        json={"tv_root": str(root), "prowlarr_url": "http://prowlarr.local:9696"},
         cookies=cookies,
         headers=csrf,
     )
@@ -906,46 +981,56 @@ async def test_get_starts_with_anime_roots_unset(client: httpx.AsyncClient, seed
 
 
 async def test_put_anime_roots_round_trip_independently_of_movies_and_tv_root(
-    client: httpx.AsyncClient, seed: SeedFn
+    client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
+    anime_movies = tmp_path / "anime-movies"
+    anime_movies.mkdir()
+    anime_tv = tmp_path / "anime-tv"
+    anime_tv.mkdir()
     put = await client.put(
         "/api/v1/settings",
-        json={"anime_movie_root": "/library/anime-movies", "anime_tv_root": "/library/anime-tv"},
+        json={"anime_movie_root": str(anime_movies), "anime_tv_root": str(anime_tv)},
         headers={"X-Api-Key": _API_KEY},
     )
     assert put.status_code == 200
     body = put.json()
-    assert body["anime_movie_root"] == "/library/anime-movies"
-    assert body["anime_tv_root"] == "/library/anime-tv"
+    assert body["anime_movie_root"] == str(anime_movies)
+    assert body["anime_tv_root"] == str(anime_tv)
     # Untouched by the anime-only PUT.
     assert body["movies_root"] is None
     assert body["tv_root"] is None
 
     got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
-    assert got["anime_movie_root"] == "/library/anime-movies"
-    assert got["anime_tv_root"] == "/library/anime-tv"
+    assert got["anime_movie_root"] == str(anime_movies)
+    assert got["anime_tv_root"] == str(anime_tv)
 
 
 async def test_put_partial_anime_root_only_leaves_the_other_and_normal_roots_untouched(
-    client: httpx.AsyncClient, seed: SeedFn
+    client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_movies = tmp_path / "anime-movies"
+    anime_movies.mkdir()
+    anime_tv = tmp_path / "anime-tv"
+    anime_tv.mkdir()
     await client.put(
         "/api/v1/settings",
-        json={"movies_root": "/library/movies", "anime_movie_root": "/library/anime-movies"},
+        json={"movies_root": str(movies_root), "anime_movie_root": str(anime_movies)},
         headers={"X-Api-Key": _API_KEY},
     )
     put = await client.put(
         "/api/v1/settings",
-        json={"anime_tv_root": "/library/anime-tv"},
+        json={"anime_tv_root": str(anime_tv)},
         headers={"X-Api-Key": _API_KEY},
     )
     assert put.status_code == 200
     body = put.json()
-    assert body["anime_tv_root"] == "/library/anime-tv"
-    assert body["anime_movie_root"] == "/library/anime-movies"  # untouched by this partial PUT
-    assert body["movies_root"] == "/library/movies"  # untouched by this partial PUT
+    assert body["anime_tv_root"] == str(anime_tv)
+    assert body["anime_movie_root"] == str(anime_movies)  # untouched by this partial PUT
+    assert body["movies_root"] == str(movies_root)  # untouched by this partial PUT
 
 
 async def test_empty_string_anime_root_reads_back_as_unset(

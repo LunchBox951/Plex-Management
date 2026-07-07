@@ -10,6 +10,7 @@ admin's plex.tv resources. Every probe is driven through the new admin-session a
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibrarySection
+from plex_manager.services import path_visibility
 from plex_manager.web import setup_validation
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
@@ -119,6 +121,125 @@ def test_library_options_probe_flag(tmp_path: Path) -> None:
     # never a fabricated bool — even for a path that does not exist.
     unprobed = library_options([writable, missing], probe_writable=False)
     assert [o.writable for o in unprobed] == [None, None]
+
+
+def test_library_options_suggests_a_container_remap_for_a_host_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    # tmp dirs are never mount points: relax the live-mount gate (the test seam).
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    host_section = LibrarySection(
+        key="1", title="Movies", type="movie", locations=("/host/Media/Movies",)
+    )
+    options = library_options([host_section], suggest_mounts=(str(mount),))
+    assert options[0].path == "/host/Media/Movies"  # the RAW Plex-reported path
+    assert options[0].suggested_path == str(mount / "Movies")
+
+
+def test_library_options_no_suggestion_when_the_path_already_resolves(tmp_path: Path) -> None:
+    already_visible = LibrarySection(
+        key="1", title="Movies", type="movie", locations=(str(tmp_path),)
+    )
+    options = library_options([already_visible], suggest_mounts=("/media",))
+    assert options[0].suggested_path is None
+
+
+def test_library_options_no_guess_for_an_unresolvable_bind_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 regression (maintainer decision): an unresolvable Plex location
+    gets NO suggestion of any kind -- the short-lived low-confidence mount-root
+    guess was removed because a child section like ``/srv/plex-data/Movies``
+    would misroute to the bare mount root. Both the whole-bind-root and the
+    child-section shapes stay raw; the operator types a container path manually
+    (plus the wizard's visibility hint) for exotic bind topologies."""
+    mount = tmp_path / "media"
+    mount.mkdir()
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
+    sections = [
+        LibrarySection(key="1", title="Movies", type="movie", locations=("/srv/plex-data",)),
+        LibrarySection(key="2", title="Kids", type="movie", locations=("/srv/plex-data/Movies",)),
+    ]
+    options = library_options(sections, probe_writable=False, suggest_mounts=(str(mount),))
+    assert [o.suggested_path for o in options] == [None, None]
+    # And the schema carries no other suggestion field to smuggle a guess through.
+    assert "low_confidence_suggested_path" not in type(options[0]).model_fields
+
+
+def test_library_options_under_mount_location_is_never_suffix_probed_deeper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 regression: a Plex location ALREADY under the app's own mount
+    (Docker setups where Plex sees the container paths) must be kept as-is --
+    never suffix-remapped DEEPER onto a nested twin like ``/media/media/Movies``
+    (which Plex does not watch), even pre-init where the raw-path probe is off
+    (probing our OWN mounts is not a remote-server oracle)."""
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    # The nesting trap the longest-suffix-first search would otherwise pick.
+    (mount / "media" / "Movies").mkdir(parents=True)
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
+    section = LibrarySection(
+        key="1", title="Movies", type="movie", locations=(str(mount / "Movies"),)
+    )
+    options = library_options([section], probe_writable=False, suggest_mounts=(str(mount),))
+    # As-is: no suggestion needed, and emphatically not the nested trap.
+    assert options[0].suggested_path is None
+
+
+def test_library_options_prefers_the_mounted_twin_over_a_phantom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 regression: a pre-fix install can have a PHANTOM host-shaped tree
+    inside this container (the old importer ``os.makedirs``-ed e.g.
+    ``/home/Media/Movies``) beside the real bind at ``/media/Movies``. The picker
+    must suggest the MOUNTED twin, not treat the phantom as authoritative."""
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    phantom = tmp_path / "phantom" / "Media" / "Movies"
+    phantom.mkdir(parents=True)
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)  # tmp-dir mount seam
+    section = LibrarySection(key="1", title="Movies", type="movie", locations=(str(phantom),))
+    # probe_writable=True (the authenticated Settings picker): the raw path IS
+    # probed and exists -- exactly the shape where the phantom used to win.
+    options = library_options([section], probe_writable=True, suggest_mounts=(str(mount),))
+    assert options[0].suggested_path == str(mount / "Movies")
+
+
+def test_library_options_suggestion_probe_original_mirrors_probe_writable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-init (probe_writable=False) must never stat the RAW, caller-supplied
+    path even to compute a suggestion -- the same pre-auth-oracle guard
+    ``probe_writable`` already enforces for writability. Ties the wiring
+    (``probe_original=probe_writable``, and ``allow_mount_root`` always on for a
+    library location), not ``remap_to_visible``'s own behavior (covered by
+    ``tests/services/test_path_visibility.py``)."""
+    seen: list[bool] = []
+    mount_root_flags: list[bool] = []
+
+    def spy(  # type: ignore[no-untyped-def]
+        path: str,
+        mounts: object,
+        *,
+        predicate: object = None,
+        probe_original: bool = True,
+        allow_mount_root: bool = False,
+    ):
+        seen.append(probe_original)
+        mount_root_flags.append(allow_mount_root)
+        return None
+
+    monkeypatch.setattr(setup_validation, "remap_to_visible", spy)
+    section = LibrarySection(key="1", title="Movies", type="movie", locations=("/some/path",))
+
+    library_options([section], probe_writable=False, suggest_mounts=("/media",))
+    library_options([section], probe_writable=True, suggest_mounts=("/media",))
+
+    assert seen == [False, True]
+    assert mount_root_flags == [True, True]  # a whole-media-root library can map to the mount root
 
 
 # --------------------------------------------------------------------------- #
@@ -764,15 +885,66 @@ async def test_validate_plex_does_not_probe_filesystem(
     assert [lib["writable"] for lib in body["libraries"]] == [None, None]
 
 
+async def test_validate_plex_attaches_a_container_suggestion_for_a_host_location(
+    admin_client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Plex section reporting a HOST-namespace location gets a container-visible
+    ``suggested_path`` (issue #132), computed WITHOUT ever stat-ing the raw,
+    caller-supplied path -- pre-init stays a non-oracle (writable stays UNKNOWN)."""
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    # Plex library locations are remapped under the LIBRARY mounts only. tmp dirs
+    # are never mount points, so relax the live-mount gate (the test seam).
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    probed: list[str] = []
+
+    def spy(path: str) -> bool:
+        probed.append(path)
+        return True
+
+    monkeypatch.setattr(setup_validation, "_is_writable", spy)
+    host_section = {**_MOVIE_SECTION, "Location": [{"path": "/home/Media/Movies"}]}
+    await _use_transport(app, _plex_probe_handler(sections=[host_section]))
+
+    response = await admin_client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://plex.local:32400"},
+        headers=_CSRF_HEADERS,
+    )
+
+    body = response.json()
+    assert body["ok"] is True
+    library = body["libraries"][0]
+    assert library["path"] == "/home/Media/Movies"  # the raw Plex-reported path
+    assert library["suggested_path"] == str(mount / "Movies")
+    assert library["writable"] is None  # pre-init never probes writability
+    assert probed == []  # nor was the raw host path ever stat-ed for the option
+
+
 # --------------------------------------------------------------------------- #
 # Settings picker (authenticated) — probes writability, unlike the pre-init step
 # --------------------------------------------------------------------------- #
 async def test_plex_libraries_picker_probes_writability(
-    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The AUTHENTICATED Settings picker uses the operator's OWN stored Plex creds, so
     # the real writability signal is legitimate there and must still be probed — the
     # opposite of the pre-init validate/plex step, which must not touch the filesystem.
+    #
+    # No library mounts: this test asserts the EXACT response JSON, so the remap/
+    # suggestion machinery must be inert regardless of the host — the default
+    # ("/media",) made the expected low_confidence field depend on whether the test
+    # host really has a /media mount (the tests-py314 CI split; a run inside the
+    # actual container would differ too).
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", ())
     await seed(initialized=True, app_api_key=_API_KEY)
     movies_section = LibrarySection(
         key="1", title="Movies", type="movie", locations=(str(tmp_path),)
@@ -790,6 +962,7 @@ async def test_plex_libraries_picker_probes_writability(
             "path": str(tmp_path),
             "section_type": "movie",
             "writable": True,
+            "suggested_path": None,
         },
         {
             "section_key": "2",
@@ -797,5 +970,6 @@ async def test_plex_libraries_picker_probes_writability(
             "path": "/no/tv",
             "section_type": "tv",
             "writable": False,
+            "suggested_path": None,
         },
     ]

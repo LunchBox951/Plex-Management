@@ -34,6 +34,12 @@ const DETAIL_MESSAGES: Record<string, string> = {
   removal_in_progress:
     'A removal for this download is already in progress — retry after it completes.',
   blocklist_entry_not_found: 'That blocklist entry no longer exists.',
+  media_root_unavailable:
+    'The library folder for this title isn’t reachable. Make sure it’s mounted and visible to Plex Manager, then try again from Settings.',
+  library_root_unreachable:
+    'That library folder isn’t visible to Plex Manager. Pick a folder under a mounted volume (usually /media), or fix the container’s volume mounts.',
+  not_reportable: 'This title can’t be reported right now — it isn’t imported or available yet.',
+  active_duplicate: 'A newer request for this title already exists. Act on that one instead.',
 
   // --- Plex sign-in / setup / access (auth error-honesty layer) ---
   plex_tv_unreachable_browser:

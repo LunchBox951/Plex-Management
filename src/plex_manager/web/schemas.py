@@ -187,6 +187,22 @@ class PlexLibraryOption(BaseModel):
     # is set only by the authenticated Settings picker, where the operator's own
     # stored creds make the probe legitimate.
     writable: bool | None = None
+    # A container-visible remap of ``path`` (see ``services.path_visibility``) when
+    # ``path`` is a HOST-namespace location this server can't see under its own
+    # mounts -- e.g. Plex reports ``/home/Media/Movies`` but this container only
+    # sees ``/media/Movies``. ``None`` when ``path`` already resolves here, or no
+    # remap exists. The picker UIs prefer this as the option's STORED value, so
+    # selecting it round-trips a path the write-time gate (setup/settings) accepts
+    # without a second remap.
+    suggested_path: str | None = None
+    # NOTE (PR #147 round 3, maintainer decision): a short-lived
+    # ``low_confidence_suggested_path`` mount-root GUESS briefly lived here within
+    # this PR and was removed before release -- an unresolvable Plex location must
+    # never be dressed up as a pickable ``/media``, even flagged low-confidence (a
+    # child section like ``/srv/plex-data/Movies`` would misroute to the bare mount
+    # root). The rare arbitrary-bind-root topology is served by manual entry plus
+    # the wizard's visibility hint instead. The field never shipped in a release,
+    # so removing it breaks no released client.
 
 
 ProbeStatusField = Literal["ok", "unreachable"]

@@ -77,3 +77,22 @@ export type EvictResponse = Schemas['EvictResponse']
 
 /** `media_type` is a free string in the contract; the UI only ever sets these. */
 export type MediaType = 'movie' | 'tv'
+
+/**
+ * The value a library-root picker `<option>` stores when selected: the confident
+ * container remap (`suggested_path`) when the backend resolved one, else the raw
+ * Plex path. Deliberately nothing else — the backend offers no guesses (an
+ * unresolvable location keeps its raw path; the operator types a container path
+ * manually for exotic bind topologies), so the UI never silently rewrites.
+ */
+export function libraryOptionValue(lib: PlexLibraryOption): string {
+  return lib.suggested_path ?? lib.path
+}
+
+/** The trailing " · in-container: …" note for a library-root `<option>`. */
+export function libraryOptionNote(lib: PlexLibraryOption): string {
+  if (lib.suggested_path && lib.suggested_path !== lib.path) {
+    return ` · in-container: ${lib.suggested_path}`
+  }
+  return ''
+}

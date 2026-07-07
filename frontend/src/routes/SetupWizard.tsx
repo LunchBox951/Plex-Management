@@ -7,6 +7,7 @@ import {
   useValidateService,
 } from '../api/hooks'
 import type { PlexLibraryOption, SetupCompleteRequest } from '../api/types'
+import { libraryOptionNote, libraryOptionValue } from '../api/types'
 import { clearSetupToken, getSetupToken, setSetupToken } from '../lib/apiKey'
 import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { cn } from '../lib/cn'
@@ -407,6 +408,11 @@ export function SetupWizard() {
         })}
       </div>
 
+      <p className="mt-4 text-xs text-faint">
+        Folders must be visible to <strong>this</strong> Plex Manager server. If it runs in
+        Docker, pick a path under a mounted volume (usually <code>/media/…</code>).
+      </p>
+
       <LibrarySection
         title="Library"
         blurb="Where imported movies are placed — pick a folder Plex already watches."
@@ -543,8 +549,13 @@ function RootPicker({
         >
           <option value="">{chooseLabel ?? 'Choose a library folder…'}</option>
           {libraries.map((lib) => (
-            <option key={`${lib.section_key}:${lib.path}`} value={lib.path} disabled={lib.writable === false}>
+            <option
+              key={`${lib.section_key}:${lib.path}`}
+              value={libraryOptionValue(lib)}
+              disabled={lib.writable === false}
+            >
               {lib.title} — {lib.path}
+              {libraryOptionNote(lib)}
               {lib.writable === false ? ' · not writable by the app' : ''}
             </option>
           ))}

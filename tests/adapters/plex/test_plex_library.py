@@ -607,6 +607,80 @@ async def test_trigger_scan_tv_raises_when_no_show_section_exists() -> None:
         await adapter.trigger_scan("/data/tv/anything", "tv")
 
 
+# Plex reports its section locations in the HOST namespace (``/srv/media/...``),
+# while the importer places into the CONTAINER-visible remap (``/media/...``).
+SECTIONS_HOST_NAMESPACE: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"path": "/srv/media/Movies"}],
+            },
+            {
+                "key": "4",
+                "title": "Movies 4K",
+                "type": "movie",
+                "Location": [{"path": "/mnt/other/Films"}],
+            },
+            {
+                "key": "2",
+                "title": "TV",
+                "type": "show",
+                "Location": [{"path": "/srv/media/TV"}],
+            },
+        ]
+    }
+}
+
+
+def _make_host_namespace_handler(record: list[tuple[str, str | None]]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS_HOST_NAMESPACE)
+        match = re.fullmatch(r"/library/sections/(\d+)/refresh", path)
+        if match:
+            record.append((match.group(1), request.url.params.get("path")))
+            return httpx.Response(200)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_trigger_scan_reverse_maps_a_remapped_container_path() -> None:
+    # The container path ``/media/Movies/Title (2020)`` sits under the container
+    # remap (``/media``) of the section's HOST location ``/srv/media/Movies``. A
+    # plain prefix check would miss and full-refresh every movie section; the
+    # reverse map re-anchors it as the HOST path ``/srv/media/Movies/Title (2020)``
+    # Plex actually knows, so ONLY the owning section gets a targeted partial scan.
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_host_namespace_handler(record), base_url="http://scan-remap:32400")
+    await adapter.trigger_scan("/media/Movies/Title (2020)", "movie")
+    assert record == [("1", "/srv/media/Movies/Title (2020)")]
+
+
+async def test_trigger_scan_reverse_maps_a_remapped_tv_season_path() -> None:
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_host_namespace_handler(record), base_url="http://scan-remap-tv:32400")
+    await adapter.trigger_scan("/media/TV/Some Show (2019)/Season 02", "tv")
+    assert record == [("2", "/srv/media/TV/Some Show (2019)/Season 02")]
+
+
+async def test_trigger_scan_full_refresh_when_container_path_shares_no_directory() -> None:
+    # A container path under a mount but sharing NO directory with any section
+    # location (e.g. a mount-root remap) has nothing to anchor on: honest full
+    # refresh of every movie section, never a wrong-path targeted no-op.
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_host_namespace_handler(record), base_url="http://scan-noanchor:32400")
+    await adapter.trigger_scan("/media/Unknown (2021)", "movie")
+    assert {key for key, _ in record} == {"1", "4"}
+    assert all(scan_path is None for _key, scan_path in record)  # full refresh: no path param
+
+
 # --------------------------------------------------------------------------- #
 # Error boundary — secrets never leak
 # --------------------------------------------------------------------------- #

@@ -52,6 +52,7 @@ from plex_manager.web.deps import (
     require_admin,
     require_api_key,
 )
+from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
     CreateRequestBody,
     ErrorDetail,
@@ -80,6 +81,33 @@ _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
     409: {"model": ErrorDetail, "description": "Already requested by another user"},
+}
+
+_REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {"model": ErrorDetail, "description": "Request or season not found"},
+    # This status code has TWO distinct producers, so BOTH shapes are documented
+    # via anyOf (the same pattern as setup/complete's 422 and PUT /settings): the
+    # string-detail ``HTTPException`` 409s (``not_reportable`` /
+    # ``active_duplicate`` -- ``ErrorDetail``) and the ``AppError`` 409
+    # (``media_root_unavailable`` -- an ``ErrorEnvelope`` whose message/hint/
+    # diagnostics carry the actionable broken-root guidance). Declaring only one
+    # model would make the generated TS client mis-model the other shape.
+    409: {
+        "description": (
+            "Not reportable in its current state, an active duplicate exists, or the "
+            "title's library folder isn't reachable from the app"
+        ),
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/ErrorDetail"},
+                        {"$ref": "#/components/schemas/ErrorEnvelope"},
+                    ]
+                }
+            }
+        },
+    },
 }
 
 
@@ -241,7 +269,7 @@ async def keep_forever_endpoint(
     return await _to_response(session, record)
 
 
-@router.post("/{request_id}/report-issue")
+@router.post("/{request_id}/report-issue", responses=_REPORT_ISSUE_RESPONSES)
 async def report_issue_endpoint(
     request_id: int,
     body: ReportIssueBody,
@@ -329,8 +357,14 @@ async def report_issue_endpoint(
             status_code=status.HTTP_409_CONFLICT, detail="active_duplicate"
         ) from exc
     except MediaRootUnavailableError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="media_root_unavailable"
+        raise AppError(
+            status_code=status.HTTP_409_CONFLICT,
+            code="media_root_unavailable",
+            message="The library folder for this title isn't reachable, so it can't be "
+            "re-requested safely.",
+            hint="Check the folder is mounted and visible to Plex Manager "
+            "(Settings → Library), then try again.",
+            diagnostics=({"root": exc.root_path} if exc.root_path else None),
         ) from exc
     return await _to_response(session, updated)
 

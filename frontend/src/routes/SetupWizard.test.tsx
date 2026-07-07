@@ -199,6 +199,28 @@ describe('SetupWizard — services (library roots + completion)', () => {
     expect(within(tvSelect).queryByText(/^Movies —/)).not.toBeInTheDocument()
   })
 
+  it('stores a container suggested_path as the option value (issue #132)', async () => {
+    // A Plex section reporting a HOST-namespace location gets a container-visible
+    // suggested_path (setup_validation.library_options); the picker must select
+    // THAT path, so completing setup sends the in-container path, not the raw one.
+    const hostLibrary: PlexLibraryOption = {
+      path: '/host/Media/Movies',
+      suggested_path: '/media/Movies',
+      section_key: '3',
+      section_type: 'movie',
+      title: 'Movies',
+      writable: null,
+    }
+    h.validatePlex.mockResolvedValue(plexVerifyOk([hostLibrary, tvLibrary]))
+    await reachServices()
+
+    const movieSelect = screen.getByLabelText('Movies library folder')
+    const option = within(movieSelect).getByText(
+      /Movies — \/host\/Media\/Movies · in-container: \/media\/Movies/,
+    ) as HTMLOptionElement
+    expect(option.value).toBe('/media/Movies')
+  })
+
   it('never requires a tv library folder to be chosen (tv_root is optional)', async () => {
     await reachServices()
     for (const button of screen.getAllByRole('button', { name: /test connection/i })) {

@@ -36,7 +36,7 @@ import logging
 import os
 import weakref
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
@@ -62,7 +62,7 @@ from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import purge_service, season_request_service
+from plex_manager.services import path_visibility, purge_service, season_request_service
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -130,27 +130,91 @@ def _ensure_under_save_path(save_path: str, candidate: str) -> str:
     return candidate
 
 
-def _resolve_content(status: DownloadStatus | None, download_path: str | None) -> str | None:
+class _ResolvedContent(NamedTuple):
+    """A download's resolved content path plus the save-path to ANCHOR its remap.
+
+    ``save_path`` is the torrent's live save directory when ``path`` came from the
+    client (``content_path``, or ``save_path`` + ``name``) -- the anchor
+    :func:`~plex_manager.services.path_visibility.remap_download_content` uses so a
+    HOST->container remap of ``path`` never shortens the file below its download
+    directory (which could match a stale, unrelated file). ``None`` when ``path`` is
+    the stored crash-resume breadcrumb (no live save path): nothing to anchor to, so
+    only the verbatim path is accepted, never a free suffix guess.
+    """
+
+    path: str
+    save_path: str | None
+
+
+def _resolve_content(
+    status: DownloadStatus | None, download_path: str | None
+) -> _ResolvedContent | None:
     """Resolve the absolute path to a torrent's completed content (file or dir).
 
     Prefer the client's ``content_path``; the adapter nulls it when it merely
     echoed ``save_path``, so fall back to the stored ``download_path`` and finally
     to ``save_path`` joined with the torrent name. ``save_path`` alone is never
     used — it can hold other torrents' files, which would scan the wrong tree.
+
+    Returns the resolved content path PAIRED with the anchoring ``save_path`` (the
+    torrent's live save directory) for the client-derived cases, or ``None`` for
+    the ``save_path`` anchor when the path is the stored breadcrumb -- see
+    :class:`_ResolvedContent`.
     """
     if status is not None and status.content_path:
         if status.save_path:
-            return _ensure_under_save_path(status.save_path, status.content_path)
+            return _ResolvedContent(
+                _ensure_under_save_path(status.save_path, status.content_path), status.save_path
+            )
         raise _UnsafeContentPathError("download client reported content path without save path")
     if status is not None and status.save_path and status.name:
         if os.path.isabs(status.name):
             raise _UnsafeContentPathError("download content path is outside download save path")
-        return _ensure_under_save_path(
-            status.save_path, os.path.join(status.save_path, status.name)
+        return _ResolvedContent(
+            _ensure_under_save_path(status.save_path, os.path.join(status.save_path, status.name)),
+            status.save_path,
         )
     if download_path:
-        return download_path
+        return _ResolvedContent(download_path, None)
     return None
+
+
+async def _resolve_visible_content(
+    qbt: DownloadClientPort, torrent_hash: str, resolved: _ResolvedContent
+) -> str | None:
+    """Container-visible path for a download's resolved content, or ``None``.
+
+    qBittorrent runs on the HOST, so ``resolved.path`` (from
+    :func:`_resolve_content`) can be a HOST-namespace path this container cannot
+    see (issue #133) -- e.g. ``/home/lunchbox/Downloads/.plex_manager/...`` when
+    the real, mounted location is ``/downloads/...``. Returns the path unchanged
+    when it already exists here (the same-namespace fast path -- no client call
+    needed); else ANCHORS the remap on ``resolved.save_path`` and demands PROOF:
+    the torrent's OWN file list is fetched from the client
+    (:meth:`~plex_manager.ports.download_client.DownloadClientPort.list_files`,
+    each entry a save-path-relative path + exact byte size) and the remapped
+    candidate must exhibit that payload at the exact relative location with the
+    exact size, under the DOWNLOAD mounts ONLY (never the library mounts). A
+    same-named stale file with a different size is an immediate disproof, and no
+    interpretation is ever accepted on bare existence -- an honest ``None``
+    (retryable "not visible / content mismatch" block), never a guess. See
+    :func:`~plex_manager.services.path_visibility.remap_download_content`. A
+    client failure fetching the file list raises the adapter's typed error and is
+    handled exactly like a ``get_status`` failure (retry next cycle / surfaced on
+    the operator's manual retry). Stat probes offload via ``asyncio.to_thread``.
+    """
+    if await asyncio.to_thread(os.path.exists, resolved.path):
+        return resolved.path
+    if not resolved.save_path:
+        # A stored crash-resume breadcrumb has no anchor to remap against: only
+        # the verbatim path counts (a free suffix search would reintroduce the
+        # stale-match hazard).
+        return None
+    files = await qbt.list_files(torrent_hash)
+    expected = [(f.name, f.size_bytes) for f in files]
+    return await asyncio.to_thread(
+        path_visibility.remap_download_content, resolved.path, resolved.save_path, expected
+    )
 
 
 def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, int, str]]:
@@ -548,11 +612,11 @@ async def _import_download_locked(
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
     try:
-        content = _resolve_content(status, row.download_path)
+        resolved = _resolve_content(status, row.download_path)
     except _UnsafeContentPathError as exc:
         await _block(session, download_repo, download_id, str(exc), request_id=request.id)
         return await download_repo.get_by_hash(torrent_hash)
-    if content is None:
+    if resolved is None:
         await _block(
             session,
             download_repo,
@@ -561,6 +625,21 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
+    visible_content = await _resolve_visible_content(qbt, torrent_hash, resolved)
+    if visible_content is None:
+        # qBittorrent runs on the host: an honest, retryable block instead of the
+        # misleading "no video file found" the empty _resolve_sources scan below
+        # would otherwise produce for a tree this container simply cannot see.
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "download path not visible inside the container "
+            f"(check volume mounts / content mismatch): {resolved.path}",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    content = visible_content
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
     if not sources:
         await _block(
@@ -614,6 +693,22 @@ async def _import_download_locked(
     ext = os.path.splitext(src)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
+
+    if not await asyncio.to_thread(os.path.isdir, effective_movies_root):
+        # A configured-but-invisible-in-this-container root (issue #132): never
+        # os.makedirs a phantom in-container tree (_place_file's mkdir below is
+        # unconditional) -- an honest, retryable block instead. Settings' write-time
+        # gate remaps a host-shaped root at save time; this catches a legacy stored
+        # root that predates that gate, and the operator's retry re-resolves fresh.
+        # Runs BEFORE begin_placement so a block here never registers a placement.
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"library root not visible inside the container: {effective_movies_root}",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
 
     # PURGE-vs-IMPORT ordering rule (round 9; stated identically at
     # purge_service's registry): FIRST-REGISTERED WINS, loser defers fast. If an
@@ -858,13 +953,13 @@ async def _import_tv_locked(
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
     try:
-        content = _resolve_content(status, download_path)
+        resolved = _resolve_content(status, download_path)
     except _UnsafeContentPathError as exc:
         await _block(
             session, download_repo, download_id, str(exc), request_id=request.id, season=season
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if content is None:
+    if resolved is None:
         await _block(
             session,
             download_repo,
@@ -874,6 +969,19 @@ async def _import_tv_locked(
             season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
+    visible_content = await _resolve_visible_content(qbt, torrent_hash, resolved)
+    if visible_content is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "download path not visible inside the container "
+            f"(check volume mounts / content mismatch): {resolved.path}",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    content = visible_content
 
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
     if not sources:
@@ -985,6 +1093,20 @@ async def _import_tv_locked(
                 relative,
                 current.video.relative_path,
             )
+
+    if not await asyncio.to_thread(os.path.isdir, tv_root):
+        # Mirrors the movie path's root-visibility guard: never os.makedirs a
+        # phantom in-container season tree -- an honest, retryable block instead.
+        # Runs BEFORE begin_placement so a block here never registers a placement.
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"library root not visible inside the container: {tv_root}",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
 
     season_dir = Path(tv_root) / plex_tv_season_relative_dir(request.title, request.year, season)
     # PURGE-vs-IMPORT ordering rule (round 9; stated identically at

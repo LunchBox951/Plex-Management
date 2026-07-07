@@ -18,11 +18,11 @@ describe('toApiError', () => {
   it('humanizes an unmapped detail code instead of surfacing raw snake_case', () => {
     // A pipeline code absent from DETAIL_MESSAGES (e.g. a correction/request verb)
     // must still read as a phrase — regression guard for the dropped fallback.
-    const err = toApiError({ detail: 'active_duplicate' }, 409)
+    const err = toApiError({ detail: 'some_future_pipeline_code' }, 409)
     // The raw code stays available for technical display...
-    expect(err.code).toBe('active_duplicate')
+    expect(err.code).toBe('some_future_pipeline_code')
     // ...while the message is the readable, humanized rendering.
-    expect(err.message).toBe('Active duplicate')
+    expect(err.message).toBe('Some future pipeline code')
   })
 
   it('maps the recovery-key rotation 409 to the honest refresh-and-retry copy', () => {
@@ -62,5 +62,29 @@ describe('toApiError', () => {
     // Pinning the exact new fallback proves the old generic sentence is gone —
     // a positive assertion, so the banned phrase never re-enters the source.
     expect(err.message).toBe('The server returned an unexpected error (HTTP 503).')
+  })
+
+  it('lets an explicit envelope message win over media_root_unavailable\'s built-in copy', () => {
+    const err = toApiError(
+      { detail: 'media_root_unavailable', message: 'The library folder for Some Movie is gone.' },
+      409,
+    )
+    expect(err.code).toBe('media_root_unavailable')
+    expect(err.message).toBe('The library folder for Some Movie is gone.')
+  })
+
+  it('falls back to the built-in media_root_unavailable copy with no envelope message', () => {
+    const err = toApiError({ detail: 'media_root_unavailable' }, 409)
+    expect(err.message).toMatch(/isn’t reachable/)
+  })
+
+  it.each([
+    ['library_root_unreachable', /isn’t visible to Plex Manager/],
+    ['not_reportable', /can’t be reported right now/],
+    ['active_duplicate', /newer request .* already exists/],
+  ] as const)('maps %s to its honest sentence, never raw snake_case', (code, expected) => {
+    const err = toApiError({ detail: code }, 409)
+    expect(err.code).toBe(code)
+    expect(err.message).toMatch(expected)
   })
 })
