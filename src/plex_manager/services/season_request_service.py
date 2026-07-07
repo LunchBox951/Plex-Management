@@ -396,11 +396,29 @@ async def ensure_seasons(
     # or re-arming the season straight to 'available' off that stale reading would
     # leave it marked watchable over a file the sweep then deletes (the season-level
     # twin of the movie P1 closed in ``request_service``). Subtract those seasons so
-    # they re-grab ('pending') instead. Only queried when Plex reported SOMETHING
-    # present -- otherwise every season is 'pending' regardless, nothing to subtract.
-    trusted_present = present
-    if present:
-        trusted_present = present - await season_repo.evicted_seasons(tmdb_id)
+    # they re-grab ('pending') instead -- queried UNCONDITIONALLY (not gated on
+    # ``present`` being non-empty): an empty ``present`` already subtracts to
+    # itself, and the eviction-regrab marker below needs the full set regardless of
+    # what Plex reported (see the finding-2 note).
+    # The season-level provenance marker (issue #156; hardened by the Codex
+    # round-2 finding below): a season whose newest tracked history is ``evicted``
+    # is exactly this function's OWN eviction-guard re-grab (a NEW season row
+    # created 'pending' instead of a stale-Plex 'available' -- the
+    # wholly-evicted-show shape, tracked under a fresh ``MediaRequest``) --
+    # regardless of whether THIS call's own Plex crawl actually reported the
+    # season present. Queried UNCONDITIONALLY (not only when ``present`` is
+    # non-empty): during the eviction claim/delete window Plex can just as easily
+    # ERROR (``_present_seasons``' best-effort empty set) or correctly report the
+    # season already gone as it can still list it, and in every one of those
+    # shapes a season in ``evicted_seasons`` that this call is about to create
+    # fresh is STILL an in-window eviction regrab -- under-stamping it would leave
+    # a genuine duplicate invisible to the restore's dedup
+    # (``eviction_service._cancel_redundant_season_regrabs``). A season simply
+    # never in ``evicted_seasons`` at all is an ordinary create, unrelated to
+    # eviction, and must NOT carry the marker.
+    evicted_seasons = await season_repo.evicted_seasons(tmdb_id)
+    trusted_present = present - evicted_seasons
+    evicted_regrab_seasons = evicted_seasons
     records: list[SeasonRequestRecord] = []
     re_armed_evicted = False
     for season_number in seasons:
@@ -409,7 +427,12 @@ async def ensure_seasons(
             if season_number in trusted_present
             else RequestStatus.pending.value
         )
-        record = await season_repo.ensure(media_request_id, season_number, status=initial_status)
+        record = await season_repo.ensure(
+            media_request_id,
+            season_number,
+            status=initial_status,
+            eviction_regrab=season_number in evicted_regrab_seasons,
+        )
         if record.status == RequestStatus.evicted.value:
             # The re-arm is a CAS from EXACTLY the status ensure() just read --
             # the same write discipline as every other status move in the
@@ -692,6 +715,13 @@ async def reset_for_research(
     await season_repo.schedule_search(row.id, search_attempts=0, next_search_at=None)
     if clear_library_path:
         await season_repo.clear_library_path(row.id)
+    # Issue #156 lifecycle fix (Codex round-2): the operator re-arming this row for
+    # a BRAND-NEW search is the row leaving "some eviction's own in-flight regrab"
+    # behind, whatever its provenance was before -- see
+    # ``SqlSeasonRequestRepository.clear_eviction_regrab``'s docstring for the full
+    # rationale (the movie twin of this clear lives directly in
+    # ``SqlRequestRepository.reset_for_research``).
+    await season_repo.clear_eviction_regrab(row.id)
     await SqlRequestRepository(session).heal_completed_at(media_request_id)
     await _recompute_parent(session, media_request_id)
 

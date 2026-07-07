@@ -266,8 +266,15 @@ async def test_ensure_seasons_rearm_loses_cleanly_to_a_concurrent_recovery_resto
         season_number: int,
         *,
         status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
-        record = await real_ensure(self, media_request_id, season_number, status=status)
+        record = await real_ensure(
+            self,
+            media_request_id,
+            season_number,
+            status=status,
+            eviction_regrab=eviction_regrab,
+        )
         # The stale pre-restore snapshot: this caller read the row as 'evicted'
         # a moment before the recovery restore committed 'available'.
         return record.model_copy(update={"status": RequestStatus.evicted.value})
@@ -431,6 +438,39 @@ async def test_mark_completed_then_mark_available_promote_the_rollup(
         assert show is not None
         # The only tracked season is available -> the whole show rolls up available.
         assert show.status is RequestStatus.available
+
+
+async def test_mark_available_clears_the_eviction_regrab_marker(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 finding 3 (TV twin): once a season regrab genuinely imports
+    and Plex confirms it watchable, it is exactly as settled as any other
+    available season -- the marker must retire, or a LATER, unrelated eviction's
+    restore could read a settled row as still "in flight" off nothing but stale
+    history."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=740)
+    async with sessionmaker_() as session:
+        season = SeasonRequest(
+            media_request_id=show_id,
+            season_number=1,
+            status=RequestStatus.completed,
+            eviction_regrab=True,  # this season WAS an eviction's own regrab
+        )
+        session.add(season)
+        await session.commit()
+        season_id = season.id
+
+    async with sessionmaker_() as session:
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+    assert season is not None
+    assert season.status is RequestStatus.available
+    assert season.eviction_regrab is False  # cleared by the fix
 
 
 async def test_mark_no_acceptable_release_updates_a_pending_season(
@@ -871,6 +911,40 @@ async def test_reset_for_research_leaves_completed_at_when_a_sibling_is_still_do
         show = await session.get(MediaRequest, show_id)
         assert show is not None
         assert show.completed_at == first_stamp
+
+
+async def test_reset_for_research_clears_the_eviction_regrab_marker(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-2 finding 3 (TV twin): report-issue re-arming a season for a
+    brand-new search is the row leaving "some eviction's own in-flight regrab"
+    behind -- the marker must clear, or a LATER, unrelated eviction's restore
+    could cancel the operator's live re-search purely because of the row's stale
+    history (see ``test_eviction_service``'s composed regression for the full
+    downstream effect)."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=738)
+    async with sessionmaker_() as session:
+        season = SeasonRequest(
+            media_request_id=show_id,
+            season_number=1,
+            status=RequestStatus.available,
+            eviction_regrab=True,  # this season WAS an eviction's own regrab
+        )
+        session.add(season)
+        await session.commit()
+        season_id = season.id
+
+    async with sessionmaker_() as session:
+        await season_request_service.reset_for_research(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+    assert season is not None
+    assert season.status is RequestStatus.searching
+    assert season.eviction_regrab is False  # cleared by the fix
 
 
 async def test_reset_clears_completed_at_when_only_a_plex_present_sibling_remains(

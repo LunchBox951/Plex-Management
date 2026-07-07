@@ -48,6 +48,9 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         library_path=row.library_path,
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
+        # NULL (every pre-migration row) reads as ``False`` -- the safe default
+        # (see ``SeasonRequest.eviction_regrab``'s docstring in ``models.py``).
+        eviction_regrab=bool(row.eviction_regrab),
     )
 
 
@@ -324,16 +327,25 @@ class SqlSeasonRequestRepository:
         await self._session.flush()
 
     async def ensure(
-        self, media_request_id: int, season_number: int, *, status: str
+        self,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
         existing = await self._find(media_request_id, season_number)
         if existing is not None:
+            # ``eviction_regrab`` is ONLY the value used on first creation, exactly
+            # like ``status`` above (see the docstring) -- an already-established
+            # season's provenance marker is never retroactively applied here.
             return _to_record(existing, await self._tmdb_id_for(media_request_id))
 
         row = SeasonRequest(
             media_request_id=media_request_id,
             season_number=season_number,
             status=RequestStatus(status),
+            eviction_regrab=eviction_regrab,
         )
         try:
             # A SAVEPOINT (not a full transaction rollback): on IntegrityError only
@@ -429,8 +441,22 @@ class SqlSeasonRequestRepository:
         await self.set_status(season_request_id, RequestStatus.completed.value)
 
     async def mark_available(self, season_request_id: int) -> None:
-        """Set ``available`` (Plex-confirmed: ``leafCount>0`` for this season)."""
-        await self.set_status(season_request_id, RequestStatus.available.value)
+        """Set ``available`` (Plex-confirmed: ``leafCount>0`` for this season).
+
+        Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2) --
+        the season-level twin of ``SqlRequestRepository.mark_available``'s same
+        clear; see its docstring for the full rationale. Deliberately its OWN
+        write (not a delegation to :meth:`set_status`, which every OTHER
+        in-flight transition -- e.g. ``downloading`` -- also uses and where the
+        marker must still stand): only THIS confirmed-watchable moment retires
+        the marker.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.status = RequestStatus.available
+        row.eviction_regrab = False
+        await self._session.flush()
 
     async def set_library_path(self, season_request_id: int, library_path: str) -> None:
         """Store the final placed path this season's import wrote into (ADR-0012)."""
@@ -453,4 +479,27 @@ class SqlSeasonRequestRepository:
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = None
+        await self._session.flush()
+
+    async def clear_eviction_regrab(self, season_request_id: int) -> None:
+        """Null the eviction-regrab provenance marker (issue #156 lifecycle fix,
+        Codex round-2).
+
+        Called from ``season_request_service.reset_for_research`` (ADR-0014's
+        report-issue verb): the operator re-arming this season for a BRAND-NEW
+        search is the row leaving "THIS eviction's own in-flight regrab" behind --
+        it is now the operator's own deliberate re-search, whatever its
+        provenance was before. Without this, a stale marker on a row later
+        re-armed here could let a DIFFERENT, unrelated eviction's failed-delete
+        restore (``eviction_service._cancel_redundant_season_regrabs``) cancel the
+        operator's live re-search purely because of the row's old history. A
+        SEPARATE call (not folded into :meth:`set_status`, which every OTHER
+        in-flight transition also uses and where the marker must still stand)
+        mirrors :meth:`mark_available`'s own dedicated clear. No-op-safe if the
+        row vanished.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.eviction_regrab = False
         await self._session.flush()

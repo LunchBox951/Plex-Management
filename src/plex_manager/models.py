@@ -359,6 +359,26 @@ class MediaRequest(Base):
     # the manual grab path never reads or writes them.
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Provenance marker (issue #156): ``True`` ONLY for a movie row this app's OWN
+    # eviction-guard fall-through created (``request_service.create_request``'s
+    # ``latest_request_evicted`` branch, ADR-0012) -- set regardless of what THAT
+    # call's own Plex probe reported (present, absent, or erroring; Codex round-2),
+    # never for an operator-initiated request, and in particular never for a #148
+    # forced re-acquire (which explicitly skips that guard). The eviction restore's
+    # redundant-regrab dedup (``eviction_service._cancel_redundant_movie_regrabs``)
+    # reads this so it cancels only regrabs IT ITSELF is responsible for, never a
+    # deliberate operator re-acquire that happens to be pre-grab in the same instant.
+    # LIFECYCLE (Codex round-2): the marker is retired -- cleared back to ``False``
+    # -- the moment this row stops being "some eviction's own in-flight regrab":
+    # when it is confirmed imported/watchable (``SqlRequestRepository.
+    # mark_available``) or when an operator re-arms it for a brand-new search
+    # (``SqlRequestRepository.reset_for_research``, report-issue). Without that,
+    # a marker surviving past either moment would let a LATER, UNRELATED
+    # eviction's restore cancel a row that no longer has anything to do with it.
+    # Nullable: every pre-existing row (and any row inserted outside this app's own
+    # create path) reads ``NULL`` -- treated as "not an eviction regrab", the safe
+    # default that never triggers an unintended cancel.
+    eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
 
 
 class RequestDedupLock(Base):
@@ -418,6 +438,25 @@ class SeasonRequest(Base):
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
+    # ONLY for a season row ``season_request_service.ensure_seasons`` created because
+    # its newest tracked history was ``evicted`` -- the season-level eviction guard's
+    # own re-grab, set regardless of what THAT call's own Plex crawl reported
+    # (present, absent, or erroring; Codex round-2). A season NEWLY created for any
+    # other reason (never before tracked, or a genuinely fresh season not in the
+    # ``evicted_seasons`` set) stays ``NULL``/``False``. The eviction restore's
+    # redundant-sibling-regrab dedup (``eviction_service._cancel_redundant_season_
+    # regrabs``) reads this so it cancels only ITS OWN re-grabs, never an unrelated
+    # concurrent tracked season for the same show. LIFECYCLE (Codex round-2): retired
+    # -- cleared back to ``False`` -- the moment this row stops being "some
+    # eviction's own in-flight regrab": confirmed watchable
+    # (``SqlSeasonRequestRepository.mark_available``) or re-armed by an operator for
+    # a brand-new search (``season_request_service.reset_for_research``, via
+    # ``SqlSeasonRequestRepository.clear_eviction_regrab``) -- see
+    # ``MediaRequest.eviction_regrab``'s docstring for the full rationale. Nullable
+    # for the same
+    # backward-compat reason as the movie mirror.
+    eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
 
 
 class Download(Base):
