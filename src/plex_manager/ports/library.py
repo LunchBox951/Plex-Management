@@ -81,22 +81,62 @@ class LibraryPort(Protocol):
         SINGLE library crawl instead of one per season. Always reflects the library
         as it is NOW (like ``is_available(use_cache=False)`` — never trusts a cached
         absence); empty when the show is absent or has no indexed season.
+
+        NOTE: this crawls EVERY show section's full ``/all`` listing to build the
+        whole-library season map (see the adapter's ``_collect_present_tv_seasons``).
+        A caller that only needs ONE show's seasons should use
+        :meth:`season_presence` instead — it costs O(1) shows, not O(library size).
+        """
+        raise NotImplementedError
+
+    async def season_presence(self, tmdb_id: int) -> frozenset[int]:
+        """Return the season numbers present for ONE show, via a TARGETED lookup.
+
+        Unlike :meth:`present_seasons` (which crawls every show section's FULL
+        listing to answer for ANY show), this resolves only the one show identified
+        by ``tmdb_id`` and costs O(1) HTTP calls regardless of library size — the
+        batch availability reconcile (``import_service.run_availability_cycle``)
+        depends on this to check N distinct pending shows without N whole-library
+        crawls. Always reads FRESH (like ``present_seasons`` — never trusts a
+        cached absence): a season that just finished indexing must be seen on the
+        very next check, not held stale for a cache TTL. Empty when the show is
+        absent from the library or has no indexed season.
         """
         raise NotImplementedError
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         """Return the subset of ``(tmdb_id, media_type)`` pairs present in the library.
 
-        The BATCH presence accessor for tile decoration (Discover/Search): a whole
-        page's keys are answered from AT MOST one movie crawl plus one show crawl
-        total -- never one library read per title (the prototype's "20 tiles = 20
-        crawls" anti-pattern). Cache-backed (``use_cache=True`` semantics): tiles are
-        HINTS and tolerate the short presence-cache staleness, so this reads the
-        warmed full-crawl snapshot rather than re-paging Plex per page-load. The
-        authoritative fresh dedup decision stays on the create path
-        (``is_available(use_cache=False)``), never here.
+        The BATCH presence accessor for tile decoration (Discover/Search) AND for
+        the availability reconcile cycle: a whole page's (or tick's) keys are
+        answered from AT MOST one movie crawl plus one show crawl total -- never
+        one library read per title (the prototype's "20 tiles = 20 crawls"
+        anti-pattern).
+
+        ``refresh_absent=False`` (the default, used by tile decoration): trusts a
+        warmed snapshot as-is, even if it does not contain one of the queried keys
+        -- tiles are HINTS and tolerate the short presence-cache staleness, so a
+        miss pages Plex once and warms the cache for the next page-load, but a hit
+        is never re-verified. The authoritative fresh dedup decision stays on the
+        create path (``is_available(use_cache=False)``), never here.
+
+        ``refresh_absent=True`` (used by the availability reconcile cycle,
+        ``import_service.run_availability_cycle``): trusts a cached PRESENCE but
+        never a cached ABSENCE for a queried key, mirroring ``is_available``'s
+        contract at batch granularity -- a warmed snapshot that does not confirm
+        EVERY queried key as present triggers exactly one fresh crawl before
+        answering (never per-key, never more than one crawl per call). This
+        matters because a Plex partial scan is asynchronous: the scan-triggered
+        cache invalidation (``trigger_scan``) can be followed by a reconcile tick
+        that pages Plex BEFORE indexing finishes, caching that miss; without
+        ``refresh_absent`` a subsequent tick would trust that stale absence for
+        the rest of the cache TTL instead of promoting the title on the very next
+        tick after it actually finishes indexing.
 
         Presence is SHOW-LEVEL for TV (the show is in the library), the granularity
         a tile needs -- per-season detail stays in the title modal. Only ever yields

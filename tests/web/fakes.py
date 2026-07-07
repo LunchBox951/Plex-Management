@@ -286,6 +286,17 @@ class FakeLibrary:
     caller resolved -- e.g. ``eviction_service``'s below-threshold pre-check test
     asserts this stays EMPTY, proving the sweep never pays for a Plex round-trip
     when there is no disk pressure to relieve.
+
+    Call counters (issue #136 -- batched availability reconcile): ``is_available_calls``
+    counts every :meth:`is_available` call, ``present_ids_calls`` every
+    :meth:`present_ids` call (``present_ids_refresh_absent_calls`` records the
+    ``refresh_absent`` flag passed to each one, so a test can assert the reconcile
+    cycle asks for the never-trust-a-cached-absence contract), and
+    ``season_presence_calls`` records every ``tmdb_id`` passed to
+    :meth:`season_presence` (one entry per call, duplicates included) -- a caller
+    asserts against these to prove a batch/reconcile pass makes AT MOST one
+    ``present_ids`` call and one ``season_presence`` call per distinct show, never
+    one ``is_available`` call per row.
     """
 
     def __init__(
@@ -296,6 +307,7 @@ class FakeLibrary:
         sections: list[LibrarySection] | None = None,
         watch_states: dict[tuple[int, str, int | None], WatchState] | None = None,
         raises: Exception | None = None,
+        raises_for_shows: dict[int, Exception] | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
@@ -304,11 +316,20 @@ class FakeLibrary:
         self.scan_calls: list[tuple[str, str]] = []
         self.watch_states = watch_states or {}
         self.watch_state_calls: list[tuple[int, str, int | None]] = []
-        # When set, ``is_available``/``present_seasons`` raise this instead of
-        # returning -- lets a caller exercise the best-effort "log and treat as
-        # not-present" error path (see request_service._already_in_library /
-        # _present_seasons_or_empty, season_request_service._present_seasons).
+        # When set, ``is_available``/``present_seasons``/``present_ids``/
+        # ``season_presence`` raise this instead of returning -- lets a caller
+        # exercise the best-effort "log and treat as not-present" error path (see
+        # request_service._already_in_library / _present_seasons_or_empty,
+        # season_request_service._present_seasons).
         self.raises = raises
+        # Per-show override of ``raises`` for ``season_presence`` ONLY -- lets a
+        # test prove per-show error isolation (one show's lookup raising must not
+        # block another distinct show's lookup in the same reconcile pass).
+        self.raises_for_shows = raises_for_shows or {}
+        self.is_available_calls = 0
+        self.present_ids_calls = 0
+        self.present_ids_refresh_absent_calls: list[bool] = []
+        self.season_presence_calls: list[int] = []
 
     async def is_available(
         self,
@@ -318,6 +339,7 @@ class FakeLibrary:
         use_cache: bool = True,
         season: int | None = None,
     ) -> bool:
+        self.is_available_calls += 1
         if self.raises is not None:
             raise self.raises
         # No cache to bypass; ``use_cache`` is accepted to match LibraryPort.
@@ -335,11 +357,35 @@ class FakeLibrary:
         # crawl); empty for an absent show, matching the real adapter.
         return self.available_tv_seasons.get(tmdb_id, frozenset())
 
-    async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
-    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+    async def season_presence(self, tmdb_id: int) -> frozenset[int]:
+        self.season_presence_calls.append(tmdb_id)
+        if tmdb_id in self.raises_for_shows:
+            raise self.raises_for_shows[tmdb_id]
         if self.raises is not None:
             raise self.raises
+        # A TARGETED lookup for ONE show -- mirrors PlexLibrary.season_presence's
+        # contract (fresh, ~O(1) cost regardless of library size); the fake answers
+        # it from the same seasons map ``present_seasons`` uses, just scoped to one
+        # show and separately counted so a test can prove it is called AT MOST once
+        # per distinct show, never once per pending season.
+        return self.available_tv_seasons.get(tmdb_id, frozenset())
+
+    async def present_ids(
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        self.present_ids_calls += 1
+        self.present_ids_refresh_absent_calls.append(refresh_absent)
+        if self.raises is not None:
+            raise self.raises
+        # The fake has no cache to "refresh" -- ``available_ids``/``available_tv_seasons``
+        # are always read live, so it already answers as freshly as
+        # ``refresh_absent=True`` would force the real adapter to. ``refresh_absent``
+        # is recorded (not applied) so a caller-side test can assert
+        # ``run_availability_cycle`` requests the fresh-on-absence contract from the
+        # reconcile cycle without needing to model the adapter's cache here.
         # Movie presence from the in-library id set; show-level TV presence from the
         # seasons map's keys (a show is "present" if any season is tracked) -- the
         # granularity the batch tile accessor needs. Mirrors PlexLibrary.present_ids.

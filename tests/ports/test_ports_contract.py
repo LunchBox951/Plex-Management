@@ -218,7 +218,10 @@ class _LibraryMissingTriggerScan(LibraryPort):
         return frozenset()
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         return frozenset()
 

@@ -578,7 +578,10 @@ class PlexLibrary:
         return frozenset(present)
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         """The batch presence accessor — see :meth:`LibraryPort.present_ids`.
 
@@ -587,23 +590,36 @@ class PlexLibrary:
         crawl), TV shows from ``_PRESENT_SHOW_TMDB_CACHE`` (one show-section guid
         crawl, no per-show ``/children``). A section type is crawled ONLY when a key
         of that type is present, so a movie-only page never touches the show sections
-        (and vice versa). Cached-presence-only, like the other tile-facing reads: a
-        warmed snapshot is trusted (tiles tolerate the short TTL); a miss pages Plex
-        once and warms the cache for the next page-load.
+        (and vice versa).
+
+        With ``refresh_absent=False`` (tile decoration's default): cached-presence-
+        only, like the other tile-facing reads — a warmed snapshot is trusted as-is
+        (tiles tolerate the short TTL); a miss pages Plex once and warms the cache
+        for the next page-load.
+
+        With ``refresh_absent=True`` (the availability reconcile cycle): a warmed
+        snapshot is trusted ONLY if it already confirms every requested id of that
+        media type as present; otherwise one fresh crawl runs before answering —
+        still at most one crawl per media type, never one per key. This mirrors
+        ``is_available``'s "trust cached presence, never cached absence" contract:
+        a partial scan's cache invalidation (``trigger_scan``) fires before Plex
+        finishes indexing, so the very next crawl can cache a still-pending title as
+        absent; without this, that stale absence would be trusted for the rest of
+        the TTL instead of self-correcting on the next reconcile tick.
         """
         movie_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "movie"}
         show_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "tv"}
         present_movies: frozenset[int] = frozenset()
         if movie_ids:
             cached_movies = _PRESENT_TMDB_CACHE.get(self._cache_key)
-            if cached_movies is None:
+            if cached_movies is None or (refresh_absent and not movie_ids.issubset(cached_movies)):
                 cached_movies = await self._collect_present_tmdb_ids()
                 _PRESENT_TMDB_CACHE.set(self._cache_key, cached_movies)
             present_movies = cached_movies
         present_shows: frozenset[int] = frozenset()
         if show_ids:
             cached_shows = _PRESENT_SHOW_TMDB_CACHE.get(self._cache_key)
-            if cached_shows is None:
+            if cached_shows is None or (refresh_absent and not show_ids.issubset(cached_shows)):
                 cached_shows = await self._collect_present_show_ids()
                 _PRESENT_SHOW_TMDB_CACHE.set(self._cache_key, cached_shows)
             present_shows = cached_shows
@@ -631,6 +647,45 @@ class PlexLibrary:
         present = await self._collect_present_tv_seasons()
         _TV_SEASONS_CACHE.set(self._cache_key, present)
         return present.get(tmdb_id, frozenset())
+
+    async def season_presence(self, tmdb_id: int) -> frozenset[int]:
+        """The seasons present for ONE show — a TARGETED lookup, not a library crawl.
+
+        Composes ``_find_section_item`` (page each show section until the show
+        matching ``tmdb_id`` is found) with ``_fetch_present_seasons`` (that show's
+        ``/children`` only) — ~2 HTTP calls total for one show, regardless of how
+        many titles the library holds, unlike ``present_seasons``/
+        ``_collect_present_tv_seasons`` which page EVERY show section's full ``/all``
+        listing to answer for any show. Exists so the availability reconcile cycle
+        (``import_service.run_availability_cycle``) can resolve M distinct pending
+        shows per tick at O(M) cost instead of paying a whole-library crawl per
+        pending season.
+
+        Always re-pages fresh (never trusts a cached absence, mirroring
+        ``present_seasons``): a season that just finished indexing must be seen
+        immediately, not held stale for the cache TTL. On a hit, write-through the
+        result into the shared ``_TV_SEASONS_CACHE`` snapshot (when one is already
+        warm) so a subsequent ``is_available``/``present_seasons`` call for the SAME
+        show inside this TTL window sees this fresh read rather than a stale one.
+        Returns an empty frozenset when the show is absent from the library.
+        """
+        for section in await self.list_sections():
+            if section.type != "show":
+                continue
+            item = await self._find_section_item(section.key, tmdb_id)
+            if item is None:
+                continue
+            rating_key = _get_str(item, "ratingKey")
+            if rating_key is None:
+                return frozenset()
+            seasons = await self._fetch_present_seasons(rating_key)
+            cached = _TV_SEASONS_CACHE.get(self._cache_key)
+            if cached is not None:
+                updated = dict(cached)
+                updated[tmdb_id] = seasons
+                _TV_SEASONS_CACHE.set(self._cache_key, updated)
+            return seasons
+        return frozenset()
 
     async def _collect_present_tv_seasons(self) -> dict[int, frozenset[int]]:
         """Page every show section and gather each show's present seasons.
