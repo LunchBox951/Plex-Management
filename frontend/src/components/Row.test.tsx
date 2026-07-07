@@ -215,6 +215,14 @@ describe('Row quick-request hover-reveal affordance (issue #135)', () => {
     expect(button.className).toContain('opacity-0')
     expect(button.className).toContain('group-hover:opacity-100')
     expect(button.className).toContain('group-focus-within:opacity-100')
+    // While invisible the button must not be hit-testable: opacity alone
+    // leaves it catching taps on touch devices (no hover reveal) — an
+    // invisible tap target that silently submits a request. Pointer events
+    // come back with the reveal; keyboard focus/activation ignore
+    // pointer-events, so the tab-order assertions above still hold.
+    expect(button.className).toContain('pointer-events-none')
+    expect(button.className).toContain('group-hover:pointer-events-auto')
+    expect(button.className).toContain('group-focus-within:pointer-events-auto')
   })
 
   it('can still be focused directly (keyboard users can tab to the hidden-by-default action)', () => {

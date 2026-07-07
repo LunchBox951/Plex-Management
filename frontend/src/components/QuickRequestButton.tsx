@@ -27,6 +27,13 @@ function asApiError(error: unknown): ApiError {
  * the button lands inside the group, so `group-focus-within` reveals it at
  * the same moment it gains focus.
  *
+ * While invisible it is also `pointer-events-none`: opacity alone leaves the
+ * button hit-testable, and on touch/coarse-pointer devices (no hover reveal)
+ * a tap on the card's top-right corner would silently submit a request
+ * instead of opening details. Pointer events return with the reveal
+ * (`group-hover`/`group-focus-within`); keyboard focus and activation are
+ * unaffected by pointer-events, so the tab-order guarantee above holds.
+ *
  * Reuses the SAME `useCreateRequest()` mutation `TitleDetailModal` uses; there
  * is only one create-request code path. For a tv title this always omits
  * `seasons`, which the backend reads as "track every aired season" (matches
@@ -96,7 +103,7 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
       className={cn(
         'flex size-8 items-center justify-center rounded-full',
         'bg-gold text-gold-ink ring-1 ring-inset ring-black/10',
-        'opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100',
+        'pointer-events-none opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100',
         'hover:bg-gold/90 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60',
         'disabled:cursor-not-allowed disabled:opacity-100 disabled:hover:bg-gold',
       )}
