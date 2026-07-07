@@ -545,6 +545,40 @@ async def test_season_presence_empty_for_absent_show() -> None:
     assert not any(path.startswith("/library/metadata/") for path in calls)
 
 
+async def test_season_presence_evicts_a_stale_cache_entry_on_a_no_match_read() -> None:
+    """Regression (symmetric to the no-poison case): a show that WAS cached as
+    present but has since been REMOVED from Plex must be evicted from the TV
+    seasons snapshot by a fresh no-match read — otherwise a season-scoped
+    ``is_available`` inside the TTL keeps answering True from the stale entry."""
+    calls: dict[str, int] = {}
+    removed = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            if removed:
+                return httpx.Response(200, json={"MediaContainer": {"size": 0, "Metadata": []}})
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://season-presence-evict-stale:32400")
+    # Warm the snapshot: the show is present with season 1.
+    assert await adapter.season_presence({2000}) == {2000: frozenset({1})}
+    # The show vanishes from Plex; a fresh read returns empty AND must evict
+    # the stale cache entry...
+    removed = True
+    assert await adapter.season_presence({2000}) == {2000: frozenset()}
+    # ...so a season-scoped availability check inside the TTL answers False
+    # instead of True-from-the-stale-snapshot.
+    assert await adapter.is_available(2000, "tv", season=1) is False
+
+
 async def test_season_presence_never_caches_a_no_match_id_as_present() -> None:
     """Regression: a requested id with NO matching item must not be written to the
     TV seasons cache. ``_is_tv_available`` treats a cached KEY as "show present"
