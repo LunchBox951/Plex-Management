@@ -202,6 +202,33 @@ async def test_list_sections_cache_is_keyed_by_token_not_just_url() -> None:
     assert calls["n"] == 2  # token-A is still served from its own cache entry
 
 
+@pytest.mark.parametrize("bad_token", ["tok\r\ninjected", "tok\x00nul", "tokén-nonascii"])
+async def test_header_unsafe_token_raises_plex_auth_error_without_request(
+    bad_token: str,
+) -> None:
+    """Defense-in-depth: a stored token that cannot ride the ``X-Plex-Token`` header
+    (a CR/LF/NUL value would leak the RAW token via httpx's ``str(exc)``; a non-ASCII
+    value an uncaught ``UnicodeEncodeError``/500) fails as a surfaced ``PlexAuthError``,
+    WITHOUT the token ever being placed in a request. Mirrors the oauth adapter's own
+    ``_require_header_safe_token`` guard for the one remaining plex header sink."""
+    sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        nonlocal sent
+        sent += 1
+        return httpx.Response(200, json=SECTIONS)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = PlexLibrary(client, base_url=PLEX_URL, token=bad_token)
+    try:
+        with pytest.raises(PlexAuthError) as exc_info:
+            await adapter.list_sections()
+        assert bad_token not in str(exc_info.value)
+        assert sent == 0
+    finally:
+        await client.aclose()
+
+
 # --------------------------------------------------------------------------- #
 # is_available — GUID parsing
 # --------------------------------------------------------------------------- #

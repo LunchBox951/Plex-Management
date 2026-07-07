@@ -110,6 +110,26 @@ def test_settings_update_rejects_target_above_threshold() -> None:
     SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=70.0)
 
 
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+def test_settings_update_rejects_header_unsafe_credential(field: str) -> None:
+    # A header-sink credential (plex_token -> X-Plex-Token, prowlarr_api_key ->
+    # X-Api-Key) that cannot ride its HTTP header is rejected at write time, before
+    # it can be stored and then leaked via httpx's str(exc) / crash the grab loop
+    # when an adapter sends it. CR/LF/NUL (a str(exc) leak) and non-ASCII (an
+    # uncaught UnicodeEncodeError/500) are the two closed failure modes.
+    from pydantic import ValidationError
+
+    for bad in ("key\r\ninjected", "key\x00nul", "kéy-nonascii"):
+        with pytest.raises(ValidationError):
+            SettingsUpdate.model_validate({field: bad})
+    # Header-safe inputs pass untouched so partial updates and the FE mask
+    # round-trip are unaffected: a plain ASCII key, the "***" redaction mask, and
+    # an absent field are all accepted.
+    SettingsUpdate.model_validate({field: "plain-ascii-key"})
+    SettingsUpdate.model_validate({field: "***"})
+    SettingsUpdate.model_validate({})
+
+
 async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})

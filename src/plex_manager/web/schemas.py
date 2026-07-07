@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from plex_manager.headersafe import HEADER_VALUE_MESSAGE, header_value_error
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
@@ -397,6 +398,30 @@ class SetupCompleteRequest(BaseModel):
             raise ValueError(message)
         return value
 
+    @field_validator("plex_token", "prowlarr_api_key")
+    @classmethod
+    def _validate_header_safe_credential(cls, value: str | None) -> str | None:
+        """Reject a credential that cannot ride its outbound HTTP header BEFORE it
+        is persisted (the header-safety persistence bypass).
+
+        ``plex_token`` rides ``X-Plex-Token`` and ``prowlarr_api_key`` rides
+        ``X-Api-Key``. A CR/LF/NUL value makes httpx echo the RAW credential in
+        ``str(exc)`` (a secret leak through any adapter that logs a chained
+        transport error -- e.g. ``ProwlarrIndexer._indexer_priorities``' priority
+        warning), and a non-ASCII value makes httpx's ASCII header encoder raise an
+        uncaught ``UnicodeEncodeError`` (a 500). The wizard's live "Test connection"
+        probes already reject such a value up front
+        (:func:`~plex_manager.web.setup_validation._require_header_safe_credential`);
+        enforcing the SAME predicate here -- shared verbatim with ``SettingsUpdate``
+        -- closes the direct-API / keyless-token bypass so a header-unsafe credential
+        can never be stored and then leaked (or crash the grab loop) when an adapter
+        later sends it as a header. ``None`` (an omitted ``plex_token``) is
+        header-safe and passes untouched.
+        """
+        if value and header_value_error(value) is not None:
+            raise ValueError(HEADER_VALUE_MESSAGE)
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def require_at_least_one_library_root(cls, data: Any) -> Any:
@@ -610,6 +635,24 @@ class SettingsUpdate(BaseModel):
         message = url_shape_error(value)
         if message is not None:
             raise ValueError(message)
+        return value
+
+    @field_validator("plex_token", "prowlarr_api_key")
+    @classmethod
+    def _validate_header_safe_credential(cls, value: str | None) -> str | None:
+        """Reject a header-unsafe credential at write time (the persistence bypass).
+
+        The write-time twin of ``SetupCompleteRequest._validate_header_safe_credential``
+        (see its docstring for the two failure modes -- a ``str(exc)`` credential
+        leak and an uncaught ``UnicodeEncodeError``/500 -- that a header-unsafe
+        ``plex_token`` / ``prowlarr_api_key`` triggers once an adapter sends it as a
+        header). ``None`` (leave unchanged) and the ``"***"`` redaction mask are both
+        header-safe and pass untouched, so the FE's mask round-trip and partial
+        updates are unaffected; only a genuinely header-unsafe NEW value is rejected
+        (422) before it is ever stored.
+        """
+        if value and header_value_error(value) is not None:
+            raise ValueError(HEADER_VALUE_MESSAGE)
         return value
 
     @field_validator(*_LIBRARY_ROOT_FIELDS)

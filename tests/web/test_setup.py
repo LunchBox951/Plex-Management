@@ -233,6 +233,26 @@ async def test_complete_rejects_empty_string_service_url(
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+@pytest.mark.parametrize("bad_value", ["key\r\ninjected", "key\x00nul", "kéy-nonascii"])
+async def test_complete_rejects_header_unsafe_credential(
+    client: httpx.AsyncClient, field: str, bad_value: str
+) -> None:
+    # A credential that cannot ride its outbound HTTP header (plex_token ->
+    # X-Plex-Token, prowlarr_api_key -> X-Api-Key) is rejected at the persistence
+    # boundary -- BEFORE it is stored and later leaked via httpx's str(exc) (or
+    # crashes the grab loop) when an adapter sends it as a header. Under dev-bypass
+    # the Plex verification ladder is skipped, so the SCHEMA validator is what
+    # rejects here, proving the guard is the write-time check itself, not a probe.
+    body = {**_COMPLETE_BODY, field: bad_value}
+    response = await client.post("/api/v1/setup/complete", json=body)
+
+    assert response.status_code == 422
+    # A rejected body must not have claimed the install.
+    status = (await client.get("/api/v1/setup/status")).json()
+    assert status["initialized"] is False
+
+
 @pytest.mark.parametrize(
     "good_url",
     [
