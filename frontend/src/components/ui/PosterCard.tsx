@@ -66,7 +66,13 @@ export function PosterCard({
       ) : null}
 
       {badge ? <div className="pointer-events-none absolute top-2 left-2 z-20">{badge}</div> : null}
-      {action ? <div className="absolute top-2 right-2 z-30">{action}</div> : null}
+      {action ? (
+        // pointer-events-none so the wrapper never swallows taps meant for the
+        // full-card details trigger underneath (z-10) while its child action is
+        // hidden — the revealed child opts back in with its own
+        // pointer-events-auto (see QuickRequestButton's reveal classes).
+        <div className="pointer-events-none absolute top-2 right-2 z-30">{action}</div>
+      ) : null}
 
       <div className="pointer-events-none absolute right-2.5 bottom-2 left-2.5 z-20">
         <div className="font-display text-[12.5px] leading-tight font-bold text-ink line-clamp-2">

@@ -62,6 +62,20 @@ describe('PosterCard action slot', () => {
     expect(onClick).toHaveBeenCalledTimes(1)
   })
 
+  it('action wrapper is not hit-testable — taps fall through to the details trigger', () => {
+    // The absolutely-positioned action wrapper sits above the full-card details
+    // trigger. While the action child hides itself (opacity-0 +
+    // pointer-events-none on coarse pointers), the WRAPPER must not swallow the
+    // tap either — pointer-events-none on the wrapper lets the tap reach the
+    // details button; the revealed child opts back in via its own
+    // pointer-events-auto classes.
+    render(<PosterCard title="Movie" onClick={() => {}} action={actionButton(() => {})} />)
+
+    const wrapper = screen.getByRole('button', { name: 'Act' }).parentElement
+    expect(wrapper).not.toBeNull()
+    expect(wrapper!.className).toContain('pointer-events-none')
+  })
+
   it('Enter/Space on the focused action button does not open the card', () => {
     const onClick = vi.fn()
     render(<PosterCard title="Movie" onClick={onClick} action={actionButton(() => {})} />)
