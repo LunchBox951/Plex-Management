@@ -192,6 +192,37 @@ def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
         engine.dispose()
 
 
+def test_stalled_event_type_migration_widens_the_check_constraint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #165's self-heal writes ``event_type='stalled'``; a database already
+    migrated to ``bfaa63130ee7`` (pre-#165) must reject it, and upgrading across
+    ``26bc01829ae1`` must then accept it — the CHECK constraint
+    ``b7e2d4f6c8a1`` gave this column really does need widening, not just the
+    Python-side enum."""
+    db_path = tmp_path / "stalled-event.db"
+    _upgrade(db_path, "bfaa63130ee7", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            with pytest.raises(IntegrityError):
+                conn.execute(text("INSERT INTO download_history (event_type) VALUES ('stalled')"))
+            conn.rollback()
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "head", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("INSERT INTO download_history (event_type) VALUES ('stalled')"))
+            conn.rollback()
+    finally:
+        engine.dispose()
+
+
 def test_import_blocked_status_migration_rejects_legacy_duplicate_completed_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
