@@ -530,6 +530,111 @@ async def test_sign_in_throttled_after_limit(
     assert throttled.json()["detail"] == "sign_in_throttled"
 
 
+async def test_sign_in_throttle_default_ignores_x_forwarded_for(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``trusted_proxy_hops`` defaults to 0: a caller-supplied X-Forwarded-For must
+    NOT carve out extra budget beyond the direct-peer throttle."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    for i in range(10):
+        ok = await client.post(
+            "/api/v1/auth/plex",
+            json={"auth_token": _TOKEN},
+            headers={"X-Forwarded-For": f"10.0.0.{i}"},
+        )
+        assert ok.status_code == 200
+    throttled = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={"X-Forwarded-For": "10.0.0.99"},
+    )
+
+    assert throttled.status_code == 429
+
+
+async def test_sign_in_throttle_trusted_hop_keys_on_forwarded_client(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``trusted_proxy_hops=1``, each distinct forwarded client gets its own
+    budget -- fixing the global-cap risk of keying on ``request.client.host`` (the
+    reverse proxy's own address) alone."""
+    monkeypatch.setenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", "1")
+    get_settings.cache_clear()
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    for _ in range(10):
+        ok = await client.post(
+            "/api/v1/auth/plex",
+            json={"auth_token": _TOKEN},
+            headers={"X-Forwarded-For": "203.0.113.5"},
+        )
+        assert ok.status_code == 200
+    throttled = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={"X-Forwarded-For": "203.0.113.5"},
+    )
+    assert throttled.status_code == 429
+
+    # A DIFFERENT forwarded client is unaffected -- its own budget, not the proxy's.
+    other = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={"X-Forwarded-For": "203.0.113.9"},
+    )
+    assert other.status_code == 200
+
+    # No X-Forwarded-For header at all still falls back to the direct peer rather
+    # than raising -- a fresh budget, since nothing above hit that key.
+    absent = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert absent.status_code == 200
+
+
+async def test_sign_in_throttle_trusted_hop_falls_back_on_short_header(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A header shorter than the configured hop count cannot be trusted -- fall back
+    to the direct peer rather than indexing into an attacker-shaped header."""
+    monkeypatch.setenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", "2")
+    get_settings.cache_clear()
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    for i in range(10):
+        ok = await client.post(
+            "/api/v1/auth/plex",
+            json={"auth_token": _TOKEN},
+            # Only ONE entry while hops=2 -- too short to trust, so every request
+            # still falls back to (and shares) the direct-peer key.
+            headers={"X-Forwarded-For": f"198.51.100.{i}"},
+        )
+        assert ok.status_code == 200
+    throttled = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={"X-Forwarded-For": "198.51.100.250"},
+    )
+
+    assert throttled.status_code == 429
+
+
 # --------------------------------------------------------------------------- #
 # /me and /logout behavior preserved
 # --------------------------------------------------------------------------- #

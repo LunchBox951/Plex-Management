@@ -96,6 +96,32 @@ def test_downloads_root_blank_env_var_falls_back_to_none(
     assert settings.downloads_root is None
 
 
+def test_trusted_proxy_hops_defaults_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", raising=False)
+
+    settings = _settings_no_dotenv()
+
+    assert settings.trusted_proxy_hops == 0
+
+
+def test_trusted_proxy_hops_blank_env_var_falls_back_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", "")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.trusted_proxy_hops == 0
+
+
+def test_trusted_proxy_hops_set_env_var_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", "1")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.trusted_proxy_hops == 1
+
+
 def test_uninitialized_boot_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1: a fresh install boots with ZERO auth env vars.
 

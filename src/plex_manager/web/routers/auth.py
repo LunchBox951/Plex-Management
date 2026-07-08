@@ -278,9 +278,38 @@ async def _post_init_access(
 # --------------------------------------------------------------------------- #
 # Throttle
 # --------------------------------------------------------------------------- #
+def _sign_in_throttle_key(request: Request) -> str:
+    """The sliding-window throttle key for this request.
+
+    ``trusted_proxy_hops`` (default 0) keys on ``request.client.host`` alone --
+    the exact prior behaviour, so an operator who never sets the knob sees no
+    change. Behind the documented reverse-proxy topology (docker-compose binds
+    127.0.0.1; the operator fronts it with their own TLS proxy),
+    ``request.client.host`` is ALWAYS the proxy's address, collapsing the
+    "per-IP" throttle into a de-facto global cap an attacker can trip to lock
+    out the real owner. Opting in with ``trusted_proxy_hops=N`` reads the Nth
+    entry from the RIGHT of ``X-Forwarded-For`` -- the standard trusted-hop-count
+    algorithm, since only the operator's own proxy chain is trusted to have
+    appended entries; anything further left could be forged by the client
+    itself. An absent, malformed, or shorter-than-N header falls back to the
+    direct peer so it can never widen the trust boundary.
+    """
+    direct = request.client.host if request.client else "unknown"
+    hops = get_settings().trusted_proxy_hops
+    if hops <= 0:
+        return direct
+    header = request.headers.get("x-forwarded-for", "")
+    if not header:
+        return direct
+    entries = [part.strip() for part in header.split(",")]
+    if len(entries) < hops or any(not entry for entry in entries):
+        return direct
+    return entries[-hops]
+
+
 def _throttle_sign_in(request: Request) -> None:
     """Reject a client IP that exceeds the sliding-window sign-in budget."""
-    key = request.client.host if request.client else "unknown"
+    key = _sign_in_throttle_key(request)
     now = time.monotonic()
     window_start = now - _SIGN_IN_WINDOW_SECONDS
     attempts = [stamp for stamp in _sign_in_attempts.get(key, []) if stamp > window_start]

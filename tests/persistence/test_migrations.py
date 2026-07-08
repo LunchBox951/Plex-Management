@@ -199,6 +199,14 @@ def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
             ).scalar_one_or_none()
             assert source_title_index is None
 
+            blocklist_tmdb_index = conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'ix_blocklist_tmdb_media'"
+                )
+            ).scalar_one_or_none()
+            assert blocklist_tmdb_index == "ix_blocklist_tmdb_media"
+
             with pytest.raises(IntegrityError):
                 conn.execute(
                     text(

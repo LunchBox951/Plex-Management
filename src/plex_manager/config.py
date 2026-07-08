@@ -82,6 +82,18 @@ class Settings(BaseSettings):
     # ``None`` means infer from the request scheme.
     auth_cookie_secure: bool | None = None
 
+    # How many trusted reverse-proxy hops sit in front of this app. ``0`` (default)
+    # keys the sign-in throttle on ``request.client.host`` alone -- the exact prior
+    # behaviour, safe for the documented topology (docker-compose binds 127.0.0.1;
+    # an UNCONFIGURED operator proxy makes ``request.client.host`` always the
+    # proxy's address). Set to the number of proxies you operate and trust to
+    # append to ``X-Forwarded-For`` (usually 1) so the throttle keys on the real
+    # client IP instead of collapsing into one global cap an attacker could trip
+    # to lock out the real owner. Never set this higher than the number of
+    # proxies you control -- anything further left in the header can be forged
+    # by the client itself.
+    trusted_proxy_hops: int = 0
+
     log_level: str = "INFO"
 
 
