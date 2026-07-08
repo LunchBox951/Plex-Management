@@ -328,6 +328,26 @@ _STALLED_PROGRESS_RAW_STATES: Final[frozenset[str]] = frozenset(
     {"downloading", "forcedDL", "stalledDL"}
 )
 
+# Persisted-status gate (issue #165 hardening finding): the rows this detector is
+# handed come from ``download_repo.list_active()``, whose OWN docstring scopes it
+# to "active (non-terminal)" -- a broader set than the two live shapes this
+# detector understands. It includes ``failed_pending``, the non-terminal pause
+# ``mark_failed``'s own docstring documents as its Phase-A rest stop: an operator
+# (or a stranded prior attempt) may have deliberately left a row there with
+# ``remove_torrent=False`` / ``blocklist=False`` (keeping the torrent, e.g. to
+# inspect it manually), and if its underlying torrent then goes quiet past the
+# stall window, keying PURELY off the live raw state would let this detector flag
+# it anyway -- the self-heal's ``mark_failed(blocklist=True, remove_torrent=True)``
+# would then silently overturn that earlier explicit choice, deleting/blocklisting
+# a torrent an operator chose to keep. Also excludes ``import_pending`` and
+# ``client_missing``: neither shape is meaningful for a settled-on-disk or
+# currently-absent torrent. Mirrors ``reconcile``'s own
+# ``row.status not in _ACTIVE_STATUS_VALUES`` gate -- same literal-string-vs-
+# persisted-value comparison style, just a narrower set than ``ACTIVE_STATES``.
+_STALL_ELIGIBLE_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {DownloadState.Downloading.value, DownloadState.MetadataFetching.value}
+)
+
 
 @dataclass(frozen=True)
 class StallDetection:
@@ -366,6 +386,15 @@ def detect_stalls(
     one. A row with no ``added_at`` (a pre-migration hole) is skipped rather than
     guessed at.
 
+    Only rows whose PERSISTED ``status`` is exactly ``downloading`` or
+    ``metadata_fetching`` (:data:`_STALL_ELIGIBLE_STATUS_VALUES`) are considered —
+    NOT every status ``list_active()`` may return (which also includes
+    ``failed_pending``, ``import_pending``, ``client_missing``, ...). This is
+    checked in addition to, and independently of, the live raw-state check below:
+    a ``failed_pending`` residual (an operator's or a stranded prior
+    ``mark_failed``'s non-terminal rest stop) must never be reinterpreted as a
+    stall just because its torrent looks stale in the live snapshot.
+
     * **Metadata stall**: the live snapshot still reports a metadata-fetching raw
       state (``metaDL``/``forcedMetaDL``) ``metadata_stall`` after the grab.
     * **Stalled progress**: the row has existed at least ``stalled_progress``,
@@ -399,6 +428,8 @@ def detect_stalls(
     snapshot: dict[str, DownloadStatus] = {status.info_hash.lower(): status for status in client}
     detections: list[StallDetection] = []
     for row in rows:
+        if row.status not in _STALL_ELIGIBLE_STATUS_VALUES:
+            continue
         if row.added_at is None:
             continue
         status = snapshot.get(row.torrent_hash.lower())

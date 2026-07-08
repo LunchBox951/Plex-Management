@@ -381,6 +381,7 @@ class SqlDownloadRepository:
         episodes: list[int] | None = None,
         media_type: str | None = None,
         release_title: str | None = None,
+        added_at: datetime | None = None,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -399,6 +400,13 @@ class SqlDownloadRepository:
         cleanup in the SAME compare-and-swap — never overwriting a row that already
         left ``allowed_from``. ``clear_download_path`` / ``clear_first_seen_at`` /
         ``clear_failed_reason`` take precedence over their corresponding set values.
+
+        ``added_at`` (issue #165 hardening finding): lets a caller re-anchor the
+        stall-detection clock when resurrecting a terminal row for a fresh grab
+        (``grab_service._reuse_terminal_row``) — without it the reused row would
+        keep the ORIGINAL grab's timestamp, so :func:`domain.reconciler.detect_stalls`
+        could immediately misjudge the brand-new grab as stalled. ``None`` (the
+        default) leaves the column untouched, for every other CAS caller.
 
         ``require_failed_reason`` (default: no predicate) additionally constrains the
         WHERE to rows whose CURRENT ``failed_reason`` exactly equals the given value
@@ -440,6 +448,8 @@ class SqlDownloadRepository:
             values["first_seen_at"] = None
         elif first_seen_at is not None:
             values["first_seen_at"] = first_seen_at
+        if added_at is not None:
+            values["added_at"] = added_at
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))
