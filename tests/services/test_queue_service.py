@@ -28,6 +28,7 @@ from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import queue_service
 from plex_manager.services.queue_service import (
+    FailedPendingAdoptionRefusedError,
     OperatorClaimActiveError,
     RemovalInProgressError,
     _is_operator_claimed,  # pyright: ignore[reportPrivateUsage]
@@ -2897,3 +2898,134 @@ async def test_self_heal_never_overrides_a_concurrent_operator_claim(
     # newer owner.
     assert _owns_operator_claim(download_id, operator_token)
     _release_operator_claim(download_id, operator_token)
+
+
+async def test_mark_failed_refuses_to_adopt_when_disallowed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Direct unit test for the new guard (Codex review, comment 3541100611):
+    ``mark_failed(allow_adopt_existing_marker=False)`` on a row already at
+    ``failed_pending`` raises :class:`FailedPendingAdoptionRefusedError` instead
+    of restamping it -- the row, its marker, and the request are left completely
+    untouched, and the claim registry has nothing leaked behind."""
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="failed_pending",
+        failed_reason="operator mark-failed in progress (blocklist=no, remove=no, nonce=7)",
+    )
+
+    async with sessionmaker_() as session:
+        with pytest.raises(FailedPendingAdoptionRefusedError):
+            await queue_service.mark_failed(
+                session,
+                None,
+                download_id=download_id,
+                blocklist=True,
+                remove_torrent=False,
+                allow_adopt_existing_marker=False,
+            )
+
+    assert not queue_service._operator_fail_claims  # pyright: ignore[reportPrivateUsage]
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None
+    assert download.status == "failed_pending"
+    assert (
+        download.failed_reason
+        == "operator mark-failed in progress (blocklist=no, remove=no, nonce=7)"
+    )
+    assert request is not None
+    assert request.status is RequestStatus.downloading
+    assert blocklist == []
+
+
+async def test_self_heal_refuses_to_adopt_a_released_operator_residual(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review (comment 3541100611): the narrower race left open by issue
+    #165's claim-supersede fix (``allow_claim_supersede=False``). That guard only
+    refuses a claim that is STILL LIVE; it says nothing about a row an operator's
+    call already finished with and moved on from -- a claim is released the
+    instant its owning call returns, but the durable ``failed_pending`` row +
+    marker it stamped can outlive that release (here: a genuine Phase-C
+    exhaustion, exactly like
+    ``test_mark_failed_exhaustion_residual_heals_with_operator_flags`` above).
+
+    Without the ``allow_adopt_existing_marker=False`` fix, self-heal's own
+    ``mark_failed`` call would see no live claim, walk into the adopt branch, and
+    restamp the operator's ``blocklist=False, remove_torrent=False`` residual
+    with the reconcile-default ``blocklist=True, remove_torrent=True`` --
+    silently overriding the operator's explicit choice. This test proves that no
+    longer happens: the residual, its marker, and the request are left exactly
+    as the operator's call left them."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+
+    # The operator's manual mark_failed(blocklist=False, remove_torrent=False)
+    # commits Phase A (stamps its marker) but every Phase C attempt fails, so the
+    # call raises -- yet its `finally` still releases the claim (see
+    # test_mark_failed_exhaustion_residual_heals_with_operator_flags).
+    async with sessionmaker_() as session:
+        _fail_commit_on(session, monkeypatch, {2, 3, 4})
+        with pytest.raises(OperationalError):
+            await queue_service.mark_failed(
+                session, None, download_id=download_id, blocklist=False, remove_torrent=False
+            )
+    assert not queue_service._operator_fail_claims  # pyright: ignore[reportPrivateUsage]
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+    assert download is not None
+    assert download.status == "failed_pending"
+    operator_marker = download.failed_reason
+    assert operator_marker is not None
+    assert re.fullmatch(
+        r"operator mark-failed in progress \(blocklist=no, remove=no, nonce=\d+\)",
+        operator_marker,
+    )
+
+    # Self-heal's own stall-detection snapshot (taken at the top of THIS cycle,
+    # before the operator's race landed) still shows the row as downloading --
+    # exactly the eligibility detect_stalls would have computed.
+    row = DownloadRecord(
+        id=download_id,
+        torrent_hash=_HASH,
+        status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    detection = StallDetection(
+        download_id=download_id, torrent_hash=_HASH, shape="stalled_progress"
+    )
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        await _self_heal_stalled_download(session, qbt, row, detection, now=datetime.now(UTC))
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    # The operator's residual is untouched: no restamp, no removal, no blocklist,
+    # no history event, and the request stays owned by the still-pending failure.
+    assert download is not None
+    assert download.status == "failed_pending"
+    assert download.failed_reason == operator_marker  # NOT restamped by self-heal
+    assert qbt.removed == []  # remove_torrent=True never ran
+    assert blocklist == []  # blocklist=True never ran
+    assert history == []
+    assert request is not None
+    assert request.status is RequestStatus.downloading  # not re-armed by self-heal
