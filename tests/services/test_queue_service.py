@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.domain.reconciler import StallDetection
 from plex_manager.models import (
     Blocklist,
     Download,
@@ -22,6 +23,7 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import queue_service
@@ -33,6 +35,7 @@ from plex_manager.services.queue_service import (
     _owns_operator_claim,  # pyright: ignore[reportPrivateUsage]
     _register_operator_claim,  # pyright: ignore[reportPrivateUsage]
     _release_operator_claim,  # pyright: ignore[reportPrivateUsage]
+    _self_heal_stalled_download,  # pyright: ignore[reportPrivateUsage]
 )
 from tests.web.fakes import FakeQbittorrent
 
@@ -1044,9 +1047,19 @@ async def test_mark_failed_phase_c_exhaustion_leaves_reconcilable_state(
 
 
 async def _seed_movie_request_and_download(
-    sm: SessionMaker, *, download_status: str = "downloading", failed_reason: str | None = None
+    sm: SessionMaker,
+    *,
+    download_status: str = "downloading",
+    failed_reason: str | None = None,
+    added_at: datetime | None = None,
 ) -> tuple[int, int]:
-    """Insert a movie request + one tracked download; return (request_id, download_id)."""
+    """Insert a movie request + one tracked download; return (request_id, download_id).
+
+    ``added_at`` (issue #165's stall self-heal) is left to the column's
+    ``server_default=func.now()`` when omitted -- only passed through when a
+    test needs to backdate the grab (never explicitly ``None``, which would
+    fight the NOT NULL column).
+    """
     async with sm() as session:
         request = MediaRequest(
             tmdb_id=603,
@@ -1062,6 +1075,7 @@ async def _seed_movie_request_and_download(
             media_request_id=request.id,
             tmdb_id=603,
             failed_reason=failed_reason,
+            **({"added_at": added_at} if added_at is not None else {}),
         )
         session.add(download)
         await session.commit()
@@ -2547,3 +2561,250 @@ async def test_reconcile_owned_removal_outcome_is_durable_and_heals_without_clie
     assert request is not None and request.status is RequestStatus.searching
     assert len(blocklist) == 1
     assert blocklist[0].reason.value == "failed"  # reconcile vocabulary, not operator
+
+
+# ---------------------------------------------------------------------------
+# Stalled-download self-heal (issue #165) -- the minimal fixed-cooldown design.
+# reconcile_and_list detects a download stuck in metadata-fetching or with a
+# dead/frozen download using THIS cycle's already-fetched DownloadStatus list,
+# and self-heals it via the EXACT same mark_failed(blocklist=True,
+# remove_torrent=True) call the operator's manual button makes.
+# ---------------------------------------------------------------------------
+async def test_metadata_stall_past_threshold_is_auto_mark_failed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="metadata_fetching",
+        added_at=datetime.now(UTC) - timedelta(minutes=46),
+    )
+
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert download is not None and download.status == "failed"
+    assert request is not None and request.status is RequestStatus.searching
+    assert len(blocklist) == 1
+    assert qbt.removed == [(_HASH, True)]
+    assert len(history) == 1
+    assert "metadata_stall" in (history[0].message or "")
+
+
+async def test_metadata_stall_under_threshold_is_not_healed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    _request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="metadata_fetching",
+        added_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert download is not None and download.status == "metadata_fetching"
+    assert blocklist == []
+    assert history == []
+    assert qbt.removed == []
+
+
+async def test_stalled_dl_raw_state_past_threshold_is_auto_mark_failed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    stale_activity = int((datetime.now(UTC) - timedelta(hours=5)).timestamp())
+
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=_TITLE,
+                raw_state="stalledDL",
+                last_activity_unix=stale_activity,
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert download is not None and download.status == "failed"
+    assert request is not None and request.status is RequestStatus.searching
+    assert len(blocklist) == 1
+    assert qbt.removed == [(_HASH, True)]
+    assert len(history) == 1
+    assert "stalled_progress" in (history[0].message or "")
+
+
+async def test_stalled_dl_raw_state_with_recent_activity_is_not_healed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Regression: a flaky-but-alive seeder reporting a single transient
+    ``stalledDL`` tick (last activity 30s ago) on a row added well past the
+    stall window must NOT be self-healed -- destroying a healthy, actively
+    transferring torrent violates "correction, never destruction"."""
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    recent_activity = int((datetime.now(UTC) - timedelta(seconds=30)).timestamp())
+
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=_TITLE,
+                raw_state="stalledDL",
+                last_activity_unix=recent_activity,
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert download is not None and download.status == "downloading"
+    assert request is not None and request.status is RequestStatus.downloading
+    assert blocklist == []
+    assert qbt.removed == []
+    assert history == []
+
+
+async def test_downloading_row_with_recent_activity_is_not_healed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    _request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    recent_activity = int((datetime.now(UTC) - timedelta(minutes=5)).timestamp())
+
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=_TITLE,
+                raw_state="downloading",
+                last_activity_unix=recent_activity,
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert download is not None and download.status == "downloading"
+    assert blocklist == []
+    assert history == []
+    assert qbt.removed == []
+
+
+async def test_self_heal_skips_a_download_that_vanished_mid_cycle(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The self-heal's own guardrail: mark_failed raising for a row that no
+    longer exists (a race between this cycle's stall snapshot and the heal
+    call landing) is logged and skipped, not raised -- one stalled row's edge
+    case must never abort the whole reconcile cycle."""
+    row = DownloadRecord(
+        id=999_999,
+        torrent_hash=_HASH,
+        status="metadata_fetching",
+        added_at=datetime.now(UTC),
+    )
+    detection = StallDetection(download_id=999_999, torrent_hash=_HASH, shape="metadata_stall")
+
+    async with sessionmaker_() as session:
+        await _self_heal_stalled_download(
+            session, FakeQbittorrent(), row, detection, now=datetime.now(UTC)
+        )
+        history = (await session.execute(select(DownloadHistory))).scalars().all()
+
+    assert history == []

@@ -191,7 +191,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.events import DownloadFailed
 from plex_manager.domain.reconciler import (
+    StallDetection,
     StateTransition,
+    detect_stalls,
     failed_download_events,
     reconcile,
     unmapped_client_states,
@@ -205,6 +207,8 @@ from plex_manager.logsafe import safe_int
 from plex_manager.models import (
     BlocklistReason,
     Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -813,6 +817,62 @@ async def _handle_failed(
     return None
 
 
+async def _self_heal_stalled_download(
+    session: AsyncSession,
+    qbt: DownloadClientPort,
+    row: DownloadRecord,
+    detection: StallDetection,
+    *,
+    now: datetime,
+) -> None:
+    """Issue #165's minimal self-heal: mark-fail + blocklist a stalled download —
+    the EXACT same :func:`mark_failed` call the operator's manual "mark failed +
+    blocklist" button makes, so the existing single-owner claim/nonce protocol,
+    blocklist write, torrent removal, and request/season re-arm are reused
+    verbatim (module docstring). Re-arming returns the owner to ``searching``,
+    which re-enters the EXISTING auto-grab backoff ladder
+    (``auto_grab_service.BACKOFF_SCHEDULE``) — no separate retry cap is added
+    here; a pathological title still bounds out at the honest,
+    retryable ``no_acceptable_release`` park state on exhaustion.
+
+    A losing race (an operator claimed the row, or it left the legal
+    Downloading/MetadataFetching states, between this cycle's snapshot and this
+    call) is logged and skipped rather than raised — one stalled row's edge case
+    must never abort the whole reconcile cycle (imports, availability, every
+    OTHER row) for this tick.
+    """
+    elapsed = now - row.added_at if row.added_at is not None else None
+    try:
+        await mark_failed(session, qbt, download_id=row.id, blocklist=True, remove_torrent=True)
+    except (InvalidStateTransitionError, RemovalInProgressError, LookupError) as exc:
+        _logger.warning(
+            "self-heal (issue #165) skipped for download %s (%s, elapsed=%s): %s",
+            safe_int(row.id),
+            detection.shape,
+            elapsed,
+            exc,
+        )
+        return
+    _logger.warning(
+        "self-heal (issue #165): download %s auto mark-failed + blocklisted after a "
+        "%s stall (elapsed=%s)",
+        safe_int(row.id),
+        detection.shape,
+        elapsed,
+    )
+    session.add(
+        DownloadHistory(
+            tmdb_id=row.tmdb_id,
+            torrent_hash=row.torrent_hash,
+            event_type=DownloadHistoryEvent.stalled,
+            source_title=row.release_title,
+            message=f"auto-detected {detection.shape} stall (elapsed={elapsed}); "
+            "mark-failed + blocklisted, replacing",
+        )
+    )
+    await session.commit()
+
+
 async def list_queue(session: AsyncSession) -> list[QueueRecord]:
     """Read-only snapshot of the active queue — NO reconcile, NO writes.
 
@@ -909,6 +969,26 @@ async def reconcile_and_list(
     # and must not run while this write transaction holds SQLite's write lock, so it
     # is likewise deferred to Phase B below.
     await session.commit()
+
+    # Stalled-download self-heal (issue #165's minimal fixed-cooldown design):
+    # reuses THIS cycle's already-fetched ``rows``/``statuses`` (no new interval,
+    # no extra client call — see ``domain.reconciler.detect_stalls``). A
+    # detection whose row this SAME cycle's reconcile above already moved (it's
+    # in ``transitions_by_id``) is skipped -- it changed domain state THIS tick,
+    # so the pre-cycle stall read is stale for it and next cycle re-evaluates it
+    # fresh. A row an operator ``mark_failed`` currently owns is likewise skipped
+    # (the pre-stamp invisibility fast-path, module docstring) -- the operator's
+    # own call, not this heal, is what completes it.
+    rows_by_id = {row.id: row for row in rows}
+    for detection in detect_stalls(rows, statuses, now=now):
+        if detection.download_id in transitions_by_id or _is_operator_claimed(
+            detection.download_id
+        ):
+            continue
+        stalled_row = rows_by_id.get(detection.download_id)
+        if stalled_row is None:  # pragma: no cover - detections derive from rows
+            continue
+        await _self_heal_stalled_download(session, qbt, stalled_row, detection, now=now)
 
     # Build the set of failed rows to complete this cycle:
     #   1. Rows that transitioned TO ``failed_pending`` THIS cycle (CAS-APPLIED only

@@ -106,6 +106,13 @@ class DownloadRecord(BaseModel):
     media_type: str | None = None
     failed_reason: str | None = None
     first_seen_at: datetime | None = None
+    # When this download was grabbed (``downloads.added_at``, server-defaulted at
+    # row creation) — distinct from ``first_seen_at``, which is ONLY the
+    # missing-grace anchor (stamped when a torrent first vanishes from the
+    # client). The stall self-heal (issue #165) anchors both its stall shapes on
+    # this: it correctly represents "since we started waiting" for a fresh grab,
+    # while ``first_seen_at`` is usually unset for a healthy, present torrent.
+    added_at: datetime | None = None
     download_path: str | None = None
     # The release ("download") title the grab decision picked -- the same value
     # already written to ``DownloadHistory.source_title`` at grab time and used

@@ -69,6 +69,7 @@ def _to_record(row: Download) -> DownloadRecord:
         media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
+        added_at=_as_utc(row.added_at),
         download_path=row.download_path,
         release_title=row.release_title,
     )

@@ -144,6 +144,15 @@ class DownloadHistoryEvent(StrEnum):
     # ``event_type`` column, so neither member needs a migration of its own.
     reported = "reported"
     cancelled = "cancelled"
+    # Issue #165's minimal fixed-cooldown self-heal: the reconcile loop auto
+    # mark-fails a download stuck in metadata-fetching or with dead/frozen
+    # progress, exactly the operator's manual mark-failed button. UNLIKE
+    # ``reported``/``cancelled`` above, this one DOES need a migration:
+    # ``b7e2d4f6c8a1`` already gave this column a real CHECK constraint
+    # (``ck_download_history_event_type_enum``) enumerating every value at the
+    # time, so a migrated database's constraint would otherwise reject this new
+    # value outright — see ``26bc01829ae1_add_stalled_download_history_event_type``.
+    stalled = "stalled"
 
 
 def _enum(enum_cls: type[StrEnum], *, name: str) -> sa.Enum:
