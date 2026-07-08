@@ -37,6 +37,21 @@ _FIELDS: dict[str, dict[str, object]] = {
         "season": 2,
         "episode": 5,
     },
+    "Show.S02E06.1080p.WEB-DL.x264-GRP": {
+        "source": "Web",
+        "screen_size": "1080p",
+        "season": 2,
+        "episode": 6,
+    },
+    # A single-episode release of a HIGHER quality than any of the pack fixtures
+    # above, used to prove the season-pack-only gate (issue #167) rejects it
+    # regardless of quality -- the gate runs BEFORE the quality gate.
+    "Show.S02E05.1080p.BluRay.x264-GRP": {
+        "source": "Blu-ray",
+        "screen_size": "1080p",
+        "season": 2,
+        "episode": 5,
+    },
     # A multi-season pack (S01-S03) — season is a LIST, so classify_release_scope
     # returns "multi_season_pack".
     "Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP": {
@@ -198,10 +213,10 @@ def test_prefer_season_pack_default_is_byte_identical_to_no_season_pack_ranking(
     ]
 
 
-def test_prefer_season_pack_breaks_ties_toward_the_pack() -> None:
-    # Identical quality + seeders, and the pack is even SMALLER (so the default
-    # size tiebreak would rank it second) -- with prefer_season_pack=True the
-    # scope tiebreak fires BEFORE seeders/size and the pack wins outright.
+def test_prefer_season_pack_hard_rejects_a_single_episode_even_when_it_is_bigger() -> None:
+    # Issue #167: prefer_season_pack is now a HARD gate, not a tiebreak -- a
+    # single-episode release is a permanent rejection, never scored, regardless of
+    # how it compares on seeders/size to the pack.
     pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10, size_bytes=1_000_000_000)
     single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=10, size_bytes=2_000_000_000)
     result = decide(
@@ -213,20 +228,16 @@ def test_prefer_season_pack_breaks_ties_toward_the_pack() -> None:
         prefer_season_pack=True,
     )
 
-    assert [s.candidate.title for s in result.accepted] == [
-        "Show.S02.1080p.WEB-DL.x264-GRP",
-        "Show.S02E05.1080p.WEB-DL.x264-GRP",
-    ]
-    # The scope bonus never overrides the profile-order comparator: it is a purely
-    # additive score component that must not itself decide acceptance/rejection.
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02.1080p.WEB-DL.x264-GRP"]
+    assert (single, RejectionReason.NOT_SEASON_PACK) in result.rejected
     assert result.no_acceptable_release is False
 
 
-def test_score_reflects_accepted_rank_not_additive_seeder_lead() -> None:
-    # #105: with prefer_season_pack, the comparator ranks a low-seeder pack ABOVE
-    # a non-pack with a >1e6 seeder lead (the scope tiebreak fires before
-    # seeders). The OLD additive score gave the non-pack a higher score than the
-    # pack ranked above it -- score contradicted the accepted order.
+def test_prefer_season_pack_hard_rejects_a_single_episode_despite_a_huge_seeder_lead() -> None:
+    # #105/#167: a single-episode release with a massive (>1e6) seeder lead over
+    # the pack must still be a permanent NOT_SEASON_PACK rejection -- seeders can
+    # never rescue a release that cannot satisfy the whole-season request. Only
+    # the pack accepts, and its score is the sole (rank-1) projection (#105).
     pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
     single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=2_000_000)
     result = decide(
@@ -238,12 +249,54 @@ def test_score_reflects_accepted_rank_not_additive_seeder_lead() -> None:
         prefer_season_pack=True,
     )
 
-    assert result.accepted[0].candidate is pack
-    assert result.accepted[1].candidate is single
-    # Score must not contradict that ordering.
-    assert result.accepted[0].score >= result.accepted[1].score
-    scores = [scored.score for scored in result.accepted]
-    assert scores == sorted(scores, reverse=True)
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02.1080p.WEB-DL.x264-GRP"]
+    assert (single, RejectionReason.NOT_SEASON_PACK) in result.rejected
+    assert result.accepted[0].score == 1.0
+
+
+def test_whole_season_request_with_only_single_episodes_yields_no_acceptable_release() -> None:
+    # Issue #167 (production bug): when no season pack is available at all -- e.g.
+    # every one was already exhausted/blocklisted -- a whole-season request must
+    # NOT fall back to grabbing single episodes. Every candidate is rejected
+    # NOT_SEASON_PACK and the engine surfaces no_acceptable_release, never a grab.
+    e05 = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=500)
+    e06 = _candidate("Show.S02E06.1080p.WEB-DL.x264-GRP", seeders=10)
+    result = decide(
+        [e05, e06],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+
+    assert result.accepted == ()
+    assert result.no_acceptable_release is True
+    assert (e05, RejectionReason.NOT_SEASON_PACK) in result.rejected
+    assert (e06, RejectionReason.NOT_SEASON_PACK) in result.rejected
+
+
+def test_whole_season_request_with_pack_and_singles_accepts_only_the_pack() -> None:
+    # Issue #167: a whole-season request with BOTH a season pack and several
+    # single-episode candidates must accept ONLY the pack -- the singles are
+    # hard-rejected regardless of seeders/quality, never scored/ranked alongside
+    # it.
+    pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
+    e05 = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=999)
+    e06 = _candidate("Show.S02E06.1080p.WEB-DL.x264-GRP", seeders=500)
+    result = decide(
+        [e05, e06, pack],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+    )
+
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02.1080p.WEB-DL.x264-GRP"]
+    assert result.no_acceptable_release is False
+    assert (e05, RejectionReason.NOT_SEASON_PACK) in result.rejected
+    assert (e06, RejectionReason.NOT_SEASON_PACK) in result.rejected
 
 
 def test_multi_season_pack_is_permanently_rejected_not_preferred() -> None:
@@ -252,7 +305,10 @@ def test_multi_season_pack_is_permanently_rejected_not_preferred() -> None:
     # for a whole-season grab where it covers the requested season and out-seeds
     # the alternative. This app's one-download-one-season model can't satisfy
     # several seasons from a single grab without stranding sibling
-    # SeasonRequests, so the engine must never prefer/accept one.
+    # SeasonRequests, so the engine must never prefer/accept one. The remaining
+    # single episode is ALSO hard-rejected by the season-pack-only gate (issue
+    # #167) -- neither candidate can satisfy a whole-season request, so nothing
+    # is accepted at all.
     multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP", seeders=500)
     single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=10)
     result = decide(
@@ -263,8 +319,10 @@ def test_multi_season_pack_is_permanently_rejected_not_preferred() -> None:
         _never_blocklisted,
         prefer_season_pack=True,
     )
-    assert [s.candidate.title for s in result.accepted] == ["Show.S02E05.1080p.WEB-DL.x264-GRP"]
+    assert result.accepted == ()
+    assert result.no_acceptable_release is True
     assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
+    assert (single, RejectionReason.NOT_SEASON_PACK) in result.rejected
 
 
 def test_multi_season_pack_rejected_even_without_prefer_season_pack() -> None:
@@ -278,10 +336,11 @@ def test_multi_season_pack_rejected_even_without_prefer_season_pack() -> None:
     assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
 
 
-def test_single_season_pack_still_classified_and_preferred() -> None:
+def test_single_season_pack_still_classified_and_hard_gated_for() -> None:
     # A single-season pack (S02, no episode token) is unaffected by the
     # multi-season gate: classify_release_scope still reports "season_pack" and
-    # it still earns the prefer_season_pack tiebreak over a single episode.
+    # it still passes the prefer_season_pack hard gate, while a single episode of
+    # the same show/season does not.
     pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
     single = _candidate("Show.S02E05.1080p.WEB-DL.x264-GRP", seeders=500)
     result = decide(
@@ -292,16 +351,18 @@ def test_single_season_pack_still_classified_and_preferred() -> None:
         _never_blocklisted,
         prefer_season_pack=True,
     )
-    assert result.accepted[0].candidate.title == "Show.S02.1080p.WEB-DL.x264-GRP"
-    assert result.rejected == ()
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02.1080p.WEB-DL.x264-GRP"]
+    assert (single, RejectionReason.NOT_SEASON_PACK) in result.rejected
 
 
-def test_prefer_season_pack_never_beats_a_higher_quality_release() -> None:
-    # prefer_season_pack only breaks a tie AFTER profile order -- a lower-quality
-    # season pack must still lose to a higher-quality single episode.
+def test_prefer_season_pack_hard_gate_precedes_the_quality_comparison() -> None:
+    # Issue #167: the season-pack-only gate runs BEFORE the quality gate, so a
+    # single episode of HIGHER quality than the pack is still hard-rejected --
+    # prefer_season_pack no longer merely breaks a tie AFTER profile order, it
+    # decides acceptance outright.
     pack = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=10)
     higher_quality_single = _candidate(
-        "Movie.2024.1080p.BluRay.x264-GRP", seeders=10
+        "Show.S02E05.1080p.BluRay.x264-GRP", seeders=10
     )  # BluRay-1080p outranks WEBDL-1080p in the default profile
     result = decide(
         [pack, higher_quality_single],
@@ -312,10 +373,8 @@ def test_prefer_season_pack_never_beats_a_higher_quality_release() -> None:
         prefer_season_pack=True,
     )
 
-    assert [s.candidate.title for s in result.accepted] == [
-        "Movie.2024.1080p.BluRay.x264-GRP",
-        "Show.S02.1080p.WEB-DL.x264-GRP",
-    ]
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02.1080p.WEB-DL.x264-GRP"]
+    assert (higher_quality_single, RejectionReason.NOT_SEASON_PACK) in result.rejected
 
 
 def test_wrong_media_is_rejected_before_quality_even_if_top_quality() -> None:
