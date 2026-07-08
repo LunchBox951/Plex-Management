@@ -148,6 +148,21 @@ PREDICATE-ATOMIC (the final protocol form):
     ``web/routers/settings.py``'s ``_rotate_lock`` documents), and the registry
     is only touched by synchronous dict/set operations on the one event loop —
     no await inside any read-modify-write, so no lock is needed.
+  - **The "newest wins" replace rule is an OPERATOR-vs-OPERATOR rule only**
+    (issue #165 hardening finding). The stalled-download self-heal
+    (:func:`_self_heal_stalled_download`) calls :func:`mark_failed` with
+    ``allow_claim_supersede=False``, so its own registration attempt REFUSES
+    (:class:`OperatorClaimActiveError`) instead of replacing whenever ANY claim
+    already exists. This closes a race the caller-side pre-check
+    (``reconcile_and_list``'s ``_is_operator_claimed``) cannot: that check and
+    self-heal's own later registration are separated by self-heal's own
+    ``session.get`` await inside ``mark_failed``, a window an operator's manual
+    call can register a claim in without the pre-check ever seeing it. Because
+    the re-check happens in the SAME synchronous step that would otherwise grant
+    the claim, no further await separates "another owner might exist" from "I am
+    now the owner" for the self-heal path — closing the gap outright rather than
+    narrowing it. An operator's OWN calls are unaffected: two operator commands
+    racing each other still resolve newest-wins, exactly as before.
 
 * **Healing honors the marker.** A residual re-derived by
   :func:`reconcile_and_list` (or, when qBittorrent is unconfigured OR the cycle
@@ -228,6 +243,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "InvalidStateTransitionError",
+    "OperatorClaimActiveError",
     "RemovalInProgressError",
     "heal_failed_pending_without_client",
     "list_queue",
@@ -317,24 +333,44 @@ _claim_tokens = count(1)
 _reconcile_removals_in_flight: set[int] = set()
 
 
-def _register_operator_claim(download_id: int, flags: _OperatorFailFlags) -> int:
-    """Claim ``download_id`` for an operator mark_failed; return the owner token.
+def _register_operator_claim(
+    download_id: int, flags: _OperatorFailFlags, *, allow_supersede: bool = True
+) -> int:
+    """Claim ``download_id`` for a mark_failed call; return the owner token.
 
-    REPLACES any existing claim: the newest operator command owns the row (protocol
-    step 1) — the superseded call's token silently stops owning, so its later
-    token-gated phases yield. The ONE exception (the removal-physics rule): while a
-    torrent-removal I/O for this download is in flight — EITHER the current
-    operator owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
+    By default (``allow_supersede=True``, every OPERATOR-initiated call)
+    REPLACES any existing claim: the newest operator command owns the row
+    (protocol step 1) — the superseded call's token silently stops owning, so its
+    later token-gated phases yield. The ONE exception (the removal-physics rule):
+    while a torrent-removal I/O for this download is in flight — EITHER the
+    current owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
     Phase-B delete (``_reconcile_removals_in_flight``) — the remove decision is
     already irreversible, so registration is REFUSED with
     :class:`RemovalInProgressError` — accepting a ``remove_torrent=False`` command
-    then would promise a file the in-flight delete is destroying.
+    then would promise a file the in-flight delete is destroying. This physics
+    check applies UNCONDITIONALLY, even when ``allow_supersede=False``.
+
+    ``allow_supersede=False`` (the stalled-download self-heal's own path, issue
+    #165 hardening finding) additionally refuses registration — with
+    :class:`OperatorClaimActiveError` — whenever ANY claim already exists, live
+    owner or not yet removal-in-flight. Self-heal must NEVER become the newer
+    owner over an existing claim: unlike two racing operator commands (where
+    "newest wins" is the correct, intentional semantics), a self-heal call
+    superseding an operator's in-flight claim would silently override a live
+    human decision the operator is still in the middle of committing. This check
+    is the ONLY thing that closes that race, because it re-verifies atomically in
+    the SAME synchronous step that would otherwise register the superseding
+    claim — no ``await`` separates the check from the decision here, unlike the
+    caller's own pre-check (:func:`_is_operator_claimed` in
+    :func:`reconcile_and_list`), which races against exactly this registration.
     """
     if download_id in _reconcile_removals_in_flight:
         raise RemovalInProgressError(download_id)
     existing = _operator_fail_claims.get(download_id)
     if existing is not None and existing.removal_in_flight:
         raise RemovalInProgressError(download_id)
+    if not allow_supersede and existing is not None:
+        raise OperatorClaimActiveError(download_id)
     token = next(_claim_tokens)
     _operator_fail_claims[download_id] = _OperatorClaim(token=token, flags=flags)
     return token
@@ -517,6 +553,34 @@ class RemovalInProgressError(Exception):
         self.download_id = download_id
         super().__init__(
             f"a removal for download {download_id} is already in progress; retry after it completes"
+        )
+
+
+class OperatorClaimActiveError(Exception):
+    """A NON-superseding claim attempt found an existing live claim (issue #165
+    hardening finding, self-heal-vs-operator race).
+
+    Raised only by a caller that registered with ``allow_supersede=False``
+    (currently the stalled-download self-heal path only, via
+    :func:`mark_failed`'s ``allow_claim_supersede``): an ordinary operator
+    ``mark_failed`` call always supersedes (the module docstring's "newest
+    command owns" rule is unchanged for operator-vs-operator races). Self-heal
+    opts OUT of that rule instead, because it must never be the newer owner over
+    ANY existing claim — including one an operator's own manual call registered
+    AFTER ``reconcile_and_list``'s own ``_is_operator_claimed`` pre-check already
+    ran and passed (that pre-check and self-heal's own registration are not one
+    atomic step: the caller's ``await session.get`` in between is exactly the
+    window an operator's call can land in). Re-checking atomically at
+    registration time — the same synchronous critical section that decides
+    ownership — closes that gap without touching the existing single-operator
+    -click behaviour at all.
+    """
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(
+            f"download {download_id} already has an active mark-failed claim; "
+            "backing off rather than superseding it"
         )
 
 
@@ -840,11 +904,30 @@ async def _self_heal_stalled_download(
     call) is logged and skipped rather than raised — one stalled row's edge case
     must never abort the whole reconcile cycle (imports, availability, every
     OTHER row) for this tick.
+
+    Passes ``allow_claim_supersede=False`` (issue #165 hardening finding): this
+    call must never become the newer owner over an EXISTING claim, even one that
+    only registered after ``reconcile_and_list``'s own ``_is_operator_claimed``
+    pre-check already ran (that pre-check races this call's own ``session.get``
+    inside :func:`mark_failed` -- see :class:`OperatorClaimActiveError`). Caught
+    below exactly like the other losing-race outcomes.
     """
     elapsed = now - row.added_at if row.added_at is not None else None
     try:
-        await mark_failed(session, qbt, download_id=row.id, blocklist=True, remove_torrent=True)
-    except (InvalidStateTransitionError, RemovalInProgressError, LookupError) as exc:
+        await mark_failed(
+            session,
+            qbt,
+            download_id=row.id,
+            blocklist=True,
+            remove_torrent=True,
+            allow_claim_supersede=False,
+        )
+    except (
+        InvalidStateTransitionError,
+        RemovalInProgressError,
+        OperatorClaimActiveError,
+        LookupError,
+    ) as exc:
         _logger.warning(
             "self-heal (issue #165) skipped for download %s (%s, elapsed=%s): %s",
             safe_int(row.id),
@@ -1366,6 +1449,7 @@ async def mark_failed(
     download_id: int,
     blocklist: bool,
     remove_torrent: bool = True,
+    allow_claim_supersede: bool = True,
 ) -> DownloadRecord:
     """Operator move: fail a download (and optionally blocklist its release).
 
@@ -1381,6 +1465,19 @@ async def mark_failed(
     ``None`` client with ``remove_torrent=True`` is a caller bug -- the endpoint has
     already 409'd that combination up front -- so it is refused loudly here rather than
     silently skipping the removal (honesty over silence).
+
+    ``allow_claim_supersede`` (default ``True``, every OPERATOR call -- unchanged
+    behaviour): whether THIS call's claim registration may replace an existing
+    live claim (module docstring, "Operator provenance"). The stalled-download
+    self-heal (issue #165 hardening finding) is the one caller that passes
+    ``False``: it must never become the newer owner over an existing claim,
+    because ``reconcile_and_list``'s own pre-check (``_is_operator_claimed``) can
+    race an operator's manual call that is suspended between ITS OWN
+    ``session.get`` and ITS OWN claim registration -- the pre-check and this
+    call's registration are two different moments, not one atomic step. Passing
+    ``False`` re-verifies atomically at registration time instead of trusting the
+    caller's earlier snapshot: see :func:`_register_operator_claim` and
+    :class:`OperatorClaimActiveError`.
 
     Mirrors :func:`reconcile_and_list`'s three-phase ordering (issue #68 + the
     Phase-C-strand hardening): Phase A routes the row to the NON-terminal
@@ -1449,7 +1546,7 @@ async def mark_failed(
     # ownership by including the exact marker in its WHERE, so no check-then-act
     # window separates the ownership decision from the write.
     flags = _OperatorFailFlags(blocklist=blocklist, remove_torrent=remove_torrent)
-    token = _register_operator_claim(download_id, flags)
+    token = _register_operator_claim(download_id, flags, allow_supersede=allow_claim_supersede)
     marker = _operator_fail_marker(flags, token)
     superseded = False
     try:

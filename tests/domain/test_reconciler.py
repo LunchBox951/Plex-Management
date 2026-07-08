@@ -506,6 +506,51 @@ def test_import_pending_row_is_never_flagged(raw_state: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "status",
+    [
+        DownloadState.FailedPending.value,
+        DownloadState.ImportPending.value,
+        DownloadState.ClientMissing.value,
+        "searching",
+        "importing",
+    ],
+)
+def test_non_downloading_metadata_persisted_status_is_never_flagged(status: str) -> None:
+    # Regression (issue #165 hardening finding): ``list_active()`` returns every
+    # non-terminal row, INCLUDING ``failed_pending`` -- mark_failed's own Phase-A
+    # rest stop, which an operator may have deliberately left with
+    # remove_torrent=False/blocklist=False to keep the torrent. Keying purely off
+    # the LIVE raw state (metaDL, stale downloading/stalledDL) must never flag one
+    # of these rows just because its underlying torrent looks stale -- the
+    # self-heal would silently overturn an earlier explicit choice.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [_row(status=status, added_at=_NOW - timedelta(hours=10))]
+    metadata_client = [_status(raw_state="metaDL")]
+    downloading_client = [_status(raw_state="stalledDL", last_activity_unix=stale_activity)]
+
+    assert detect_stalls(rows, metadata_client, now=_NOW) == []
+    assert detect_stalls(rows, downloading_client, now=_NOW) == []
+
+
+def test_failed_pending_row_with_stale_torrent_is_never_self_healed() -> None:
+    # The exact scenario the finding describes: an earlier
+    # mark_failed(remove_torrent=False, blocklist=False) left the row at
+    # failed_pending, deliberately keeping the torrent. If that torrent then goes
+    # stale, detect_stalls must not pick it up even though the live snapshot looks
+    # identical to a genuine stalled_progress case.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [
+        _row(
+            status=DownloadState.FailedPending.value,
+            added_at=_NOW - timedelta(hours=4),
+        )
+    ]
+    client = [_status(raw_state="downloading", last_activity_unix=stale_activity)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+@pytest.mark.parametrize(
     "raw_state",
     [
         "pausedDL",

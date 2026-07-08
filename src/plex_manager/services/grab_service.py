@@ -18,6 +18,7 @@ request never ends up with two active downloads racing each other.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
@@ -282,6 +283,17 @@ async def _reuse_terminal_row(
     fresh grab against the long-expired window. ``clear_first_seen_at`` gives the
     re-grab a clean grace window.
 
+    The stale ``added_at`` stall anchor is reset the same way (issue #165
+    hardening finding): :func:`domain.reconciler.detect_stalls` anchors its
+    metadata/stalled-progress windows on ``added_at`` ("when the row was
+    grabbed"). Without resetting it here, a resurrected row keeps the ORIGINAL
+    grab's timestamp — which, for a row that stalled, got self-healed, and is now
+    being re-grabbed under the SAME torrent hash, may already be past the stall
+    thresholds, so the very next reconcile tick would immediately misjudge the
+    brand-new grab as stalled and mark-fail/remove/blocklist it before it ever had
+    a chance to download (a heal-regrab-heal loop). Stamped to the CURRENT time so
+    the fresh grab gets a full, honest stall window.
+
     The stale ``download_path`` breadcrumb is likewise cleared: an ``Imported`` row
     carries ``download_path`` pointing at the OLD Plex library file. Left in place,
     the next import's ``_resolve_content`` would fall back to that stale library
@@ -322,6 +334,7 @@ async def _reuse_terminal_row(
         episodes=episodes,
         media_type=media_type,
         release_title=release_title,
+        added_at=datetime.now(UTC),
     )
     if not claimed:
         await session.rollback()

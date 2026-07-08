@@ -28,6 +28,7 @@ from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import queue_service
 from plex_manager.services.queue_service import (
+    OperatorClaimActiveError,
     RemovalInProgressError,
     _is_operator_claimed,  # pyright: ignore[reportPrivateUsage]
     _mark_removal_in_flight,  # pyright: ignore[reportPrivateUsage]
@@ -1702,6 +1703,33 @@ def test_register_refuses_supersession_while_removal_in_flight() -> None:
     _release_operator_claim(download_id, token2)
 
 
+def test_register_non_superseding_backs_off_when_a_claim_already_exists() -> None:
+    """Self-heal-vs-operator race hardening: a NON-superseding registration
+    (``allow_supersede=False``, the self-heal path) must back off with
+    :class:`OperatorClaimActiveError` -- never replace -- whenever ANY claim
+    already exists, even one that is not (yet) removal-in-flight. The existing
+    owner's claim is left completely untouched. When no claim exists at all, the
+    same non-superseding call registers normally (self-heal's ordinary path)."""
+    download_id = 987_656
+    operator_flags = _OperatorFailFlags(blocklist=False, remove_torrent=False)
+    self_heal_flags = _OperatorFailFlags(blocklist=True, remove_torrent=True)
+
+    operator_token = _register_operator_claim(download_id, operator_flags)
+
+    with pytest.raises(OperatorClaimActiveError):
+        _register_operator_claim(download_id, self_heal_flags, allow_supersede=False)
+
+    # The refusal changed nothing: the operator's own claim (and its explicit
+    # blocklist=False/remove_torrent=False choice) still owns the row.
+    assert _owns_operator_claim(download_id, operator_token)
+    _release_operator_claim(download_id, operator_token)
+
+    # With no existing claim, the same non-superseding call succeeds normally.
+    self_heal_token = _register_operator_claim(download_id, self_heal_flags, allow_supersede=False)
+    assert _owns_operator_claim(download_id, self_heal_token)
+    _release_operator_claim(download_id, self_heal_token)
+
+
 class _NestedMarkFailedDuringRemovalQbt(FakeQbittorrent):
     """A client whose ``remove`` (the outer call's Phase B, removal-in-flight
     already flagged) attempts a SECOND mark_failed on the same download -- the
@@ -2808,3 +2836,64 @@ async def test_self_heal_skips_a_download_that_vanished_mid_cycle(
         history = (await session.execute(select(DownloadHistory))).scalars().all()
 
     assert history == []
+
+
+async def test_self_heal_never_overrides_a_concurrent_operator_claim(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #165 hardening finding 3: reconcile_and_list's own
+    ``_is_operator_claimed`` pre-check is not atomic with self-heal's later
+    ``mark_failed`` call -- an operator's manual mark_failed(remove_torrent=False,
+    blocklist=False) can register its claim in the gap between that pre-check and
+    self-heal's own registration attempt. Self-heal's claim registration
+    (``allow_claim_supersede=False``) must back off rather than superseding: the
+    row, the operator's claim, and the queue must all be untouched by the heal."""
+    _request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    row = DownloadRecord(
+        id=download_id,
+        torrent_hash=_HASH,
+        status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    detection = StallDetection(
+        download_id=download_id, torrent_hash=_HASH, shape="stalled_progress"
+    )
+
+    # Simulate the operator's manual mark_failed having already registered its
+    # claim (past reconcile's pre-check, mid-flight) with its own explicit
+    # choice to keep the torrent and skip the blocklist.
+    operator_flags = _OperatorFailFlags(blocklist=False, remove_torrent=False)
+    operator_token = _register_operator_claim(download_id, operator_flags)
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        await _self_heal_stalled_download(session, qbt, row, detection, now=datetime.now(UTC))
+        download = await session.get(Download, download_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.event_type == DownloadHistoryEvent.stalled
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    # Self-heal backed off entirely: no removal, no blocklist, no history event,
+    # and the row's status is exactly as the operator's in-flight call left it.
+    assert qbt.removed == []
+    assert blocklist == []
+    assert history == []
+    assert download is not None and download.status == "downloading"
+
+    # The operator's own claim survived untouched -- self-heal never became the
+    # newer owner.
+    assert _owns_operator_claim(download_id, operator_token)
+    _release_operator_claim(download_id, operator_token)

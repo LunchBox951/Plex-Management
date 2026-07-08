@@ -211,6 +211,57 @@ async def test_grab_reuse_clears_stale_first_seen_at_grace_anchor(
     assert row.first_seen_at is None  # stale grace anchor cleared on re-grab
 
 
+async def test_grab_reuse_resets_stale_added_at_stall_anchor(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A terminal row reused for a fresh grab must not keep the ORIGINAL grab's
+    ``added_at`` (issue #165 hardening finding): ``detect_stalls`` anchors its
+    metadata/stalled-progress windows on ``added_at``, so a stale value already
+    past the stall thresholds would let the very next reconcile tick immediately
+    misjudge the brand-new re-grab as stalled -- self-healing (mark-failed +
+    remove + blocklist) a download that never had a chance to run."""
+    stale_added_at = datetime(2020, 1, 1, tzinfo=UTC)
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.searching
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=req_id,
+                tmdb_id=100,
+                failed_reason="prior failure",
+                added_at=stale_added_at,
+            )
+        )
+        await session.commit()
+
+    before_regrab = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=req_id,
+            tmdb_id=100,
+        )
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.status == "downloading"
+    assert row.added_at is not None
+    # SQLite returns a naive datetime even for a DateTime(timezone=True) column;
+    # the app always stores UTC (see repositories/downloads.py's ``_as_utc``), so
+    # comparing naive-vs-naive here is correct.
+    assert row.added_at >= before_regrab.replace(tzinfo=None)
+
+
 async def test_grab_rejects_terminal_request_and_adds_nothing(
     sessionmaker_: SessionMaker,
 ) -> None:
