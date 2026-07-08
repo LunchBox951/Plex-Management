@@ -302,9 +302,19 @@ def _sign_in_throttle_key(request: Request) -> str:
     if not header:
         return direct
     entries = [part.strip() for part in header.split(",")]
-    if len(entries) < hops or any(not entry for entry in entries):
+    if len(entries) < hops:
         return direct
-    return entries[-hops]
+    # Only the TRUSTED suffix (the last ``hops`` entries, appended by the
+    # operator's own proxy chain) needs to be well-formed. Entries to its left
+    # are client-controlled -- a client can freely send blank/malformed junk
+    # there, and rejecting the whole header on that basis would let an
+    # attacker force every request behind the proxy back onto the shared
+    # ``direct`` key, recreating the exact global-cap lockout this throttle
+    # key exists to prevent.
+    trusted_suffix = entries[-hops:]
+    if any(not entry for entry in trusted_suffix):
+        return direct
+    return trusted_suffix[0]
 
 
 def _throttle_sign_in(request: Request) -> None:

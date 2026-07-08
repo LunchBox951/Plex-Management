@@ -635,6 +635,52 @@ async def test_sign_in_throttle_trusted_hop_falls_back_on_short_header(
     assert throttled.status_code == 429
 
 
+async def test_sign_in_throttle_ignores_blank_entries_outside_trusted_suffix(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank/malformed entry in the CLIENT-CONTROLLED portion of the header (to
+    the left of the trusted suffix) must not collapse every forwarded client onto
+    the shared direct-peer key -- only the trusted suffix's own well-formedness
+    gates the fallback. Otherwise an attacker could send a distinct blank-entry
+    header on every request and force everyone behind the proxy to share one
+    budget, recreating the exact global-cap lockout this throttle key exists to
+    prevent."""
+    monkeypatch.setenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", "1")
+    get_settings.cache_clear()
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    for _ in range(10):
+        ok = await client.post(
+            "/api/v1/auth/plex",
+            json={"auth_token": _TOKEN},
+            # A blank leading (client-controlled) entry ahead of the proxy's own
+            # trusted-suffix entry -- must still key on the trusted "203.0.113.5".
+            headers={"X-Forwarded-For": ", 203.0.113.5"},
+        )
+        assert ok.status_code == 200
+    throttled = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={"X-Forwarded-For": ", 203.0.113.5"},
+    )
+    assert throttled.status_code == 429
+
+    # A DIFFERENT trusted client, still preceded by a blank entry, has its own
+    # budget rather than colliding on a shared fallback key.
+    other = await client.post(
+        "/api/v1/auth/plex",
+        json={"auth_token": _TOKEN},
+        headers={"X-Forwarded-For": ", 203.0.113.10"},
+    )
+    assert other.status_code == 200
+
+
 # --------------------------------------------------------------------------- #
 # /me and /logout behavior preserved
 # --------------------------------------------------------------------------- #
