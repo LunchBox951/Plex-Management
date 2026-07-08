@@ -60,9 +60,10 @@ __all__ = ["preview"]
 # (wave-6 finding: operational rows must not dodge the operator's retention).
 _logger = logging.getLogger(DECISION_TELEMETRY_LOGGER_NAME)
 
-#: Cap on sample release titles carried by the multi-season-pack rejection
-#: telemetry INFO below -- enough to spot-check which packs are showing up
-#: without per-release log spam (issue #24's beta-week data need).
+#: Cap on sample release titles carried by the season-pack-scope rejection
+#: telemetry INFOs below (issue #24's ``MULTI_SEASON_PACK`` and issue #167's
+#: ``NOT_SEASON_PACK``) -- enough to spot-check which releases are showing up
+#: without per-release log spam.
 _MULTI_SEASON_PACK_SAMPLE_TITLES = 3
 
 
@@ -91,10 +92,13 @@ async def preview(
 
     ``prefer_season_pack`` is derived, never a caller-supplied flag: it is True
     only for a season-scoped tv request with NO specific episodes named -- an
-    operator asking for "the whole season" should rank a season-pack release over
-    an equivalent-quality single-episode one; naming specific episodes (or a
-    movie, or an unscoped tv search) leaves the engine's default ranking
-    untouched.
+    operator asking for "the whole season" turns this into a *permanent*
+    rejection gate (issue #167): any candidate that is not itself a season pack
+    is rejected ``NOT_SEASON_PACK`` and never scored, because a single-episode
+    release can never satisfy a whole-season request and must never be
+    auto-grabbed just because every season pack was exhausted/blocklisted;
+    naming specific episodes (or a movie, or an unscoped tv search) leaves the
+    engine's default behavior untouched.
     """
     search_media_type: MediaType
     if media_type == "movie":
@@ -189,6 +193,7 @@ async def preview(
         prefer_season_pack=prefer_season_pack,
     )
     _log_multi_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
+    _log_not_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
     return result
 
 
@@ -201,6 +206,64 @@ def _log_multi_season_pack_rejections(
 ) -> None:
     """Beta-week telemetry (issue #24): one aggregated INFO per preview when any
     release was rejected ``MULTI_SEASON_PACK`` -- never per-release spam.
+
+    See :func:`_log_season_scope_rejections` for the shared aggregation mechanics
+    and the rationale for what goes in the message text vs. ``extra=`` only.
+    """
+    _log_season_scope_rejections(
+        result,
+        reason=RejectionReason.MULTI_SEASON_PACK,
+        label="multi-season-pack",
+        count_key="multi_season_pack_rejections",
+        sample_limit=_MULTI_SEASON_PACK_SAMPLE_TITLES,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        season=season,
+    )
+
+
+def _log_not_season_pack_rejections(
+    result: DecisionResult,
+    *,
+    tmdb_id: int,
+    media_type: str,
+    season: int | None,
+) -> None:
+    """Beta-week telemetry (issue #167): one aggregated INFO per preview when any
+    release was rejected ``NOT_SEASON_PACK`` -- the observability parity counterpart
+    to :func:`_log_multi_season_pack_rejections` for the sibling season-pack-only
+    gate (:func:`plex_manager.domain.decision_engine.decide`'s ``prefer_season_pack``
+    hard reject) -- never per-release spam.
+
+    See :func:`_log_season_scope_rejections` for the shared aggregation mechanics
+    and the rationale for what goes in the message text vs. ``extra=`` only.
+    """
+    _log_season_scope_rejections(
+        result,
+        reason=RejectionReason.NOT_SEASON_PACK,
+        label="not-season-pack",
+        count_key="not_season_pack_rejections",
+        sample_limit=_MULTI_SEASON_PACK_SAMPLE_TITLES,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        season=season,
+    )
+
+
+def _log_season_scope_rejections(
+    result: DecisionResult,
+    *,
+    reason: RejectionReason,
+    label: str,
+    count_key: str,
+    sample_limit: int,
+    tmdb_id: int,
+    media_type: str,
+    season: int | None,
+) -> None:
+    """Shared aggregation behind :func:`_log_multi_season_pack_rejections` and
+    :func:`_log_not_season_pack_rejections`: one aggregated INFO per preview per
+    ``reason`` -- never per-release spam.
 
     The decision choke point, not :func:`plex_manager.domain.decision_engine.decide`
     itself (domain stays pure/no logging). ``tmdb_id`` is a correlation key
@@ -226,22 +289,23 @@ def _log_multi_season_pack_rejections(
     """
     samples = [
         safe_text(candidate.title)
-        for candidate, reason in result.rejected
-        if reason is RejectionReason.MULTI_SEASON_PACK
+        for candidate, rejection_reason in result.rejected
+        if rejection_reason is reason
     ]
     if not samples:
         return
     _logger.info(
-        "decision preview: %d multi-season-pack rejection(s) (media_type=%s season=%s); samples=%s",
+        "decision preview: %d %s rejection(s) (media_type=%s season=%s); samples=%s",
         len(samples),
+        label,
         safe_text(media_type),
         season if season is None else safe_int(season),
-        samples[:_MULTI_SEASON_PACK_SAMPLE_TITLES],
+        samples[:sample_limit],
         extra={
             "tmdb_id": safe_int(tmdb_id),
             "season": season if season is None else safe_int(season),
             "media_type": safe_text(media_type),
-            "multi_season_pack_rejections": len(samples),
-            "sample_titles": samples[:_MULTI_SEASON_PACK_SAMPLE_TITLES],
+            count_key: len(samples),
+            "sample_titles": samples[:sample_limit],
         },
     )

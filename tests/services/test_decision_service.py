@@ -149,6 +149,9 @@ async def test_preview_accepts_tv_episode_despite_series_year(
     # name (SxxExx) legitimately omits any year and Prowlarr maps TV via tvdb, so
     # the candidate has tmdb_id=0. The media gate must NOT reject a correctly
     # titled episode as WRONG_MEDIA just because the series year can't be matched.
+    # ``episodes=[4]`` keeps prefer_season_pack off (issue #167's season-pack-only
+    # gate would otherwise hard-reject this single episode for an unrelated
+    # reason and mask what this test actually checks).
     candidates = [
         candidate("The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="d" * 40),
     ]
@@ -163,6 +166,7 @@ async def test_preview_accepts_tv_episode_despite_series_year(
             media_type="tv",
             year=2019,
             season=2,
+            episodes=[4],
         )
 
     assert [s.candidate.title for s in result.accepted] == [
@@ -175,9 +179,10 @@ async def test_preview_accepts_tv_episode_despite_series_year(
 async def test_preview_prefers_season_pack_when_whole_season_requested(
     sessionmaker_: SessionMaker,
 ) -> None:
-    # Same quality, same seeders, and the pack is even SMALLER (so the plain size
-    # tiebreak would otherwise rank it second) -- a whole-season request (season
-    # set, no specific episodes) must still prefer the pack.
+    # Issue #167: a whole-season request (season set, no specific episodes) now
+    # HARD-REJECTS the single-episode candidate rather than merely ranking it
+    # below the pack -- even though it is bigger (so the plain size tiebreak
+    # would otherwise have ranked it first), it must not accept at all.
     pack = candidate(
         "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP",
         info_hash="e" * 40,
@@ -205,8 +210,9 @@ async def test_preview_prefers_season_pack_when_whole_season_requested(
 
     assert [s.candidate.title for s in result.accepted] == [
         "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP",
-        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP",
     ]
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert rejected[single.title] is RejectionReason.NOT_SEASON_PACK
 
 
 async def test_preview_does_not_prefer_season_pack_when_episodes_are_named(
@@ -442,10 +448,12 @@ async def test_preview_multi_episode_request_rejects_partial_single_episode(
 async def test_preview_whole_season_request_still_accepts_all_episodes(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """No-regression: with NO specific episodes named (a whole-season request),
-    the episode-overlap gate must not fire -- every episode of the season,
-    including one that would be "wrong" under an episode-scoped request, is a
-    legitimate accept."""
+    """With NO specific episodes named (a whole-season request), the
+    episode-overlap gate must not fire -- neither episode is rejected WRONG_MEDIA
+    just for being "the wrong episode" under an episode-scoped request. But issue
+    #167's season-pack-only gate now fires instead: only the season pack is a
+    legitimate accept, and both single episodes are hard-rejected NOT_SEASON_PACK,
+    not WRONG_MEDIA -- the accurate reason."""
     e01 = candidate("The.Mandalorian.S02E01.2160p.WEB-DL.x264-GROUP", info_hash="1" * 40)
     e04 = candidate("The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="2" * 40)
     pack = candidate("The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="3" * 40)
@@ -461,7 +469,10 @@ async def test_preview_whole_season_request_still_accepts_all_episodes(
             year=2019,
             season=2,
         )
-    assert {s.candidate.title for s in result.accepted} == {e01.title, e04.title, pack.title}
+    assert {s.candidate.title for s in result.accepted} == {pack.title}
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert rejected[e01.title] is RejectionReason.NOT_SEASON_PACK
+    assert rejected[e04.title] is RejectionReason.NOT_SEASON_PACK
 
 
 async def test_preview_movie_unaffected_by_episode_overlap_gate(
@@ -652,6 +663,121 @@ async def test_preview_emits_no_telemetry_when_no_multi_season_pack_rejections(
                 title="Some Movie",
                 media_type="movie",
                 year=2020,
+            )
+
+    assert result.no_acceptable_release is False
+    assert caplog.records == []
+
+
+async def test_preview_whole_season_request_with_only_singles_yields_no_acceptable_release(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #167 (production bug): when no season pack is available at all --
+    e.g. every one was already exhausted/blocklisted -- a whole-season request
+    must NOT fall back to auto-grabbing single episodes. Both candidates are
+    hard-rejected NOT_SEASON_PACK and the preview surfaces no_acceptable_release,
+    never a grab."""
+    e01 = candidate(
+        "The.Mandalorian.S02E01.1080p.WEB-DL.x264-GROUP", info_hash="1" * 40, seeders=999
+    )
+    e04 = candidate(
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="2" * 40, seeders=10
+    )
+    async with sessionmaker_() as session:
+        result = await decision_service.preview(
+            FakeProwlarr([e01, e04]),
+            GuessitParser(),
+            default_profile(),
+            SqlBlocklistRepository(session),
+            tmdb_id=82856,
+            title="The Mandalorian",
+            media_type="tv",
+            year=2019,
+            season=2,
+        )
+
+    assert result.accepted == ()
+    assert result.no_acceptable_release is True
+    rejected = {c.title: reason for c, reason in result.rejected}
+    assert rejected[e01.title] is RejectionReason.NOT_SEASON_PACK
+    assert rejected[e04.title] is RejectionReason.NOT_SEASON_PACK
+
+
+async def test_preview_logs_not_season_pack_rejection_telemetry(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Observability parity with MULTI_SEASON_PACK (issue #167): a preview that
+    hard-rejects release(s) NOT_SEASON_PACK emits exactly ONE aggregated INFO --
+    never per-release spam -- carrying the count, up to 3 sample titles, tmdb_id,
+    media_type, and season via ``extra=`` (same convention as
+    ``_log_multi_season_pack_rejections``)."""
+    single = candidate(
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="f" * 40, seeders=999
+    )
+    pack = candidate("The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP", info_hash="e" * 40, seeders=10)
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.decision_service"):
+        async with sessionmaker_() as session:
+            result = await decision_service.preview(
+                FakeProwlarr([single, pack]),
+                GuessitParser(),
+                default_profile(),
+                SqlBlocklistRepository(session),
+                tmdb_id=82856,
+                title="The Mandalorian",
+                media_type="tv",
+                year=2019,
+                season=2,
+            )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "The.Mandalorian.S02.1080p.WEB-DL.x264-GROUP"
+    ]
+    infos = [
+        r
+        for r in caplog.records
+        if r.levelname == "INFO" and "not-season-pack rejection(s)" in r.getMessage()
+    ]
+    assert len(infos) == 1, "expected exactly one aggregated INFO, never per-release spam"
+    record = infos[0]
+    assert getattr(record, "tmdb_id", None) == 82856
+    assert getattr(record, "season", None) == 2
+    assert getattr(record, "media_type", None) == "tv"
+    assert getattr(record, "not_season_pack_rejections", None) == 1
+    assert getattr(record, "sample_titles", None) == [
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP"
+    ]
+    message = record.getMessage()
+    assert "82856" not in message
+    assert "media_type=tv" in message
+    assert "season=2" in message
+    assert "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP" in message
+
+
+async def test_preview_emits_no_not_season_pack_telemetry_when_episodes_named(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No-regression: naming specific episode(s) turns prefer_season_pack off, so
+    a single episode never hits the NOT_SEASON_PACK gate and the telemetry must
+    emit NOTHING -- an aggregate log firing on every episode-scoped preview would
+    be noise, not signal."""
+    single = candidate(
+        "The.Mandalorian.S02E04.1080p.WEB-DL.x264-GROUP", info_hash="f" * 40, seeders=999
+    )
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.decision_service"):
+        async with sessionmaker_() as session:
+            result = await decision_service.preview(
+                FakeProwlarr([single]),
+                GuessitParser(),
+                default_profile(),
+                SqlBlocklistRepository(session),
+                tmdb_id=82856,
+                title="The Mandalorian",
+                media_type="tv",
+                year=2019,
+                season=2,
+                episodes=[4],
             )
 
     assert result.no_acceptable_release is False

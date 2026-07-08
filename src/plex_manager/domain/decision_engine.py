@@ -14,11 +14,18 @@ Mirrors Radarr's decision-engine specification pipeline, in a fixed order:
    download == one season data model can't satisfy several seasons from a single
    grab without stranding sibling ``SeasonRequest``s, so the beta posture is to
    never grab one, not to prefer it (see ADR/issue #24);
-4. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
+4. **season-pack-only gate** (``prefer_season_pack``) — when the operator
+   explicitly requested a WHOLE season (no specific episodes named), a release
+   that is not itself a season pack is a *permanent* rejection, never scored:
+   a single-episode release can never satisfy a whole-season request, so it must
+   never be auto-grabbed just because every season pack was exhausted/blocklisted
+   (issue #167 -- "The Last Man on Earth" S04 was auto-grabbed as single episodes
+   three times in production before this gate existed);
+5. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
    a *permanent* rejection and is never scored (north-star hard cutoff);
-5. **blocklist filter** — a previously failed/reported release is an
+6. **blocklist filter** — a previously failed/reported release is an
    unconditional skip;
-6. **score / sort** the survivors, best-first.
+7. **score / sort** the survivors, best-first.
 
 There is deliberately **no relaxed-fallback retry**: if nothing survives, the
 result carries ``no_acceptable_release=True`` as an observable state. The engine
@@ -51,10 +58,11 @@ from plex_manager.domain.season_pack import classify_release_scope
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
-# Release scopes that satisfy a WHOLE-season grab and so earn the season-pack
-# preference: an exact single-season pack. It must rank ahead of a single-episode
-# release for a whole-season request, or a higher-seeded single episode could
-# out-rank a release that actually contains the whole requested season.
+# Release scopes that satisfy a WHOLE-season grab: an exact single-season pack.
+# When ``prefer_season_pack`` is set, anything outside this set is a *permanent*
+# rejection (the gate below, issue #167) -- a single-episode release can never
+# satisfy a whole-season request, so it must never be accepted just because
+# every season pack was exhausted/blocklisted.
 #
 # A multi-season pack (``S01-S03``) is DELIBERATELY excluded: it is permanently
 # rejected below (the ``_MULTI_SEASON_SCOPE`` gate) rather than preferred, so it
@@ -111,11 +119,14 @@ def decide(
 
     ``prefer_season_pack`` (default ``False``, byte-identical to the pre-season-pack
     engine) is set by the caller only when the operator explicitly requested a
-    whole TV season: it adds a tiebreak (after profile order, before seeders) that
-    prefers a release :func:`~plex_manager.domain.season_pack.classify_release_scope`
-    classifies as a ``"season_pack"`` over one it does not. It never overrides the
-    quality/identity/blocklist gates -- a season pack that fails the profile gate is
-    still rejected.
+    whole TV season: any release :func:`~plex_manager.domain.season_pack.classify_release_scope`
+    does NOT classify as a ``"season_pack"`` then becomes a *permanent* rejection,
+    never scored (issue #167) -- a single-episode release can never satisfy a
+    whole-season request, so it must never be auto-grabbed just because every
+    season pack was exhausted/blocklisted. It never overrides the identity/
+    multi-season gates that run before it -- a release that fails one of those is
+    still rejected for that gate's reason -- and a season pack still must clear
+    the quality gate after it to be accepted.
     """
     accepted: list[ScoredRelease] = []
     rejected: list[tuple[CandidateRelease, RejectionReason]] = []
@@ -136,6 +147,17 @@ def decide(
         # beta posture is "borrow proven brains" (issue #24), not "prefer it".
         if classify_release_scope(parsed) == _MULTI_SEASON_SCOPE:
             rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
+            continue
+
+        # Season-pack-only gate (issue #167): the operator explicitly requested a
+        # WHOLE season, so a release that is not itself a season pack can never
+        # satisfy the request -- it is a *permanent* rejection, never scored, not
+        # merely a scoring tiebreak. Without this, a single-episode release used
+        # to survive to scoring (and get auto-grabbed) once every season pack was
+        # exhausted/blocklisted -- confirmed live ("The Last Man on Earth" S04 was
+        # auto-grabbed as single episodes three times).
+        if prefer_season_pack and classify_release_scope(parsed) not in _PACK_SCOPES:
+            rejected.append((candidate, RejectionReason.NOT_SEASON_PACK))
             continue
 
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
@@ -166,6 +188,13 @@ def decide(
         by_quality = compare_by_profile(left.quality, right.quality, profile)
         if by_quality != 0:
             return by_quality
+        # Issue #167: the season-pack-only gate above already rejects every
+        # non-pack candidate before it reaches ``accepted`` when
+        # ``prefer_season_pack`` is set, so ``left_pack``/``right_pack`` are now
+        # always equal here and this block is a no-op for the pack-vs-non-pack
+        # case. Left in place (rather than deleted) because it is harmless and
+        # documents the ranking intent; it would only ever fire again if a future
+        # ``_PACK_SCOPES`` grew a second member.
         if prefer_season_pack:
             left_pack = classify_release_scope(left.parsed) in _PACK_SCOPES
             right_pack = classify_release_scope(right.parsed) in _PACK_SCOPES
