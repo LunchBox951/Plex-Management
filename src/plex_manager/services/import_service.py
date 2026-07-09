@@ -113,6 +113,9 @@ _logger = logging.getLogger(__name__)
 # EXACTLY this block reason without re-deriving or loosely substring-matching a
 # duplicated literal, and so the two call sites here can never drift apart.
 PATH_NOT_VISIBLE_REASON_PREFIX: Final = "download path not visible inside the container "
+_MANUAL_CLEANUP_BREADCRUMB_REASON: Final = (
+    "stored import breadcrumb requires manual cleanup before re-search"
+)
 
 # States ``import_download`` will (re)process: a freshly-completed torrent, an
 # operator retry of a blocked one, and a row left mid-import by a crash — all
@@ -805,6 +808,7 @@ async def _fail_unsafe_payload(
             return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
 
         if owned_placement is not None:
+            await asyncio.to_thread(_remove_quietly, owned_placement)
             cleared = await download_repo.update_status_if_in(
                 download_id,
                 DownloadState.FailedPending.value,
@@ -817,7 +821,6 @@ async def _fail_unsafe_payload(
             else:
                 await session.rollback()
                 return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-            await asyncio.to_thread(_remove_quietly, owned_placement)
 
         removed_ok = await purge_service.remove_torrent(
             qbt,
@@ -1087,7 +1090,7 @@ async def _reject_unsafe_payload_if_reported(
             session,
             download_repo,
             download_id,
-            f"{reason}; stored import breadcrumb requires manual cleanup before re-search",
+            f"{reason}; {_MANUAL_CLEANUP_BREADCRUMB_REASON}",
             request_id=request_id,
             season=season,
         )
@@ -1201,6 +1204,17 @@ def _can_resume_tv_breadcrumb_without_client_status(
         download_status == DownloadState.ImportBlocked.value
         and failed_reason is not None
         and failed_reason.startswith(_PLEX_SCAN_FAILED_REASON_PREFIX)
+    )
+
+
+def _is_manual_cleanup_breadcrumb(
+    download_status: str, download_path: str | None, failed_reason: str | None
+) -> bool:
+    return (
+        download_status == DownloadState.ImportBlocked.value
+        and download_path is not None
+        and failed_reason is not None
+        and _MANUAL_CLEANUP_BREADCRUMB_REASON in failed_reason
     )
 
 
@@ -2141,7 +2155,8 @@ async def _import_tv_locked(
             request_id=request.id,
             season=season,
             block_existing_breadcrumb=(
-                download_status == DownloadState.Importing.value and download_path is not None
+                (download_status == DownloadState.Importing.value and download_path is not None)
+                or _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason)
             ),
         )
         if rejected is not None:

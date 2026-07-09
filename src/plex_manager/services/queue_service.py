@@ -286,6 +286,9 @@ _TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATES)
 _PAYLOAD_VALIDATION_STATUS_VALUES = frozenset(s.value for s in ACTIVE_STATES) | frozenset(
     {DownloadState.ImportBlocked.value}
 )
+_MANUAL_CLEANUP_BREADCRUMB_REASON = (
+    "stored import breadcrumb requires manual cleanup before re-search"
+)
 _COMPLETE_PROGRESS = 1.0
 _PAYLOAD_COMPLETE_RAW_STATES = frozenset(
     {"uploading", "stalledUP", "pausedUP", "stoppedUP", "queuedUP", "checkingUP", "forcedUP"}
@@ -1134,6 +1137,16 @@ def _payload_manifest_is_complete(live: DownloadStatus) -> bool:
     return live.progress >= _COMPLETE_PROGRESS or live.raw_state in _PAYLOAD_COMPLETE_RAW_STATES
 
 
+def _has_manual_cleanup_breadcrumb(row: DownloadRecord) -> bool:
+    return (
+        row.status == DownloadState.ImportBlocked.value
+        and row.season is not None
+        and row.download_path is not None
+        and row.failed_reason is not None
+        and _MANUAL_CLEANUP_BREADCRUMB_REASON in row.failed_reason
+    )
+
+
 async def _payload_safety_transitions(
     qbt: DownloadClientPort,
     rows: list[DownloadRecord],
@@ -1143,6 +1156,8 @@ async def _payload_safety_transitions(
     transitions: list[StateTransition] = []
     for row in rows:
         if row.status not in _PAYLOAD_VALIDATION_STATUS_VALUES:
+            continue
+        if _has_manual_cleanup_breadcrumb(row):
             continue
         live = snapshot.get(row.torrent_hash.lower())
         if live is None:

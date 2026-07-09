@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -461,6 +462,92 @@ async def test_import_blocked_unsafe_payload_is_rejected_by_reconcile(
     assert len(blocklist) == 1
     assert request.status is RequestStatus.searching
     assert download.status == "failed"
+
+
+async def test_reconcile_preserves_manual_cleanup_tv_breadcrumb_block(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    season_dir = tmp_path / "tv" / "Some Show (2020)" / "Season 02"
+    placed = season_dir / "Some Show - S02E01.mkv"
+    placed.parent.mkdir(parents=True)
+    placed.write_bytes(b"episode")
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.import_blocked,
+        )
+        session.add(request)
+        await session.flush()
+        season = SeasonRequest(
+            media_request_id=request.id,
+            season_number=2,
+            status=RequestStatus.import_blocked.value,
+        )
+        session.add(season)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="import_blocked",
+            media_request_id=request.id,
+            tmdb_id=603,
+            season=2,
+            download_path=str(season_dir),
+            failed_reason=failed_reason,
+        )
+        session.add(download)
+        await session.commit()
+        request_id = request.id
+        season_id = season.id
+
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+        raw_state="stoppedUP",
+        progress=1.0,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[live],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Show.S02.1080p.WEB-DL.x264-GROUP/Some.Show.S02E01.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Show.S02.1080p.WEB-DL.x264-GROUP/setup.exe",
+                    size_bytes=1024,
+                ),
+            ]
+        },
+    )
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(i for i in queue if i.torrent_hash == _HASH)
+    assert item.status == "import_blocked"
+    assert qbt.removed == []
+    assert placed.exists()
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+        season = await session.get(SeasonRequest, season_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert blocklist == []
+    assert request is not None and request.status is RequestStatus.import_blocked
+    assert season is not None and season.status.value == "import_blocked"
+    assert download.status == "import_blocked"
+    assert download.failed_reason == failed_reason
+    assert download.download_path == str(season_dir)
 
 
 async def test_safe_payload_manifest_still_advances_completed_download(
