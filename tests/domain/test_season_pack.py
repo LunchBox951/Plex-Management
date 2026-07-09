@@ -229,7 +229,7 @@ def test_plan_same_quality_overlap_rejects_when_waste_ties_or_wins() -> None:
     assert plan.waste_seasons == (1, 2)
 
 
-def test_plan_higher_quality_overlap_targets_upgrade() -> None:
+def test_plan_higher_quality_overlap_does_not_target_upgrade_without_replacement() -> None:
     plan = plan_multi_season_pack(
         pack_seasons=[1, 2],
         candidate_quality_id=WEBDL1080P.id,
@@ -244,10 +244,33 @@ def test_plan_higher_quality_overlap_targets_upgrade() -> None:
         ),
     )
 
-    assert plan.accepted is True
-    assert plan.target_seasons == (1, 2)
-    assert plan.upgrade_seasons == (1,)
-    assert plan.waste_seasons == ()
+    assert plan.accepted is False
+    assert plan.reason == "useful_seasons_not_majority"
+    assert plan.target_seasons == (2,)
+    assert plan.upgrade_seasons == ()
+    assert plan.waste_seasons == (1,)
+
+
+def test_plan_all_higher_quality_overlap_rejects_until_replacement_supported() -> None:
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2],
+            [
+                _season(1, "available", WEBDL720P.id),
+                _season(2, "available", WEBDL720P.id),
+            ],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.reason == "no_useful_seasons"
+    assert plan.target_seasons == ()
+    assert plan.upgrade_seasons == ()
+    assert plan.waste_seasons == (1, 2)
 
 
 def test_plan_unknown_legacy_quality_is_waste_not_upgrade() -> None:

@@ -144,7 +144,10 @@ class SqlDownloadRepository:
         episodes: list[int] | None,
     ) -> None:
         await self._session.execute(
-            delete(DownloadScope).where(DownloadScope.download_id == download_id)
+            delete(DownloadScope).where(
+                DownloadScope.download_id == download_id,
+                DownloadScope.status != "imported",
+            )
         )
         if media_request_id is not None and season is not None:
             await self.ensure_scope(
@@ -186,14 +189,21 @@ class SqlDownloadRepository:
             DownloadScope.season_number == season,
             DownloadScope.status.in_(_ACTIVE_SCOPE_STATUSES),
         )
+        matching_scope_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id == media_request_id,
+            DownloadScope.season_number == season,
+        )
+        legacy_scalar_match = (
+            (Download.media_request_id == media_request_id)
+            & (Download.season == season)
+            & ~matching_scope_exists
+        )
         stmt = (
             select(Download)
             .where(
                 Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
-                or_(
-                    (Download.media_request_id == media_request_id) & (Download.season == season),
-                    scoped_exists,
-                ),
+                or_(legacy_scalar_match, scoped_exists),
             )
             .order_by(Download.id)
         )
@@ -422,9 +432,19 @@ class SqlDownloadRepository:
             DownloadScope.media_request_id == media_request_id,
             DownloadScope.season_number == season,
         )
+        terminal_match: DownloadScope | None = None
         for row in (await self._session.execute(stmt)).scalars().all():
             if _episodes_equal(row.episodes_json, normalized_episodes):
-                return _to_scope_record(row)
+                if row.status in _ACTIVE_SCOPE_STATUSES:
+                    return _to_scope_record(row)
+                terminal_match = row
+
+        if terminal_match is not None:
+            terminal_match.status = "active"
+            terminal_match.completed_at = None
+            await self._session.flush()
+            await self._session.refresh(terminal_match)
+            return _to_scope_record(terminal_match)
 
         season_request_id: int | None = None
         if media_request_id is not None and season is not None:

@@ -413,6 +413,34 @@ def test_multi_season_pack_rejects_same_quality_when_overlap_not_worth_it() -> N
     assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
 
 
+def test_multi_season_pack_does_not_target_installed_upgrade_until_replacement() -> None:
+    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP")
+    result = decide(
+        [multi],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+        multi_season_intent=MultiSeasonRequestIntent(
+            mode="whole_show",
+            requested_seasons=(1, 2, 3),
+            seasons=(
+                SeasonPackSeasonState(1, "available", WEBDL720P.id),
+                SeasonPackSeasonState(2, "pending"),
+                SeasonPackSeasonState(3, "pending"),
+            ),
+        ),
+    )
+
+    assert [s.candidate.title for s in result.accepted] == [
+        "Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP"
+    ]
+    assert result.accepted[0].target_seasons == (2, 3)
+    assert result.accepted[0].upgrade_seasons == ()
+    assert result.accepted[0].waste_seasons == (1,)
+
+
 def test_multi_season_pack_ignores_waiting_for_air_date_sibling() -> None:
     multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP")
     result = decide(

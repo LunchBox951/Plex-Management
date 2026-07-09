@@ -256,8 +256,9 @@ def plan_multi_season_pack(
             and installed_index is not None
             and candidate_index > installed_index
         ):
-            target.append(season_number)
-            upgrades.append(season_number)
+            # Replacement is not implemented yet: importing an upgrade target would
+            # collide with the installed season files and block the shared torrent.
+            waste.append(season_number)
         else:
             waste.append(season_number)
 
