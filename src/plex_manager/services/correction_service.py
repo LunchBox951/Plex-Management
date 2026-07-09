@@ -154,6 +154,7 @@ CANCELLABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.pending.value,
         RequestStatus.searching.value,
         RequestStatus.no_acceptable_release.value,
+        RequestStatus.waiting_for_air_date.value,
         RequestStatus.downloading.value,
     }
 )
@@ -1046,13 +1047,13 @@ async def cancel_request(
     status (kept only for history; nothing re-grabbed). Returns the updated record.
 
     ``qbt`` may be ``None``: a cancel for a ``pending``/``searching``/
-    ``no_acceptable_release`` request with NO active download rows is a PURE DB settle
-    that never touches the client, so it must still work on an install with qBittorrent
-    unconfigured (the endpoint resolves it via ``get_qbittorrent_optional``). Active
-    rows ARE discovered first; only if there are torrents to remove but ``qbt is None``
-    is :class:`DownloadClientRequiredError` raised -- BEFORE any state change (the
-    endpoint maps it to an honest 409 ``service_not_configured``), never a silent skip
-    that would leak a seeding torrent.
+    ``no_acceptable_release``/``waiting_for_air_date`` request with NO active download
+    rows is a PURE DB settle that never touches the client, so it must still work on an
+    install with qBittorrent unconfigured (the endpoint resolves it via
+    ``get_qbittorrent_optional``). Active rows ARE discovered first; only if there are
+    torrents to remove but ``qbt is None`` is :class:`DownloadClientRequiredError`
+    raised -- BEFORE any state change (the endpoint maps it to an honest 409
+    ``service_not_configured``), never a silent skip that would leak a seeding torrent.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)

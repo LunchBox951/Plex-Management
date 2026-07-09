@@ -1702,16 +1702,22 @@ class _FoldSeasonDuringAddQbt(FakeQbittorrent):
     (``pending`` -> ``available``) of the season row in a separate session
     before returning -- the fold-vs-grab race, made deterministic."""
 
-    def __init__(self, sm: SessionMaker, season_request_id: int) -> None:
+    def __init__(
+        self,
+        sm: SessionMaker,
+        season_request_id: int,
+        status: RequestStatus = RequestStatus.available,
+    ) -> None:
         super().__init__()
         self._sm = sm
         self._season_request_id = season_request_id
+        self._status = status
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         async with self._sm() as session:
             row = await session.get(SeasonRequest, self._season_request_id)
             assert row is not None
-            row.status = RequestStatus.available  # the recovery fold: file never left
+            row.status = self._status
             await session.commit()
         return await super().add(magnet_or_url, save_path, category)
 
@@ -1775,6 +1781,73 @@ async def test_grab_loses_to_a_recovery_fold_that_landed_while_qbt_add_was_in_fl
         assert season_row.status is RequestStatus.available  # the fold STANDS
         assert downloads == []  # no duplicate download for on-disk content
         assert history == []  # no 'grabbed' record for a refused grab
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("settled_status", [RequestStatus.available, RequestStatus.completed])
+async def test_pack_grab_does_not_reopen_a_sibling_settled_during_add(
+    tmp_path: Any,
+    settled_status: RequestStatus,
+) -> None:
+    """A pack owns only siblings that remain searchable through its post-add CAS.
+
+    The planner selected S1+S2 while both were pending, but S2 settled while the
+    physical torrent was being added. The pack must lose atomically instead of
+    moving S2 back to downloading and re-downloading content already on disk.
+    """
+    sm, engine = await _file_backed_sessionmaker(
+        tmp_path, f"pack_sibling_{settled_status.value}_mid_grab.db"
+    )
+    try:
+        request_id = await _make_tv_request(sm, tmdb_id=712)
+        async with sm() as session:
+            season_2_id = await session.scalar(
+                select(SeasonRequest.id).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        assert season_2_id is not None
+
+        pack = _scored_tv(_HASH, "Some.Show.S01-S02.COMPLETE.1080p.WEB-DL.x264-GROUP").model_copy(
+            update={"target_seasons": (1, 2)}
+        )
+        qbt = _FoldSeasonDuringAddQbt(sm, season_2_id, settled_status)
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=pack,
+                    request_id=request_id,
+                    tmdb_id=712,
+                    season=1,
+                )
+
+        assert qbt.removed == [(_HASH, True)]
+        async with sm() as session:
+            seasons = (
+                (
+                    await session.execute(
+                        select(SeasonRequest)
+                        .where(SeasonRequest.media_request_id == request_id)
+                        .order_by(SeasonRequest.season_number)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            downloads = (await session.execute(select(Download))).scalars().all()
+            scopes = (await session.execute(select(DownloadScope))).scalars().all()
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert [(row.season_number, row.status) for row in seasons] == [
+            (1, RequestStatus.pending),
+            (2, settled_status),
+        ]
+        assert downloads == []
+        assert scopes == []
+        assert history == []
     finally:
         await engine.dispose()
 

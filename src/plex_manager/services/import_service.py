@@ -1518,6 +1518,8 @@ async def _import_tv_targets_locked(
 
         for failure in failures:
             await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
+        if failures:
+            await download_repo.align_scalar_scope_with_active(download_id)
         finalized = await download_repo.update_status_if_in(
             download_id,
             DownloadState.ImportBlocked.value if failures else DownloadState.Imported.value,

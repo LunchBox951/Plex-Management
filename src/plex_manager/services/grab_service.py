@@ -93,14 +93,15 @@ _GRABBABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = (
 _GRABBABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     s.value for s in RequestStatus if s is not RequestStatus.cancelled
 )
+# Secondary pack targets must still be SEARCHABLE when the post-add CAS lands.
+# Installed ``available``/``completed`` siblings are waste, not targets; accepting
+# either here would let a stale plan move settled content back to downloading.
 _PACK_TARGET_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     {
         RequestStatus.pending.value,
         RequestStatus.searching.value,
         RequestStatus.no_acceptable_release.value,
         RequestStatus.failed.value,
-        RequestStatus.available.value,
-        RequestStatus.completed.value,
     }
 )
 

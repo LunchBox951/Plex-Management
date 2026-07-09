@@ -18,6 +18,7 @@ from typing import Literal
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
@@ -39,6 +40,7 @@ from plex_manager.models import (
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import (
     eviction_service,
     import_service,
@@ -1911,6 +1913,7 @@ async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
     assert record.status == DownloadState.ImportBlocked.value
     assert record.failed_reason is not None
     assert "S02" in record.failed_reason
+    assert record.season == 2
     season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
     season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
     assert (season_1_dir / "Some Show - S01E01.mkv").exists()
@@ -1949,6 +1952,30 @@ async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
     }
     assert next(scope for scope in scopes if scope.season_number == 1).completed_at is not None
     assert next(scope for scope in scopes if scope.season_number == 2).completed_at is None
+
+    # The non-terminal physical row now claims its unresolved S2 scope, not the
+    # imported S1 compatibility slot. A replacement S1 download can be tracked,
+    # while the legacy DB guard still rejects a second active release for S2.
+    async with sessionmaker_() as session:
+        repo = SqlDownloadRepository(session)
+        replacement = await repo.create(
+            torrent_hash="replacement-s1",
+            status=DownloadState.Downloading.value,
+            media_request_id=request_id,
+            tmdb_id=_TMDB_ID,
+            season=1,
+            media_type="tv",
+        )
+        assert replacement.season == 1
+        with pytest.raises(IntegrityError):
+            await repo.create(
+                torrent_hash="replacement-s2",
+                status=DownloadState.Downloading.value,
+                media_request_id=request_id,
+                tmdb_id=_TMDB_ID,
+                season=2,
+                media_type="tv",
+            )
 
 
 async def test_import_tv_retry_success_clears_stale_failed_reason(

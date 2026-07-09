@@ -440,6 +440,63 @@ async def test_ensure_scope_reactivates_matching_terminal_scope(
     assert active.torrent_hash == "shared_reactivate"
 
 
+async def test_align_scalar_scope_keeps_same_season_unresolved_episode_claim(
+    session: AsyncSession,
+) -> None:
+    """Settling one episode scope must not release its season's legacy DB slot
+    while another episode scope for that same season is still unresolved."""
+    mr = MediaRequest(
+        tmdb_id=48, media_type=MediaType.tv, title="Show", status=RequestStatus.import_blocked
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_episode_partial",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        episodes_json=[1],
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add_all(
+        [
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=mr.id,
+                season_number=1,
+                episodes_json=[1],
+                scope_key="season:1|episodes:[1]",
+                status="imported",
+            ),
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=mr.id,
+                season_number=1,
+                episodes_json=[2],
+                scope_key="season:1|episodes:[2]",
+                status="import_blocked",
+            ),
+        ]
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    await repo.align_scalar_scope_with_active(download.id)
+
+    assert download.season == 1
+    assert download.episodes_json == [2]
+    with pytest.raises(IntegrityError):
+        await repo.create(
+            torrent_hash="same_season_replacement",
+            status="downloading",
+            media_request_id=mr.id,
+            season=1,
+            media_type="tv",
+        )
+
+
 async def test_find_active_for_request_default_season_matches_movie_null_season(
     session: AsyncSession,
 ) -> None:

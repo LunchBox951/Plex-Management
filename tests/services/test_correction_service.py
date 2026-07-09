@@ -1911,6 +1911,58 @@ async def test_cancel_with_no_active_rows_settles_without_a_client(
     assert updated.status == RequestStatus.cancelled.value
 
 
+async def test_cancel_waiting_for_air_date_settles_and_releases_dedup_slot(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A future TV request is active/dedup-blocking but has no torrent to remove.
+
+    Cancelling it is a pure database settle: both the waiting season and its
+    parent become cancelled, and a fresh request for the same show can claim the
+    active-media slot.
+    """
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=1901,
+            media_type=MediaType.tv,
+            title="Future Show",
+            status=RequestStatus.waiting_for_air_date,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=request.id,
+                season_number=3,
+                status=RequestStatus.waiting_for_air_date,
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        updated = await correction_service.cancel_request(session, None, request_id=request_id)
+    assert updated.status == RequestStatus.cancelled.value
+
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+        assert season.status is RequestStatus.cancelled
+        assert await SqlRequestRepository(session).find_active(1901, "tv") is None
+
+        replacement = MediaRequest(
+            tmdb_id=1901,
+            media_type=MediaType.tv,
+            title="Future Show",
+            status=RequestStatus.pending,
+        )
+        session.add(replacement)
+        await session.commit()
+        assert replacement.id != request_id
+
+
 async def test_cancel_with_an_active_torrent_requires_a_client(
     sessionmaker_: SessionMaker,
 ) -> None:

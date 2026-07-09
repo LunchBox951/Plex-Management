@@ -56,6 +56,7 @@ type DerivedState =
   | { kind: 'searching' }
   | { kind: 'downloading' }
   | { kind: 'no_acceptable_release' }
+  | { kind: 'waiting_for_air_date' }
   | { kind: 'import_blocked' }
   | { kind: 'completed' }
   | { kind: 'available' }
@@ -128,6 +129,8 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
       return { kind: 'downloading' }
     case 'no_acceptable_release':
       return { kind: 'no_acceptable_release' }
+    case 'waiting_for_air_date':
+      return { kind: 'waiting_for_air_date' }
     case 'import_blocked':
       return { kind: 'import_blocked' }
     case 'completed':
@@ -151,7 +154,13 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
  * action against the PARENT request status (for tv the rollup), never the
  * per-season zone — a `partially_available` show is not cancellable wholesale.
  */
-const CANCELLABLE_STATUSES = new Set(['pending', 'searching', 'no_acceptable_release', 'downloading'])
+const CANCELLABLE_STATUSES = new Set([
+  'pending',
+  'searching',
+  'no_acceptable_release',
+  'waiting_for_air_date',
+  'downloading',
+])
 
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
@@ -903,6 +912,19 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           </span>
           {reSearchButton}
           {cancelButton}
+        </div>
+      )
+      break
+    case 'waiting_for_air_date':
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={requestStatus('waiting_for_air_date')} />
+            <span className="text-sm text-muted">
+              This season has not aired yet. Cancel the request if you no longer want it.
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2">{cancelButton}</div>
         </div>
       )
       break

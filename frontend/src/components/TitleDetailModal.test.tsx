@@ -821,6 +821,37 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(7))
   })
 
+  it('offers Cancel for a TV request waiting for its air date', async () => {
+    const tvTitle: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 77,
+      title: 'Future Show',
+      year: 2026,
+      library_state: 'none',
+    }
+    const waiting: RequestResponse = {
+      id: 21,
+      tmdb_id: 77,
+      media_type: 'tv',
+      title: 'Future Show',
+      status: 'waiting_for_air_date',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [{ season_number: 3, status: 'waiting_for_air_date' }],
+    }
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
+    const cancelMock = mutation({ ...waiting, status: 'cancelled' })
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
+    render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
+
+    expect(screen.getAllByText(/waiting for air date/i)).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: /cancel request/i }))
+    const confirms = screen.getAllByRole('button', { name: /cancel request/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(21))
+  })
+
   it('does not offer Cancel for an already-imported (available) request', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'available' })] },

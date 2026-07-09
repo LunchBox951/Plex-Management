@@ -471,6 +471,50 @@ class SqlDownloadRepository:
     async def list_scopes(self, download_id: int) -> list[DownloadScopeRecord]:
         return (await self._scopes_by_download([download_id])).get(download_id, [])
 
+    async def align_scalar_scope_with_active(self, download_id: int) -> None:
+        """Keep the legacy scalar TV scope on an unresolved logical scope.
+
+        ``downloads.season`` still backs the legacy one-active-per-season index.
+        A shared pack can import that scalar season while a sibling scope remains
+        ``import_blocked``, leaving the non-terminal physical row falsely claiming
+        the imported season's slot. Repoint the compatibility fields to a remaining
+        unresolved scope so a replacement for the imported season can be created
+        while the sibling remains protected by the same database guard.
+
+        Prefer an unresolved scope for the current scalar season (including a
+        different episode subset), then fall back deterministically to the lowest
+        season/id. A fully imported download has no unresolved scopes and needs no
+        rewrite because its physical status will leave the active index.
+        """
+        download = await self._session.get(Download, download_id)
+        if download is None:
+            raise LookupError(f"download {download_id} does not exist")
+
+        stmt = (
+            select(DownloadScope)
+            .where(
+                DownloadScope.download_id == download_id,
+                DownloadScope.status.in_(_ACTIVE_SCOPE_STATUSES),
+            )
+            .order_by(DownloadScope.season_number, DownloadScope.id)
+        )
+        scopes = (await self._session.execute(stmt)).scalars().all()
+        if not scopes:
+            return
+
+        target = next(
+            (scope for scope in scopes if scope.season_number == download.season),
+            scopes[0],
+        )
+        if download.season == target.season_number and _episodes_equal(
+            download.episodes_json, target.episodes_json
+        ):
+            return
+
+        download.season = target.season_number
+        download.episodes_json = target.episodes_json
+        await self._session.flush()
+
     async def update_status(
         self,
         download_id: int,
