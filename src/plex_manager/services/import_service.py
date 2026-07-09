@@ -894,6 +894,122 @@ def _owned_movie_breadcrumb_for_unsafe_rollback(
     return path
 
 
+async def _resume_breadcrumbed_tv_import(
+    *,
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    request: RequestRecord,
+    season: int,
+    download_id: int,
+    torrent_hash: str,
+    fs: FileSystemPort,
+    library: LibraryPort,
+    tv_root: str,
+    download_path: str,
+) -> DownloadRecord | None:
+    expected_season_dir = Path(tv_root) / plex_tv_season_relative_dir(
+        request.title, request.year, season
+    )
+    season_dir = Path(download_path)
+    root_real = os.path.realpath(tv_root)
+    season_dir_real = os.path.realpath(season_dir)
+    expected_real = os.path.realpath(expected_season_dir)
+    if not _is_within(root_real, season_dir_real) or season_dir_real != expected_real:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "stored import breadcrumb is not the expected tv season directory",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if not await asyncio.to_thread(os.path.isdir, season_dir):
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "stored import breadcrumb is not visible inside the container",
+            request_id=request.id,
+            season=season,
+            clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    if not purge_service.begin_placement(str(season_dir)):
+        _logger.info(
+            "deferring import of download %s: a purge is deleting this path; "
+            "will retry next import cycle",
+            safe_int(download_id),
+            extra={"request_id": safe_int(request.id), "season": safe_int(season)},
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    try:
+        imported = [
+            (os.path.basename(abs_path), PurePosixPath(os.path.relpath(abs_path, tv_root)))
+            for abs_path, _size, _rel in await asyncio.to_thread(
+                fs.list_video_files, os.fspath(season_dir)
+            )
+        ]
+        if not imported:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                "stored import breadcrumb contains no visible video files",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        try:
+            await library.trigger_scan(str(season_dir), "tv")
+        except (PlexLibraryError, PlexAuthError) as exc:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"plex scan failed: {type(exc).__name__}",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        finalized = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Imported.value,
+            frozenset({DownloadState.Importing.value}),
+            download_path=str(season_dir),
+            clear_failed_reason=True,
+        )
+        if not finalized:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        for basename, relative in imported:
+            session.add(
+                DownloadHistory(
+                    tmdb_id=request.tmdb_id,
+                    torrent_hash=torrent_hash,
+                    event_type=DownloadHistoryEvent.imported,
+                    source_title=None,
+                    message=f"imported {basename} to {relative}",
+                )
+            )
+        await season_request_service.set_library_path(
+            session,
+            media_request_id=request.id,
+            season_number=season,
+            library_path=str(season_dir),
+        )
+        await season_request_service.mark_completed(
+            session, media_request_id=request.id, season_number=season
+        )
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    finally:
+        purge_service.end_placement(str(season_dir))
+
+
 async def _reject_unsafe_payload_if_reported(
     *,
     session: AsyncSession,
@@ -1925,12 +2041,20 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
-    resume_from_breadcrumb = (
-        status is None
-        and download_path is not None
-        and download_status == DownloadState.Importing.value
-    )
-    if status is None and not resume_from_breadcrumb:
+    if status is None:
+        if download_path is not None and download_status == DownloadState.Importing.value:
+            return await _resume_breadcrumbed_tv_import(
+                session=session,
+                download_repo=download_repo,
+                request=request,
+                season=season,
+                download_id=download_id,
+                torrent_hash=torrent_hash,
+                fs=fs,
+                library=library,
+                tv_root=tv_root,
+                download_path=download_path,
+            )
         await _block(
             session,
             download_repo,
@@ -1940,7 +2064,7 @@ async def _import_tv_locked(
             season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if status is not None and _payload_manifest_is_complete(status):
+    if _payload_manifest_is_complete(status):
         rejected = await _reject_unsafe_payload_if_reported(
             session=session,
             download_repo=download_repo,
@@ -1956,7 +2080,7 @@ async def _import_tv_locked(
         )
         if rejected is not None:
             return rejected
-    if status is not None and not _is_settled_for_import(status):
+    if not _is_settled_for_import(status):
         deferred = await download_repo.update_status_if_in(
             download_id,
             DownloadState.Downloading.value,
