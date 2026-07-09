@@ -266,6 +266,64 @@ async def test_unsafe_payload_manifest_fails_blocklists_researches_and_removes(
     assert "unsupported file type .exe" in download.failed_reason
 
 
+async def test_payload_reason_survives_remove_done_phase_c_exhaustion(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.01,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[live],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/movie.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/setup.exe",
+                    size_bytes=1024,
+                ),
+            ]
+        },
+    )
+
+    async with sessionmaker_() as session:
+        _fail_commit_on(session, monkeypatch, {3, 4, 5})
+        with pytest.raises(OperationalError):
+            await queue_service.reconcile_and_list(qbt, session)
+
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert download.status == "failed_pending"
+    assert download.failed_reason is not None
+    assert "remove=done" in download.failed_reason
+    assert "unsupported file type .exe" in download.failed_reason
+
+    async with sessionmaker_() as session:
+        await queue_service.heal_failed_pending_without_client(session)
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+
+    assert request is not None and request.status is RequestStatus.searching
+    assert download.status == "failed"
+    assert download.failed_reason is not None
+    assert "unsupported file type .exe" in download.failed_reason
+    assert len(blocklist) == 1
+
+
 async def test_completed_unsafe_payload_fails_before_import_pending(
     sessionmaker_: SessionMaker,
 ) -> None:

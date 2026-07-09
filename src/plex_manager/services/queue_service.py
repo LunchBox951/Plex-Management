@@ -212,6 +212,8 @@ PREDICATE-ATOMIC (the final protocol form):
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import re
 from dataclasses import dataclass, replace
@@ -464,7 +466,7 @@ def _release_operator_claim(download_id: int, token: int) -> None:
 # ``failed_pending`` window.
 _OPERATOR_FAIL_MARKER_RE: Final = re.compile(
     r"^(operator mark-failed|reconcile failure) in progress "
-    r"\(blocklist=(yes|no), remove=(yes|no|done), nonce=(\d+)\)$"
+    r"\(blocklist=(yes|no), remove=(yes|no|done), nonce=(\d+)(?:, reason=(.+))?\)$"
 )
 
 _OPERATOR_FAIL_FINAL_REASON: Final = "marked failed by operator"
@@ -505,7 +507,11 @@ def _operator_fail_marker_removal_done(blocklist: bool, nonce: int) -> str:
     )
 
 
-def _reconcile_removal_done_marker() -> str:
+def _is_payload_rejection_reason(reason: str | None) -> bool:
+    return reason is not None and reason.startswith("torrent payload rejected")
+
+
+def _reconcile_removal_done_marker(reason: str | None = None) -> str:
     """Render the RECONCILE actor's durable removal-outcome record.
 
     Stamped (CAS'd on the observed plain/NULL reason, committed at once) after a
@@ -516,9 +522,12 @@ def _reconcile_removal_done_marker() -> str:
     mark-failed"), reconcile-default flags (``blocklist=yes``), and the fixed
     ``nonce=0`` reconcile tag (operator tokens start at 1).
     """
-    return (
-        f"reconcile failure in progress (blocklist=yes, remove=done, nonce={_RECONCILE_DONE_NONCE})"
+    marker = (
+        f"reconcile failure in progress (blocklist=yes, remove=done, nonce={_RECONCILE_DONE_NONCE}"
     )
+    if _is_payload_rejection_reason(reason):
+        marker += f", reason={json.dumps(reason)}"
+    return marker + ")"
 
 
 @dataclass(frozen=True)
@@ -534,6 +543,7 @@ class _ParsedOperatorMarker:
     operator: bool
     flags: _OperatorFailFlags
     nonce: int
+    final_reason: str | None = None
 
 
 def _parse_operator_fail_marker(failed_reason: str | None) -> _ParsedOperatorMarker | None:
@@ -550,6 +560,13 @@ def _parse_operator_fail_marker(failed_reason: str | None) -> _ParsedOperatorMar
     match = _OPERATOR_FAIL_MARKER_RE.match(failed_reason)
     if match is None:
         return None
+    final_reason: str | None = None
+    encoded_reason = match.group(5)
+    if encoded_reason is not None:
+        with contextlib.suppress(json.JSONDecodeError):
+            decoded = json.loads(encoded_reason)
+            if isinstance(decoded, str):
+                final_reason = decoded
     return _ParsedOperatorMarker(
         operator=match.group(1) == "operator mark-failed",
         flags=_OperatorFailFlags(
@@ -559,6 +576,7 @@ def _parse_operator_fail_marker(failed_reason: str | None) -> _ParsedOperatorMar
             remove_torrent=match.group(3) == "yes",
         ),
         nonce=int(match.group(4)),
+        final_reason=final_reason,
     )
 
 
@@ -1208,6 +1226,11 @@ async def reconcile_and_list(
                 frozenset({transition.from_state}),
                 progress=live.progress if live is not None else None,
                 seed_ratio=live.ratio if live is not None else None,
+                failed_reason=(
+                    transition.reason
+                    if transition.to_state is DownloadState.FailedPending
+                    else None
+                ),
                 first_seen_at=now if transition.set_first_seen_at else None,
                 clear_first_seen_at=transition.clear_first_seen_at,
             )
@@ -1283,11 +1306,10 @@ async def reconcile_and_list(
                 blocklist=True,
                 remove_torrent=True,
                 blocklist_reason=BlocklistReason.failed.value,
-                # The Phase-A transition CAS never writes ``failed_reason``, so the
-                # cycle-start snapshot value is still the row's current reason; the
-                # terminal CAS re-proves that atomically (an operator marker landing
-                # mid-cycle changes it and defeats this completion at the DB).
-                observed_failed_reason=event_row.failed_reason,
+                # Phase A persists the failure reason on the ``failed_pending`` row.
+                # The terminal CAS re-proves that atomically; an operator marker
+                # landing mid-cycle changes it and defeats this stale completion.
+                observed_failed_reason=event.reason,
             )
         )
     for row in rows:
@@ -1303,7 +1325,7 @@ async def reconcile_and_list(
             final_reason = _OPERATOR_FAIL_FINAL_REASON
             blocklist_reason = BlocklistReason.user_reported.value
         elif marker is not None:
-            final_reason = _RECONCILE_FAIL_FINAL_REASON
+            final_reason = marker.final_reason or _RECONCILE_FAIL_FINAL_REASON
             blocklist_reason = BlocklistReason.failed.value
         else:
             final_reason = row.failed_reason or "recovered stranded failed_pending row"
@@ -1467,7 +1489,7 @@ async def reconcile_and_list(
                     provenance.flags.blocklist, provenance.nonce
                 )
             elif removed_ok and provenance is None:
-                done_marker = _reconcile_removal_done_marker()
+                done_marker = _reconcile_removal_done_marker(completion.event.reason)
             if done_marker is not None:
                 restamped = await download_repo.update_status_if_in(
                     completion.download_id,
@@ -1576,7 +1598,7 @@ async def heal_failed_pending_without_client(session: AsyncSession) -> None:
                     reason=(
                         _OPERATOR_FAIL_FINAL_REASON
                         if marker.operator
-                        else _RECONCILE_FAIL_FINAL_REASON
+                        else marker.final_reason or _RECONCILE_FAIL_FINAL_REASON
                     ),
                     tmdb_id=row.tmdb_id,
                     occurred_at=now,

@@ -775,22 +775,46 @@ async def _fail_unsafe_payload(
     reason: str,
     request_id: int,
     season: int | None = None,
+    owned_placement: Path | None = None,
 ) -> DownloadRecord | None:
-    failed_pending = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.FailedPending.value,
-        _RESUMABLE,
-        failed_reason=reason,
-    )
-    if not failed_pending:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-    await session.commit()
-
-    # Share queue_service's automatic-removal guard so an operator mark_failed cannot
-    # claim remove=no semantics while this safety rejection is deleting the torrent.
     queue_service._reconcile_removals_in_flight.add(download_id)  # pyright: ignore[reportPrivateUsage]
     try:
+        if queue_service._is_operator_claimed(download_id):  # pyright: ignore[reportPrivateUsage]
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        failed_pending = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.FailedPending.value,
+            _RESUMABLE,
+            failed_reason=reason,
+        )
+        if not failed_pending:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        await session.commit()
+
+        await session.rollback()
+        latest = await session.get(Download, download_id, populate_existing=True)
+        latest_status = latest.status if latest is not None else None
+        latest_reason = latest.failed_reason if latest is not None else None
+        await session.rollback()
+        if latest_status != DownloadState.FailedPending.value or latest_reason != reason:
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+
+        if owned_placement is not None:
+            cleared = await download_repo.update_status_if_in(
+                download_id,
+                DownloadState.FailedPending.value,
+                frozenset({DownloadState.FailedPending.value}),
+                clear_download_path=True,
+                require_failed_reason=reason,
+            )
+            if cleared:
+                await session.commit()
+            else:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            await asyncio.to_thread(_remove_quietly, owned_placement)
+
         await purge_service.remove_torrent(
             qbt,
             torrent_hash,
@@ -801,53 +825,72 @@ async def _fail_unsafe_payload(
                 "request_id": safe_int(request_id),
             },
         )
+
+        request_repo = SqlRequestRepository(session)
+        request = await request_repo.get(request_id)
+        source_title = (
+            await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
+        )
+        indexer = await blocklist_service.indexer_for(session, torrent_hash)
+        completed = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Failed.value,
+            frozenset({DownloadState.FailedPending.value}),
+            failed_reason=reason,
+            require_failed_reason=reason,
+        )
+        if not completed:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+
+        await SqlBlocklistRepository(session).create(
+            source_title=source_title,
+            reason=BlocklistReason.failed.value,
+            tmdb_id=request.tmdb_id if request is not None else None,
+            torrent_hash=torrent_hash,
+            indexer=indexer,
+            media_type=(
+                request.media_type
+                if request is not None
+                else ("tv" if season is not None else "movie")
+            ),
+        )
+        if request is not None:
+            if season is not None:
+                season_repo = SqlSeasonRequestRepository(session)
+                row = await season_repo.ensure(
+                    request_id, season, status=RequestStatus.pending.value
+                )
+                await season_request_service.set_status_if_in(
+                    session,
+                    media_request_id=request_id,
+                    season_request_id=row.id,
+                    status=RequestStatus.searching.value,
+                    allowed_from=_REARMABLE_REQUEST_STATUS_VALUES,
+                )
+            else:
+                await request_repo.set_status_if_in(
+                    request_id,
+                    RequestStatus.searching.value,
+                    _REARMABLE_REQUEST_STATUS_VALUES,
+                )
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
     finally:
         queue_service._reconcile_removals_in_flight.discard(download_id)  # pyright: ignore[reportPrivateUsage]
 
-    request_repo = SqlRequestRepository(session)
-    request = await request_repo.get(request_id)
-    source_title = await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
-    indexer = await blocklist_service.indexer_for(session, torrent_hash)
-    completed = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.Failed.value,
-        frozenset({DownloadState.FailedPending.value}),
-        failed_reason=reason,
-        require_failed_reason=reason,
-    )
-    if not completed:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
 
-    await SqlBlocklistRepository(session).create(
-        source_title=source_title,
-        reason=BlocklistReason.failed.value,
-        tmdb_id=request.tmdb_id if request is not None else None,
-        torrent_hash=torrent_hash,
-        indexer=indexer,
-        media_type=(
-            request.media_type if request is not None else ("tv" if season is not None else "movie")
-        ),
-    )
-    if request is not None:
-        if season is not None:
-            season_repo = SqlSeasonRequestRepository(session)
-            row = await season_repo.ensure(request_id, season, status=RequestStatus.pending.value)
-            await season_request_service.set_status_if_in(
-                session,
-                media_request_id=request_id,
-                season_request_id=row.id,
-                status=RequestStatus.searching.value,
-                allowed_from=_REARMABLE_REQUEST_STATUS_VALUES,
-            )
-        else:
-            await request_repo.set_status_if_in(
-                request_id,
-                RequestStatus.searching.value,
-                _REARMABLE_REQUEST_STATUS_VALUES,
-            )
-    await session.commit()
-    return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+def _owned_movie_breadcrumb_for_unsafe_rollback(
+    status: str, download_path: str | None, movies_root: str
+) -> Path | None:
+    if status != DownloadState.Importing.value or download_path is None:
+        return None
+    path = Path(download_path)
+    root_real = os.path.realpath(movies_root)
+    path_real = os.path.realpath(path)
+    if path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(root_real, path_real):
+        return None
+    return path
 
 
 async def _reject_unsafe_payload_if_reported(
@@ -860,6 +903,7 @@ async def _reject_unsafe_payload_if_reported(
     status: DownloadStatus | None,
     request_id: int,
     season: int | None = None,
+    owned_placement: Path | None = None,
 ) -> DownloadRecord | None:
     if status is None:
         return None
@@ -889,6 +933,7 @@ async def _reject_unsafe_payload_if_reported(
         reason=reason,
         request_id=request_id,
         season=season,
+        owned_placement=owned_placement,
     )
 
 
@@ -1192,6 +1237,9 @@ async def _import_download_locked(
             torrent_hash=torrent_hash,
             status=status,
             request_id=request.id,
+            owned_placement=_owned_movie_breadcrumb_for_unsafe_rollback(
+                row.status, row.download_path, effective_movies_root
+            ),
         )
         if rejected is not None:
             return rejected

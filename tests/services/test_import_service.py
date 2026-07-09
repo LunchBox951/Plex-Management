@@ -290,6 +290,43 @@ async def test_importing_unsafe_payload_manifest_fails_instead_of_blocking(
     assert request is not None and request.status is RequestStatus.searching
 
 
+async def test_importing_unsafe_payload_rolls_back_owned_movie_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        await session.commit()
+
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024),
+        ],
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert record.download_path is None
+    assert not dst.exists(), "owned crash-resume placement must be removed before re-search"
+    assert qbt.removed == [(_HASH, True)]
+
+
 async def test_import_blocks_when_client_status_missing_before_payload_validation(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
