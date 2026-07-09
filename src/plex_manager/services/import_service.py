@@ -1161,22 +1161,20 @@ async def _import_download_locked(
 
     # Locate the completed video file on disk.
     status = await qbt.get_status(row.torrent_hash)
-    can_use_movie_breadcrumb = (
-        row.status == DownloadState.Importing.value and row.download_path is not None
-    )
-    if status is None and can_use_movie_breadcrumb:
-        return await _resume_breadcrumbed_movie_import(
-            session=session,
-            download_repo=download_repo,
-            request_repo=request_repo,
-            library=library,
-            download_id=download_id,
-            torrent_hash=torrent_hash,
-            request=request,
-            movies_root=effective_movies_root,
-            download_path=row.download_path,
-        )
+    download_path = row.download_path
     if status is None:
+        if row.status == DownloadState.Importing.value and download_path is not None:
+            return await _resume_breadcrumbed_movie_import(
+                session=session,
+                download_repo=download_repo,
+                request_repo=request_repo,
+                library=library,
+                download_id=download_id,
+                torrent_hash=torrent_hash,
+                request=request,
+                movies_root=effective_movies_root,
+                download_path=download_path,
+            )
         await _block(
             session,
             download_repo,
@@ -1185,7 +1183,7 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if status is not None and _payload_manifest_is_complete(status):
+    if _payload_manifest_is_complete(status):
         rejected = await _reject_unsafe_payload_if_reported(
             session=session,
             download_repo=download_repo,
@@ -1197,7 +1195,7 @@ async def _import_download_locked(
         )
         if rejected is not None:
             return rejected
-    if status is not None and not _is_settled_for_import(status):
+    if not _is_settled_for_import(status):
         # The row may be resumable because a prior reconcile saw completion, but the
         # live client can still be moving/downloading the payload. Do not validate or
         # import a changing file tree; re-arm the honest Downloading state and let the
