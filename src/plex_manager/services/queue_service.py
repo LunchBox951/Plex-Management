@@ -243,7 +243,7 @@ from plex_manager.domain.state_machine import (
     DownloadState,
     is_legal_transition,
 )
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
     Download,
@@ -1114,7 +1114,7 @@ async def _payload_safety_transitions(
             _logger.warning(
                 "download %s: could not validate torrent payload manifest (%s); "
                 "deferring payload safety decision",
-                row.torrent_hash,
+                safe_text(row.torrent_hash),
                 type(exc).__name__,
             )
             continue

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -547,6 +548,11 @@ class _OneListFilesOutageQbt(FakeQbittorrent):
         return await super().list_files(info_hash)
 
 
+class _AnyListFilesOutageQbt(FakeQbittorrent):
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        raise QbittorrentError("qBittorrent request failed")
+
+
 async def test_list_files_outage_does_not_blocklist_release(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -604,6 +610,41 @@ async def test_list_files_outage_does_not_blocklist_release(
     assert blocklist == []
     assert download.status == "downloading"
     assert other_download.status == "import_pending"
+
+
+async def test_list_files_outage_sanitizes_logged_torrent_hash(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    torrent_hash = "bad\nERROR forged"
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash=torrent_hash,
+                status="downloading",
+                tmdb_id=603,
+                first_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    live = DownloadStatus(
+        info_hash=torrent_hash,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.3,
+    )
+    caplog.set_level(logging.WARNING, logger="plex_manager.services.queue_service")
+
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(_AnyListFilesOutageQbt(statuses=[live]), session)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "could not validate torrent payload manifest" in record.getMessage()
+    ]
+    assert messages
+    assert "\n" not in messages[0]
+    assert "bad ERROR forged" in messages[0]
 
 
 async def test_mark_failed_routes_downloading_through_failed_pending(

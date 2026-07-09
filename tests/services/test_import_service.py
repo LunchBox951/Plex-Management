@@ -210,7 +210,7 @@ async def test_import_happy_path_places_file_scans_and_marks_completed(
         assert request.completed_at is not None
 
 
-async def test_import_rejects_unsafe_payload_manifest_before_copy(
+async def test_import_fails_unsafe_payload_manifest_before_copy(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
     movies_root = tmp_path / "library"
@@ -233,21 +233,61 @@ async def test_import_rejects_unsafe_payload_manifest_before_copy(
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
 
     assert record is not None
-    assert record.status == DownloadState.ImportBlocked.value
+    assert record.status == DownloadState.Failed.value
     assert record.failed_reason is not None
     assert "unsupported file type .exe" in record.failed_reason
-    assert qbt.removed == []
+    assert qbt.removed == [(_HASH, True)]
     assert not (movies_root / "The Matrix (1999)").exists()
     async with sessionmaker_() as session:
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
         request = await session.get(MediaRequest, request_id)
         download = await session.get(Download, download_id)
 
-    assert blocklist == []
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+    assert blocklist[0].reason.value == "failed"
     assert request is not None
-    assert request.status is RequestStatus.import_blocked
+    assert request.status is RequestStatus.searching
     assert download is not None
-    assert download.status == DownloadState.ImportBlocked.value
+    assert download.status == DownloadState.Failed.value
+    assert download.failed_reason is not None
+    assert "unsupported file type .exe" in download.failed_reason
+
+
+async def test_importing_unsafe_payload_manifest_fails_instead_of_blocking(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024),
+        ],
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert record.failed_reason is not None
+    assert "unsupported file type .exe" in record.failed_reason
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+    assert request is not None and request.status is RequestStatus.searching
 
 
 async def test_import_blocks_when_client_status_missing_before_payload_validation(
@@ -268,6 +308,36 @@ async def test_import_blocks_when_client_status_missing_before_payload_validatio
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
     assert record.failed_reason == "download client reported no status for payload validation"
+
+
+async def test_importing_movie_uses_library_breadcrumb_when_client_status_missing(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert record.download_path == str(dst)
+    assert library.scanned == [str(dst.parent)]
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.completed
 
 
 async def test_import_persists_library_path_and_a_later_sweep_reclaims_it(

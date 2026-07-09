@@ -62,8 +62,9 @@ from plex_manager.domain.naming import (
 from plex_manager.domain.quality import Quality
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
+    BlocklistReason,
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
@@ -71,10 +72,18 @@ from plex_manager.models import (
     RequestStatus,
 )
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
+from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import path_visibility, purge_service, season_request_service
+from plex_manager.services import (
+    blocklist_service,
+    path_visibility,
+    purge_service,
+    queue_service,
+    season_request_service,
+)
+from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -126,6 +135,10 @@ _IMPORT_READY_RAW_STATES: frozenset[str] = frozenset(
 # ``failed_reason`` joins together -- a 20+ episode pack where every file is
 # rejected must not produce an unreadably long string.
 _MAX_BLOCK_REASONS: Final = 10
+
+_REARMABLE_REQUEST_STATUS_VALUES: frozenset[str] = (
+    frozenset(s.value for s in RequestStatus) - TERMINAL_REQUEST_STATUS_VALUES
+)
 
 # Bounded Finalizing (issue #158): "Finalizing" ("completed", not yet
 # "available") was previously an UNBOUNDED silent state -- a row whose Plex item
@@ -752,6 +765,93 @@ def _build_tv_import_plan(
     return _TvImportPlan(target, season_dir, abs_by_rel, by_relative, validation.accepted)
 
 
+async def _fail_unsafe_payload(
+    *,
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    qbt: DownloadClientPort,
+    download_id: int,
+    torrent_hash: str,
+    reason: str,
+    request_id: int,
+    season: int | None = None,
+) -> DownloadRecord | None:
+    failed_pending = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.FailedPending.value,
+        _RESUMABLE,
+        failed_reason=reason,
+    )
+    if not failed_pending:
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+    await session.commit()
+
+    # Share queue_service's automatic-removal guard so an operator mark_failed cannot
+    # claim remove=no semantics while this safety rejection is deleting the torrent.
+    queue_service._reconcile_removals_in_flight.add(download_id)  # pyright: ignore[reportPrivateUsage]
+    try:
+        await purge_service.remove_torrent(
+            qbt,
+            torrent_hash,
+            context="an unsafe torrent payload rejection",
+            extra={
+                "torrent_hash": safe_text(torrent_hash),
+                "download_id": safe_int(download_id),
+                "request_id": safe_int(request_id),
+            },
+        )
+    finally:
+        queue_service._reconcile_removals_in_flight.discard(download_id)  # pyright: ignore[reportPrivateUsage]
+
+    request_repo = SqlRequestRepository(session)
+    request = await request_repo.get(request_id)
+    source_title = await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
+    indexer = await blocklist_service.indexer_for(session, torrent_hash)
+    completed = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.Failed.value,
+        frozenset({DownloadState.FailedPending.value}),
+        failed_reason=reason,
+        require_failed_reason=reason,
+    )
+    if not completed:
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+
+    await SqlBlocklistRepository(session).create(
+        source_title=source_title,
+        reason=BlocklistReason.failed.value,
+        tmdb_id=request.tmdb_id if request is not None else None,
+        torrent_hash=torrent_hash,
+        indexer=indexer,
+        media_type=(
+            request.media_type if request is not None else ("tv" if season is not None else "movie")
+        ),
+    )
+    if request is not None:
+        if season is not None:
+            season_repo = SqlSeasonRequestRepository(session)
+            row = await season_repo.ensure(
+                request_id, season, status=RequestStatus.pending.value
+            )
+            await season_request_service.set_status_if_in(
+                session,
+                media_request_id=request_id,
+                season_request_id=row.id,
+                status=RequestStatus.searching.value,
+                allowed_from=_REARMABLE_REQUEST_STATUS_VALUES,
+            )
+        else:
+            await request_repo.set_status_if_in(
+                request_id,
+                RequestStatus.searching.value,
+                _REARMABLE_REQUEST_STATUS_VALUES,
+            )
+    await session.commit()
+    return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+
+
 async def _reject_unsafe_payload_if_reported(
     *,
     session: AsyncSession,
@@ -782,15 +882,16 @@ async def _reject_unsafe_payload_if_reported(
     if reason is None:
         return None
 
-    await _block(
-        session,
-        download_repo,
-        download_id,
-        reason,
+    return await _fail_unsafe_payload(
+        session=session,
+        download_repo=download_repo,
+        qbt=qbt,
+        download_id=download_id,
+        torrent_hash=torrent_hash,
+        reason=reason,
         request_id=request_id,
         season=season,
     )
-    return await download_repo.get_by_hash(torrent_hash)
 
 
 async def import_download(
@@ -987,7 +1088,10 @@ async def _import_download_locked(
 
     # Locate the completed video file on disk.
     status = await qbt.get_status(row.torrent_hash)
-    if status is None:
+    can_use_movie_breadcrumb = (
+        row.status == DownloadState.Importing.value and row.download_path is not None
+    )
+    if status is None and not can_use_movie_breadcrumb:
         await _block(
             session,
             download_repo,
@@ -996,7 +1100,7 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if _payload_manifest_is_complete(status):
+    if status is not None and _payload_manifest_is_complete(status):
         rejected = await _reject_unsafe_payload_if_reported(
             session=session,
             download_repo=download_repo,
@@ -1008,7 +1112,7 @@ async def _import_download_locked(
         )
         if rejected is not None:
             return rejected
-    if not _is_settled_for_import(status):
+    if status is not None and not _is_settled_for_import(status):
         # The row may be resumable because a prior reconcile saw completion, but the
         # live client can still be moving/downloading the payload. Do not validate or
         # import a changing file tree; re-arm the honest Downloading state and let the
