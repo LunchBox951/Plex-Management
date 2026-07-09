@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 
 from sqlalchemy import update
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.download_payload import (
@@ -816,7 +818,7 @@ async def _fail_unsafe_payload(
                 return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
             await asyncio.to_thread(_remove_quietly, owned_placement)
 
-        await purge_service.remove_torrent(
+        removed_ok = await purge_service.remove_torrent(
             qbt,
             torrent_hash,
             context="an unsafe torrent payload rejection",
@@ -826,6 +828,30 @@ async def _fail_unsafe_payload(
                 "request_id": safe_int(request_id),
             },
         )
+        observed_failed_reason = reason
+        if removed_ok:
+            done_marker = queue_service._reconcile_removal_done_marker(reason)  # pyright: ignore[reportPrivateUsage]
+            restamped = await download_repo.update_status_if_in(
+                download_id,
+                DownloadState.FailedPending.value,
+                frozenset({DownloadState.FailedPending.value}),
+                failed_reason=done_marker,
+                require_failed_reason=reason,
+            )
+            if not restamped:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            try:
+                await session.commit()
+            except SQLAlchemyError:
+                await session.rollback()
+                _logger.warning(
+                    "could not persist the unsafe payload removal outcome for download %s; "
+                    "the final failure commit will retry with the original payload reason",
+                    safe_int(download_id),
+                )
+            else:
+                observed_failed_reason = done_marker
 
         request_repo = SqlRequestRepository(session)
         request = await request_repo.get(request_id)
@@ -838,7 +864,7 @@ async def _fail_unsafe_payload(
             DownloadState.Failed.value,
             frozenset({DownloadState.FailedPending.value}),
             failed_reason=reason,
-            require_failed_reason=reason,
+            require_failed_reason=observed_failed_reason,
         )
         if not completed:
             await session.rollback()

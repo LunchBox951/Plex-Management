@@ -18,7 +18,7 @@ from typing import Literal
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
@@ -164,6 +164,21 @@ class _ListFilesFailsQbt(FakeQbittorrent):
         raise QbittorrentError("qBittorrent request failed")
 
 
+def _fail_commit_on(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, fail_calls: set[int]
+) -> None:
+    real_commit = session.commit
+    counter = {"n": 0}
+
+    async def _counting_commit() -> None:
+        counter["n"] += 1
+        if counter["n"] in fail_calls:
+            raise OperationalError("simulated", {}, Exception("database is locked"))
+        await real_commit()
+
+    monkeypatch.setattr(session, "commit", _counting_commit)
+
+
 async def _import(
     sessionmaker_: SessionMaker,
     download_id: int,
@@ -258,6 +273,67 @@ async def test_import_fails_unsafe_payload_manifest_before_copy(
     assert download.status == DownloadState.Failed.value
     assert download.failed_reason is not None
     assert "unsupported file type .exe" in download.failed_reason
+
+
+async def test_import_unsafe_payload_removal_outcome_heals_without_client(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024),
+        ],
+    )
+
+    async with sessionmaker_() as session:
+        _fail_commit_on(session, monkeypatch, {3})
+        with pytest.raises(OperationalError):
+            await import_download(
+                download_id=download_id,
+                fs=LocalFileSystem(),
+                library=FakeLibrary(),
+                qbt=qbt,
+                parser=GuessitParser(),
+                profile=default_profile(),
+                session=session,
+                movies_root=str(movies_root),
+            )
+
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+    assert download is not None
+    assert download.status == DownloadState.FailedPending.value
+    assert download.failed_reason is not None
+    assert "remove=done" in download.failed_reason
+    assert "unsupported file type .exe" in download.failed_reason
+    assert request is not None and request.status is RequestStatus.downloading
+
+    async with sessionmaker_() as session:
+        await queue_service.heal_failed_pending_without_client(session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None and download.status == DownloadState.Failed.value
+    assert download.failed_reason is not None
+    assert "unsupported file type .exe" in download.failed_reason
+    assert request is not None and request.status is RequestStatus.searching
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+    assert blocklist[0].reason.value == "failed"
 
 
 async def test_importing_unsafe_payload_manifest_fails_instead_of_blocking(
