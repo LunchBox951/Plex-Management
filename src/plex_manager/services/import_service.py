@@ -894,6 +894,81 @@ async def _reject_unsafe_payload_if_reported(
     )
 
 
+async def _resume_breadcrumbed_movie_import(
+    *,
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    request_repo: SqlRequestRepository,
+    library: LibraryPort,
+    download_id: int,
+    torrent_hash: str,
+    request: RequestRecord,
+    movies_root: str,
+    download_path: str,
+) -> DownloadRecord | None:
+    dst = Path(download_path)
+    root_real = os.path.realpath(movies_root)
+    dst_real = os.path.realpath(dst)
+    if dst.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(root_real, dst_real):
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "stored import breadcrumb is outside the movie library root",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if not await asyncio.to_thread(os.path.exists, dst):
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "stored import breadcrumb is not visible inside the container",
+            request_id=request.id,
+            clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    try:
+        await library.trigger_scan(str(dst.parent), "movie")
+    except (PlexLibraryError, PlexAuthError) as exc:
+        await asyncio.to_thread(_remove_quietly, dst)
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"plex scan failed: {type(exc).__name__}",
+            request_id=request.id,
+            clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    finalized = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.Imported.value,
+        frozenset({DownloadState.Importing.value}),
+        download_path=str(dst),
+        clear_failed_reason=True,
+    )
+    if not finalized:
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash)
+    relative = os.path.relpath(dst, movies_root)
+    session.add(
+        DownloadHistory(
+            tmdb_id=request.tmdb_id,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.imported,
+            source_title=None,
+            message=f"imported {dst.name} to {relative}",
+        )
+    )
+    await request_repo.set_library_path(request.id, str(dst.parent))
+    await request_repo.mark_completed(request.id)
+    await session.commit()
+    return await download_repo.get_by_hash(torrent_hash)
+
+
 async def import_download(
     *,
     download_id: int,
@@ -1091,7 +1166,19 @@ async def _import_download_locked(
     can_use_movie_breadcrumb = (
         row.status == DownloadState.Importing.value and row.download_path is not None
     )
-    if status is None and not can_use_movie_breadcrumb:
+    if status is None and can_use_movie_breadcrumb:
+        return await _resume_breadcrumbed_movie_import(
+            session=session,
+            download_repo=download_repo,
+            request_repo=request_repo,
+            library=library,
+            download_id=download_id,
+            torrent_hash=torrent_hash,
+            request=request,
+            movies_root=effective_movies_root,
+            download_path=row.download_path,
+        )
+    if status is None:
         await _block(
             session,
             download_repo,
