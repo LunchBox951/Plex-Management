@@ -176,11 +176,23 @@ def upgrade() -> None:
                     ELSE 'active'
                 END
             FROM downloads
+            LEFT JOIN media_requests
+              ON media_requests.id = downloads.media_request_id
             LEFT JOIN season_requests
               ON season_requests.media_request_id = downloads.media_request_id
              AND season_requests.season_number = downloads.season
-            WHERE downloads.media_type = 'tv'
-              AND downloads.season IS NOT NULL
+            WHERE downloads.season IS NOT NULL
+              AND (
+                downloads.media_type = 'tv'
+                OR media_requests.media_type = 'tv'
+                OR (
+                  downloads.media_type IS NULL
+                  AND (
+                    media_requests.media_type = 'tv'
+                    OR media_requests.id IS NULL
+                  )
+                )
+              )
             """
         )
     )
@@ -216,6 +228,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(
+        sa.text("UPDATE media_requests SET status = 'pending' WHERE status = 'waiting_for_air_date'")
+    )
+    op.execute(
+        sa.text(
+            "UPDATE season_requests SET status = 'pending' WHERE status = 'waiting_for_air_date'"
+        )
+    )
+
     op.drop_index("uq_download_scopes_active_scope", table_name="download_scopes")
     op.drop_index(op.f("ix_download_scopes_season_request_id"), table_name="download_scopes")
     op.drop_index(op.f("ix_download_scopes_media_request_id"), table_name="download_scopes")

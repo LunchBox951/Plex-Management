@@ -20,8 +20,10 @@ from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.prowlarr.adapter import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
+from plex_manager.domain.decision_engine import DecisionResult
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Blocklist,
@@ -1484,6 +1486,95 @@ async def test_report_issue_researches_the_whole_season_after_an_episode_scoped_
     assert len(prowlarr.searched) == 1
     assert prowlarr.searched[0].season == 1
     assert prowlarr.searched[0].episode is None
+
+
+async def test_report_issue_tv_threads_multi_season_intent_into_research(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Some Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Some.Show.S01E05.mkv").write_bytes(b"x" * 2048)
+    captured: dict[str, object] = {}
+
+    async def capture_preview(*_args: object, **kwargs: object) -> DecisionResult:
+        captured["multi_season_intent"] = kwargs["multi_season_intent"]
+        captured["episodes"] = kwargs["episodes"]
+        return DecisionResult(accepted=(), rejected=(), no_acceptable_release=True)
+
+    monkeypatch.setattr(correction_service.decision_service, "preview", capture_preview)
+
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1399,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.available,
+            tv_request_mode="explicit_episodes",
+            requested_seasons_json=[1, 2],
+            requested_episodes_json={"1": [5], "2": [6]},
+        )
+        session.add(show)
+        await session.flush()
+        session.add_all(
+            [
+                SeasonRequest(
+                    media_request_id=show.id,
+                    season_number=1,
+                    status=RequestStatus.available,
+                    library_path=str(season_dir),
+                ),
+                SeasonRequest(
+                    media_request_id=show.id,
+                    season_number=2,
+                    status=RequestStatus.available,
+                ),
+            ]
+        )
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="imported",
+                media_request_id=show.id,
+                tmdb_id=1399,
+                season=1,
+                episodes_json=[5],
+            )
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=1399,
+                torrent_hash=_CULPRIT,
+                event_type=DownloadHistoryEvent.grabbed,
+                source_title="Some.Show.S01E05.1080p.WEB-DL.x264-GROUP",
+                indexer="FakeIndexer",
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    intent = captured["multi_season_intent"]
+    assert captured["episodes"] is None
+    assert isinstance(intent, MultiSeasonRequestIntent)
+    assert intent.mode == "explicit_seasons"
+    assert intent.requested_seasons == (1, 2)
 
 
 async def test_cancel_refuses_while_a_download_is_finalizing_its_import(

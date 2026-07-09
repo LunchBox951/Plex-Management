@@ -111,6 +111,24 @@ describe('Queue — tv season/episode badge', () => {
     expect(screen.getByText('S01 pack')).toBeInTheDocument()
     expect(screen.getByText('S02E04-E05')).toBeInTheDocument()
   })
+
+  it('labels non-active attached scope statuses', () => {
+    h.queue = [
+      queueItem({
+        season: 1,
+        episodes: null,
+        scopes: [
+          { media_request_id: 7, season: 1, episodes: null, status: 'imported' },
+          { media_request_id: 7, season: 2, episodes: [4, 5], status: 'import_blocked' },
+        ],
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.getByText('S01 pack · Imported')).toBeInTheDocument()
+    expect(screen.getByText('S02E04-E05 · Import blocked')).toBeInTheDocument()
+  })
 })
 
 describe('Queue — human-legible identity (issue #134)', () => {

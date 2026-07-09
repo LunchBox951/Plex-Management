@@ -67,6 +67,7 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.prowlarr.adapter import IndexerError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError, QbittorrentSourceError
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
@@ -239,6 +240,37 @@ _INDEXER_ERRORS: Final = (IndexerError,)
 # subclasses ``QbittorrentError`` but is a source veto, not an outage), and
 # ``QbittorrentAuthError`` is a subclass of ``QbittorrentError`` and so is covered.
 _DOWNLOAD_CLIENT_ERRORS: Final = (QbittorrentError,)
+
+
+async def _multi_season_intent_for_request(
+    session: AsyncSession,
+    request: RequestRecord,
+) -> MultiSeasonRequestIntent | None:
+    if request.media_type != "tv" or request.tv_request_mode not in {
+        "whole_show",
+        "explicit_seasons",
+        "explicit_episodes",
+    }:
+        return None
+    season_rows = await SqlSeasonRequestRepository(session).list_for_request(request.id)
+    requested = (
+        request.requested_seasons
+        or tuple(sorted(request.requested_episodes or {}))
+        or tuple(row.season_number for row in season_rows)
+    )
+    return MultiSeasonRequestIntent(
+        mode="whole_show" if request.tv_request_mode == "whole_show" else "explicit_seasons",
+        requested_seasons=tuple(requested),
+        seasons=tuple(
+            SeasonPackSeasonState(
+                season_number=row.season_number,
+                status=row.status,
+                installed_quality_id=row.installed_quality_id,
+                installed_profile_index=row.installed_profile_index,
+            )
+            for row in season_rows
+        ),
+    )
 
 
 async def _mark_download_scopes_terminal(
@@ -823,6 +855,12 @@ async def report_issue(
     # season dir, never a single episode), so re-fetching only the culprit's episode
     # subset would leave the season with the OTHER (also-deleted) episodes missing while
     # marking it done. A season-directory purge must drive a season-level re-search.
+    multi_season_intent = await _multi_season_intent_for_request(session, request)
+    scope_episodes_by_season = (
+        {season: list(values) for season, values in request.requested_episodes.items()}
+        if request.requested_episodes
+        else None
+    )
     try:
         result = await decision_service.preview(
             prowlarr,
@@ -835,6 +873,7 @@ async def report_issue(
             year=request.year,
             season=target.season,
             episodes=None,
+            multi_season_intent=multi_season_intent,
         )
     except _INDEXER_ERRORS as exc:
         # The re-search could not reach the indexer AFTER the blocklist/purge/reset
@@ -880,6 +919,7 @@ async def report_issue(
                             year=request.year,
                             season=target.season,
                             episodes=None,
+                            scope_episodes_by_season=scope_episodes_by_season,
                             save_path=save_path,
                         )
                         park_scope = False

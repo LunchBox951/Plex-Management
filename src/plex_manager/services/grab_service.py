@@ -18,6 +18,7 @@ request never ends up with two active downloads racing each other.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
@@ -340,6 +341,21 @@ def _planned_target_seasons(scored: ScoredRelease, season: int | None) -> tuple[
     return tuple(dict.fromkeys(scored.target_seasons or (season,)))
 
 
+def _target_episodes(
+    *,
+    primary_season: int,
+    primary_episodes: list[int] | None,
+    target_season: int,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+) -> list[int] | None:
+    if target_season == primary_season:
+        return primary_episodes
+    if scope_episodes_by_season is None or target_season not in scope_episodes_by_season:
+        return None
+    episodes = scope_episodes_by_season[target_season]
+    return list(episodes) if episodes is not None else None
+
+
 async def _active_conflict_for_targets(
     download_repo: SqlDownloadRepository,
     *,
@@ -364,6 +380,7 @@ async def _attach_target_scopes_to_existing_download(
     request_id: int | None,
     season: int | None,
     episodes: list[int] | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
     target_seasons: tuple[int, ...],
     observed_season_status: str | None,
     qbt: DownloadClientPort | None = None,
@@ -385,7 +402,12 @@ async def _attach_target_scopes_to_existing_download(
 
     try:
         for target_season in target_seasons:
-            target_episodes = episodes if target_season == season else None
+            target_episodes = _target_episodes(
+                primary_season=season,
+                primary_episodes=episodes,
+                target_season=target_season,
+                scope_episodes_by_season=scope_episodes_by_season,
+            )
             await download_repo.ensure_scope(
                 existing.id,
                 media_request_id=request_id,
@@ -461,6 +483,7 @@ async def grab(
     save_path: str = "",
     category: str = DEFAULT_CATEGORY,
     expected_season_status: str | None = None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None = None,
 ) -> DownloadRecord:
     """Grab ``scored``: add it to the client and persist a tracked download.
 
@@ -473,6 +496,9 @@ async def grab(
     ``Download.episodes_json`` -- ``None`` means import every valid video file
     found for the season, an explicit list scopes the import to those episode
     numbers only (a season-pack grab scoped to specific missing episodes).
+    ``scope_episodes_by_season`` optionally carries the stored per-season episode
+    intent for sibling scopes of a multi-season pack; the explicit ``episodes``
+    argument remains authoritative for the primary ``season``.
 
     When ``request_id`` resolves to a real request, ``season``/``episodes`` are
     validated (and, for a movie, silently coerced) against the request's ACTUAL
@@ -596,6 +622,7 @@ async def grab(
                     request_id=request_id,
                     season=season,
                     episodes=episodes,
+                    scope_episodes_by_season=scope_episodes_by_season,
                     target_seasons=target_seasons,
                     observed_season_status=observed_season_status,
                 )
@@ -661,6 +688,7 @@ async def grab(
                 request_id=request_id,
                 season=season,
                 episodes=episodes,
+                scope_episodes_by_season=scope_episodes_by_season,
                 target_seasons=target_seasons,
                 observed_season_status=observed_season_status,
                 qbt=qbt,
@@ -720,6 +748,7 @@ async def grab(
                             request_id=request_id,
                             season=season,
                             episodes=episodes,
+                            scope_episodes_by_season=scope_episodes_by_season,
                             target_seasons=target_seasons,
                             observed_season_status=observed_season_status,
                             qbt=qbt,
@@ -810,6 +839,7 @@ async def grab(
                         request_id=request_id,
                         season=season,
                         episodes=episodes,
+                        scope_episodes_by_season=scope_episodes_by_season,
                         target_seasons=target_seasons,
                         observed_season_status=observed_season_status,
                         qbt=qbt,
@@ -848,6 +878,7 @@ async def grab(
                             request_id=request_id,
                             season=season,
                             episodes=episodes,
+                            scope_episodes_by_season=scope_episodes_by_season,
                             target_seasons=target_seasons,
                             observed_season_status=observed_season_status,
                             qbt=qbt,
@@ -909,7 +940,12 @@ async def grab(
                             record.id,
                             media_request_id=request_id,
                             season=target_season,
-                            episodes=None,
+                            episodes=_target_episodes(
+                                primary_season=season,
+                                primary_episodes=episodes,
+                                target_season=target_season,
+                                scope_episodes_by_season=scope_episodes_by_season,
+                            ),
                         )
                         target_row = await SqlSeasonRequestRepository(session).ensure(
                             request_id, target_season, status=RequestStatus.pending.value

@@ -605,6 +605,11 @@ async def run_grab_cycle(
                 parent.requested_episodes.get(scope.season) if parent.requested_episodes else None
             )
             scope_episodes = list(stored_episodes) if stored_episodes is not None else None
+            scope_episodes_by_season = (
+                {season: list(values) for season, values in parent.requested_episodes.items()}
+                if parent.requested_episodes
+                else None
+            )
             sibling_seasons = await season_repo.list_for_request(parent.id)
             requested = (
                 parent.requested_seasons
@@ -629,6 +634,7 @@ async def run_grab_cycle(
         else:  # movie
             title, year, media_type = scope.title or "", scope.year, "movie"
             scope_episodes = None
+            scope_episodes_by_season = None
             multi_season_intent = None
 
         searched += 1
@@ -677,6 +683,7 @@ async def run_grab_cycle(
                     year=year,
                     season=scope.season,
                     episodes=scope_episodes,
+                    scope_episodes_by_season=scope_episodes_by_season,
                     save_path=save_path,
                     # The decision's premise rides with the action: this scope
                     # was selected because the season read as DUE at selection

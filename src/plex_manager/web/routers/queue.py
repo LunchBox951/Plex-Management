@@ -220,6 +220,11 @@ async def grab_endpoint(
         episodes=body.episodes,
         episodes_was_provided="episodes" in body.model_fields_set,
     )
+    scope_episodes_by_season = (
+        {season: list(values) for season, values in request.requested_episodes.items()}
+        if request.media_type == "tv" and request.requested_episodes
+        else None
+    )
 
     result = await run_preview(
         # Carry season/episodes so a TV grab searches (and later records) the
@@ -279,6 +284,7 @@ async def grab_endpoint(
             year=request.year,
             season=body.season,
             episodes=effective_episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
             save_path=downloads_host_root,
         )
     except NoGrabSourceError as exc:

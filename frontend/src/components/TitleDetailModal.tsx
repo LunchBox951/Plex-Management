@@ -86,6 +86,14 @@ function seasonStatusFor(request: RequestResponse, season: number | null): strin
   return request.seasons?.find((s) => s.season_number === season)?.status ?? request.status
 }
 
+function queueItemCoversSeason(item: QueueItem, season: number | null): boolean {
+  if (season == null) return true
+  if (item.scopes && item.scopes.length > 0) {
+    return item.scopes.some((scope) => scope.season === season)
+  }
+  return item.season === season
+}
+
 /** The first non-terminal tracked season, else the first tracked season. */
 function firstActionableSeason(seasons: SeasonStatus[] | null): number | null {
   if (!seasons || seasons.length === 0) return null
@@ -377,7 +385,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     const matches = items.filter((q) => {
       if (effectiveRequestId === null) return q.tmdb_id === title.tmdb_id
       if (q.media_request_id !== effectiveRequestId) return false
-      return title.media_type === 'tv' ? q.season === currentSeason : true
+      return title.media_type === 'tv' ? queueItemCoversSeason(q, currentSeason) : true
     })
     return matches.length > 0 ? matches[matches.length - 1]! : null
   }, [queueQuery.data, title, effectiveRequestId, currentSeason])

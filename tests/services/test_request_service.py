@@ -834,6 +834,68 @@ async def test_create_request_tv_dedups_onto_concurrent_regrab_under_the_lock(
     assert sorted(r.status.value for r in rows) == ["available", "evicted", "pending"]
 
 
+async def test_create_request_tv_under_lock_dedup_merges_intent(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with sessionmaker_() as session:
+        stale = MediaRequest(
+            tmdb_id=671,
+            media_type=MediaType.tv,
+            title="Raced Intent",
+            status=RequestStatus.available,
+        )
+        session.add(stale)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=stale.id, season_number=2, status=RequestStatus.available
+            )
+        )
+        regrab = MediaRequest(
+            tmdb_id=671,
+            media_type=MediaType.tv,
+            title="Raced Intent",
+            status=RequestStatus.pending,
+            tv_request_mode="explicit_seasons",
+            requested_seasons_json=[1],
+        )
+        session.add(regrab)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=regrab.id, season_number=1, status=RequestStatus.pending)
+        )
+        await session.commit()
+        regrab_id = regrab.id
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(
+        shows={671: TvMetadata(tmdb_id=671, title="Raced Intent", year=2020, season_count=2)}
+    )
+    library = FakeLibrary(available_tv_seasons={671: frozenset({2})})
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session, tmdb, tmdb_id=671, media_type="tv", seasons=[2], library=library
+        )
+
+    assert result.id == regrab_id
+    record = await _request_record(sessionmaker_, regrab_id)
+    assert record.requested_seasons == (1, 2)
+    assert await _season_numbers(sessionmaker_, regrab_id) == {1, 2}
+
+
 async def test_create_request_after_cancelled_in_window_regrab_still_re_grabs(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -959,6 +1021,27 @@ async def _season_numbers(sm: SessionMaker, media_request_id: int) -> set[int]:
     return {row.season_number for row in rows}
 
 
+async def _season_statuses(sm: SessionMaker, media_request_id: int) -> dict[int, str]:
+    async with sm() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == media_request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return {row.season_number: row.status.value for row in rows}
+
+
+async def _request_record(sm: SessionMaker, media_request_id: int) -> RequestRecord:
+    async with sm() as session:
+        record = await SqlRequestRepository(session).get(media_request_id)
+    assert record is not None
+    return record
+
+
 async def test_create_request_tv_ensures_every_aired_season_when_seasons_omitted(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1038,6 +1121,129 @@ async def test_create_request_tv_second_post_with_new_seasons_grows_the_tracked_
         )
     assert second.id == first.id
     assert await _season_numbers(sessionmaker_, first.id) == {1, 2}
+
+
+async def test_create_request_tv_dedup_future_explicit_season_waits(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5011: TvMetadata(tmdb_id=5011, title="Future Show", year=2024, season_count=1)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5011, media_type="tv", seasons=[1]
+        )
+
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(
+            session, tmdb, tmdb_id=5011, media_type="tv", seasons=[2]
+        )
+
+    assert second.id == first.id
+    assert await _season_statuses(sessionmaker_, first.id) == {
+        1: "pending",
+        2: "waiting_for_air_date",
+    }
+
+
+async def test_create_request_tv_integrity_recovery_future_explicit_season_waits(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5012: TvMetadata(tmdb_id=5012, title="Future Race", year=2024, season_count=1)}
+    )
+    async with sessionmaker_() as session:
+        existing = await request_service.create_request(
+            session, tmdb, tmdb_id=5012, media_type="tv", seasons=[1]
+        )
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    async with sessionmaker_() as session:
+        recovered = await request_service.create_request(
+            session, tmdb, tmdb_id=5012, media_type="tv", seasons=[2]
+        )
+
+    assert recovered.id == existing.id
+    assert await _season_statuses(sessionmaker_, existing.id) == {
+        1: "pending",
+        2: "waiting_for_air_date",
+    }
+
+
+async def test_create_request_tv_merges_episode_and_season_intent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5013: TvMetadata(tmdb_id=5013, title="Intent Show", year=2020, season_count=4)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5013, media_type="tv", episodes={1: [5]}
+        )
+    async with sessionmaker_() as session:
+        await request_service.create_request(
+            session, tmdb, tmdb_id=5013, media_type="tv", seasons=[2]
+        )
+
+    record = await _request_record(sessionmaker_, first.id)
+    assert record.tv_request_mode == "explicit_episodes"
+    assert record.requested_seasons == (1, 2)
+    assert record.requested_episodes == {1: (5,)}
+
+
+async def test_create_request_tv_merges_season_and_episode_intent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5014: TvMetadata(tmdb_id=5014, title="Intent Show", year=2020, season_count=4)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5014, media_type="tv", seasons=[2]
+        )
+    async with sessionmaker_() as session:
+        await request_service.create_request(
+            session, tmdb, tmdb_id=5014, media_type="tv", episodes={1: [5]}
+        )
+
+    record = await _request_record(sessionmaker_, first.id)
+    assert record.tv_request_mode == "explicit_episodes"
+    assert record.requested_seasons == (1, 2)
+    assert record.requested_episodes == {1: (5,)}
+
+
+async def test_create_request_tv_whole_season_intent_dominates_later_episode_subset(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5015: TvMetadata(tmdb_id=5015, title="Intent Show", year=2020, season_count=4)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5015, media_type="tv", seasons=[1]
+        )
+    async with sessionmaker_() as session:
+        await request_service.create_request(
+            session, tmdb, tmdb_id=5015, media_type="tv", episodes={1: [5]}
+        )
+
+    record = await _request_record(sessionmaker_, first.id)
+    assert record.tv_request_mode == "explicit_seasons"
+    assert record.requested_seasons == (1,)
+    assert record.requested_episodes is None
 
 
 async def test_create_request_tv_all_seasons_in_library_dedups_to_existing(

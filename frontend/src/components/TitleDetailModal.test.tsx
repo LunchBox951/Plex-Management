@@ -575,6 +575,51 @@ describe('TitleDetailModal — tv season selector', () => {
     fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
     expect(await screen.findByText(/in your library/i)).toBeInTheDocument()
   })
+
+  it('matches queue rows by attached scope when the legacy season differs', () => {
+    const request: RequestResponse = {
+      id: 21,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'downloading' },
+      ],
+    }
+    const sharedPack: QueueItem = {
+      id: 31,
+      media_request_id: 21,
+      tmdb_id: 100,
+      season: 1,
+      episodes: null,
+      progress: 0.63,
+      seed_ratio: 0,
+      status: 'downloading',
+      torrent_hash: 'hash-shared-pack',
+      scopes: [
+        { media_request_id: 21, season: 1, episodes: null, status: 'active' },
+        { media_request_id: 21, season: 2, episodes: null, status: 'active' },
+      ],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [sharedPack] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    expect(screen.getByText('63%')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+  })
 })
 
 describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', () => {

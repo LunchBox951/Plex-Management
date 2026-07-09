@@ -728,6 +728,46 @@ async def test_grab_fresh_multi_season_pack_returns_all_attached_scopes(
     ]
 
 
+async def test_grab_fresh_multi_season_pack_preserves_sibling_explicit_episode_scopes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A multi-season pack accepted for an episode-scoped request must attach each
+    sibling season with that season's requested episodes, not widen siblings to
+    whole-season scopes."""
+    request_id = await _make_tv_request(sessionmaker_)
+    pack_hash = "b" * 40
+    scored = _scored_tv(pack_hash, "Some.Show.S01-S02.COMPLETE.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"target_seasons": (1, 2)}
+    )
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=scored,
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+            episodes=[5],
+            scope_episodes_by_season={1: [5], 2: [6]},
+        )
+
+    async with sessionmaker_() as session:
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope)
+                    .where(DownloadScope.download_id == record.id)
+                    .order_by(DownloadScope.season_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert [(scope.season_number, scope.episodes_json) for scope in scopes] == [(1, [5]), (2, [6])]
+
+
 async def test_grab_attaches_same_hash_active_for_uncovered_episodes(
     sessionmaker_: SessionMaker,
 ) -> None:

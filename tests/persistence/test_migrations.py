@@ -150,6 +150,15 @@ def _upgrade(db_path: Path, revision: str, monkeypatch: pytest.MonkeyPatch) -> N
         get_settings.cache_clear()
 
 
+def _downgrade(db_path: Path, revision: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    get_settings.cache_clear()
+    try:
+        command.downgrade(Config("alembic.ini"), revision)
+    finally:
+        get_settings.cache_clear()
+
+
 def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -356,7 +365,7 @@ def test_download_scope_migration_backfills_canonical_scope_keys(
                 text(
                     """
                     INSERT INTO season_requests (id, media_request_id, season_number, status)
-                    VALUES (10, 1, 2, 'downloading')
+                    VALUES (10, 1, 2, 'downloading'), (11, 1, 3, 'downloading')
                     """
                 )
             )
@@ -384,6 +393,17 @@ def test_download_scope_migration_backfills_canonical_scope_keys(
                         2,
                         '[5,4,5]',
                         'tv'
+                    ),
+                    (
+                        'legacy_null_type_hash',
+                        'downloading',
+                        0.0,
+                        0.0,
+                        1,
+                        42,
+                        3,
+                        NULL,
+                        NULL
                     )
                     """
                 )
@@ -395,25 +415,73 @@ def test_download_scope_migration_backfills_canonical_scope_keys(
 
     con = sqlite3.connect(db_path)
     try:
-        season, scope_key, status = con.execute(
-            """
-            SELECT season_number, scope_key, status
-            FROM download_scopes
-            WHERE download_id = (
-                SELECT id FROM downloads WHERE torrent_hash = 'legacy_scope_hash'
+        rows = {
+            torrent_hash: (season, scope_key, status)
+            for torrent_hash, season, scope_key, status in con.execute(
+                """
+                SELECT downloads.torrent_hash, season_number, scope_key, download_scopes.status
+                FROM download_scopes
+                JOIN downloads ON downloads.id = download_scopes.download_id
+                """
             )
-            """
-        ).fetchone()
+        }
         scope_key_not_null = {
             row[1]: row[3] for row in con.execute("PRAGMA table_info(download_scopes)")
         }["scope_key"]
     finally:
         con.close()
 
-    assert season == 2
-    assert scope_key == "season:2|episodes:[4,5]"
-    assert status == "active"
+    assert rows["legacy_scope_hash"] == (2, "season:2|episodes:[4,5]", "active")
+    assert rows["legacy_null_type_hash"] == (3, "season:3|episodes:*", "active")
     assert scope_key_not_null == 1
+
+
+def test_download_scope_waiting_status_downgrade_remaps_before_constraint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "waiting-downgrade.db"
+    _upgrade(db_path, "head", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO media_requests (
+                        id, tmdb_id, media_type, title, status, tv_request_mode
+                    )
+                    VALUES (1, 42, 'tv', 'Waiting Show', 'waiting_for_air_date', 'whole_show')
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO season_requests (media_request_id, season_number, status)
+                    VALUES (1, 1, 'waiting_for_air_date')
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _downgrade(db_path, "9b7a1c5d2e4f", monkeypatch)
+
+    con = sqlite3.connect(db_path)
+    try:
+        request_status = con.execute("SELECT status FROM media_requests WHERE id = 1").fetchone()[0]
+        season_status = con.execute(
+            """
+            SELECT status FROM season_requests
+            WHERE media_request_id = 1 AND season_number = 1
+            """
+        ).fetchone()
+    finally:
+        con.close()
+
+    assert request_status == "pending"
+    assert season_status == ("pending",)
 
 
 def test_release_title_migration_backfills_from_download_history(

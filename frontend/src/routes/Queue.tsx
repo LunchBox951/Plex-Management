@@ -53,15 +53,35 @@ function tvScopeBadge(
   return `${season}${episodes}`
 }
 
-function seasonBadge(item: QueueItem): string | null {
-  return tvScopeBadge(item.season, item.episodes)
+interface ScopeBadge {
+  label: string
+  status: string
 }
 
-function scopeBadges(item: QueueItem): string[] {
+function scopeBadgeLabel(
+  seasonNumber: number | null | undefined,
+  episodeNumbers: number[] | null | undefined,
+  status: string,
+): string | null {
+  const badge = tvScopeBadge(seasonNumber, episodeNumbers)
+  if (badge === null) return null
+  return status === 'active' ? badge : `${badge} · ${downloadStatus(status).label}`
+}
+
+function seasonBadge(item: QueueItem): ScopeBadge | null {
+  const label = tvScopeBadge(item.season, item.episodes)
+  return label ? { label, status: 'active' } : null
+}
+
+function scopeBadges(item: QueueItem): ScopeBadge[] {
   if (item.scopes && item.scopes.length > 0) {
     return item.scopes
-      .map((scope) => tvScopeBadge(scope.season, scope.episodes))
-      .filter((badge): badge is string => badge !== null)
+      .map((scope) => {
+        const status = scope.status ?? 'active'
+        const label = scopeBadgeLabel(scope.season, scope.episodes, status)
+        return label ? { label, status } : null
+      })
+      .filter((badge): badge is ScopeBadge => badge !== null)
   }
   const legacyBadge = seasonBadge(item)
   return legacyBadge ? [legacyBadge] : []
@@ -304,14 +324,28 @@ function QueueCard({
             <div className="flex min-w-0 flex-wrap items-center gap-3">
               <p className="truncate font-display font-semibold text-ink">{heading}</p>
               <StatusBadge status={presentation} {...(detail ? { detail } : {})} />
-              {scopes.map((scope, index) => (
-                <span
-                  key={`${scope}-${index}`}
-                  className="rounded bg-white/8 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-muted ring-1 ring-white/10"
-                >
-                  {scope}
-                </span>
-              ))}
+              {scopes.map((scope, index) => {
+                const scopePresentation = scope.status === 'active' ? null : downloadStatus(scope.status)
+                return (
+                  <span
+                    key={`${scope.label}-${index}`}
+                    className={cn(
+                      'rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide ring-1',
+                      scopePresentation
+                        ? {
+                            searching: 'bg-searching/15 text-searching ring-searching/30',
+                            downloading: 'bg-downloading/15 text-downloading ring-downloading/30',
+                            available: 'bg-available/15 text-available ring-available/30',
+                            error: 'bg-error/15 text-error ring-error/30',
+                            neutral: 'bg-white/8 text-muted ring-white/10',
+                          }[scopePresentation.intent]
+                        : 'bg-white/8 text-muted ring-white/10',
+                    )}
+                  >
+                    {scope.label}
+                  </span>
+                )
+              })}
             </div>
             {showReleaseSubline ? (
               <p className="mt-0.5 truncate font-mono text-xs text-muted">{item.release_title}</p>
