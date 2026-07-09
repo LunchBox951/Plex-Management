@@ -9,6 +9,7 @@ before the torrent can finish and reach import.
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +20,7 @@ from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 
 __all__ = [
     "ALLOWED_PAYLOAD_EXTENSIONS",
+    "EMPTY_PAYLOAD_REJECTION_REASON",
     "SUBTITLE_EXTENSIONS",
     "PayloadRejection",
     "PayloadRejectionReason",
@@ -44,6 +46,11 @@ SUBTITLE_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 ALLOWED_PAYLOAD_EXTENSIONS: frozenset[str] = VIDEO_EXTENSIONS | SUBTITLE_EXTENSIONS
+EMPTY_PAYLOAD_REJECTION_REASON = (
+    "torrent payload rejected: no files reported after completion"
+)
+_DISPLAY_NAME_MAX_LENGTH = 180
+_UNSAFE_UNICODE_CATEGORIES = frozenset({"Cc", "Cf"})
 
 
 class PayloadRejectionReason(StrEnum):
@@ -72,6 +79,8 @@ class PayloadValidation:
 
 def _is_safe_relative_path(name: str) -> bool:
     if not name or "\x00" in name:
+        return False
+    if any(unicodedata.category(char) in _UNSAFE_UNICODE_CATEGORIES for char in name):
         return False
     if PurePosixPath(name.replace("\\", "/")).is_absolute():
         return False
@@ -118,9 +127,19 @@ def validate_payload_files(files: Sequence[DownloadedFile]) -> PayloadValidation
     return PayloadValidation(accepted=not rejections, rejections=tuple(rejections))
 
 
+def _display_name(name: str) -> str:
+    sanitized = "".join(
+        "?" if unicodedata.category(char) in _UNSAFE_UNICODE_CATEGORIES else char
+        for char in name
+    )
+    if len(sanitized) <= _DISPLAY_NAME_MAX_LENGTH:
+        return sanitized
+    return sanitized[: _DISPLAY_NAME_MAX_LENGTH - 3] + "..."
+
+
 def format_payload_rejection(validation: PayloadValidation) -> str:
     """Build the concise failed_reason shown in the queue for an unsafe payload."""
     if not validation.rejections:
         return "torrent payload rejected"
     first = validation.rejections[0]
-    return f"torrent payload rejected: {first.detail} ({first.name})"
+    return f"torrent payload rejected: {first.detail} ({_display_name(first.name)})"

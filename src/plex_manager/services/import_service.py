@@ -43,6 +43,11 @@ from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 from sqlalchemy import update
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.domain.download_payload import (
+    EMPTY_PAYLOAD_REJECTION_REASON,
+    format_payload_rejection,
+    validate_payload_files,
+)
 from plex_manager.domain.import_validation import (
     EpisodeImportResult,
     VideoFile,
@@ -292,6 +297,10 @@ def _lowest_profile_quality(
         )
         pairs.append((quality, profile.get_index(quality.id)))
     return min(pairs, key=lambda pair: pair[1] if pair[1] is not None else -1)
+
+
+def _payload_manifest_is_complete(status: DownloadStatus) -> bool:
+    return status.progress >= 1.0 or status.raw_state in _IMPORT_READY_RAW_STATES
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -743,6 +752,59 @@ def _build_tv_import_plan(
     return _TvImportPlan(target, season_dir, abs_by_rel, by_relative, validation.accepted)
 
 
+async def _reject_unsafe_payload_if_reported(
+    *,
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    qbt: DownloadClientPort,
+    download_id: int,
+    torrent_hash: str,
+    row_status: str,
+    status: DownloadStatus | None,
+    request_id: int,
+    season: int | None = None,
+) -> DownloadRecord | None:
+    if status is None:
+        return None
+    complete = _payload_manifest_is_complete(status)
+    if status.progress <= 0 and not complete:
+        return None
+
+    files = await qbt.list_files(torrent_hash)
+    reason: str | None = None
+    if not files:
+        if complete:
+            reason = EMPTY_PAYLOAD_REJECTION_REASON
+    else:
+        validation = validate_payload_files(files)
+        if not validation.accepted:
+            reason = format_payload_rejection(validation)
+
+    if reason is None:
+        return None
+
+    if row_status in {DownloadState.ImportPending.value, DownloadState.ImportBlocked.value}:
+        from plex_manager.services import queue_service
+
+        return await queue_service.mark_failed(
+            session,
+            qbt,
+            download_id=download_id,
+            blocklist=True,
+            remove_torrent=True,
+        )
+
+    await _block(
+        session,
+        download_repo,
+        download_id,
+        reason,
+        request_id=request_id,
+        season=season,
+    )
+    return await download_repo.get_by_hash(torrent_hash)
+
+
 async def import_download(
     *,
     download_id: int,
@@ -895,6 +957,7 @@ async def _import_download_locked(
             season=season,
             episodes=episodes,
             download_path=row.download_path,
+            row_status=row.status,
             fs=fs,
             library=library,
             qbt=qbt,
@@ -937,7 +1000,29 @@ async def _import_download_locked(
 
     # Locate the completed video file on disk.
     status = await qbt.get_status(row.torrent_hash)
-    if status is not None and not _is_settled_for_import(status):
+    if status is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "download client reported no status for payload validation",
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if _payload_manifest_is_complete(status):
+        rejected = await _reject_unsafe_payload_if_reported(
+            session=session,
+            download_repo=download_repo,
+            qbt=qbt,
+            download_id=download_id,
+            torrent_hash=torrent_hash,
+            row_status=row.status,
+            status=status,
+            request_id=request.id,
+        )
+        if rejected is not None:
+            return rejected
+    if not _is_settled_for_import(status):
         # The row may be resumable because a prior reconcile saw completion, but the
         # live client can still be moving/downloading the payload. Do not validate or
         # import a changing file tree; re-arm the honest Downloading state and let the
@@ -1545,6 +1630,7 @@ async def _import_tv_locked(
     season: int,
     episodes: list[int] | None,
     download_path: str | None,
+    row_status: str,
     fs: FileSystemPort,
     library: LibraryPort,
     qbt: DownloadClientPort,
@@ -1591,7 +1677,31 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
-    if status is not None and not _is_settled_for_import(status):
+    if status is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "download client reported no status for payload validation",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if _payload_manifest_is_complete(status):
+        rejected = await _reject_unsafe_payload_if_reported(
+            session=session,
+            download_repo=download_repo,
+            qbt=qbt,
+            download_id=download_id,
+            torrent_hash=torrent_hash,
+            row_status=row_status,
+            status=status,
+            request_id=request.id,
+            season=season,
+        )
+        if rejected is not None:
+            return rejected
+    if not _is_settled_for_import(status):
         deferred = await download_repo.update_status_if_in(
             download_id,
             DownloadState.Downloading.value,

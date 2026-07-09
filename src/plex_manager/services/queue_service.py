@@ -222,7 +222,9 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
+from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.download_payload import (
+    EMPTY_PAYLOAD_REJECTION_REASON,
     format_payload_rejection,
     validate_payload_files,
 )
@@ -279,8 +281,13 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATES)
-_PAYLOAD_VALIDATION_STATUS_VALUES = frozenset(s.value for s in ACTIVE_STATES)
+_PAYLOAD_VALIDATION_STATUS_VALUES = frozenset(s.value for s in ACTIVE_STATES) | frozenset(
+    {DownloadState.ImportBlocked.value}
+)
 _COMPLETE_PROGRESS = 1.0
+_PAYLOAD_COMPLETE_RAW_STATES = frozenset(
+    {"uploading", "stalledUP", "pausedUP", "stoppedUP", "queuedUP", "checkingUP", "forcedUP"}
+)
 
 # Request statuses from which a failed download's owning request/season may still
 # be re-armed to ``searching`` — every NON-terminal status. This is the CAS
@@ -1078,6 +1085,10 @@ def _payload_failure_transition(row: DownloadRecord, reason: str) -> StateTransi
     )
 
 
+def _payload_manifest_is_complete(live: DownloadStatus) -> bool:
+    return live.progress >= _COMPLETE_PROGRESS or live.raw_state in _PAYLOAD_COMPLETE_RAW_STATES
+
+
 async def _payload_safety_transitions(
     qbt: DownloadClientPort,
     rows: list[DownloadRecord],
@@ -1089,17 +1100,27 @@ async def _payload_safety_transitions(
         if row.status not in _PAYLOAD_VALIDATION_STATUS_VALUES:
             continue
         live = snapshot.get(row.torrent_hash.lower())
-        if live is None or live.progress <= 0:
+        if live is None:
+            continue
+        complete = _payload_manifest_is_complete(live)
+        if live.progress <= 0 and not complete:
+            continue
+        if _is_operator_claimed(row.id):
             continue
 
-        files = await qbt.list_files(row.torrent_hash)
+        try:
+            files = await qbt.list_files(row.torrent_hash)
+        except QbittorrentError as exc:
+            _logger.warning(
+                "download %s: could not validate torrent payload manifest (%s); "
+                "deferring payload safety decision",
+                row.torrent_hash,
+                type(exc).__name__,
+            )
+            continue
         if not files:
-            if live.progress >= _COMPLETE_PROGRESS:
-                transitions.append(
-                    _payload_failure_transition(
-                        row, "torrent payload rejected: no files reported after completion"
-                    )
-                )
+            if complete:
+                transitions.append(_payload_failure_transition(row, EMPTY_PAYLOAD_REJECTION_REASON))
             continue
 
         validation = validate_payload_files(files)

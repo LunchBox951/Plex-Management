@@ -25,7 +25,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -1369,7 +1369,12 @@ async def test_import_endpoint_anime_movie_routes_to_configured_anime_root(
                 save_path=str(video.parent),
                 content_path=str(video),
             )
-        ]
+        ],
+        files={
+            torrent_hash: [
+                DownloadedFile(name=video.name, size_bytes=60 * 1024 * 1024),
+            ]
+        },
     )
     override_adapters(app, qbt=qbt, library=FakeLibrary())
 

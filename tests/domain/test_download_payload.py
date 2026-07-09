@@ -68,6 +68,10 @@ def test_rejects_any_non_video_or_subtitle_payload(name: str) -> None:
         "\\\\server\\share\\movie.mkv",
         "Movie//movie.mkv",
         "Movie/./movie.mkv",
+        "Movie/movie\nname.mkv",
+        "Movie/movie\rname.mkv",
+        "Movie/movie\tname.mkv",
+        "Movie/movie\u202ename.mkv",
         "",
         "Movie\x00Name/movie.mkv",
     ],
@@ -92,3 +96,18 @@ def test_failed_reason_uses_first_rejection() -> None:
     assert format_payload_rejection(result) == (
         "torrent payload rejected: unsupported file type .exe (Movie.2020.1080p/setup.exe)"
     )
+
+
+def test_failed_reason_sanitizes_and_truncates_manifest_name() -> None:
+    result = validate_payload_files([_file("Movie.2020.1080p/bad\nname.exe")])
+
+    message = format_payload_rejection(result)
+
+    assert "\n" not in message
+    assert "bad?name.exe" in message
+
+    long_name = "Movie.2020.1080p/" + ("a" * 300) + ".exe"
+    long_result = validate_payload_files([_file(long_name)])
+
+    assert len(format_payload_rejection(long_result)) < 260
+    assert format_payload_rejection(long_result).endswith("...)")

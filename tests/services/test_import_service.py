@@ -87,6 +87,23 @@ def _make_video(path: Path, size_bytes: int = 60 * 1024 * 1024) -> None:
         handle.write(b"\0")
 
 
+def _manifest_files(content_path: Path) -> list[DownloadedFile]:
+    if content_path.is_file():
+        return [DownloadedFile(name=content_path.name, size_bytes=content_path.stat().st_size)]
+    if not content_path.exists():
+        return []
+    files: list[DownloadedFile] = []
+    for path in content_path.rglob("*"):
+        if path.is_file():
+            files.append(
+                DownloadedFile(
+                    name=str(path.relative_to(content_path.parent)).replace(os.sep, "/"),
+                    size_bytes=path.stat().st_size,
+                )
+            )
+    return files
+
+
 async def _seed(
     sessionmaker_: SessionMaker,
     *,
@@ -125,6 +142,7 @@ def _qbt(content_path: Path, *, files: list[DownloadedFile] | None = None) -> Fa
     list, the PROOF a host->container content remap must exhibit on disk (round
     3); tests that exercise the remap must supply it, same as the real client.
     """
+    manifest = _manifest_files(content_path) if files is None else files
     return FakeQbittorrent(
         statuses=[
             DownloadStatus(
@@ -136,7 +154,7 @@ def _qbt(content_path: Path, *, files: list[DownloadedFile] | None = None) -> Fa
                 content_path=str(content_path),
             )
         ],
-        files={_HASH: files} if files is not None else None,
+        files={_HASH: manifest},
     )
 
 
@@ -190,6 +208,65 @@ async def test_import_happy_path_places_file_scans_and_marks_completed(
         assert request is not None
         assert request.status == RequestStatus.completed  # "Finalizing", not yet available
         assert request.completed_at is not None
+
+
+async def test_import_rejects_unsafe_payload_manifest_before_copy(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024),
+        ],
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert qbt.removed == [(_HASH, True)]
+    assert not (movies_root / "The Matrix (1999)").exists()
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+    assert request is not None
+    assert request.status is RequestStatus.searching
+    assert download is not None
+    assert download.status == DownloadState.Failed.value
+
+
+async def test_import_blocks_when_client_status_missing_before_payload_validation(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "download client reported no status for payload validation"
 
 
 async def test_import_persists_library_path_and_a_later_sweep_reclaims_it(
