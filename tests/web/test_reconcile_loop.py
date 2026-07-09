@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.qbittorrent import QbittorrentAuthError, QbittorrentError
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
-from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
+from plex_manager.ports.download_client import DownloadClientPort, DownloadedFile, DownloadStatus
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import ServiceNotConfiguredError
@@ -162,7 +162,8 @@ async def test_reconcile_imports_when_only_movies_root_unset(
             DownloadStatus(
                 info_hash="deadbeef02", name="The.Matrix.1999.mkv", raw_state="stalledUP"
             )
-        ]
+        ],
+        files={"deadbeef02": [DownloadedFile(name="The.Matrix.1999.mkv", size_bytes=1)]},
     )
 
     app = FastAPI()

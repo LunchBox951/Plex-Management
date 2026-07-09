@@ -233,20 +233,21 @@ async def test_import_rejects_unsafe_payload_manifest_before_copy(
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
 
     assert record is not None
-    assert record.status == DownloadState.Failed.value
-    assert qbt.removed == [(_HASH, True)]
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "unsupported file type .exe" in record.failed_reason
+    assert qbt.removed == []
     assert not (movies_root / "The Matrix (1999)").exists()
     async with sessionmaker_() as session:
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
         request = await session.get(MediaRequest, request_id)
         download = await session.get(Download, download_id)
 
-    assert len(blocklist) == 1
-    assert blocklist[0].torrent_hash == _HASH
+    assert blocklist == []
     assert request is not None
-    assert request.status is RequestStatus.searching
+    assert request.status is RequestStatus.import_blocked
     assert download is not None
-    assert download.status == DownloadState.Failed.value
+    assert download.status == DownloadState.ImportBlocked.value
 
 
 async def test_import_blocks_when_client_status_missing_before_payload_validation(
@@ -356,7 +357,8 @@ async def test_import_blocks_content_path_without_save_path(
                 progress=1.0,
                 content_path=str(video),
             )
-        ]
+        ],
+        files={_HASH: [DownloadedFile(name=video.name, size_bytes=video.stat().st_size)]},
     )
 
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
@@ -837,8 +839,9 @@ async def test_import_with_no_video_file_is_blocked(
     movies_root = tmp_path / "library"
     movies_root.mkdir()
     content_dir = tmp_path / "downloads" / "junk"
-    content_dir.mkdir(parents=True)
-    (content_dir / "readme.txt").write_text("no video here")
+    subtitle = content_dir / "Subs" / "English.srt"
+    subtitle.parent.mkdir(parents=True)
+    subtitle.write_text("subtitle only")
     download_id, _ = await _seed(
         sessionmaker_,
         request_status=RequestStatus.downloading,
@@ -938,7 +941,14 @@ async def test_import_blocks_when_download_path_not_visible(
     )
 
     record = await _import(
-        sessionmaker_, download_id, movies_root, _qbt(host_content), FakeLibrary()
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(
+            host_content,
+            files=[DownloadedFile(name=host_content.name, size_bytes=60 * 1024 * 1024)],
+        ),
+        FakeLibrary(),
     )
 
     assert record is not None
@@ -1152,7 +1162,8 @@ async def test_import_rejects_content_path_outside_qbittorrent_save_path(
                 save_path=str(save_path),
                 content_path=str(outside),
             )
-        ]
+        ],
+        files={_HASH: [DownloadedFile(name=outside.name, size_bytes=outside.stat().st_size)]},
     )
 
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
@@ -1190,7 +1201,8 @@ async def test_import_rejects_traversing_qbittorrent_name(
                 save_path=str(save_path),
                 content_path=None,
             )
-        ]
+        ],
+        files={_HASH: [DownloadedFile(name=outside.name, size_bytes=outside.stat().st_size)]},
     )
 
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
@@ -2421,7 +2433,21 @@ async def test_import_tv_blocks_when_download_path_not_visible(
     download_id, _request_id, season_id = await _seed_tv(sessionmaker_, season=2)
     library = FakeLibrary()
 
-    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(host_release_dir), library)
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(
+            host_release_dir,
+            files=[
+                DownloadedFile(
+                    name=f"{host_release_dir.name}/Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv",
+                    size_bytes=60 * 1024 * 1024,
+                )
+            ],
+        ),
+        library,
+    )
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value

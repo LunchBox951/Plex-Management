@@ -759,7 +759,6 @@ async def _reject_unsafe_payload_if_reported(
     qbt: DownloadClientPort,
     download_id: int,
     torrent_hash: str,
-    row_status: str,
     status: DownloadStatus | None,
     request_id: int,
     season: int | None = None,
@@ -782,17 +781,6 @@ async def _reject_unsafe_payload_if_reported(
 
     if reason is None:
         return None
-
-    if row_status in {DownloadState.ImportPending.value, DownloadState.ImportBlocked.value}:
-        from plex_manager.services import queue_service
-
-        return await queue_service.mark_failed(
-            session,
-            qbt,
-            download_id=download_id,
-            blocklist=True,
-            remove_torrent=True,
-        )
 
     await _block(
         session,
@@ -957,7 +945,6 @@ async def _import_download_locked(
             season=season,
             episodes=episodes,
             download_path=row.download_path,
-            row_status=row.status,
             fs=fs,
             library=library,
             qbt=qbt,
@@ -1016,7 +1003,6 @@ async def _import_download_locked(
             qbt=qbt,
             download_id=download_id,
             torrent_hash=torrent_hash,
-            row_status=row.status,
             status=status,
             request_id=request.id,
         )
@@ -1630,7 +1616,6 @@ async def _import_tv_locked(
     season: int,
     episodes: list[int] | None,
     download_path: str | None,
-    row_status: str,
     fs: FileSystemPort,
     library: LibraryPort,
     qbt: DownloadClientPort,
@@ -1694,7 +1679,6 @@ async def _import_tv_locked(
             qbt=qbt,
             download_id=download_id,
             torrent_hash=torrent_hash,
-            row_status=row_status,
             status=status,
             request_id=request.id,
             season=season,

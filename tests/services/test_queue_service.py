@@ -754,7 +754,12 @@ async def test_reconcile_applies_completed_and_keeps_client_missing_within_grace
         completed_id, missing_id = completed.id, missing.id
 
     qbt = FakeQbittorrent(
-        statuses=[DownloadStatus(info_hash="a" * 40, name="done.torrent", raw_state="stoppedUP")]
+        statuses=[DownloadStatus(info_hash="a" * 40, name="done.torrent", raw_state="stoppedUP")],
+        files={
+            "a" * 40: [
+                DownloadedFile(name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP.mkv", size_bytes=1)
+            ]
+        },
     )
     async with sessionmaker_() as session:
         queue = await queue_service.reconcile_and_list(qbt, session)

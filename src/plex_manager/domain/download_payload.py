@@ -46,9 +46,7 @@ SUBTITLE_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 ALLOWED_PAYLOAD_EXTENSIONS: frozenset[str] = VIDEO_EXTENSIONS | SUBTITLE_EXTENSIONS
-EMPTY_PAYLOAD_REJECTION_REASON = (
-    "torrent payload rejected: no files reported after completion"
-)
+EMPTY_PAYLOAD_REJECTION_REASON = "torrent payload rejected: no files reported after completion"
 _DISPLAY_NAME_MAX_LENGTH = 180
 _UNSAFE_UNICODE_CATEGORIES = frozenset({"Cc", "Cf"})
 
@@ -129,8 +127,7 @@ def validate_payload_files(files: Sequence[DownloadedFile]) -> PayloadValidation
 
 def _display_name(name: str) -> str:
     sanitized = "".join(
-        "?" if unicodedata.category(char) in _UNSAFE_UNICODE_CATEGORIES else char
-        for char in name
+        "?" if unicodedata.category(char) in _UNSAFE_UNICODE_CATEGORIES else char for char in name
     )
     if len(sanitized) <= _DISPLAY_NAME_MAX_LENGTH:
         return sanitized
