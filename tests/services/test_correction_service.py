@@ -1157,6 +1157,84 @@ async def test_cancel_tv_settles_every_season_and_rolls_up_cancelled(
     assert scope.status == "cancelled"
 
 
+async def test_cancel_terminalizes_import_blocked_scope_so_replacement_can_attach(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1400,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.downloading
+        )
+        season_2 = SeasonRequest(
+            media_request_id=show.id, season_number=2, status=RequestStatus.import_blocked
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_CULPRIT,
+            status=DownloadState.ImportBlocked.value,
+            media_request_id=show.id,
+            tmdb_id=1400,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=show.id,
+                season_request_id=season_2.id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="import_blocked",
+            )
+        )
+        await session.commit()
+        request_id, season_id, download_id = show.id, season_2.id, download.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+
+    assert updated.status == RequestStatus.cancelled.value
+    assert (_CULPRIT, True) in qbt.removed
+    async with sessionmaker_() as session:
+        scope = (
+            await session.execute(
+                select(DownloadScope).where(DownloadScope.download_id == download_id)
+            )
+        ).scalar_one()
+        replacement = Download(
+            torrent_hash="b" * 40,
+            status=DownloadState.Downloading.value,
+            media_request_id=request_id,
+            tmdb_id=1400,
+            season=2,
+        )
+        session.add(replacement)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=replacement.id,
+                media_request_id=request_id,
+                season_request_id=season_id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="active",
+            )
+        )
+        await session.flush()
+
+    assert scope.status == "cancelled"
+
+
 async def test_cancel_rejects_an_already_imported_request(
     sessionmaker_: SessionMaker,
 ) -> None:

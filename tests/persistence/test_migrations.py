@@ -182,7 +182,10 @@ def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
             assert "waiting_for_air_date" in media_index
             assert "completed" in media_index
             assert "status NOT IN ('imported', 'failed', 'no_acceptable_release')" in download_index
-            assert "media_request_id IS NOT NULL AND status = 'active'" in scope_index
+            assert (
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+                in scope_index
+            )
             lock_table = conn.execute(
                 text("SELECT name FROM sqlite_master WHERE name = 'request_dedup_locks'")
             ).scalar_one()

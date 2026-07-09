@@ -580,8 +580,12 @@ class DownloadScope(Base):
             "media_request_id",
             "scope_key",
             unique=True,
-            sqlite_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
-            postgresql_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
+            sqlite_where=sa.text(
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+            ),
+            postgresql_where=sa.text(
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+            ),
         ),
     )
 

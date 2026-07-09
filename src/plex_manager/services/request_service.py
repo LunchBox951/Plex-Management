@@ -204,6 +204,7 @@ class _TvSeasonPlan(NamedTuple):
 
     season_numbers: list[int]
     waiting_seasons: set[int]
+    episode_scoped: bool = False
 
 
 async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> _Detail:
@@ -342,7 +343,11 @@ async def _resolve_tv_season_plan(
         waiting_seasons.add(1)
     elif seasons or episodes:
         waiting_seasons.update(season for season in season_numbers if season > detail.season_count)
-    return _TvSeasonPlan(season_numbers=season_numbers, waiting_seasons=waiting_seasons)
+    return _TvSeasonPlan(
+        season_numbers=season_numbers,
+        waiting_seasons=waiting_seasons,
+        episode_scoped=bool(episodes),
+    )
 
 
 async def _ensure_tv_season_plan(
@@ -359,6 +364,7 @@ async def _ensure_tv_season_plan(
         media_request_id=media_request_id,
         tmdb_id=tmdb_id,
         seasons=plan.season_numbers,
+        force_pending=plan.episode_scoped,
     )
     for waiting_season in sorted(plan.waiting_seasons):
         await season_request_service.set_status(
@@ -863,7 +869,12 @@ async def create_request_result(
                     return CreateRequestResult(record=in_library, created=False)
                 initial_status = RequestStatus.available.value
 
-    if media_type == "tv" and library is not None and season_numbers:
+    if (
+        media_type == "tv"
+        and library is not None
+        and season_numbers
+        and not season_plan.episode_scoped
+    ):
         # TV in-library dedup — the per-season analogue of the movie short-circuit
         # above. When EVERY requested season is already in Plex AND an
         # available/completed request for this show already exists, return it

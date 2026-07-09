@@ -1183,6 +1183,31 @@ async def test_create_request_tv_integrity_recovery_future_explicit_season_waits
     }
 
 
+async def test_create_request_tv_rearms_future_explicit_season_after_tmdb_airs(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5016: TvMetadata(tmdb_id=5016, title="Future Show", year=2024, season_count=1)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(
+            session, tmdb, tmdb_id=5016, media_type="tv", seasons=[2]
+        )
+
+    assert first.status == RequestStatus.waiting_for_air_date.value
+    assert await _season_statuses(sessionmaker_, first.id) == {2: "waiting_for_air_date"}
+
+    tmdb.shows[5016] = TvMetadata(tmdb_id=5016, title="Future Show", year=2024, season_count=2)
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(
+            session, tmdb, tmdb_id=5016, media_type="tv", seasons=[2]
+        )
+
+    assert second.id == first.id
+    assert second.status == RequestStatus.pending.value
+    assert await _season_statuses(sessionmaker_, first.id) == {2: "pending"}
+
+
 async def test_create_request_tv_merges_episode_and_season_intent(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1244,6 +1269,32 @@ async def test_create_request_tv_whole_season_intent_dominates_later_episode_sub
     assert record.tv_request_mode == "explicit_seasons"
     assert record.requested_seasons == (1,)
     assert record.requested_episodes is None
+
+
+async def test_create_request_tv_episode_request_does_not_dedup_on_season_presence(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5017: TvMetadata(tmdb_id=5017, title="Episode Show", year=2020, season_count=1)}
+    )
+    library = FakeLibrary(available_tv_seasons={5017: frozenset({1})})
+    async with sessionmaker_() as session:
+        already_available = await request_service.create_request(
+            session, tmdb, tmdb_id=5017, media_type="tv", seasons=[1], library=library
+        )
+    assert already_available.status == RequestStatus.available.value
+
+    async with sessionmaker_() as session:
+        missing_episode = await request_service.create_request(
+            session, tmdb, tmdb_id=5017, media_type="tv", episodes={1: [6]}, library=library
+        )
+
+    assert missing_episode.id != already_available.id
+    assert missing_episode.status == RequestStatus.pending.value
+    record = await _request_record(sessionmaker_, missing_episode.id)
+    assert record.tv_request_mode == "explicit_episodes"
+    assert record.requested_episodes == {1: (6,)}
+    assert await _season_statuses(sessionmaker_, missing_episode.id) == {1: "pending"}
 
 
 async def test_create_request_tv_all_seasons_in_library_dedups_to_existing(
@@ -1364,6 +1415,27 @@ async def test_create_request_tv_whole_series_with_zero_aired_seasons_waits(
     assert [(season.season_number, season.status) for season in seasons] == [
         (1, "waiting_for_air_date")
     ]
+
+
+async def test_create_request_tv_zero_aired_whole_show_rearms_after_tmdb_airs(
+    sessionmaker_: SessionMaker,
+) -> None:
+    tmdb = FakeTmdb(
+        shows={5018: TvMetadata(tmdb_id=5018, title="Gap Show", year=2020, season_count=0)}
+    )
+    async with sessionmaker_() as session:
+        first = await request_service.create_request(session, tmdb, tmdb_id=5018, media_type="tv")
+
+    assert first.status == RequestStatus.waiting_for_air_date.value
+    assert await _season_statuses(sessionmaker_, first.id) == {1: "waiting_for_air_date"}
+
+    tmdb.shows[5018] = TvMetadata(tmdb_id=5018, title="Gap Show", year=2020, season_count=1)
+    async with sessionmaker_() as session:
+        second = await request_service.create_request(session, tmdb, tmdb_id=5018, media_type="tv")
+
+    assert second.id == first.id
+    assert second.status == RequestStatus.pending.value
+    assert await _season_statuses(sessionmaker_, first.id) == {1: "pending"}
 
 
 async def test_create_request_tv_season_already_in_plex_rolls_up_partially_available(

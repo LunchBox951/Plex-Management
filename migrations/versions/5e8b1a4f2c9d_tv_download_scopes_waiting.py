@@ -211,8 +211,12 @@ def upgrade() -> None:
         "download_scopes",
         ["media_request_id", "scope_key"],
         unique=True,
-        sqlite_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
-        postgresql_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
+        sqlite_where=sa.text(
+            "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+        ),
+        postgresql_where=sa.text(
+            "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+        ),
     )
     op.create_index(op.f("ix_download_scopes_download_id"), "download_scopes", ["download_id"])
     op.create_index(

@@ -174,6 +174,7 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.completed.value,
     }
 )
+_UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import_blocked"})
 
 # The PER-RELEASE grab failures the inline re-grab falls through on (mirroring
 # ``auto_grab_service``'s per-release set): the ATTEMPTED release is unusable --
@@ -278,7 +279,10 @@ async def _mark_download_scopes_terminal(
 ) -> None:
     await session.execute(
         update(DownloadScope)
-        .where(DownloadScope.download_id == download_id, DownloadScope.status == "active")
+        .where(
+            DownloadScope.download_id == download_id,
+            DownloadScope.status.in_(_UNRESOLVED_SCOPE_STATUSES),
+        )
         .values(status=status)
     )
 

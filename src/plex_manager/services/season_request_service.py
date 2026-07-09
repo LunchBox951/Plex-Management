@@ -274,6 +274,7 @@ async def ensure_seasons(
     media_request_id: int,
     tmdb_id: int,
     seasons: list[int],
+    force_pending: bool = False,
 ) -> list[SeasonRequestRecord]:
     """Idempotently create every season row in ``seasons``, then recompute the rollup.
 
@@ -285,6 +286,11 @@ async def ensure_seasons(
     unconfigured/unreachable Plex (or the still-partial per-episode check) is treated
     as "not proven available", so the season is created ``pending`` and search
     proceeds normally.
+
+    ``force_pending`` is used for explicit episode requests. Plex's current season
+    presence API only proves "some episode in this season exists", not that the
+    requested episode numbers are present, so those requests deliberately ignore
+    season-level presence and create/re-arm the season as searchable ``pending``.
 
     ``SeasonRequestRepository.ensure`` never re-applies ``status`` to an
     already-established season, so calling this on EVERY ``create_request`` call
@@ -387,7 +393,9 @@ async def ensure_seasons(
     evidence cannot resurrect a ``completed_at`` that no current import supports.
     """
     present: frozenset[int] = (
-        await _present_seasons(library, tmdb_id) if library is not None else frozenset()
+        await _present_seasons(library, tmdb_id)
+        if library is not None and not force_pending
+        else frozenset()
     )
     season_repo = SqlSeasonRequestRepository(session)
     # Never trust a fresh Plex 'present' reading for a season the disk-pressure
@@ -421,7 +429,7 @@ async def ensure_seasons(
     trusted_present = present - evicted_seasons
     evicted_regrab_seasons = evicted_seasons
     records: list[SeasonRequestRecord] = []
-    re_armed_evicted = False
+    needs_completed_at_heal = False
     for season_number in seasons:
         initial_status = (
             RequestStatus.available.value
@@ -465,10 +473,29 @@ async def ensure_seasons(
                 # strand a folded-back live season with no eviction/report handle
                 # (#117). See this function's docstring for the full rationale.
                 await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
-                re_armed_evicted = True
+                needs_completed_at_heal = True
+            record = await season_repo.get(record.id) or record
+        elif record.status == RequestStatus.waiting_for_air_date.value:
+            rearmed = await season_repo.set_status_if_in(
+                record.id,
+                initial_status,
+                frozenset({RequestStatus.waiting_for_air_date.value}),
+            )
+            if rearmed:
+                await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
+            record = await season_repo.get(record.id) or record
+        elif force_pending and record.status in _REAL_DONE_SEASON_STATUS_VALUES:
+            rearmed = await season_repo.set_status_if_in(
+                record.id,
+                RequestStatus.pending.value,
+                _REAL_DONE_SEASON_STATUS_VALUES,
+            )
+            if rearmed:
+                await season_repo.schedule_search(record.id, search_attempts=0, next_search_at=None)
+                needs_completed_at_heal = True
             record = await season_repo.get(record.id) or record
         records.append(record)
-    if re_armed_evicted:
+    if needs_completed_at_heal:
         # After the loop (not per season) so the heal sees every re-armed season's
         # new status; see the docstring for why only a re-arm triggers it.
         await SqlRequestRepository(session).heal_completed_at(media_request_id)

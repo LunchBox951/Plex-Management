@@ -495,6 +495,84 @@ async def test_mark_failed_for_tv_rearms_the_season_not_the_request_directly(
     assert scope.status == "failed"
 
 
+async def test_mark_failed_terminalizes_import_blocked_scope_so_replacement_can_attach(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=604,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.import_blocked,
+        )
+        session.add(request)
+        await session.flush()
+        season_row = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.import_blocked
+        )
+        session.add(season_row)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="import_blocked",
+            media_request_id=request.id,
+            tmdb_id=604,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=request.id,
+                season_request_id=season_row.id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="import_blocked",
+            )
+        )
+        await session.commit()
+        request_id, season_id, download_id = request.id, season_row.id, download.id
+
+    async with sessionmaker_() as session:
+        record = await queue_service.mark_failed(
+            session, FakeQbittorrent(), download_id=download_id, blocklist=False
+        )
+    assert record.status == "failed"
+
+    async with sessionmaker_() as session:
+        scope = (
+            await session.execute(
+                select(DownloadScope).where(DownloadScope.download_id == download_id)
+            )
+        ).scalar_one()
+        season_row = await session.get(SeasonRequest, season_id)
+        replacement = Download(
+            torrent_hash="e" * 40,
+            status="downloading",
+            media_request_id=request_id,
+            tmdb_id=604,
+            season=2,
+        )
+        session.add(replacement)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=replacement.id,
+                media_request_id=request_id,
+                season_request_id=season_id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="active",
+            )
+        )
+        await session.flush()
+
+    assert scope.status == "failed"
+    assert season_row is not None
+    assert season_row.status.value == "searching"
+
+
 async def test_missing_beyond_grace_never_regresses_an_already_available_season(
     sessionmaker_: SessionMaker,
 ) -> None:

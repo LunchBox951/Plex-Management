@@ -53,7 +53,7 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value
 
 
-_ACTIVE_SCOPE_STATUSES: frozenset[str] = frozenset({"active"})
+_ACTIVE_SCOPE_STATUSES: frozenset[str] = frozenset({"active", "import_blocked"})
 
 
 def _normalize_episodes(value: list[int] | None) -> list[int] | None:
@@ -294,9 +294,10 @@ class SqlDownloadRepository:
                 # Literal (not the P4 ``DownloadState`` enum) -- this layer duplicates
                 # the state vocabulary as strings to stay decoupled (see module docstring
                 # and ``_TERMINAL_DOWNLOAD_STATUSES``); ``imported`` is that enum's value.
-                Download.status == "imported",
                 or_(
-                    (Download.media_request_id == media_request_id) & (Download.season == season),
+                    (Download.status == "imported")
+                    & (Download.media_request_id == media_request_id)
+                    & (Download.season == season),
                     scoped_exists,
                 ),
             )

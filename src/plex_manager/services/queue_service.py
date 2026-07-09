@@ -296,6 +296,7 @@ _REARMABLE_REQUEST_STATUS_VALUES: frozenset[str] = (
 # ``_PHASE_C_MAX_ATTEMPTS - 1`` (no sleep after the final attempt).
 _PHASE_C_MAX_ATTEMPTS = 3
 _PHASE_C_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.1)
+_UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import_blocked"})
 
 
 @dataclass(frozen=True)
@@ -828,7 +829,10 @@ async def _mark_download_scopes_terminal(
 ) -> None:
     await session.execute(
         update(DownloadScope)
-        .where(DownloadScope.download_id == download_id, DownloadScope.status == "active")
+        .where(
+            DownloadScope.download_id == download_id,
+            DownloadScope.status.in_(_UNRESOLVED_SCOPE_STATUSES),
+        )
         .values(status=status)
     )
 
