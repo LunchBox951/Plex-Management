@@ -1063,6 +1063,14 @@ async def _reject_unsafe_payload_if_reported(
         files = await qbt.list_files(torrent_hash)
     except QbittorrentError as exc:
         if complete:
+            if owned_placement is not None or block_existing_breadcrumb:
+                # A transient manifest outage must not erase the durable marker
+                # that proves library files were already placed.  Leave an
+                # Importing row resumable, or preserve an existing manual-cleanup
+                # block, so a later unsafe retry cannot re-arm the torrent while
+                # orphaning those files.
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
             await _block(
                 session,
                 download_repo,
@@ -2155,7 +2163,12 @@ async def _import_tv_locked(
             request_id=request.id,
             season=season,
             block_existing_breadcrumb=(
-                (download_status == DownloadState.Importing.value and download_path is not None)
+                (
+                    download_path is not None
+                    and _can_resume_tv_breadcrumb_without_client_status(
+                        download_status, failed_reason
+                    )
+                )
                 or _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason)
             ),
         )

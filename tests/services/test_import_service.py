@@ -558,6 +558,63 @@ async def test_import_blocks_retryably_when_payload_manifest_listing_fails(
     assert not (movies_root / "The Matrix (1999)").exists()
 
 
+async def test_importing_movie_manifest_outage_preserves_owned_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        await session.commit()
+    outage_qbt = _ListFilesFailsQbt(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=video.name,
+                raw_state="stalledUP",
+                progress=1.0,
+                save_path=str(video.parent),
+                content_path=str(video),
+            )
+        ]
+    )
+
+    deferred = await _import(sessionmaker_, download_id, movies_root, outage_qbt, FakeLibrary())
+
+    assert deferred is not None
+    assert deferred.status == DownloadState.Importing.value
+    assert deferred.failed_reason is None
+    assert deferred.download_path == str(dst)
+    assert dst.exists()
+    assert outage_qbt.removed == []
+
+    unsafe_qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024),
+        ],
+    )
+    rejected = await _import(sessionmaker_, download_id, movies_root, unsafe_qbt, FakeLibrary())
+
+    assert rejected is not None
+    assert rejected.status == DownloadState.Failed.value
+    assert rejected.download_path is None
+    assert not dst.exists()
+    assert unsafe_qbt.removed == [(_HASH, True)]
+
+
 async def test_import_blocks_when_client_status_missing_before_payload_validation(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -2563,6 +2620,23 @@ async def test_import_tv_retries_breadcrumb_after_status_missing_scan_failure(
     assert first.failed_reason is not None
     assert first.failed_reason.startswith("plex scan failed:")
 
+    outage_qbt = _ListFilesFailsQbt(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="Some.Show.S02.1080p.WEB-DL.x264-GRP",
+                raw_state="stoppedUP",
+                progress=1.0,
+            )
+        ]
+    )
+    deferred = await _import_tv(sessionmaker_, download_id, tv_root, outage_qbt, FakeLibrary())
+
+    assert deferred is not None
+    assert deferred.status == DownloadState.ImportBlocked.value
+    assert deferred.download_path == str(season_dir)
+    assert deferred.failed_reason == first.failed_reason
+
     library = FakeLibrary()
     second = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), library)
 
@@ -2709,6 +2783,122 @@ async def test_importing_tv_unsafe_payload_with_breadcrumb_blocks_for_cleanup(
         request = await session.get(MediaRequest, request_id)
     assert season_row is not None and season_row.status == RequestStatus.import_blocked.value
     assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_importing_tv_manifest_outage_preserves_breadcrumb_for_unsafe_retry(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    placed_episode = season_dir / "Some Show - S02E01.mkv"
+    _make_video(placed_episode)
+    download_id, _request_id, _season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        await session.commit()
+    outage_qbt = _ListFilesFailsQbt(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="Some.Show.S02.1080p.WEB-DL.x264-GRP",
+                raw_state="stoppedUP",
+                progress=1.0,
+            )
+        ]
+    )
+
+    deferred = await _import_tv(sessionmaker_, download_id, tv_root, outage_qbt, FakeLibrary())
+
+    assert deferred is not None
+    assert deferred.status == DownloadState.Importing.value
+    assert deferred.failed_reason is None
+    assert deferred.download_path == str(season_dir)
+    assert placed_episode.exists()
+    assert outage_qbt.removed == []
+
+    unsafe_qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="Some.Show.S02.1080p.WEB-DL.x264-GRP",
+                raw_state="stoppedUP",
+                progress=1.0,
+            )
+        ],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Show.S02.1080p.WEB-DL.x264-GRP/Some.Show.S02E01.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Show.S02.1080p.WEB-DL.x264-GRP/setup.exe",
+                    size_bytes=1024,
+                ),
+            ]
+        },
+    )
+
+    rejected = await _import_tv(sessionmaker_, download_id, tv_root, unsafe_qbt, FakeLibrary())
+
+    assert rejected is not None
+    assert rejected.status == DownloadState.ImportBlocked.value
+    assert rejected.failed_reason is not None
+    assert "manual cleanup before re-search" in rejected.failed_reason
+    assert rejected.download_path == str(season_dir)
+    assert placed_episode.exists()
+    assert unsafe_qbt.removed == []
+
+
+async def test_import_blocked_tv_manifest_outage_preserves_manual_cleanup_reason(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    placed_episode = season_dir / "Some Show - S02E01.mkv"
+    _make_video(placed_episode)
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id, _season_id = await _seed_tv(
+        sessionmaker_,
+        season=2,
+        request_status=RequestStatus.import_blocked,
+        season_status=RequestStatus.import_blocked.value,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.failed_reason = failed_reason
+        await session.commit()
+    outage_qbt = _ListFilesFailsQbt(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="Some.Show.S02.1080p.WEB-DL.x264-GRP",
+                raw_state="stoppedUP",
+                progress=1.0,
+            )
+        ]
+    )
+
+    deferred = await _import_tv(sessionmaker_, download_id, tv_root, outage_qbt, FakeLibrary())
+
+    assert deferred is not None
+    assert deferred.status == DownloadState.ImportBlocked.value
+    assert deferred.failed_reason == failed_reason
+    assert deferred.download_path == str(season_dir)
+    assert placed_episode.exists()
+    assert outage_qbt.removed == []
 
 
 async def test_import_blocked_tv_manual_cleanup_retry_with_live_unsafe_payload_stays_blocked(
