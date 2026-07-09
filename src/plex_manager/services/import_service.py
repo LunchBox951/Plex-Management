@@ -38,7 +38,9 @@ import weakref
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Final, Literal, NamedTuple
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
+
+from sqlalchemy import update
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
@@ -60,6 +62,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     RequestStatus,
 )
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
@@ -250,6 +253,26 @@ def _check_bounded_finalizing(key: str, anchor: datetime, title: str, *, now: da
 
 class _UnsafeContentPathError(Exception):
     """The download client reported a content path outside its save path."""
+
+
+class _TvImportTarget(NamedTuple):
+    request: RequestRecord
+    season: int
+    episodes: list[int] | None
+    scope_id: int | None
+
+
+class _TvImportPlan(NamedTuple):
+    target: _TvImportTarget
+    season_dir: Path
+    abs_by_rel: dict[str, str]
+    by_relative: dict[PurePosixPath, EpisodeImportResult]
+    accepted: tuple[EpisodeImportResult, ...]
+
+
+class _TvImportFailure(NamedTuple):
+    target: _TvImportTarget
+    reason: str
 
 
 def _is_settled_for_import(status: DownloadStatus) -> bool:
@@ -536,6 +559,30 @@ def _import_lock(download_id: int) -> asyncio.Lock:
     return lock
 
 
+async def _set_download_scope_status(
+    session: AsyncSession,
+    *,
+    download_id: int,
+    status: str,
+    request_id: int | None = None,
+    season: int | None = None,
+    scope_id: int | None = None,
+    completed: bool = False,
+) -> None:
+    stmt = update(DownloadScope).where(DownloadScope.download_id == download_id)
+    if scope_id is not None:
+        stmt = stmt.where(DownloadScope.id == scope_id)
+    else:
+        if request_id is not None:
+            stmt = stmt.where(DownloadScope.media_request_id == request_id)
+        if season is not None:
+            stmt = stmt.where(DownloadScope.season_number == season)
+    values: dict[str, object] = {"status": status}
+    if completed:
+        values["completed_at"] = datetime.now(UTC)
+    await session.execute(stmt.values(**values))
+
+
 async def _block(
     session: AsyncSession,
     download_repo: SqlDownloadRepository,
@@ -544,6 +591,7 @@ async def _block(
     *,
     request_id: int | None = None,
     season: int | None = None,
+    seasons: tuple[int, ...] = (),
     clear_download_path: bool = False,
 ) -> None:
     """Move a download to the retryable ``ImportBlocked`` state, honestly.
@@ -585,18 +633,114 @@ async def _block(
         await session.rollback()
         return
     if request_id is not None:
-        if season is not None:
-            await season_request_service.set_status(
-                session,
-                media_request_id=request_id,
-                season_number=season,
-                status=RequestStatus.import_blocked.value,
-            )
+        target_seasons = seasons or ((season,) if season is not None else ())
+        if target_seasons:
+            for target_season in target_seasons:
+                await _set_download_scope_status(
+                    session,
+                    download_id=download_id,
+                    request_id=request_id,
+                    season=target_season,
+                    status=RequestStatus.import_blocked.value,
+                )
+                await season_request_service.set_status(
+                    session,
+                    media_request_id=request_id,
+                    season_number=target_season,
+                    status=RequestStatus.import_blocked.value,
+                )
         else:
             await SqlRequestRepository(session).set_status(
                 request_id, RequestStatus.import_blocked.value
             )
     await session.commit()
+
+
+def _tv_block_reason(validation_count: int, failures: tuple[str, ...]) -> str:
+    reason_parts = failures[:_MAX_BLOCK_REASONS]
+    if len(failures) > _MAX_BLOCK_REASONS:
+        reason_parts = (*reason_parts, f"(+{len(failures) - _MAX_BLOCK_REASONS} more)")
+    return (
+        "; ".join(reason_parts) or f"no accepted episode among {validation_count} file(s) inspected"
+    )
+
+
+def _build_tv_import_plan(
+    *,
+    target: _TvImportTarget,
+    sources: list[tuple[str, int, str]],
+    parser: ParserPort,
+    profile: QualityProfile,
+    tv_root: str,
+) -> _TvImportPlan | _TvImportFailure:
+    validation = validate_season_import(
+        [VideoFile(relative_path=rel, size_bytes=size) for _abs, size, rel in sources],
+        parser=parser,
+        profile=profile,
+        expected_title=target.request.title,
+        expected_tmdb_id=target.request.tmdb_id,
+        expected_season=target.season,
+        requested_episodes=target.episodes,
+    )
+    for rejection in validation.rejected:
+        _logger.warning(
+            "tv import: rejected %s for season %s (%s): %s",
+            rejection.relative_path,
+            safe_int(target.season),
+            rejection.reason.value,
+            rejection.detail,
+        )
+
+    if not validation.accepted:
+        reason_parts = tuple(
+            f"{r.relative_path}: {r.reason.value}: {r.detail}" for r in validation.rejected
+        )
+        reason = _tv_block_reason(len(sources), reason_parts) or (
+            f"no accepted episode among {len(sources)} file(s) inspected "
+            f"({len(validation.skipped_not_requested)} not requested)"
+        )
+        return _TvImportFailure(target, reason)
+
+    if target.episodes:
+        accepted_episodes = {ep for result in validation.accepted for ep in result.episodes}
+        missing = sorted(set(target.episodes) - accepted_episodes)
+        if missing:
+            return _TvImportFailure(
+                target,
+                f"episode-scoped grab is incomplete: requested {sorted(set(target.episodes))}, "
+                f"missing {missing} (accepted {sorted(accepted_episodes)})",
+            )
+
+    abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
+    by_relative: dict[PurePosixPath, EpisodeImportResult] = {}
+    for result in validation.accepted:
+        src = abs_by_rel[result.video.relative_path]
+        ext = os.path.splitext(src)[1].lstrip(".")
+        relative = plex_tv_episode_relative_path(
+            target.request.title, target.request.year, target.season, result.episodes, ext
+        )
+        current = by_relative.get(relative)
+        if current is None or result.video.size_bytes > current.video.size_bytes:
+            if current is not None:
+                _logger.warning(
+                    "tv import: dropping smaller duplicate %s for %s (kept %s)",
+                    current.video.relative_path,
+                    relative,
+                    result.video.relative_path,
+                )
+            by_relative[relative] = result
+        else:
+            _logger.warning(
+                "tv import: dropping smaller duplicate %s for %s (kept %s)",
+                result.video.relative_path,
+                relative,
+                current.video.relative_path,
+            )
+
+    season_dir = Path(tv_root) / plex_tv_season_relative_dir(
+        target.request.title, target.request.year, target.season
+    )
+    return _TvImportPlan(target, season_dir, abs_by_rel, by_relative, validation.accepted)
 
 
 async def import_download(
@@ -694,16 +838,48 @@ async def _import_download_locked(
         # is_anime AND that root is configured; otherwise it falls back to the
         # normal tv_root exactly as before this feature existed.
         effective_tv_root = anime_tv_root if request.is_anime and anime_tv_root else tv_root
+        scope_records = [
+            scope
+            for scope in await download_repo.list_scopes(download_id)
+            if scope.media_request_id == request.id
+            and scope.season is not None
+            and scope.status != "imported"
+        ]
+        scope_targets = tuple(
+            _TvImportTarget(
+                request=request,
+                season=cast(int, scope.season),
+                episodes=scope.episodes,
+                scope_id=scope.id,
+            )
+            for scope in scope_records
+        )
         if effective_tv_root is None:
+            target_seasons = tuple(dict.fromkeys(scope.season for scope in scope_targets))
             await _block(
                 session,
                 download_repo,
                 download_id,
                 "tv library root is not configured",
                 request_id=request.id,
-                season=season,
+                season=season if not target_seasons else None,
+                seasons=target_seasons,
             )
             return await download_repo.get_by_hash(torrent_hash)
+        if scope_targets:
+            return await _import_tv_targets_locked(
+                download_id=download_id,
+                targets=scope_targets,
+                download_path=row.download_path,
+                fs=fs,
+                library=library,
+                qbt=qbt,
+                parser=parser,
+                profile=profile,
+                session=session,
+                tv_root=effective_tv_root,
+                torrent_hash=torrent_hash,
+            )
         if season is None:  # pragma: no cover - grab_service always threads season for tv
             await _block(
                 session,
@@ -1046,6 +1222,318 @@ async def _import_download_locked(
         return await download_repo.get_by_hash(torrent_hash)
     finally:
         purge_service.end_placement(str(dst))
+
+
+def _failure_summary(failures: list[_TvImportFailure]) -> str:
+    if len(failures) == 1:
+        return failures[0].reason
+    parts = [f"S{failure.target.season:02d}: {failure.reason}" for failure in failures]
+    return _tv_block_reason(len(parts), tuple(parts))
+
+
+async def _mark_tv_scope_blocked(
+    session: AsyncSession,
+    *,
+    download_id: int,
+    failure: _TvImportFailure,
+) -> None:
+    await _set_download_scope_status(
+        session,
+        download_id=download_id,
+        scope_id=failure.target.scope_id,
+        request_id=failure.target.request.id,
+        season=failure.target.season,
+        status=RequestStatus.import_blocked.value,
+    )
+    await season_request_service.set_status(
+        session,
+        media_request_id=failure.target.request.id,
+        season_number=failure.target.season,
+        status=RequestStatus.import_blocked.value,
+    )
+
+
+async def _import_tv_targets_locked(
+    *,
+    download_id: int,
+    targets: tuple[_TvImportTarget, ...],
+    download_path: str | None,
+    fs: FileSystemPort,
+    library: LibraryPort,
+    qbt: DownloadClientPort,
+    parser: ParserPort,
+    profile: QualityProfile,
+    session: AsyncSession,
+    tv_root: str,
+    torrent_hash: str,
+) -> DownloadRecord | None:
+    download_repo = SqlDownloadRepository(session)
+    request = targets[0].request
+    target_seasons = tuple(dict.fromkeys(target.season for target in targets))
+
+    status = await qbt.get_status(torrent_hash)
+    if status is not None and not _is_settled_for_import(status):
+        deferred = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Downloading.value,
+            _RESUMABLE,
+            clear_failed_reason=True,
+            progress=status.progress,
+            seed_ratio=status.ratio,
+        )
+        if not deferred:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        for target in targets:
+            await _set_download_scope_status(
+                session,
+                download_id=download_id,
+                scope_id=target.scope_id,
+                request_id=target.request.id,
+                season=target.season,
+                status="active",
+            )
+            await season_request_service.set_status(
+                session,
+                media_request_id=target.request.id,
+                season_number=target.season,
+                status=RequestStatus.downloading.value,
+            )
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+
+    try:
+        resolved = _resolve_content(status, download_path)
+    except _UnsafeContentPathError as exc:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            str(exc),
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if resolved is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "download client reported no content path",
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    visible_content = await _resolve_visible_content(qbt, torrent_hash, resolved)
+    if visible_content is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            PATH_NOT_VISIBLE_REASON_PREFIX
+            + f"(check volume mounts / content mismatch): {resolved.path}",
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    sources = await asyncio.to_thread(_resolve_sources, fs, visible_content)
+    if not sources:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "no video file found in the download",
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    if not await asyncio.to_thread(os.path.isdir, tv_root):
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"library root not visible inside the container: {tv_root}",
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    plans: list[_TvImportPlan] = []
+    failures: list[_TvImportFailure] = []
+    for target in targets:
+        planned = _build_tv_import_plan(
+            target=target,
+            sources=sources,
+            parser=parser,
+            profile=profile,
+            tv_root=tv_root,
+        )
+        if isinstance(planned, _TvImportFailure):
+            failures.append(planned)
+        else:
+            plans.append(planned)
+
+    if not plans:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            _failure_summary(failures),
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    claimed_paths: list[str] = []
+    for plan in plans:
+        if not purge_service.begin_placement(str(plan.season_dir)):
+            for claimed in claimed_paths:
+                purge_service.end_placement(claimed)
+            _logger.info(
+                "deferring import of download %s: a purge is deleting this path; "
+                "will retry next import cycle",
+                safe_int(download_id),
+                extra={
+                    "request_id": safe_int(plan.target.request.id),
+                    "season": safe_int(plan.target.season),
+                },
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        claimed_paths.append(str(plan.season_dir))
+
+    try:
+        claimed = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Importing.value,
+            _RESUMABLE,
+            clear_failed_reason=True,
+        )
+        if not claimed:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.import_started,
+                source_title=None,
+                message=f"importing {len(plans)} tv scope(s)",
+            )
+        )
+        await session.commit()
+
+        successful_dirs: list[Path] = []
+        for plan in plans:
+            placed_paths: list[Path] = []
+            imported: list[tuple[str, PurePosixPath]] = []
+            for relative, result in plan.by_relative.items():
+                src = plan.abs_by_rel[result.video.relative_path]
+                dst = Path(tv_root) / relative
+                try:
+                    placed = await asyncio.to_thread(_place_file, fs, src, dst)
+                except (FileExistsError, OSError) as exc:
+                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    reason = (
+                        str(exc)
+                        if isinstance(exc, FileExistsError)
+                        else f"import copy failed: {type(exc).__name__}"
+                    )
+                    failures.append(_TvImportFailure(plan.target, reason))
+                    break
+                if placed:
+                    placed_paths.append(dst)
+                imported.append((os.path.basename(src), relative))
+            else:
+                await download_repo.update_status(
+                    download_id,
+                    DownloadState.Importing.value,
+                    download_path=str(plan.season_dir),
+                )
+                await session.commit()
+                try:
+                    await library.trigger_scan(str(plan.season_dir), "tv")
+                except (PlexLibraryError, PlexAuthError) as exc:
+                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    failures.append(
+                        _TvImportFailure(plan.target, f"plex scan failed: {type(exc).__name__}")
+                    )
+                    continue
+
+                for basename, relative in imported:
+                    session.add(
+                        DownloadHistory(
+                            tmdb_id=plan.target.request.tmdb_id,
+                            torrent_hash=torrent_hash,
+                            event_type=DownloadHistoryEvent.imported,
+                            source_title=None,
+                            message=f"imported {basename} to {relative}",
+                        )
+                    )
+                await season_request_service.set_library_path(
+                    session,
+                    media_request_id=plan.target.request.id,
+                    season_number=plan.target.season,
+                    library_path=str(plan.season_dir),
+                )
+                installed_quality, installed_profile_index = _lowest_profile_quality(
+                    plan.accepted, profile
+                )
+                await season_request_service.set_installed_quality(
+                    session,
+                    media_request_id=plan.target.request.id,
+                    season_number=plan.target.season,
+                    quality_id=installed_quality.id,
+                    profile_index=installed_profile_index,
+                )
+                await season_request_service.mark_completed(
+                    session,
+                    media_request_id=plan.target.request.id,
+                    season_number=plan.target.season,
+                )
+                await _set_download_scope_status(
+                    session,
+                    download_id=download_id,
+                    scope_id=plan.target.scope_id,
+                    request_id=plan.target.request.id,
+                    season=plan.target.season,
+                    status="imported",
+                    completed=True,
+                )
+                successful_dirs.append(plan.season_dir)
+
+        if not successful_dirs:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _failure_summary(failures),
+                request_id=request.id,
+                seasons=target_seasons,
+                clear_download_path=True,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        for failure in failures:
+            await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
+        finalized = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.ImportBlocked.value if failures else DownloadState.Imported.value,
+            frozenset({DownloadState.Importing.value}),
+            download_path=str(successful_dirs[-1]),
+            failed_reason=_failure_summary(failures) if failures else None,
+            clear_failed_reason=not failures,
+        )
+        if not finalized:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    finally:
+        for claimed in claimed_paths:
+            purge_service.end_placement(claimed)
 
 
 async def _import_tv_locked(

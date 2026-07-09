@@ -62,6 +62,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.prowlarr.adapter import IndexerError
@@ -73,6 +74,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -178,12 +180,11 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 # is raised BEFORE anything reaches the client; it subclasses ``QbittorrentError``
 # so it MUST be caught before ``_DOWNLOAD_CLIENT_ERRORS`` or a bad source would be
 # mistreated as a client outage and the scope silently left at ``searching``), or
-# its hash is already active under a different scope/request -- while a LOWER-
-# ranked accepted replacement may still be grabbable. The re-grab tries the next
-# candidate (bounded) and only parks when the list/cap exhausts.
+# its hash is already active under a different request -- while a LOWER-ranked
+# accepted replacement may still be grabbable. The re-grab tries the next candidate
+# (bounded) and only parks when the list/cap exhausts.
 _PER_RELEASE_GRAB_ERRORS: Final = (
     grab_service.NoGrabSourceError,
-    grab_service.DownloadScopeConflictError,
     grab_service.TorrentAlreadyTrackedError,
     QbittorrentSourceError,
 )
@@ -238,6 +239,17 @@ _INDEXER_ERRORS: Final = (IndexerError,)
 # subclasses ``QbittorrentError`` but is a source veto, not an outage), and
 # ``QbittorrentAuthError`` is a subclass of ``QbittorrentError`` and so is covered.
 _DOWNLOAD_CLIENT_ERRORS: Final = (QbittorrentError,)
+
+
+async def _mark_download_scopes_terminal(
+    session: AsyncSession, download_id: int, status: str
+) -> None:
+    await session.execute(
+        update(DownloadScope)
+        .where(DownloadScope.download_id == download_id, DownloadScope.status == "active")
+        .values(status=status)
+    )
+
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal
 # state EXCEPT ``importing``. An ``importing`` row is mid-copy/scan: failing it would
@@ -1072,6 +1084,7 @@ async def cancel_request(
             # rather than half-cancelling around a finalizing import.
             await session.rollback()
             raise ImportInProgressError(request_id)
+        await _mark_download_scopes_terminal(session, row.id, RequestStatus.cancelled.value)
         hashes_to_remove.append(row.torrent_hash)
 
     if request.media_type == "tv":

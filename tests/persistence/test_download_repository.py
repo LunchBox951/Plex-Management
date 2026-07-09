@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import Download, DownloadScope, MediaRequest, MediaType, RequestStatus
 from plex_manager.repositories import SqlDownloadRepository
 
 
@@ -102,6 +102,78 @@ async def test_find_active_for_request_scopes_by_season(session: AsyncSession) -
     # A season with no active download of its own finds nothing, even though the
     # request has active downloads for OTHER seasons.
     assert await repo.find_active_for_request(mr.id, season=3) is None
+
+
+async def test_active_download_scope_unique_index_blocks_duplicate_exact_scope(
+    session: AsyncSession,
+) -> None:
+    """The logical scope table has its own DB backstop: even if two physical
+    downloads carry different scalar seasons, they cannot both claim the same active
+    TV scope for one request."""
+    mr = MediaRequest(
+        tmdb_id=40, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    first = await repo.create(
+        torrent_hash="scope_s1",
+        status="downloading",
+        media_request_id=mr.id,
+        season=1,
+        episodes=[4, 5],
+    )
+    second = await repo.create(
+        torrent_hash="scope_s2",
+        status="downloading",
+        media_request_id=mr.id,
+        season=2,
+    )
+
+    assert first.scopes[0].episodes == [4, 5]
+    with pytest.raises(IntegrityError):
+        await repo.ensure_scope(second.id, media_request_id=mr.id, season=1, episodes=[5, 4])
+
+
+async def test_active_download_scope_unique_index_allows_terminal_prior_scope(
+    session: AsyncSession,
+) -> None:
+    """A completed/imported scope is historical and must not block a fresh active
+    scope with the same target."""
+    mr = MediaRequest(
+        tmdb_id=41, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    imported = Download(
+        torrent_hash="scope_imported",
+        status="imported",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(imported)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=imported.id,
+            media_request_id=mr.id,
+            season_number=1,
+            episodes_json=None,
+            scope_key="season:1|episodes:*",
+            status="imported",
+        )
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    active = await repo.create(
+        torrent_hash="scope_active",
+        status="downloading",
+        media_request_id=mr.id,
+        season=1,
+    )
+    assert active.scopes[0].status == "active"
 
 
 async def test_find_active_for_request_default_season_matches_movie_null_season(

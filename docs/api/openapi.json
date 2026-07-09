@@ -4,9 +4,25 @@
       "AcceptedRelease": {
         "description": "A release that passed the quality gate and blocklist, with its ranking.",
         "properties": {
+          "covered_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Covered Seasons",
+            "type": "array"
+          },
           "guid": {
             "title": "Guid",
             "type": "string"
+          },
+          "ignored_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Ignored Seasons",
+            "type": "array"
           },
           "indexer": {
             "title": "Indexer",
@@ -46,13 +62,45 @@
             ],
             "title": "Seeders"
           },
+          "skipped_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Skipped Seasons",
+            "type": "array"
+          },
           "source": {
             "title": "Source",
             "type": "string"
           },
+          "target_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Target Seasons",
+            "type": "array"
+          },
           "title": {
             "title": "Title",
             "type": "string"
+          },
+          "upgrade_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Upgrade Seasons",
+            "type": "array"
+          },
+          "waste_seasons": {
+            "default": [],
+            "items": {
+              "type": "integer"
+            },
+            "title": "Waste Seasons",
+            "type": "array"
           }
         },
         "required": [
@@ -373,6 +421,23 @@
       "CreateRequestBody": {
         "description": "Create a media request by tmdb id + media type.",
         "properties": {
+          "episodes": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Episodes"
+          },
           "force": {
             "anyOf": [
               {
@@ -955,7 +1020,7 @@
         "type": "object"
       },
       "GrabRequest": {
-        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; ``episodes`` further\nscopes it to those specific episode number(s) (``None``/empty = the whole\nseason). Every TV grab is per-season: the endpoint REJECTS (422) a tv request\ngrabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed\nWITH a ``season`` -- the branch is always the request's actual media type,\nnever merely whether ``season`` happens to be set.",
+        "description": "Grab a release for a request: a chosen ``info_hash``/``guid`` or the top pick.\n\nWith neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted\nrelease is grabbed (\"grab top\"). For a TV request, ``season`` scopes both the\nindexer search and the stored download to that season; ``episodes`` further\nscopes it to those specific episode number(s). When omitted, stored\n``explicit_episodes`` request intent supplies the selected season's target;\nexplicit ``None``/empty = the whole season. Every TV grab is per-season: the\nendpoint REJECTS (422) a tv request grabbed with no ``season``, and REJECTS\n(422) a non-tv (movie) request grabbed WITH a ``season`` -- the branch is\nalways the request's actual media type, never merely whether ``season``\nhappens to be set.",
         "properties": {
           "episodes": {
             "anyOf": [
@@ -1579,6 +1644,13 @@
             ],
             "title": "Release Title"
           },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/QueueScope"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
           "season": {
             "anyOf": [
               {
@@ -1649,6 +1721,54 @@
           "queue"
         ],
         "title": "QueueResponse",
+        "type": "object"
+      },
+      "QueueScope": {
+        "description": "One logical TV scope attached to a queue download.",
+        "properties": {
+          "episodes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Episodes"
+          },
+          "media_request_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Request Id"
+          },
+          "season": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Season"
+          },
+          "status": {
+            "default": "active",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "QueueScope",
         "type": "object"
       },
       "ReconcileStatusItem": {
@@ -1819,6 +1939,37 @@
             ],
             "title": "Poster Url"
           },
+          "requested_episodes": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Episodes"
+          },
+          "requested_seasons": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Seasons"
+          },
           "seasons": {
             "anyOf": [
               {
@@ -1845,6 +1996,17 @@
             "title": "Tmdb Id",
             "type": "integer"
           },
+          "tv_request_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tv Request Mode"
+          },
           "year": {
             "anyOf": [
               {
@@ -1868,7 +2030,7 @@
         "type": "object"
       },
       "SearchPreviewRequest": {
-        "description": "Preview by ``request_id`` OR by an explicit media descriptor.\n\nWhen ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are\nresolved from the stored request and any values passed for them are ignored;\n``season``/``episodes`` always come from THIS body regardless -- a stored\nrequest carries no per-search season/episode scoping of its own. Otherwise\n(no ``request_id``) ``tmdb_id``, ``media_type`` and ``title`` are required.\n\nEvery TV preview is per-season: the endpoint REJECTS (422) a tv media type\npreviewed with no ``season``, and REJECTS (422) a non-tv (movie) media type\npreviewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's\nscope guard exactly, so an invalid combination never reaches the indexer.",
+        "description": "Preview by ``request_id`` OR by an explicit media descriptor.\n\nWhen ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are\nresolved from the stored request and any values passed for them are ignored;\n``season`` comes from this body. ``episodes`` also comes from this body when\npresent; when omitted, a stored ``explicit_episodes`` request supplies the\nselected season's episode target. Otherwise (no ``request_id``) ``tmdb_id``,\n``media_type`` and ``title`` are required.\n\nEvery TV preview is per-season: the endpoint REJECTS (422) a tv media type\npreviewed with no ``season``, and REJECTS (422) a non-tv (movie) media type\npreviewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's\nscope guard exactly, so an invalid combination never reaches the indexer.",
         "properties": {
           "episodes": {
             "anyOf": [
@@ -1991,6 +2153,28 @@
       "SeasonStatus": {
         "description": "One tracked season's status, embedded in a tv ``RequestResponse``.",
         "properties": {
+          "installed_profile_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed Profile Index"
+          },
+          "installed_quality_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installed Quality Id"
+          },
           "season_number": {
             "title": "Season Number",
             "type": "integer"

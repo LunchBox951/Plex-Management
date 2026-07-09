@@ -162,6 +162,7 @@ function isGrabbableStatus(status: string): boolean {
     status !== 'completed' &&
     status !== 'failed' &&
     status !== 'evicted' &&
+    status !== 'waiting_for_air_date' &&
     // ADR-0014: a `cancelled` request is settled and terminal for grab (the backend
     // rejects a cancelled id in /queue/grab with request_not_active); a fresh
     // "Request again" must be made before grabbing. Mirrors the backend's

@@ -219,6 +219,7 @@ from datetime import UTC, datetime
 from itertools import count
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.events import DownloadFailed
@@ -241,6 +242,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -821,6 +823,16 @@ def _media_type_for_blocklist(
     return "tv" if record.season is not None else "movie"
 
 
+async def _mark_download_scopes_terminal(
+    session: AsyncSession, download_id: int, status: str
+) -> None:
+    await session.execute(
+        update(DownloadScope)
+        .where(DownloadScope.download_id == download_id, DownloadScope.status == "active")
+        .values(status=status)
+    )
+
+
 async def _handle_failed(
     session: AsyncSession,
     completion: _FailureCompletion,
@@ -892,6 +904,7 @@ async def _handle_failed(
             safe_int(completion.download_id),
         )
         return None
+    await _mark_download_scopes_terminal(session, record.id, RequestStatus.failed.value)
 
     request_repo = SqlRequestRepository(session)
     request = (
@@ -921,6 +934,22 @@ async def _handle_failed(
                 record, request.media_type if request is not None else None
             ),
         )
+
+    if record.scopes:
+        media_type = _media_type_for_blocklist(
+            record, request.media_type if request is not None else None
+        )
+        for scope in record.scopes:
+            if scope.media_request_id is not None and scope.season is not None:
+                await _rearm_failed_request(
+                    session,
+                    _FailedReArm(
+                        media_request_id=scope.media_request_id,
+                        season=scope.season,
+                        media_type=media_type,
+                    ),
+                )
+        return None
 
     # Hand the owning request/season back for the re-arm (same Phase-C transaction).
     # Captured from ``record``/``request`` in hand rather than re-read after a commit
@@ -1617,17 +1646,32 @@ async def mark_failed(
     torrent_hash = row.torrent_hash
     request_id = row.media_request_id
     download_tmdb_id = row.tmdb_id
-    rearm: _FailedReArm | None = None
-    if request_id is not None:
-        rearm = _FailedReArm(
-            media_request_id=request_id,
-            season=row.season,
-            media_type=(
-                row.media_type.value
-                if row.media_type is not None
-                else ("tv" if row.season is not None else "movie")
-            ),
-        )
+    record_snapshot = await download_repo.get_by_hash(torrent_hash)
+    request_media_type = (
+        row.media_type.value
+        if row.media_type is not None
+        else ("tv" if row.season is not None else "movie")
+    )
+    rearms: list[_FailedReArm] = []
+    if record_snapshot is not None and record_snapshot.scopes:
+        media_type = _media_type_for_blocklist(record_snapshot, request_media_type)
+        rearms = [
+            _FailedReArm(
+                media_request_id=scope.media_request_id,
+                season=scope.season,
+                media_type=media_type,
+            )
+            for scope in record_snapshot.scopes
+            if scope.media_request_id is not None and scope.season is not None
+        ]
+    elif request_id is not None:
+        rearms = [
+            _FailedReArm(
+                media_request_id=request_id,
+                season=row.season,
+                media_type=request_media_type,
+            )
+        ]
 
     # Ownership protocol (module docstring): register the single-owner claim BEFORE
     # any Phase-A write -- from this point reconcile treats the row as invisible at
@@ -1809,6 +1853,9 @@ async def mark_failed(
                         safe_int(download_id),
                     )
                     return
+                await _mark_download_scopes_terminal(
+                    session, download_id, RequestStatus.failed.value
+                )
                 if blocklist:
                     source_title = (
                         await blocklist_service.source_title_for(session, torrent_hash)
@@ -1833,7 +1880,7 @@ async def mark_failed(
                             request.media_type if request is not None else None,
                         ),
                     )
-                if rearm is not None:
+                for rearm in rearms:
                     await _rearm_failed_request(session, rearm)
 
             await _commit_phase_c_with_retry(

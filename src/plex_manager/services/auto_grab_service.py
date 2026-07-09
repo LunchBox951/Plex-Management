@@ -53,9 +53,9 @@ Design decisions (see ADR-0013):
   guid/info_hash, season, attempt context) so "how often did the same source
   persistently fail" is answerable from ``log_events`` after the beta week; a
   per-cycle ``source_failures`` count is folded into the closing summary INFO. Its
-  sibling per-release failures ({``NoGrabSourceError``, ``DownloadScopeConflictError``,
-  ``TorrentAlreadyTrackedError``}) keep the lighter "type name only" logging -- there
-  is no beta-week data need for those.
+  sibling per-release failures ({``NoGrabSourceError``, ``TorrentAlreadyTrackedError``})
+  keep the lighter "type name only" logging -- there is no beta-week data need for
+  those.
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
 from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -79,7 +80,6 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
-    DownloadScopeConflictError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
@@ -511,10 +511,9 @@ async def run_grab_cycle(
       scope to ``downloading`` and commits), falling through to the next-ranked
       accepted release -- bounded by :data:`MAX_GRAB_ATTEMPTS_PER_SCOPE` -- when the
       top pick hits a PER-RELEASE grab failure ({``NoGrabSourceError``,
-      ``QbittorrentSourceError``, ``DownloadScopeConflictError``,
-      ``TorrentAlreadyTrackedError``}); if nothing is acceptable, or every accepted
-      release is ungrabbable, park it at ``no_acceptable_release`` and schedule the
-      escalating backoff.
+      ``QbittorrentSourceError``, ``TorrentAlreadyTrackedError``}); if nothing is
+      acceptable, or every accepted release is ungrabbable, park it at
+      ``no_acceptable_release`` and schedule the escalating backoff.
 
     A search that RAISES (Prowlarr unreachable / rate-limited -- the ``IndexerPort``
     contract raises rather than returning ``[]``) is NOT caught here: it propagates
@@ -602,8 +601,35 @@ async def run_grab_cycle(
             if parent is None:  # pragma: no cover - the FK guarantees the parent row
                 continue
             title, year, media_type = parent.title, parent.year, "tv"
+            stored_episodes = (
+                parent.requested_episodes.get(scope.season) if parent.requested_episodes else None
+            )
+            scope_episodes = list(stored_episodes) if stored_episodes is not None else None
+            sibling_seasons = await season_repo.list_for_request(parent.id)
+            requested = (
+                parent.requested_seasons
+                or tuple(sorted(parent.requested_episodes or {}))
+                or tuple(row.season_number for row in sibling_seasons)
+            )
+            multi_season_intent = MultiSeasonRequestIntent(
+                mode=(
+                    "whole_show" if parent.tv_request_mode == "whole_show" else "explicit_seasons"
+                ),
+                requested_seasons=tuple(requested),
+                seasons=tuple(
+                    SeasonPackSeasonState(
+                        season_number=row.season_number,
+                        status=row.status,
+                        installed_quality_id=row.installed_quality_id,
+                        installed_profile_index=row.installed_profile_index,
+                    )
+                    for row in sibling_seasons
+                ),
+            )
         else:  # movie
             title, year, media_type = scope.title or "", scope.year, "movie"
+            scope_episodes = None
+            multi_season_intent = None
 
         searched += 1
         # NOTE: deliberately NOT wrapped -- a raised indexer error must propagate
@@ -618,13 +644,14 @@ async def run_grab_cycle(
             media_type=media_type,
             year=year,
             season=scope.season,
-            episodes=None,
+            episodes=scope_episodes,
+            multi_season_intent=multi_season_intent,
         )
 
         # Try the accepted releases in rank order until one grabs. Only the four
         # PER-RELEASE failures {NoGrabSourceError, QbittorrentSourceError,
-        # DownloadScopeConflictError, TorrentAlreadyTrackedError} -- none of which
-        # leaves anything live to track -- fall through to the next-ranked candidate;
+        # TorrentAlreadyTrackedError} -- none of which leaves anything live to track
+        # for this scope -- fall through to the next-ranked candidate;
         # every OTHER outcome settles the scope on the spot
         # (a grab, an operational GrabError, or a concurrency/shape refusal), so a
         # single top-pick hiccup never hides a grabbable lower-ranked release behind
@@ -649,7 +676,7 @@ async def run_grab_cycle(
                     tmdb_id=scope.tmdb_id,
                     year=year,
                     season=scope.season,
-                    episodes=None,
+                    episodes=scope_episodes,
                     save_path=save_path,
                     # The decision's premise rides with the action: this scope
                     # was selected because the season read as DUE at selection
@@ -825,15 +852,11 @@ async def run_grab_cycle(
                 )
             except (
                 NoGrabSourceError,
-                DownloadScopeConflictError,
                 TorrentAlreadyTrackedError,
             ) as exc:
                 # A release WAS accepted but cannot be grabbed right now, and NOTHING
                 # is left live to track: no usable source (``NoGrabSourceError`` --
-                # raised BEFORE anything is handed to the client); the same physical
-                # torrent is already active for a DIFFERENT scope of THIS request
-                # (``DownloadScopeConflictError`` -- a multi-season pack; the re-add
-                # is a qBittorrent no-op, so nothing is orphaned); or the torrent's
+                # raised BEFORE anything is handed to the client); or the torrent's
                 # hash is already tracked by a DIFFERENT request entirely
                 # (``TorrentAlreadyTrackedError`` -- that request's download owns the
                 # physical torrent, so any add was an idempotent no-op on an

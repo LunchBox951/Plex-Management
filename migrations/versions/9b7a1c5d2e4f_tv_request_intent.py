@@ -1,7 +1,7 @@
 """persist tv request intent and season quality breadcrumbs
 
 Revision ID: 9b7a1c5d2e4f
-Revises: b7e2d4f6c8a1
+Revises: 26bc01829ae1
 Create Date: 2026-07-04 13:55:00.000000
 """
 
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "9b7a1c5d2e4f"
-down_revision: str | None = "b7e2d4f6c8a1"
+down_revision: str | None = "26bc01829ae1"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -40,6 +40,7 @@ ReleaseScope = Literal["single_episode", "season_pack", "multi_season_pack", "un
 MultiSeasonRequestMode = Literal["whole_show", "explicit_seasons"]
 
 _INSTALLED_STATUSES = frozenset({"completed", "available"})
+_SEARCHABLE_STATUSES = frozenset({"pending", "searching", "no_acceptable_release", "failed"})
 
 
 @dataclass(frozen=True)
@@ -224,7 +225,7 @@ def plan_multi_season_pack(
         )
 
     eligible = (requested or tracked) & tracked
-    ignored = tuple(sorted(set(covered) - eligible))
+    ignored_set = set(covered) - eligible
     candidate_index = profile.get_index(candidate_quality_id)
 
     target: list[int] = []
@@ -237,8 +238,11 @@ def plan_multi_season_pack(
         state = state_by_season.get(season_number)
         if state is None:
             continue
-        if state.status not in _INSTALLED_STATUSES:
+        if state.status in _SEARCHABLE_STATUSES:
             target.append(season_number)
+            continue
+        if state.status not in _INSTALLED_STATUSES:
+            ignored_set.add(season_number)
             continue
 
         installed_index = _profile_index(
@@ -259,6 +263,7 @@ def plan_multi_season_pack(
 
     target_seasons = tuple(target)
     waste_seasons = tuple(waste)
+    ignored = tuple(sorted(ignored_set))
     reason: str | None = None
     accepted = True
     if not target_seasons:

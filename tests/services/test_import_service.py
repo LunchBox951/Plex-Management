@@ -30,6 +30,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -1739,6 +1740,215 @@ async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
     assert season_row.status.value == "completed"
     assert request is not None
     assert request.status is RequestStatus.completed  # "Finalizing", not yet available
+
+
+async def test_import_tv_shared_torrent_completes_each_attached_scope(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=request.id, season_number=1, status=RequestStatus.downloading.value
+        )
+        season_2 = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.downloading.value
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status="active",
+                ),
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_2.id,
+                    season_number=2,
+                    scope_key="season:2|episodes:*",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+        download_id = download.id
+        request_id = request.id
+
+    library = FakeLibrary()
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert (season_1_dir / "Some Show - S01E01.mkv").exists()
+    assert (season_2_dir / "Some Show - S02E01.mkv").exists()
+    assert library.scan_calls == [(str(season_1_dir), "tv"), (str(season_2_dir), "tv")]
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert {season.season_number: season.status for season in seasons} == {
+        1: "completed",
+        2: "completed",
+    }
+    assert {scope.season_number: scope.status for scope in scopes} == {
+        1: "imported",
+        2: "imported",
+    }
+    assert all(scope.completed_at is not None for scope in scopes)
+
+
+async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=request.id, season_number=1, status=RequestStatus.downloading.value
+        )
+        season_2 = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.downloading.value
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status="active",
+                ),
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_2.id,
+                    season_number=2,
+                    scope_key="season:2|episodes:*",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+        download_id = download.id
+        request_id = request.id
+
+    library = FakeLibrary()
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "S02" in record.failed_reason
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert (season_1_dir / "Some Show - S01E01.mkv").exists()
+    assert not season_2_dir.exists()
+    assert library.scan_calls == [(str(season_1_dir), "tv")]
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert request is not None and request.status is RequestStatus.import_blocked
+    assert {season.season_number: season.status for season in seasons} == {
+        1: "completed",
+        2: "import_blocked",
+    }
+    assert {scope.season_number: scope.status for scope in scopes} == {
+        1: "imported",
+        2: "import_blocked",
+    }
+    assert next(scope for scope in scopes if scope.season_number == 1).completed_at is not None
+    assert next(scope for scope in scopes if scope.season_number == 2).completed_at is None
 
 
 async def test_import_tv_retry_success_clears_stale_failed_reason(

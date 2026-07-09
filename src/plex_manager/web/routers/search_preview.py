@@ -18,9 +18,13 @@ from plex_manager.domain.decision_engine import DecisionResult
 from plex_manager.domain.quality import Resolution
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.release import ScoredRelease
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.parser import ParserPort
+from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
+from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import decision_service, request_service
 from plex_manager.web.deps import (
     get_parser,
@@ -100,6 +104,25 @@ def _to_response(result: DecisionResult) -> SearchPreviewResponse:
     )
 
 
+def stored_episodes_for_request(
+    request: RequestRecord,
+    *,
+    season: int | None,
+    episodes: list[int] | None,
+    episodes_was_provided: bool,
+) -> list[int] | None:
+    """Resolve effective TV episode scope for request-backed preview/grab calls.
+
+    Omitted ``episodes`` inherits a stored ``explicit_episodes`` intent for the
+    selected season. Explicit ``episodes: null`` or ``episodes: []`` remains a
+    whole-season operation.
+    """
+    if episodes_was_provided or season is None or not request.requested_episodes:
+        return episodes
+    requested = request.requested_episodes.get(season)
+    return list(requested) if requested else episodes
+
+
 async def _resolve_descriptor(
     body: SearchPreviewRequest,
     session: AsyncSession,
@@ -107,21 +130,28 @@ async def _resolve_descriptor(
     """Return ``(tmdb_id, title, media_type, year, season, episodes)`` for the preview.
 
     Resolved from a stored request when ``request_id`` is given, else from the
-    explicit body fields (which then must be complete). ``season``/``episodes``
-    always come from the BODY regardless of the ``request_id`` branch -- a stored
-    request carries no per-search season/episode scoping of its own.
+    explicit body fields (which then must be complete). ``season`` comes from the
+    body. ``episodes`` also comes from the body when the field is present; when it
+    is omitted, a stored ``explicit_episodes`` request supplies the selected
+    season's episode target.
     """
     if body.request_id is not None:
         record = await request_service.get_request(session, body.request_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+        episodes = stored_episodes_for_request(
+            record,
+            season=body.season,
+            episodes=body.episodes,
+            episodes_was_provided="episodes" in body.model_fields_set,
+        )
         return (
             record.tmdb_id,
             record.title,
             record.media_type,
             record.year,
             body.season,
-            body.episodes,
+            episodes,
         )
     if body.tmdb_id is None or body.media_type is None or body.title is None:
         raise HTTPException(
@@ -140,6 +170,35 @@ async def run_preview(
 ) -> DecisionResult:
     """Resolve the descriptor and run the decision engine (shared with grab)."""
     tmdb_id, title, media_type, year, season, episodes = await _resolve_descriptor(body, session)
+    multi_season_intent: MultiSeasonRequestIntent | None = None
+    if body.request_id is not None and media_type == "tv":
+        request = await SqlRequestRepository(session).get(body.request_id)
+        if request is not None and request.tv_request_mode in {
+            "whole_show",
+            "explicit_seasons",
+            "explicit_episodes",
+        }:
+            season_rows = await SqlSeasonRequestRepository(session).list_for_request(request.id)
+            requested = (
+                request.requested_seasons
+                or tuple(sorted(request.requested_episodes or {}))
+                or tuple(row.season_number for row in season_rows)
+            )
+            multi_season_intent = MultiSeasonRequestIntent(
+                mode=(
+                    "whole_show" if request.tv_request_mode == "whole_show" else "explicit_seasons"
+                ),
+                requested_seasons=tuple(requested),
+                seasons=tuple(
+                    SeasonPackSeasonState(
+                        season_number=row.season_number,
+                        status=row.status,
+                        installed_quality_id=row.installed_quality_id,
+                        installed_profile_index=row.installed_profile_index,
+                    )
+                    for row in season_rows
+                ),
+            )
     # Branch on the resolved media's ACTUAL type, never on whether ``season``
     # happens to be set -- mirrors the grab endpoint's exact scope guard
     # (queue.py's tv_grab_requires_season / movie_grab_rejects_season) so an
@@ -168,6 +227,7 @@ async def run_preview(
         year=year,
         season=season,
         episodes=episodes,
+        multi_season_intent=multi_season_intent,
     )
 
 

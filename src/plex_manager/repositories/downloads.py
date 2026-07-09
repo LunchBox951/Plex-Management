@@ -8,13 +8,14 @@ string literals; it mirrors P4's terminal ``DownloadState`` members.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, delete, exists, or_, select, update
 
-from plex_manager.models import Download, MediaRequest, MediaType
-from plex_manager.ports.repositories import DownloadRecord, QueueRecord
+from plex_manager.models import Download, DownloadScope, MediaRequest, MediaType, SeasonRequest
+from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord, QueueRecord
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,7 +53,39 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value
 
 
-def _to_record(row: Download) -> DownloadRecord:
+_ACTIVE_SCOPE_STATUSES: frozenset[str] = frozenset({"active"})
+
+
+def _normalize_episodes(value: list[int] | None) -> list[int] | None:
+    normalized = sorted({int(episode) for episode in value or []})
+    return normalized or None
+
+
+def _episodes_equal(left: list[int] | None, right: list[int] | None) -> bool:
+    return _normalize_episodes(left) == _normalize_episodes(right)
+
+
+def _scope_key(season: int | None, episodes: list[int] | None) -> str:
+    episode_key = (
+        json.dumps(_normalize_episodes(episodes), separators=(",", ":")) if episodes else "*"
+    )
+    return f"season:{season if season is not None else 'null'}|episodes:{episode_key}"
+
+
+def _to_scope_record(row: DownloadScope) -> DownloadScopeRecord:
+    return DownloadScopeRecord(
+        id=row.id,
+        download_id=row.download_id,
+        media_request_id=row.media_request_id,
+        season_request_id=row.season_request_id,
+        season=row.season_number,
+        episodes=row.episodes_json,
+        status=row.status,
+        completed_at=_as_utc(row.completed_at),
+    )
+
+
+def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -> DownloadRecord:
     """Map a ``Download`` ORM row to its frozen read-model DTO."""
     return DownloadRecord(
         id=row.id,
@@ -72,6 +105,7 @@ def _to_record(row: Download) -> DownloadRecord:
         added_at=_as_utc(row.added_at),
         download_path=row.download_path,
         release_title=row.release_title,
+        scopes=tuple(scopes or ()),
     )
 
 
@@ -80,6 +114,45 @@ class SqlDownloadRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def _scopes_by_download(
+        self, download_ids: list[int]
+    ) -> dict[int, list[DownloadScopeRecord]]:
+        if not download_ids:
+            return {}
+        stmt = (
+            select(DownloadScope)
+            .where(DownloadScope.download_id.in_(download_ids))
+            .order_by(DownloadScope.download_id, DownloadScope.season_number, DownloadScope.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        grouped: dict[int, list[DownloadScopeRecord]] = {}
+        for row in rows:
+            grouped.setdefault(row.download_id, []).append(_to_scope_record(row))
+        return grouped
+
+    async def _to_record_with_scopes(self, row: Download) -> DownloadRecord:
+        scopes = await self._scopes_by_download([row.id])
+        return _to_record(row, scopes.get(row.id, []))
+
+    async def _replace_scope_set(
+        self,
+        download_id: int,
+        *,
+        media_request_id: int | None,
+        season: int | None,
+        episodes: list[int] | None,
+    ) -> None:
+        await self._session.execute(
+            delete(DownloadScope).where(DownloadScope.download_id == download_id)
+        )
+        if media_request_id is not None and season is not None:
+            await self.ensure_scope(
+                download_id,
+                media_request_id=media_request_id,
+                season=season,
+                episodes=episodes,
+            )
 
     async def get_by_hash(
         self, torrent_hash: str, *, populate_existing: bool = False
@@ -96,7 +169,7 @@ class SqlDownloadRepository:
         if populate_existing:
             stmt = stmt.execution_options(populate_existing=True)
         row = (await self._session.execute(stmt)).scalars().first()
-        return _to_record(row) if row is not None else None
+        return await self._to_record_with_scopes(row) if row is not None else None
 
     async def find_active_for_request(
         self, media_request_id: int, *, season: int | None = None
@@ -107,17 +180,25 @@ class SqlDownloadRepository:
         # rows they always create -- identical to the pre-widen behaviour, since a
         # movie never has a non-NULL ``season``. TV callers pass the season being
         # grabbed, scoping the guard to that season only.
+        scoped_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id == media_request_id,
+            DownloadScope.season_number == season,
+            DownloadScope.status.in_(_ACTIVE_SCOPE_STATUSES),
+        )
         stmt = (
             select(Download)
             .where(
-                Download.media_request_id == media_request_id,
-                Download.season == season,
                 Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                or_(
+                    (Download.media_request_id == media_request_id) & (Download.season == season),
+                    scoped_exists,
+                ),
             )
             .order_by(Download.id)
         )
         row = (await self._session.execute(stmt)).scalars().first()
-        return _to_record(row) if row is not None else None
+        return await self._to_record_with_scopes(row) if row is not None else None
 
     async def list_active_for_request(self, media_request_id: int) -> list[DownloadRecord]:
         """Every ACTIVE (non-terminal) download for a request, across all seasons.
@@ -128,16 +209,22 @@ class SqlDownloadRepository:
         (imported/failed/no_acceptable_release) are excluded: they hold no live
         torrent to remove and re-failing them would be dishonest.
         """
+        scoped_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id == media_request_id,
+            DownloadScope.status.in_(_ACTIVE_SCOPE_STATUSES),
+        )
         stmt = (
             select(Download)
             .where(
-                Download.media_request_id == media_request_id,
                 Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                or_(Download.media_request_id == media_request_id, scoped_exists),
             )
             .order_by(Download.id)
         )
         rows = (await self._session.execute(stmt)).scalars().all()
-        return [_to_record(row) for row in rows]
+        scopes = await self._scopes_by_download([row.id for row in rows])
+        return [_to_record(row, scopes.get(row.id, [])) for row in rows]
 
     async def find_latest_for_request(
         self, media_request_id: int, *, season: int | None = None
@@ -153,17 +240,24 @@ class SqlDownloadRepository:
         follows the same ``== None`` -> ``IS NULL`` translation as
         :meth:`find_active_for_request` (movies match the NULL-season rows only).
         """
+        scoped_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id == media_request_id,
+            DownloadScope.season_number == season,
+        )
         stmt = (
             select(Download)
             .where(
-                Download.media_request_id == media_request_id,
-                Download.season == season,
+                or_(
+                    (Download.media_request_id == media_request_id) & (Download.season == season),
+                    scoped_exists,
+                ),
             )
             .order_by(Download.id.desc())
             .limit(1)
         )
         row = (await self._session.execute(stmt)).scalars().first()
-        return _to_record(row) if row is not None else None
+        return await self._to_record_with_scopes(row) if row is not None else None
 
     async def find_latest_imported_for_request(
         self, media_request_id: int, *, season: int | None = None
@@ -188,21 +282,29 @@ class SqlDownloadRepository:
         ``season`` follows the same ``== None`` -> ``IS NULL`` translation as the
         sibling lookups (movies match the NULL-season rows only).
         """
+        scoped_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id == media_request_id,
+            DownloadScope.season_number == season,
+            DownloadScope.status == "imported",
+        )
         stmt = (
             select(Download)
             .where(
-                Download.media_request_id == media_request_id,
-                Download.season == season,
                 # Literal (not the P4 ``DownloadState`` enum) -- this layer duplicates
                 # the state vocabulary as strings to stay decoupled (see module docstring
                 # and ``_TERMINAL_DOWNLOAD_STATUSES``); ``imported`` is that enum's value.
                 Download.status == "imported",
+                or_(
+                    (Download.media_request_id == media_request_id) & (Download.season == season),
+                    scoped_exists,
+                ),
             )
             .order_by(Download.id.desc())
             .limit(1)
         )
         row = (await self._session.execute(stmt)).scalars().first()
-        return _to_record(row) if row is not None else None
+        return await self._to_record_with_scopes(row) if row is not None else None
 
     async def list_active(self, *, populate_existing: bool = False) -> list[DownloadRecord]:
         """Active (non-terminal) downloads as read-model DTOs.
@@ -227,7 +329,8 @@ class SqlDownloadRepository:
         if populate_existing:
             stmt = stmt.execution_options(populate_existing=True)
         rows = (await self._session.execute(stmt)).scalars().all()
-        return [_to_record(row) for row in rows]
+        scopes = await self._scopes_by_download([row.id for row in rows])
+        return [_to_record(row, scopes.get(row.id, [])) for row in rows]
 
     async def list_active_for_queue(self) -> list[QueueRecord]:
         """Active (non-terminal) downloads enriched for the human-legible queue.
@@ -248,9 +351,10 @@ class SqlDownloadRepository:
             .order_by(Download.id)
         )
         rows = (await self._session.execute(stmt)).all()
+        scopes = await self._scopes_by_download([download.id for download, _title, _poster in rows])
         return [
             QueueRecord(
-                **_to_record(download).model_dump(),
+                **_to_record(download, scopes.get(download.id, [])).model_dump(),
                 title=title,
                 poster_url=poster_url,
             )
@@ -286,7 +390,65 @@ class SqlDownloadRepository:
         self._session.add(row)
         await self._session.flush()
         await self._session.refresh(row)
-        return _to_record(row)
+        scopes: list[DownloadScopeRecord] = []
+        if media_request_id is not None and season is not None:
+            scopes.append(
+                await self.ensure_scope(
+                    row.id,
+                    media_request_id=media_request_id,
+                    season=season,
+                    episodes=episodes,
+                )
+            )
+        return _to_record(row, scopes)
+
+    async def ensure_scope(
+        self,
+        download_id: int,
+        *,
+        media_request_id: int | None,
+        season: int | None,
+        episodes: list[int] | None = None,
+    ) -> DownloadScopeRecord:
+        """Attach ``(media_request_id, season, episodes)`` to ``download_id``.
+
+        Idempotent for an already-attached equivalent scope. ``episodes=None`` is
+        the whole-season sentinel and is distinct from a concrete episode list.
+        """
+        normalized_episodes = _normalize_episodes(episodes)
+        stmt = select(DownloadScope).where(
+            DownloadScope.download_id == download_id,
+            DownloadScope.media_request_id == media_request_id,
+            DownloadScope.season_number == season,
+        )
+        for row in (await self._session.execute(stmt)).scalars().all():
+            if _episodes_equal(row.episodes_json, normalized_episodes):
+                return _to_scope_record(row)
+
+        season_request_id: int | None = None
+        if media_request_id is not None and season is not None:
+            season_request_id = await self._session.scalar(
+                select(SeasonRequest.id).where(
+                    SeasonRequest.media_request_id == media_request_id,
+                    SeasonRequest.season_number == season,
+                )
+            )
+        row = DownloadScope(
+            download_id=download_id,
+            media_request_id=media_request_id,
+            season_request_id=season_request_id,
+            season_number=season,
+            episodes_json=normalized_episodes,
+            scope_key=_scope_key(season, normalized_episodes),
+            status="active",
+        )
+        self._session.add(row)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return _to_scope_record(row)
+
+    async def list_scopes(self, download_id: int) -> list[DownloadScopeRecord]:
+        return (await self._scopes_by_download([download_id])).get(download_id, [])
 
     async def update_status(
         self,
@@ -357,6 +519,13 @@ class SqlDownloadRepository:
         elif first_seen_at is not None:
             row.first_seen_at = first_seen_at
         await self._session.flush()
+        if replace_grab_metadata:
+            await self._replace_scope_set(
+                download_id,
+                media_request_id=media_request_id,
+                season=season,
+                episodes=episodes,
+            )
 
     async def update_status_if_in(
         self,
@@ -465,7 +634,15 @@ class SqlDownloadRepository:
         # cast target is referenced at runtime (not a string) so CodeQL does not read
         # ``CursorResult``/``Any`` as unused imports.
         result = cast(CursorResult[Any], await self._session.execute(stmt))
-        return result.rowcount == 1
+        updated = result.rowcount == 1
+        if updated and replace_grab_metadata:
+            await self._replace_scope_set(
+                download_id,
+                media_request_id=media_request_id,
+                season=season,
+                episodes=episodes,
+            )
+        return updated
 
     async def refresh_progress(
         self,

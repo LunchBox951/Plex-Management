@@ -45,6 +45,7 @@ __all__ = [
     "Download",
     "DownloadHistory",
     "DownloadHistoryEvent",
+    "DownloadScope",
     "LogEvent",
     "MediaRequest",
     "MediaType",
@@ -74,6 +75,7 @@ class RequestStatus(StrEnum):
     pending = "pending"
     searching = "searching"
     no_acceptable_release = "no_acceptable_release"
+    waiting_for_air_date = "waiting_for_air_date"
     downloading = "downloading"
     completed = "completed"
     available = "available"
@@ -314,11 +316,13 @@ class MediaRequest(Base):
             unique=True,
             sqlite_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed', 'partially_available')"
+                "'waiting_for_air_date', 'downloading', 'import_blocked', "
+                "'completed', 'partially_available')"
             ),
             postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed', 'partially_available')"
+                "'waiting_for_air_date', 'downloading', 'import_blocked', "
+                "'completed', 'partially_available')"
             ),
         ),
     )
@@ -393,6 +397,7 @@ class MediaRequest(Base):
     # operator named a finite season set, persisted in ``requested_seasons_json``.
     tv_request_mode: Mapped[str | None] = mapped_column(String)
     requested_seasons_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    requested_episodes_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
 
 
 class RequestDedupLock(Base):
@@ -554,6 +559,50 @@ class Download(Base):
     # migration) -- the queue UI degrades honestly (title -> release_title ->
     # short hash).
     release_title: Mapped[str | None] = mapped_column(String)
+
+
+class DownloadScope(Base):
+    """A logical TV scope attached to one physical torrent download.
+
+    ``downloads.torrent_hash`` remains the physical torrent identity. This table
+    records every season/episode target that torrent is expected to satisfy, so a
+    multi-season pack can be one client torrent with several durable TV scopes.
+    The scalar ``downloads.season`` / ``episodes_json`` columns remain as the
+    first/back-compat scope.
+    """
+
+    __tablename__ = "download_scopes"
+    __table_args__ = (
+        Index("ix_download_scopes_download", "download_id"),
+        Index("ix_download_scopes_request_scope", "media_request_id", "season_number"),
+        Index(
+            "uq_download_scopes_active_scope",
+            "media_request_id",
+            "scope_key",
+            unique=True,
+            sqlite_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
+            postgresql_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    download_id: Mapped[int] = mapped_column(
+        ForeignKey("downloads.id", ondelete="CASCADE"), index=True
+    )
+    media_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("season_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_number: Mapped[int | None] = mapped_column()
+    episodes_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    scope_key: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(
+        String, default="active", server_default=sa.text("'active'")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DownloadHistory(Base):

@@ -1123,21 +1123,20 @@ async def test_create_request_tv_collapses_racing_in_library_available_rows(
     assert await _season_numbers(sessionmaker_, first.id) == {1, 2}
 
 
-async def test_create_request_tv_whole_series_with_zero_aired_seasons_raises(
+async def test_create_request_tv_whole_series_with_zero_aired_seasons_waits(
     sessionmaker_: SessionMaker,
 ) -> None:
     """A whole-series tv request (no explicit ``seasons``) whose TMDB
-    ``season_count`` resolves to 0 (a TMDB gap, or a specials-only show) must
-    never persist a 'pending' request with ZERO tracked seasons -- nothing would
-    ever drive search/grab for it, and it would show 'pending' forever (a silent
-    dead request). Surfaced honestly as NoAiredSeasonsError instead."""
+    ``season_count`` resolves to 0 (a TMDB gap, an unaired show, or a specials-only
+    show) persists as ``waiting_for_air_date`` so metadata refresh can make it
+    searchable later."""
     tmdb = FakeTmdb(
         shows={5005: TvMetadata(tmdb_id=5005, title="Gap Show", year=2020, season_count=0)}
     )
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.NoAiredSeasonsError):
-            await request_service.create_request(session, tmdb, tmdb_id=5005, media_type="tv")
+        record = await request_service.create_request(session, tmdb, tmdb_id=5005, media_type="tv")
+    assert record.status == RequestStatus.waiting_for_air_date.value
 
     async with sessionmaker_() as session:
         rows = (
@@ -1145,7 +1144,20 @@ async def test_create_request_tv_whole_series_with_zero_aired_seasons_raises(
             .scalars()
             .all()
         )
-    assert rows == []  # nothing was persisted -- no dead-end ghost request
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].status is RequestStatus.waiting_for_air_date
+    assert [(season.season_number, season.status) for season in seasons] == [
+        (1, "waiting_for_air_date")
+    ]
 
 
 async def test_create_request_tv_season_already_in_plex_rolls_up_partially_available(

@@ -19,6 +19,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -398,6 +399,77 @@ async def test_get_queue_enriches_rows_with_media_title_poster_and_release_title
     assert item["title"] == "Some Movie"
     assert item["poster_url"] == "https://image.tmdb.org/poster.jpg"
     assert item["release_title"] == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+async def test_get_queue_exposes_tv_download_scopes(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=900,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=request.id, season_number=1, status=RequestStatus.downloading.value
+        )
+        season_2 = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.downloading.value
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash="f" * 40,
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=900,
+            season=1,
+            episodes_json=[1],
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    episodes_json=[1],
+                    scope_key="season:1|episodes:[1]",
+                    status="active",
+                ),
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_2.id,
+                    season_number=2,
+                    episodes_json=None,
+                    scope_key="season:2|episodes:*",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 200
+    [item] = [i for i in response.json()["queue"] if i["torrent_hash"] == "f" * 40]
+    assert item["season"] == 1
+    assert item["episodes"] == [1]
+    assert [
+        {"season": scope["season"], "episodes": scope["episodes"], "status": scope["status"]}
+        for scope in item["scopes"]
+    ] == [
+        {"season": 1, "episodes": [1], "status": "active"},
+        {"season": 2, "episodes": None, "status": "active"},
+    ]
 
 
 async def test_get_queue_orphaned_download_still_renders_with_none_title_and_poster(
@@ -1353,13 +1425,50 @@ async def test_grab_threads_season_and_episodes_into_search_and_queue_item(
     assert prowlarr.searched[-1].episode == "5"
 
 
+async def test_grab_omitted_episodes_inherits_explicit_episode_request(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "episodes": {"2": [5]}},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S02E05.1080p.WEB-DL.x264-GROUP", info_hash="5" * 40)]
+    )
+    override_adapters(app, prowlarr=prowlarr, qbt=FakeQbittorrent())
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["season"] == 2
+    assert body["episodes"] == [5]
+    assert prowlarr.searched[-1].season == 2
+    assert prowlarr.searched[-1].episode == "5"
+
+
 async def test_grab_empty_episodes_persists_none_whole_season_scope(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     """Issue #102: a hand-crafted ``episodes: []`` body must persist ``None``
     (whole-season), not an empty scoped list -- the schema boundary normalizes
-    it BEFORE it ever reaches ``episodes_json``, so it can't later defeat
-    ``_reuse_conflicts``' strict ``is None`` identity checks."""
+    it BEFORE it ever reaches ``episodes_json`` or the same-hash scope attachment
+    path."""
     await seed(initialized=True, app_api_key=_API_KEY)
     override_adapters(
         app,
@@ -1404,8 +1513,7 @@ async def test_grab_empty_episodes_then_whole_season_regrab_is_idempotent(
     """Issue #102 end-to-end: a first grab with a hand-crafted ``episodes: []``
     normalizes to ``None`` on persist, so a LATER legitimate whole-season
     re-grab of the SAME release (``episodes`` omitted) is recognized as the
-    same scope -- an idempotent no-op, not a spurious
-    ``DownloadScopeConflictError`` (409)."""
+    same scope -- an idempotent no-op, not a spurious 409 scope conflict."""
     await seed(initialized=True, app_api_key=_API_KEY)
     override_adapters(
         app,
@@ -1437,7 +1545,7 @@ async def test_grab_empty_episodes_then_whole_season_regrab_is_idempotent(
         json={"request_id": request_id, "season": 2},
         headers=_HEADERS,
     )
-    assert second.status_code == 201  # not a 409 download_scope_conflict
+    assert second.status_code == 201  # not a scope-conflict 409
     assert second.json()["id"] == first.json()["id"]
 
 

@@ -7,8 +7,11 @@ from collections.abc import Awaitable, Callable
 import httpx
 from fastapi import FastAPI
 
+from plex_manager.ports.metadata import TvMetadata
 from tests.web.fakes import (
     FakeProwlarr,
+    FakeTmdb,
+    candidate,
     good_and_cam_candidates,
     override_adapters,
     prerelease_only_candidates,
@@ -160,6 +163,39 @@ async def test_search_preview_tv_with_season_still_previews_normally(
     # engine as before (the fixture's movie-titled candidates don't match a tv
     # season, so nothing is accepted here, but that is unrelated to the guard).
     assert response.status_code == 200
+
+
+async def test_search_preview_request_id_omitted_episodes_inherits_explicit_episode_intent(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "episodes": {"2": [5]}},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S02E05.1080p.WEB-DL.x264-GROUP", info_hash="5" * 40)]
+    )
+    override_adapters(app, prowlarr=prowlarr)
+
+    response = await client.post(
+        "/api/v1/search-preview",
+        json={"request_id": created.json()["id"], "season": 2},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert prowlarr.searched[-1].season == 2
+    assert prowlarr.searched[-1].episode == "5"
 
 
 async def test_search_preview_empty_episodes_normalizes_and_still_previews(

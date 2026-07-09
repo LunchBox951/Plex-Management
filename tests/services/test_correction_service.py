@@ -28,6 +28,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -1100,25 +1101,34 @@ async def test_cancel_tv_settles_every_season_and_rolls_up_cancelled(
         )
         session.add(show)
         await session.flush()
-        session.add(
-            SeasonRequest(
-                media_request_id=show.id, season_number=1, status=RequestStatus.downloading
-            )
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.downloading
         )
+        session.add(season_1)
         session.add(
             SeasonRequest(media_request_id=show.id, season_number=2, status=RequestStatus.searching)
         )
+        download = Download(
+            torrent_hash=_CULPRIT,
+            status="downloading",
+            media_request_id=show.id,
+            tmdb_id=1399,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
         session.add(
-            Download(
-                torrent_hash=_CULPRIT,
-                status="downloading",
+            DownloadScope(
+                download_id=download.id,
                 media_request_id=show.id,
-                tmdb_id=1399,
-                season=1,
+                season_request_id=season_1.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="active",
             )
         )
         await session.commit()
-        request_id = show.id
+        request_id, download_id = show.id, download.id
 
     qbt = FakeQbittorrent()
     async with sessionmaker_() as session:
@@ -1136,7 +1146,13 @@ async def test_cancel_tv_settles_every_season_and_rolls_up_cancelled(
             .scalars()
             .all()
         )
+        scope = (
+            await session.execute(
+                select(DownloadScope).where(DownloadScope.download_id == download_id)
+            )
+        ).scalar_one()
     assert {s.status for s in seasons} == {RequestStatus.cancelled}
+    assert scope.status == "cancelled"
 
 
 async def test_cancel_rejects_an_already_imported_request(

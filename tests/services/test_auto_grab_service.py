@@ -26,6 +26,7 @@ from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest, ScoredRelease
 from plex_manager.models import (
     Download,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -553,14 +554,13 @@ async def test_no_grab_source_still_parks_on_backoff(sessionmaker_: SessionMaker
 # --------------------------------------------------------------------------- #
 # Alternate accepted releases — try the next before parking (PR #31)
 # --------------------------------------------------------------------------- #
-async def test_scope_conflict_on_top_pick_grabs_lower_ranked_release(
+async def test_same_hash_top_pick_attaches_scope_without_client_add(
     sessionmaker_: SessionMaker,
 ) -> None:
     # The top-ranked accepted release is a multi-season pack whose hash is ALREADY
-    # active tracking a DIFFERENT season (season 2), so the season-1 grab raises
-    # DownloadScopeConflictError. A lower-ranked, season-1-only pack is still
-    # grabbable -- the worker must fall through to it and GRAB, never park a
-    # still-grabbable season behind backoff.
+    # active tracking a DIFFERENT season (season 2). The worker should attach the
+    # season-1 scope to the existing physical torrent, not add a duplicate torrent
+    # or fall through to a lower-ranked release.
     request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=1399, season_number=1)
     async with sessionmaker_() as session:
         # The shared pack (hash "aaaa...") is already downloading season 2.
@@ -586,24 +586,29 @@ async def test_scope_conflict_on_top_pick_grabs_lower_ranked_release(
 
     assert result.searched == 1
     assert result.grabbed == 1
-    assert result.no_acceptable == 0  # NOT parked -- a grabbable alternate existed
-    assert len(qbt.added) == 1  # only the fallback pack reached the client
+    assert result.no_acceptable == 0
+    assert qbt.added == []  # existing same-hash torrent was reused in-place
     async with sessionmaker_() as session:
         season = await session.get(SeasonRequest, season_id)
         assert season is not None
         assert season.status == RequestStatus.downloading
         assert season.search_attempts == 0  # no backoff scheduled
         assert season.next_search_at is None
-        # The grabbed season-1 download tracks the FALLBACK hash, not the conflict.
         grabbed_row = (
-            await session.execute(
-                select(Download).where(
-                    Download.media_request_id == request_id, Download.season == 1
+            await session.execute(select(Download).where(Download.torrent_hash == "a" * 40))
+        ).scalar_one()
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == grabbed_row.id)
                 )
             )
-        ).scalar_one()
-        assert grabbed_row.torrent_hash == "b" * 40
+            .scalars()
+            .all()
+        )
         assert grabbed_row.status == "downloading"
+        assert grabbed_row.season == 2
+        assert [(scope.season_number, scope.status) for scope in scopes] == [(1, "active")]
 
 
 async def test_torrent_tracked_by_other_request_grabs_next_release_cycle_survives(

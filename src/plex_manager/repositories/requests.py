@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -75,6 +75,27 @@ def _season_json(value: Sequence[int] | None) -> list[int] | None:
     return list(_season_tuple(value) or [])
 
 
+def _episode_map(value: dict[str, Any] | None) -> dict[int, tuple[int, ...]] | None:
+    if value is None:
+        return None
+    return {
+        int(season): tuple(sorted({int(episode) for episode in cast(list[Any], episodes)}))
+        for season, episodes in value.items()
+        if isinstance(episodes, list)
+    }
+
+
+def _episode_json(
+    value: Mapping[int, Sequence[int]] | None,
+) -> dict[str, list[int]] | None:
+    if value is None:
+        return None
+    return {
+        str(int(season)): sorted({int(episode) for episode in episodes})
+        for season, episodes in value.items()
+    }
+
+
 def _to_record(row: MediaRequest) -> RequestRecord:
     """Map a ``MediaRequest`` ORM row to its frozen read-model DTO."""
     return RequestRecord(
@@ -99,6 +120,7 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         eviction_regrab=bool(row.eviction_regrab),
         tv_request_mode=row.tv_request_mode,
         requested_seasons=_season_tuple(row.requested_seasons_json),
+        requested_episodes=_episode_map(row.requested_episodes_json),
     )
 
 
@@ -487,6 +509,7 @@ class SqlRequestRepository:
         eviction_regrab: bool = False,
         tv_request_mode: str | None = None,
         requested_seasons: Sequence[int] | None = None,
+        requested_episodes: Mapping[int, Sequence[int]] | None = None,
     ) -> RequestRecord:
         row = MediaRequest(
             tmdb_id=tmdb_id,
@@ -501,6 +524,7 @@ class SqlRequestRepository:
             eviction_regrab=eviction_regrab,
             tv_request_mode=tv_request_mode,
             requested_seasons_json=_season_json(requested_seasons),
+            requested_episodes_json=_episode_json(requested_episodes),
         )
         self._session.add(row)
         await self._session.flush()
@@ -508,13 +532,19 @@ class SqlRequestRepository:
         return _to_record(row)
 
     async def set_tv_request_intent(
-        self, request_id: int, *, mode: str, requested_seasons: Sequence[int] | None
+        self,
+        request_id: int,
+        *,
+        mode: str,
+        requested_seasons: Sequence[int] | None,
+        requested_episodes: Mapping[int, Sequence[int]] | None = None,
     ) -> None:
         row = await self._session.get(MediaRequest, request_id)
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.tv_request_mode = mode
         row.requested_seasons_json = _season_json(requested_seasons)
+        row.requested_episodes_json = _episode_json(requested_episodes)
         await self._session.flush()
 
     async def set_status(self, request_id: int, status: str) -> None:

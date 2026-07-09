@@ -64,6 +64,7 @@ __all__ = [
     "QualityProfileResponse",
     "QueueItem",
     "QueueResponse",
+    "QueueScope",
     "ReconcileStatusItem",
     "RejectedRelease",
     "ReportIssueBody",
@@ -797,6 +798,10 @@ class CreateRequestBody(BaseModel):
     # ``_season_numbers``. A repeat POST with a NEW season list GROWS the tracked
     # set rather than being dropped by the request-level dedup.
     seasons: list[int] | None = None
+    # TV only: explicit episode targets keyed by season number. Supplying this
+    # records an ``explicit_episodes`` TV intent and creates season rows for the
+    # map's keys. Values are the episode numbers requested within that season.
+    episodes: dict[int, list[int]] | None = None
     # Re-acquire (issue #131): force a fresh grabbable request even when the movie
     # is still reported present in Plex (its file was deleted/replaced out-of-band),
     # instead of the normal already-in-library short-circuit that returns a
@@ -855,6 +860,9 @@ class RequestResponse(BaseModel):
     is_anime: bool = False
     poster_url: str | None = None
     backdrop_url: str | None = None
+    tv_request_mode: str | None = None
+    requested_seasons: list[int] | None = None
+    requested_episodes: dict[int, list[int]] | None = None
     # TV only: this show's per-season rollup, ordered by season number. ``None``
     # for a movie (movies have no ``SeasonRequest`` rows). ``status`` above is the
     # COMPUTED fold of these (``domain.season_rollup.rollup_status``).
@@ -881,9 +889,10 @@ class SearchPreviewRequest(BaseModel):
 
     When ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are
     resolved from the stored request and any values passed for them are ignored;
-    ``season``/``episodes`` always come from THIS body regardless -- a stored
-    request carries no per-search season/episode scoping of its own. Otherwise
-    (no ``request_id``) ``tmdb_id``, ``media_type`` and ``title`` are required.
+    ``season`` comes from this body. ``episodes`` also comes from this body when
+    present; when omitted, a stored ``explicit_episodes`` request supplies the
+    selected season's episode target. Otherwise (no ``request_id``) ``tmdb_id``,
+    ``media_type`` and ``title`` are required.
 
     Every TV preview is per-season: the endpoint REJECTS (422) a tv media type
     previewed with no ``season``, and REJECTS (422) a non-tv (movie) media type
@@ -908,10 +917,9 @@ class SearchPreviewRequest(BaseModel):
     @classmethod
     def _normalize_empty_episodes(cls, value: list[int] | None) -> list[int] | None:
         """Coerce ``[]`` to ``None`` (issue #102): both mean "whole season", but
-        only ``None`` is what ``_reuse_conflicts``' strict ``is None`` identity
-        checks (grab_service.py) recognize as such. Normalizing here -- at the
-        schema boundary -- means an unnormalized ``[]`` can never reach a stored
-        ``episodes_json`` or a reuse/import scope check in the first place.
+        ``None`` is the canonical whole-season scope value. Normalizing here -- at
+        the schema boundary -- means an unnormalized ``[]`` can never reach a
+        stored ``episodes_json`` or a reuse/import scope check in the first place.
         """
         return value or None
 
@@ -960,6 +968,21 @@ class SearchPreviewResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # Queue (downloads + reconciled status)
 # --------------------------------------------------------------------------- #
+class QueueScope(BaseModel):
+    """One logical TV scope attached to a queue download."""
+
+    model_config = ConfigDict(frozen=True)
+
+    media_request_id: int | None = None
+    season: int | None = None
+    episodes: list[int] | None = None
+    status: str = "active"
+
+
+def _empty_queue_scopes() -> list[QueueScope]:
+    return []
+
+
 class QueueItem(BaseModel):
     """A tracked download in the live queue."""
 
@@ -988,6 +1011,7 @@ class QueueItem(BaseModel):
     title: str | None = None
     poster_url: str | None = None
     release_title: str | None = None
+    scopes: list[QueueScope] = Field(default_factory=_empty_queue_scopes)
 
 
 class QueueResponse(BaseModel):
@@ -1004,11 +1028,13 @@ class GrabRequest(BaseModel):
     With neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted
     release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
     indexer search and the stored download to that season; ``episodes`` further
-    scopes it to those specific episode number(s) (``None``/empty = the whole
-    season). Every TV grab is per-season: the endpoint REJECTS (422) a tv request
-    grabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed
-    WITH a ``season`` -- the branch is always the request's actual media type,
-    never merely whether ``season`` happens to be set.
+    scopes it to those specific episode number(s). When omitted, stored
+    ``explicit_episodes`` request intent supplies the selected season's target;
+    explicit ``None``/empty = the whole season. Every TV grab is per-season: the
+    endpoint REJECTS (422) a tv request grabbed with no ``season``, and REJECTS
+    (422) a non-tv (movie) request grabbed WITH a ``season`` -- the branch is
+    always the request's actual media type, never merely whether ``season``
+    happens to be set.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -1023,10 +1049,9 @@ class GrabRequest(BaseModel):
     @classmethod
     def _normalize_empty_episodes(cls, value: list[int] | None) -> list[int] | None:
         """Coerce ``[]`` to ``None`` (issue #102): both mean "whole season", but
-        only ``None`` is what ``_reuse_conflicts``' strict ``is None`` identity
-        checks (grab_service.py) recognize as such. Normalizing here -- at the
-        schema boundary -- means an unnormalized ``[]`` can never reach a stored
-        ``episodes_json`` or a reuse/import scope check in the first place.
+        ``None`` is the canonical whole-season scope value. Normalizing here -- at
+        the schema boundary -- means an unnormalized ``[]`` can never reach a
+        stored ``episodes_json`` or a reuse/import scope check in the first place.
         """
         return value or None
 

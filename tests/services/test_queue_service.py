@@ -17,6 +17,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -459,6 +460,17 @@ async def test_mark_failed_for_tv_rearms_the_season_not_the_request_directly(
             season=1,
         )
         session.add(download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=request.id,
+                season_request_id=season_row.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="active",
+            )
+        )
         await session.commit()
         request_id, season_id, download_id = request.id, season_row.id, download.id
 
@@ -471,10 +483,16 @@ async def test_mark_failed_for_tv_rearms_the_season_not_the_request_directly(
     async with sessionmaker_() as session:
         season_row = await session.get(SeasonRequest, season_id)
         request = await session.get(MediaRequest, request_id)
+        scope = (
+            await session.execute(
+                select(DownloadScope).where(DownloadScope.download_id == download_id)
+            )
+        ).scalar_one()
     assert season_row is not None
     assert season_row.status.value == "searching"
     assert request is not None
     assert request.status is RequestStatus.searching
+    assert scope.status == "failed"
 
 
 async def test_missing_beyond_grace_never_regresses_an_already_available_season(

@@ -95,6 +95,7 @@ def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> No
 
     tables, dl_cols = _tables_and_download_cols(db)
     assert "season_requests" in tables
+    assert "download_scopes" in tables
     assert {"season", "episodes_json"} <= dl_cols
 
     # Operability beta (ADR-0012, migration ``6c7fca1436d8``) — this (and the
@@ -106,6 +107,7 @@ def test_migration_chain_upgrades_head_and_downgrades_base(tmp_path: Path) -> No
         "keep_forever",
         "tv_request_mode",
         "requested_seasons_json",
+        "requested_episodes_json",
     } <= _media_request_cols(db)
     assert {"installed_quality_id", "installed_profile_index"} <= _season_request_cols(db)
 
@@ -125,6 +127,7 @@ def test_existing_install_upgrades_across_the_tv_revision(tmp_path: Path) -> Non
 
     tables, dl_cols = _tables_and_download_cols(db)
     assert "season_requests" in tables
+    assert "download_scopes" in tables
     assert {"season", "episodes_json"} <= dl_cols
 
     assert "log_events" in tables
@@ -133,6 +136,7 @@ def test_existing_install_upgrades_across_the_tv_revision(tmp_path: Path) -> Non
         "keep_forever",
         "tv_request_mode",
         "requested_seasons_json",
+        "requested_episodes_json",
     } <= _media_request_cols(db)
     assert {"installed_quality_id", "installed_profile_index"} <= _season_request_cols(db)
 
@@ -161,10 +165,15 @@ def test_alembic_upgrade_head_builds_sqlite_schema_with_partial_indexes(
             download_index = conn.execute(
                 text("SELECT sql FROM sqlite_master WHERE name = 'uq_downloads_active_request'")
             ).scalar_one()
+            scope_index = conn.execute(
+                text("SELECT sql FROM sqlite_master WHERE name = 'uq_download_scopes_active_scope'")
+            ).scalar_one()
 
             assert "import_blocked" in media_index
+            assert "waiting_for_air_date" in media_index
             assert "completed" in media_index
             assert "status NOT IN ('imported', 'failed', 'no_acceptable_release')" in download_index
+            assert "media_request_id IS NOT NULL AND status = 'active'" in scope_index
             lock_table = conn.execute(
                 text("SELECT name FROM sqlite_master WHERE name = 'request_dedup_locks'")
             ).scalar_one()
@@ -322,6 +331,89 @@ def test_tv_request_intent_backfills_legacy_rows_as_whole_show(
         parsed = json_lib.loads(raw) if isinstance(raw, str) else raw
         assert parsed is None, rid
     assert rows[3][0] is None
+
+
+def test_download_scope_migration_backfills_canonical_scope_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "download-scopes-backfill.db"
+    _upgrade(db_path, "9b7a1c5d2e4f", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO media_requests (
+                        id, tmdb_id, media_type, title, status, tv_request_mode
+                    )
+                    VALUES (1, 42, 'tv', 'Some Show', 'downloading', 'whole_show')
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO season_requests (id, media_request_id, season_number, status)
+                    VALUES (10, 1, 2, 'downloading')
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO downloads (
+                        torrent_hash,
+                        status,
+                        progress,
+                        seed_ratio,
+                        media_request_id,
+                        tmdb_id,
+                        season,
+                        episodes_json,
+                        media_type
+                    )
+                    VALUES (
+                        'legacy_scope_hash',
+                        'downloading',
+                        0.0,
+                        0.0,
+                        1,
+                        42,
+                        2,
+                        '[5,4,5]',
+                        'tv'
+                    )
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    _upgrade(db_path, "head", monkeypatch)
+
+    con = sqlite3.connect(db_path)
+    try:
+        season, scope_key, status = con.execute(
+            """
+            SELECT season_number, scope_key, status
+            FROM download_scopes
+            WHERE download_id = (
+                SELECT id FROM downloads WHERE torrent_hash = 'legacy_scope_hash'
+            )
+            """
+        ).fetchone()
+        scope_key_not_null = {
+            row[1]: row[3] for row in con.execute("PRAGMA table_info(download_scopes)")
+        }["scope_key"]
+    finally:
+        con.close()
+
+    assert season == 2
+    assert scope_key == "season:2|episodes:[4,5]"
+    assert status == "active"
+    assert scope_key_not_null == 1
 
 
 def test_release_title_migration_backfills_from_download_history(

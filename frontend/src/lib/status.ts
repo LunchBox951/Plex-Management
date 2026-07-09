@@ -19,6 +19,7 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   pending: { label: 'Requested', intent: 'neutral' },
   searching: { label: 'Searching', intent: 'searching' },
   no_acceptable_release: { label: 'No release', intent: 'error' },
+  waiting_for_air_date: { label: 'Waiting for air date', intent: 'neutral' },
   downloading: { label: 'Downloading', intent: 'downloading' },
   import_blocked: { label: 'Import blocked', intent: 'error' },
   completed: { label: 'Finalizing', intent: 'downloading' },
