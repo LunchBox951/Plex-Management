@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 from sqlalchemy import update
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.download_payload import (
     EMPTY_PAYLOAD_REJECTION_REASON,
     format_payload_rejection,
@@ -911,7 +912,20 @@ async def _reject_unsafe_payload_if_reported(
     if status.progress <= 0 and not complete:
         return None
 
-    files = await qbt.list_files(torrent_hash)
+    try:
+        files = await qbt.list_files(torrent_hash)
+    except QbittorrentError as exc:
+        if complete:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"could not validate torrent payload manifest: {type(exc).__name__}",
+                request_id=request_id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        return None
     reason: str | None = None
     if not files:
         if complete:
@@ -1008,6 +1022,80 @@ async def _resume_breadcrumbed_movie_import(
     )
     await request_repo.set_library_path(request.id, str(dst.parent))
     await request_repo.mark_completed(request.id)
+    await session.commit()
+    return await download_repo.get_by_hash(torrent_hash)
+
+
+async def _resume_breadcrumbed_tv_import(
+    *,
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    request: RequestRecord,
+    season: int,
+    download_id: int,
+    torrent_hash: str,
+    library: LibraryPort,
+    tv_root: str,
+    download_status: str,
+    download_path: str,
+) -> DownloadRecord | None:
+    season_dir = Path(download_path)
+    root_real = os.path.realpath(tv_root)
+    season_dir_real = os.path.realpath(season_dir)
+    if download_status not in (
+        DownloadState.Importing.value,
+        DownloadState.ImportBlocked.value,
+    ) or not _is_within(root_real, season_dir_real):
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "stored import breadcrumb is outside the tv library root",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if not await asyncio.to_thread(os.path.isdir, season_dir):
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            "stored import breadcrumb is not visible inside the container",
+            request_id=request.id,
+            season=season,
+            clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    try:
+        await library.trigger_scan(str(season_dir), "tv")
+    except (PlexLibraryError, PlexAuthError) as exc:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"plex scan failed: {type(exc).__name__}",
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+
+    finalized = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.Imported.value,
+        frozenset({DownloadState.Importing.value, DownloadState.ImportBlocked.value}),
+        download_path=str(season_dir),
+        clear_failed_reason=True,
+    )
+    if not finalized:
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash)
+    await season_request_service.set_library_path(
+        session, media_request_id=request.id, season_number=season, library_path=str(season_dir)
+    )
+    await season_request_service.mark_completed(
+        session, media_request_id=request.id, season_number=season
+    )
     await session.commit()
     return await download_repo.get_by_hash(torrent_hash)
 
@@ -1163,6 +1251,7 @@ async def _import_download_locked(
             request=request,
             season=season,
             episodes=episodes,
+            download_status=row.status,
             download_path=row.download_path,
             fs=fs,
             library=library,
@@ -1850,6 +1939,7 @@ async def _import_tv_locked(
     request: RequestRecord,
     season: int,
     episodes: list[int] | None,
+    download_status: str,
     download_path: str | None,
     fs: FileSystemPort,
     library: LibraryPort,
@@ -1898,6 +1988,22 @@ async def _import_tv_locked(
 
     status = await qbt.get_status(torrent_hash)
     if status is None:
+        if download_path is not None and download_status in (
+            DownloadState.Importing.value,
+            DownloadState.ImportBlocked.value,
+        ):
+            return await _resume_breadcrumbed_tv_import(
+                session=session,
+                download_repo=download_repo,
+                request=request,
+                season=season,
+                download_id=download_id,
+                torrent_hash=torrent_hash,
+                library=library,
+                tv_root=tv_root,
+                download_status=download_status,
+                download_path=download_path,
+            )
         await _block(
             session,
             download_repo,

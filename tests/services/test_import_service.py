@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
+from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
@@ -156,6 +157,11 @@ def _qbt(content_path: Path, *, files: list[DownloadedFile] | None = None) -> Fa
         ],
         files={_HASH: manifest},
     )
+
+
+class _ListFilesFailsQbt(FakeQbittorrent):
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        raise QbittorrentError("qBittorrent request failed")
 
 
 async def _import(
@@ -325,6 +331,40 @@ async def test_importing_unsafe_payload_rolls_back_owned_movie_breadcrumb(
     assert record.download_path is None
     assert not dst.exists(), "owned crash-resume placement must be removed before re-search"
     assert qbt.removed == [(_HASH, True)]
+
+
+async def test_import_blocks_retryably_when_payload_manifest_listing_fails(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _ListFilesFailsQbt(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=video.name,
+                raw_state="stalledUP",
+                progress=1.0,
+                save_path=str(video.parent),
+                content_path=str(video),
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "could not validate torrent payload manifest: QbittorrentError"
+    assert qbt.removed == []
+    assert not (movies_root / "The Matrix (1999)").exists()
 
 
 async def test_import_blocks_when_client_status_missing_before_payload_validation(
@@ -2172,6 +2212,39 @@ async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
                 season=2,
                 media_type="tv",
             )
+
+
+async def test_import_tv_uses_season_breadcrumb_when_client_status_missing(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    _make_video(season_dir / "Some Show - S02E01.mkv")
+    _make_video(season_dir / "Some Show - S02E02.mkv")
+    download_id, request_id, season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert record.download_path == str(season_dir)
+    assert library.scan_calls == [(str(season_dir), "tv")]
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None
+    assert season_row.library_path == str(season_dir)
+    assert season_row.status.value == "completed"
+    assert request is not None and request.status is RequestStatus.completed
 
 
 async def test_import_tv_retry_success_clears_stale_failed_reason(
