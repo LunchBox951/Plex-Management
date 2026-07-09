@@ -356,8 +356,8 @@ _operator_fail_claims: dict[int, _OperatorClaim] = {}
 
 _claim_tokens = count(1)
 
-# Reconcile-side removal window (the removal-physics rule covers BOTH actors):
-# download ids whose AUTOMATIC reconcile-driven Phase-B delete has started and
+# Automatic removal window (the removal-physics rule covers BOTH actors):
+# download ids whose automatic reconcile/import-side delete has started and
 # whose CONSEQUENCE has not yet settled. ``_register_operator_claim`` refuses
 # registration during this window for the same physics reason as the operator
 # flag above — an operator ``remove_torrent=False`` claim registered mid-delete,
@@ -368,6 +368,33 @@ _claim_tokens = count(1)
 # cycle's Phase C exhausted (the residual is then settled-but-unhealed — plain,
 # claimable, reconcilable).
 _reconcile_removals_in_flight: set[int] = set()
+_reconcile_removal_guard_counts: dict[int, int] = {}
+
+
+def _begin_reconcile_removal_guard(download_id: int) -> None:
+    """Refcount the automatic removal guard for ``download_id``.
+
+    ``_reconcile_removals_in_flight`` remains the membership view used by the
+    operator-claim gate, while the count prevents overlapping automatic paths
+    from releasing each other's removal-physics guard.
+    """
+    current = _reconcile_removal_guard_counts.get(download_id, 0)
+    _reconcile_removal_guard_counts[download_id] = current + 1
+    _reconcile_removals_in_flight.add(download_id)
+
+
+def _end_reconcile_removal_guard(download_id: int) -> None:
+    count = _reconcile_removal_guard_counts.get(download_id, 0)
+    if count <= 1:
+        _reconcile_removal_guard_counts.pop(download_id, None)
+        _reconcile_removals_in_flight.discard(download_id)
+        return
+    _reconcile_removal_guard_counts[download_id] = count - 1
+
+
+def _end_reconcile_removal_guards(download_ids: set[int]) -> None:
+    for download_id in download_ids:
+        _end_reconcile_removal_guard(download_id)
 
 
 def _register_operator_claim(
@@ -1415,14 +1442,14 @@ async def reconcile_and_list(
             if not completion.remove_torrent:
                 unclaimed.append(completion)
                 continue
-            # GUARD FIRST (round 10): registering the removal-physics guard is a
-            # SYNCHRONOUS set-add -- no await separates the claim check above from
+            # GUARD FIRST (round 10): registering the removal-physics guard is
+            # SYNCHRONOUS -- no await separates the claim check above from
             # this line, and from this line no operator claim can be created for
             # the row (_register_operator_claim refuses). So there is NO yield
             # point between "operators are barred" and the durable verification
             # below: anything an operator did finished BEFORE the bar and is
             # visible to the re-proof SELECT; anything after the bar is refused.
-            _reconcile_removals_in_flight.add(completion.download_id)
+            _begin_reconcile_removal_guard(completion.download_id)
             settling.add(completion.download_id)
             # DURABLE re-proof immediately before the irreversible delete: the
             # claim check above sees only LIVE claims -- an operator who stamped,
@@ -1454,7 +1481,7 @@ async def reconcile_and_list(
                 # settle: release the bar NOW (not at cycle scope) so operator
                 # commands for a row this cycle no longer touches are not
                 # refused. Rows whose delete DOES run keep the round-8 lifetime.
-                _reconcile_removals_in_flight.discard(completion.download_id)
+                _end_reconcile_removal_guard(completion.download_id)
                 settling.discard(completion.download_id)
                 continue
             # Removal-physics rule, reconcile side: the guard registered above
@@ -1548,7 +1575,7 @@ async def reconcile_and_list(
         # committed, was dropped/deferred in Phase C, or Phase C exhausted
         # (leaving a plain reconcilable residual). Release the physics guard for
         # exactly the ids this cycle added.
-        _reconcile_removals_in_flight.difference_update(settling)
+        _end_reconcile_removal_guards(settling)
 
     # ``populate_existing`` refreshes the returned rows from the DB (issue #77): see
     # the same note in the no-failures early return above.

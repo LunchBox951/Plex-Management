@@ -142,6 +142,7 @@ _MAX_BLOCK_REASONS: Final = 10
 _REARMABLE_REQUEST_STATUS_VALUES: frozenset[str] = (
     frozenset(s.value for s in RequestStatus) - TERMINAL_REQUEST_STATUS_VALUES
 )
+_PLEX_SCAN_FAILED_REASON_PREFIX: Final = "plex scan failed:"
 
 # Bounded Finalizing (issue #158): "Finalizing" ("completed", not yet
 # "available") was previously an UNBOUNDED silent state -- a row whose Plex item
@@ -780,7 +781,7 @@ async def _fail_unsafe_payload(
     season: int | None = None,
     owned_placement: Path | None = None,
 ) -> DownloadRecord | None:
-    queue_service._reconcile_removals_in_flight.add(download_id)  # pyright: ignore[reportPrivateUsage]
+    queue_service._begin_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
     try:
         if queue_service._is_operator_claimed(download_id):  # pyright: ignore[reportPrivateUsage]
             return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
@@ -904,7 +905,7 @@ async def _fail_unsafe_payload(
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
     finally:
-        queue_service._reconcile_removals_in_flight.discard(download_id)  # pyright: ignore[reportPrivateUsage]
+        queue_service._end_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
 
 
 def _owned_movie_breadcrumb_for_unsafe_rollback(
@@ -1140,44 +1141,67 @@ async def _resume_breadcrumbed_movie_import(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
+    if not purge_service.begin_placement(str(dst)):
+        _logger.info(
+            "deferring import of download %s: a purge is deleting this path; "
+            "will retry next import cycle",
+            safe_int(download_id),
+            extra={"request_id": safe_int(request.id)},
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     try:
-        await library.trigger_scan(str(dst.parent), "movie")
-    except (PlexLibraryError, PlexAuthError) as exc:
-        await asyncio.to_thread(_remove_quietly, dst)
-        await _block(
-            session,
-            download_repo,
-            download_id,
-            f"plex scan failed: {type(exc).__name__}",
-            request_id=request.id,
-            clear_download_path=True,
-        )
-        return await download_repo.get_by_hash(torrent_hash)
+        try:
+            await library.trigger_scan(str(dst.parent), "movie")
+        except (PlexLibraryError, PlexAuthError) as exc:
+            await asyncio.to_thread(_remove_quietly, dst)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"plex scan failed: {type(exc).__name__}",
+                request_id=request.id,
+                clear_download_path=True,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
 
-    finalized = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.Imported.value,
-        frozenset({DownloadState.Importing.value}),
-        download_path=str(dst),
-        clear_failed_reason=True,
-    )
-    if not finalized:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash)
-    relative = os.path.relpath(dst, movies_root)
-    session.add(
-        DownloadHistory(
-            tmdb_id=request.tmdb_id,
-            torrent_hash=torrent_hash,
-            event_type=DownloadHistoryEvent.imported,
-            source_title=None,
-            message=f"imported {dst.name} to {relative}",
+        finalized = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.Imported.value,
+            frozenset({DownloadState.Importing.value}),
+            download_path=str(dst),
+            clear_failed_reason=True,
         )
+        if not finalized:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash)
+        relative = os.path.relpath(dst, movies_root)
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.imported,
+                source_title=None,
+                message=f"imported {dst.name} to {relative}",
+            )
+        )
+        await request_repo.set_library_path(request.id, str(dst.parent))
+        await request_repo.mark_completed(request.id)
+        await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    finally:
+        purge_service.end_placement(str(dst))
+
+
+def _can_resume_tv_breadcrumb_without_client_status(
+    download_status: str, failed_reason: str | None
+) -> bool:
+    if download_status == DownloadState.Importing.value:
+        return True
+    return (
+        download_status == DownloadState.ImportBlocked.value
+        and failed_reason is not None
+        and failed_reason.startswith(_PLEX_SCAN_FAILED_REASON_PREFIX)
     )
-    await request_repo.set_library_path(request.id, str(dst.parent))
-    await request_repo.mark_completed(request.id)
-    await session.commit()
-    return await download_repo.get_by_hash(torrent_hash)
 
 
 async def import_download(
@@ -1333,6 +1357,7 @@ async def _import_download_locked(
             episodes=episodes,
             download_status=row.status,
             download_path=row.download_path,
+            failed_reason=row.failed_reason,
             fs=fs,
             library=library,
             qbt=qbt,
@@ -2021,6 +2046,7 @@ async def _import_tv_locked(
     episodes: list[int] | None,
     download_status: str,
     download_path: str | None,
+    failed_reason: str | None,
     fs: FileSystemPort,
     library: LibraryPort,
     qbt: DownloadClientPort,
@@ -2068,7 +2094,21 @@ async def _import_tv_locked(
 
     status = await qbt.get_status(torrent_hash)
     if status is None:
-        if download_path is not None and download_status == DownloadState.Importing.value:
+        if download_path is not None and _can_resume_tv_breadcrumb_without_client_status(
+            download_status, failed_reason
+        ):
+            if download_status == DownloadState.ImportBlocked.value:
+                resumed = await download_repo.update_status_if_in(
+                    download_id,
+                    DownloadState.Importing.value,
+                    frozenset({DownloadState.ImportBlocked.value}),
+                    clear_failed_reason=True,
+                    require_failed_reason=failed_reason,
+                )
+                if not resumed:
+                    await session.rollback()
+                    return await download_repo.get_by_hash(torrent_hash)
+                await session.commit()
             return await _resume_breadcrumbed_tv_import(
                 session=session,
                 download_repo=download_repo,

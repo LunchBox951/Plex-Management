@@ -59,6 +59,7 @@ def clear_operator_claims() -> Iterator[None]:
     yield
     queue_service._operator_fail_claims.clear()  # pyright: ignore[reportPrivateUsage]
     queue_service._reconcile_removals_in_flight.clear()  # pyright: ignore[reportPrivateUsage]
+    queue_service._reconcile_removal_guard_counts.clear()  # pyright: ignore[reportPrivateUsage]
 
 
 async def _seed_request_with_download(
