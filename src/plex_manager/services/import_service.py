@@ -832,9 +832,7 @@ async def _fail_unsafe_payload(
     if request is not None:
         if season is not None:
             season_repo = SqlSeasonRequestRepository(session)
-            row = await season_repo.ensure(
-                request_id, season, status=RequestStatus.pending.value
-            )
+            row = await season_repo.ensure(request_id, season, status=RequestStatus.pending.value)
             await season_request_service.set_status_if_in(
                 session,
                 media_request_id=request_id,
