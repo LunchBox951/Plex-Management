@@ -905,6 +905,7 @@ async def _reject_unsafe_payload_if_reported(
     request_id: int,
     season: int | None = None,
     owned_placement: Path | None = None,
+    block_existing_breadcrumb: bool = False,
 ) -> DownloadRecord | None:
     if status is None:
         return None
@@ -937,6 +938,17 @@ async def _reject_unsafe_payload_if_reported(
 
     if reason is None:
         return None
+
+    if block_existing_breadcrumb:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"{reason}; stored import breadcrumb requires manual cleanup before re-search",
+            request_id=request_id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
 
     return await _fail_unsafe_payload(
         session=session,
@@ -1022,80 +1034,6 @@ async def _resume_breadcrumbed_movie_import(
     )
     await request_repo.set_library_path(request.id, str(dst.parent))
     await request_repo.mark_completed(request.id)
-    await session.commit()
-    return await download_repo.get_by_hash(torrent_hash)
-
-
-async def _resume_breadcrumbed_tv_import(
-    *,
-    session: AsyncSession,
-    download_repo: SqlDownloadRepository,
-    request: RequestRecord,
-    season: int,
-    download_id: int,
-    torrent_hash: str,
-    library: LibraryPort,
-    tv_root: str,
-    download_status: str,
-    download_path: str,
-) -> DownloadRecord | None:
-    season_dir = Path(download_path)
-    root_real = os.path.realpath(tv_root)
-    season_dir_real = os.path.realpath(season_dir)
-    if download_status not in (
-        DownloadState.Importing.value,
-        DownloadState.ImportBlocked.value,
-    ) or not _is_within(root_real, season_dir_real):
-        await _block(
-            session,
-            download_repo,
-            download_id,
-            "stored import breadcrumb is outside the tv library root",
-            request_id=request.id,
-            season=season,
-        )
-        return await download_repo.get_by_hash(torrent_hash)
-    if not await asyncio.to_thread(os.path.isdir, season_dir):
-        await _block(
-            session,
-            download_repo,
-            download_id,
-            "stored import breadcrumb is not visible inside the container",
-            request_id=request.id,
-            season=season,
-            clear_download_path=True,
-        )
-        return await download_repo.get_by_hash(torrent_hash)
-
-    try:
-        await library.trigger_scan(str(season_dir), "tv")
-    except (PlexLibraryError, PlexAuthError) as exc:
-        await _block(
-            session,
-            download_repo,
-            download_id,
-            f"plex scan failed: {type(exc).__name__}",
-            request_id=request.id,
-            season=season,
-        )
-        return await download_repo.get_by_hash(torrent_hash)
-
-    finalized = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.Imported.value,
-        frozenset({DownloadState.Importing.value, DownloadState.ImportBlocked.value}),
-        download_path=str(season_dir),
-        clear_failed_reason=True,
-    )
-    if not finalized:
-        await session.rollback()
-        return await download_repo.get_by_hash(torrent_hash)
-    await season_request_service.set_library_path(
-        session, media_request_id=request.id, season_number=season, library_path=str(season_dir)
-    )
-    await season_request_service.mark_completed(
-        session, media_request_id=request.id, season_number=season
-    )
     await session.commit()
     return await download_repo.get_by_hash(torrent_hash)
 
@@ -1987,23 +1925,12 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
-    if status is None:
-        if download_path is not None and download_status in (
-            DownloadState.Importing.value,
-            DownloadState.ImportBlocked.value,
-        ):
-            return await _resume_breadcrumbed_tv_import(
-                session=session,
-                download_repo=download_repo,
-                request=request,
-                season=season,
-                download_id=download_id,
-                torrent_hash=torrent_hash,
-                library=library,
-                tv_root=tv_root,
-                download_status=download_status,
-                download_path=download_path,
-            )
+    resume_from_breadcrumb = (
+        status is None
+        and download_path is not None
+        and download_status == DownloadState.Importing.value
+    )
+    if status is None and not resume_from_breadcrumb:
         await _block(
             session,
             download_repo,
@@ -2013,7 +1940,7 @@ async def _import_tv_locked(
             season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if _payload_manifest_is_complete(status):
+    if status is not None and _payload_manifest_is_complete(status):
         rejected = await _reject_unsafe_payload_if_reported(
             session=session,
             download_repo=download_repo,
@@ -2023,10 +1950,13 @@ async def _import_tv_locked(
             status=status,
             request_id=request.id,
             season=season,
+            block_existing_breadcrumb=(
+                download_status == DownloadState.Importing.value and download_path is not None
+            ),
         )
         if rejected is not None:
             return rejected
-    if not _is_settled_for_import(status):
+    if status is not None and not _is_settled_for_import(status):
         deferred = await download_repo.update_status_if_in(
             download_id,
             DownloadState.Downloading.value,

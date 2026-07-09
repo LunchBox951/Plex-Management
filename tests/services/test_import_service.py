@@ -2241,10 +2241,78 @@ async def test_import_tv_uses_season_breadcrumb_when_client_status_missing(
     async with sessionmaker_() as session:
         season_row = await session.get(SeasonRequest, season_id)
         request = await session.get(MediaRequest, request_id)
+        history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.torrent_hash == _HASH,
+                        DownloadHistory.event_type == DownloadHistoryEvent.imported,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert season_row is not None
     assert season_row.library_path == str(season_dir)
     assert season_row.status.value == "completed"
     assert request is not None and request.status is RequestStatus.completed
+    assert len(history) == 2
+    assert all(row.message is not None and "Season 02" in row.message for row in history)
+
+
+async def test_importing_tv_unsafe_payload_with_breadcrumb_blocks_for_cleanup(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    _make_video(season_dir / "Some Show - S02E01.mkv")
+    download_id, request_id, season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="Some.Show.S02.1080p.WEB-DL.x264-GRP",
+                raw_state="stoppedUP",
+                progress=1.0,
+            )
+        ],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Show.S02.1080p.WEB-DL.x264-GRP/Some.Show.S02E01.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Show.S02.1080p.WEB-DL.x264-GRP/setup.exe",
+                    size_bytes=1024,
+                ),
+            ]
+        },
+    )
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "unsupported file type .exe" in record.failed_reason
+    assert "manual cleanup before re-search" in record.failed_reason
+    assert qbt.removed == []
+    assert (season_dir / "Some Show - S02E01.mkv").exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status == RequestStatus.import_blocked.value
+    assert request is not None and request.status is RequestStatus.import_blocked
 
 
 async def test_import_tv_retry_success_clears_stale_failed_reason(
