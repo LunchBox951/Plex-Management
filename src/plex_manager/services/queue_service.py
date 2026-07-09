@@ -222,6 +222,10 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
+from plex_manager.domain.download_payload import (
+    format_payload_rejection,
+    validate_payload_files,
+)
 from plex_manager.domain.events import DownloadFailed
 from plex_manager.domain.reconciler import (
     StallDetection,
@@ -232,6 +236,7 @@ from plex_manager.domain.reconciler import (
     unmapped_client_states,
 )
 from plex_manager.domain.state_machine import (
+    ACTIVE_STATES,
     TERMINAL_STATES,
     DownloadState,
     is_legal_transition,
@@ -257,7 +262,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from plex_manager.ports.download_client import DownloadClientPort
+    from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
     from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 
 __all__ = [
@@ -274,6 +279,8 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATES)
+_PAYLOAD_VALIDATION_STATUS_VALUES = frozenset(s.value for s in ACTIVE_STATES)
+_COMPLETE_PROGRESS = 1.0
 
 # Request statuses from which a failed download's owning request/season may still
 # be re-armed to ``searching`` — every NON-terminal status. This is the CAS
@@ -1061,6 +1068,48 @@ async def _self_heal_stalled_download(
     await session.commit()
 
 
+def _payload_failure_transition(row: DownloadRecord, reason: str) -> StateTransition:
+    return StateTransition(
+        download_id=row.id,
+        torrent_hash=row.torrent_hash,
+        from_state=row.status,
+        to_state=DownloadState.FailedPending,
+        reason=reason,
+    )
+
+
+async def _payload_safety_transitions(
+    qbt: DownloadClientPort,
+    rows: list[DownloadRecord],
+    snapshot: dict[str, DownloadStatus],
+) -> list[StateTransition]:
+    """Fail torrents whose manifest contains anything except video/subtitle files."""
+    transitions: list[StateTransition] = []
+    for row in rows:
+        if row.status not in _PAYLOAD_VALIDATION_STATUS_VALUES:
+            continue
+        live = snapshot.get(row.torrent_hash.lower())
+        if live is None or live.progress <= 0:
+            continue
+
+        files = await qbt.list_files(row.torrent_hash)
+        if not files:
+            if live.progress >= _COMPLETE_PROGRESS:
+                transitions.append(
+                    _payload_failure_transition(
+                        row, "torrent payload rejected: no files reported after completion"
+                    )
+                )
+            continue
+
+        validation = validate_payload_files(files)
+        if not validation.accepted:
+            reason = format_payload_rejection(validation)
+            transitions.append(_payload_failure_transition(row, reason))
+
+    return transitions
+
+
 async def list_queue(session: AsyncSession) -> list[QueueRecord]:
     """Read-only snapshot of the active queue — NO reconcile, NO writes.
 
@@ -1092,8 +1141,9 @@ async def reconcile_and_list(
     statuses = await qbt.get_all_statuses()
     now = _utcnow()
 
-    transitions = reconcile(rows, statuses, now=now)
     snapshot = {status.info_hash.lower(): status for status in statuses}
+    transitions = reconcile(rows, statuses, now=now)
+    payload_transitions = await _payload_safety_transitions(qbt, rows, snapshot)
 
     # Honesty over silence: surface every unmapped raw client state on EVERY
     # cycle, even when it maps to the row's current state and so emits no
@@ -1113,6 +1163,9 @@ async def reconcile_and_list(
     # 10%->50%->90% while staying "Downloading" would otherwise show stale progress
     # in the queue forever (honesty over silence).
     transitions_by_id = {transition.download_id: transition for transition in transitions}
+    transitions_by_id.update(
+        {transition.download_id: transition for transition in payload_transitions}
+    )
     applied_transitions: list[StateTransition] = []
     for row in rows:
         # Pre-stamp invisibility fast-path, Phase A: a claimed row is INVISIBLE — apply no

@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.reconciler import StallDetection
 from plex_manager.models import (
     Blocklist,
@@ -23,7 +24,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -209,6 +210,193 @@ async def test_live_progress_persisted_without_state_change(
         ).scalar_one()
     assert persisted.progress == 0.5
     assert persisted.seed_ratio == 1.2
+
+
+async def test_unsafe_payload_manifest_fails_blocklists_researches_and_removes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.01,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[live],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/movie.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/setup.exe",
+                    size_bytes=1024,
+                ),
+            ]
+        },
+    )
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    assert all(item.torrent_hash != _HASH for item in queue)
+    assert qbt.removed == [(_HASH, True)]
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+    assert request is not None
+    assert request.status is RequestStatus.searching
+    assert download.status == "failed"
+    assert download.failed_reason is not None
+    assert "unsupported file type .exe" in download.failed_reason
+
+
+async def test_safe_payload_manifest_still_advances_completed_download(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="stoppedUP",
+        progress=1.0,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[live],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/movie.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/Subs/English.srt",
+                    size_bytes=40_000,
+                ),
+            ]
+        },
+    )
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(i for i in queue if i.torrent_hash == _HASH)
+    assert item.status == "import_pending"
+    assert qbt.removed == []
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert blocklist == []
+
+
+class _ListFilesMustNotRunQbt(FakeQbittorrent):
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        raise AssertionError("payload validation should wait for positive progress")
+
+
+async def test_payload_manifest_check_waits_for_positive_progress(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.0,
+    )
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(_ListFilesMustNotRunQbt([live]), session)
+
+    item = next(i for i in queue if i.torrent_hash == _HASH)
+    assert item.status == "downloading"
+
+
+async def test_empty_manifest_before_completion_retries_later(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.2,
+    )
+    qbt = FakeQbittorrent(statuses=[live], files={_HASH: []})
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(i for i in queue if i.torrent_hash == _HASH)
+    assert item.status == "downloading"
+    assert item.progress == 0.2
+    assert qbt.removed == []
+
+
+async def test_empty_manifest_at_completion_fails_instead_of_importing_blind(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="stoppedUP",
+        progress=1.0,
+    )
+    qbt = FakeQbittorrent(statuses=[live], files={_HASH: []})
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    assert all(item.torrent_hash != _HASH for item in queue)
+    assert qbt.removed == [(_HASH, True)]
+
+    async with sessionmaker_() as session:
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert download.status == "failed"
+    assert download.failed_reason == "torrent payload rejected: no files reported after completion"
+
+
+class _ListFilesOutageQbt(FakeQbittorrent):
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        raise QbittorrentError("qBittorrent request failed")
+
+
+async def test_list_files_outage_does_not_blocklist_release(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.3,
+    )
+    qbt = _ListFilesOutageQbt(statuses=[live])
+
+    async with sessionmaker_() as session:
+        with pytest.raises(QbittorrentError):
+            await queue_service.reconcile_and_list(qbt, session)
+
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert blocklist == []
+    assert download.status == "downloading"
 
 
 async def test_mark_failed_routes_downloading_through_failed_pending(
