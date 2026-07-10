@@ -95,9 +95,20 @@ export function plexClientId(): string {
  * centered spinner — so the operator sees "Opening plex.tv…" rather than a blank
  * frame during the (typically sub-second) gap before {@link runPlexPinFlow}
  * navigates it to plex.tv's hosted login.
+ *
+ * `window.open` leaves the popup's `opener` pointed back at this window, and
+ * {@link runPlexPinFlow} later navigates that popup to plex.tv — an external
+ * origin. A page there could otherwise reach back through `window.opener` and
+ * repoint this tab (reverse tabnabbing, GHSA-xw83-hqxh-77r9), so the reference
+ * is severed immediately after opening. We can't pass the `noopener` feature to
+ * `window.open` instead: with `noopener`, browsers return `null` unconditionally
+ * — including on success — which would break the flow, since the caller needs
+ * the live `Window` handle to navigate and later close the popup.
  */
 export function openPlexPopup(): Window | null {
-  return window.open('/login/plex/loading', 'plex-auth', 'width=600,height=700')
+  const popup = window.open('/login/plex/loading', 'plex-auth', 'width=600,height=700')
+  if (popup) popup.opener = null
+  return popup
 }
 
 interface PlexPinResponse {
