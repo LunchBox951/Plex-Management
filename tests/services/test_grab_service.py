@@ -15,6 +15,7 @@ from plex_manager.models import (
     Blocklist,
     Download,
     DownloadHistory,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -24,7 +25,6 @@ from plex_manager.ports.download_client import AddResult
 from plex_manager.services import grab_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
-    DownloadScopeConflictError,
     GrabError,
     RequestNotActiveError,
     SeasonRequiredError,
@@ -209,6 +209,57 @@ async def test_grab_reuse_clears_stale_first_seen_at_grace_anchor(
         ).scalar_one()
     assert row.status == "downloading"
     assert row.first_seen_at is None  # stale grace anchor cleared on re-grab
+
+
+async def test_grab_reuse_resets_stale_added_at_stall_anchor(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A terminal row reused for a fresh grab must not keep the ORIGINAL grab's
+    ``added_at`` (issue #165 hardening finding): ``detect_stalls`` anchors its
+    metadata/stalled-progress windows on ``added_at``, so a stale value already
+    past the stall thresholds would let the very next reconcile tick immediately
+    misjudge the brand-new re-grab as stalled -- self-healing (mark-failed +
+    remove + blocklist) a download that never had a chance to run."""
+    stale_added_at = datetime(2020, 1, 1, tzinfo=UTC)
+    async with sessionmaker_() as session:
+        req = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.searching
+        )
+        session.add(req)
+        await session.flush()
+        req_id = req.id
+        session.add(
+            Download(
+                torrent_hash=_HASH,
+                status="failed",
+                media_request_id=req_id,
+                tmdb_id=100,
+                failed_reason="prior failure",
+                added_at=stale_added_at,
+            )
+        )
+        await session.commit()
+
+    before_regrab = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(_HASH),
+            request_id=req_id,
+            tmdb_id=100,
+        )
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert row.status == "downloading"
+    assert row.added_at is not None
+    # SQLite returns a naive datetime even for a DateTime(timezone=True) column;
+    # the app always stores UTC (see repositories/downloads.py's ``_as_utc``), so
+    # comparing naive-vs-naive here is correct.
+    assert row.added_at >= before_regrab.replace(tzinfo=None)
 
 
 async def test_grab_rejects_terminal_request_and_adds_nothing(
@@ -529,13 +580,52 @@ async def test_grab_rejects_a_second_release_for_the_same_season(
             )
 
 
-async def test_grab_rejects_same_hash_active_for_a_different_season(
+async def test_grab_rejects_pack_when_target_sibling_has_different_active_release(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A multi-season pack claims every planned target season. If any sibling season
+    already has a different active torrent, the pack is rejected before qBittorrent is
+    asked to add it."""
+    request_id = await _make_tv_request(sessionmaker_)
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv("5" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+
+    pack = _scored_tv("6" * 40, "Some.Show.S01-S02.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"target_seasons": (1, 2)}
+    )
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=pack,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].torrent_hash == "5" * 40
+
+
+async def test_grab_attaches_same_hash_active_for_a_different_season(
     sessionmaker_: SessionMaker,
 ) -> None:
     """A multi-season pack (one hash) already downloading for season 1, grabbed again
-    for season 2, must NOT be returned as an idempotent no-op: the hash is UNIQUE per
-    Download row, so season 2 would never be tracked. Reject with
-    DownloadScopeConflictError instead of silently stranding season 2."""
+    for season 2, attaches season 2 as another logical scope on the same physical
+    Download row instead of silently treating it as an idempotent no-op."""
     request_id = await _make_tv_request(sessionmaker_)
     pack_hash = "7" * 40
 
@@ -551,34 +641,140 @@ async def test_grab_rejects_same_hash_active_for_a_different_season(
     assert first.season == 1
 
     async with sessionmaker_() as session:
-        with pytest.raises(DownloadScopeConflictError):
-            await grab_service.grab(
-                FakeQbittorrent(),
-                session,
-                scored=_scored_tv(pack_hash, "Some.Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"),
-                request_id=request_id,
-                tmdb_id=900,
-                season=2,
-            )
+        second = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(pack_hash, "Some.Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+    assert second.id == first.id
 
-    # Season 1's row is untouched and remains the only download for this hash.
+    # One physical row now carries both TV scopes.
     async with sessionmaker_() as session:
         rows = (
             (await session.execute(select(Download).where(Download.torrent_hash == pack_hash)))
             .scalars()
             .all()
         )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == rows[0].id)
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert len(rows) == 1
     assert rows[0].season == 1
+    assert sorted(scope.season_number for scope in scopes if scope.season_number is not None) == [
+        1,
+        2,
+    ]
 
 
-async def test_grab_rejects_same_hash_active_for_uncovered_episodes(
+async def test_grab_fresh_multi_season_pack_returns_all_attached_scopes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A fresh accepted multi-season pack attaches every planned season in the same
+    transaction and returns the refreshed record with those scopes populated."""
+    request_id = await _make_tv_request(sessionmaker_)
+    pack_hash = "a" * 40
+    scored = _scored_tv(pack_hash, "Some.Show.S01-S02.COMPLETE.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"target_seasons": (1, 2)}
+    )
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=scored,
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+
+    assert record.status == "downloading"
+    assert [scope.season for scope in record.scopes] == [1, 2]
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert {season.season_number: season.status for season in seasons} == {
+        1: "downloading",
+        2: "downloading",
+    }
+    assert sorted(scope.season_number for scope in scopes if scope.season_number is not None) == [
+        1,
+        2,
+    ]
+
+
+async def test_grab_fresh_multi_season_pack_preserves_sibling_explicit_episode_scopes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A multi-season pack accepted for an episode-scoped request must attach each
+    sibling season with that season's requested episodes, not widen siblings to
+    whole-season scopes."""
+    request_id = await _make_tv_request(sessionmaker_)
+    pack_hash = "b" * 40
+    scored = _scored_tv(pack_hash, "Some.Show.S01-S02.COMPLETE.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"target_seasons": (1, 2)}
+    )
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=scored,
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+            episodes=[5],
+            scope_episodes_by_season={1: [5], 2: [6]},
+        )
+
+    async with sessionmaker_() as session:
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope)
+                    .where(DownloadScope.download_id == record.id)
+                    .order_by(DownloadScope.season_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert [(scope.season_number, scope.episodes_json) for scope in scopes] == [(1, [5]), (2, [6])]
+
+
+async def test_grab_attaches_same_hash_active_for_uncovered_episodes(
     sessionmaker_: SessionMaker,
 ) -> None:
     """Same-hash reuse compares the full scope, not just the season: an active row
-    scoped to S02 episode [4], re-grabbed for the SAME hash + season but an UNCOVERED
-    episode [5], must conflict (not a no-op that leaves E05 untracked). A COVERED
-    request (the same [4], or a subset) stays an idempotent no-op."""
+    scoped to S02 episode [4], re-grabbed for the SAME hash + season but an
+    uncovered episode [5], attaches an additional logical scope. A covered request
+    (the same [4], or a subset) stays an idempotent no-op."""
     request_id = await _make_tv_request(sessionmaker_)
     h = "8" * 40
     async with sessionmaker_() as session:
@@ -594,16 +790,16 @@ async def test_grab_rejects_same_hash_active_for_uncovered_episodes(
     assert first.episodes == [4]
 
     async with sessionmaker_() as session:
-        with pytest.raises(DownloadScopeConflictError):
-            await grab_service.grab(
-                FakeQbittorrent(),
-                session,
-                scored=_scored_tv(h, "Some.Show.S02E05.1080p.WEB-DL.x264-GROUP"),
-                request_id=request_id,
-                tmdb_id=900,
-                season=2,
-                episodes=[5],
-            )
+        second = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(h, "Some.Show.S02E05.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            episodes=[5],
+        )
+    assert second.id == first.id
 
     # The already-requested episode [4] is COVERED -> idempotent no-op, same row.
     async with sessionmaker_() as session:
@@ -616,7 +812,20 @@ async def test_grab_rejects_same_hash_active_for_uncovered_episodes(
             season=2,
             episodes=[4],
         )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == first.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert again.id == first.id
+    assert sorted(scope.episodes_json for scope in scopes if scope.episodes_json is not None) == [
+        [4],
+        [5],
+    ]
 
 
 async def test_grab_tv_request_missing_season_raises_season_required(
@@ -1167,17 +1376,14 @@ async def test_grab_terminal_reuse_cas_lost_rejects_new_owner(
         assert (await session.execute(select(DownloadHistory))).scalars().all() == []
 
 
-async def test_grab_terminal_reuse_cas_lost_to_same_request_conflicting_scope_raises(
+async def test_grab_terminal_reuse_cas_lost_to_same_request_attaches_scope(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reuse-race loser within ONE request: two grabs (e.g. two seasons of the same
     multi-season pack) race to resurrect the same terminal row. The loser sees the
-    row now active under the SAME ``media_request_id`` — but carrying the WINNER's
-    scope (season 1). Returning it would report the season-2 grab as success while
-    season 2 stays silently untracked (the importer only ever processes the active
-    row's stored scope). The loser must hit the same ``_reuse_conflicts`` guard the
-    non-race active paths apply and raise ``DownloadScopeConflictError``."""
+    row now active under the SAME ``media_request_id`` and attaches its season 2
+    scope to that physical row instead of raising a same-request conflict."""
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=900, media_type=MediaType.tv, title="Some Show", status=RequestStatus.pending
@@ -1223,15 +1429,15 @@ async def test_grab_terminal_reuse_cas_lost_to_same_request_conflicting_scope_ra
     monkeypatch.setattr(grab_service.SqlDownloadRepository, "update_status_if_in", racing_update)
 
     async with sessionmaker_() as session:
-        with pytest.raises(DownloadScopeConflictError):
-            await grab_service.grab(
-                FakeQbittorrent(),
-                session,
-                scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
-                request_id=request_id,
-                tmdb_id=900,
-                season=2,
-            )
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+    assert record.torrent_hash == _HASH
 
     async with sessionmaker_() as session:
         row = (
@@ -1246,10 +1452,21 @@ async def test_grab_terminal_reuse_cas_lost_to_same_request_conflicting_scope_ra
             .scalars()
             .all()
         )
-    # The winner's claim is intact; the losing season was never falsely marked.
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == row.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # The winner's scalar claim is intact, and the losing season is now tracked as
+    # an attached scope.
     assert row.status == "downloading"
     assert row.season == 1
-    assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "pending"}
+    assert sorted(scope.season_number for scope in scopes if scope.season_number is not None) == [2]
+    assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "downloading"}
 
 
 # --------------------------------------------------------------------------- #
@@ -1485,16 +1702,22 @@ class _FoldSeasonDuringAddQbt(FakeQbittorrent):
     (``pending`` -> ``available``) of the season row in a separate session
     before returning -- the fold-vs-grab race, made deterministic."""
 
-    def __init__(self, sm: SessionMaker, season_request_id: int) -> None:
+    def __init__(
+        self,
+        sm: SessionMaker,
+        season_request_id: int,
+        status: RequestStatus = RequestStatus.available,
+    ) -> None:
         super().__init__()
         self._sm = sm
         self._season_request_id = season_request_id
+        self._status = status
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         async with self._sm() as session:
             row = await session.get(SeasonRequest, self._season_request_id)
             assert row is not None
-            row.status = RequestStatus.available  # the recovery fold: file never left
+            row.status = self._status
             await session.commit()
         return await super().add(magnet_or_url, save_path, category)
 
@@ -1558,6 +1781,73 @@ async def test_grab_loses_to_a_recovery_fold_that_landed_while_qbt_add_was_in_fl
         assert season_row.status is RequestStatus.available  # the fold STANDS
         assert downloads == []  # no duplicate download for on-disk content
         assert history == []  # no 'grabbed' record for a refused grab
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("settled_status", [RequestStatus.available, RequestStatus.completed])
+async def test_pack_grab_does_not_reopen_a_sibling_settled_during_add(
+    tmp_path: Any,
+    settled_status: RequestStatus,
+) -> None:
+    """A pack owns only siblings that remain searchable through its post-add CAS.
+
+    The planner selected S1+S2 while both were pending, but S2 settled while the
+    physical torrent was being added. The pack must lose atomically instead of
+    moving S2 back to downloading and re-downloading content already on disk.
+    """
+    sm, engine = await _file_backed_sessionmaker(
+        tmp_path, f"pack_sibling_{settled_status.value}_mid_grab.db"
+    )
+    try:
+        request_id = await _make_tv_request(sm, tmdb_id=712)
+        async with sm() as session:
+            season_2_id = await session.scalar(
+                select(SeasonRequest.id).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        assert season_2_id is not None
+
+        pack = _scored_tv(_HASH, "Some.Show.S01-S02.COMPLETE.1080p.WEB-DL.x264-GROUP").model_copy(
+            update={"target_seasons": (1, 2)}
+        )
+        qbt = _FoldSeasonDuringAddQbt(sm, season_2_id, settled_status)
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=pack,
+                    request_id=request_id,
+                    tmdb_id=712,
+                    season=1,
+                )
+
+        assert qbt.removed == [(_HASH, True)]
+        async with sm() as session:
+            seasons = (
+                (
+                    await session.execute(
+                        select(SeasonRequest)
+                        .where(SeasonRequest.media_request_id == request_id)
+                        .order_by(SeasonRequest.season_number)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            downloads = (await session.execute(select(Download))).scalars().all()
+            scopes = (await session.execute(select(DownloadScope))).scalars().all()
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert [(row.season_number, row.status) for row in seasons] == [
+            (1, RequestStatus.pending),
+            (2, settled_status),
+        ]
+        assert downloads == []
+        assert scopes == []
+        assert history == []
     finally:
         await engine.dispose()
 
@@ -1910,13 +2200,12 @@ async def test_grab_hashless_different_release_still_rejected(
 
 # --------------------------------------------------------------------------- #
 # Issue #102: ``episodes=[]`` and ``episodes=None`` both mean "whole season" --
-# the ``_reuse_conflicts`` guard (exercised here through the public ``grab()``
-# API, matching this module's convention of testing private helpers via their
-# only callers rather than importing them directly) must treat the two
-# identically in BOTH directions, whether the empty list originates from the
-# ACTIVE row or the REQUESTED scope (e.g. a row persisted by a caller that
-# bypasses the pydantic schema layer's ``[]`` -> ``None`` normalization -- as
-# calling ``grab_service.grab`` directly, below, does).
+# the same-hash scope attachment path (exercised here through the public
+# ``grab()`` API) must treat the two identically in BOTH directions, whether the
+# empty list originates from the ACTIVE row or the REQUESTED scope (e.g. a row
+# persisted by a caller that bypasses the pydantic schema layer's ``[]`` ->
+# ``None`` normalization -- as calling ``grab_service.grab`` directly, below,
+# does).
 # --------------------------------------------------------------------------- #
 
 
@@ -1925,8 +2214,8 @@ async def test_reuse_same_hash_active_episodes_empty_vs_requested_none_non_confl
 ) -> None:
     """Direction 1: the ACTIVE row persisted ``episodes=[]`` (a caller that
     bypassed the schema-layer normalization) and the SAME-hash re-grab requests
-    whole-season (``episodes=None``) -- must be an idempotent no-op, not a
-    ``DownloadScopeConflictError``."""
+    whole-season (``episodes=None``) -- must be an idempotent no-op, not a scope
+    conflict."""
     request_id = await _make_tv_request(sessionmaker_)
     h = "9" * 40
     async with sessionmaker_() as session:

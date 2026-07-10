@@ -62,10 +62,12 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.prowlarr.adapter import IndexerError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError, QbittorrentSourceError
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
@@ -73,6 +75,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -151,6 +154,7 @@ CANCELLABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.pending.value,
         RequestStatus.searching.value,
         RequestStatus.no_acceptable_release.value,
+        RequestStatus.waiting_for_air_date.value,
         RequestStatus.downloading.value,
     }
 )
@@ -171,6 +175,7 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.completed.value,
     }
 )
+_UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import_blocked"})
 
 # The PER-RELEASE grab failures the inline re-grab falls through on (mirroring
 # ``auto_grab_service``'s per-release set): the ATTEMPTED release is unusable --
@@ -178,12 +183,11 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 # is raised BEFORE anything reaches the client; it subclasses ``QbittorrentError``
 # so it MUST be caught before ``_DOWNLOAD_CLIENT_ERRORS`` or a bad source would be
 # mistreated as a client outage and the scope silently left at ``searching``), or
-# its hash is already active under a different scope/request -- while a LOWER-
-# ranked accepted replacement may still be grabbable. The re-grab tries the next
-# candidate (bounded) and only parks when the list/cap exhausts.
+# its hash is already active under a different request -- while a LOWER-ranked
+# accepted replacement may still be grabbable. The re-grab tries the next candidate
+# (bounded) and only parks when the list/cap exhausts.
 _PER_RELEASE_GRAB_ERRORS: Final = (
     grab_service.NoGrabSourceError,
-    grab_service.DownloadScopeConflictError,
     grab_service.TorrentAlreadyTrackedError,
     QbittorrentSourceError,
 )
@@ -238,6 +242,51 @@ _INDEXER_ERRORS: Final = (IndexerError,)
 # subclasses ``QbittorrentError`` but is a source veto, not an outage), and
 # ``QbittorrentAuthError`` is a subclass of ``QbittorrentError`` and so is covered.
 _DOWNLOAD_CLIENT_ERRORS: Final = (QbittorrentError,)
+
+
+async def _multi_season_intent_for_request(
+    session: AsyncSession,
+    request: RequestRecord,
+) -> MultiSeasonRequestIntent | None:
+    if request.media_type != "tv" or request.tv_request_mode not in {
+        "whole_show",
+        "explicit_seasons",
+        "explicit_episodes",
+    }:
+        return None
+    season_rows = await SqlSeasonRequestRepository(session).list_for_request(request.id)
+    requested = (
+        request.requested_seasons
+        or tuple(sorted(request.requested_episodes or {}))
+        or tuple(row.season_number for row in season_rows)
+    )
+    return MultiSeasonRequestIntent(
+        mode="whole_show" if request.tv_request_mode == "whole_show" else "explicit_seasons",
+        requested_seasons=tuple(requested),
+        seasons=tuple(
+            SeasonPackSeasonState(
+                season_number=row.season_number,
+                status=row.status,
+                installed_quality_id=row.installed_quality_id,
+                installed_profile_index=row.installed_profile_index,
+            )
+            for row in season_rows
+        ),
+    )
+
+
+async def _mark_download_scopes_terminal(
+    session: AsyncSession, download_id: int, status: str
+) -> None:
+    await session.execute(
+        update(DownloadScope)
+        .where(
+            DownloadScope.download_id == download_id,
+            DownloadScope.status.in_(_UNRESOLVED_SCOPE_STATUSES),
+        )
+        .values(status=status)
+    )
+
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal
 # state EXCEPT ``importing``. An ``importing`` row is mid-copy/scan: failing it would
@@ -811,6 +860,12 @@ async def report_issue(
     # season dir, never a single episode), so re-fetching only the culprit's episode
     # subset would leave the season with the OTHER (also-deleted) episodes missing while
     # marking it done. A season-directory purge must drive a season-level re-search.
+    multi_season_intent = await _multi_season_intent_for_request(session, request)
+    scope_episodes_by_season = (
+        {season: list(values) for season, values in request.requested_episodes.items()}
+        if request.requested_episodes
+        else None
+    )
     try:
         result = await decision_service.preview(
             prowlarr,
@@ -823,6 +878,7 @@ async def report_issue(
             year=request.year,
             season=target.season,
             episodes=None,
+            multi_season_intent=multi_season_intent,
         )
     except _INDEXER_ERRORS as exc:
         # The re-search could not reach the indexer AFTER the blocklist/purge/reset
@@ -868,6 +924,7 @@ async def report_issue(
                             year=request.year,
                             season=target.season,
                             episodes=None,
+                            scope_episodes_by_season=scope_episodes_by_season,
                             save_path=save_path,
                         )
                         park_scope = False
@@ -990,13 +1047,13 @@ async def cancel_request(
     status (kept only for history; nothing re-grabbed). Returns the updated record.
 
     ``qbt`` may be ``None``: a cancel for a ``pending``/``searching``/
-    ``no_acceptable_release`` request with NO active download rows is a PURE DB settle
-    that never touches the client, so it must still work on an install with qBittorrent
-    unconfigured (the endpoint resolves it via ``get_qbittorrent_optional``). Active
-    rows ARE discovered first; only if there are torrents to remove but ``qbt is None``
-    is :class:`DownloadClientRequiredError` raised -- BEFORE any state change (the
-    endpoint maps it to an honest 409 ``service_not_configured``), never a silent skip
-    that would leak a seeding torrent.
+    ``no_acceptable_release``/``waiting_for_air_date`` request with NO active download
+    rows is a PURE DB settle that never touches the client, so it must still work on an
+    install with qBittorrent unconfigured (the endpoint resolves it via
+    ``get_qbittorrent_optional``). Active rows ARE discovered first; only if there are
+    torrents to remove but ``qbt is None`` is :class:`DownloadClientRequiredError`
+    raised -- BEFORE any state change (the endpoint maps it to an honest 409
+    ``service_not_configured``), never a silent skip that would leak a seeding torrent.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -1072,6 +1129,7 @@ async def cancel_request(
             # rather than half-cancelling around a finalizing import.
             await session.rollback()
             raise ImportInProgressError(request_id)
+        await _mark_download_scopes_terminal(session, row.id, RequestStatus.cancelled.value)
         hashes_to_remove.append(row.torrent_hash)
 
     if request.media_type == "tv":

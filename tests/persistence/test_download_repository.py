@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import Download, DownloadScope, MediaRequest, MediaType, RequestStatus
 from plex_manager.repositories import SqlDownloadRepository
 
 
@@ -102,6 +102,399 @@ async def test_find_active_for_request_scopes_by_season(session: AsyncSession) -
     # A season with no active download of its own finds nothing, even though the
     # request has active downloads for OTHER seasons.
     assert await repo.find_active_for_request(mr.id, season=3) is None
+
+
+async def test_active_download_scope_unique_index_blocks_duplicate_exact_scope(
+    session: AsyncSession,
+) -> None:
+    """The logical scope table has its own DB backstop: even if two physical
+    downloads carry different scalar seasons, they cannot both claim the same active
+    TV scope for one request."""
+    mr = MediaRequest(
+        tmdb_id=40, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    first = await repo.create(
+        torrent_hash="scope_s1",
+        status="downloading",
+        media_request_id=mr.id,
+        season=1,
+        episodes=[4, 5],
+    )
+    second = await repo.create(
+        torrent_hash="scope_s2",
+        status="downloading",
+        media_request_id=mr.id,
+        season=2,
+    )
+
+    assert first.scopes[0].episodes == [4, 5]
+    with pytest.raises(IntegrityError):
+        await repo.ensure_scope(second.id, media_request_id=mr.id, season=1, episodes=[5, 4])
+
+
+async def test_active_download_scope_unique_index_allows_terminal_prior_scope(
+    session: AsyncSession,
+) -> None:
+    """A completed/imported scope is historical and must not block a fresh active
+    scope with the same target."""
+    mr = MediaRequest(
+        tmdb_id=41, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    imported = Download(
+        torrent_hash="scope_imported",
+        status="imported",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(imported)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=imported.id,
+            media_request_id=mr.id,
+            season_number=1,
+            episodes_json=None,
+            scope_key="season:1|episodes:*",
+            status="imported",
+        )
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    active = await repo.create(
+        torrent_hash="scope_active",
+        status="downloading",
+        media_request_id=mr.id,
+        season=1,
+    )
+    assert active.scopes[0].status == "active"
+
+
+async def test_active_download_scope_unique_index_blocks_duplicate_import_blocked_scope(
+    session: AsyncSession,
+) -> None:
+    """An unresolved import-blocked scope is still active for dedup purposes."""
+    mr = MediaRequest(
+        tmdb_id=42, media_type=MediaType.tv, title="Show", status=RequestStatus.import_blocked
+    )
+    session.add(mr)
+    await session.flush()
+    blocked = Download(
+        torrent_hash="scope_blocked",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    active = Download(
+        torrent_hash="scope_active_again",
+        status="downloading",
+        media_request_id=mr.id,
+        season=2,
+        media_type=MediaType.tv,
+    )
+    session.add_all([blocked, active])
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=blocked.id,
+            media_request_id=mr.id,
+            season_number=2,
+            episodes_json=None,
+            scope_key="season:2|episodes:*",
+            status="import_blocked",
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(IntegrityError):
+        session.add(
+            DownloadScope(
+                download_id=active.id,
+                media_request_id=mr.id,
+                season_number=2,
+                episodes_json=None,
+                scope_key="season:2|episodes:*",
+                status="active",
+            )
+        )
+        await session.flush()
+
+
+async def test_find_active_for_request_includes_import_blocked_scope(
+    session: AsyncSession,
+) -> None:
+    mr = MediaRequest(
+        tmdb_id=43, media_type=MediaType.tv, title="Show", status=RequestStatus.import_blocked
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_blocked",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=download.id,
+            media_request_id=mr.id,
+            season_number=2,
+            episodes_json=None,
+            scope_key="season:2|episodes:*",
+            status="import_blocked",
+        )
+    )
+    await session.flush()
+
+    active = await SqlDownloadRepository(session).find_active_for_request(mr.id, season=2)
+
+    assert active is not None
+    assert active.torrent_hash == "shared_blocked"
+
+
+async def test_find_latest_imported_for_request_matches_imported_scope_on_blocked_download(
+    session: AsyncSession,
+) -> None:
+    mr = MediaRequest(
+        tmdb_id=44, media_type=MediaType.tv, title="Show", status=RequestStatus.import_blocked
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_partial_import",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=download.id,
+            media_request_id=mr.id,
+            season_number=2,
+            episodes_json=None,
+            scope_key="season:2|episodes:*",
+            status="imported",
+        )
+    )
+    await session.flush()
+
+    imported = await SqlDownloadRepository(session).find_latest_imported_for_request(
+        mr.id, season=2
+    )
+
+    assert imported is not None
+    assert imported.torrent_hash == "shared_partial_import"
+
+
+async def test_terminal_reuse_preserves_imported_scope_history(
+    session: AsyncSession,
+) -> None:
+    mr = MediaRequest(
+        tmdb_id=45, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_reuse",
+        status="imported",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=download.id,
+            media_request_id=mr.id,
+            season_number=1,
+            episodes_json=None,
+            scope_key="season:1|episodes:*",
+            status="imported",
+            completed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+
+    claimed = await repo.update_status_if_in(
+        download.id,
+        "downloading",
+        frozenset({"imported"}),
+        media_request_id=mr.id,
+        replace_grab_metadata=True,
+        season=2,
+        media_type="tv",
+    )
+
+    assert claimed is True
+    fetched = await repo.get_by_hash("shared_reuse")
+    assert fetched is not None
+    assert fetched.season == 2
+    assert [(scope.season, scope.status) for scope in fetched.scopes] == [
+        (1, "imported"),
+        (2, "active"),
+    ]
+    imported = await repo.find_latest_imported_for_request(mr.id, season=1)
+    assert imported is not None
+    assert imported.torrent_hash == "shared_reuse"
+
+
+async def test_find_active_for_request_ignores_imported_matching_scope_on_blocked_row(
+    session: AsyncSession,
+) -> None:
+    mr = MediaRequest(
+        tmdb_id=46, media_type=MediaType.tv, title="Show", status=RequestStatus.import_blocked
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_partial_blocked",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add_all(
+        [
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=mr.id,
+                season_number=1,
+                episodes_json=None,
+                scope_key="season:1|episodes:*",
+                status="imported",
+            ),
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=mr.id,
+                season_number=2,
+                episodes_json=None,
+                scope_key="season:2|episodes:*",
+                status="import_blocked",
+            ),
+        ]
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+
+    assert await repo.find_active_for_request(mr.id, season=1) is None
+    active = await repo.find_active_for_request(mr.id, season=2)
+    assert active is not None
+    assert active.torrent_hash == "shared_partial_blocked"
+
+
+async def test_ensure_scope_reactivates_matching_terminal_scope(
+    session: AsyncSession,
+) -> None:
+    mr = MediaRequest(
+        tmdb_id=47, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_reactivate",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=download.id,
+            media_request_id=mr.id,
+            season_number=1,
+            episodes_json=None,
+            scope_key="season:1|episodes:*",
+            status="imported",
+            completed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    scope = await repo.ensure_scope(download.id, media_request_id=mr.id, season=1)
+
+    assert scope.status == "active"
+    assert scope.completed_at is None
+    active = await repo.find_active_for_request(mr.id, season=1)
+    assert active is not None
+    assert active.torrent_hash == "shared_reactivate"
+
+
+async def test_align_scalar_scope_keeps_same_season_unresolved_episode_claim(
+    session: AsyncSession,
+) -> None:
+    """Settling one episode scope must not release its season's legacy DB slot
+    while another episode scope for that same season is still unresolved."""
+    mr = MediaRequest(
+        tmdb_id=48, media_type=MediaType.tv, title="Show", status=RequestStatus.import_blocked
+    )
+    session.add(mr)
+    await session.flush()
+    download = Download(
+        torrent_hash="shared_episode_partial",
+        status="import_blocked",
+        media_request_id=mr.id,
+        season=1,
+        episodes_json=[1],
+        media_type=MediaType.tv,
+    )
+    session.add(download)
+    await session.flush()
+    session.add_all(
+        [
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=mr.id,
+                season_number=1,
+                episodes_json=[1],
+                scope_key="season:1|episodes:[1]",
+                status="imported",
+            ),
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=mr.id,
+                season_number=1,
+                episodes_json=[2],
+                scope_key="season:1|episodes:[2]",
+                status="import_blocked",
+            ),
+        ]
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    await repo.align_scalar_scope_with_active(download.id)
+
+    assert download.season == 1
+    assert download.episodes_json == [2]
+    with pytest.raises(IntegrityError):
+        await repo.create(
+            torrent_hash="same_season_replacement",
+            status="downloading",
+            media_request_id=mr.id,
+            season=1,
+            media_type="tv",
+        )
 
 
 async def test_find_active_for_request_default_season_matches_movie_null_season(

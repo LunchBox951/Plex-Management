@@ -97,6 +97,12 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
         title: 'Test.Movie.1080p.WEB-DL',
         seeders: 10,
         info_hash: 'hash1',
+        covered_seasons: [],
+        target_seasons: [],
+        upgrade_seasons: [],
+        waste_seasons: [],
+        ignored_seasons: [],
+        skipped_seasons: [],
       },
     ],
     rejected: [],
@@ -390,6 +396,12 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test.Show.S02.1080p.WEB-DL',
       seeders: 10,
       info_hash: 'hash3',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
     }
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
     ;(useSearchPreview as unknown as Mock).mockReturnValue(
@@ -442,6 +454,12 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test.Show.S02.1080p.WEB-DL',
       seeders: 10,
       info_hash: 'hash2',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
     }
     const createRequestMock = mutation(created)
     const searchPreviewMock = mutation({
@@ -556,6 +574,51 @@ describe('TitleDetailModal — tv season selector', () => {
     // rather than the show's 'partially_available' rollup leaking through.
     fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
     expect(await screen.findByText(/in your library/i)).toBeInTheDocument()
+  })
+
+  it('matches queue rows by attached scope when the legacy season differs', () => {
+    const request: RequestResponse = {
+      id: 21,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'downloading' },
+      ],
+    }
+    const sharedPack: QueueItem = {
+      id: 31,
+      media_request_id: 21,
+      tmdb_id: 100,
+      season: 1,
+      episodes: null,
+      progress: 0.63,
+      seed_ratio: 0,
+      status: 'downloading',
+      torrent_hash: 'hash-shared-pack',
+      scopes: [
+        { media_request_id: 21, season: 1, episodes: null, status: 'active' },
+        { media_request_id: 21, season: 2, episodes: null, status: 'active' },
+      ],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [sharedPack] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    expect(screen.getByText('63%')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
   })
 })
 
@@ -756,6 +819,37 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     fireEvent.click(confirms[confirms.length - 1]!)
 
     await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(7))
+  })
+
+  it('offers Cancel for a TV request waiting for its air date', async () => {
+    const tvTitle: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 77,
+      title: 'Future Show',
+      year: 2026,
+      library_state: 'none',
+    }
+    const waiting: RequestResponse = {
+      id: 21,
+      tmdb_id: 77,
+      media_type: 'tv',
+      title: 'Future Show',
+      status: 'waiting_for_air_date',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [{ season_number: 3, status: 'waiting_for_air_date' }],
+    }
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
+    const cancelMock = mutation({ ...waiting, status: 'cancelled' })
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
+    render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
+
+    expect(screen.getAllByText(/waiting for air date/i)).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: /cancel request/i }))
+    const confirms = screen.getAllByRole('button', { name: /cancel request/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(21))
   })
 
   it('does not offer Cancel for an already-imported (available) request', () => {

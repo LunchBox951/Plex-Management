@@ -55,6 +55,7 @@ _VALID_SEASON_STATUSES: frozenset[str] = frozenset(
         "pending",
         "searching",
         "no_acceptable_release",
+        "waiting_for_air_date",
         "downloading",
         "completed",
         "available",
@@ -143,6 +144,9 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         # all-``evicted`` case just above -- a fresh request re-tracks the show.
         return "cancelled"
 
+    if statuses == {"waiting_for_air_date"}:
+        return "waiting_for_air_date"
+
     # Only pending/available/completed/failed/evicted/cancelled remain among the
     # season statuses. ``evicted`` and ``cancelled`` fold alongside available/
     # completed as "gone/settled" for the purposes of this branch, EXCEPT neither
@@ -175,4 +179,6 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         return "partially_available"
     if "pending" in statuses:
         return "pending"
+    if "waiting_for_air_date" in statuses:
+        return "waiting_for_air_date"
     return "failed"

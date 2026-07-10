@@ -241,6 +241,45 @@ async def test_new_request_defaults_library_path_none_and_keep_forever_false(
     assert created.keep_forever is False
 
 
+async def test_tv_request_intent_round_trips(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=900,
+        media_type="tv",
+        title="Show",
+        status="pending",
+        tv_request_mode="explicit_seasons",
+        requested_seasons=[2, 1],
+    )
+
+    assert created.tv_request_mode == "explicit_seasons"
+    assert created.requested_seasons == (1, 2)
+
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.tv_request_mode == "explicit_seasons"
+    assert fetched.requested_seasons == (1, 2)
+
+
+async def test_set_tv_request_intent_promotes_to_whole_show(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=901,
+        media_type="tv",
+        title="Show",
+        status="pending",
+        tv_request_mode="explicit_seasons",
+        requested_seasons=[1],
+    )
+
+    await repo.set_tv_request_intent(created.id, mode="whole_show", requested_seasons=None)
+
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.tv_request_mode == "whole_show"
+    assert fetched.requested_seasons is None
+
+
 async def test_set_library_path_round_trips(session: AsyncSession) -> None:
     """The breadcrumb the disk-pressure eviction sweep later ``fs.delete()``s (ADR-0012)."""
     repo = SqlRequestRepository(session)

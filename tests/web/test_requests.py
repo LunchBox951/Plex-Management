@@ -265,7 +265,7 @@ async def test_create_unknown_media_is_404(
     assert response.json()["detail"] == "media_not_found"
 
 
-async def test_create_tv_request_with_no_aired_seasons_is_404(
+async def test_create_tv_request_with_no_aired_seasons_waits(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
@@ -274,11 +274,15 @@ async def test_create_tv_request_with_no_aired_seasons_is_404(
     response = await client.post(
         "/api/v1/requests", json={"tmdb_id": 44, "media_type": "tv"}, headers=_HEADERS
     )
-    assert response.status_code == 404
-    assert response.json()["detail"] == "no_aired_seasons"
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "waiting_for_air_date"
+    assert body["tv_request_mode"] == "whole_show"
 
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
-    assert listed.json()["requests"] == []
+    listed_body = listed.json()["requests"]
+    assert len(listed_body) == 1
+    assert listed_body[0]["status"] == "waiting_for_air_date"
 
 
 def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:

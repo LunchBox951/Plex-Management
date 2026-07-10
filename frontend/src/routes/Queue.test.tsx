@@ -78,12 +78,56 @@ describe('Queue — tv season/episode badge', () => {
     expect(screen.getByText('S02E05-E06')).toBeInTheDocument()
   })
 
+  it('does not collapse non-contiguous episodes into a range', () => {
+    h.queue = [queueItem({ season: 2, episodes: [6, 4] })]
+
+    render(<Queue />)
+
+    expect(screen.getByText('S02E04E06')).toBeInTheDocument()
+  })
+
   it('shows "S02 pack" for a whole-season grab (no episodes named)', () => {
     h.queue = [queueItem({ season: 2, episodes: null })]
 
     render(<Queue />)
 
     expect(screen.getByText('S02 pack')).toBeInTheDocument()
+  })
+
+  it('shows every attached scope for a shared tv torrent', () => {
+    h.queue = [
+      queueItem({
+        season: 1,
+        episodes: null,
+        scopes: [
+          { media_request_id: 7, season: 1, episodes: null, status: 'active' },
+          { media_request_id: 7, season: 2, episodes: [4, 5], status: 'active' },
+        ],
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.getByText('S01 pack')).toBeInTheDocument()
+    expect(screen.getByText('S02E04-E05')).toBeInTheDocument()
+  })
+
+  it('labels non-active attached scope statuses', () => {
+    h.queue = [
+      queueItem({
+        season: 1,
+        episodes: null,
+        scopes: [
+          { media_request_id: 7, season: 1, episodes: null, status: 'imported' },
+          { media_request_id: 7, season: 2, episodes: [4, 5], status: 'import_blocked' },
+        ],
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.getByText('S01 pack · Imported')).toBeInTheDocument()
+    expect(screen.getByText('S02E04-E05 · Import blocked')).toBeInTheDocument()
   })
 })
 

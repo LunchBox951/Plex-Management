@@ -199,6 +199,14 @@ class CreateRequestResult(NamedTuple):
     created: bool
 
 
+class _TvSeasonPlan(NamedTuple):
+    """Resolved TV season rows plus any explicit unaired seasons to park as waiting."""
+
+    season_numbers: list[int]
+    waiting_seasons: set[int]
+    episode_scoped: bool = False
+
+
 async def _resolve_detail(tmdb: MetadataPort, tmdb_id: int, media_type: str) -> _Detail:
     """Return the request detail (title/year/anime + art), or raise if unresolved."""
     if media_type == "movie":
@@ -226,21 +234,145 @@ def _season_numbers(seasons: list[int] | None, season_count: int) -> list[int]:
     return seasons if seasons else list(range(1, season_count + 1))
 
 
-async def _resolve_tv_seasons(
-    tmdb: MetadataPort, tmdb_id: int, seasons: list[int] | None
-) -> list[int]:
-    """Like :func:`_season_numbers`, but fetches ``season_count`` from TMDB itself.
+def _tv_request_intent(
+    seasons: list[int] | None,
+    episodes: dict[int, list[int]] | None = None,
+) -> tuple[str, list[int] | None, dict[int, tuple[int, ...]] | None]:
+    if episodes:
+        return (
+            "explicit_episodes",
+            sorted(set(episodes)),
+            {season: tuple(sorted(set(values))) for season, values in episodes.items()},
+        )
+    if seasons:
+        return "explicit_seasons", sorted(set(seasons)), None
+    return "whole_show", None, None
+
+
+async def _merge_tv_request_intent(
+    repo: SqlRequestRepository,
+    record: RequestRecord,
+    seasons: list[int] | None,
+    episodes: dict[int, list[int]] | None = None,
+) -> None:
+    incoming_mode, incoming_requested, incoming_episodes = _tv_request_intent(seasons, episodes)
+    if record.tv_request_mode == "whole_show":
+        return
+    merged_requested = set(record.requested_seasons or ()) | set(record.requested_episodes or {})
+    merged_episodes: dict[int, set[int]] = {
+        season: set(values) for season, values in (record.requested_episodes or {}).items()
+    }
+    if incoming_mode == "explicit_episodes":
+        for season, values in (incoming_episodes or {}).items():
+            whole_season_already_requested = (
+                season in merged_requested and season not in merged_episodes
+            )
+            merged_requested.add(season)
+            # A whole-season request for this season already dominates any later
+            # episode subset. Preserve the broader intent instead of narrowing it.
+            if whole_season_already_requested:
+                continue
+            merged_episodes.setdefault(season, set()).update(values)
+        mode = "explicit_episodes" if merged_episodes else "explicit_seasons"
+        await repo.set_tv_request_intent(
+            record.id,
+            mode=mode,
+            requested_seasons=sorted(merged_requested),
+            requested_episodes=(
+                {season: tuple(sorted(values)) for season, values in merged_episodes.items()}
+                if merged_episodes
+                else None
+            ),
+        )
+        return
+    if incoming_mode == "whole_show":
+        await repo.set_tv_request_intent(
+            record.id, mode="whole_show", requested_seasons=None, requested_episodes=None
+        )
+        return
+    merged_requested.update(incoming_requested or ())
+    for whole_season in incoming_requested or ():
+        # A later explicit whole-season request widens a prior episode-filtered
+        # request for the same season.
+        merged_episodes.pop(whole_season, None)
+    mode = "explicit_episodes" if merged_episodes else "explicit_seasons"
+    await repo.set_tv_request_intent(
+        record.id,
+        mode=mode,
+        requested_seasons=sorted(merged_requested),
+        requested_episodes=(
+            {season: tuple(sorted(values)) for season, values in merged_episodes.items()}
+            if merged_episodes
+            else None
+        ),
+    )
+
+
+async def _resolve_tv_season_plan(
+    tmdb: MetadataPort,
+    tmdb_id: int,
+    *,
+    seasons: list[int] | None,
+    episodes: dict[int, list[int]] | None,
+    detail: _Detail | None = None,
+    default_waiting_first_season: bool = False,
+) -> _TvSeasonPlan:
+    """Resolve TV season rows and explicit unaired seasons consistently.
 
     For call sites that never resolved a ``_Detail`` (the dedup / integrity-race
-    paths below skip that TMDB round-trip when an explicit ``seasons`` list makes
-    it unnecessary) -- fetches only when ``seasons`` is falsy.
+    paths below may skip that TMDB round-trip), this fetches the show metadata so
+    explicit future seasons can be parked as ``waiting_for_air_date`` the same way
+    the fresh-create path does.
     """
-    if seasons:
-        return seasons
-    tv = await tmdb.get_tv_show(tmdb_id)
-    if tv is None:
-        raise MediaNotFoundError(tmdb_id, "tv")
-    return _season_numbers(seasons, tv.season_count)
+    if detail is None:
+        tv = await tmdb.get_tv_show(tmdb_id)
+        if tv is None:
+            raise MediaNotFoundError(tmdb_id, "tv")
+        detail = _Detail(
+            tv.title, tv.year, tv.is_anime, tv.poster_url, tv.backdrop_url, tv.season_count
+        )
+
+    if episodes:
+        season_numbers = sorted(set(episodes))
+    else:
+        season_numbers = _season_numbers(seasons, detail.season_count)
+
+    waiting_seasons: set[int] = set()
+    if not season_numbers and default_waiting_first_season:
+        season_numbers = [1]
+        waiting_seasons.add(1)
+    elif seasons or episodes:
+        waiting_seasons.update(season for season in season_numbers if season > detail.season_count)
+    return _TvSeasonPlan(
+        season_numbers=season_numbers,
+        waiting_seasons=waiting_seasons,
+        episode_scoped=bool(episodes),
+    )
+
+
+async def _ensure_tv_season_plan(
+    session: AsyncSession,
+    library: LibraryPort | None,
+    *,
+    media_request_id: int,
+    tmdb_id: int,
+    plan: _TvSeasonPlan,
+) -> None:
+    await season_request_service.ensure_seasons(
+        session,
+        library,
+        media_request_id=media_request_id,
+        tmdb_id=tmdb_id,
+        seasons=plan.season_numbers,
+        force_pending=plan.episode_scoped,
+    )
+    for waiting_season in sorted(plan.waiting_seasons):
+        await season_request_service.set_status(
+            session,
+            media_request_id=media_request_id,
+            season_number=waiting_season,
+            status=RequestStatus.waiting_for_air_date.value,
+        )
 
 
 async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
@@ -451,6 +583,7 @@ async def create_request(
     actor_is_admin: bool = False,
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
+    episodes: dict[int, list[int]] | None = None,
     force: bool = False,
 ) -> RequestRecord:
     """Create a request and return only the request read model."""
@@ -463,6 +596,7 @@ async def create_request(
         actor_is_admin=actor_is_admin,
         library=library,
         seasons=seasons,
+        episodes=episodes,
         force=force,
     )
     return result.record
@@ -478,6 +612,7 @@ async def create_request_result(
     actor_is_admin: bool = False,
     library: LibraryPort | None = None,
     seasons: list[int] | None = None,
+    episodes: dict[int, list[int]] | None = None,
     force: bool = False,
 ) -> CreateRequestResult:
     """Create (or return the existing active) media request for this media.
@@ -568,14 +703,20 @@ async def create_request_result(
             session, repo, existing, user_id, actor_is_admin
         )
         if media_type == "tv":
-            season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
-            await season_request_service.ensure_seasons(
+            season_plan = await _resolve_tv_season_plan(
+                tmdb,
+                tmdb_id,
+                seasons=seasons,
+                episodes=episodes,
+            )
+            await _ensure_tv_season_plan(
                 session,
                 library,
                 media_request_id=existing.id,
                 tmdb_id=tmdb_id,
-                seasons=season_numbers,
+                plan=season_plan,
             )
+            await _merge_tv_request_intent(repo, existing, seasons, episodes)
             await session.commit()
             # ensure_seasons recomputed + persisted the parent rollup; re-read so the
             # returned record's top-level status matches the seasons the response will
@@ -591,10 +732,17 @@ async def create_request_result(
     # NoAiredSeasonsError). An explicit (even out-of-range) season list is left
     # alone -- tracking a season Plex/TMDB doesn't have yet is harmless.
     season_numbers: list[int] = []
+    season_plan = _TvSeasonPlan(season_numbers=[], waiting_seasons=set())
     if media_type == "tv":
-        season_numbers = _season_numbers(seasons, detail.season_count)
-        if not season_numbers:
-            raise NoAiredSeasonsError(tmdb_id)
+        season_plan = await _resolve_tv_season_plan(
+            tmdb,
+            tmdb_id,
+            seasons=seasons,
+            episodes=episodes,
+            detail=detail,
+            default_waiting_first_season=True,
+        )
+        season_numbers = season_plan.season_numbers
 
     initial_status = RequestStatus.pending.value
     # Provenance marker (issue #156; hardened by the Codex round-2 finding below):
@@ -721,7 +869,12 @@ async def create_request_result(
                     return CreateRequestResult(record=in_library, created=False)
                 initial_status = RequestStatus.available.value
 
-    if media_type == "tv" and library is not None and season_numbers:
+    if (
+        media_type == "tv"
+        and library is not None
+        and season_numbers
+        and not season_plan.episode_scoped
+    ):
         # TV in-library dedup — the per-season analogue of the movie short-circuit
         # above. When EVERY requested season is already in Plex AND an
         # available/completed request for this show already exists, return it
@@ -769,13 +922,14 @@ async def create_request_result(
                 # across that network call (the rollback discards only the lock
                 # acquisition -- nothing else is pending in this session here).
                 await session.rollback()
-                await season_request_service.ensure_seasons(
+                await _ensure_tv_season_plan(
                     session,
                     library,
                     media_request_id=existing_active.id,
                     tmdb_id=tmdb_id,
-                    seasons=season_numbers,
+                    plan=season_plan,
                 )
+                await _merge_tv_request_intent(repo, existing_active, seasons, episodes)
                 await session.commit()
                 return CreateRequestResult(
                     record=await repo.get(existing_active.id) or existing_active,
@@ -813,13 +967,14 @@ async def create_request_result(
                 # ensure_seasons itself is race-safe without the lock (the
                 # unconditional season unique index + IntegrityError re-read).
                 await session.rollback()
-                await season_request_service.ensure_seasons(
+                await _ensure_tv_season_plan(
                     session,
                     library,
                     media_request_id=in_library.id,
                     tmdb_id=tmdb_id,
-                    seasons=season_numbers,
+                    plan=season_plan,
                 )
+                await _merge_tv_request_intent(repo, in_library, seasons, episodes)
                 await session.commit()
                 return CreateRequestResult(
                     record=await repo.get(in_library.id) or in_library,
@@ -854,6 +1009,15 @@ async def create_request_result(
             poster_url=detail.poster_url,
             backdrop_url=detail.backdrop_url,
             eviction_regrab=movie_eviction_regrab,
+            tv_request_mode=(
+                _tv_request_intent(seasons, episodes)[0] if media_type == "tv" else None
+            ),
+            requested_seasons=(
+                _tv_request_intent(seasons, episodes)[1] if media_type == "tv" else None
+            ),
+            requested_episodes=(
+                _tv_request_intent(seasons, episodes)[2] if media_type == "tv" else None
+            ),
         )
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.
@@ -865,12 +1029,12 @@ async def create_request_result(
             # onto the SAME row, in the SAME transaction, before it is committed below.
             # ``season_numbers`` was already resolved (and guaranteed non-empty)
             # above, before this request row was even created.
-            await season_request_service.ensure_seasons(
+            await _ensure_tv_season_plan(
                 session,
                 library,
                 media_request_id=record.id,
                 tmdb_id=tmdb_id,
-                seasons=season_numbers,
+                plan=season_plan,
             )
         await session.commit()
         if media_type == "tv":
@@ -899,13 +1063,14 @@ async def create_request_result(
                     # winner also tracks the seasons THIS request asked for -- else the
                     # caller gets back a request that doesn't track the season it just
                     # requested. Then re-read past the merged rollup.
-                    await season_request_service.ensure_seasons(
+                    await _ensure_tv_season_plan(
                         session,
                         library,
                         media_request_id=winner.id,
                         tmdb_id=tmdb_id,
-                        seasons=season_numbers,
+                        plan=season_plan,
                     )
+                    await _merge_tv_request_intent(repo, winner, seasons, episodes)
                     await session.commit()
                     winner = await repo.get(winner.id) or winner
                     created = False
@@ -936,14 +1101,20 @@ async def create_request_result(
             session, repo, winner, user_id, actor_is_admin
         )
         if media_type == "tv":
-            season_numbers = await _resolve_tv_seasons(tmdb, tmdb_id, seasons)
-            await season_request_service.ensure_seasons(
+            season_plan = await _resolve_tv_season_plan(
+                tmdb,
+                tmdb_id,
+                seasons=seasons,
+                episodes=episodes,
+            )
+            await _ensure_tv_season_plan(
                 session,
                 library,
                 media_request_id=winner.id,
                 tmdb_id=tmdb_id,
-                seasons=season_numbers,
+                plan=season_plan,
             )
+            await _merge_tv_request_intent(repo, winner, seasons, episodes)
             await session.commit()
             # Re-read past the rollup ensure_seasons just persisted (``winner`` was
             # captured before it), so the returned status matches the response's seasons.

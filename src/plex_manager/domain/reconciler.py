@@ -33,7 +33,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import Final
 
 from plex_manager.domain.events import DownloadFailed
 from plex_manager.domain.state_machine import ACTIVE_STATES, DownloadState
@@ -41,7 +42,9 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
 
 __all__ = [
+    "StallDetection",
     "StateTransition",
+    "detect_stalls",
     "failed_download_events",
     "reconcile",
     "unmapped_client_states",
@@ -289,3 +292,158 @@ def failed_download_events(
             )
         )
     return events
+
+
+# --------------------------------------------------------------------------- #
+# Stalled-download self-heal (issue #165) — the minimal fixed-cooldown design.
+#
+# Two fixed windows, module constants so a future web-configurable knob has a
+# name to bind to (mirrors ``web/app.py``'s ``_RECONCILE_INTERVAL_SECONDS`` /
+# ``auto_grab_service``'s ``BACKOFF_SCHEDULE`` precedent, issue #150). Neither
+# is the full adaptive/candidate-count-aware design the issue also sketches —
+# deliberately out of scope for this pass.
+# --------------------------------------------------------------------------- #
+_METADATA_STALL_MINUTES: Final = 45
+_STALLED_PROGRESS_HOURS: Final = 3
+
+# Raw states the ``last_activity_unix`` check is willing to flag. Deliberately
+# NARROWER than "maps to DownloadState.Downloading": pausedDL/stoppedDL are paused
+# by the operator or client, not a failure; queuedDL is waiting its turn behind
+# other torrents by design; checkingDL/checkingResumeData is qBittorrent verifying
+# pieces (routinely triggered by a restart, which also freezes last_activity from
+# before the restart); moving is actively relocating settled bytes. Flagging any of
+# those would self-heal (remove + blocklist) a healthy torrent. An unmapped future
+# state also stays excluded here, consistent with ``_UNKNOWN_FALLBACK``'s own
+# intent to keep tracking rather than fail it.
+#
+# ``stalledDL`` — qBittorrent's own zero-peer signal — is included here rather
+# than trusted on its own: a single transient tick of ``stalledDL`` (a momentary
+# zero-peer blip between bursts on an otherwise-healthy, actively-transferring
+# torrent) must NOT be enough to self-heal it. Requiring the SAME stale
+# ``last_activity_unix`` gate as the frozen-mid-download catch-all means
+# ``stalledDL`` only trips once the client has genuinely seen no activity for
+# the full ``stalled_progress`` window — never on a one-off report (north star:
+# correction, never destruction).
+_STALLED_PROGRESS_RAW_STATES: Final[frozenset[str]] = frozenset(
+    {"downloading", "forcedDL", "stalledDL"}
+)
+
+# Persisted-status gate (issue #165 hardening finding): the rows this detector is
+# handed come from ``download_repo.list_active()``, whose OWN docstring scopes it
+# to "active (non-terminal)" -- a broader set than the two live shapes this
+# detector understands. It includes ``failed_pending``, the non-terminal pause
+# ``mark_failed``'s own docstring documents as its Phase-A rest stop: an operator
+# (or a stranded prior attempt) may have deliberately left a row there with
+# ``remove_torrent=False`` / ``blocklist=False`` (keeping the torrent, e.g. to
+# inspect it manually), and if its underlying torrent then goes quiet past the
+# stall window, keying PURELY off the live raw state would let this detector flag
+# it anyway -- the self-heal's ``mark_failed(blocklist=True, remove_torrent=True)``
+# would then silently overturn that earlier explicit choice, deleting/blocklisting
+# a torrent an operator chose to keep. Also excludes ``import_pending`` and
+# ``client_missing``: neither shape is meaningful for a settled-on-disk or
+# currently-absent torrent. Mirrors ``reconcile``'s own
+# ``row.status not in _ACTIVE_STATUS_VALUES`` gate -- same literal-string-vs-
+# persisted-value comparison style, just a narrower set than ``ACTIVE_STATES``.
+_STALL_ELIGIBLE_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {DownloadState.Downloading.value, DownloadState.MetadataFetching.value}
+)
+
+
+@dataclass(frozen=True)
+class StallDetection:
+    """One active download whose stall shape has crossed its fixed cooldown
+    window (issue #165). ``shape`` is the honesty-facing label written to both
+    the log line and the ``DownloadHistory`` row the service layer records:
+    ``"metadata_stall"`` (stuck fetching magnet metadata) or
+    ``"stalled_progress"`` (a ``stalledDL``/``downloading``/``forcedDL``
+    torrent whose last client activity is older than the window — covering
+    both qBittorrent's own zero-peer signal and a frozen mid-download stall,
+    and requiring the same staleness gate for both so a single transient
+    ``stalledDL`` tick on an otherwise-healthy torrent is never enough on its
+    own).
+    """
+
+    download_id: int
+    torrent_hash: str
+    shape: str
+
+
+def detect_stalls(
+    rows: Sequence[DownloadRecord],
+    client: Sequence[DownloadStatus],
+    *,
+    now: datetime,
+    metadata_stall: timedelta = timedelta(minutes=_METADATA_STALL_MINUTES),
+    stalled_progress: timedelta = timedelta(hours=_STALLED_PROGRESS_HOURS),
+) -> list[StallDetection]:
+    """Detect rows stuck in metadata-fetching or with a dead/frozen download,
+    pure and read-only (no I/O, no side effects — the service layer decides what
+    to do with each :class:`StallDetection`, exactly like :func:`reconcile`).
+
+    Both windows are anchored on ``row.added_at`` (when the row was grabbed) —
+    NOT ``first_seen_at``, which is only the missing-grace anchor stamped when a
+    torrent vanishes from the client and is usually unset for a healthy, present
+    one. A row with no ``added_at`` (a pre-migration hole) is skipped rather than
+    guessed at.
+
+    Only rows whose PERSISTED ``status`` is exactly ``downloading`` or
+    ``metadata_fetching`` (:data:`_STALL_ELIGIBLE_STATUS_VALUES`) are considered —
+    NOT every status ``list_active()`` may return (which also includes
+    ``failed_pending``, ``import_pending``, ``client_missing``, ...). This is
+    checked in addition to, and independently of, the live raw-state check below:
+    a ``failed_pending`` residual (an operator's or a stranded prior
+    ``mark_failed``'s non-terminal rest stop) must never be reinterpreted as a
+    stall just because its torrent looks stale in the live snapshot.
+
+    * **Metadata stall**: the live snapshot still reports a metadata-fetching raw
+      state (``metaDL``/``forcedMetaDL``) ``metadata_stall`` after the grab.
+    * **Stalled progress**: the row has existed at least ``stalled_progress``,
+      its raw state is one of ``_STALLED_PROGRESS_RAW_STATES`` (qBittorrent's
+      own zero-peer ``stalledDL`` signal, or the actively-``downloading``/
+      ``forcedDL`` catch-all covering a frozen mid-download stall), AND its
+      ``last_activity_unix`` is older than ``stalled_progress`` (skipped when
+      the client hasn't reported one, i.e. ``<= 0`` — never treated as "epoch,
+      therefore ancient"). Requiring the same staleness gate for ``stalledDL``
+      as for the catch-all means a single transient tick of ``stalledDL`` on an
+      otherwise-healthy torrent (last activity seconds ago) is never enough to
+      flag it — only genuine, sustained inactivity is. The raw-state set is
+      deliberately narrower than "maps to ``DownloadState.Downloading``": it
+      excludes every ``ImportPending`` raw state
+      (``uploading``/``stalledUP``/``pausedUP``/``stoppedUP``/
+      ``queuedUP``/``checkingUP``/``forcedUP``) because those are completed
+      torrents seeding with no leechers, so a stale ``last_activity`` there is
+      normal, not a stall; and it also excludes the non-failure Downloading-side
+      states (``pausedDL``/``stoppedDL`` — paused, not failed; ``queuedDL`` —
+      waiting its turn by design; ``checkingDL``/``checkingResumeData`` —
+      verifying pieces, routinely triggered by a restart that also freezes
+      ``last_activity``; ``moving`` — actively relocating settled bytes) and any
+      unmapped future state. Self-healing one of those would remove and
+      blocklist a healthy torrent (north star: correction, never destruction).
+
+    Deliberately keyed off the LIVE raw state (not the row's persisted
+    ``status``) so a row this SAME cycle's :func:`reconcile` is already moving
+    out of metadata-fetching/downloading is naturally excluded — no race with
+    the reconciler's own transitions.
+    """
+    snapshot: dict[str, DownloadStatus] = {status.info_hash.lower(): status for status in client}
+    detections: list[StallDetection] = []
+    for row in rows:
+        if row.status not in _STALL_ELIGIBLE_STATUS_VALUES:
+            continue
+        if row.added_at is None:
+            continue
+        status = snapshot.get(row.torrent_hash.lower())
+        if status is None:
+            continue
+        elapsed = now - row.added_at
+        if status.raw_state in ("metaDL", "forcedMetaDL"):
+            if elapsed >= metadata_stall:
+                detections.append(StallDetection(row.id, row.torrent_hash, "metadata_stall"))
+            continue
+        if elapsed < stalled_progress:
+            continue
+        if status.raw_state in _STALLED_PROGRESS_RAW_STATES and status.last_activity_unix > 0:
+            last_activity = datetime.fromtimestamp(status.last_activity_unix, tz=UTC)
+            if now - last_activity > stalled_progress:
+                detections.append(StallDetection(row.id, row.torrent_hash, "stalled_progress"))
+    return detections

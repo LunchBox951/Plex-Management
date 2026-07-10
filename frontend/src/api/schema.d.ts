@@ -1160,8 +1160,18 @@ export interface components {
          * @description A release that passed the quality gate and blocklist, with its ranking.
          */
         AcceptedRelease: {
+            /**
+             * Covered Seasons
+             * @default []
+             */
+            covered_seasons: number[];
             /** Guid */
             guid: string;
+            /**
+             * Ignored Seasons
+             * @default []
+             */
+            ignored_seasons: number[];
             /** Indexer */
             indexer: string;
             /** Info Hash */
@@ -1174,10 +1184,30 @@ export interface components {
             score: number;
             /** Seeders */
             seeders?: number | null;
+            /**
+             * Skipped Seasons
+             * @default []
+             */
+            skipped_seasons: number[];
             /** Source */
             source: string;
+            /**
+             * Target Seasons
+             * @default []
+             */
+            target_seasons: number[];
             /** Title */
             title: string;
+            /**
+             * Upgrade Seasons
+             * @default []
+             */
+            upgrade_seasons: number[];
+            /**
+             * Waste Seasons
+             * @default []
+             */
+            waste_seasons: number[];
         };
         /**
          * AppApiKeyResponse
@@ -1314,6 +1344,10 @@ export interface components {
          * @description Create a media request by tmdb id + media type.
          */
         CreateRequestBody: {
+            /** Episodes */
+            episodes?: {
+                [key: string]: number[];
+            } | null;
             /** Force */
             force?: boolean | null;
             /**
@@ -1567,11 +1601,13 @@ export interface components {
          *     With neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted
          *     release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
          *     indexer search and the stored download to that season; ``episodes`` further
-         *     scopes it to those specific episode number(s) (``None``/empty = the whole
-         *     season). Every TV grab is per-season: the endpoint REJECTS (422) a tv request
-         *     grabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed
-         *     WITH a ``season`` -- the branch is always the request's actual media type,
-         *     never merely whether ``season`` happens to be set.
+         *     scopes it to those specific episode number(s). When omitted, stored
+         *     ``explicit_episodes`` request intent supplies the selected season's target;
+         *     explicit ``None``/empty = the whole season. Every TV grab is per-season: the
+         *     endpoint REJECTS (422) a tv request grabbed with no ``season``, and REJECTS
+         *     (422) a non-tv (movie) request grabbed WITH a ``season`` -- the branch is
+         *     always the request's actual media type, never merely whether ``season``
+         *     happens to be set.
          */
         GrabRequest: {
             /** Episodes */
@@ -1871,6 +1907,8 @@ export interface components {
             progress: number;
             /** Release Title */
             release_title?: string | null;
+            /** Scopes */
+            scopes?: components["schemas"]["QueueScope"][];
             /** Season */
             season?: number | null;
             /**
@@ -1894,6 +1932,23 @@ export interface components {
         QueueResponse: {
             /** Queue */
             queue: components["schemas"]["QueueItem"][];
+        };
+        /**
+         * QueueScope
+         * @description One logical TV scope attached to a queue download.
+         */
+        QueueScope: {
+            /** Episodes */
+            episodes?: number[] | null;
+            /** Media Request Id */
+            media_request_id?: number | null;
+            /** Season */
+            season?: number | null;
+            /**
+             * Status
+             * @default active
+             */
+            status: string;
         };
         /**
          * ReconcileStatusItem
@@ -1977,6 +2032,12 @@ export interface components {
             media_type: string;
             /** Poster Url */
             poster_url?: string | null;
+            /** Requested Episodes */
+            requested_episodes?: {
+                [key: string]: number[];
+            } | null;
+            /** Requested Seasons */
+            requested_seasons?: number[] | null;
             /** Seasons */
             seasons?: components["schemas"]["SeasonStatus"][] | null;
             /** Status */
@@ -1985,6 +2046,8 @@ export interface components {
             title: string;
             /** Tmdb Id */
             tmdb_id: number;
+            /** Tv Request Mode */
+            tv_request_mode?: string | null;
             /** Year */
             year?: number | null;
         };
@@ -1994,9 +2057,10 @@ export interface components {
          *
          *     When ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are
          *     resolved from the stored request and any values passed for them are ignored;
-         *     ``season``/``episodes`` always come from THIS body regardless -- a stored
-         *     request carries no per-search season/episode scoping of its own. Otherwise
-         *     (no ``request_id``) ``tmdb_id``, ``media_type`` and ``title`` are required.
+         *     ``season`` comes from this body. ``episodes`` also comes from this body when
+         *     present; when omitted, a stored ``explicit_episodes`` request supplies the
+         *     selected season's episode target. Otherwise (no ``request_id``) ``tmdb_id``,
+         *     ``media_type`` and ``title`` are required.
          *
          *     Every TV preview is per-season: the endpoint REJECTS (422) a tv media type
          *     previewed with no ``season``, and REJECTS (422) a non-tv (movie) media type
@@ -2036,6 +2100,10 @@ export interface components {
          * @description One tracked season's status, embedded in a tv ``RequestResponse``.
          */
         SeasonStatus: {
+            /** Installed Profile Index */
+            installed_profile_index?: number | null;
+            /** Installed Quality Id */
+            installed_quality_id?: number | null;
             /** Season Number */
             season_number: number;
             /** Status */

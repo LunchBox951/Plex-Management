@@ -62,7 +62,11 @@ export function ReleaseList({ preview, onGrab, grabbingGuid, canGrab }: ReleaseL
         <StateMessage
           tone="error"
           title="No acceptable release found"
-          message="Every candidate was rejected by the quality gate or blocklist. You can re-search later — nothing was grabbed."
+          message={
+            rejected.length > 0
+              ? 'Every candidate was rejected — see the reasons below. You can re-search later — nothing was grabbed.'
+              : 'No candidates were found for this search. You can re-search later — nothing was grabbed.'
+          }
         />
       ) : (
         <section className="flex flex-col gap-2">

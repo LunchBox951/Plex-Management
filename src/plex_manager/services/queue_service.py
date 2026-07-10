@@ -148,6 +148,38 @@ PREDICATE-ATOMIC (the final protocol form):
     ``web/routers/settings.py``'s ``_rotate_lock`` documents), and the registry
     is only touched by synchronous dict/set operations on the one event loop —
     no await inside any read-modify-write, so no lock is needed.
+  - **The "newest wins" replace rule is an OPERATOR-vs-OPERATOR rule only**
+    (issue #165 hardening finding). The stalled-download self-heal
+    (:func:`_self_heal_stalled_download`) calls :func:`mark_failed` with
+    ``allow_claim_supersede=False``, so its own registration attempt REFUSES
+    (:class:`OperatorClaimActiveError`) instead of replacing whenever ANY claim
+    already exists. This closes a race the caller-side pre-check
+    (``reconcile_and_list``'s ``_is_operator_claimed``) cannot: that check and
+    self-heal's own later registration are separated by self-heal's own
+    ``session.get`` await inside ``mark_failed``, a window an operator's manual
+    call can register a claim in without the pre-check ever seeing it. Because
+    the re-check happens in the SAME synchronous step that would otherwise grant
+    the claim, no further await separates "another owner might exist" from "I am
+    now the owner" for the self-heal path — closing the gap outright rather than
+    narrowing it. An operator's OWN calls are unaffected: two operator commands
+    racing each other still resolve newest-wins, exactly as before.
+  - **A released claim is not the same as an unclaimed row** (Codex review,
+    comment 3541100611 — the narrower race left open by the above). The claim
+    above is LIVE, in-process state, released the instant its owning call
+    returns — but the ``failed_pending`` row + durable marker it stamped can
+    outlive that release (e.g. Phase-C exhaustion, or a clean completion whose
+    terminal CAS simply hasn't run yet). ``allow_claim_supersede=False`` alone
+    only refuses a claim that is STILL live; it has nothing to say about a row
+    an operator's (or reconcile's) call already finished with and moved on from.
+    Self-heal ALSO passes ``allow_adopt_existing_marker=False``, which refuses
+    (:class:`FailedPendingAdoptionRefusedError`) :func:`mark_failed`'s adopt
+    branch outright whenever the row is already ``failed_pending`` at the point
+    this call attempts it — live claim or not — rather than restamping someone
+    else's durable provenance with the reconcile-default ``blocklist=True,
+    remove_torrent=True``. An operator's OWN calls keep the default
+    ``allow_adopt_existing_marker=True``: adopting an abandoned residual and
+    driving it to completion with the newest explicit instruction is exactly
+    what the operator-facing endpoint is FOR.
 
 * **Healing honors the marker.** A residual re-derived by
   :func:`reconcile_and_list` (or, when qBittorrent is unconfigured OR the cycle
@@ -187,11 +219,14 @@ from datetime import UTC, datetime
 from itertools import count
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.events import DownloadFailed
 from plex_manager.domain.reconciler import (
+    StallDetection,
     StateTransition,
+    detect_stalls,
     failed_download_events,
     reconcile,
     unmapped_client_states,
@@ -205,6 +240,9 @@ from plex_manager.logsafe import safe_int
 from plex_manager.models import (
     BlocklistReason,
     Download,
+    DownloadHistory,
+    DownloadHistoryEvent,
+    DownloadScope,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -223,7 +261,9 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 
 __all__ = [
+    "FailedPendingAdoptionRefusedError",
     "InvalidStateTransitionError",
+    "OperatorClaimActiveError",
     "RemovalInProgressError",
     "heal_failed_pending_without_client",
     "list_queue",
@@ -256,6 +296,7 @@ _REARMABLE_REQUEST_STATUS_VALUES: frozenset[str] = (
 # ``_PHASE_C_MAX_ATTEMPTS - 1`` (no sleep after the final attempt).
 _PHASE_C_MAX_ATTEMPTS = 3
 _PHASE_C_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.1)
+_UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import_blocked"})
 
 
 @dataclass(frozen=True)
@@ -313,24 +354,44 @@ _claim_tokens = count(1)
 _reconcile_removals_in_flight: set[int] = set()
 
 
-def _register_operator_claim(download_id: int, flags: _OperatorFailFlags) -> int:
-    """Claim ``download_id`` for an operator mark_failed; return the owner token.
+def _register_operator_claim(
+    download_id: int, flags: _OperatorFailFlags, *, allow_supersede: bool = True
+) -> int:
+    """Claim ``download_id`` for a mark_failed call; return the owner token.
 
-    REPLACES any existing claim: the newest operator command owns the row (protocol
-    step 1) — the superseded call's token silently stops owning, so its later
-    token-gated phases yield. The ONE exception (the removal-physics rule): while a
-    torrent-removal I/O for this download is in flight — EITHER the current
-    operator owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
+    By default (``allow_supersede=True``, every OPERATOR-initiated call)
+    REPLACES any existing claim: the newest operator command owns the row
+    (protocol step 1) — the superseded call's token silently stops owning, so its
+    later token-gated phases yield. The ONE exception (the removal-physics rule):
+    while a torrent-removal I/O for this download is in flight — EITHER the
+    current owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
     Phase-B delete (``_reconcile_removals_in_flight``) — the remove decision is
     already irreversible, so registration is REFUSED with
     :class:`RemovalInProgressError` — accepting a ``remove_torrent=False`` command
-    then would promise a file the in-flight delete is destroying.
+    then would promise a file the in-flight delete is destroying. This physics
+    check applies UNCONDITIONALLY, even when ``allow_supersede=False``.
+
+    ``allow_supersede=False`` (the stalled-download self-heal's own path, issue
+    #165 hardening finding) additionally refuses registration — with
+    :class:`OperatorClaimActiveError` — whenever ANY claim already exists, live
+    owner or not yet removal-in-flight. Self-heal must NEVER become the newer
+    owner over an existing claim: unlike two racing operator commands (where
+    "newest wins" is the correct, intentional semantics), a self-heal call
+    superseding an operator's in-flight claim would silently override a live
+    human decision the operator is still in the middle of committing. This check
+    is the ONLY thing that closes that race, because it re-verifies atomically in
+    the SAME synchronous step that would otherwise register the superseding
+    claim — no ``await`` separates the check from the decision here, unlike the
+    caller's own pre-check (:func:`_is_operator_claimed` in
+    :func:`reconcile_and_list`), which races against exactly this registration.
     """
     if download_id in _reconcile_removals_in_flight:
         raise RemovalInProgressError(download_id)
     existing = _operator_fail_claims.get(download_id)
     if existing is not None and existing.removal_in_flight:
         raise RemovalInProgressError(download_id)
+    if not allow_supersede and existing is not None:
+        raise OperatorClaimActiveError(download_id)
     token = next(_claim_tokens)
     _operator_fail_claims[download_id] = _OperatorClaim(token=token, flags=flags)
     return token
@@ -516,6 +577,71 @@ class RemovalInProgressError(Exception):
         )
 
 
+class OperatorClaimActiveError(Exception):
+    """A NON-superseding claim attempt found an existing live claim (issue #165
+    hardening finding, self-heal-vs-operator race).
+
+    Raised only by a caller that registered with ``allow_supersede=False``
+    (currently the stalled-download self-heal path only, via
+    :func:`mark_failed`'s ``allow_claim_supersede``): an ordinary operator
+    ``mark_failed`` call always supersedes (the module docstring's "newest
+    command owns" rule is unchanged for operator-vs-operator races). Self-heal
+    opts OUT of that rule instead, because it must never be the newer owner over
+    ANY existing claim — including one an operator's own manual call registered
+    AFTER ``reconcile_and_list``'s own ``_is_operator_claimed`` pre-check already
+    ran and passed (that pre-check and self-heal's own registration are not one
+    atomic step: the caller's ``await session.get`` in between is exactly the
+    window an operator's call can land in). Re-checking atomically at
+    registration time — the same synchronous critical section that decides
+    ownership — closes that gap without touching the existing single-operator
+    -click behaviour at all.
+    """
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(
+            f"download {download_id} already has an active mark-failed claim; "
+            "backing off rather than superseding it"
+        )
+
+
+class FailedPendingAdoptionRefusedError(Exception):
+    """A caller that opted OUT of adopting an existing residual
+    (``allow_adopt_existing_marker=False``) found the row ALREADY at
+    ``failed_pending`` when it actually attempted the call (Codex review, comment
+    3541100611 -- the narrower race left open by issue #165's claim-supersede
+    fix).
+
+    ``OperatorClaimActiveError`` guards the LIVE-claim window: it stops self-heal
+    from superseding a claim that is still registered. But a claim is only
+    in-process state -- it is released in the owning call's ``finally`` the
+    moment that call returns (success, a lost race, or a Phase-C exhaustion that
+    re-raises), while the row it stamped can be left behind as a DURABLE
+    ``failed_pending`` residual (the marker survives; the claim does not). A
+    caller arriving AFTER that release sees no live claim at all, so
+    ``allow_claim_supersede`` never enters into it -- yet the row still carries
+    someone else's provenance (an operator's explicit ``blocklist``/
+    ``remove_torrent`` choice, or a reconcile failure awaiting completion).
+
+    The stalled-download self-heal (:func:`_self_heal_stalled_download`) is the
+    one caller that passes ``allow_adopt_existing_marker=False``: unlike a
+    genuine operator instruction -- which IS entitled to adopt and restamp an
+    abandoned residual with its own explicit flags, the newest human decision
+    being authoritative -- self-heal has no standing to override a residual it
+    did not create. It must back off and leave the residual for its OWN owner's
+    provenance to drive completion (the reconcile heal machinery, or the
+    operator's own retry), never restamp over it with the reconcile-default
+    ``blocklist=True, remove_torrent=True``.
+    """
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(
+            f"download {download_id} is already failed_pending with an existing "
+            "residual; refusing to adopt/restamp it"
+        )
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -698,6 +824,19 @@ def _media_type_for_blocklist(
     return "tv" if record.season is not None else "movie"
 
 
+async def _mark_download_scopes_terminal(
+    session: AsyncSession, download_id: int, status: str
+) -> None:
+    await session.execute(
+        update(DownloadScope)
+        .where(
+            DownloadScope.download_id == download_id,
+            DownloadScope.status.in_(_UNRESOLVED_SCOPE_STATUSES),
+        )
+        .values(status=status)
+    )
+
+
 async def _handle_failed(
     session: AsyncSession,
     completion: _FailureCompletion,
@@ -769,6 +908,7 @@ async def _handle_failed(
             safe_int(completion.download_id),
         )
         return None
+    await _mark_download_scopes_terminal(session, record.id, RequestStatus.failed.value)
 
     request_repo = SqlRequestRepository(session)
     request = (
@@ -799,6 +939,22 @@ async def _handle_failed(
             ),
         )
 
+    if record.scopes:
+        media_type = _media_type_for_blocklist(
+            record, request.media_type if request is not None else None
+        )
+        for scope in record.scopes:
+            if scope.media_request_id is not None and scope.season is not None:
+                await _rearm_failed_request(
+                    session,
+                    _FailedReArm(
+                        media_request_id=scope.media_request_id,
+                        season=scope.season,
+                        media_type=media_type,
+                    ),
+                )
+        return None
+
     # Hand the owning request/season back for the re-arm (same Phase-C transaction).
     # Captured from ``record``/``request`` in hand rather than re-read after a commit
     # boundary, where the now-``Failed`` row would be excluded from ``list_active``.
@@ -811,6 +967,98 @@ async def _handle_failed(
             ),
         )
     return None
+
+
+async def _self_heal_stalled_download(
+    session: AsyncSession,
+    qbt: DownloadClientPort,
+    row: DownloadRecord,
+    detection: StallDetection,
+    *,
+    now: datetime,
+) -> None:
+    """Issue #165's minimal self-heal: mark-fail + blocklist a stalled download —
+    the EXACT same :func:`mark_failed` call the operator's manual "mark failed +
+    blocklist" button makes, so the existing single-owner claim/nonce protocol,
+    blocklist write, torrent removal, and request/season re-arm are reused
+    verbatim (module docstring). Re-arming returns the owner to ``searching``,
+    which re-enters the EXISTING auto-grab backoff ladder
+    (``auto_grab_service.BACKOFF_SCHEDULE``) — no separate retry cap is added
+    here; a pathological title still bounds out at the honest,
+    retryable ``no_acceptable_release`` park state on exhaustion.
+
+    A losing race (an operator claimed the row, or it left the legal
+    Downloading/MetadataFetching states, between this cycle's snapshot and this
+    call) is logged and skipped rather than raised — one stalled row's edge case
+    must never abort the whole reconcile cycle (imports, availability, every
+    OTHER row) for this tick.
+
+    Passes ``allow_claim_supersede=False`` (issue #165 hardening finding): this
+    call must never become the newer owner over an EXISTING claim, even one that
+    only registered after ``reconcile_and_list``'s own ``_is_operator_claimed``
+    pre-check already ran (that pre-check races this call's own ``session.get``
+    inside :func:`mark_failed` -- see :class:`OperatorClaimActiveError`). Caught
+    below exactly like the other losing-race outcomes.
+
+    Also passes ``allow_adopt_existing_marker=False`` (Codex review, comment
+    3541100611 -- the narrower race left open by the claim-supersede fix above):
+    a claim is only LIVE state, released the instant its owning call returns, but
+    the ``failed_pending`` row + marker it stamped can durably outlive that
+    release. If an operator's own ``mark_failed`` (or a reconcile failure) landed
+    on this row and finished — releasing its claim — in the window between this
+    cycle's stall snapshot and this call, ``allow_claim_supersede=False`` sees no
+    live claim to refuse and would otherwise walk straight into
+    :func:`mark_failed`'s adopt branch, restamping someone else's durable
+    residual with the reconcile-default ``blocklist=True, remove_torrent=True``.
+    ``allow_adopt_existing_marker=False`` closes that: :class:`mark_failed`
+    refuses (:class:`FailedPendingAdoptionRefusedError`) instead of adopting
+    whenever it finds the row already ``failed_pending``, live claim or not.
+    Caught below exactly like the other losing-race outcomes.
+    """
+    elapsed = now - row.added_at if row.added_at is not None else None
+    try:
+        await mark_failed(
+            session,
+            qbt,
+            download_id=row.id,
+            blocklist=True,
+            remove_torrent=True,
+            allow_claim_supersede=False,
+            allow_adopt_existing_marker=False,
+        )
+    except (
+        InvalidStateTransitionError,
+        RemovalInProgressError,
+        OperatorClaimActiveError,
+        FailedPendingAdoptionRefusedError,
+        LookupError,
+    ) as exc:
+        _logger.warning(
+            "self-heal (issue #165) skipped for download %s (%s, elapsed=%s): %s",
+            safe_int(row.id),
+            detection.shape,
+            elapsed,
+            exc,
+        )
+        return
+    _logger.warning(
+        "self-heal (issue #165): download %s auto mark-failed + blocklisted after a "
+        "%s stall (elapsed=%s)",
+        safe_int(row.id),
+        detection.shape,
+        elapsed,
+    )
+    session.add(
+        DownloadHistory(
+            tmdb_id=row.tmdb_id,
+            torrent_hash=row.torrent_hash,
+            event_type=DownloadHistoryEvent.stalled,
+            source_title=row.release_title,
+            message=f"auto-detected {detection.shape} stall (elapsed={elapsed}); "
+            "mark-failed + blocklisted, replacing",
+        )
+    )
+    await session.commit()
 
 
 async def list_queue(session: AsyncSession) -> list[QueueRecord]:
@@ -909,6 +1157,26 @@ async def reconcile_and_list(
     # and must not run while this write transaction holds SQLite's write lock, so it
     # is likewise deferred to Phase B below.
     await session.commit()
+
+    # Stalled-download self-heal (issue #165's minimal fixed-cooldown design):
+    # reuses THIS cycle's already-fetched ``rows``/``statuses`` (no new interval,
+    # no extra client call — see ``domain.reconciler.detect_stalls``). A
+    # detection whose row this SAME cycle's reconcile above already moved (it's
+    # in ``transitions_by_id``) is skipped -- it changed domain state THIS tick,
+    # so the pre-cycle stall read is stale for it and next cycle re-evaluates it
+    # fresh. A row an operator ``mark_failed`` currently owns is likewise skipped
+    # (the pre-stamp invisibility fast-path, module docstring) -- the operator's
+    # own call, not this heal, is what completes it.
+    rows_by_id = {row.id: row for row in rows}
+    for detection in detect_stalls(rows, statuses, now=now):
+        if detection.download_id in transitions_by_id or _is_operator_claimed(
+            detection.download_id
+        ):
+            continue
+        stalled_row = rows_by_id.get(detection.download_id)
+        if stalled_row is None:  # pragma: no cover - detections derive from rows
+            continue
+        await _self_heal_stalled_download(session, qbt, stalled_row, detection, now=now)
 
     # Build the set of failed rows to complete this cycle:
     #   1. Rows that transitioned TO ``failed_pending`` THIS cycle (CAS-APPLIED only
@@ -1286,6 +1554,8 @@ async def mark_failed(
     download_id: int,
     blocklist: bool,
     remove_torrent: bool = True,
+    allow_claim_supersede: bool = True,
+    allow_adopt_existing_marker: bool = True,
 ) -> DownloadRecord:
     """Operator move: fail a download (and optionally blocklist its release).
 
@@ -1301,6 +1571,36 @@ async def mark_failed(
     ``None`` client with ``remove_torrent=True`` is a caller bug -- the endpoint has
     already 409'd that combination up front -- so it is refused loudly here rather than
     silently skipping the removal (honesty over silence).
+
+    ``allow_claim_supersede`` (default ``True``, every OPERATOR call -- unchanged
+    behaviour): whether THIS call's claim registration may replace an existing
+    live claim (module docstring, "Operator provenance"). The stalled-download
+    self-heal (issue #165 hardening finding) is the one caller that passes
+    ``False``: it must never become the newer owner over an existing claim,
+    because ``reconcile_and_list``'s own pre-check (``_is_operator_claimed``) can
+    race an operator's manual call that is suspended between ITS OWN
+    ``session.get`` and ITS OWN claim registration -- the pre-check and this
+    call's registration are two different moments, not one atomic step. Passing
+    ``False`` re-verifies atomically at registration time instead of trusting the
+    caller's earlier snapshot: see :func:`_register_operator_claim` and
+    :class:`OperatorClaimActiveError`.
+
+    ``allow_adopt_existing_marker`` (default ``True``, every OPERATOR call --
+    unchanged behaviour): whether this call may ADOPT a row it finds already at
+    ``failed_pending`` (restamp it with its own flags and drive it to
+    completion). An operator is always entitled to adopt an abandoned residual --
+    the newest human instruction wins. The stalled-download self-heal passes
+    ``False`` (Codex review, comment 3541100611): a claim is released the moment
+    its owning call returns, but the ``failed_pending`` row + marker it stamped
+    can durably outlive that release (e.g. a Phase-C exhaustion), so
+    ``allow_claim_supersede=False`` alone does not stop self-heal from walking
+    straight into the adopt branch of an UNCLAIMED, already-marked residual and
+    restamping someone else's provenance with the reconcile-default
+    ``blocklist=True, remove_torrent=True``. When ``False`` and this call would
+    otherwise adopt (whether the row was already ``failed_pending`` when read,
+    or reached it via a concurrent transition discovered mid-CAS), it raises
+    :class:`FailedPendingAdoptionRefusedError` instead of adopting -- the row,
+    its marker, and its live claim (there is none) are left untouched.
 
     Mirrors :func:`reconcile_and_list`'s three-phase ordering (issue #68 + the
     Phase-C-strand hardening): Phase A routes the row to the NON-terminal
@@ -1350,17 +1650,32 @@ async def mark_failed(
     torrent_hash = row.torrent_hash
     request_id = row.media_request_id
     download_tmdb_id = row.tmdb_id
-    rearm: _FailedReArm | None = None
-    if request_id is not None:
-        rearm = _FailedReArm(
-            media_request_id=request_id,
-            season=row.season,
-            media_type=(
-                row.media_type.value
-                if row.media_type is not None
-                else ("tv" if row.season is not None else "movie")
-            ),
-        )
+    record_snapshot = await download_repo.get_by_hash(torrent_hash)
+    request_media_type = (
+        row.media_type.value
+        if row.media_type is not None
+        else ("tv" if row.season is not None else "movie")
+    )
+    rearms: list[_FailedReArm] = []
+    if record_snapshot is not None and record_snapshot.scopes:
+        media_type = _media_type_for_blocklist(record_snapshot, request_media_type)
+        rearms = [
+            _FailedReArm(
+                media_request_id=scope.media_request_id,
+                season=scope.season,
+                media_type=media_type,
+            )
+            for scope in record_snapshot.scopes
+            if scope.media_request_id is not None and scope.season is not None
+        ]
+    elif request_id is not None:
+        rearms = [
+            _FailedReArm(
+                media_request_id=request_id,
+                season=row.season,
+                media_type=request_media_type,
+            )
+        ]
 
     # Ownership protocol (module docstring): register the single-owner claim BEFORE
     # any Phase-A write -- from this point reconcile treats the row as invisible at
@@ -1369,7 +1684,7 @@ async def mark_failed(
     # ownership by including the exact marker in its WHERE, so no check-then-act
     # window separates the ownership decision from the write.
     flags = _OperatorFailFlags(blocklist=blocklist, remove_torrent=remove_torrent)
-    token = _register_operator_claim(download_id, flags)
+    token = _register_operator_claim(download_id, flags, allow_supersede=allow_claim_supersede)
     marker = _operator_fail_marker(flags, token)
     superseded = False
     try:
@@ -1406,6 +1721,18 @@ async def mark_failed(
                     raise InvalidStateTransitionError(actual, DownloadState.Failed.value)
                 adopt = True
                 observed_reason = latest.failed_reason
+        if adopt and not allow_adopt_existing_marker:
+            # Codex review (comment 3541100611): this caller opted OUT of adoption
+            # (self-heal only). The row is ALREADY failed_pending here -- whether it
+            # was found that way at the top-of-function read, or reached via the CAS
+            # re-read just above -- so restamping it would silently override
+            # whatever provenance is already durably recorded (an operator's
+            # explicit blocklist/remove_torrent choice, or a reconcile failure
+            # awaiting completion), even though no LIVE claim exists to have
+            # blocked this call via ``allow_claim_supersede``. Refuse outright;
+            # nothing has been written yet in this branch, so there is nothing to
+            # roll back beyond the ``finally``'s claim release.
+            raise FailedPendingAdoptionRefusedError(download_id)
         if adopt:
             # Predicate-atomic restamp (finding: an older call must not clobber a
             # newer call's marker): stamp MY nonce-marker over EXACTLY the reason
@@ -1530,6 +1857,9 @@ async def mark_failed(
                         safe_int(download_id),
                     )
                     return
+                await _mark_download_scopes_terminal(
+                    session, download_id, RequestStatus.failed.value
+                )
                 if blocklist:
                     source_title = (
                         await blocklist_service.source_title_for(session, torrent_hash)
@@ -1554,7 +1884,7 @@ async def mark_failed(
                             request.media_type if request is not None else None,
                         ),
                     )
-                if rearm is not None:
+                for rearm in rearms:
                     await _rearm_failed_request(session, rearm)
 
             await _commit_phase_c_with_retry(

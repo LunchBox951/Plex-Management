@@ -14,7 +14,7 @@ and the ``LogEvent`` repository backing the durable, LLM-diagnosable log store.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -26,6 +26,7 @@ __all__ = [
     "BlocklistRepository",
     "DownloadRecord",
     "DownloadRepository",
+    "DownloadScopeRecord",
     "LogEventCreate",
     "LogEventPage",
     "LogEventRecord",
@@ -82,6 +83,11 @@ class RequestRecord(BaseModel):
     # request (in particular never a #148 forced re-acquire). See
     # ``MediaRequest.eviction_regrab``'s docstring for the full rationale.
     eviction_regrab: bool = False
+    # TV-only request intent used by multi-season pack planning. ``None`` for
+    # movies and legacy rows.
+    tv_request_mode: str | None = None
+    requested_seasons: tuple[int, ...] | None = None
+    requested_episodes: dict[int, tuple[int, ...]] | None = None
 
 
 class DownloadRecord(BaseModel):
@@ -106,6 +112,19 @@ class DownloadRecord(BaseModel):
     media_type: str | None = None
     failed_reason: str | None = None
     first_seen_at: datetime | None = None
+    # When this download was grabbed (``downloads.added_at``, server-defaulted at
+    # row creation, and explicitly RE-STAMPED to now by
+    # ``grab_service._reuse_terminal_row`` when a terminal row is resurrected for
+    # a fresh grab under the same torrent hash) — distinct from ``first_seen_at``,
+    # which is ONLY the missing-grace anchor (stamped when a torrent first
+    # vanishes from the client). The stall self-heal (issue #165) anchors both its
+    # stall shapes on this: it correctly represents "since we started waiting" for
+    # a fresh grab, while ``first_seen_at`` is usually unset for a healthy,
+    # present torrent. Re-stamping on reuse (hardening finding) is what keeps that
+    # true across a resurrection -- without it a reused row would carry the STALE
+    # original grab time, letting the very next reconcile tick immediately
+    # misjudge the brand-new grab as stalled.
+    added_at: datetime | None = None
     download_path: str | None = None
     # The release ("download") title the grab decision picked -- the same value
     # already written to ``DownloadHistory.source_title`` at grab time and used
@@ -114,6 +133,22 @@ class DownloadRecord(BaseModel):
     # into the append-only history log. ``None`` for a pre-migration row with no
     # backfillable history.
     release_title: str | None = None
+    scopes: tuple[DownloadScopeRecord, ...] = ()
+
+
+class DownloadScopeRecord(BaseModel):
+    """One logical TV scope attached to a physical download."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    download_id: int
+    media_request_id: int | None = None
+    season_request_id: int | None = None
+    season: int | None = None
+    episodes: list[int] | None = None
+    status: str = "active"
+    completed_at: datetime | None = None
 
 
 class QueueRecord(DownloadRecord):
@@ -151,6 +186,8 @@ class SeasonRequestRecord(BaseModel):
     # The per-season mirror of ``RequestRecord.library_path`` (ADR-0012): the
     # final placed path this season's import wrote into, ``None`` until set.
     library_path: str | None = None
+    installed_quality_id: int | None = None
+    installed_profile_index: int | None = None
     # Auto-grab scheduling (ADR-0013): the per-season mirror of
     # ``RequestRecord.search_attempts`` / ``next_search_at`` -- a TV grab is always
     # per-season, so the backoff ladder is tracked here.
@@ -341,6 +378,9 @@ class RequestRepository(Protocol):
         poster_url: str | None = None,
         backdrop_url: str | None = None,
         eviction_regrab: bool = False,
+        tv_request_mode: str | None = None,
+        requested_seasons: Sequence[int] | None = None,
+        requested_episodes: Mapping[int, Sequence[int]] | None = None,
     ) -> RequestRecord:
         """Insert a new request and return the persisted record.
 
@@ -349,6 +389,17 @@ class RequestRepository(Protocol):
         service.create_request``'s ``latest_request_evicted`` branch), never for
         an ordinary or forced (#148) request.
         """
+        raise NotImplementedError
+
+    async def set_tv_request_intent(
+        self,
+        request_id: int,
+        *,
+        mode: str,
+        requested_seasons: Sequence[int] | None,
+        requested_episodes: Mapping[int, Sequence[int]] | None = None,
+    ) -> None:
+        """Persist TV request intent for multi-season pack planning."""
         raise NotImplementedError
 
     async def set_status(self, request_id: int, status: str) -> None:
@@ -479,6 +530,21 @@ class DownloadRepository(Protocol):
         grab decision's release name (issue #134) -- the same value the caller
         already writes to ``DownloadHistory.source_title``.
         """
+        raise NotImplementedError
+
+    async def ensure_scope(
+        self,
+        download_id: int,
+        *,
+        media_request_id: int | None,
+        season: int | None,
+        episodes: list[int] | None = None,
+    ) -> DownloadScopeRecord:
+        """Attach a logical TV scope to an existing physical download."""
+        raise NotImplementedError
+
+    async def list_scopes(self, download_id: int) -> list[DownloadScopeRecord]:
+        """List logical scopes attached to ``download_id``."""
         raise NotImplementedError
 
     async def update_status(
@@ -659,6 +725,12 @@ class SeasonRequestRepository(Protocol):
         The per-season mirror of :meth:`RequestRepository.set_library_path` --
         same "set once, never reconstruct" rule, same eviction target.
         """
+        raise NotImplementedError
+
+    async def set_installed_quality(
+        self, season_request_id: int, *, quality_id: int, profile_index: int | None
+    ) -> None:
+        """Store the imported quality breadcrumb for this season."""
         raise NotImplementedError
 
 

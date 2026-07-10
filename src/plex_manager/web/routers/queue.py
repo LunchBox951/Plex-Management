@@ -27,7 +27,6 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
-    DownloadScopeConflictError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
@@ -52,12 +51,13 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
     require_admin,
 )
-from plex_manager.web.routers.search_preview import run_preview
+from plex_manager.web.routers.search_preview import run_preview, stored_episodes_for_request
 from plex_manager.web.schemas import (
     ErrorDetail,
     GrabRequest,
     QueueItem,
     QueueResponse,
+    QueueScope,
     SearchPreviewRequest,
 )
 
@@ -121,6 +121,15 @@ def _to_item(record: DownloadRecord) -> QueueItem:
         title=record.title if isinstance(record, QueueRecord) else None,
         poster_url=record.poster_url if isinstance(record, QueueRecord) else None,
         release_title=record.release_title,
+        scopes=[
+            QueueScope(
+                media_request_id=scope.media_request_id,
+                season=scope.season,
+                episodes=scope.episodes,
+                status=scope.status,
+            )
+            for scope in record.scopes
+        ],
     )
 
 
@@ -205,12 +214,24 @@ async def grab_endpoint(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
         )
 
+    effective_episodes = stored_episodes_for_request(
+        request,
+        season=body.season,
+        episodes=body.episodes,
+        episodes_was_provided="episodes" in body.model_fields_set,
+    )
+    scope_episodes_by_season = (
+        {season: list(values) for season, values in request.requested_episodes.items()}
+        if request.media_type == "tv" and request.requested_episodes
+        else None
+    )
+
     result = await run_preview(
         # Carry season/episodes so a TV grab searches (and later records) the
         # right scope; both are None for a movie and so leave movie behaviour
         # unchanged.
         SearchPreviewRequest(
-            request_id=body.request_id, season=body.season, episodes=body.episodes
+            request_id=body.request_id, season=body.season, episodes=effective_episodes
         ),
         session,
         prowlarr,
@@ -262,7 +283,8 @@ async def grab_endpoint(
             tmdb_id=request.tmdb_id,
             year=request.year,
             season=body.season,
-            episodes=body.episodes,
+            episodes=effective_episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
             save_path=downloads_host_root,
         )
     except NoGrabSourceError as exc:
@@ -286,13 +308,6 @@ async def grab_endpoint(
         # refuse the parallel grab instead of spawning a second active row.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
-        ) from exc
-    except DownloadScopeConflictError as exc:
-        # The same physical torrent is already downloading for a DIFFERENT season
-        # (a multi-season pack re-grabbed per season). Refused honestly rather than
-        # returned as a no-op that would leave this season untracked.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="download_scope_conflict"
         ) from exc
     except TorrentAlreadyTrackedError as exc:
         # The same torrent hash is already actively owned by a different request.

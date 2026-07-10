@@ -145,8 +145,23 @@ async def _to_response(
         is_anime=record.is_anime,
         poster_url=record.poster_url,
         backdrop_url=record.backdrop_url,
+        tv_request_mode=record.tv_request_mode,
+        requested_seasons=list(record.requested_seasons) if record.requested_seasons else None,
+        requested_episodes=(
+            {season: list(values) for season, values in record.requested_episodes.items()}
+            if record.requested_episodes
+            else None
+        ),
         seasons=(
-            [SeasonStatus(season_number=s.season_number, status=s.status) for s in seasons]
+            [
+                SeasonStatus(
+                    season_number=s.season_number,
+                    status=s.status,
+                    installed_quality_id=s.installed_quality_id,
+                    installed_profile_index=s.installed_profile_index,
+                )
+                for s in seasons
+            ]
             if seasons is not None
             else None
         ),
@@ -191,6 +206,7 @@ async def create_request_endpoint(
             media_type=body.media_type,
             library=library,
             seasons=body.seasons,
+            episodes=body.episodes,
             force=bool(body.force),
             user_id=auth.user_id,
             actor_is_admin=auth.is_admin,

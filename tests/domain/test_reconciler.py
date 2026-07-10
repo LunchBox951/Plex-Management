@@ -12,6 +12,7 @@ import pytest
 
 from plex_manager.domain.reconciler import (
     StateTransition,
+    detect_stalls,
     failed_download_events,
     reconcile,
 )
@@ -57,6 +58,7 @@ def _row(
     download_id: int = 1,
     first_seen_at: datetime | None = None,
     tmdb_id: int | None = None,
+    added_at: datetime | None = None,
 ) -> DownloadRecord:
     return DownloadRecord(
         id=download_id,
@@ -64,11 +66,19 @@ def _row(
         status=status,
         first_seen_at=first_seen_at,
         tmdb_id=tmdb_id,
+        added_at=added_at,
     )
 
 
-def _status(*, raw_state: str, info_hash: str = _HASH) -> DownloadStatus:
-    return DownloadStatus(info_hash=info_hash, name="Some.Release", raw_state=raw_state)
+def _status(
+    *, raw_state: str, info_hash: str = _HASH, last_activity_unix: int = 0
+) -> DownloadStatus:
+    return DownloadStatus(
+        info_hash=info_hash,
+        name="Some.Release",
+        raw_state=raw_state,
+        last_activity_unix=last_activity_unix,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -365,3 +375,205 @@ def test_failed_download_events_empty_when_no_failures() -> None:
     ]
 
     assert failed_download_events(transitions) == []
+
+
+# --------------------------------------------------------------------------- #
+# Stalled-download self-heal detection (issue #165)
+# --------------------------------------------------------------------------- #
+def test_metadata_stall_past_threshold_is_detected() -> None:
+    rows = [
+        _row(status=DownloadState.MetadataFetching.value, added_at=_NOW - timedelta(minutes=46))
+    ]
+    client = [_status(raw_state="metaDL")]
+
+    detections = detect_stalls(rows, client, now=_NOW)
+
+    assert len(detections) == 1
+    assert detections[0].download_id == 1
+    assert detections[0].torrent_hash == _HASH
+    assert detections[0].shape == "metadata_stall"
+
+
+def test_metadata_stall_under_threshold_is_not_detected() -> None:
+    rows = [
+        _row(status=DownloadState.MetadataFetching.value, added_at=_NOW - timedelta(minutes=10))
+    ]
+    client = [_status(raw_state="forcedMetaDL")]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_stalled_progress_via_stalled_dl_raw_state_and_stale_activity_is_detected() -> None:
+    # The genuine case: qBittorrent's own zero-peer ``stalledDL`` signal AND
+    # the client hasn't seen activity in over the stall window.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="stalledDL", last_activity_unix=stale_activity)]
+
+    detections = detect_stalls(rows, client, now=_NOW)
+
+    assert len(detections) == 1
+    assert detections[0].shape == "stalled_progress"
+
+
+def test_stalled_dl_row_with_recent_activity_is_not_detected() -> None:
+    # Regression for the flaky-but-alive-seeder bug: a single transient tick of
+    # ``stalledDL`` (a momentary zero-peer blip) on a torrent whose client
+    # activity is recent must NOT self-heal a healthy download.
+    recent_activity = int((_NOW - timedelta(seconds=30)).timestamp())
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="stalledDL", last_activity_unix=recent_activity)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_stalled_dl_row_with_no_last_activity_unix_is_not_detected() -> None:
+    # ``last_activity_unix`` defaults to 0 (the client never reported one) --
+    # never treated as "epoch, therefore ancient", consistent with the
+    # downloading/forcedDL catch-all's treatment of a missing/zero value.
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="stalledDL", last_activity_unix=0)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_downloading_row_under_stall_window_is_not_detected() -> None:
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=1))]
+    client = [_status(raw_state="stalledDL")]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_stalled_progress_via_stale_last_activity_is_detected() -> None:
+    # ``downloading`` (not stalledDL) but the client hasn't seen activity in
+    # over the stall window -- the state-agnostic frozen-mid-download catch-all.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="downloading", last_activity_unix=stale_activity)]
+
+    detections = detect_stalls(rows, client, now=_NOW)
+
+    assert len(detections) == 1
+    assert detections[0].shape == "stalled_progress"
+
+
+def test_downloading_row_with_recent_activity_is_not_detected() -> None:
+    recent_activity = int((_NOW - timedelta(minutes=5)).timestamp())
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="downloading", last_activity_unix=recent_activity)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_downloading_row_with_no_last_activity_unix_and_no_stalled_dl_is_not_detected() -> None:
+    # ``last_activity_unix`` defaults to 0 (the client never reported one) --
+    # never treated as "epoch, therefore ancient".
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="downloading", last_activity_unix=0)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_row_with_no_added_at_is_skipped() -> None:
+    rows = [_row(status=DownloadState.MetadataFetching.value, added_at=None)]
+    client = [_status(raw_state="metaDL")]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_row_absent_from_client_snapshot_is_skipped() -> None:
+    rows = [_row(status=DownloadState.MetadataFetching.value, added_at=_NOW - timedelta(hours=1))]
+
+    assert detect_stalls(rows, [], now=_NOW) == []
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    ["uploading", "stalledUP", "pausedUP", "stoppedUP", "queuedUP", "checkingUP", "forcedUP"],
+)
+def test_import_pending_row_is_never_flagged(raw_state: str) -> None:
+    # A settled-on-disk row that happens to be old is not a stall shape this
+    # detector covers -- import stalls are a different concern. Uses a REALISTIC
+    # stale last_activity (a completed torrent seeding with no leechers goes
+    # stale within hours) so this doesn't just trivially pass on the
+    # last_activity_unix=0 default: self-healing one of these would delete a
+    # finished torrent and its files.
+    stale_activity = int((_NOW - timedelta(hours=4)).timestamp())
+    rows = [_row(status=DownloadState.ImportPending.value, added_at=_NOW - timedelta(hours=10))]
+    client = [_status(raw_state=raw_state, last_activity_unix=stale_activity)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        DownloadState.FailedPending.value,
+        DownloadState.ImportPending.value,
+        DownloadState.ClientMissing.value,
+        "searching",
+        "importing",
+    ],
+)
+def test_non_downloading_metadata_persisted_status_is_never_flagged(status: str) -> None:
+    # Regression (issue #165 hardening finding): ``list_active()`` returns every
+    # non-terminal row, INCLUDING ``failed_pending`` -- mark_failed's own Phase-A
+    # rest stop, which an operator may have deliberately left with
+    # remove_torrent=False/blocklist=False to keep the torrent. Keying purely off
+    # the LIVE raw state (metaDL, stale downloading/stalledDL) must never flag one
+    # of these rows just because its underlying torrent looks stale -- the
+    # self-heal would silently overturn an earlier explicit choice.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [_row(status=status, added_at=_NOW - timedelta(hours=10))]
+    metadata_client = [_status(raw_state="metaDL")]
+    downloading_client = [_status(raw_state="stalledDL", last_activity_unix=stale_activity)]
+
+    assert detect_stalls(rows, metadata_client, now=_NOW) == []
+    assert detect_stalls(rows, downloading_client, now=_NOW) == []
+
+
+def test_failed_pending_row_with_stale_torrent_is_never_self_healed() -> None:
+    # The exact scenario the finding describes: an earlier
+    # mark_failed(remove_torrent=False, blocklist=False) left the row at
+    # failed_pending, deliberately keeping the torrent. If that torrent then goes
+    # stale, detect_stalls must not pick it up even though the live snapshot looks
+    # identical to a genuine stalled_progress case.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [
+        _row(
+            status=DownloadState.FailedPending.value,
+            added_at=_NOW - timedelta(hours=4),
+        )
+    ]
+    client = [_status(raw_state="downloading", last_activity_unix=stale_activity)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        "pausedDL",
+        "stoppedDL",
+        "queuedDL",
+        "checkingDL",
+        "checkingResumeData",
+        "moving",
+        "someFutureState",
+    ],
+)
+def test_non_failure_downloading_side_row_is_never_flagged_by_last_activity(
+    raw_state: str,
+) -> None:
+    # These all map (or, for an unknown future state, fall back) to
+    # DownloadState.Downloading, but none of them is a stall: pausedDL/stoppedDL
+    # is an operator/client pause, queuedDL is waiting its turn, checkingDL/
+    # checkingResumeData is qBittorrent verifying pieces (routinely triggered by
+    # a restart that also freezes last_activity), and moving is actively
+    # relocating already-settled bytes. Self-healing any of these would remove
+    # and blocklist a healthy torrent.
+    stale_activity = int((_NOW - timedelta(hours=5)).timestamp())
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state=raw_state, last_activity_unix=stale_activity)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []

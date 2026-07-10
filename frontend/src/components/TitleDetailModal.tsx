@@ -56,6 +56,7 @@ type DerivedState =
   | { kind: 'searching' }
   | { kind: 'downloading' }
   | { kind: 'no_acceptable_release' }
+  | { kind: 'waiting_for_air_date' }
   | { kind: 'import_blocked' }
   | { kind: 'completed' }
   | { kind: 'available' }
@@ -84,6 +85,14 @@ type DerivedState =
 function seasonStatusFor(request: RequestResponse, season: number | null): string {
   if (season == null) return request.status
   return request.seasons?.find((s) => s.season_number === season)?.status ?? request.status
+}
+
+function queueItemCoversSeason(item: QueueItem, season: number | null): boolean {
+  if (season == null) return true
+  if (item.scopes && item.scopes.length > 0) {
+    return item.scopes.some((scope) => scope.season === season)
+  }
+  return item.season === season
 }
 
 /** The first non-terminal tracked season, else the first tracked season. */
@@ -120,6 +129,8 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
       return { kind: 'downloading' }
     case 'no_acceptable_release':
       return { kind: 'no_acceptable_release' }
+    case 'waiting_for_air_date':
+      return { kind: 'waiting_for_air_date' }
     case 'import_blocked':
       return { kind: 'import_blocked' }
     case 'completed':
@@ -143,7 +154,13 @@ function deriveState(status: string | null, optimistic: boolean): DerivedState {
  * action against the PARENT request status (for tv the rollup), never the
  * per-season zone — a `partially_available` show is not cancellable wholesale.
  */
-const CANCELLABLE_STATUSES = new Set(['pending', 'searching', 'no_acceptable_release', 'downloading'])
+const CANCELLABLE_STATUSES = new Set([
+  'pending',
+  'searching',
+  'no_acceptable_release',
+  'waiting_for_air_date',
+  'downloading',
+])
 
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
@@ -162,6 +179,7 @@ function isGrabbableStatus(status: string): boolean {
     status !== 'completed' &&
     status !== 'failed' &&
     status !== 'evicted' &&
+    status !== 'waiting_for_air_date' &&
     // ADR-0014: a `cancelled` request is settled and terminal for grab (the backend
     // rejects a cancelled id in /queue/grab with request_not_active); a fresh
     // "Request again" must be made before grabbing. Mirrors the backend's
@@ -376,7 +394,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     const matches = items.filter((q) => {
       if (effectiveRequestId === null) return q.tmdb_id === title.tmdb_id
       if (q.media_request_id !== effectiveRequestId) return false
-      return title.media_type === 'tv' ? q.season === currentSeason : true
+      return title.media_type === 'tv' ? queueItemCoversSeason(q, currentSeason) : true
     })
     return matches.length > 0 ? matches[matches.length - 1]! : null
   }, [queueQuery.data, title, effectiveRequestId, currentSeason])
@@ -894,6 +912,19 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
           </span>
           {reSearchButton}
           {cancelButton}
+        </div>
+      )
+      break
+    case 'waiting_for_air_date':
+      actionZone = (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <StatusBadge status={requestStatus('waiting_for_air_date')} />
+            <span className="text-sm text-muted">
+              This season has not aired yet. Cancel the request if you no longer want it.
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2">{cancelButton}</div>
         </div>
       )
       break

@@ -37,12 +37,54 @@ function isRelocatable(item: QueueItem): boolean {
  * `domain/naming.py::_episode_token`, but this is cosmetic only: nothing here
  * feeds back into a request.
  */
-function seasonBadge(item: QueueItem): string | null {
-  if (item.season == null) return null
-  const season = `S${String(item.season).padStart(2, '0')}`
-  if (!item.episodes || item.episodes.length === 0) return `${season} pack`
-  const episodes = item.episodes.map((e) => `E${String(e).padStart(2, '0')}`).join('-')
+function tvScopeBadge(
+  seasonNumber: number | null | undefined,
+  episodeNumbers: number[] | null | undefined,
+): string | null {
+  if (seasonNumber == null) return null
+  const season = `S${String(seasonNumber).padStart(2, '0')}`
+  if (!episodeNumbers || episodeNumbers.length === 0) return `${season} pack`
+  const ordered = [...new Set(episodeNumbers)].sort((a, b) => a - b)
+  if (ordered.length === 1) return `${season}E${String(ordered[0]).padStart(2, '0')}`
+  const contiguous = ordered[ordered.length - 1]! - ordered[0]! === ordered.length - 1
+  const episodes = contiguous
+    ? `E${String(ordered[0]).padStart(2, '0')}-E${String(ordered[ordered.length - 1]).padStart(2, '0')}`
+    : ordered.map((e) => `E${String(e).padStart(2, '0')}`).join('')
   return `${season}${episodes}`
+}
+
+interface ScopeBadge {
+  label: string
+  status: string
+}
+
+function scopeBadgeLabel(
+  seasonNumber: number | null | undefined,
+  episodeNumbers: number[] | null | undefined,
+  status: string,
+): string | null {
+  const badge = tvScopeBadge(seasonNumber, episodeNumbers)
+  if (badge === null) return null
+  return status === 'active' ? badge : `${badge} · ${downloadStatus(status).label}`
+}
+
+function seasonBadge(item: QueueItem): ScopeBadge | null {
+  const label = tvScopeBadge(item.season, item.episodes)
+  return label ? { label, status: 'active' } : null
+}
+
+function scopeBadges(item: QueueItem): ScopeBadge[] {
+  if (item.scopes && item.scopes.length > 0) {
+    return item.scopes
+      .map((scope) => {
+        const status = scope.status ?? 'active'
+        const label = scopeBadgeLabel(scope.season, scope.episodes, status)
+        return label ? { label, status } : null
+      })
+      .filter((badge): badge is ScopeBadge => badge !== null)
+  }
+  const legacyBadge = seasonBadge(item)
+  return legacyBadge ? [legacyBadge] : []
 }
 
 /**
@@ -251,7 +293,7 @@ function QueueCard({
   const pct = Math.round(Math.min(1, Math.max(0, item.progress ?? 0)) * 100)
   const shortHash = item.torrent_hash.slice(0, 12)
   const detail = isDownloadingLike ? `${pct}%` : undefined
-  const season = seasonBadge(item)
+  const scopes = scopeBadges(item)
   const heading = queueHeading(item)
   // Only worth a second line when it says something the heading doesn't already:
   // a release_title that WAS the heading (title absent) would just repeat itself.
@@ -282,11 +324,28 @@ function QueueCard({
             <div className="flex min-w-0 flex-wrap items-center gap-3">
               <p className="truncate font-display font-semibold text-ink">{heading}</p>
               <StatusBadge status={presentation} {...(detail ? { detail } : {})} />
-              {season ? (
-                <span className="rounded bg-white/8 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-muted ring-1 ring-white/10">
-                  {season}
-                </span>
-              ) : null}
+              {scopes.map((scope, index) => {
+                const scopePresentation = scope.status === 'active' ? null : downloadStatus(scope.status)
+                return (
+                  <span
+                    key={`${scope.label}-${index}`}
+                    className={cn(
+                      'rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide ring-1',
+                      scopePresentation
+                        ? {
+                            searching: 'bg-searching/15 text-searching ring-searching/30',
+                            downloading: 'bg-downloading/15 text-downloading ring-downloading/30',
+                            available: 'bg-available/15 text-available ring-available/30',
+                            error: 'bg-error/15 text-error ring-error/30',
+                            neutral: 'bg-white/8 text-muted ring-white/10',
+                          }[scopePresentation.intent]
+                        : 'bg-white/8 text-muted ring-white/10',
+                    )}
+                  >
+                    {scope.label}
+                  </span>
+                )
+              })}
             </div>
             {showReleaseSubline ? (
               <p className="mt-0.5 truncate font-mono text-xs text-muted">{item.release_title}</p>

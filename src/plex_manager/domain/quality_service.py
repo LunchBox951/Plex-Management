@@ -35,6 +35,7 @@ class RejectionReason(StrEnum):
     BLOCKLISTED = "blocklisted"
     WRONG_MEDIA = "wrong_media"
     MULTI_SEASON_PACK = "multi_season_pack"
+    NOT_SEASON_PACK = "not_season_pack"
 
 
 @dataclass(frozen=True)

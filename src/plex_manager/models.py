@@ -45,6 +45,7 @@ __all__ = [
     "Download",
     "DownloadHistory",
     "DownloadHistoryEvent",
+    "DownloadScope",
     "LogEvent",
     "MediaRequest",
     "MediaType",
@@ -74,6 +75,7 @@ class RequestStatus(StrEnum):
     pending = "pending"
     searching = "searching"
     no_acceptable_release = "no_acceptable_release"
+    waiting_for_air_date = "waiting_for_air_date"
     downloading = "downloading"
     completed = "completed"
     available = "available"
@@ -144,6 +146,15 @@ class DownloadHistoryEvent(StrEnum):
     # ``event_type`` column, so neither member needs a migration of its own.
     reported = "reported"
     cancelled = "cancelled"
+    # Issue #165's minimal fixed-cooldown self-heal: the reconcile loop auto
+    # mark-fails a download stuck in metadata-fetching or with dead/frozen
+    # progress, exactly the operator's manual mark-failed button. UNLIKE
+    # ``reported``/``cancelled`` above, this one DOES need a migration:
+    # ``b7e2d4f6c8a1`` already gave this column a real CHECK constraint
+    # (``ck_download_history_event_type_enum``) enumerating every value at the
+    # time, so a migrated database's constraint would otherwise reject this new
+    # value outright — see ``26bc01829ae1_add_stalled_download_history_event_type``.
+    stalled = "stalled"
 
 
 def _enum(enum_cls: type[StrEnum], *, name: str) -> sa.Enum:
@@ -305,11 +316,13 @@ class MediaRequest(Base):
             unique=True,
             sqlite_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed', 'partially_available')"
+                "'waiting_for_air_date', 'downloading', 'import_blocked', "
+                "'completed', 'partially_available')"
             ),
             postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed', 'partially_available')"
+                "'waiting_for_air_date', 'downloading', 'import_blocked', "
+                "'completed', 'partially_available')"
             ),
         ),
     )
@@ -379,6 +392,12 @@ class MediaRequest(Base):
     # create path) reads ``NULL`` -- treated as "not an eviction regrab", the safe
     # default that never triggers an unintended cancel.
     eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
+    # TV-only request intent for multi-season pack eligibility. ``whole_show`` means
+    # the operator asked for every tracked season; ``explicit_seasons`` means the
+    # operator named a finite season set, persisted in ``requested_seasons_json``.
+    tv_request_mode: Mapped[str | None] = mapped_column(String)
+    requested_seasons_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    requested_episodes_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
 
 
 class RequestDedupLock(Base):
@@ -437,6 +456,10 @@ class SeasonRequest(Base):
     # season; ``next_search_at`` gates the next auto-grab search (``NULL`` = due now).
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Quality imported for this season. Used by multi-season pack planning to
+    # decide whether overlap is a real upgrade or wasted same/lower-quality work.
+    installed_quality_id: Mapped[int | None] = mapped_column()
+    installed_profile_index: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
     # ONLY for a season row ``season_request_service.ensure_seasons`` created because
@@ -536,6 +559,54 @@ class Download(Base):
     # migration) -- the queue UI degrades honestly (title -> release_title ->
     # short hash).
     release_title: Mapped[str | None] = mapped_column(String)
+
+
+class DownloadScope(Base):
+    """A logical TV scope attached to one physical torrent download.
+
+    ``downloads.torrent_hash`` remains the physical torrent identity. This table
+    records every season/episode target that torrent is expected to satisfy, so a
+    multi-season pack can be one client torrent with several durable TV scopes.
+    The scalar ``downloads.season`` / ``episodes_json`` columns remain as the
+    first/back-compat scope.
+    """
+
+    __tablename__ = "download_scopes"
+    __table_args__ = (
+        Index("ix_download_scopes_download", "download_id"),
+        Index("ix_download_scopes_request_scope", "media_request_id", "season_number"),
+        Index(
+            "uq_download_scopes_active_scope",
+            "media_request_id",
+            "scope_key",
+            unique=True,
+            sqlite_where=sa.text(
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+            ),
+            postgresql_where=sa.text(
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+            ),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    download_id: Mapped[int] = mapped_column(
+        ForeignKey("downloads.id", ondelete="CASCADE"), index=True
+    )
+    media_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("season_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_number: Mapped[int | None] = mapped_column()
+    episodes_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    scope_key: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(
+        String, default="active", server_default=sa.text("'active'")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DownloadHistory(Base):

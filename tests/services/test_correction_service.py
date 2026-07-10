@@ -20,14 +20,17 @@ from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.prowlarr.adapter import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
+from plex_manager.domain.decision_engine import DecisionResult
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Blocklist,
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -1100,25 +1103,34 @@ async def test_cancel_tv_settles_every_season_and_rolls_up_cancelled(
         )
         session.add(show)
         await session.flush()
-        session.add(
-            SeasonRequest(
-                media_request_id=show.id, season_number=1, status=RequestStatus.downloading
-            )
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.downloading
         )
+        session.add(season_1)
         session.add(
             SeasonRequest(media_request_id=show.id, season_number=2, status=RequestStatus.searching)
         )
+        download = Download(
+            torrent_hash=_CULPRIT,
+            status="downloading",
+            media_request_id=show.id,
+            tmdb_id=1399,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
         session.add(
-            Download(
-                torrent_hash=_CULPRIT,
-                status="downloading",
+            DownloadScope(
+                download_id=download.id,
                 media_request_id=show.id,
-                tmdb_id=1399,
-                season=1,
+                season_request_id=season_1.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="active",
             )
         )
         await session.commit()
-        request_id = show.id
+        request_id, download_id = show.id, download.id
 
     qbt = FakeQbittorrent()
     async with sessionmaker_() as session:
@@ -1136,7 +1148,91 @@ async def test_cancel_tv_settles_every_season_and_rolls_up_cancelled(
             .scalars()
             .all()
         )
+        scope = (
+            await session.execute(
+                select(DownloadScope).where(DownloadScope.download_id == download_id)
+            )
+        ).scalar_one()
     assert {s.status for s in seasons} == {RequestStatus.cancelled}
+    assert scope.status == "cancelled"
+
+
+async def test_cancel_terminalizes_import_blocked_scope_so_replacement_can_attach(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1400,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.downloading
+        )
+        season_2 = SeasonRequest(
+            media_request_id=show.id, season_number=2, status=RequestStatus.import_blocked
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_CULPRIT,
+            status=DownloadState.ImportBlocked.value,
+            media_request_id=show.id,
+            tmdb_id=1400,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=show.id,
+                season_request_id=season_2.id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="import_blocked",
+            )
+        )
+        await session.commit()
+        request_id, season_id, download_id = show.id, season_2.id, download.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+
+    assert updated.status == RequestStatus.cancelled.value
+    assert (_CULPRIT, True) in qbt.removed
+    async with sessionmaker_() as session:
+        scope = (
+            await session.execute(
+                select(DownloadScope).where(DownloadScope.download_id == download_id)
+            )
+        ).scalar_one()
+        replacement = Download(
+            torrent_hash="b" * 40,
+            status=DownloadState.Downloading.value,
+            media_request_id=request_id,
+            tmdb_id=1400,
+            season=2,
+        )
+        session.add(replacement)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=replacement.id,
+                media_request_id=request_id,
+                season_request_id=season_id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="active",
+            )
+        )
+        await session.flush()
+
+    assert scope.status == "cancelled"
 
 
 async def test_cancel_rejects_an_already_imported_request(
@@ -1470,6 +1566,95 @@ async def test_report_issue_researches_the_whole_season_after_an_episode_scoped_
     assert prowlarr.searched[0].episode is None
 
 
+async def test_report_issue_tv_threads_multi_season_intent_into_research(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Some Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Some.Show.S01E05.mkv").write_bytes(b"x" * 2048)
+    captured: dict[str, object] = {}
+
+    async def capture_preview(*_args: object, **kwargs: object) -> DecisionResult:
+        captured["multi_season_intent"] = kwargs["multi_season_intent"]
+        captured["episodes"] = kwargs["episodes"]
+        return DecisionResult(accepted=(), rejected=(), no_acceptable_release=True)
+
+    monkeypatch.setattr(correction_service.decision_service, "preview", capture_preview)
+
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=1399,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.available,
+            tv_request_mode="explicit_episodes",
+            requested_seasons_json=[1, 2],
+            requested_episodes_json={"1": [5], "2": [6]},
+        )
+        session.add(show)
+        await session.flush()
+        session.add_all(
+            [
+                SeasonRequest(
+                    media_request_id=show.id,
+                    season_number=1,
+                    status=RequestStatus.available,
+                    library_path=str(season_dir),
+                ),
+                SeasonRequest(
+                    media_request_id=show.id,
+                    season_number=2,
+                    status=RequestStatus.available,
+                ),
+            ]
+        )
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="imported",
+                media_request_id=show.id,
+                tmdb_id=1399,
+                season=1,
+                episodes_json=[5],
+            )
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=1399,
+                torrent_hash=_CULPRIT,
+                event_type=DownloadHistoryEvent.grabbed,
+                source_title="Some.Show.S01E05.1080p.WEB-DL.x264-GROUP",
+                indexer="FakeIndexer",
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="bad_quality",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    intent = captured["multi_season_intent"]
+    assert captured["episodes"] is None
+    assert isinstance(intent, MultiSeasonRequestIntent)
+    assert intent.mode == "explicit_seasons"
+    assert intent.requested_seasons == (1, 2)
+
+
 async def test_cancel_refuses_while_a_download_is_finalizing_its_import(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1724,6 +1909,58 @@ async def test_cancel_with_no_active_rows_settles_without_a_client(
     async with sessionmaker_() as session:
         updated = await correction_service.cancel_request(session, None, request_id=request_id)
     assert updated.status == RequestStatus.cancelled.value
+
+
+async def test_cancel_waiting_for_air_date_settles_and_releases_dedup_slot(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A future TV request is active/dedup-blocking but has no torrent to remove.
+
+    Cancelling it is a pure database settle: both the waiting season and its
+    parent become cancelled, and a fresh request for the same show can claim the
+    active-media slot.
+    """
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=1901,
+            media_type=MediaType.tv,
+            title="Future Show",
+            status=RequestStatus.waiting_for_air_date,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=request.id,
+                season_number=3,
+                status=RequestStatus.waiting_for_air_date,
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        updated = await correction_service.cancel_request(session, None, request_id=request_id)
+    assert updated.status == RequestStatus.cancelled.value
+
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+        assert season.status is RequestStatus.cancelled
+        assert await SqlRequestRepository(session).find_active(1901, "tv") is None
+
+        replacement = MediaRequest(
+            tmdb_id=1901,
+            media_type=MediaType.tv,
+            title="Future Show",
+            status=RequestStatus.pending,
+        )
+        session.add(replacement)
+        await session.commit()
+        assert replacement.id != request_id
 
 
 async def test_cancel_with_an_active_torrent_requires_a_client(
