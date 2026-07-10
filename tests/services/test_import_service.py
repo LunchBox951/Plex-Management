@@ -1,7 +1,7 @@
 """Import pipeline — validate the completed file, place it, scan, mark completed.
 
-Uses the REAL ``LocalFileSystem`` against ``tmp_path`` (hardlink stays on one
-filesystem) and the REAL parser + default quality profile, so the CAM/wrong-media
+Uses the REAL ``LocalFileSystem`` against ``tmp_path`` and the REAL parser plus
+default quality profile, so the CAM/wrong-media
 gate is genuinely exercised. The download client and Plex library are faked. Video
 files are created sparse so a >50 MiB feature (above the sample floor) costs no
 real bytes.
@@ -9,8 +9,10 @@ real bytes.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import stat
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import plex_manager.adapters.filesystem.local as local_filesystem
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
@@ -93,6 +96,38 @@ def _make_video(path: Path, size_bytes: int = 60 * 1024 * 1024) -> None:
     with path.open("wb") as handle:
         handle.seek(size_bytes - 1)
         handle.write(b"\0")
+
+
+def _source_candidate_for(
+    path: Path,
+) -> import_service._SourceCandidate:  # pyright: ignore[reportPrivateUsage]
+    with import_service._open_source_authority(  # pyright: ignore[reportPrivateUsage]
+        str(path.parent)
+    ) as authority:
+        candidate = import_service._source_candidate_from_authority(  # pyright: ignore[reportPrivateUsage]
+            str(path),
+            path.name,
+            authority=authority,
+        )
+    assert candidate is not None
+    return candidate
+
+
+def _resolve_sources_for(
+    fs: LocalFileSystem,
+    content_path: Path,
+) -> list[import_service._SourceCandidate]:  # pyright: ignore[reportPrivateUsage]
+    source_root = content_path.parent
+    observed = source_root.stat()
+    return import_service._resolve_sources(  # pyright: ignore[reportPrivateUsage]
+        fs,
+        str(content_path),
+        source_root=str(source_root),
+        source_root_identity=import_service._DirectoryIdentity(  # pyright: ignore[reportPrivateUsage]
+            observed.st_dev,
+            observed.st_ino,
+        ),
+    )
 
 
 def _manifest_files(content_path: Path) -> list[DownloadedFile]:
@@ -174,8 +209,17 @@ def _attest_payload_validation(
     placement_owned: bool = True,
 ) -> None:
     """Persist the post-payload-gate import marker used by status-less resume tests."""
+    path = Path(download_path)
+    allowed_root = path.parents[1]
+    content_identity = import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+        os.fspath(path),
+        allowed_root=os.fspath(allowed_root),
+    )
+    assert content_identity is not None
     attestation = import_service._payload_validation_attestation(  # pyright: ignore[reportPrivateUsage]
-        os.fspath(download_path), placement_owned=placement_owned
+        os.fspath(download_path),
+        placement_owned=placement_owned,
+        content_identity=content_identity,
     )
     session.add(
         DownloadHistory(
@@ -274,6 +318,29 @@ async def _import(
             session=session,
             movies_root=str(movies_root),
             anime_movie_root=str(anime_movie_root) if anime_movie_root is not None else None,
+        )
+
+
+def test_payload_attestation_never_falls_back_to_filesystem_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _unexpected_probe(_download_path: str) -> str | None:
+        raise AssertionError("attestation formatting must not inspect the filesystem")
+
+    monkeypatch.setattr(import_service, "_payload_content_identity", _unexpected_probe)
+
+    marker = import_service._payload_validation_attestation(  # pyright: ignore[reportPrivateUsage]
+        "/configured/library/Movie.mkv",
+        placement_owned=True,
+        content_identity="caller-proven-identity",
+    )
+
+    assert "identity=caller-proven-identity ownership=placed:" in marker
+    with pytest.raises(ValueError, match="content_identity must not be empty"):
+        import_service._payload_validation_attestation(  # pyright: ignore[reportPrivateUsage]
+            "/configured/library/Movie.mkv",
+            placement_owned=False,
+            content_identity="",
         )
 
 
@@ -650,7 +717,7 @@ async def test_replacement_before_placement_returns_never_inherits_deletion_auth
     assert record.status == DownloadState.ImportBlocked.value
     assert record.download_path == str(dst)
     assert record.failed_reason is not None
-    assert "changed after payload validation" in record.failed_reason
+    assert "manual cleanup before re-search" in record.failed_reason
     assert library.scanned == []
     with dst.open("rb") as handle:
         assert handle.read(11) == b"replacement"
@@ -734,8 +801,8 @@ async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_c
         ],
     )
 
-    def _crash_before_unlink(_path: Path, *, expected_identity: str | None = None) -> None:
-        del expected_identity
+    def _crash_before_unlink(_path: Path, *, expected_identity: str, allowed_root: str) -> None:
+        del expected_identity, allowed_root
         raise RuntimeError("simulated crash before owned placement unlink")
 
     monkeypatch.setattr(import_service, "_remove_quietly", _crash_before_unlink)
@@ -853,15 +920,26 @@ async def test_importing_unsafe_payload_parks_until_owned_breadcrumb_unlink_succ
             ),
         ],
     )
-    original_unlink = Path.unlink
+    original_exchange = import_service.rename_exchange
     deny_unlink = True
 
-    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
-        if deny_unlink and path == dst:
+    def _permission_guard(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        if deny_unlink and left_dir_fd is not None and left == dst.name:
             raise PermissionError("simulated read-only library mount")
-        original_unlink(path, missing_ok=missing_ok)
+        original_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
 
-    monkeypatch.setattr(Path, "unlink", _permission_guard)
+    monkeypatch.setattr(import_service, "rename_exchange", _permission_guard)
 
     blocked = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
 
@@ -1077,6 +1155,140 @@ async def test_import_blocks_when_client_status_missing_before_payload_validatio
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
     assert record.failed_reason == "download client reported no status for payload validation"
+
+
+@pytest.mark.parametrize("manual_cleanup", [False, True])
+async def test_statusless_movie_clears_missing_trusted_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker, manual_cleanup: bool
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=(
+            RequestStatus.import_blocked if manual_cleanup else RequestStatus.downloading
+        ),
+        download_status=(
+            DownloadState.ImportBlocked.value if manual_cleanup else DownloadState.Importing.value
+        ),
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        if manual_cleanup:
+            download.failed_reason = (
+                "torrent payload rejected: unsupported file type .exe; "
+                "stored import breadcrumb requires manual cleanup before re-search"
+            )
+        await session.commit()
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path is None
+    assert record.failed_reason == "download client reported no status for payload validation"
+
+
+async def test_statusless_movie_preserves_breadcrumb_when_library_root_is_unavailable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "unavailable-library"
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.import_blocked,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        download.failed_reason = failed_reason
+        await session.commit()
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason == failed_reason
+
+
+async def test_live_safe_movie_preserves_reason_when_library_root_becomes_unavailable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    moved_root = tmp_path / "unavailable-library"
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    failed_reason = "plex scan failed: PlexLibraryError"
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.import_blocked,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        download.failed_reason = failed_reason
+        _attest_payload_validation(session, dst)
+        await session.commit()
+    movies_root.rename(moved_root)
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        FakeLibrary(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason == failed_reason
+    assert (moved_root / "The Matrix (1999)" / dst.name).exists()
+
+
+async def test_statusless_movie_malformed_breadcrumb_fails_closed(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    malformed = f"{movies_root}\0suffix/The Matrix (1999)/The Matrix (1999).mkv"
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = malformed
+        await session.commit()
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == malformed
+    assert record.failed_reason == "stored import breadcrumb is not the expected movie destination"
 
 
 async def test_importing_movie_uses_library_breadcrumb_when_client_status_missing(
@@ -1325,8 +1537,7 @@ async def test_statusless_movie_dangling_symlink_breadcrumb_is_never_cleared(
     movies_root = tmp_path / "library"
     movies_root.mkdir()
     dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
-    dst.parent.mkdir(parents=True)
-    dst.symlink_to(tmp_path / "missing-target.mkv")
+    _make_video(dst)
     download_id, _request_id = await _seed(
         sessionmaker_,
         request_status=RequestStatus.downloading,
@@ -1338,6 +1549,8 @@ async def test_statusless_movie_dangling_symlink_breadcrumb_is_never_cleared(
         download.download_path = str(dst)
         _attest_payload_validation(session, dst)
         await session.commit()
+    dst.unlink()
+    dst.symlink_to(tmp_path / "missing-target.mkv")
 
     record = await _import(
         sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
@@ -1398,7 +1611,7 @@ async def test_importing_movie_breadcrumb_scan_failure_preserves_only_copy_for_r
 
 
 async def test_importing_movie_breadcrumb_resume_rejects_mismatched_destination(
-    tmp_path: Path, sessionmaker_: SessionMaker
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A stale breadcrumb pointing at ANOTHER title under the (possibly widened) movies
     # root must not be scanned/finalized against this request: the resume path requires
@@ -1418,6 +1631,11 @@ async def test_importing_movie_breadcrumb_resume_rejects_mismatched_destination(
         download.download_path = str(stale)
         _attest_payload_validation(session, stale)
         await session.commit()
+
+    def _unexpected_probe(_download_path: str) -> str | None:
+        raise AssertionError("a mismatched persisted breadcrumb must not be fingerprinted")
+
+    monkeypatch.setattr(import_service, "_payload_content_identity", _unexpected_probe)
     library = FakeLibrary()
 
     record = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
@@ -1684,6 +1902,45 @@ async def test_import_defers_when_live_client_status_is_not_settled(
     assert request is not None and request.status == RequestStatus.downloading
 
 
+async def test_unsettled_movie_clears_missing_pre_publish_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=video.name,
+                raw_state="moving",
+                progress=0.5,
+                ratio=0.25,
+                save_path=str(video.parent),
+                content_path=str(video),
+            )
+        ]
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Downloading.value
+    assert record.download_path is None
+
+
 async def test_import_generic_file_under_release_folder_succeeds(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -1762,7 +2019,22 @@ class _LosingRaceFs(LocalFileSystem):
         super().__init__()
         self._winner_size = winner_size
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(
+        self, src: Path, dst: Path, *, destination_root: Path | None = None
+    ) -> FilePlacementIdentity:
+        del destination_root
+        _make_video(dst, self._winner_size)
+        raise FileExistsError(str(dst))
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        del source_fd, source_name, destination_root
         _make_video(dst, self._winner_size)
         raise FileExistsError(str(dst))
 
@@ -1770,9 +2042,28 @@ class _LosingRaceFs(LocalFileSystem):
 class _WrongSameSizeFs(LocalFileSystem):
     """Loses placement to a same-size but different file."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(
+        self, src: Path, dst: Path, *, destination_root: Path | None = None
+    ) -> FilePlacementIdentity:
+        del destination_root
         dst.parent.mkdir(parents=True, exist_ok=True)
         size = os.path.getsize(src)
+        with dst.open("wb") as handle:
+            handle.seek(size - 1)
+            handle.write(b"x")
+        raise FileExistsError(str(dst))
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        del source_name, destination_root
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        size = os.fstat(source_fd).st_size
         with dst.open("wb") as handle:
             handle.seek(size - 1)
             handle.write(b"x")
@@ -1782,21 +2073,83 @@ class _WrongSameSizeFs(LocalFileSystem):
 class _CrashAfterPublishFs(LocalFileSystem):
     """Simulate process death after the final library pathname becomes visible."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(
+        self, src: Path, dst: Path, *, destination_root: Path | None = None
+    ) -> FilePlacementIdentity:
+        del destination_root
         super().hardlink_or_copy(src, dst)
+        raise RuntimeError("simulated process death after placement publish")
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        super().hardlink_or_copy_from_fd_beneath(
+            source_fd,
+            source_name,
+            dst,
+            destination_root=destination_root,
+        )
         raise RuntimeError("simulated process death after placement publish")
 
 
 class _ReplaceAfterPublishFs(LocalFileSystem):
     """Return the original publish token after replacing its pathname."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity:
+    def hardlink_or_copy(
+        self, src: Path, dst: Path, *, destination_root: Path | None = None
+    ) -> FilePlacementIdentity:
+        del destination_root
         published = super().hardlink_or_copy(src, dst)
         dst.unlink()
         _make_video(dst, src.stat().st_size)
         with dst.open("r+b") as handle:
             handle.write(b"replacement")
         return published
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        published = super().hardlink_or_copy_from_fd_beneath(
+            source_fd,
+            source_name,
+            dst,
+            destination_root=destination_root,
+        )
+        dst.unlink()
+        _make_video(dst, os.fstat(source_fd).st_size)
+        with dst.open("r+b") as handle:
+            handle.write(b"replacement")
+        return published
+
+
+class _PublishThenFailFs(LocalFileSystem):
+    """Leave a published destination behind, then surface an adapter failure."""
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        super().hardlink_or_copy_from_fd_beneath(
+            source_fd,
+            source_name,
+            dst,
+            destination_root=destination_root,
+        )
+        raise OSError("simulated post-publish adapter failure")
 
 
 async def _import_with_fs(
@@ -1932,7 +2285,7 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
     # The legitimate rollback the F3 fix must preserve: THIS import actually places
-    # the file (real hardlink via LocalFileSystem), then the Plex scan fails. Because
+    # the file (real snapshot via LocalFileSystem), then the Plex scan fails. Because
     # this attempt created dst, it IS rolled back, so a later reject / re-search
     # can't orphan it in the library (the retry re-places it).
     movies_root = tmp_path / "library"
@@ -1982,15 +2335,26 @@ async def test_movie_scan_rollback_preserves_breadcrumb_when_unlink_is_denied(
         request_status=RequestStatus.downloading,
         download_status=DownloadState.ImportPending.value,
     )
-    original_unlink = Path.unlink
+    original_exchange = import_service.rename_exchange
     deny_unlink = True
 
-    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
-        if deny_unlink and path == dst:
+    def _permission_guard(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        if deny_unlink and left_dir_fd is not None and left == dst.name:
             raise PermissionError("simulated read-only movie library")
-        original_unlink(path, missing_ok=missing_ok)
+        original_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
 
-    monkeypatch.setattr(Path, "unlink", _permission_guard)
+    monkeypatch.setattr(import_service, "rename_exchange", _permission_guard)
 
     blocked = await _import(
         sessionmaker_, download_id, movies_root, _qbt(video), _ScanFailsLibrary()
@@ -2019,7 +2383,7 @@ async def test_movie_scan_rollback_preserves_breadcrumb_when_unlink_is_denied(
 
 
 async def test_live_safe_movie_never_overwrites_mismatched_existing_breadcrumb(
-    tmp_path: Path, sessionmaker_: SessionMaker
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     movies_root = tmp_path / "library"
     movies_root.mkdir()
@@ -2037,6 +2401,12 @@ async def test_live_safe_movie_never_overwrites_mismatched_existing_breadcrumb(
         assert download is not None
         download.download_path = str(stale)
         await session.commit()
+
+    def _unexpected_probe(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("a mismatched persisted breadcrumb must not be inspected")
+
+    monkeypatch.setattr(import_service, "_trusted_breadcrumb_cleanup_state", _unexpected_probe)
+    monkeypatch.setattr(import_service, "_classify_stored_path", _unexpected_probe)
 
     record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
 
@@ -2092,7 +2462,7 @@ async def test_scan_failure_never_deletes_unproven_identical_destination_file(
 async def test_import_idempotent_when_placement_race_lost_to_same_size(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
-    # The operator's retry races the reconcile loop; this import's hardlink raises
+    # The operator's retry races the reconcile loop; this import's placement raises
     # EEXIST, but the winner already placed an identical (same-size) file. That is an
     # idempotent win — the import completes, it is NOT blocked.
     movies_root = tmp_path / "library"
@@ -2462,7 +2832,7 @@ async def test_import_never_places_a_stale_shorter_suffix_match(
     # The decisive assertions: the stale file was neither validated nor placed.
     assert not any(movies_root.iterdir())
     assert library.scanned == []
-    # The stale source itself is untouched (never hardlinked out).
+    # The stale source itself is untouched (never copied into the library).
     assert stale.exists()
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
@@ -2660,25 +3030,1142 @@ def test_place_file_refuses_dangling_symlink_destination(tmp_path: Path) -> None
 
     with pytest.raises(FileExistsError):
         import_service._place_file(  # pyright: ignore[reportPrivateUsage]
-            LocalFileSystem(), str(src), dst
+            LocalFileSystem(), _source_candidate_for(src), dst, allowed_root=str(tmp_path)
         )
 
     assert dst.is_symlink()
     assert not target.exists()
 
 
-def test_same_file_content_false_for_dangling_symlink(tmp_path: Path) -> None:
-    """``_same_file_content`` must not raise ``FileNotFoundError`` on a dangling
-    symlink dst -- it is honestly NOT the same content as a real src file."""
+def test_place_file_refuses_fifo_destination_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"payload")
+    dst = tmp_path / "dst.mkv"
+    os.mkfifo(dst)
+    real_open = os.open
+    destination_opened = False
+
+    def _require_nonblocking_destination(
+        path: str | bytes,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal destination_opened
+        if path == dst.name and dir_fd is not None:
+            destination_opened = True
+            assert flags & os.O_NONBLOCK
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _require_nonblocking_destination)
+
+    with pytest.raises(FileExistsError):
+        import_service._place_file(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            _source_candidate_for(src),
+            dst,
+            allowed_root=str(tmp_path),
+        )
+
+    assert destination_opened
+    assert stat.S_ISFIFO(dst.stat().st_mode)
+
+
+def test_place_file_never_publishes_through_ancestor_symlink(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    title_dir = library_root / "Movie (2020)"
+    title_dir.symlink_to(outside, target_is_directory=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title_dir / "Movie (2020).mkv"
+
+    with pytest.raises(OSError):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            _source_candidate_for(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    assert not (outside / dst.name).exists()
+    assert not (outside / f".{dst.name}.publish.lock").exists()
+
+
+def test_adopted_file_replacement_during_comparison_is_not_attested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"expected")
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    dst.parent.mkdir()
+    dst.write_bytes(b"expected")
+    original_digest = import_service._file_digest  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    def _replace_after_comparison(path: str | Path) -> bytes:
+        nonlocal calls
+        digest = original_digest(path)
+        calls += 1
+        if calls == 2:
+            dst.unlink()
+            dst.write_bytes(b"replaced")
+        return digest
+
+    monkeypatch.setattr(import_service, "_file_digest", _replace_after_comparison)
+
+    with pytest.raises(FileExistsError):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            _source_candidate_for(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+    assert dst.read_bytes() == b"replaced"
+
+
+def test_adopted_content_comparison_never_follows_sandwiched_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"GOOD")
+    title_dir = library_root / "Movie (2020)"
+    dst = title_dir / "Movie (2020).mkv"
+    title_dir.mkdir()
+    dst.write_bytes(b"EVIL")
+    outside_title = tmp_path / "outside-title"
+    outside_title.mkdir()
+    (outside_title / dst.name).write_bytes(b"GOOD")
+    moved_title = tmp_path / "moved-title"
+    original_digest = import_service._file_digest  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    def _sandwich_ancestor(path: str | Path) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls != 2:
+            return original_digest(path)
+        title_dir.rename(moved_title)
+        title_dir.symlink_to(outside_title, target_is_directory=True)
+        try:
+            return original_digest(path)
+        finally:
+            title_dir.unlink()
+            moved_title.rename(title_dir)
+
+    monkeypatch.setattr(import_service, "_file_digest", _sandwich_ancestor)
+
+    assert (
+        import_service._adopted_file_identity_if_same(  # pyright: ignore[reportPrivateUsage]
+            str(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+    assert dst.read_bytes() == b"EVIL"
+
+
+def test_validated_source_rejects_ancestor_replaced_by_outside_symlink(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "downloads" / "Release"
+    source_path = release / "movie.mkv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"validated")
+    source = _source_candidate_for(source_path)
+
+    saved_release = tmp_path / "saved-release"
+    release.rename(saved_release)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / source_path.name).write_bytes(b"SECRET")
+    release.symlink_to(outside, target_is_directory=True)
+
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    with pytest.raises(OSError, match="source authority changed"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    assert not dst.exists()
+    assert (outside / source_path.name).read_bytes() == b"SECRET"
+
+
+def test_source_enumeration_rejects_final_symlink_even_with_in_root_target(
+    tmp_path: Path,
+) -> None:
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    target = downloads / "other" / "secret.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"secret")
+    content = downloads / "Movie.2020.1080p.WEB-DL.mkv"
+    content.symlink_to(target)
+
+    assert _resolve_sources_for(LocalFileSystem(), content) == []
+
+
+async def test_live_content_resolution_preserves_final_symlink_for_nofollow(
+    tmp_path: Path,
+) -> None:
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    target = downloads / "other" / "Movie.2020.1080p.WEB-DL.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"cross-torrent bytes")
+    content = downloads / "Movie.2020.1080p.WEB-DL.mkv"
+    content.symlink_to(target)
+    status = DownloadStatus(
+        info_hash=_HASH,
+        name=content.name,
+        raw_state="stalledUP",
+        progress=1.0,
+        save_path=str(downloads),
+        content_path=str(content),
+    )
+
+    resolved = import_service._resolve_content(  # pyright: ignore[reportPrivateUsage]
+        status,
+        None,
+    )
+    assert resolved is not None
+    assert resolved.path == str(content)
+    visible = await import_service._resolve_visible_content(  # pyright: ignore[reportPrivateUsage]
+        FakeQbittorrent(),
+        _HASH,
+        resolved,
+    )
+    assert visible is not None
+    assert (
+        import_service._resolve_sources(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            visible.path,
+            source_root=visible.source_root,
+            source_root_identity=visible.source_root_identity,
+        )
+        == []
+    )
+    assert target.read_bytes() == b"cross-torrent bytes"
+
+
+def test_live_content_resolution_rejects_symlinked_save_root(tmp_path: Path) -> None:
+    real_downloads = tmp_path / "real-downloads"
+    real_downloads.mkdir()
+    content = real_downloads / "Movie.2020.1080p.WEB-DL.mkv"
+    content.write_bytes(b"cross-torrent bytes")
+    reported_downloads = tmp_path / "reported-downloads"
+    reported_downloads.symlink_to(real_downloads, target_is_directory=True)
+    status = DownloadStatus(
+        info_hash=_HASH,
+        name=content.name,
+        raw_state="stalledUP",
+        progress=1.0,
+        save_path=str(reported_downloads),
+        content_path=str(reported_downloads / content.name),
+    )
+
+    with pytest.raises(
+        import_service._UnsafeContentPathError,  # pyright: ignore[reportPrivateUsage]
+        match="save path must not be a symlink",
+    ):
+        import_service._resolve_content(  # pyright: ignore[reportPrivateUsage]
+            status,
+            None,
+        )
+
+
+def test_source_enumeration_rejects_fifo_swap_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated")
+    real_open = os.open
+    swapped = False
+
+    def _swap_regular_for_fifo(
+        path: str | bytes,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        decoded = os.fsdecode(path)
+        if not swapped and (
+            decoded == os.fspath(source_path)
+            or (dir_fd is not None and decoded == source_path.name)
+        ):
+            swapped = True
+            assert flags & (os.O_NONBLOCK | os.O_DIRECTORY)
+            source_path.unlink()
+            os.mkfifo(source_path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _swap_regular_for_fifo)
+
+    assert _resolve_sources_for(LocalFileSystem(), source_path) == []
+    assert swapped
+
+
+def test_validated_source_rejects_fifo_swap_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated")
+    source = _source_candidate_for(source_path)
+    real_open = os.open
+    swapped = False
+
+    def _swap_regular_for_fifo(
+        path: str | bytes,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        decoded = os.fsdecode(path)
+        if not swapped and (
+            decoded == os.fspath(source_path)
+            or (dir_fd is not None and decoded == source_path.name)
+        ):
+            swapped = True
+            assert flags & os.O_NONBLOCK
+            source_path.unlink()
+            os.mkfifo(source_path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _swap_regular_for_fifo)
+
+    with (
+        pytest.raises(OSError, match="source identity changed"),
+        import_service._anchored_source_file(source),  # pyright: ignore[reportPrivateUsage]
+    ):
+        pytest.fail("FIFO replacement must not be accepted")
+    assert swapped
+
+
+def test_source_enumeration_never_reauthorizes_swapped_content_root(tmp_path: Path) -> None:
+    release = tmp_path / "downloads" / "Release"
+    source_path = release / "movie.mkv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"GOOD")
+    saved_release = tmp_path / "saved-release"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / source_path.name).write_bytes(b"SECRET")
+
+    class _SwapRootAfterListingFs(LocalFileSystem):
+        def list_video_files(self, root: str) -> list[tuple[str, int, str]]:
+            listed = super().list_video_files(root)
+            release.rename(saved_release)
+            release.symlink_to(outside, target_is_directory=True)
+            return listed
+
+    assert _resolve_sources_for(_SwapRootAfterListingFs(), release) == []
+    assert (saved_release / source_path.name).read_bytes() == b"GOOD"
+    assert (outside / source_path.name).read_bytes() == b"SECRET"
+
+
+async def test_source_enumeration_stays_bound_to_validated_save_root(tmp_path: Path) -> None:
+    downloads = tmp_path / "downloads"
+    release = downloads / "level" / "Release"
+    source_path = release / "movie.mkv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"GOODGOOD")
+    status = DownloadStatus(
+        info_hash=_HASH,
+        name="level/Release",
+        raw_state="stalledUP",
+        progress=1.0,
+        save_path=str(downloads),
+        content_path=str(release),
+    )
+    resolved = import_service._resolve_content(  # pyright: ignore[reportPrivateUsage]
+        status,
+        None,
+    )
+    assert resolved is not None
+
+    saved_level = tmp_path / "saved-level"
+    (downloads / "level").rename(saved_level)
+    outside_level = tmp_path / "outside-level"
+    outside_release = outside_level / "Release"
+    outside_release.mkdir(parents=True)
+    (outside_release / source_path.name).write_bytes(b"EVILEVIL")
+    (downloads / "level").symlink_to(outside_level, target_is_directory=True)
+
+    visible = await import_service._resolve_visible_content(  # pyright: ignore[reportPrivateUsage]
+        FakeQbittorrent(),
+        _HASH,
+        resolved,
+    )
+    assert visible is not None
+    assert (
+        import_service._resolve_sources(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            visible.path,
+            source_root=visible.source_root,
+            source_root_identity=visible.source_root_identity,
+        )
+        == []
+    )
+    assert (saved_level / "Release" / source_path.name).read_bytes() == b"GOODGOOD"
+    assert (outside_release / source_path.name).read_bytes() == b"EVILEVIL"
+
+
+async def test_remapped_save_root_cannot_escape_after_manifest_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host_save = tmp_path / "host-unseen" / "save"
+    host_content = host_save / "Release"
+    status = DownloadStatus(
+        info_hash=_HASH,
+        name="Release",
+        raw_state="stalledUP",
+        progress=1.0,
+        save_path=str(host_save),
+        content_path=str(host_content),
+    )
+    resolved = import_service._resolve_content(  # pyright: ignore[reportPrivateUsage]
+        status,
+        None,
+    )
+    assert resolved is not None
+
+    visible_root = tmp_path / "visible-save"
+    visible_content = visible_root / "Release"
+    visible_content.mkdir(parents=True)
+    (visible_content / "movie.mkv").write_bytes(b"GOODGOOD")
+    saved_root = tmp_path / "saved-visible-root"
+    outside_root = tmp_path / "outside-visible-root"
+    outside_content = outside_root / "Release"
+    outside_content.mkdir(parents=True)
+    (outside_content / "movie.mkv").write_bytes(b"EVILEVIL")
+
+    def _swap_after_proof(
+        _content: str,
+        _save_path: str,
+        _expected: list[tuple[str, int]],
+    ) -> str:
+        visible_root.rename(saved_root)
+        visible_root.symlink_to(outside_root, target_is_directory=True)
+        return str(visible_content)
+
+    monkeypatch.setattr(path_visibility, "remap_download_content", _swap_after_proof)
+    qbt = FakeQbittorrent(
+        files={_HASH: [DownloadedFile(name="Release/movie.mkv", size_bytes=len(b"GOODGOOD"))]}
+    )
+
+    assert (
+        await import_service._resolve_visible_content(  # pyright: ignore[reportPrivateUsage]
+            qbt,
+            _HASH,
+            resolved,
+        )
+        is None
+    )
+    assert (saved_root / "Release" / "movie.mkv").read_bytes() == b"GOODGOOD"
+    assert (outside_content / "movie.mkv").read_bytes() == b"EVILEVIL"
+
+
+def test_source_descriptor_pins_validated_inode_through_publication(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated bytes")
+    source = _source_candidate_for(source_path)
+    saved = source_path.with_name("validated-saved.mkv")
+
+    class _SwapAfterSourceOpenFs(LocalFileSystem):
+        def hardlink_or_copy_from_fd_beneath(
+            self,
+            source_fd: int,
+            source_name: str,
+            dst: Path,
+            *,
+            destination_root: Path,
+        ) -> FilePlacementIdentity:
+            source_path.rename(saved)
+            source_path.write_bytes(b"attacker payload")
+            return super().hardlink_or_copy_from_fd_beneath(
+                source_fd,
+                source_name,
+                dst,
+                destination_root=destination_root,
+            )
+
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    with pytest.raises(OSError, match="source changed during publication"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            _SwapAfterSourceOpenFs(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+    assert not dst.exists()
+    assert saved.read_bytes() == b"validated bytes"
+    assert source_path.read_bytes() == b"attacker payload"
+
+
+def test_source_mutation_during_publication_is_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated")
+    source = _source_candidate_for(source_path)
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    real_copy = local_filesystem._copy_exact_fd  # pyright: ignore[reportPrivateUsage]
+
+    def _mutate_then_copy(source_fd: int, destination_fd: int, expected_size: int) -> None:
+        with open(f"/proc/self/fd/{source_fd}", "r+b") as handle:
+            handle.seek(0)
+            handle.write(b"EVILBYTES")
+            handle.truncate()
+        real_copy(source_fd, destination_fd, expected_size)
+
+    monkeypatch.setattr(
+        local_filesystem,
+        "_copy_exact_fd",
+        _mutate_then_copy,
+    )
+
+    with pytest.raises(OSError, match="source changed during publication"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    assert not dst.exists()
+
+
+def test_secure_import_rejects_shared_source_inode(tmp_path: Path) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated")
+    source = _source_candidate_for(source_path)
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    class _HardlinkingFs(LocalFileSystem):
+        def hardlink_or_copy_from_fd_beneath(
+            self,
+            source_fd: int,
+            source_name: str,
+            dst: Path,
+            *,
+            destination_root: Path,
+        ) -> FilePlacementIdentity:
+            del source_fd, source_name, destination_root
+            dst.parent.mkdir(parents=True)
+            os.link(source_path, dst)
+            return FilePlacementIdentity(
+                dst.stat().st_dev,
+                dst.stat().st_ino,
+                dst.stat().st_size,
+                dst.stat().st_mtime_ns,
+                dst.stat().st_ctime_ns,
+                dst.stat().st_mode,
+            )
+
+    with pytest.raises(OSError, match="source changed during publication"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            _HardlinkingFs(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    assert source_path.read_bytes() == b"validated"
+    assert not dst.exists()
+
+
+def test_cross_filesystem_copy_rejects_rewrite_with_restored_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"GOODGOOD")
+    source = _source_candidate_for(source_path)
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    class _TransientRewriteFs(LocalFileSystem):
+        def hardlink_or_copy_from_fd_beneath(
+            self,
+            source_fd: int,
+            source_name: str,
+            dst: Path,
+            *,
+            destination_root: Path,
+        ) -> FilePlacementIdentity:
+            initial = os.fstat(source_fd)
+            with open(f"/proc/self/fd/{source_fd}", "r+b") as handle:
+                handle.write(b"EVILEVIL")
+                handle.truncate()
+            placed = super().hardlink_or_copy_from_fd_beneath(
+                source_fd,
+                source_name,
+                dst,
+                destination_root=destination_root,
+            )
+            with open(f"/proc/self/fd/{source_fd}", "r+b") as handle:
+                handle.write(b"GOODGOOD")
+                handle.truncate()
+            os.utime(
+                source_fd,
+                ns=(initial.st_atime_ns, initial.st_mtime_ns),
+            )
+            os.fchmod(source_fd, stat.S_IMODE(initial.st_mode))
+            return placed
+
+    with pytest.raises(OSError, match="source changed during publication"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            _TransientRewriteFs(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    current = source_path.stat()
+    assert source_path.read_bytes() == b"GOODGOOD"
+    assert current.st_size == source.identity.size
+    assert current.st_mtime_ns == source.identity.mtime_ns
+    assert stat.S_IMODE(current.st_mode) == stat.S_IMODE(source.identity.mode)
+    assert current.st_ctime_ns != source.identity.ctime_ns
+    assert not dst.exists()
+
+
+def test_unlinked_validated_source_copy_is_rolled_back(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated")
+    source = _source_candidate_for(source_path)
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    class _UnlinkAfterSourceOpenFs(LocalFileSystem):
+        def hardlink_or_copy_from_fd_beneath(
+            self,
+            source_fd: int,
+            source_name: str,
+            dst: Path,
+            *,
+            destination_root: Path,
+        ) -> FilePlacementIdentity:
+            source_path.unlink()
+            return super().hardlink_or_copy_from_fd_beneath(
+                source_fd,
+                source_name,
+                dst,
+                destination_root=destination_root,
+            )
+
+    with pytest.raises(OSError, match="source changed during publication"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            _UnlinkAfterSourceOpenFs(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    assert not source_path.exists()
+    assert not dst.exists()
+
+
+def test_destination_parent_move_during_publish_leaves_no_outside_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "downloads" / "movie.mkv"
+    source_path.parent.mkdir()
+    source_path.write_bytes(b"validated bytes")
+    source = _source_candidate_for(source_path)
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    title_dir = library_root / "Movie (2020)"
+    moved_title = tmp_path / "moved-title"
+    dst = title_dir / "Movie (2020).mkv"
+    real_publish = local_filesystem.rename_no_replace
+    moved = False
+
+    def _move_parent_then_publish(
+        source_name: str | bytes,
+        destination_name: str | bytes,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal moved
+        if not moved:
+            moved = True
+            title_dir.rename(moved_title)
+            title_dir.mkdir()
+        real_publish(
+            source_name,
+            destination_name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        local_filesystem,
+        "rename_no_replace",
+        _move_parent_then_publish,
+    )
+
+    with pytest.raises(OSError, match="destination authority changed"):
+        import_service._place_file_with_identity(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(),
+            source,
+            dst,
+            allowed_root=str(library_root),
+        )
+
+    assert not dst.exists()
+    assert not (moved_title / dst.name).exists()
+
+
+def test_adopted_file_identity_is_none_for_dangling_symlink(tmp_path: Path) -> None:
+    """A dangling destination is never adopted as the source's content."""
     src = tmp_path / "src.mkv"
     src.write_text("payload")
     dst = tmp_path / "dst.mkv"
     dst.symlink_to(tmp_path / "gone.mkv")
 
     assert (
-        import_service._same_file_content(str(src), dst)  # pyright: ignore[reportPrivateUsage]
+        import_service._adopted_file_identity_if_same(  # pyright: ignore[reportPrivateUsage]
+            str(src),
+            dst,
+            allowed_root=str(tmp_path),
+        )
+        is None
+    )
+
+
+def test_adopted_file_identity_rejects_shared_source_inode(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    src = tmp_path / "downloads" / "src.mkv"
+    src.parent.mkdir()
+    src.write_bytes(b"payload")
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    dst.parent.mkdir()
+    os.link(src, dst)
+
+    assert (
+        import_service._adopted_file_identity_if_same(  # pyright: ignore[reportPrivateUsage]
+            str(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+    src.write_bytes(b"changed")
+    assert dst.read_bytes() == b"changed"
+
+
+def test_adopted_file_identity_rejects_unknown_external_hardlink(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    src = tmp_path / "downloads" / "current.mkv"
+    src.parent.mkdir()
+    src.write_bytes(b"GOODGOOD")
+    old_source = tmp_path / "old-torrent.mkv"
+    old_source.write_bytes(b"GOODGOOD")
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    dst.parent.mkdir()
+    os.link(old_source, dst)
+
+    assert (
+        import_service._adopted_file_identity_if_same(  # pyright: ignore[reportPrivateUsage]
+            str(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+    old_source.write_bytes(b"EVILEVIL")
+    assert dst.read_bytes() == b"EVILEVIL"
+
+
+def test_adopted_file_identity_rejects_external_write_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    src = tmp_path / "downloads" / "current.mkv"
+    src.parent.mkdir()
+    src.write_bytes(b"GOODGOOD")
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    dst.parent.mkdir()
+    dst.write_bytes(b"GOODGOOD")
+    dst.chmod(0o666)
+
+    assert (
+        import_service._adopted_file_identity_if_same(  # pyright: ignore[reportPrivateUsage]
+            str(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+
+    dst.chmod(0o644)
+    real_euid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real_euid + 1)
+    assert (
+        import_service._adopted_file_identity_if_same(  # pyright: ignore[reportPrivateUsage]
+            str(src),
+            dst,
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+
+
+def test_snapshot_permission_guard_reads_xattrs_from_held_file(tmp_path: Path) -> None:
+    path = tmp_path / "snapshot.mkv"
+    path.write_bytes(b"payload")
+    try:
+        os.setxattr(path, "user.acl_probe", b"present")
+    except OSError as exc:
+        if exc.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            pytest.skip("test filesystem does not support extended attributes")
+        raise
+
+    with path.open("rb") as handle:
+        assert not import_service._snapshot_permissions_are_safe(  # pyright: ignore[reportPrivateUsage]
+            os.fstat(handle.fileno()),
+            handle.fileno(),
+        )
+
+
+def test_payload_identity_and_removal_reject_ancestor_symlink_escape(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    movie_dir = library_root / "Movie (2020)"
+    movie = movie_dir / "Movie (2020).mkv"
+    _make_video(movie)
+    identity = import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+        str(movie),
+        allowed_root=str(library_root),
+    )
+    assert identity is not None
+    assert (
+        import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+            str(library_root),
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+
+    outside_dir = tmp_path / "moved-outside-library"
+    movie_dir.rename(outside_dir)
+    movie_dir.symlink_to(outside_dir, target_is_directory=True)
+
+    assert (
+        import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+            str(movie),
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+    assert (
+        import_service._remove_quietly(  # pyright: ignore[reportPrivateUsage]
+            movie,
+            expected_identity=identity,
+            allowed_root=str(library_root),
+        )
         is False
     )
+    assert (outside_dir / movie.name).exists()
+
+
+def test_payload_identity_and_removal_reject_configured_root_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    movie = outside / "Movie (2020)" / "Movie (2020).mkv"
+    _make_video(movie)
+    library_root = tmp_path / "library"
+    library_root.symlink_to(outside, target_is_directory=True)
+    identity = import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+        str(movie),
+        allowed_root=str(tmp_path),
+    )
+    assert identity is not None
+
+    assert (
+        import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+            str(library_root / "Movie (2020)" / movie.name),
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+    assert not import_service._remove_quietly(  # pyright: ignore[reportPrivateUsage]
+        library_root / "Movie (2020)" / movie.name,
+        expected_identity=identity,
+        allowed_root=str(library_root),
+    )
+    assert movie.exists()
+
+
+def test_payload_identity_traversal_is_pinned_during_ancestor_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    season_dir = library_root / "Show (2020)" / "Season 01"
+    episode = season_dir / "Show - S01E01.mkv"
+    _make_video(episode)
+    moved_show = tmp_path / "moved-show"
+    outside_show = tmp_path / "outside-show"
+    outside_episode = outside_show / "Season 01" / episode.name
+    _make_video(outside_episode)
+    real_scandir = os.scandir
+    swapped = False
+
+    def _swap_before_scan(path: int) -> Iterator[os.DirEntry[str]]:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            season_dir.parent.rename(moved_show)
+            season_dir.parent.symlink_to(outside_show, target_is_directory=True)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _swap_before_scan)
+
+    assert (
+        import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+            str(season_dir),
+            allowed_root=str(library_root),
+        )
+        is None
+    )
+    assert outside_episode.exists()
+    assert (moved_show / "Season 01" / episode.name).exists()
+
+
+def test_owned_removal_keeps_parent_authority_during_ancestor_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    movie_dir = library_root / "Movie (2020)"
+    movie = movie_dir / "Movie (2020).mkv"
+    _make_video(movie)
+    identity = import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+        str(movie),
+        allowed_root=str(library_root),
+    )
+    assert identity is not None
+    moved_owned_dir = tmp_path / "moved-owned-dir"
+    attacker_dir = tmp_path / "attacker-dir"
+    victim = attacker_dir / movie.name
+    _make_video(victim)
+    real_exchange = import_service.rename_exchange
+    swapped = False
+
+    def _swap_parent_before_exchange(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if not swapped and left_dir_fd is not None and left == movie.name:
+            swapped = True
+            movie_dir.rename(moved_owned_dir)
+            movie_dir.symlink_to(attacker_dir, target_is_directory=True)
+        real_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
+
+    monkeypatch.setattr(import_service, "rename_exchange", _swap_parent_before_exchange)
+
+    assert not import_service._remove_quietly(  # pyright: ignore[reportPrivateUsage]
+        movie,
+        expected_identity=identity,
+        allowed_root=str(library_root),
+    )
+    assert victim.exists(), "cleanup must never follow the replacement ancestor"
+    assert not (moved_owned_dir / movie.name).exists()
+
+
+def test_owned_removal_never_unlinks_final_component_race_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library_root = tmp_path / "library"
+    movie_dir = library_root / "Movie (2020)"
+    movie = movie_dir / "Movie (2020).mkv"
+    movie.parent.mkdir(parents=True)
+    movie.write_bytes(b"owned")
+    victim = movie_dir / "victim.mkv"
+    victim.write_bytes(b"victim")
+    identity = import_service._payload_content_identity(  # pyright: ignore[reportPrivateUsage]
+        str(movie),
+        allowed_root=str(library_root),
+    )
+    assert identity is not None
+    real_exchange = import_service.rename_exchange
+    swapped = False
+
+    def _swap_final_before_capture(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if not swapped and left_dir_fd is not None and left == movie.name:
+            swapped = True
+            os.rename(
+                movie.name,
+                "saved-owned.mkv",
+                src_dir_fd=left_dir_fd,
+                dst_dir_fd=left_dir_fd,
+            )
+            os.rename(
+                victim.name,
+                movie.name,
+                src_dir_fd=left_dir_fd,
+                dst_dir_fd=left_dir_fd,
+            )
+        real_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
+
+    monkeypatch.setattr(import_service, "rename_exchange", _swap_final_before_capture)
+
+    assert not import_service._remove_quietly(  # pyright: ignore[reportPrivateUsage]
+        movie,
+        expected_identity=identity,
+        allowed_root=str(library_root),
+    )
+    assert (movie_dir / "saved-owned.mkv").read_bytes() == b"owned"
+    assert movie.read_bytes() == b"victim"
+    assert not list(movie_dir.glob(".plex-manager-cleanup-*"))
+
+
+def test_empty_breadcrumb_cleanup_never_follows_replaced_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    title_dir = tv_root / "Some Show (2020)"
+    season_dir = title_dir / "Season 01"
+    season_dir.mkdir(parents=True)
+    moved_title = tmp_path / "moved-title"
+    outside_title = tmp_path / "outside-title"
+    outside_season = outside_title / season_dir.name
+    outside_season.mkdir(parents=True)
+    real_clear = import_service.clear_stale_publish_locks
+    swapped = False
+
+    def _swap_ancestor_then_clear(directory: Path) -> Literal["cleared", "pending", "protected"]:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            title_dir.rename(moved_title)
+            title_dir.symlink_to(outside_title, target_is_directory=True)
+        return real_clear(directory)
+
+    monkeypatch.setattr(
+        import_service,
+        "clear_stale_publish_locks",
+        _swap_ancestor_then_clear,
+    )
+
+    state = import_service._trusted_breadcrumb_cleanup_state(  # pyright: ignore[reportPrivateUsage]
+        str(tv_root),
+        season_dir,
+        allow_empty_directory=True,
+    )
+
+    assert state == "protected"
+    assert (moved_title / season_dir.name).is_dir()
+    assert outside_season.is_dir()
+
+
+def test_empty_breadcrumb_cleanup_does_not_report_late_race_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Some Show (2020)" / "Season 01"
+    season_dir.mkdir(parents=True)
+    saved_name = "saved-season"
+    real_rename = import_service.rename_no_replace
+
+    def _move_observed_directory_then_fail(
+        src: str | bytes,
+        target: str | bytes,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if src_dir_fd is not None and src == season_dir.name:
+            os.rename(
+                src,
+                saved_name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=src_dir_fd,
+            )
+            raise FileNotFoundError(src)
+        real_rename(
+            src,
+            target,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        import_service,
+        "rename_no_replace",
+        _move_observed_directory_then_fail,
+    )
+
+    state = import_service._trusted_breadcrumb_cleanup_state(  # pyright: ignore[reportPrivateUsage]
+        str(tv_root),
+        season_dir,
+        allow_empty_directory=True,
+    )
+
+    assert state == "protected"
+    assert (season_dir.parent / saved_name).is_dir()
 
 
 def test_tree_attestation_rejects_replacement_after_per_file_observation(
@@ -2690,8 +4177,8 @@ def test_tree_attestation_rejects_replacement_after_per_file_observation(
     _make_video(episode_1)
     _make_video(episode_2)
     original_identity = import_service._payload_content_identity  # pyright: ignore[reportPrivateUsage]
-    identity_1 = original_identity(str(episode_1))
-    identity_2 = original_identity(str(episode_2))
+    identity_1 = original_identity(str(episode_1), allowed_root=str(tmp_path))
+    identity_2 = original_identity(str(episode_2), allowed_root=str(tmp_path))
     assert identity_1 is not None and identity_2 is not None
     observations = [
         import_service._PlacedPath(episode_1, identity_1),  # pyright: ignore[reportPrivateUsage]
@@ -2699,7 +4186,7 @@ def test_tree_attestation_rejects_replacement_after_per_file_observation(
     ]
     calls = 0
 
-    def _replace_after_first_observation(path: str) -> str | None:
+    def _replace_after_first_observation(path: str, *, allowed_root: str) -> str | None:
         nonlocal calls
         calls += 1
         if calls == 3:
@@ -2707,7 +4194,7 @@ def test_tree_attestation_rejects_replacement_after_per_file_observation(
             _make_video(episode_1)
             with episode_1.open("r+b") as handle:
                 handle.write(b"replacement")
-        return original_identity(path)
+        return original_identity(path, allowed_root=allowed_root)
 
     monkeypatch.setattr(
         import_service,
@@ -2717,7 +4204,7 @@ def test_tree_attestation_rejects_replacement_after_per_file_observation(
 
     assert (
         import_service._payload_identity_if_observations_match(  # pyright: ignore[reportPrivateUsage]
-            str(season_dir), observations
+            str(season_dir), observations, allowed_root=str(tmp_path)
         )
         is None
     )
@@ -3580,14 +5067,25 @@ async def test_scoped_tv_partial_cleanup_keeps_failed_scope_breadcrumb(
     season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
     season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
     season_2_episode = season_2_dir / "Some Show - S02E01.mkv"
-    original_unlink = Path.unlink
+    original_exchange = import_service.rename_exchange
 
-    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
-        if path == season_2_episode:
+    def _permission_guard(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        if left_dir_fd is not None and left == season_2_episode.name:
             raise PermissionError("simulated read-only second season")
-        original_unlink(path, missing_ok=missing_ok)
+        original_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
 
-    monkeypatch.setattr(Path, "unlink", _permission_guard)
+    monkeypatch.setattr(import_service, "rename_exchange", _permission_guard)
 
     record = await _import_tv(
         sessionmaker_,
@@ -3632,6 +5130,36 @@ async def test_scoped_tv_partial_cleanup_keeps_failed_scope_breadcrumb(
     assert repeated.failed_reason is not None
     assert "manual cleanup before re-search" in repeated.failed_reason
     assert season_2_episode.exists()
+
+
+async def test_scoped_tv_post_publish_copy_error_retains_cleanup_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportPending.value
+    )
+    season_dir = tv_root / "Some Show (2020)" / "Season 01"
+    episode = season_dir / "Some Show - S01E01.mkv"
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(release_dir),
+        FakeLibrary(),
+        fs=_PublishThenFailFs(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_dir)
+    assert record.failed_reason is not None
+    assert "manual cleanup before re-search" in record.failed_reason
+    assert episode.exists()
 
 
 async def test_import_tv_scoped_unsafe_payload_fails_and_rearms_every_scope(
@@ -3789,6 +5317,93 @@ async def test_import_tv_scoped_unvalidated_breadcrumb_waits_for_client_manifest
     assert request is not None and request.status is RequestStatus.import_blocked
     assert all(season is not None and season.status.value == "import_blocked" for season in seasons)
     assert all(scope.status == "import_blocked" for scope in scopes)
+
+
+async def test_scoped_tv_mismatched_breadcrumb_is_blocked_without_filesystem_probe(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    unrelated = tv_root / "Unrelated Show (2019)" / "Season 03"
+    unrelated.mkdir(parents=True)
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(unrelated)
+        await session.commit()
+
+    def _unexpected_probe(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("a mismatched persisted breadcrumb must not be inspected")
+
+    monkeypatch.setattr(import_service, "_trusted_breadcrumb_cleanup_state", _unexpected_probe)
+    monkeypatch.setattr(import_service, "_payload_content_identity", _unexpected_probe)
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(unrelated)
+    assert record.failed_reason is not None
+    assert "does not match any attached season" in record.failed_reason
+    assert unrelated.is_dir(), "an unrelated empty directory must never be removed"
+
+
+async def test_statusless_scoped_tv_clears_missing_trusted_manual_cleanup_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 01"
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportBlocked.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.failed_reason = failed_reason
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path is None
+    assert record.failed_reason == "download client reported no content path"
+
+
+async def test_statusless_scoped_tv_preserves_breadcrumb_when_root_is_unavailable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "unavailable-tv"
+    season_dir = tv_root / "Some Show (2020)" / "Season 01"
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportBlocked.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.failed_reason = failed_reason
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_dir)
+    assert record.failed_reason == failed_reason
 
 
 async def test_scoped_attested_breadcrumb_reorders_resume_before_other_scopes(
@@ -4606,6 +6221,69 @@ async def test_import_blocked_tv_missing_status_preserves_manual_cleanup_reason(
     assert placed_episode.exists()
 
 
+async def test_statusless_tv_clears_missing_trusted_manual_cleanup_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id, _season_id = await _seed_tv(
+        sessionmaker_,
+        season=2,
+        request_status=RequestStatus.import_blocked,
+        season_status=RequestStatus.import_blocked.value,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.failed_reason = failed_reason
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path is None
+    assert record.failed_reason == "download client reported no status for payload validation"
+
+
+async def test_statusless_tv_preserves_breadcrumb_when_library_root_is_unavailable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "unavailable-tv"
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id, _season_id = await _seed_tv(
+        sessionmaker_,
+        season=2,
+        request_status=RequestStatus.import_blocked,
+        season_status=RequestStatus.import_blocked.value,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.failed_reason = failed_reason
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_dir)
+    assert record.failed_reason == failed_reason
+
+
 async def test_import_blocked_tv_manual_cleanup_retry_with_live_unsafe_payload_stays_blocked(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -5121,14 +6799,25 @@ async def test_tv_scan_rollback_preserves_partial_cleanup_breadcrumb(
     season_dir = tv_root / "Some Show (2020)" / "Season 02"
     retained = season_dir / "Some Show - S02E01.mkv"
     removed = season_dir / "Some Show - S02E02.mkv"
-    original_unlink = Path.unlink
+    original_exchange = import_service.rename_exchange
 
-    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
-        if path == retained:
+    def _permission_guard(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        if left_dir_fd is not None and left == retained.name:
             raise PermissionError("simulated read-only episode")
-        original_unlink(path, missing_ok=missing_ok)
+        original_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
 
-    monkeypatch.setattr(Path, "unlink", _permission_guard)
+    monkeypatch.setattr(import_service, "rename_exchange", _permission_guard)
 
     blocked = await _import_tv(
         sessionmaker_, download_id, tv_root, _qbt(release_dir), _ScanFailsLibrary()
@@ -5164,7 +6853,7 @@ async def test_tv_scan_rollback_preserves_partial_cleanup_breadcrumb(
 
 
 async def test_live_safe_tv_never_overwrites_mismatched_existing_breadcrumb(
-    tmp_path: Path, sessionmaker_: SessionMaker
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tv_root = tmp_path / "tv"
     tv_root.mkdir()
@@ -5181,6 +6870,11 @@ async def test_live_safe_tv_never_overwrites_mismatched_existing_breadcrumb(
         assert download is not None
         download.download_path = str(stale_dir)
         await session.commit()
+
+    def _unexpected_probe(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("a mismatched persisted breadcrumb must not be inspected")
+
+    monkeypatch.setattr(import_service, "_trusted_breadcrumb_cleanup_state", _unexpected_probe)
 
     record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
 
@@ -5205,11 +6899,32 @@ class _FailsOnSecondCallFs(LocalFileSystem):
         super().__init__()
         self._calls = 0
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity:
+    def hardlink_or_copy(
+        self, src: Path, dst: Path, *, destination_root: Path | None = None
+    ) -> FilePlacementIdentity:
+        del destination_root
         self._calls += 1
         if self._calls >= 2:
             raise OSError("simulated copy failure")
         return super().hardlink_or_copy(src, dst)
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        self._calls += 1
+        if self._calls >= 2:
+            raise OSError("simulated copy failure")
+        return super().hardlink_or_copy_from_fd_beneath(
+            source_fd,
+            source_name,
+            dst,
+            destination_root=destination_root,
+        )
 
 
 async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(

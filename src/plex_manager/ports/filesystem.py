@@ -10,7 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import NamedTuple, Protocol, runtime_checkable
 
-__all__ = ["VIDEO_EXTENSIONS", "FilePlacementIdentity", "FileSystemPort"]
+__all__ = [
+    "VIDEO_EXTENSIONS",
+    "FilePlacementIdentity",
+    "FileSystemPort",
+    "RootAnchoredFileSystemPort",
+]
 
 #: Lowercased file suffixes (with the leading dot) that count as a video file
 #: when scanning a downloaded release for the main feature. Mirrors the common
@@ -46,6 +51,22 @@ class FilePlacementIdentity(NamedTuple):
     mtime_ns: int
     ctime_ns: int
     mode: int
+
+
+@runtime_checkable
+class RootAnchoredFileSystemPort(Protocol):
+    """Secure distinct-inode snapshot capability for the torrent boundary."""
+
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        """Copy an open source beneath a root without sharing its writable inode."""
+        raise NotImplementedError
 
 
 @runtime_checkable

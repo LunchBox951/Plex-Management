@@ -1,8 +1,8 @@
-"""Import orchestration — close the loop: validate, hardlink, scan -> Available.
+"""Import orchestration — close the loop: validate, snapshot, scan -> Available.
 
 When a completed torrent reaches ``ImportPending`` (the reconciler maps the
 client's seeding/complete states there), this service validates the file against
-the requested movie/show with the SAME decision brain the search uses, hardlinks
+the requested movie/show with the SAME decision brain the search uses, snapshots
 it into the Movies/TV library under the Plex naming convention, triggers a
 targeted Plex scan, and marks the request (or, for TV, the season)
 ``completed`` ("Finalizing"). A later reconcile cycle confirms availability via
@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import logging
 import os
+import secrets
 import stat
 import weakref
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
@@ -44,7 +46,11 @@ from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from plex_manager.adapters.filesystem.local import clear_stale_publish_locks
+from plex_manager.adapters.filesystem.local import (
+    clear_stale_publish_locks,
+    rename_exchange,
+    rename_no_replace,
+)
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.download_payload import (
@@ -76,7 +82,11 @@ from plex_manager.models import (
     DownloadScope,
     RequestStatus,
 )
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS, FilePlacementIdentity
+from plex_manager.ports.filesystem import (
+    VIDEO_EXTENSIONS,
+    FilePlacementIdentity,
+    RootAnchoredFileSystemPort,
+)
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -311,10 +321,61 @@ class _TvImportTarget(NamedTuple):
     scope_id: int | None
 
 
+class _SourceCandidate(NamedTuple):
+    path: str
+    size: int
+    relative_path: str
+    authority_root: str
+    identity: FilePlacementIdentity
+
+
+class _SourceAuthority(NamedTuple):
+    root_fd: int
+    root_abs: str
+
+
+class _DirectoryIdentity(NamedTuple):
+    device: int
+    inode: int
+
+
+def _placement_identity(observed: os.stat_result) -> FilePlacementIdentity:
+    return FilePlacementIdentity(
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        size=observed.st_size,
+        mtime_ns=observed.st_mtime_ns,
+        ctime_ns=observed.st_ctime_ns,
+        mode=observed.st_mode,
+    )
+
+
+def _source_stable_after_publication(
+    expected: FilePlacementIdentity,
+    observed: FilePlacementIdentity,
+) -> bool:
+    """A secure distinct-inode snapshot leaves every source field unchanged."""
+    return expected == observed
+
+
+def _placement_matches_validated_source(
+    source: FilePlacementIdentity,
+    placed: FilePlacementIdentity,
+) -> bool:
+    """Whether published bytes/metadata still match the validated source snapshot."""
+    if not stat.S_ISREG(placed.mode) or source.size != placed.size:
+        return False
+    # A hardlink permanently shares the torrent writer's inode. Require an
+    # independent snapshot so post-validation writes cannot mutate Plex data.
+    # Cross-filesystem copies may normalize timestamp precision/permissions; the
+    # trusted primitive verifies a complete size before atomic publication.
+    return source.device != placed.device or source.inode != placed.inode
+
+
 class _TvImportPlan(NamedTuple):
     target: _TvImportTarget
     season_dir: Path
-    abs_by_rel: dict[str, str]
+    source_by_rel: dict[str, _SourceCandidate]
     by_relative: dict[PurePosixPath, EpisodeImportResult]
     accepted: tuple[EpisodeImportResult, ...]
 
@@ -357,12 +418,86 @@ def _is_within(root_real: str, candidate_real: str) -> bool:
     return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
 
 
+def _library_root_is_visible(library_root: str) -> bool:
+    """Whether the configured root is a visible, non-symlink directory authority."""
+    try:
+        root_abs = os.path.abspath(os.path.normpath(library_root))
+        root_real = os.path.realpath(root_abs)
+        filesystem_prefix = os.path.realpath(os.sep)
+        return (
+            root_real != filesystem_prefix
+            and root_real.startswith(filesystem_prefix)
+            and root_real == root_abs
+            and stat.S_ISDIR(Path(root_real).lstat().st_mode)
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _bind_expected_library_breadcrumb(
+    download_path: str,
+    library_root: str,
+    expected_paths: tuple[Path, ...],
+) -> Path | None:
+    """Return a deterministic destination matching a persisted breadcrumb.
+
+    Persisted paths are state, not filesystem authority. Resolve them only far
+    enough to compare against the finite destinations derived from the request,
+    and return that trusted destination rather than the stored spelling. Callers
+    can then inspect/clean/fingerprint only a path rooted in current settings.
+    """
+    candidate_normalized = os.path.normcase(os.path.abspath(os.path.normpath(download_path)))
+    for expected in expected_paths:
+        expected_normalized = os.path.normcase(os.path.abspath(os.path.normpath(expected)))
+        if candidate_normalized != expected_normalized:
+            continue
+        try:
+            root_real = os.path.realpath(library_root)
+            expected_real = os.path.realpath(expected)
+        except (OSError, ValueError):
+            return None
+        if _is_within(root_real, expected_real):
+            return expected
+    return None
+
+
 def _ensure_under_save_path(save_path: str, candidate: str) -> str:
-    root_real = os.path.realpath(save_path)
-    candidate_real = os.path.realpath(candidate)
+    """Validate containment without erasing symlinks below the save root.
+
+    The save-root-relative spelling is security-significant: the later dirfd
+    traversal must see every literal component so ``O_NOFOLLOW`` can reject a
+    symlink instead of silently importing its canonical target.  Canonical
+    paths are still compared here to reject an escaping link, but only the save
+    root itself is canonicalized in the returned pathname.
+    """
+    root_literal = os.path.abspath(os.path.normpath(save_path))
+    candidate_literal = os.path.abspath(os.path.normpath(candidate))
+    lexical_prefix = root_literal.rstrip(os.sep) + os.sep
+    if candidate_literal == root_literal or not candidate_literal.startswith(lexical_prefix):
+        raise _UnsafeContentPathError("download content path is outside download save path")
+    relative_parts = Path(os.path.relpath(candidate_literal, root_literal)).parts
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        raise _UnsafeContentPathError("download content path is outside download save path")
+    root_real = os.path.realpath(root_literal)
+    candidate_real = os.path.realpath(candidate_literal)
     if not _is_within(root_real, candidate_real):
         raise _UnsafeContentPathError("download content path is outside download save path")
-    return candidate
+    return os.path.join(root_real, *relative_parts)
+
+
+def _capture_directory_authority(path: str) -> tuple[str, _DirectoryIdentity] | None:
+    """Capture one canonical directory pathname and exact inode identity."""
+    try:
+        root_abs = os.path.realpath(os.path.abspath(os.path.normpath(path)))
+        filesystem_prefix = os.path.realpath(os.sep)
+        if root_abs == filesystem_prefix or not root_abs.startswith(filesystem_prefix):
+            return None
+        observed = os.stat(root_abs, follow_symlinks=False)
+        if not stat.S_ISDIR(observed.st_mode):
+            return None
+        return root_abs, _DirectoryIdentity(observed.st_dev, observed.st_ino)
+    except (OSError, ValueError):
+        return None
 
 
 class _ResolvedContent(NamedTuple):
@@ -379,6 +514,27 @@ class _ResolvedContent(NamedTuple):
 
     path: str
     save_path: str | None
+    save_identity: _DirectoryIdentity | None
+
+
+class _VisibleContent(NamedTuple):
+    """Container-visible content bound to one exact download-root inode."""
+
+    path: str
+    source_root: str
+    source_root_identity: _DirectoryIdentity
+
+
+def _resolved_live_content(save_path: str, candidate: str) -> _ResolvedContent:
+    """Bind client content to the current canonical save-root observation."""
+    save_literal = os.path.abspath(os.path.normpath(save_path))
+    save_real = os.path.realpath(save_literal)
+    if save_real != save_literal:
+        raise _UnsafeContentPathError("download save path must not be a symlink")
+    candidate_beneath_root = _ensure_under_save_path(save_path, candidate)
+    captured = _capture_directory_authority(save_real)
+    identity = captured[1] if captured is not None and captured[0] == save_real else None
+    return _ResolvedContent(candidate_beneath_root, save_real, identity)
 
 
 def _resolve_content(
@@ -398,26 +554,24 @@ def _resolve_content(
     """
     if status is not None and status.content_path:
         if status.save_path:
-            return _ResolvedContent(
-                _ensure_under_save_path(status.save_path, status.content_path), status.save_path
-            )
+            return _resolved_live_content(status.save_path, status.content_path)
         raise _UnsafeContentPathError("download client reported content path without save path")
     if status is not None and status.save_path and status.name:
         if os.path.isabs(status.name):
             raise _UnsafeContentPathError("download content path is outside download save path")
-        return _ResolvedContent(
-            _ensure_under_save_path(status.save_path, os.path.join(status.save_path, status.name)),
+        return _resolved_live_content(
             status.save_path,
+            os.path.join(status.save_path, status.name),
         )
     if download_path:
-        return _ResolvedContent(download_path, None)
+        return _ResolvedContent(download_path, None, None)
     return None
 
 
 async def _resolve_visible_content(
     qbt: DownloadClientPort, torrent_hash: str, resolved: _ResolvedContent
-) -> str | None:
-    """Container-visible path for a download's resolved content, or ``None``.
+) -> _VisibleContent | None:
+    """Container-visible content plus its bound save-root, or ``None``.
 
     qBittorrent runs on the HOST, so ``resolved.path`` (from
     :func:`_resolve_content`) can be a HOST-namespace path this container cannot
@@ -439,7 +593,16 @@ async def _resolve_visible_content(
     the operator's manual retry). Stat probes offload via ``asyncio.to_thread``.
     """
     if await asyncio.to_thread(os.path.exists, resolved.path):
-        return resolved.path
+        if resolved.save_path is None or resolved.save_identity is None:
+            return None
+        captured = await asyncio.to_thread(_capture_directory_authority, resolved.save_path)
+        if (
+            captured is None
+            or captured[0] != resolved.save_path
+            or captured[1] != resolved.save_identity
+        ):
+            return None
+        return _VisibleContent(resolved.path, captured[0], captured[1])
     if not resolved.save_path:
         # A stored crash-resume breadcrumb has no anchor to remap against: only
         # the verbatim path counts (a free suffix search would reintroduce the
@@ -447,12 +610,237 @@ async def _resolve_visible_content(
         return None
     files = await qbt.list_files(torrent_hash)
     expected = [(f.name, f.size_bytes) for f in files]
-    return await asyncio.to_thread(
+    visible_path = await asyncio.to_thread(
         path_visibility.remap_download_content, resolved.path, resolved.save_path, expected
     )
+    if visible_path is None:
+        return None
+    relative_parts = Path(os.path.relpath(resolved.path, resolved.save_path)).parts
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        return None
+    visible_abs = os.path.abspath(os.path.normpath(visible_path))
+    visible_root = visible_abs
+    for _part in relative_parts:
+        visible_root = os.path.dirname(visible_root)
+    if (
+        os.path.abspath(os.path.normpath(os.path.join(visible_root, *relative_parts)))
+        != visible_abs
+    ):
+        return None
+    captured = await asyncio.to_thread(_capture_directory_authority, visible_root)
+    if captured is None or captured[0] != visible_root:
+        return None
+    canonical_content = os.path.join(captured[0], *relative_parts)
+    return _VisibleContent(canonical_content, captured[0], captured[1])
 
 
-def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, int, str]]:
+def _source_authority_is_current(authority: _SourceAuthority) -> bool:
+    """Whether a held source root still occupies its canonical pathname."""
+    try:
+        held = os.fstat(authority.root_fd)
+        current = os.stat(authority.root_abs, follow_symlinks=False)
+        return (
+            stat.S_ISDIR(held.st_mode)
+            and stat.S_ISDIR(current.st_mode)
+            and held.st_dev == current.st_dev
+            and held.st_ino == current.st_ino
+            and os.path.realpath(f"/proc/self/fd/{authority.root_fd}") == authority.root_abs
+        )
+    except (OSError, ValueError):
+        return False
+
+
+@contextlib.contextmanager
+def _open_source_authority(
+    authority_root: str,
+    *,
+    expected_identity: _DirectoryIdentity | None = None,
+) -> Generator[_SourceAuthority]:
+    """Pin a canonical directory authority without following its final entry."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    filesystem_prefix = os.path.realpath(os.sep)
+    root_literal = os.path.abspath(os.path.normpath(authority_root))
+    if (
+        not nofollow
+        or not directory
+        or not os.path.isdir("/proc/self/fd")
+        or root_literal == filesystem_prefix
+        or not root_literal.startswith(filesystem_prefix)
+    ):
+        raise OSError("descriptor-anchored source authority is unavailable")
+    before = os.stat(root_literal, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        raise OSError("source authority is not a directory")
+    root_fd = os.open(root_literal, os.O_RDONLY | directory | nofollow | cloexec)
+    try:
+        opened = os.fstat(root_fd)
+        root_abs = os.path.realpath(f"/proc/self/fd/{root_fd}")
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or before.st_dev != opened.st_dev
+            or before.st_ino != opened.st_ino
+            or (
+                expected_identity is not None
+                and _DirectoryIdentity(opened.st_dev, opened.st_ino) != expected_identity
+            )
+            or not os.path.isabs(root_abs)
+        ):
+            raise OSError("source authority changed while it was opened")
+        authority = _SourceAuthority(root_fd, root_abs)
+        if not _source_authority_is_current(authority):
+            raise OSError("source authority changed while it was opened")
+        yield authority
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(root_fd)
+
+
+@contextlib.contextmanager
+def _open_source_directory_beneath(
+    authority: _SourceAuthority,
+    relative_parts: tuple[str, ...],
+) -> Generator[_SourceAuthority]:
+    """Pin a no-follow descendant directory beneath an existing source root."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if (
+        not relative_parts
+        or any(part in {"", ".", ".."} for part in relative_parts)
+        or not nofollow
+        or not directory
+    ):
+        raise OSError("invalid source directory beneath download root")
+    opened: list[int] = []
+    try:
+        current_fd = os.dup(authority.root_fd)
+        opened.append(current_fd)
+        for component in relative_parts:
+            current_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            opened.append(current_fd)
+        child_abs = os.path.join(authority.root_abs, *relative_parts)
+        child = _SourceAuthority(current_fd, child_abs)
+        if not _source_authority_is_current(authority) or not _source_authority_is_current(child):
+            raise OSError("source directory authority changed")
+        yield child
+    finally:
+        for fd in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _source_candidate_from_authority(
+    path: str,
+    relative_path: str,
+    *,
+    authority: _SourceAuthority,
+) -> _SourceCandidate | None:
+    """Capture a candidate through an already-pinned source-root descriptor."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow or not directory:
+        return None
+    root_abs = authority.root_abs
+    candidate_abs = os.path.abspath(os.path.normpath(path))
+    prefix = root_abs.rstrip(os.sep) + os.sep
+    if candidate_abs == root_abs or not candidate_abs.startswith(prefix):
+        return None
+    relative_parts = Path(os.path.relpath(candidate_abs, root_abs)).parts
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        return None
+    opened: list[int] = []
+    source_fd: int | None = None
+    try:
+        current_fd = os.dup(authority.root_fd)
+        opened.append(current_fd)
+        for component in relative_parts[:-1]:
+            current_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            opened.append(current_fd)
+        name = relative_parts[-1]
+        before = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        source_fd = os.open(
+            name,
+            os.O_RDONLY | nofollow | cloexec | nonblock,
+            dir_fd=current_fd,
+        )
+        observed = os.fstat(source_fd)
+        current_name = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or _placement_identity(before) != _placement_identity(observed)
+            or _placement_identity(before) != _placement_identity(current_name)
+            or os.path.realpath(f"/proc/self/fd/{source_fd}") != candidate_abs
+            or not _source_authority_is_current(authority)
+        ):
+            return None
+        identity = _placement_identity(observed)
+        return _SourceCandidate(
+            candidate_abs,
+            observed.st_size,
+            relative_path,
+            root_abs,
+            identity,
+        )
+    except (OSError, ValueError):
+        return None
+    finally:
+        if source_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(source_fd)
+        for fd in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+@contextlib.contextmanager
+def _anchored_source_file(source: _SourceCandidate) -> Generator[tuple[int, Path]]:
+    """Hold the validated source inode open through adoption and publication."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow or not os.path.isdir("/proc/self/fd"):
+        raise OSError("descriptor-anchored source access is unavailable")
+    candidate_real = os.path.realpath(os.path.abspath(os.path.normpath(source.path)))
+    prefix = source.authority_root.rstrip(os.sep) + os.sep
+    if candidate_real != source.path or not candidate_real.startswith(prefix):
+        raise OSError("validated import source authority changed")
+    source_fd = os.open(candidate_real, os.O_RDONLY | nofollow | cloexec | nonblock)
+    try:
+        observed = os.fstat(source_fd)
+        current = _placement_identity(observed)
+        if (
+            current != source.identity
+            or not stat.S_ISREG(observed.st_mode)
+            or os.path.realpath(f"/proc/self/fd/{source_fd}") != source.path
+        ):
+            raise OSError("validated import source identity changed")
+        yield source_fd, Path(f"/proc/self/fd/{source_fd}")
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(source_fd)
+
+
+def _resolve_sources(
+    fs: FileSystemPort,
+    content_path: str,
+    *,
+    source_root: str,
+    source_root_identity: _DirectoryIdentity,
+) -> list[_SourceCandidate]:
     """Enumerate EVERY candidate video file under a download's content.
 
     Returns ``(abs_path, size, rel)`` for each eligible file. ``rel`` is anchored
@@ -476,70 +864,157 @@ def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, i
     via :func:`~plex_manager.domain.import_validation.validate_season_import` (a
     season pack legitimately ships many independently-valid episodes).
     """
-    root_path = Path(content_path)
-    if root_path.is_file():
-        # A single-file torrent (no release folder): mirror ``largest_video_file``'s
-        # is_file branch (adapters/filesystem/local.py) verbatim -- the lone file is
-        # the only candidate, and its filename alone is sufficient (no folder to
-        # anchor above). Same containment + extension guard as that branch: a
-        # single-file grab is a single-file torrent, so a content root that is
-        # ITSELF a symlink escaping its own parent directory (or that isn't even a
-        # video file) must never be followed, or the importer would copy an
-        # arbitrary out-of-tree file into the public library. An honest "no video
-        # found" ([]) -> whole-download block, never a silent skip.
-        resolved = os.path.realpath(content_path)
-        parent_real = os.path.realpath(root_path.parent)
-        if root_path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(
-            parent_real, resolved
-        ):
-            return []
-        return [(resolved, os.path.getsize(resolved), root_path.name)]
-    anchor = os.path.dirname(os.path.normpath(content_path))
-    return [
-        (abs_path, size, os.path.relpath(abs_path, anchor))
-        for abs_path, size, _rel in fs.list_video_files(content_path)
-    ]
+    root_abs = os.path.abspath(os.path.normpath(source_root))
+    content_abs = os.path.abspath(os.path.normpath(content_path))
+    prefix = root_abs.rstrip(os.sep) + os.sep
+    if content_abs == root_abs or not content_abs.startswith(prefix):
+        return []
+    content_parts = Path(os.path.relpath(content_abs, root_abs)).parts
+    if not content_parts or any(part in {"", ".", ".."} for part in content_parts):
+        return []
+    try:
+        with _open_source_authority(
+            root_abs,
+            expected_identity=source_root_identity,
+        ) as root_authority:
+            try:
+                with _open_source_directory_beneath(
+                    root_authority,
+                    tuple(content_parts),
+                ) as content_authority:
+                    anchor = os.path.dirname(content_authority.root_abs)
+                    sources: list[_SourceCandidate] = []
+                    for abs_path, _size, literal_relative in fs.list_video_files(
+                        content_authority.root_abs
+                    ):
+                        literal_path = os.path.abspath(
+                            os.path.normpath(
+                                os.path.join(content_authority.root_abs, literal_relative)
+                            )
+                        )
+                        # Compare captured text, never a fresh realpath that could
+                        # follow a replacement ancestor and re-authorize it.
+                        reported_path = os.path.abspath(os.path.normpath(abs_path))
+                        if reported_path != literal_path:
+                            continue
+                        relative = os.path.relpath(literal_path, anchor)
+                        candidate = _source_candidate_from_authority(
+                            literal_path,
+                            relative,
+                            authority=content_authority,
+                        )
+                        if candidate is not None:
+                            sources.append(candidate)
+                    if not _source_authority_is_current(content_authority):
+                        return []
+                    if not _source_authority_is_current(root_authority):
+                        return []
+                    return sources
+            except OSError:
+                # A single-file torrent: resolve the final entry directly from
+                # the pinned save-root fd. Symlinks/FIFOs/special entries fail the
+                # regular-file checks without ever becoming an authority.
+                if Path(content_abs).suffix.lower() not in VIDEO_EXTENSIONS:
+                    return []
+                canonical_path = os.path.join(root_authority.root_abs, *content_parts)
+                candidate = _source_candidate_from_authority(
+                    canonical_path,
+                    Path(content_abs).name,
+                    authority=root_authority,
+                )
+                if not _source_authority_is_current(root_authority):
+                    return []
+                return [candidate] if candidate is not None else []
+    except (OSError, ValueError):
+        return []
 
 
 def _place_file(
-    fs: FileSystemPort, src: str, dst: Path
-) -> tuple[bool, FilePlacementIdentity | None]:
-    """Hardlink/copy ``src`` to ``dst``, idempotently (sync I/O, run in a thread).
+    fs: FileSystemPort,
+    source: _SourceCandidate,
+    dst: Path,
+    *,
+    allowed_root: str,
+) -> tuple[bool, FilePlacementIdentity | None, str | None]:
+    """Snapshot ``src`` to ``dst``, idempotently (sync I/O, run in a thread).
 
-    Returns whether THIS call created ``dst`` plus the publish primitive's
-    creation-bound identity. An already-supplied file returns ``(False, None)``.
-    The caller rolls ``dst`` back on a later failure only when the primitive's
-    identity still matches, so it never unlinks another import's or user's file.
+    Returns ``(created, publish_identity, adopted_identity)``. Exactly one identity
+    is populated: the creation-bound primitive token for a new destination, or the
+    descriptor-bound content identity for an already-supplied identical file. The
+    caller rolls a created path back only while its identity still matches.
 
-    A fully-imported destination (same size) is left untouched. A *differently*-sized
+    A fully-imported destination with identical bytes is left untouched. A different
     file already at ``dst`` (a user's library file, or a stale partial) is NEVER
     blind-deleted — it is surfaced as a ``FileExistsError`` conflict for the operator
     to resolve, so a re-import never silently overwrites someone else's file.
     """
-    os.makedirs(dst.parent, exist_ok=True)
-    # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
-    # absent, which would let hardlink_or_copy's rename fallback silently replace
-    # the symlink entry (GHSA-8fj8) instead of surfacing the conflict below.
-    if os.path.lexists(os.fspath(dst)):
-        if _same_file_content(src, dst):
-            return False, None  # already fully imported here — idempotent skip; not ours
-        # A differently-sized file is already at the destination: a user's
-        # manually-managed library file, or a title Plex availability missed. NEVER
-        # blind-delete it (that is data loss) — surface it as an import conflict the
-        # operator resolves, instead of overwriting their file with the download.
-        raise FileExistsError(f"destination already exists with different content: {dst}")
-    try:
-        placement_identity = fs.hardlink_or_copy(Path(src), dst)
-    except FileExistsError:
-        # Lost a placement race: a concurrent import (the reconcile loop racing the
-        # operator's POST /queue/{id}/import retry) created ``dst`` between the
-        # lexists check above and this link. Same content (same size) is an
-        # idempotent win for the other attempt, NOT a failure to block on; a
-        # different size is a genuine conflict, surfaced like the pre-existing case.
-        if os.path.lexists(os.fspath(dst)) and _same_file_content(src, dst):
-            return False, None  # the race winner's file — not ours to roll back
-        raise FileExistsError(f"destination already exists with different content: {dst}") from None
-    return True, placement_identity  # a later failure may roll back only this identity
+    with _anchored_source_file(source) as (source_fd, source_path):
+        source_name = os.path.basename(source.path)
+        # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
+        # absent, which would let hardlink_or_copy's rename fallback silently replace
+        # the symlink entry (GHSA-8fj8) instead of surfacing the conflict below.
+        if os.path.lexists(os.fspath(dst)):
+            adopted_identity = _adopted_file_identity_if_same(
+                os.fspath(source_path),
+                dst,
+                allowed_root=allowed_root,
+            )
+            if adopted_identity is not None:
+                return False, None, adopted_identity
+            # A differently-sized file is already at the destination: a user's
+            # manually-managed library file, or a title Plex availability missed. NEVER
+            # blind-delete it (that is data loss) — surface it as an import conflict the
+            # operator resolves, instead of overwriting their file with the download.
+            raise FileExistsError(f"destination already exists with different content: {dst}")
+        try:
+            if not isinstance(fs, RootAnchoredFileSystemPort):
+                raise OSError("filesystem adapter lacks root-anchored placement support")
+            placement_identity = fs.hardlink_or_copy_from_fd_beneath(
+                source_fd,
+                source_name,
+                dst,
+                destination_root=Path(allowed_root),
+            )
+        except FileExistsError:
+            # Lost a placement race: a concurrent import (the reconcile loop racing the
+            # operator's POST /queue/{id}/import retry) created ``dst`` between the
+            # lexists check above and this link. Identical content is an
+            # idempotent win for the other attempt, NOT a failure to block on; a
+            # different content is a genuine conflict, surfaced like the pre-existing case.
+            adopted_identity = (
+                _adopted_file_identity_if_same(
+                    os.fspath(source_path),
+                    dst,
+                    allowed_root=allowed_root,
+                )
+                if os.path.lexists(os.fspath(dst))
+                else None
+            )
+            if adopted_identity is not None:
+                return False, None, adopted_identity
+            raise FileExistsError(
+                f"destination already exists with different content: {dst}"
+            ) from None
+        source_after = _placement_identity(os.fstat(source_fd))
+        if (
+            not _source_stable_after_publication(
+                source.identity,
+                source_after,
+            )
+            or not _placement_matches_validated_source(source.identity, placement_identity)
+            or not _published_snapshot_is_safe(
+                dst,
+                placement_identity,
+                allowed_root=allowed_root,
+            )
+        ):
+            _remove_quietly(
+                dst,
+                expected_identity=_placement_content_identity(placement_identity),
+                allowed_root=allowed_root,
+            )
+            raise OSError("validated import source changed during publication")
+        return True, placement_identity, None
 
 
 def _file_digest(path: str | Path) -> bytes:
@@ -550,22 +1025,18 @@ def _file_digest(path: str | Path) -> bytes:
     return digest.digest()
 
 
-def _same_file_content(src: str, dst: Path) -> bool:
-    # samefile is only the cheap same-inode short-circuit; on any OSError (a side
-    # not stat-able) fall through to the honest size + digest comparison below.
-    with contextlib.suppress(OSError):
-        if os.path.samefile(src, dst):
-            return True
-    try:
-        dst_size = dst.stat().st_size
-    except OSError:
-        # A dangling symlink (or dst vanished between the lexists check and here)
-        # is NOT our identical file -- never raise FileNotFoundError out of a
-        # content check; the caller surfaces this as an honest conflict instead.
-        return False
-    if dst_size != os.path.getsize(src):
-        return False
-    return _file_digest(src) == _file_digest(dst)
+def _adopted_file_identity_if_same(
+    src: str,
+    dst: Path,
+    *,
+    allowed_root: str,
+) -> str | None:
+    """Bind an idempotently adopted file to one descriptor-held observation."""
+    return _adopted_file_identity_from_open_files(
+        src,
+        dst,
+        allowed_root=allowed_root,
+    )
 
 
 class _PlacedPath(NamedTuple):
@@ -573,82 +1044,434 @@ class _PlacedPath(NamedTuple):
     identity: str
 
 
-def _file_placement_identity(path: Path) -> FilePlacementIdentity | None:
-    try:
-        observed = path.lstat()
-    except OSError:
-        return None
-    if not stat.S_ISREG(observed.st_mode):
-        return None
-    return FilePlacementIdentity(
-        device=observed.st_dev,
-        inode=observed.st_ino,
-        size=observed.st_size,
-        mtime_ns=observed.st_mtime_ns,
-        ctime_ns=observed.st_ctime_ns,
-        mode=observed.st_mode,
+def _placement_content_identity(identity: FilePlacementIdentity) -> str:
+    """Encode the creation-bound regular-file observation as payload identity."""
+    digest = hashlib.sha256()
+    digest.update(os.fsencode("."))
+    digest.update(b"\0")
+    digest.update(
+        (
+            f"{identity.device}:{identity.inode}:{identity.size}:"
+            f"{identity.mtime_ns}:{identity.ctime_ns}:{stat.S_IFMT(identity.mode)}"
+        ).encode()
     )
+    digest.update(b"\0")
+    return digest.hexdigest()
 
 
-def _place_file_with_identity(fs: FileSystemPort, src: str, dst: Path) -> tuple[bool, str | None]:
+def _place_file_with_identity(
+    fs: FileSystemPort,
+    source: _SourceCandidate,
+    dst: Path,
+    *,
+    allowed_root: str,
+) -> tuple[bool, str | None]:
     """Place/adopt a file and fingerprint that exact observation in one worker."""
-    placed, published_identity = _place_file(fs, src, dst)
-    observed_identity = _payload_content_identity(str(dst))
-    if placed and (
-        published_identity is None or _file_placement_identity(dst) != published_identity
-    ):
-        return placed, None
-    return placed, observed_identity
+    placed, published_identity, adopted_identity = _place_file(
+        fs,
+        source,
+        dst,
+        allowed_root=allowed_root,
+    )
+    if placed:
+        return (
+            placed,
+            _placement_content_identity(published_identity)
+            if published_identity is not None
+            else None,
+        )
+    return placed, adopted_identity
 
 
 def _payload_identity_if_observations_match(
-    download_path: str, observations: list[_PlacedPath]
+    download_path: str, observations: list[_PlacedPath], *, allowed_root: str
 ) -> str | None:
     """Fingerprint a tree only while every placed/adopted file is unchanged."""
-    before = _payload_content_identity(download_path)
+    before = _payload_content_identity(download_path, allowed_root=allowed_root)
     if before is None:
         return None
     if any(
-        _payload_content_identity(str(observed.path)) != observed.identity
+        _payload_content_identity(str(observed.path), allowed_root=allowed_root)
+        != observed.identity
         for observed in observations
     ):
         return None
-    after = _payload_content_identity(download_path)
+    after = _payload_content_identity(download_path, allowed_root=allowed_root)
     return before if after == before else None
 
 
-def _remove_quietly(path: Path, *, expected_identity: str | None = None) -> bool:
+class _AnchoredParent(NamedTuple):
+    root_fd: int
+    parent_fd: int
+    name: str
+    root_abs: str
+    parent_parts: tuple[str, ...]
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _snapshot_permissions_are_safe(observed: os.stat_result, file_fd: int) -> bool:
+    """Whether only this service UID retains write authority to a snapshot."""
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.geteuid()
+        or observed.st_nlink != 1
+        or observed.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        return False
+    try:
+        names = os.listxattr(file_fd)
+    except OSError as exc:
+        # Filesystems without extended-attribute support cannot carry an ACL
+        # xattr. Any other inspection failure is unknown authority: fail closed.
+        return exc.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}
+    return not any("acl" in name.lower() for name in names)
+
+
+def _same_regular_file_after_rename(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare every regular-file field that rename(2) itself leaves stable."""
+    return (
+        _same_inode(left, right)
+        and stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_mode == right.st_mode
+    )
+
+
+def _anchored_parent_is_current(anchor: _AnchoredParent) -> bool:
+    """Whether held root/parent descriptors still occupy their configured path."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    opened: list[int] = []
+    try:
+        filesystem_prefix = os.path.realpath(os.sep)
+        if (
+            anchor.root_abs == filesystem_prefix
+            or not anchor.root_abs.startswith(filesystem_prefix)
+            or os.path.realpath(anchor.root_abs) != anchor.root_abs
+        ):
+            return False
+        current_fd = os.open(
+            anchor.root_abs,
+            os.O_RDONLY | directory | nofollow | cloexec,
+        )
+        opened.append(current_fd)
+        if not _same_inode(os.fstat(current_fd), os.fstat(anchor.root_fd)):
+            return False
+        if os.path.realpath(f"/proc/self/fd/{current_fd}") != anchor.root_abs:
+            return False
+        for component in anchor.parent_parts:
+            current_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            opened.append(current_fd)
+        return _same_inode(os.fstat(current_fd), os.fstat(anchor.parent_fd))
+    except (OSError, ValueError):
+        return False
+    finally:
+        for fd in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+@contextlib.contextmanager
+def _anchored_parent_beneath(allowed_root: str, path: Path) -> Generator[_AnchoredParent]:
+    """Open ``path.parent`` root-relatively without following symlinks."""
+    root_abs = os.path.abspath(os.path.normpath(allowed_root))
+    path_abs = os.path.abspath(os.path.normpath(path))
+    prefix = root_abs.rstrip(os.sep) + os.sep
+    if path_abs == root_abs or not path_abs.startswith(prefix):
+        raise OSError("path is outside configured library root")
+    relative_parts = Path(os.path.relpath(path_abs, root_abs)).parts
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        raise OSError("invalid path beneath configured library root")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    filesystem_prefix = os.path.realpath(os.sep)
+    if (
+        not nofollow
+        or not directory
+        or not os.path.isdir("/proc/self/fd")
+        or root_abs == filesystem_prefix
+        or not root_abs.startswith(filesystem_prefix)
+        or os.path.realpath(root_abs) != root_abs
+    ):
+        raise OSError("root-anchored cleanup is unavailable")
+
+    opened: list[int] = []
+    try:
+        current_fd = os.open(root_abs, os.O_RDONLY | directory | nofollow | cloexec)
+        opened.append(current_fd)
+        for component in relative_parts[:-1]:
+            current_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            opened.append(current_fd)
+        anchor = _AnchoredParent(
+            root_fd=opened[0],
+            parent_fd=current_fd,
+            name=relative_parts[-1],
+            root_abs=root_abs,
+            parent_parts=tuple(relative_parts[:-1]),
+        )
+        if not _anchored_parent_is_current(anchor):
+            raise OSError("root-anchored cleanup authority changed")
+        yield anchor
+    finally:
+        for fd in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _published_snapshot_is_safe(
+    dst: Path,
+    placement: FilePlacementIdentity,
+    *,
+    allowed_root: str,
+) -> bool:
+    """Bind safe permissions/ownership to the exact newly published inode."""
+    destination_fd: int | None = None
+    try:
+        with _anchored_parent_beneath(allowed_root, dst) as anchor:
+            destination_fd = os.open(
+                anchor.name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=anchor.parent_fd,
+            )
+            observed = os.fstat(destination_fd)
+            current = os.stat(
+                anchor.name,
+                dir_fd=anchor.parent_fd,
+                follow_symlinks=False,
+            )
+            return (
+                _placement_identity(observed) == placement
+                and _placement_identity(current) == placement
+                and _snapshot_permissions_are_safe(observed, destination_fd)
+                and _anchored_parent_is_current(anchor)
+            )
+    except (OSError, ValueError):
+        return False
+    finally:
+        if destination_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(destination_fd)
+
+
+def _adopted_file_identity_from_open_files(
+    src: str,
+    dst: Path,
+    *,
+    allowed_root: str,
+) -> str | None:
+    """Compare source/destination through stable fds and bind the exact dst inode."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow:
+        return None
+    destination_fd: int | None = None
+    try:
+        with _anchored_parent_beneath(allowed_root, dst) as anchor:
+            destination_fd = os.open(
+                anchor.name,
+                os.O_RDONLY | nofollow | cloexec | nonblock,
+                dir_fd=anchor.parent_fd,
+            )
+            destination_before = os.fstat(destination_fd)
+            source_before = os.stat(src)
+            if not stat.S_ISREG(destination_before.st_mode) or not stat.S_ISREG(
+                source_before.st_mode
+            ):
+                return None
+            if not _snapshot_permissions_are_safe(destination_before, destination_fd):
+                # Never inherit a foreign owner's, writable mode's, external
+                # link's, or access ACL's authority over adopted library bytes.
+                return None
+            if _same_inode(source_before, destination_before):
+                # Any external hardlink preserves write authority through an
+                # unknown pathname (including a legacy torrent source). Never
+                # adopt that inode into the distinct-snapshot trust model.
+                return None
+            if not _anchored_parent_is_current(anchor):
+                return None
+            same_content = source_before.st_size == destination_before.st_size and _file_digest(
+                src
+            ) == _file_digest(Path(f"/proc/self/fd/{destination_fd}"))
+            if not same_content:
+                return None
+            source_after = os.stat(src)
+            destination_after = os.fstat(destination_fd)
+            current_name = os.stat(
+                anchor.name,
+                dir_fd=anchor.parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _placement_identity(source_before) != _placement_identity(source_after)
+                or _placement_identity(destination_before) != _placement_identity(destination_after)
+                or _placement_identity(destination_before) != _placement_identity(current_name)
+                or not _snapshot_permissions_are_safe(destination_after, destination_fd)
+                or not _anchored_parent_is_current(anchor)
+            ):
+                return None
+            return _payload_entries_identity([(".", destination_before)])
+    except (OSError, ValueError):
+        return None
+    finally:
+        if destination_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(destination_fd)
+
+
+def _remove_quietly(path: Path, *, expected_identity: str, allowed_root: str) -> bool:
     """Best-effort unlink; return whether the path is confirmed absent.
 
     ``lexists``-style verification matters here: a dangling symlink still exists,
     while an inaccessible parent can make a convenience ``exists()`` check look
     false.  Treat every stat error except an actual ``FileNotFoundError`` as an
     unverified removal so callers that own durable cleanup breadcrumbs fail closed.
+    The mode-0700 quarantine protects against other UIDs; processes already
+    running as the service UID are inside the filesystem authority boundary.
     """
     try:
-        before = path.lstat()
-    except FileNotFoundError:
-        return True
-    except OSError:
+        with _anchored_parent_beneath(allowed_root, path) as anchor:
+            held_fd: int | None = None
+            quarantine_fd: int | None = None
+            captured_fd: int | None = None
+            placeholder_fd: int | None = None
+            quarantine_dir = f".plex-manager-cleanup-{secrets.token_hex(16)}"
+            exchanged = False
+            captured_removed = False
+            try:
+                held_fd = os.open(
+                    anchor.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=anchor.parent_fd,
+                )
+            except FileNotFoundError:
+                return True
+            try:
+                before = os.fstat(held_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or _payload_entries_identity([(".", before)]) != expected_identity
+                ):
+                    return False
+                os.mkdir(quarantine_dir, mode=0o700, dir_fd=anchor.parent_fd)
+                quarantine_fd = os.open(
+                    quarantine_dir,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=anchor.parent_fd,
+                )
+                os.fchmod(quarantine_fd, 0o700)
+                placeholder_fd = os.open(
+                    "slot",
+                    os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=quarantine_fd,
+                )
+                placeholder_before = os.fstat(placeholder_fd)
+                rename_exchange(
+                    anchor.name,
+                    "slot",
+                    left_dir_fd=anchor.parent_fd,
+                    right_dir_fd=quarantine_fd,
+                )
+                exchanged = True
+                captured_fd = os.open(
+                    "slot",
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=quarantine_fd,
+                )
+                captured = os.fstat(captured_fd)
+                if (
+                    not _same_regular_file_after_rename(before, captured)
+                    or _placement_identity(os.fstat(captured_fd)) != _placement_identity(captured)
+                    or _placement_identity(
+                        os.stat("slot", dir_fd=quarantine_fd, follow_symlinks=False)
+                    )
+                    != _placement_identity(captured)
+                ):
+                    rename_exchange(
+                        anchor.name,
+                        "slot",
+                        left_dir_fd=anchor.parent_fd,
+                        right_dir_fd=quarantine_fd,
+                    )
+                    exchanged = False
+                    # The restored private placeholder is no longer needed;
+                    # remove it so the quarantine directory can be reclaimed.
+                    os.unlink("slot", dir_fd=quarantine_fd)
+                    return False
+                os.unlink("slot", dir_fd=quarantine_fd)
+                captured_removed = True
+                rename_no_replace(
+                    anchor.name,
+                    "placeholder",
+                    src_dir_fd=anchor.parent_fd,
+                    dst_dir_fd=quarantine_fd,
+                )
+                placeholder_after = os.stat(
+                    "placeholder",
+                    dir_fd=quarantine_fd,
+                    follow_symlinks=False,
+                )
+                if not _same_regular_file_after_rename(placeholder_before, placeholder_after):
+                    rename_no_replace(
+                        "placeholder",
+                        anchor.name,
+                        src_dir_fd=quarantine_fd,
+                        dst_dir_fd=anchor.parent_fd,
+                    )
+                    return False
+                os.unlink("placeholder", dir_fd=quarantine_fd)
+            except (OSError, ValueError):
+                if exchanged and not captured_removed and quarantine_fd is not None:
+                    try:
+                        rename_exchange(
+                            anchor.name,
+                            "slot",
+                            left_dir_fd=anchor.parent_fd,
+                            right_dir_fd=quarantine_fd,
+                        )
+                        os.unlink("slot", dir_fd=quarantine_fd)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                for fd in (placeholder_fd, captured_fd, quarantine_fd, held_fd):
+                    if fd is not None:
+                        with contextlib.suppress(OSError):
+                            os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.rmdir(quarantine_dir, dir_fd=anchor.parent_fd)
+            if not _anchored_parent_is_current(anchor):
+                return False
+            try:
+                os.stat(
+                    anchor.name,
+                    dir_fd=anchor.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return True
+            return False
+    except (OSError, ValueError):
         return False
-    # Cleanup owns regular files only. Never follow or unlink a symlink that may
-    # have replaced the attested placement during an awaited Plex scan.
-    if not stat.S_ISREG(before.st_mode):
-        return False
-    if expected_identity is not None and _payload_content_identity(str(path)) != expected_identity:
-        return False
-    with contextlib.suppress(OSError):
-        path.unlink()
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return False
 
 
-def _remove_quietly_many(paths: list[_PlacedPath]) -> bool:
+def _remove_quietly_many(paths: list[_PlacedPath], *, allowed_root: str) -> bool:
     """Best-effort unlink every owned path and confirm whether all are absent.
 
     Unlike the movie path's single ``dst``, a season import can place several
@@ -657,7 +1480,11 @@ def _remove_quietly_many(paths: list[_PlacedPath]) -> bool:
     """
     all_removed = True
     for placed in paths:
-        if not _remove_quietly(placed.path, expected_identity=placed.identity):
+        if not _remove_quietly(
+            placed.path,
+            expected_identity=placed.identity,
+            allowed_root=allowed_root,
+        ):
             all_removed = False
     return all_removed
 
@@ -675,13 +1502,13 @@ def _classify_stored_path(
         link_stat = path.lstat()
     except FileNotFoundError:
         return "missing"
-    except OSError:
+    except (OSError, ValueError):
         return "unverified"
     if stat.S_ISLNK(link_stat.st_mode):
         return "unverified"
     try:
         mode = path.stat().st_mode
-    except OSError:
+    except (OSError, ValueError):
         return "unverified"
     if stat.S_ISREG(mode):
         return "file"
@@ -690,28 +1517,93 @@ def _classify_stored_path(
     return "other"
 
 
-def _stored_path_cleanup_state(
-    path: Path, *, allow_empty_directory: bool = False
-) -> Literal["absent", "defer", "protected"]:
-    """Classify whether a planned destination can be cleared, retried, or parked."""
-    kind = _classify_stored_path(path)
-    if kind == "missing":
-        return "absent"
-    if kind != "directory" or not allow_empty_directory:
-        return "protected"
-    lock_state = clear_stale_publish_locks(path)
-    if lock_state == "pending":
-        return "defer"
-    if lock_state == "protected":
-        return "protected"
+def _trusted_breadcrumb_cleanup_state(
+    library_root: str,
+    path: Path,
+    *,
+    allow_empty_directory: bool = False,
+) -> Literal["absent", "defer", "protected", "root_unavailable"]:
+    """Classify cleanup only while its configured library authority is visible."""
+    if not _library_root_is_visible(library_root):
+        return "root_unavailable"
+    observed_existing = False
     try:
-        path.rmdir()
+        with _anchored_parent_beneath(library_root, path) as anchor:
+            try:
+                observed = os.stat(
+                    anchor.name,
+                    dir_fd=anchor.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return "absent"
+            observed_existing = True
+            if not stat.S_ISDIR(observed.st_mode) or not allow_empty_directory:
+                return "protected"
+            directory_fd = os.open(
+                anchor.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=anchor.parent_fd,
+            )
+            try:
+                if not _same_inode(observed, os.fstat(directory_fd)):
+                    return "protected"
+                lock_state = clear_stale_publish_locks(Path(f"/proc/self/fd/{directory_fd}"))
+                if lock_state == "pending":
+                    return "defer"
+                if lock_state == "protected":
+                    return "protected"
+                quarantine = f".plex-manager-empty-{secrets.token_hex(16)}"
+                rename_no_replace(
+                    anchor.name,
+                    quarantine,
+                    src_dir_fd=anchor.parent_fd,
+                    dst_dir_fd=anchor.parent_fd,
+                )
+                try:
+                    captured = os.stat(
+                        quarantine,
+                        dir_fd=anchor.parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if not _same_inode(observed, captured) or not _anchored_parent_is_current(
+                        anchor
+                    ):
+                        rename_no_replace(
+                            quarantine,
+                            anchor.name,
+                            src_dir_fd=anchor.parent_fd,
+                            dst_dir_fd=anchor.parent_fd,
+                        )
+                        return "protected"
+                    os.rmdir(quarantine, dir_fd=anchor.parent_fd)
+                except (OSError, ValueError):
+                    with contextlib.suppress(OSError):
+                        rename_no_replace(
+                            quarantine,
+                            anchor.name,
+                            src_dir_fd=anchor.parent_fd,
+                            dst_dir_fd=anchor.parent_fd,
+                        )
+                    raise
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(directory_fd)
+            if not _anchored_parent_is_current(anchor):
+                return "protected"
+            try:
+                os.stat(
+                    anchor.name,
+                    dir_fd=anchor.parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return "absent"
+            return "protected"
     except FileNotFoundError:
-        return "absent"
-    except OSError:
-        # Non-empty, inaccessible, or concurrently changed: retain the pointer.
+        return "protected" if observed_existing else "absent"
+    except (OSError, ValueError):
         return "protected"
-    return "absent" if _classify_stored_path(path) == "missing" else "protected"
 
 
 # Per-download serialization. The reconcile loop and an operator's
@@ -865,13 +1757,16 @@ def _tv_block_reason(validation_count: int, failures: tuple[str, ...]) -> str:
 def _build_tv_import_plan(
     *,
     target: _TvImportTarget,
-    sources: list[tuple[str, int, str]],
+    sources: list[_SourceCandidate],
     parser: ParserPort,
     profile: QualityProfile,
     tv_root: str,
 ) -> _TvImportPlan | _TvImportFailure:
     validation = validate_season_import(
-        [VideoFile(relative_path=rel, size_bytes=size) for _abs, size, rel in sources],
+        [
+            VideoFile(relative_path=source.relative_path, size_bytes=source.size)
+            for source in sources
+        ],
         parser=parser,
         profile=profile,
         expected_title=target.request.title,
@@ -908,11 +1803,11 @@ def _build_tv_import_plan(
                 f"missing {missing} (accepted {sorted(accepted_episodes)})",
             )
 
-    abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
+    source_by_rel = {source.relative_path: source for source in sources}
     by_relative: dict[PurePosixPath, EpisodeImportResult] = {}
     for result in validation.accepted:
-        src = abs_by_rel[result.video.relative_path]
-        ext = os.path.splitext(src)[1].lstrip(".")
+        source = source_by_rel[result.video.relative_path]
+        ext = os.path.splitext(source.path)[1].lstrip(".")
         relative = plex_tv_episode_relative_path(
             target.request.title, target.request.year, target.season, result.episodes, ext
         )
@@ -937,7 +1832,7 @@ def _build_tv_import_plan(
     season_dir = Path(tv_root) / plex_tv_season_relative_dir(
         target.request.title, target.request.year, target.season
     )
-    return _TvImportPlan(target, season_dir, abs_by_rel, by_relative, validation.accepted)
+    return _TvImportPlan(target, season_dir, source_by_rel, by_relative, validation.accepted)
 
 
 async def _fail_unsafe_payload(
@@ -953,6 +1848,7 @@ async def _fail_unsafe_payload(
     seasons: tuple[int, ...] = (),
     owned_placement: Path | None = None,
     owned_placement_identity: str | None = None,
+    owned_placement_root: str | None = None,
 ) -> DownloadRecord | None:
     queue_service._begin_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
     try:
@@ -981,12 +1877,19 @@ async def _fail_unsafe_payload(
         # into one commit closes that window: a crash before it rolls the row back to
         # ``Importing`` (still resumable), so a later cycle re-detects the unsafe payload
         # and retries the idempotent unlink.
-        if owned_placement is not None:
+        placement_removed = False
+        if (
+            owned_placement is not None
+            and owned_placement_identity is not None
+            and owned_placement_root is not None
+        ):
             placement_removed = await asyncio.to_thread(
                 _remove_quietly,
                 owned_placement,
                 expected_identity=owned_placement_identity,
+                allowed_root=owned_placement_root,
             )
+        if owned_placement is not None:
             if not placement_removed:
                 # The failed-pending CAS is still uncommitted. Roll it back before
                 # parking the row so the durable breadcrumb and unsafe torrent both
@@ -1142,15 +2045,29 @@ async def _fail_unsafe_payload(
         queue_service._end_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
 
 
-def _is_expected_movie_destination(
-    dst: Path, movies_root: str, title: str, year: int | None
-) -> bool:
-    """True when ``dst`` is the exact deterministic destination the normal movie import
-    would place this request at (same ownership predicate for both the crash-resume
-    finalize and the unsafe-rollback delete: any-video-under-root is NOT proof the file
-    is ours after a root widening or a stale breadcrumb)."""
-    expected = Path(movies_root) / plex_movie_relative_path(title, year, dst.suffix.lstrip("."))
-    return os.path.realpath(dst) == os.path.realpath(expected)
+def _expected_movie_breadcrumb_path(
+    download_path: str, movies_root: str, title: str, year: int | None
+) -> Path | None:
+    """Bind a stored movie breadcrumb to its one deterministic destination."""
+    path = Path(download_path)
+    if path.suffix.lower() not in VIDEO_EXTENSIONS:
+        return None
+    expected = Path(movies_root) / plex_movie_relative_path(title, year, path.suffix.lstrip("."))
+    return _bind_expected_library_breadcrumb(download_path, movies_root, (expected,))
+
+
+def _expected_tv_breadcrumb_path(
+    download_path: str,
+    tv_root: str,
+    title: str,
+    year: int | None,
+    seasons: tuple[int, ...],
+) -> Path | None:
+    """Bind a stored TV breadcrumb to one attached deterministic season path."""
+    expected = tuple(
+        Path(tv_root) / plex_tv_season_relative_dir(title, year, season) for season in seasons
+    )
+    return _bind_expected_library_breadcrumb(download_path, tv_root, expected)
 
 
 def _expected_movie_breadcrumb_for_unsafe_rollback(
@@ -1162,18 +2079,11 @@ def _expected_movie_breadcrumb_for_unsafe_rollback(
 ) -> Path | None:
     if download_path is None or status not in _RESUMABLE:
         return None
-    path = Path(download_path)
-    root_real = os.path.realpath(movies_root)
-    path_real = os.path.realpath(path)
-    if path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(root_real, path_real):
-        return None
     # Only a breadcrumb at the exact expected destination is provably OUR placement.
     # Deleting anything else under the (possibly re-pointed) movies root risks
     # destroying an unrelated title's file — nothing beats maybe-deleting someone
     # else's file, so an unprovable breadcrumb is left on disk for the operator.
-    if not _is_expected_movie_destination(path, movies_root, title, year):
-        return None
-    return path
+    return _expected_movie_breadcrumb_path(download_path, movies_root, title, year)
 
 
 async def _resume_breadcrumbed_tv_import(
@@ -1278,7 +2188,12 @@ async def _resume_breadcrumbed_tv_import(
         # Plex scanning is an awaited external call. Re-bind the durable proof to
         # what is on disk now so a file deletion/replacement during that gap cannot
         # turn a previously validated season into a status-less finalization.
-        if not await _payload_manifest_was_validated(session, torrent_hash, str(season_dir)):
+        if not await _payload_manifest_was_validated(
+            session,
+            torrent_hash,
+            str(season_dir),
+            allowed_root=tv_root,
+        ):
             await _block(
                 session,
                 download_repo,
@@ -1355,6 +2270,7 @@ async def _reject_unsafe_payload_if_reported(
     seasons: tuple[int, ...] = (),
     owned_placement: Path | None = None,
     owned_placement_identity: str | None = None,
+    owned_placement_root: str | None = None,
     block_existing_breadcrumb: bool = False,
 ) -> DownloadRecord | None:
     if status is None:
@@ -1416,6 +2332,7 @@ async def _reject_unsafe_payload_if_reported(
         seasons=seasons,
         owned_placement=owned_placement,
         owned_placement_identity=owned_placement_identity,
+        owned_placement_root=owned_placement_root,
     )
 
 
@@ -1431,20 +2348,14 @@ async def _resume_breadcrumbed_movie_import(
     movies_root: str,
     download_path: str,
 ) -> DownloadRecord | None:
-    dst = Path(download_path)
-    root_real = os.path.realpath(movies_root)
-    dst_real = os.path.realpath(dst)
+    dst = _expected_movie_breadcrumb_path(download_path, movies_root, request.title, request.year)
     # Require the breadcrumb to be the SAME deterministic destination the normal movie
     # import would place this request at — not merely any video under the root. A bare
     # ``_is_within`` check would finalize the request against an unrelated title if the
     # movies root were later widened to a parent path, or against a stale breadcrumb
     # pointing at another file under the root, scanning/completing the wrong media. This
     # mirrors the TV resume path, which requires the exact expected season directory.
-    if (
-        dst.suffix.lower() not in VIDEO_EXTENSIONS
-        or not _is_within(root_real, dst_real)
-        or not _is_expected_movie_destination(dst, movies_root, request.title, request.year)
-    ):
+    if dst is None:
         await _block(
             session,
             download_repo,
@@ -1513,7 +2424,12 @@ async def _resume_breadcrumbed_movie_import(
         # The attested file may have been replaced while Plex was scanning. Never
         # finalize a status-less breadcrumb unless its identity still matches the
         # current lifecycle's validation proof after that awaited boundary.
-        if not await _payload_manifest_was_validated(session, torrent_hash, str(dst)):
+        if not await _payload_manifest_was_validated(
+            session,
+            torrent_hash,
+            str(dst),
+            allowed_root=movies_root,
+        ):
             await _block(
                 session,
                 download_repo,
@@ -1556,40 +2472,7 @@ def _payload_placement_fingerprint(download_path: str) -> str:
     return hashlib.sha256(os.fsencode(normalized)).hexdigest()
 
 
-def _payload_content_identity(download_path: str) -> str | None:
-    """Fingerprint the current non-symlink file/tree identity without reading media.
-
-    Device/inode/size/mtime plus the complete relative tree catches replacement,
-    deletion, addition, and in-place modification while avoiding a multi-gigabyte
-    digest on every resume. Any access error or special/symlink entry fails closed.
-    """
-    root = Path(download_path)
-    try:
-        root_stat = root.lstat()
-    except OSError:
-        return None
-    if stat.S_ISLNK(root_stat.st_mode):
-        return None
-    if stat.S_ISREG(root_stat.st_mode):
-        entries = [(".", root_stat)]
-    elif stat.S_ISDIR(root_stat.st_mode):
-        entries = [(".", root_stat)]
-        try:
-            descendants = sorted(
-                root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
-            )
-            for descendant in descendants:
-                descendant_stat = descendant.lstat()
-                if stat.S_ISLNK(descendant_stat.st_mode) or not (
-                    stat.S_ISREG(descendant_stat.st_mode) or stat.S_ISDIR(descendant_stat.st_mode)
-                ):
-                    return None
-                entries.append((descendant.relative_to(root).as_posix(), descendant_stat))
-        except OSError:
-            return None
-    else:
-        return None
-
+def _payload_entries_identity(entries: list[tuple[str, os.stat_result]]) -> str:
     digest = hashlib.sha256()
     for relative, entry_stat in entries:
         digest.update(os.fsencode(relative))
@@ -1605,18 +2488,126 @@ def _payload_content_identity(download_path: str) -> str | None:
     return digest.hexdigest()
 
 
+def _payload_content_identity(download_path: str, *, allowed_root: str) -> str | None:
+    """Fingerprint the current non-symlink file/tree identity without reading media.
+
+    Device/inode/size/mtime plus the complete relative tree catches replacement,
+    deletion, addition, and in-place modification while avoiding a multi-gigabyte
+    digest on every resume. Any access error or special/symlink entry fails closed.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    path_only = getattr(os, "O_PATH", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory or not path_only or not os.path.isdir("/proc/self/fd"):
+        return None
+    try:
+        allowed_root_abs = os.path.abspath(os.path.normpath(allowed_root))
+        candidate_abs = os.path.abspath(os.path.normpath(download_path))
+        lexical_prefix = allowed_root_abs.rstrip(os.sep) + os.sep
+        if candidate_abs == allowed_root_abs or not candidate_abs.startswith(lexical_prefix):
+            return None
+        relative_parts = Path(os.path.relpath(candidate_abs, allowed_root_abs)).parts
+        if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+            return None
+        allowed_root_real = os.path.realpath(allowed_root_abs)
+        candidate_real = os.path.realpath(candidate_abs)
+        expected_real = os.path.normpath(os.path.join(allowed_root_real, *relative_parts))
+    except (OSError, ValueError):
+        return None
+    allowed_prefix = allowed_root_real.rstrip(os.sep) + os.sep
+    if (
+        allowed_root_real != allowed_root_abs
+        or candidate_real != expected_real
+        or candidate_real == allowed_root_real
+        or not candidate_real.startswith(allowed_prefix)
+    ):
+        return None
+
+    root_fd: int | None = None
+    try:
+        root_fd = os.open(candidate_real, path_only | nofollow | cloexec)
+        root_stat = os.fstat(root_fd)
+        if os.path.realpath(f"/proc/self/fd/{root_fd}") != candidate_real:
+            return None
+        entries: list[tuple[str, os.stat_result]] = [(".", root_stat)]
+        if stat.S_ISREG(root_stat.st_mode):
+            pass
+        elif stat.S_ISDIR(root_stat.st_mode):
+            visited: set[tuple[int, int]] = {(root_stat.st_dev, root_stat.st_ino)}
+
+            def _walk(directory_path_fd: int, relative_parent: PurePosixPath) -> bool:
+                read_fd = os.open(
+                    ".",
+                    os.O_RDONLY | directory | nofollow | cloexec,
+                    dir_fd=directory_path_fd,
+                )
+                try:
+                    with os.scandir(read_fd) as iterator:
+                        names = sorted(entry.name for entry in iterator)
+                    child_prefix = f"/proc/self/fd/{read_fd}/"
+                    for name in names:
+                        child_path = os.path.normpath(os.path.join(child_prefix, name))
+                        if not child_path.startswith(child_prefix):
+                            return False
+                        child_fd = os.open(child_path, path_only | nofollow | cloexec)
+                        try:
+                            child_stat = os.fstat(child_fd)
+                            relative = relative_parent / name
+                            if stat.S_ISREG(child_stat.st_mode):
+                                entries.append((relative.as_posix(), child_stat))
+                                continue
+                            if not stat.S_ISDIR(child_stat.st_mode):
+                                return False
+                            key = (child_stat.st_dev, child_stat.st_ino)
+                            if key in visited:
+                                return False
+                            visited.add(key)
+                            entries.append((relative.as_posix(), child_stat))
+                            if not _walk(child_fd, relative):
+                                return False
+                        finally:
+                            os.close(child_fd)
+                    return True
+                finally:
+                    os.close(read_fd)
+
+            if not _walk(root_fd, PurePosixPath()):
+                return None
+        else:
+            return None
+
+        # The traversal stayed on stable descriptors. Re-bind those descriptors to
+        # the configured namespace before granting durable attestation authority.
+        if (
+            os.path.realpath(allowed_root_abs) != allowed_root_real
+            or os.path.realpath(candidate_abs) != candidate_real
+            or os.path.realpath(f"/proc/self/fd/{root_fd}") != candidate_real
+        ):
+            return None
+        return _payload_entries_identity(entries)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if root_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(root_fd)
+
+
 def _payload_validation_attestation(
     download_path: str,
     *,
     placement_owned: bool,
-    content_identity: str | None = None,
+    content_identity: str,
 ) -> str:
+    """Format a caller-proven validation marker without touching the filesystem."""
+    if not content_identity:
+        raise ValueError("content_identity must not be empty")
     ownership = "placed" if placement_owned else "adopted"
-    identity = content_identity or _payload_content_identity(download_path) or "unverified"
     return (
         f"{_PAYLOAD_VALIDATED_IMPORT_HISTORY_PREFIX}"
         f"placement={_payload_placement_fingerprint(download_path)} "
-        f"identity={identity} "
+        f"identity={content_identity} "
         f"ownership={ownership}:"
     )
 
@@ -1652,7 +2643,11 @@ async def _latest_payload_attestation(
 
 
 async def _payload_manifest_was_validated(
-    session: AsyncSession, torrent_hash: str, download_path: str
+    session: AsyncSession,
+    torrent_hash: str,
+    download_path: str,
+    *,
+    allowed_root: str,
 ) -> bool:
     """Whether this torrent/path pair durably passed the current payload gate.
 
@@ -1664,7 +2659,11 @@ async def _payload_manifest_was_validated(
     History also avoids abusing ``failed_reason``, which the UI renders as an error.
     """
     latest = await _latest_payload_attestation(session, torrent_hash, download_path)
-    current_identity = await asyncio.to_thread(_payload_content_identity, download_path)
+    current_identity = await asyncio.to_thread(
+        _payload_content_identity,
+        download_path,
+        allowed_root=allowed_root,
+    )
     return (
         latest is not None
         and current_identity is not None
@@ -1681,21 +2680,15 @@ async def _payload_placement_was_owned(
     torrent_hash: str,
     download_path: str,
     *,
-    current_identity: str | None = None,
+    current_identity: str,
 ) -> bool:
     """Whether current identity matches this lifecycle's latest owned placement."""
     latest = await _latest_payload_attestation(session, torrent_hash, download_path)
-    if current_identity is None:
-        current_identity = await asyncio.to_thread(_payload_content_identity, download_path)
-    return (
-        latest is not None
-        and current_identity is not None
-        and latest.startswith(
-            _payload_validation_attestation(
-                download_path,
-                placement_owned=True,
-                content_identity=current_identity,
-            )
+    return latest is not None and latest.startswith(
+        _payload_validation_attestation(
+            download_path,
+            placement_owned=True,
+            content_identity=current_identity,
         )
     )
 
@@ -1963,17 +2956,79 @@ async def _import_download_locked(
     download_path = row.download_path
     row_status = row.status
     row_failed_reason = row.failed_reason
-    if status is None:
-        if _is_manual_cleanup_breadcrumb(row.status, download_path, row.failed_reason):
-            # Keep an unlink-failed unsafe rollback parked with its breadcrumb and
-            # reason intact while the client is temporarily missing. Overwriting the
-            # marker here would let a later retry remove the torrent while the placed
-            # library file still exists.
-            return await download_repo.get_by_hash(torrent_hash)
-        payload_validated = download_path is not None and await _payload_manifest_was_validated(
-            session, torrent_hash, download_path
+    expected_breadcrumb = (
+        _expected_movie_breadcrumb_path(
+            download_path,
+            effective_movies_root,
+            request.title,
+            request.year,
         )
-        if download_path is not None and _can_resume_breadcrumb_without_client_status(
+        if download_path is not None
+        else None
+    )
+    if expected_breadcrumb is not None:
+        # Filesystem work uses the deterministic destination, never the persisted
+        # spelling that merely proved lexically equal to it.
+        download_path = os.fspath(expected_breadcrumb)
+    breadcrumb_cleanup: Literal["absent", "defer", "protected", "root_unavailable"] | None = (
+        await asyncio.to_thread(
+            _trusted_breadcrumb_cleanup_state,
+            effective_movies_root,
+            expected_breadcrumb,
+        )
+        if expected_breadcrumb is not None
+        else None
+    )
+    if breadcrumb_cleanup == "absent" and expected_breadcrumb is not None:
+        _invalidate_payload_placement_ownership(
+            session,
+            torrent_hash,
+            os.fspath(expected_breadcrumb),
+            tmdb_id=request.tmdb_id,
+        )
+        cleared = await download_repo.update_status_if_in(
+            download_id,
+            row_status,
+            frozenset({row_status}),
+            clear_download_path=True,
+            require_failed_reason=row_failed_reason,
+        )
+        if not cleared:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        await session.commit()
+        download_path = None
+        expected_breadcrumb = None
+        breadcrumb_cleanup = None
+    if status is None:
+        if download_path is not None and expected_breadcrumb is None:
+            if _is_manual_cleanup_breadcrumb(row.status, download_path, row.failed_reason):
+                # An unbound cleanup pointer remains parked without a filesystem probe.
+                return await download_repo.get_by_hash(torrent_hash)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                "stored import breadcrumb is not the expected movie destination",
+                request_id=request.id,
+                expected_failed_reason=row.failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        if breadcrumb_cleanup == "root_unavailable":
+            return await download_repo.get_by_hash(torrent_hash)
+        if _is_manual_cleanup_breadcrumb(row.status, download_path, row.failed_reason):
+            # The trusted destination still exists, so retain its cleanup breadcrumb.
+            return await download_repo.get_by_hash(torrent_hash)
+        payload_validated = (
+            expected_breadcrumb is not None
+            and await _payload_manifest_was_validated(
+                session,
+                torrent_hash,
+                os.fspath(expected_breadcrumb),
+                allowed_root=effective_movies_root,
+            )
+        )
+        if expected_breadcrumb is not None and _can_resume_breadcrumb_without_client_status(
             row.status, row.failed_reason, payload_validated=payload_validated
         ):
             if row.status == DownloadState.ImportBlocked.value:
@@ -1997,7 +3052,7 @@ async def _import_download_locked(
                 torrent_hash=torrent_hash,
                 request=request,
                 movies_root=effective_movies_root,
-                download_path=download_path,
+                download_path=os.fspath(expected_breadcrumb),
             )
         if download_path is not None and not payload_validated:
             # A pre-security-release breadcrumb has no durable proof that its torrent
@@ -2029,34 +3084,6 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     if _payload_manifest_is_complete(status):
-        if download_path is not None:
-            breadcrumb_cleanup = await asyncio.to_thread(
-                _stored_path_cleanup_state, Path(download_path)
-            )
-            if breadcrumb_cleanup == "absent":
-                # An unsafe-rollback attempt may have successfully unlinked its
-                # owned placement and then died before the path-clear transaction
-                # committed. Missing is the one state that proves the cleanup
-                # obligation is already resolved, so consume the stale pointer
-                # idempotently before adjudicating/removing the torrent again.
-                _invalidate_payload_placement_ownership(
-                    session,
-                    torrent_hash,
-                    download_path,
-                    tmdb_id=request.tmdb_id,
-                )
-                cleared = await download_repo.update_status_if_in(
-                    download_id,
-                    row_status,
-                    frozenset({row_status}),
-                    clear_download_path=True,
-                    require_failed_reason=row_failed_reason,
-                )
-                if not cleared:
-                    await session.rollback()
-                    return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-                await session.commit()
-                download_path = None
         owned_candidate = _expected_movie_breadcrumb_for_unsafe_rollback(
             row_status,
             download_path,
@@ -2068,7 +3095,9 @@ async def _import_download_locked(
         owned_placement_identity = None
         if owned_candidate is not None:
             candidate_identity = await asyncio.to_thread(
-                _payload_content_identity, os.fspath(owned_candidate)
+                _payload_content_identity,
+                os.fspath(owned_candidate),
+                allowed_root=effective_movies_root,
             )
             if candidate_identity is not None and await _payload_placement_was_owned(
                 session,
@@ -2089,10 +3118,13 @@ async def _import_download_locked(
             request_id=request.id,
             owned_placement=owned_placement,
             owned_placement_identity=owned_placement_identity,
+            owned_placement_root=effective_movies_root,
             block_existing_breadcrumb=has_placement_breadcrumb and owned_placement is None,
         )
         if rejected is not None:
             return rejected
+        if breadcrumb_cleanup == "root_unavailable":
+            return await download_repo.get_by_hash(torrent_hash)
     if not _is_settled_for_import(status):
         if download_path is not None:
             # ``download_path`` is a durable Plex-library placement, not a qBt
@@ -2117,6 +3149,19 @@ async def _import_download_locked(
             return await download_repo.get_by_hash(torrent_hash)
         await request_repo.set_status(request.id, RequestStatus.downloading.value)
         await session.commit()
+        return await download_repo.get_by_hash(torrent_hash)
+    if download_path is not None and expected_breadcrumb is None:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            (
+                "stored movie import breadcrumb does not match the current destination; "
+                f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+            ),
+            request_id=request.id,
+            expected_failed_reason=row.failed_reason,
+        )
         return await download_repo.get_by_hash(torrent_hash)
     try:
         resolved = _resolve_content(status, download_path)
@@ -2146,8 +3191,14 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    content = visible_content
-    sources = await asyncio.to_thread(_resolve_sources, fs, content)
+    content = visible_content.path
+    sources = await asyncio.to_thread(
+        _resolve_sources,
+        fs,
+        content,
+        source_root=visible_content.source_root,
+        source_root_identity=visible_content.source_root_identity,
+    )
     if not sources:
         await _block(
             session,
@@ -2166,7 +3217,10 @@ async def _import_download_locked(
     # largest surviving feature, so a larger featurette/proof/decoy beside the real
     # feature no longer blinds it into a false ``NO_VIDEO_FILE`` / wrong-media block.
     validation = validate_import(
-        [VideoFile(relative_path=rel, size_bytes=size) for _abs, size, rel in sources],
+        [
+            VideoFile(relative_path=source.relative_path, size_bytes=source.size)
+            for source in sources
+        ],
         parser=parser,
         profile=profile,
         expected_title=request.title,
@@ -2180,8 +3234,8 @@ async def _import_download_locked(
         await _block(session, download_repo, download_id, reason, request_id=request.id)
         return await download_repo.get_by_hash(torrent_hash)
 
-    # Map the validator's chosen feature back to its absolute source path — exactly
-    # the ``abs_by_rel`` shape the TV path uses — so placement copies the file the
+    # Map the validator's chosen feature back to its identity-bound source — exactly
+    # the ``source_by_rel`` shape the TV path uses — so placement copies the file the
     # validator actually selected, not a separately re-derived "largest". An
     # ``accepted`` validation ALWAYS carries a chosen ``video`` (accepted is defined
     # as "no rejections", reachable only after a feature was picked), so the None
@@ -2195,45 +3249,24 @@ async def _import_download_locked(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
-    src = abs_by_rel[validation.video.relative_path]
-    ext = os.path.splitext(src)[1].lstrip(".")
+    source_by_rel = {source.relative_path: source for source in sources}
+    source = source_by_rel[validation.video.relative_path]
+    ext = os.path.splitext(source.path)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
-    if download_path is not None and os.path.realpath(download_path) != os.path.realpath(dst):
-        breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, Path(download_path))
-        if breadcrumb_kind == "missing":
-            _invalidate_payload_placement_ownership(
-                session,
-                torrent_hash,
-                download_path,
-                tmdb_id=request.tmdb_id,
-            )
-            cleared = await download_repo.update_status_if_in(
-                download_id,
-                row.status,
-                frozenset({row.status}),
-                clear_download_path=True,
-                require_failed_reason=row.failed_reason,
-            )
-            if not cleared:
-                await session.rollback()
-                return await download_repo.get_by_hash(torrent_hash)
-            await session.commit()
-            download_path = None
-        else:
-            await _block(
-                session,
-                download_repo,
-                download_id,
-                (
-                    "stored movie import breadcrumb does not match the current destination; "
-                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
-                ),
-                request_id=request.id,
-                expected_failed_reason=row.failed_reason,
-            )
-            return await download_repo.get_by_hash(torrent_hash)
+    if download_path is not None and Path(download_path) != dst:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            (
+                "stored movie import breadcrumb does not match the current destination; "
+                f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+            ),
+            request_id=request.id,
+            expected_failed_reason=row.failed_reason,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
 
     if not await asyncio.to_thread(os.path.isdir, effective_movies_root):
         # A configured-but-invisible-in-this-container root (issue #132): never
@@ -2299,14 +3332,18 @@ async def _import_download_locked(
             # basename must NOT shadow the grabbed RELEASE title. Keep the basename in
             # ``message`` only.
             source_title=None,
-            message=f"importing {os.path.basename(src)} to {relative}",
+            message=f"importing {os.path.basename(source.path)} to {relative}",
         )
         session.add(import_started_history)
         await session.commit()
 
         try:
             placed, observed_identity = await asyncio.to_thread(
-                _place_file_with_identity, fs, src, dst
+                _place_file_with_identity,
+                fs,
+                source,
+                dst,
+                allowed_root=effective_movies_root,
             )
         except FileExistsError as exc:
             # A pre-existing, differently-sized file at the destination (a user's file,
@@ -2314,11 +3351,18 @@ async def _import_download_locked(
             await _block(session, download_repo, download_id, str(exc), request_id=request.id)
             return await download_repo.get_by_hash(torrent_hash)
         except OSError as exc:
+            failed_destination_kind = await asyncio.to_thread(_classify_stored_path, dst)
+            reason = f"import copy failed: {type(exc).__name__}"
+            if failed_destination_kind != "missing":
+                reason = (
+                    f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                )
             await _block(
                 session,
                 download_repo,
                 download_id,
-                f"import copy failed: {type(exc).__name__}",
+                reason,
                 request_id=request.id,
             )
             return await download_repo.get_by_hash(torrent_hash)
@@ -2332,7 +3376,11 @@ async def _import_download_locked(
         await download_repo.update_status(
             download_id, DownloadState.Importing.value, download_path=str(dst)
         )
-        content_identity = await asyncio.to_thread(_payload_content_identity, str(dst))
+        content_identity = await asyncio.to_thread(
+            _payload_content_identity,
+            str(dst),
+            allowed_root=effective_movies_root,
+        )
         if (
             observed_identity is None
             or content_identity is None
@@ -2368,7 +3416,7 @@ async def _import_download_locked(
                 source_title=None,
                 message=(
                     f"{validation_attestation} "
-                    f"validated placement for {os.path.basename(src)} at {relative}"
+                    f"validated placement for {os.path.basename(source.path)} at {relative}"
                 ),
             )
         )
@@ -2405,7 +3453,11 @@ async def _import_download_locked(
             # importer owns from an identical user file it merely adopted. A confirmed
             # rollback appends an invalidation before clearing the breadcrumb, so stale
             # historical ownership can never authorize a later deletion.
-            current_identity = await asyncio.to_thread(_payload_content_identity, str(dst))
+            current_identity = await asyncio.to_thread(
+                _payload_content_identity,
+                str(dst),
+                allowed_root=effective_movies_root,
+            )
             owns_placement = current_identity is not None and await _payload_placement_was_owned(
                 session,
                 torrent_hash,
@@ -2413,11 +3465,12 @@ async def _import_download_locked(
                 current_identity=current_identity,
             )
             placement_removed = False
-            if owns_placement:
+            if owns_placement and current_identity is not None:
                 placement_removed = await asyncio.to_thread(
                     _remove_quietly,
                     dst,
                     expected_identity=current_identity,
+                    allowed_root=effective_movies_root,
                 )
                 if placement_removed:
                     _invalidate_payload_placement_ownership(
@@ -2448,7 +3501,12 @@ async def _import_download_locked(
             )
             return await download_repo.get_by_hash(torrent_hash)
 
-        if not await _payload_manifest_was_validated(session, torrent_hash, str(dst)):
+        if not await _payload_manifest_was_validated(
+            session,
+            torrent_hash,
+            str(dst),
+            allowed_root=effective_movies_root,
+        ):
             await _block(
                 session,
                 download_repo,
@@ -2482,7 +3540,7 @@ async def _import_download_locked(
                 torrent_hash=torrent_hash,
                 event_type=DownloadHistoryEvent.imported,
                 source_title=None,  # never shadow the grabbed title (see import_started above)
-                message=f"imported {os.path.basename(src)} to {relative}",
+                message=f"imported {os.path.basename(source.path)} to {relative}",
             )
         )
         # Persist the eviction breadcrumb (ADR-0012) NOW, in the SAME transaction as
@@ -2553,12 +3611,43 @@ async def _import_tv_targets_locked(
     target_seasons = tuple(dict.fromkeys(target.season for target in targets))
 
     status = await qbt.get_status(torrent_hash)
+    breadcrumb_cleanup: Literal["absent", "defer", "protected", "root_unavailable"] | None = None
     if download_path is not None:
+        expected_breadcrumb = _expected_tv_breadcrumb_path(
+            download_path,
+            tv_root,
+            request.title,
+            request.year,
+            known_scope_seasons,
+        )
+        if expected_breadcrumb is None:
+            if status is None and _is_manual_cleanup_breadcrumb(
+                download_status, download_path, failed_reason
+            ):
+                # An unbound cleanup pointer remains parked without a filesystem probe.
+                return await download_repo.get_by_hash(torrent_hash)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                (
+                    "stored scoped-tv import breadcrumb does not match any attached season; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                ),
+                request_id=request.id,
+                seasons=target_seasons,
+                expected_failed_reason=failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        download_path = os.fspath(expected_breadcrumb)
         breadcrumb_cleanup = await asyncio.to_thread(
-            _stored_path_cleanup_state,
-            Path(download_path),
+            _trusted_breadcrumb_cleanup_state,
+            tv_root,
+            expected_breadcrumb,
             allow_empty_directory=True,
         )
+        if breadcrumb_cleanup == "root_unavailable" and status is None:
+            return await download_repo.get_by_hash(torrent_hash)
         if breadcrumb_cleanup == "defer":
             return await download_repo.get_by_hash(torrent_hash)
         if breadcrumb_cleanup == "absent":
@@ -2583,17 +3672,17 @@ async def _import_tv_targets_locked(
     if status is None and _is_manual_cleanup_breadcrumb(
         download_status, download_path, failed_reason
     ):
-        # Same guard as the scalar TV path: a transient missing client status must not
-        # let this scoped row "resume" through ``_resolve_content``'s breadcrumb
-        # fallback (re-importing the parked placement) or overwrite the manual-cleanup
-        # reason. Leave the row parked until the client reports the torrent again.
+        # The trusted destination still exists, so retain its cleanup breadcrumb.
         return await download_repo.get_by_hash(torrent_hash)
     if status is None and download_path is not None:
         # This multi-scope path has no single safe status-less resume transaction.
         # Park it visibly while retaining the placement; current-policy proof
         # distinguishes a client outage from an old/unvalidated crash row.
         payload_validated = await _payload_manifest_was_validated(
-            session, torrent_hash, download_path
+            session,
+            torrent_hash,
+            download_path,
+            allowed_root=tv_root,
         )
         await _block(
             session,
@@ -2629,6 +3718,8 @@ async def _import_tv_targets_locked(
         )
         if rejected is not None:
             return rejected
+        if breadcrumb_cleanup == "root_unavailable":
+            return await download_repo.get_by_hash(torrent_hash)
     if status is not None and not _is_settled_for_import(status):
         if download_path is not None:
             return await download_repo.get_by_hash(torrent_hash)
@@ -2660,44 +3751,6 @@ async def _import_tv_targets_locked(
             )
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
-
-    if download_path is not None:
-        expected_scope_dirs = {
-            os.path.realpath(
-                Path(tv_root)
-                / plex_tv_season_relative_dir(request.title, request.year, known_season)
-            )
-            for known_season in known_scope_seasons
-        }
-        if os.path.realpath(download_path) not in expected_scope_dirs:
-            breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, Path(download_path))
-            if breadcrumb_kind == "missing":
-                cleared = await download_repo.update_status_if_in(
-                    download_id,
-                    download_status,
-                    frozenset({download_status}),
-                    clear_download_path=True,
-                    require_failed_reason=failed_reason,
-                )
-                if not cleared:
-                    await session.rollback()
-                    return await download_repo.get_by_hash(torrent_hash)
-                await session.commit()
-                download_path = None
-            else:
-                await _block(
-                    session,
-                    download_repo,
-                    download_id,
-                    (
-                        "stored scoped-tv import breadcrumb does not match any attached season; "
-                        f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
-                    ),
-                    request_id=request.id,
-                    seasons=target_seasons,
-                    expected_failed_reason=failed_reason,
-                )
-                return await download_repo.get_by_hash(torrent_hash)
 
     try:
         resolved = _resolve_content(status, download_path)
@@ -2734,7 +3787,13 @@ async def _import_tv_targets_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
-    sources = await asyncio.to_thread(_resolve_sources, fs, visible_content)
+    sources = await asyncio.to_thread(
+        _resolve_sources,
+        fs,
+        visible_content.path,
+        source_root=visible_content.source_root,
+        source_root_identity=visible_content.source_root_identity,
+    )
     if not sources:
         await _block(
             session,
@@ -2881,20 +3940,33 @@ async def _import_tv_targets_locked(
             observed_paths: list[_PlacedPath] = []
             imported: list[tuple[str, PurePosixPath]] = []
             for relative, result in plan.by_relative.items():
-                src = plan.abs_by_rel[result.video.relative_path]
+                source = plan.source_by_rel[result.video.relative_path]
                 dst = Path(tv_root) / relative
                 try:
                     placed, observed_identity = await asyncio.to_thread(
-                        _place_file_with_identity, fs, src, dst
+                        _place_file_with_identity,
+                        fs,
+                        source,
+                        dst,
+                        allowed_root=tv_root,
                     )
                 except (FileExistsError, OSError) as exc:
-                    rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    rollback_complete = await asyncio.to_thread(
+                        _remove_quietly_many,
+                        placed_paths,
+                        allowed_root=tv_root,
+                    )
+                    failed_destination_kind = await asyncio.to_thread(_classify_stored_path, dst)
                     reason = (
                         str(exc)
                         if isinstance(exc, FileExistsError)
                         else f"import copy failed: {type(exc).__name__}"
                     )
-                    cleanup_incomplete = plan_has_existing_breadcrumb or not rollback_complete
+                    cleanup_incomplete = (
+                        plan_has_existing_breadcrumb
+                        or not rollback_complete
+                        or failed_destination_kind != "missing"
+                    )
                     if cleanup_incomplete:
                         reason = (
                             f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
@@ -2907,7 +3979,7 @@ async def _import_tv_targets_locked(
                 observed_paths.append(observed_path)
                 if placed:
                     placed_paths.append(observed_path)
-                imported.append((os.path.basename(src), relative))
+                imported.append((os.path.basename(source.path), relative))
             else:
                 await download_repo.update_status(
                     download_id,
@@ -2918,9 +3990,14 @@ async def _import_tv_targets_locked(
                     _payload_identity_if_observations_match,
                     str(plan.season_dir),
                     observed_paths,
+                    allowed_root=tv_root,
                 )
                 if content_identity is None:
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    await asyncio.to_thread(
+                        _remove_quietly_many,
+                        placed_paths,
+                        allowed_root=tv_root,
+                    )
                     cleanup_breadcrumb = plan.season_dir
                     failures.append(
                         _TvImportFailure(
@@ -2959,7 +4036,11 @@ async def _import_tv_targets_locked(
                     await library.trigger_scan(str(plan.season_dir), "tv")
                 except (PlexLibraryError, PlexAuthError) as exc:
                     scan_succeeded = False
-                    rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    rollback_complete = await asyncio.to_thread(
+                        _remove_quietly_many,
+                        placed_paths,
+                        allowed_root=tv_root,
+                    )
                     reason = f"plex scan failed: {type(exc).__name__}"
                     cleanup_incomplete = plan_has_existing_breadcrumb or not rollback_complete
                     if cleanup_incomplete:
@@ -2970,10 +4051,17 @@ async def _import_tv_targets_locked(
                         cleanup_breadcrumb = plan.season_dir
                     failures.append(_TvImportFailure(plan.target, reason))
                 if scan_succeeded and not await _payload_manifest_was_validated(
-                    session, torrent_hash, str(plan.season_dir)
+                    session,
+                    torrent_hash,
+                    str(plan.season_dir),
+                    allowed_root=tv_root,
                 ):
                     scan_succeeded = False
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    await asyncio.to_thread(
+                        _remove_quietly_many,
+                        placed_paths,
+                        allowed_root=tv_root,
+                    )
                     cleanup_breadcrumb = plan.season_dir
                     failures.append(
                         _TvImportFailure(
@@ -3139,8 +4227,8 @@ async def _import_tv_locked(
     Unlike the movie path's single ``download_path`` breadcrumb (which lets a
     crash-resumed run re-adopt a placement it made before a prior crash), a TV
     import that crashes mid-copy is simply retried by a fresh run: each file's
-    placement is independently idempotent (:func:`_place_file` skips an already-
-    identical-size destination), so only the files THIS invocation itself placed
+    placement is independently idempotent (:func:`_place_file` adopts an already-
+    identical-content destination), so only the files THIS invocation itself placed
     are rolled back on a scan failure -- a single column cannot represent "N
     placed files" across invocations, so cross-invocation ownership tracking is
     not attempted here (a scoped follow-up, like true per-episode completeness).
@@ -3148,12 +4236,43 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
+    breadcrumb_cleanup: Literal["absent", "defer", "protected", "root_unavailable"] | None = None
     if download_path is not None:
+        expected_breadcrumb = _expected_tv_breadcrumb_path(
+            download_path,
+            tv_root,
+            request.title,
+            request.year,
+            (season,),
+        )
+        if expected_breadcrumb is None:
+            if status is None and _is_manual_cleanup_breadcrumb(
+                download_status, download_path, failed_reason
+            ):
+                # An unbound cleanup pointer remains parked without a filesystem probe.
+                return await download_repo.get_by_hash(torrent_hash)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                (
+                    "stored tv import breadcrumb does not match the current season; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                ),
+                request_id=request.id,
+                season=season,
+                expected_failed_reason=failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        download_path = os.fspath(expected_breadcrumb)
         breadcrumb_cleanup = await asyncio.to_thread(
-            _stored_path_cleanup_state,
-            Path(download_path),
+            _trusted_breadcrumb_cleanup_state,
+            tv_root,
+            expected_breadcrumb,
             allow_empty_directory=True,
         )
+        if breadcrumb_cleanup == "root_unavailable" and status is None:
+            return await download_repo.get_by_hash(torrent_hash)
         if breadcrumb_cleanup == "defer":
             return await download_repo.get_by_hash(torrent_hash)
         if breadcrumb_cleanup == "absent":
@@ -3177,17 +4296,13 @@ async def _import_tv_locked(
             download_path = None
     if status is None:
         if _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason):
-            # An ImportBlocked row already parked for manual cleanup keeps its
-            # manual-cleanup ``failed_reason``: overwriting it with the generic
-            # "no status for payload validation" block below (ImportBlocked is
-            # resumable, so that CAS would land) makes ``_is_manual_cleanup_breadcrumb``
-            # stop matching on the next retry, after which the import path could
-            # fail/re-arm and delete the torrent while leaving the placed season files
-            # behind. Leave the row untouched until the client reports the torrent again
-            # (or the operator clears the placed files).
+            # The trusted destination still exists, so retain its cleanup breadcrumb.
             return await download_repo.get_by_hash(torrent_hash)
         payload_validated = download_path is not None and await _payload_manifest_was_validated(
-            session, torrent_hash, download_path
+            session,
+            torrent_hash,
+            download_path,
+            allowed_root=tv_root,
         )
         if download_path is not None and _can_resume_breadcrumb_without_client_status(
             download_status, failed_reason, payload_validated=payload_validated
@@ -3255,6 +4370,8 @@ async def _import_tv_locked(
         )
         if rejected is not None:
             return rejected
+        if breadcrumb_cleanup == "root_unavailable":
+            return await download_repo.get_by_hash(torrent_hash)
     if not _is_settled_for_import(status):
         if download_path is not None:
             return await download_repo.get_by_hash(torrent_hash)
@@ -3306,9 +4423,15 @@ async def _import_tv_locked(
             season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    content = visible_content
+    content = visible_content.path
 
-    sources = await asyncio.to_thread(_resolve_sources, fs, content)
+    sources = await asyncio.to_thread(
+        _resolve_sources,
+        fs,
+        content,
+        source_root=visible_content.source_root,
+        source_root_identity=visible_content.source_root_identity,
+    )
     if not sources:
         await _block(
             session,
@@ -3324,7 +4447,10 @@ async def _import_tv_locked(
     # season identity, quality gate, sample floor, episode-number gate). Partial
     # success is legitimate here, unlike the movie path's all-or-nothing verdict.
     validation = validate_season_import(
-        [VideoFile(relative_path=rel, size_bytes=size) for _abs, size, rel in sources],
+        [
+            VideoFile(relative_path=source.relative_path, size_bytes=source.size)
+            for source in sources
+        ],
         parser=parser,
         profile=profile,
         expected_title=request.title,
@@ -3393,11 +4519,11 @@ async def _import_tv_locked(
     # WHOLE season -- defeating "partial success is legitimate" over what is
     # really just a single duplicate. The smaller duplicate is dropped with a
     # logged warning (never silently), same posture as a validation rejection.
-    abs_by_rel = {rel: abs_path for abs_path, _size, rel in sources}
+    source_by_rel = {source.relative_path: source for source in sources}
     by_relative: dict[PurePosixPath, EpisodeImportResult] = {}
     for result in validation.accepted:
-        src = abs_by_rel[result.video.relative_path]
-        ext = os.path.splitext(src)[1].lstrip(".")
+        source = source_by_rel[result.video.relative_path]
+        ext = os.path.splitext(source.path)[1].lstrip(".")
         relative = plex_tv_episode_relative_path(
             request.title, request.year, season, result.episodes, ext
         )
@@ -3434,37 +4560,6 @@ async def _import_tv_locked(
         return await download_repo.get_by_hash(torrent_hash)
 
     season_dir = Path(tv_root) / plex_tv_season_relative_dir(request.title, request.year, season)
-    if download_path is not None and os.path.realpath(download_path) != os.path.realpath(
-        season_dir
-    ):
-        breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, Path(download_path))
-        if breadcrumb_kind == "missing":
-            cleared = await download_repo.update_status_if_in(
-                download_id,
-                download_status,
-                frozenset({download_status}),
-                clear_download_path=True,
-                require_failed_reason=failed_reason,
-            )
-            if not cleared:
-                await session.rollback()
-                return await download_repo.get_by_hash(torrent_hash)
-            await session.commit()
-            download_path = None
-        else:
-            await _block(
-                session,
-                download_repo,
-                download_id,
-                (
-                    "stored tv import breadcrumb does not match the current season; "
-                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
-                ),
-                request_id=request.id,
-                season=season,
-                expected_failed_reason=failed_reason,
-            )
-            return await download_repo.get_by_hash(torrent_hash)
     preserve_existing_breadcrumb = download_path is not None
     # PURGE-vs-IMPORT ordering rule (round 9; stated identically at
     # purge_service's registry): FIRST-REGISTERED WINS, loser defers fast. If an
@@ -3519,14 +4614,22 @@ async def _import_tv_locked(
         observed_paths: list[_PlacedPath] = []
         imported: list[tuple[str, PurePosixPath]] = []
         for relative, result in by_relative.items():
-            src = abs_by_rel[result.video.relative_path]
+            source = source_by_rel[result.video.relative_path]
             dst = Path(tv_root) / relative
             try:
                 placed, observed_identity = await asyncio.to_thread(
-                    _place_file_with_identity, fs, src, dst
+                    _place_file_with_identity,
+                    fs,
+                    source,
+                    dst,
+                    allowed_root=tv_root,
                 )
             except (FileExistsError, OSError) as exc:
-                rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                rollback_complete = await asyncio.to_thread(
+                    _remove_quietly_many,
+                    placed_paths,
+                    allowed_root=tv_root,
+                )
                 failed_destination_kind = await asyncio.to_thread(_classify_stored_path, dst)
                 reason = (
                     str(exc)
@@ -3558,7 +4661,7 @@ async def _import_tv_locked(
             observed_paths.append(observed_path)
             if placed:
                 placed_paths.append(observed_path)
-            imported.append((os.path.basename(src), relative))
+            imported.append((os.path.basename(source.path), relative))
 
         # download_path is stamped with the SEASON folder (not one file) purely for
         # queue-display observability -- unlike the movie path, it is never consulted
@@ -3570,9 +4673,14 @@ async def _import_tv_locked(
             _payload_identity_if_observations_match,
             str(season_dir),
             observed_paths,
+            allowed_root=tv_root,
         )
         if content_identity is None:
-            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            await asyncio.to_thread(
+                _remove_quietly_many,
+                placed_paths,
+                allowed_root=tv_root,
+            )
             await _block(
                 session,
                 download_repo,
@@ -3606,7 +4714,11 @@ async def _import_tv_locked(
         try:
             await library.trigger_scan(str(season_dir), "tv")
         except (PlexLibraryError, PlexAuthError) as exc:
-            rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            rollback_complete = await asyncio.to_thread(
+                _remove_quietly_many,
+                placed_paths,
+                allowed_root=tv_root,
+            )
             reason = f"plex scan failed: {type(exc).__name__}"
             cleanup_incomplete = preserve_existing_breadcrumb or not rollback_complete
             if cleanup_incomplete:
@@ -3625,8 +4737,17 @@ async def _import_tv_locked(
             )
             return await download_repo.get_by_hash(torrent_hash)
 
-        if not await _payload_manifest_was_validated(session, torrent_hash, str(season_dir)):
-            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+        if not await _payload_manifest_was_validated(
+            session,
+            torrent_hash,
+            str(season_dir),
+            allowed_root=tv_root,
+        ):
+            await asyncio.to_thread(
+                _remove_quietly_many,
+                placed_paths,
+                allowed_root=tv_root,
+            )
             await _block(
                 session,
                 download_repo,

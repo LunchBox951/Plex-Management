@@ -1,9 +1,8 @@
 """LocalFileSystem — the :class:`FileSystemPort` implementation for local disk.
 
-Unlike the Plex stub, this is a *real, safe* implementation: shipping it is
-harmless because nothing imports it into a running pipeline yet (the import step
-is deferred), and it is fully unit-testable against ``tmp_path``. Operations are
-synchronous (local disk) per the port contract.
+Unlike the Plex stub, this is a *real, safe* implementation used by the import
+pipeline and fully unit-testable against ``tmp_path``. Operations are synchronous
+(local disk) per the port contract.
 
 ``hardlink_or_copy`` prefers a hardlink (instant, zero extra space) and falls
 back to a content copy when the destination is on a different device — the
@@ -13,27 +12,101 @@ classic seedbox/library cross-mount case.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import errno
 import os
+import secrets
 import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from plex_manager.ports.filesystem import VIDEO_EXTENSIONS, FilePlacementIdentity
 
-__all__ = ["LocalFileSystem", "LocalFileSystemError", "clear_stale_publish_locks"]
+__all__ = [
+    "LocalFileSystem",
+    "LocalFileSystemError",
+    "clear_stale_publish_locks",
+    "rename_exchange",
+    "rename_no_replace",
+]
 
 # os.link failures that genuinely warrant a content-copy fallback (cross-device,
 # hardlink-refusing / unsupported filesystem). Any OTHER errno (notably EEXIST —
 # the destination already exists) must NOT be masked as cross-device, or a copy
 # could overwrite a file another import just placed.
 _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
-    {errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.EACCES}
+    {
+        errno.EXDEV,
+        errno.EPERM,
+        errno.EMLINK,
+        errno.EOPNOTSUPP,
+        errno.EACCES,
+        errno.ENOSYS,
+    }
 )
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def rename_no_replace(
+    src: str | bytes,
+    dst: str | bytes,
+    *,
+    src_dir_fd: int | None = None,
+    dst_dir_fd: int | None = None,
+) -> None:
+    """Atomically rename ``src`` without ever replacing ``dst`` (Linux)."""
+    renameat2 = getattr(_LIBC, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable")
+    src_bytes = os.fsencode(src)
+    dst_bytes = os.fsencode(dst)
+    result = renameat2(
+        _AT_FDCWD if src_dir_fd is None else src_dir_fd,
+        ctypes.c_char_p(src_bytes),
+        _AT_FDCWD if dst_dir_fd is None else dst_dir_fd,
+        ctypes.c_char_p(dst_bytes),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), os.fsdecode(dst_bytes))
+    raise OSError(error, os.strerror(error), os.fsdecode(src_bytes))
+
+
+def rename_exchange(
+    left: str | bytes,
+    right: str | bytes,
+    *,
+    left_dir_fd: int | None = None,
+    right_dir_fd: int | None = None,
+) -> None:
+    """Atomically exchange two existing directory entries (Linux)."""
+    renameat2 = getattr(_LIBC, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOTSUP, "atomic exchange rename is unavailable")
+    left_bytes = os.fsencode(left)
+    right_bytes = os.fsencode(right)
+    result = renameat2(
+        _AT_FDCWD if left_dir_fd is None else left_dir_fd,
+        ctypes.c_char_p(left_bytes),
+        _AT_FDCWD if right_dir_fd is None else right_dir_fd,
+        ctypes.c_char_p(right_bytes),
+        _RENAME_EXCHANGE,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), os.fsdecode(left_bytes))
 
 
 def _placement_identity(observed: os.stat_result) -> FilePlacementIdentity:
@@ -205,14 +278,12 @@ def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
     same-directory atomic move that costs no second content copy — previously
     this fell back to re-copying the temp's bytes into the final path, needing
     ~2x the title's size transiently and failing with a spurious ENOSPC on a
-    barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
-    PUBLISHER is preserved by the per-destination ``_publish_lock`` plus the
-    ``os.path.lexists(dst)`` check made under it — every publisher in this
-    module takes that same lock before touching ``dst``.
+    barely-fitting disk. ``RENAME_NOREPLACE`` preserves the exclusive-create
+    guarantee even against a writer that does not honor the cooperative lock.
     """
     with _publish_lock(dst):
         # lexists, not exists: on a hardlink-refusing filesystem the copy fallback
-        # below is os.rename, which WOULD silently replace a dangling symlink's
+        # below is a rename publish, which could replace a dangling symlink's
         # entry (exists() reads a dangling link as absent) -- GHSA-8fj8. This is
         # the critical backstop, immediately before the link/rename attempt, under
         # the lock every publisher in this module takes before touching dst.
@@ -223,8 +294,10 @@ def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
         except OSError as exc:
             if exc.errno not in _COPY_FALLBACK_ERRNOS:
                 raise
-            # The rename consumes the temp — nothing left to unlink.
-            os.rename(tmp_path, os.fspath(dst))
+            # The rename consumes the temp — nothing left to unlink. Linux's
+            # RENAME_NOREPLACE closes the gap against writers that do not honor
+            # our cooperative publish lock.
+            rename_no_replace(tmp_path, os.fspath(dst))
             return
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
@@ -234,6 +307,289 @@ def _publish_link_no_overwrite(src: Path, dst: Path) -> None:
     """Publish ``src`` at ``dst`` via an exclusive hardlink under the destination lock."""
     with _publish_lock(dst):
         os.link(os.fspath(src), os.fspath(dst))
+
+
+class _AnchoredDestination(NamedTuple):
+    path: Path
+    root_fd: int
+    parent_fd: int
+    name: str
+    root_abs: str
+    parent_parts: tuple[str, ...]
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _same_regular_file_after_rename(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare every regular-file field that rename(2) itself leaves stable."""
+    return (
+        _same_inode(left, right)
+        and stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_mode == right.st_mode
+    )
+
+
+def _anchor_is_current(anchor: _AnchoredDestination) -> bool:
+    """Whether held root/parent descriptors still occupy their configured path."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    opened: list[int] = []
+    try:
+        filesystem_prefix = os.path.realpath(os.sep)
+        if (
+            anchor.root_abs == filesystem_prefix
+            or not anchor.root_abs.startswith(filesystem_prefix)
+            or os.path.realpath(anchor.root_abs) != anchor.root_abs
+        ):
+            return False
+        current_fd = os.open(
+            anchor.root_abs,
+            os.O_RDONLY | directory | nofollow | cloexec,
+        )
+        opened.append(current_fd)
+        if not _same_inode(os.fstat(current_fd), os.fstat(anchor.root_fd)):
+            return False
+        if os.path.realpath(f"/proc/self/fd/{current_fd}") != anchor.root_abs:
+            return False
+        for component in anchor.parent_parts:
+            current_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            opened.append(current_fd)
+        return _same_inode(os.fstat(current_fd), os.fstat(anchor.parent_fd))
+    except (OSError, ValueError):
+        return False
+    finally:
+        for fd in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _quarantine_unlink_placement(
+    parent_fd: int,
+    name: str,
+    expected: FilePlacementIdentity,
+) -> bool:
+    """Remove only the published inode, leaving a crash-visible placeholder.
+
+    The mode-0700 quarantine is an authority boundary against other UIDs. A
+    process already running as this service UID is trusted; Linux has no atomic
+    compare-inode-and-unlink primitive that could defend against that peer.
+    """
+    quarantine_dir = f".plex-manager-rollback-{secrets.token_hex(16)}"
+    held_fd: int | None = None
+    quarantine_fd: int | None = None
+    captured_fd: int | None = None
+    placeholder_fd: int | None = None
+    exchanged = False
+    captured_removed = False
+    try:
+        held_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_fd,
+        )
+        before = os.fstat(held_fd)
+        if _placement_identity(before) != expected:
+            return False
+        os.mkdir(quarantine_dir, mode=0o700, dir_fd=parent_fd)
+        quarantine_fd = os.open(
+            quarantine_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(quarantine_fd, 0o700)
+        placeholder_fd = os.open(
+            "slot",
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=quarantine_fd,
+        )
+        placeholder_before = os.fstat(placeholder_fd)
+        rename_exchange(
+            name,
+            "slot",
+            left_dir_fd=parent_fd,
+            right_dir_fd=quarantine_fd,
+        )
+        exchanged = True
+        captured_fd = os.open(
+            "slot",
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=quarantine_fd,
+        )
+        observed = os.fstat(captured_fd)
+        if (
+            not _same_regular_file_after_rename(before, observed)
+            or _placement_identity(os.fstat(captured_fd)) != _placement_identity(observed)
+            or _placement_identity(os.stat("slot", dir_fd=quarantine_fd, follow_symlinks=False))
+            != _placement_identity(observed)
+        ):
+            rename_exchange(
+                name,
+                "slot",
+                left_dir_fd=parent_fd,
+                right_dir_fd=quarantine_fd,
+            )
+            exchanged = False
+            # The successful restore puts our private placeholder back in the
+            # mode-0700 quarantine. Remove it so the temporary directory does
+            # not leak on an identity-mismatch/race-loser path.
+            os.unlink("slot", dir_fd=quarantine_fd)
+            return False
+        os.unlink("slot", dir_fd=quarantine_fd)
+        captured_removed = True
+        rename_no_replace(
+            name,
+            "placeholder",
+            src_dir_fd=parent_fd,
+            dst_dir_fd=quarantine_fd,
+        )
+        placeholder_after = os.stat(
+            "placeholder",
+            dir_fd=quarantine_fd,
+            follow_symlinks=False,
+        )
+        if not _same_regular_file_after_rename(placeholder_before, placeholder_after):
+            rename_no_replace(
+                "placeholder",
+                name,
+                src_dir_fd=quarantine_fd,
+                dst_dir_fd=parent_fd,
+            )
+            return False
+        os.unlink("placeholder", dir_fd=quarantine_fd)
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        return False
+    except (OSError, ValueError):
+        return False
+    finally:
+        if exchanged and not captured_removed and quarantine_fd is not None:
+            try:
+                rename_exchange(
+                    name,
+                    "slot",
+                    left_dir_fd=parent_fd,
+                    right_dir_fd=quarantine_fd,
+                )
+                os.unlink("slot", dir_fd=quarantine_fd)
+            except OSError:
+                pass
+        for fd in (placeholder_fd, captured_fd, quarantine_fd, held_fd):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        with contextlib.suppress(OSError):
+            os.rmdir(quarantine_dir, dir_fd=parent_fd)
+
+
+@contextlib.contextmanager
+def _anchored_destination_path(root: Path, dst: Path) -> Generator[_AnchoredDestination]:
+    """Yield ``dst`` through a no-follow parent dirfd rooted at ``root``."""
+    root_abs = os.path.normcase(os.path.abspath(os.path.normpath(root)))
+    dst_abs = os.path.normcase(os.path.abspath(os.path.normpath(dst)))
+    prefix = root_abs.rstrip(os.sep) + os.sep
+    if dst_abs == root_abs or not dst_abs.startswith(prefix):
+        raise OSError(errno.EPERM, "destination is outside configured library root")
+    relative_parts = Path(os.path.relpath(dst_abs, root_abs)).parts
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        raise OSError(errno.EPERM, "invalid destination beneath configured library root")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    filesystem_prefix = os.path.realpath(os.sep)
+    if (
+        not nofollow
+        or not directory
+        or not os.path.isdir("/proc/self/fd")
+        or root_abs == filesystem_prefix
+        or not root_abs.startswith(filesystem_prefix)
+        or os.path.realpath(root_abs) != root_abs
+    ):
+        raise OSError(errno.ENOTSUP, "root-anchored publication is unavailable")
+
+    opened: list[int] = []
+    try:
+        current_fd = os.open(root_abs, os.O_RDONLY | directory | nofollow | cloexec)
+        opened.append(current_fd)
+        for component in relative_parts[:-1]:
+            try:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | cloexec,
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(component, dir_fd=current_fd)
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | cloexec,
+                    dir_fd=current_fd,
+                )
+            opened.append(next_fd)
+            current_fd = next_fd
+        anchor = _AnchoredDestination(
+            path=Path(f"/proc/self/fd/{current_fd}") / relative_parts[-1],
+            root_fd=opened[0],
+            parent_fd=current_fd,
+            name=relative_parts[-1],
+            root_abs=root_abs,
+            parent_parts=tuple(relative_parts[:-1]),
+        )
+        if not _anchor_is_current(anchor):
+            raise OSError(errno.ESTALE, "library destination authority changed")
+        yield anchor
+    finally:
+        for fd in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _remove_acl_xattrs_from_fd(file_fd: int) -> None:
+    """Strip inherited ACL authority from one descriptor-held inode."""
+    try:
+        names = os.listxattr(file_fd)
+    except OSError as exc:
+        if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            raise
+        return
+    for name in names:
+        if "acl" in name.lower():
+            os.removexattr(file_fd, name)
+
+
+def _copy_exact_fd(source_fd: int, destination_fd: int, expected_size: int) -> None:
+    """Copy exactly one captured source size without reopening either pathname."""
+    offset = 0
+    while offset < expected_size:
+        chunk = os.pread(source_fd, min(1024 * 1024, expected_size - offset), offset)
+        if not chunk:
+            raise OSError(
+                errno.EIO,
+                f"snapshot source became short: expected {expected_size} bytes, read {offset}",
+            )
+        written = 0
+        while written < len(chunk):
+            count = os.pwrite(destination_fd, chunk[written:], offset + written)
+            if count <= 0:
+                raise OSError(errno.EIO, "snapshot destination made no write progress")
+            written += count
+        offset += len(chunk)
+    if os.pread(source_fd, 1, expected_size):
+        raise OSError(errno.EIO, "snapshot source grew during copy")
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -342,6 +698,176 @@ class LocalFileSystem:
             self._copy_no_overwrite(src, dst)
         src.unlink()
 
+    def hardlink_or_copy_from_fd_beneath(
+        self,
+        source_fd: int,
+        source_name: str,
+        dst: Path,
+        *,
+        destination_root: Path,
+    ) -> FilePlacementIdentity:
+        """Snapshot an open source into a distinct inode beneath the root.
+
+        Torrent content remains writable by the download client after import.
+        A hardlink would permanently share that mutable inode with the public
+        library, so this security-boundary API always creates an independent
+        copy. The generic trusted-path helper retains its hardlink optimization.
+        """
+        del source_name
+        with _anchored_destination_path(destination_root, dst) as anchor:
+            source_stat = os.fstat(source_fd)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise OSError(errno.EPERM, "import source is not a regular file")
+            free = self.available_bytes(anchor.path.parent)
+            if free < source_stat.st_size:
+                raise OSError(
+                    "insufficient space to snapshot import source: need "
+                    f"{source_stat.st_size} bytes, {free} available on destination filesystem"
+                ) from None
+            identity = self._snapshot_fd_no_overwrite(source_fd, source_stat.st_size, anchor)
+            try:
+                observed = os.stat(
+                    anchor.name,
+                    dir_fd=anchor.parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                observed = None
+            if (
+                observed is None
+                or _placement_identity(observed) != identity
+                or not _anchor_is_current(anchor)
+            ):
+                _quarantine_unlink_placement(anchor.parent_fd, anchor.name, identity)
+                raise OSError(errno.ESTALE, "library destination authority changed")
+            return identity
+
+    def _snapshot_fd_no_overwrite(
+        self,
+        source_fd: int,
+        source_size: int,
+        anchor: _AnchoredDestination,
+    ) -> FilePlacementIdentity:
+        """Create and atomically publish a sanitized snapshot through held fds.
+
+        The temporary inode lives in a private mode-0700 directory opened from
+        the already-anchored destination parent.  No copy, metadata operation,
+        or publication reopens a writable-parent pathname, so replacing a temp
+        entry cannot redirect writes outside the library root.
+        """
+        quarantine_name = f".plex-manager-snapshot-{secrets.token_hex(16)}"
+        quarantine_fd: int | None = None
+        snapshot_fd: int | None = None
+        quarantine_identity: tuple[int, int] | None = None
+        published_identity: FilePlacementIdentity | None = None
+        snapshot_name = "payload"
+        try:
+            os.mkdir(quarantine_name, mode=0o700, dir_fd=anchor.parent_fd)
+            quarantine_before = os.stat(
+                quarantine_name,
+                dir_fd=anchor.parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(quarantine_before.st_mode)
+                or quarantine_before.st_uid != os.geteuid()
+            ):
+                raise OSError(errno.EPERM, "snapshot quarantine authority changed")
+            quarantine_identity = (
+                quarantine_before.st_dev,
+                quarantine_before.st_ino,
+            )
+            quarantine_fd = os.open(
+                quarantine_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=anchor.parent_fd,
+            )
+            quarantine_opened = os.fstat(quarantine_fd)
+            if (
+                not stat.S_ISDIR(quarantine_opened.st_mode)
+                or quarantine_opened.st_uid != os.geteuid()
+                or not _same_inode(quarantine_before, quarantine_opened)
+            ):
+                raise OSError(errno.EPERM, "snapshot quarantine authority changed")
+            # A parent default ACL may be inherited even when mkdir's mode masks
+            # it. Remove it before the directory becomes the trust boundary.
+            _remove_acl_xattrs_from_fd(quarantine_fd)
+            os.fchmod(quarantine_fd, 0o700)
+            quarantine_hardened = os.fstat(quarantine_fd)
+            quarantine_current = os.stat(
+                quarantine_name,
+                dir_fd=anchor.parent_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_IMODE(quarantine_hardened.st_mode) != 0o700 or not _same_inode(
+                quarantine_hardened, quarantine_current
+            ):
+                raise OSError(errno.ESTALE, "snapshot quarantine authority changed")
+
+            snapshot_fd = os.open(
+                snapshot_name,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=quarantine_fd,
+            )
+            _copy_exact_fd(source_fd, snapshot_fd, source_size)
+            _remove_acl_xattrs_from_fd(snapshot_fd)
+            os.fchmod(snapshot_fd, 0o644)
+            snapshot_before = os.fstat(snapshot_fd)
+            snapshot_current = os.stat(
+                snapshot_name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(snapshot_before.st_mode)
+                or snapshot_before.st_uid != os.geteuid()
+                or snapshot_before.st_nlink != 1
+                or snapshot_before.st_size != source_size
+                or stat.S_IMODE(snapshot_before.st_mode) != 0o644
+                or _placement_identity(snapshot_before) != _placement_identity(snapshot_current)
+            ):
+                raise OSError(errno.ESTALE, "snapshot temporary identity changed")
+
+            # The temp and final entry share the anchored destination filesystem;
+            # renameat2(RENAME_NOREPLACE) publishes the exact held inode without
+            # exposing an overwrite window or requiring a pathname reopen.
+            rename_no_replace(
+                snapshot_name,
+                anchor.name,
+                src_dir_fd=quarantine_fd,
+                dst_dir_fd=anchor.parent_fd,
+            )
+            published_identity = _placement_identity(os.fstat(snapshot_fd))
+            return published_identity
+        except Exception:
+            if published_identity is not None:
+                _quarantine_unlink_placement(
+                    anchor.parent_fd,
+                    anchor.name,
+                    published_identity,
+                )
+            raise
+        finally:
+            if quarantine_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(snapshot_name, dir_fd=quarantine_fd)
+            for fd in (snapshot_fd, quarantine_fd):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            if quarantine_identity is not None:
+                try:
+                    current = os.stat(
+                        quarantine_name,
+                        dir_fd=anchor.parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (current.st_dev, current.st_ino) == quarantine_identity:
+                        os.rmdir(quarantine_name, dir_fd=anchor.parent_fd)
+                except OSError:
+                    pass
+
     def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
 
@@ -369,7 +895,11 @@ class LocalFileSystem:
             # filesystem can hold the source before writing a partial file.
             return self._copy_no_overwrite(src, dst)
 
-    def _copy_no_overwrite(self, src: Path, dst: Path) -> FilePlacementIdentity:
+    def _copy_no_overwrite(
+        self,
+        src: Path,
+        dst: Path,
+    ) -> FilePlacementIdentity:
         src_size = src.stat().st_size
         free = self.available_bytes(dst.parent)
         if free < src_size:

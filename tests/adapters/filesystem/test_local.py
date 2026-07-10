@@ -5,11 +5,13 @@ from __future__ import annotations
 import errno
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 
 import pytest
 
+import plex_manager.adapters.filesystem.local as local_filesystem
 from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
 from plex_manager.adapters.filesystem.local import (
     _EMPTY_LOCK_STALE_SECONDS,  # pyright: ignore[reportPrivateUsage]
@@ -138,6 +140,225 @@ def test_hardlink_or_copy_falls_back_to_copy(
     assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
 
 
+def test_root_anchored_snapshot_uses_distinct_inode(tmp_path: Path) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    with src.open("rb") as source:
+        LocalFileSystem().hardlink_or_copy_from_fd_beneath(
+            source.fileno(),
+            src.name,
+            dst,
+            destination_root=library_root,
+        )
+
+    assert dst.read_text() == "payload"
+    assert src.stat().st_ino != dst.stat().st_ino
+
+
+def test_root_anchored_snapshot_sanitizes_untrusted_metadata(tmp_path: Path) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"payload")
+    src.chmod(0o666)
+    xattrs_supported = True
+    try:
+        os.setxattr(src, "user.untrusted_acl_probe", b"present")
+    except OSError as exc:
+        if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            raise
+        xattrs_supported = False
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    with src.open("rb") as source:
+        LocalFileSystem().hardlink_or_copy_from_fd_beneath(
+            source.fileno(),
+            src.name,
+            dst,
+            destination_root=library_root,
+        )
+
+    assert stat.S_IMODE(src.stat().st_mode) == 0o666
+    assert stat.S_IMODE(dst.stat().st_mode) == 0o644
+    if xattrs_supported:
+        assert "user.untrusted_acl_probe" in os.listxattr(src)
+        assert "user.untrusted_acl_probe" not in os.listxattr(dst)
+    src.write_bytes(b"changed")
+    assert dst.read_bytes() == b"payload"
+
+
+def test_root_anchored_snapshot_temp_replacement_cannot_redirect_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"torrent payload")
+    victim = tmp_path / "outside-victim"
+    victim.write_bytes(b"KEEP-ME")
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    real_copy = local_filesystem._copy_exact_fd  # pyright: ignore[reportPrivateUsage]
+    replaced = False
+
+    def _replace_temp_then_copy(
+        source_fd: int,
+        destination_fd: int,
+        expected_size: int,
+    ) -> None:
+        nonlocal replaced
+        temp_path = Path(os.readlink(f"/proc/self/fd/{destination_fd}"))
+        temp_path.unlink()
+        temp_path.symlink_to(victim)
+        replaced = True
+        real_copy(source_fd, destination_fd, expected_size)
+
+    monkeypatch.setattr(local_filesystem, "_copy_exact_fd", _replace_temp_then_copy)
+
+    with (
+        src.open("rb") as source,
+        pytest.raises(
+            OSError,
+            match="snapshot temporary identity changed",
+        ),
+    ):
+        LocalFileSystem().hardlink_or_copy_from_fd_beneath(
+            source.fileno(),
+            src.name,
+            dst,
+            destination_root=library_root,
+        )
+
+    assert replaced
+    assert victim.read_bytes() == b"KEEP-ME"
+    assert not dst.exists()
+    assert not list(dst.parent.glob(".plex-manager-snapshot-*"))
+
+
+def test_root_anchored_hardlink_or_copy_tolerates_parent_creation_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+    real_mkdir = os.mkdir
+    raced = False
+
+    def _create_parent_then_report_race(
+        path: str | bytes,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if not raced and dir_fd is not None and path == dst.parent.name:
+            raced = True
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            raise FileExistsError(errno.EEXIST, "simulated parent creation race", path)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", _create_parent_then_report_race)
+
+    with src.open("rb") as source:
+        LocalFileSystem().hardlink_or_copy_from_fd_beneath(
+            source.fileno(),
+            src.name,
+            dst,
+            destination_root=library_root,
+        )
+
+    assert raced
+    assert dst.read_text() == "payload"
+
+
+def test_root_anchored_hardlink_or_copy_rejects_configured_root_symlink(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    library_root = tmp_path / "library"
+    library_root.symlink_to(outside, target_is_directory=True)
+    dst = library_root / "Movie (2020)" / "Movie (2020).mkv"
+
+    with src.open("rb") as source, pytest.raises(OSError):
+        LocalFileSystem().hardlink_or_copy_from_fd_beneath(
+            source.fileno(),
+            src.name,
+            dst,
+            destination_root=library_root,
+        )
+
+    assert not (outside / "Movie (2020)").exists()
+
+
+def test_rollback_race_restores_winner_without_leaking_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "library" / "Movie (2020)"
+    parent.mkdir(parents=True)
+    published = parent / "Movie (2020).mkv"
+    published.write_bytes(b"owned")
+    winner = parent / "winner.mkv"
+    winner.write_bytes(b"winner")
+    expected = local_filesystem._placement_identity(  # pyright: ignore[reportPrivateUsage]
+        published.stat()
+    )
+    real_exchange = local_filesystem.rename_exchange
+    swapped = False
+
+    def _replace_before_capture(
+        left: str | bytes,
+        right: str | bytes,
+        *,
+        left_dir_fd: int | None = None,
+        right_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if not swapped and left == published.name and left_dir_fd is not None:
+            swapped = True
+            os.rename(
+                published.name,
+                "saved-owned.mkv",
+                src_dir_fd=left_dir_fd,
+                dst_dir_fd=left_dir_fd,
+            )
+            os.rename(
+                winner.name,
+                published.name,
+                src_dir_fd=left_dir_fd,
+                dst_dir_fd=left_dir_fd,
+            )
+        real_exchange(
+            left,
+            right,
+            left_dir_fd=left_dir_fd,
+            right_dir_fd=right_dir_fd,
+        )
+
+    monkeypatch.setattr(local_filesystem, "rename_exchange", _replace_before_capture)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        removed = local_filesystem._quarantine_unlink_placement(  # pyright: ignore[reportPrivateUsage]
+            parent_fd,
+            published.name,
+            expected,
+        )
+    finally:
+        os.close(parent_fd)
+
+    assert not removed
+    assert (parent / "saved-owned.mkv").read_bytes() == b"owned"
+    assert published.read_bytes() == b"winner"
+    assert not list(parent.glob(".plex-manager-rollback-*"))
+
+
 def test_cross_device_copy_refuses_destination_created_during_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -161,6 +382,54 @@ def test_cross_device_copy_refuses_destination_created_during_publish(
 
     assert src.read_text() == "copy-path-loser"
     assert dst.read_text() == "race winner"
+
+
+def test_hardlinkless_rename_never_overwrites_noncooperating_race_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("download payload")
+    dst = tmp_path / "movie" / "copied.mkv"
+    real_link = os.link
+
+    def _race_every_publish_link(link_src: str, link_dst: str) -> None:
+        if link_src == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device source")
+        if link_dst == os.fspath(dst):
+            dst.write_text("race winner")
+            raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+        real_link(link_src, link_dst)
+
+    monkeypatch.setattr(os, "link", _race_every_publish_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.read_text() == "race winner"
+    assert sorted(path.name for path in dst.parent.iterdir()) == ["copied.mkv"]
+
+
+def test_hardlinkless_publish_fails_closed_without_atomic_no_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("download payload")
+    dst = tmp_path / "movie" / "copied.mkv"
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    def _no_atomic_rename(_src: str, _dst: str) -> None:
+        raise OSError(errno.ENOTSUP, "renameat2 unavailable")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+    monkeypatch.setattr(local_filesystem, "rename_no_replace", _no_atomic_rename)
+
+    with pytest.raises(OSError, match="renameat2 unavailable"):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert not dst.exists()
+    assert not dst.parent.exists() or list(dst.parent.iterdir()) == []
 
 
 def test_hardlink_or_copy_falls_back_when_all_hardlinks_are_unsupported(
@@ -202,7 +471,7 @@ def test_hardlinkless_publish_renames_temp_without_second_copy(
         copies.append((copy_src, copy_dst))
         real_copy2(copy_src, copy_dst)
 
-    real_rename = os.rename
+    real_rename = local_filesystem.rename_no_replace
     renames: list[tuple[str, str]] = []
 
     def _recording_rename(rename_src: str, rename_dst: str) -> None:
@@ -211,7 +480,7 @@ def test_hardlinkless_publish_renames_temp_without_second_copy(
 
     monkeypatch.setattr(os, "link", _refuse_link)
     monkeypatch.setattr(shutil, "copy2", _counting_copy2)
-    monkeypatch.setattr(os, "rename", _recording_rename)
+    monkeypatch.setattr(local_filesystem, "rename_no_replace", _recording_rename)
 
     LocalFileSystem().hardlink_or_copy(src, dst)
 
