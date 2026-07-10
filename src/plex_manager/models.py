@@ -631,6 +631,7 @@ class Blocklist(Base):
     """A failed / reported-bad release. Checked before every grab (two-tier id)."""
 
     __tablename__ = "blocklist"
+    __table_args__ = (Index("ix_blocklist_tmdb_media", "tmdb_id", "media_type"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
