@@ -131,6 +131,29 @@ describe('API auth middleware', () => {
     window.removeEventListener(AUTH_INVALID_EVENT, listener)
   })
 
+  it('ignores a stale in-flight 401 sent with a key that key rotation has since replaced (#139)', () => {
+    setApiKey('old-key')
+    enableApiKeyAuth()
+    const request = new Request('http://localhost/api/v1/settings')
+    middleware().onRequest({ request })
+
+    // Key rotation lands while `request` is still in flight with `old-key`.
+    setApiKey('new-key')
+    const invalid = vi.fn()
+    const expired = vi.fn()
+    window.addEventListener(AUTH_INVALID_EVENT, invalid)
+    window.addEventListener(AUTH_EXPIRED_EVENT, expired)
+
+    middleware().onResponse({ request, response: new Response(null, { status: 401 }) })
+
+    expect(invalid).not.toHaveBeenCalled()
+    expect(expired).not.toHaveBeenCalled()
+    expect(getApiKey()).toBe('new-key')
+    expect(isApiKeyAuthEnabled()).toBe(true)
+    window.removeEventListener(AUTH_INVALID_EVENT, invalid)
+    window.removeEventListener(AUTH_EXPIRED_EVENT, expired)
+  })
+
   it('adds CSRF from the readable cookie on unsafe session requests', () => {
     document.cookie = 'plexmgr.csrf=csrf-token'
     const request = new Request('http://localhost/api/v1/settings', { method: 'PUT' })

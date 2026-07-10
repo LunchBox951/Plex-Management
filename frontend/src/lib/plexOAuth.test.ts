@@ -31,6 +31,10 @@ function makePopup(): Window {
     closed: false,
     close: vi.fn(),
     location: { href: '' },
+    // Real popups start with `opener` set to the window that opened them; the
+    // reverse-tabnabbing fix severs this before the caller can navigate the
+    // popup to plex.tv, so tests need a non-null starting value to prove it.
+    opener: window,
   } as unknown as Window
 }
 
@@ -107,6 +111,16 @@ describe('openPlexPopup', () => {
   it('returns null when the browser blocks the popup', () => {
     vi.spyOn(window, 'open').mockReturnValue(null)
     expect(openPlexPopup()).toBeNull()
+  })
+
+  it('severs the opener reference to block reverse-tabnabbing once the popup navigates to plex.tv (GHSA-xw83-hqxh-77r9)', () => {
+    const popup = makePopup()
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+
+    const handle = openPlexPopup()
+
+    expect(handle).toBe(popup)
+    expect(popup.opener).toBeNull()
   })
 })
 

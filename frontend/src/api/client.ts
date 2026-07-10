@@ -60,17 +60,19 @@ const authMiddleware: Middleware = {
     } else if (response.status === 401) {
       // Only react if the key THIS request used is still the current one. A slow
       // 401 from an earlier request that used a now-replaced key must not clobber
-      // a freshly pasted/valid key and undo recovery.
+      // a freshly pasted/valid key and undo recovery (#139).
       const sentKey = request.headers.get('X-Api-Key')
       if (sentKey && sentKey === getApiKey()) {
         clearApiKey()
         emit(AUTH_INVALID_EVENT)
-      } else {
+      } else if (!sentKey) {
         // No current api key rode this request, yet it was rejected: the request
         // was relying on the browser session cookie, which is now missing/expired/
         // revoked. Signal so the gate re-checks auth and shows the login again.
         emit(AUTH_EXPIRED_EVENT)
       }
+      // else: sentKey is set but stale (rotated out mid-flight) — this response
+      // says nothing about the current key or the session, so ignore it entirely.
     }
     return response
   },
