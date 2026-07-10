@@ -1,7 +1,7 @@
 """add blocklist tmdb_id/media_type index
 
 Revision ID: c86212dad733
-Revises: bfaa63130ee7
+Revises: 5e8b1a4f2c9d
 Create Date: 2026-07-07 21:52:45.120787
 """
 
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "c86212dad733"
-down_revision: str | None = "bfaa63130ee7"
+down_revision: str | None = "5e8b1a4f2c9d"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
