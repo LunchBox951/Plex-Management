@@ -41,7 +41,6 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 
 from sqlalchemy import update
-
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
@@ -797,16 +796,20 @@ async def _fail_unsafe_payload(
         if not failed_pending:
             await session.rollback()
             return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-        await session.commit()
 
-        await session.rollback()
-        latest = await session.get(Download, download_id, populate_existing=True)
-        latest_status = latest.status if latest is not None else None
-        latest_reason = latest.failed_reason if latest is not None else None
-        await session.rollback()
-        if latest_status != DownloadState.FailedPending.value or latest_reason != reason:
-            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-
+        # Winning the CAS out of a resumable state atomically claims this failure: a
+        # racing operator ``mark_failed`` either loses its own resumable-state CAS or
+        # blocks on this row's write lock until this transaction commits and then loses.
+        # For a crash-resumed movie whose ``download_path`` breadcrumb points at an
+        # already-placed library file, remove that file and clear the breadcrumb in the
+        # SAME transaction as the ``failed_pending`` transition. Committing the
+        # transition first and unlinking in a later commit (the prior ordering) left a
+        # window where a crash stranded a ``failed_pending`` row whose Phase-C heal
+        # completes and re-arms the request while an unmanaged copy is still in the
+        # library — the completion path never consumes ``download_path``. Folding both
+        # into one commit closes that window: a crash before it rolls the row back to
+        # ``Importing`` (still resumable), so a later cycle re-detects the unsafe payload
+        # and retries the idempotent unlink.
         if owned_placement is not None:
             await asyncio.to_thread(_remove_quietly, owned_placement)
             cleared = await download_repo.update_status_if_in(
@@ -816,11 +819,18 @@ async def _fail_unsafe_payload(
                 clear_download_path=True,
                 require_failed_reason=reason,
             )
-            if cleared:
-                await session.commit()
-            else:
+            if not cleared:
                 await session.rollback()
                 return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        await session.commit()
+
+        await session.rollback()
+        latest = await session.get(Download, download_id, populate_existing=True)
+        latest_status = latest.status if latest is not None else None
+        latest_reason = latest.failed_reason if latest is not None else None
+        await session.rollback()
+        if latest_status != DownloadState.FailedPending.value or latest_reason != reason:
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
 
         removed_ok = await purge_service.remove_torrent(
             qbt,
@@ -911,8 +921,19 @@ async def _fail_unsafe_payload(
         queue_service._end_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
 
 
+def _is_expected_movie_destination(
+    dst: Path, movies_root: str, title: str, year: int | None
+) -> bool:
+    """True when ``dst`` is the exact deterministic destination the normal movie import
+    would place this request at (same ownership predicate for both the crash-resume
+    finalize and the unsafe-rollback delete: any-video-under-root is NOT proof the file
+    is ours after a root widening or a stale breadcrumb)."""
+    expected = Path(movies_root) / plex_movie_relative_path(title, year, dst.suffix.lstrip("."))
+    return os.path.realpath(dst) == os.path.realpath(expected)
+
+
 def _owned_movie_breadcrumb_for_unsafe_rollback(
-    status: str, download_path: str | None, movies_root: str
+    status: str, download_path: str | None, movies_root: str, title: str, year: int | None
 ) -> Path | None:
     if status != DownloadState.Importing.value or download_path is None:
         return None
@@ -920,6 +941,12 @@ def _owned_movie_breadcrumb_for_unsafe_rollback(
     root_real = os.path.realpath(movies_root)
     path_real = os.path.realpath(path)
     if path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(root_real, path_real):
+        return None
+    # Only a breadcrumb at the exact expected destination is provably OUR placement.
+    # Deleting anything else under the (possibly re-pointed) movies root risks
+    # destroying an unrelated title's file — nothing beats maybe-deleting someone
+    # else's file, so an unprovable breadcrumb is left on disk for the operator.
+    if not _is_expected_movie_destination(path, movies_root, title, year):
         return None
     return path
 
@@ -1132,12 +1159,22 @@ async def _resume_breadcrumbed_movie_import(
     dst = Path(download_path)
     root_real = os.path.realpath(movies_root)
     dst_real = os.path.realpath(dst)
-    if dst.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(root_real, dst_real):
+    # Require the breadcrumb to be the SAME deterministic destination the normal movie
+    # import would place this request at — not merely any video under the root. A bare
+    # ``_is_within`` check would finalize the request against an unrelated title if the
+    # movies root were later widened to a parent path, or against a stale breadcrumb
+    # pointing at another file under the root, scanning/completing the wrong media. This
+    # mirrors the TV resume path, which requires the exact expected season directory.
+    if (
+        dst.suffix.lower() not in VIDEO_EXTENSIONS
+        or not _is_within(root_real, dst_real)
+        or not _is_expected_movie_destination(dst, movies_root, request.title, request.year)
+    ):
         await _block(
             session,
             download_repo,
             download_id,
-            "stored import breadcrumb is outside the movie library root",
+            "stored import breadcrumb is not the expected movie destination",
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
@@ -1454,7 +1491,11 @@ async def _import_download_locked(
             status=status,
             request_id=request.id,
             owned_placement=_owned_movie_breadcrumb_for_unsafe_rollback(
-                row.status, row.download_path, effective_movies_root
+                row.status,
+                row.download_path,
+                effective_movies_root,
+                request.title,
+                request.year,
             ),
         )
         if rejected is not None:
@@ -2116,6 +2157,16 @@ async def _import_tv_locked(
 
     status = await qbt.get_status(torrent_hash)
     if status is None:
+        if _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason):
+            # An ImportBlocked row already parked for manual cleanup keeps its
+            # manual-cleanup ``failed_reason``: overwriting it with the generic
+            # "no status for payload validation" block below (ImportBlocked is
+            # resumable, so that CAS would land) makes ``_is_manual_cleanup_breadcrumb``
+            # stop matching on the next retry, after which the import path could
+            # fail/re-arm and delete the torrent while leaving the placed season files
+            # behind. Leave the row untouched until the client reports the torrent again
+            # (or the operator clears the placed files).
+            return await download_repo.get_by_hash(torrent_hash)
         if download_path is not None and _can_resume_tv_breadcrumb_without_client_status(
             download_status, failed_reason
         ):

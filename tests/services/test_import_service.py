@@ -437,6 +437,46 @@ async def test_importing_unsafe_payload_rolls_back_owned_movie_breadcrumb(
     assert qbt.removed == [(_HASH, True)]
 
 
+async def test_importing_unsafe_payload_never_deletes_mismatched_breadcrumb_file(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # The unsafe-rollback delete uses the SAME ownership predicate as the crash-resume
+    # finalize: only a breadcrumb at the exact deterministic destination is provably our
+    # placement. A breadcrumb pointing at another title under a (possibly widened)
+    # movies root must be left on disk — never maybe-delete someone else's file.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    unrelated = movies_root / "Some Other Movie (2001)" / "Some Other Movie (2001).mkv"
+    _make_video(unrelated)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(unrelated)
+        await session.commit()
+
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024),
+        ],
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert unrelated.exists(), "a file that is not provably ours must never be deleted"
+    assert qbt.removed == [(_HASH, True)]
+
+
 async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_crashes(
     tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -479,10 +519,15 @@ async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_c
     async with sessionmaker_() as session:
         download = await session.get(Download, download_id)
     assert download is not None
-    assert download.status == DownloadState.FailedPending.value
+    # The unlink + failed_pending transition now share ONE commit, so a crash before
+    # the unlink rolls the whole thing back to the resumable ``Importing`` state with
+    # its breadcrumb and file intact — rather than stranding a ``FailedPending`` row
+    # whose Phase-C heal would re-arm the request while leaving an unmanaged copy in the
+    # library. A later cycle re-detects the unsafe payload and retries the idempotent
+    # unlink.
+    assert download.status == DownloadState.Importing.value
     assert download.download_path == str(dst)
-    assert download.failed_reason is not None
-    assert "unsupported file type .exe" in download.failed_reason
+    assert download.failed_reason is None
     assert dst.exists()
     assert qbt.removed == []
 
@@ -663,6 +708,41 @@ async def test_importing_movie_uses_library_breadcrumb_when_client_status_missin
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
     assert request is not None and request.status is RequestStatus.completed
+
+
+async def test_importing_movie_breadcrumb_resume_rejects_mismatched_destination(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A stale breadcrumb pointing at ANOTHER title under the (possibly widened) movies
+    # root must not be scanned/finalized against this request: the resume path requires
+    # the exact deterministic destination, not merely any video under the root.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    stale = movies_root / "Some Other Movie (2001)" / "Some Other Movie (2001).mkv"
+    _make_video(stale)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(stale)
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "stored import breadcrumb is not the expected movie destination"
+    assert record.download_path == str(stale)
+    assert library.scanned == []
+    assert stale.exists(), "an unrelated file must be left untouched for operator review"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
 
 
 async def test_importing_movie_breadcrumb_resume_defers_while_purge_deletes_destination(
@@ -2899,6 +2979,46 @@ async def test_import_blocked_tv_manifest_outage_preserves_manual_cleanup_reason
     assert deferred.download_path == str(season_dir)
     assert placed_episode.exists()
     assert outage_qbt.removed == []
+
+
+async def test_import_blocked_tv_missing_status_preserves_manual_cleanup_reason(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A transient MISSING client status (get_status -> None) for a manual-cleanup
+    # breadcrumb must not overwrite its failed_reason with the generic "no status" block:
+    # doing so would stop ``_is_manual_cleanup_breadcrumb`` matching on the next retry,
+    # letting the import path fail/re-arm and delete the torrent while leaving the placed
+    # season files behind.
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    placed_episode = season_dir / "Some Show - S02E01.mkv"
+    _make_video(placed_episode)
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    download_id, _request_id, _season_id = await _seed_tv(
+        sessionmaker_,
+        season=2,
+        request_status=RequestStatus.import_blocked,
+        season_status=RequestStatus.import_blocked.value,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.failed_reason = failed_reason
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == failed_reason
+    assert record.download_path == str(season_dir)
+    assert placed_episode.exists()
 
 
 async def test_import_blocked_tv_manual_cleanup_retry_with_live_unsafe_payload_stays_blocked(
