@@ -8,9 +8,9 @@ when possible and falls back to a copy across devices.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
-__all__ = ["VIDEO_EXTENSIONS", "FileSystemPort"]
+__all__ = ["VIDEO_EXTENSIONS", "FilePlacementIdentity", "FileSystemPort"]
 
 #: Lowercased file suffixes (with the leading dot) that count as a video file
 #: when scanning a downloaded release for the main feature. Mirrors the common
@@ -37,6 +37,17 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 
+class FilePlacementIdentity(NamedTuple):
+    """Filesystem identity captured by the primitive that published a file."""
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    mode: int
+
+
 @runtime_checkable
 class FileSystemPort(Protocol):
     """Disk-space queries and move / hardlink-or-copy operations."""
@@ -56,8 +67,12 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity | None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        A mutating implementation should return the destination identity captured
+        inside the publish primitive. ``None`` is retained for legacy/test ports,
+        but callers must treat it as unverified and never grant deletion authority.
 
         Raises ``NotImplementedError`` by default (issue #80): same rationale
         as :meth:`move` — a silent no-op default would let an import pipeline

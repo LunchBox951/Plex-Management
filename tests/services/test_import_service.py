@@ -39,6 +39,7 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
+from plex_manager.ports.filesystem import FilePlacementIdentity
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -165,9 +166,55 @@ def _qbt(content_path: Path, *, files: list[DownloadedFile] | None = None) -> Fa
     )
 
 
+def _attest_payload_validation(
+    session: AsyncSession,
+    download_path: str | Path,
+    torrent_hash: str = _HASH,
+    *,
+    placement_owned: bool = True,
+) -> None:
+    """Persist the post-payload-gate import marker used by status-less resume tests."""
+    attestation = import_service._payload_validation_attestation(  # pyright: ignore[reportPrivateUsage]
+        os.fspath(download_path), placement_owned=placement_owned
+    )
+    session.add(
+        DownloadHistory(
+            tmdb_id=_TMDB_ID,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.import_started,
+            source_title=None,
+            message=f"{attestation} test",
+        )
+    )
+
+
 class _ListFilesFailsQbt(FakeQbittorrent):
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         raise QbittorrentError("qBittorrent request failed")
+
+
+class _ReplaceFileDuringListQbt(FakeQbittorrent):
+    """Swap an attested library file during the awaited manifest request."""
+
+    def __init__(
+        self,
+        statuses: list[DownloadStatus],
+        *,
+        files: dict[str, list[DownloadedFile]],
+        replacement: Path,
+    ) -> None:
+        super().__init__(statuses=statuses, files=files)
+        self._replacement = replacement
+        self._fired = False
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        if not self._fired:
+            self._fired = True
+            self._replacement.unlink()
+            _make_video(self._replacement)
+            with self._replacement.open("r+b") as handle:
+                handle.write(b"replacement")
+        return await super().list_files(info_hash)
 
 
 class _RestampReasonDuringStatusQbt(FakeQbittorrent):
@@ -303,6 +350,48 @@ async def test_import_fails_unsafe_payload_manifest_before_copy(
     assert "unsupported file type .exe" in download.failed_reason
 
 
+async def test_import_unsafe_payload_waits_for_successful_torrent_removal(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(
+                name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe",
+                size_bytes=1024,
+            ),
+        ],
+    )
+
+    async def _remove_fails(_info_hash: str, *, delete_files: bool) -> None:
+        assert delete_files is True
+        raise RuntimeError("simulated qBittorrent removal outage")
+
+    monkeypatch.setattr(qbt, "remove", _remove_fails)
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.FailedPending.value
+    assert record.failed_reason is not None
+    assert "unsupported file type .exe" in record.failed_reason
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status is RequestStatus.downloading
+    assert blocklist == []
+
+
 async def test_import_unsafe_payload_removal_outcome_heals_without_client(
     tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -418,6 +507,7 @@ async def test_importing_unsafe_payload_rolls_back_owned_movie_breadcrumb(
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(dst)
+        _attest_payload_validation(session, dst, placement_owned=True)
         await session.commit()
 
     qbt = _qbt(
@@ -435,6 +525,138 @@ async def test_importing_unsafe_payload_rolls_back_owned_movie_breadcrumb(
     assert record.download_path is None
     assert not dst.exists(), "owned crash-resume placement must be removed before re-search"
     assert qbt.removed == [(_HASH, True)]
+
+
+async def test_unsafe_manifest_never_unlinks_file_replaced_during_manifest_await(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst, placement_owned=True)
+        await session.commit()
+
+    base_qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="setup.exe", size_bytes=1024),
+        ],
+    )
+    qbt = _ReplaceFileDuringListQbt(
+        base_qbt.statuses,
+        files=base_qbt.files,
+        replacement=dst,
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "manual cleanup before re-search" in record.failed_reason
+    with dst.open("rb") as handle:
+        assert handle.read(11) == b"replacement"
+    assert qbt.removed == []
+
+
+async def test_crash_after_movie_publish_retains_planned_breadcrumb_for_unsafe_retry(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+
+    with pytest.raises(RuntimeError, match="process death after placement publish"):
+        await _import_with_fs(
+            sessionmaker_,
+            download_id,
+            movies_root,
+            _qbt(video),
+            FakeLibrary(),
+            _CrashAfterPublishFs(),
+        )
+
+    async with sessionmaker_() as session:
+        crashed = await session.get(Download, download_id)
+    assert crashed is not None
+    assert crashed.status == DownloadState.Importing.value
+    assert crashed.download_path == str(dst)
+    assert dst.exists()
+
+    unsafe_qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="setup.exe", size_bytes=1024),
+        ],
+    )
+    blocked = await _import(sessionmaker_, download_id, movies_root, unsafe_qbt, FakeLibrary())
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.download_path == str(dst)
+    assert blocked.failed_reason is not None
+    assert "manual cleanup before re-search" in blocked.failed_reason
+    assert dst.exists()
+    assert unsafe_qbt.removed == []
+
+
+async def test_replacement_before_placement_returns_never_inherits_deletion_authority(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        _ReplaceAfterPublishFs(),
+    )
+
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "changed after payload validation" in record.failed_reason
+    assert library.scanned == []
+    with dst.open("rb") as handle:
+        assert handle.read(11) == b"replacement"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
 
 
 async def test_importing_unsafe_payload_never_deletes_mismatched_breadcrumb_file(
@@ -472,9 +694,12 @@ async def test_importing_unsafe_payload_never_deletes_mismatched_breadcrumb_file
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
 
     assert record is not None
-    assert record.status == DownloadState.Failed.value
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(unrelated)
+    assert record.failed_reason is not None
+    assert "manual cleanup before re-search" in record.failed_reason
     assert unrelated.exists(), "a file that is not provably ours must never be deleted"
-    assert qbt.removed == [(_HASH, True)]
+    assert qbt.removed == []
 
 
 async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_crashes(
@@ -495,6 +720,7 @@ async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_c
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(dst)
+        _attest_payload_validation(session, dst, placement_owned=True)
         await session.commit()
 
     qbt = _qbt(
@@ -508,7 +734,8 @@ async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_c
         ],
     )
 
-    def _crash_before_unlink(_path: Path) -> None:
+    def _crash_before_unlink(_path: Path, *, expected_identity: str | None = None) -> None:
+        del expected_identity
         raise RuntimeError("simulated crash before owned placement unlink")
 
     monkeypatch.setattr(import_service, "_remove_quietly", _crash_before_unlink)
@@ -530,6 +757,140 @@ async def test_importing_unsafe_payload_keeps_breadcrumb_if_owned_file_removal_c
     assert download.failed_reason is None
     assert dst.exists()
     assert qbt.removed == []
+
+
+async def test_unsafe_retry_consumes_stale_breadcrumb_after_unlink_commit_crash(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst, placement_owned=True)
+        await session.commit()
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(name="setup.exe", size_bytes=1024),
+        ],
+    )
+    original_invalidate = import_service._invalidate_payload_placement_ownership  # pyright: ignore[reportPrivateUsage]
+
+    def _crash_after_unlink(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated crash before path-clear commit")
+
+    monkeypatch.setattr(
+        import_service,
+        "_invalidate_payload_placement_ownership",
+        _crash_after_unlink,
+    )
+    with pytest.raises(RuntimeError, match="before path-clear commit"):
+        await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    async with sessionmaker_() as session:
+        crashed = await session.get(Download, download_id)
+    assert crashed is not None
+    assert crashed.status == DownloadState.Importing.value
+    assert crashed.download_path == str(dst)
+    assert not dst.exists()
+    assert qbt.removed == []
+
+    monkeypatch.setattr(
+        import_service,
+        "_invalidate_payload_placement_ownership",
+        original_invalidate,
+    )
+    recovered = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert recovered is not None
+    assert recovered.status == DownloadState.Failed.value
+    assert recovered.download_path is None
+    assert recovered.failed_reason is not None
+    assert recovered.failed_reason.startswith("torrent payload rejected")
+    assert qbt.removed == [(_HASH, True)]
+
+
+async def test_importing_unsafe_payload_parks_until_owned_breadcrumb_unlink_succeeds(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst, placement_owned=True)
+        await session.commit()
+
+    qbt = _qbt(
+        video,
+        files=[
+            DownloadedFile(name=video.name, size_bytes=video.stat().st_size),
+            DownloadedFile(
+                name="The.Matrix.1999.1080p.WEB-DL.x264-GRP/setup.exe",
+                size_bytes=1024,
+            ),
+        ],
+    )
+    original_unlink = Path.unlink
+    deny_unlink = True
+
+    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
+        if deny_unlink and path == dst:
+            raise PermissionError("simulated read-only library mount")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _permission_guard)
+
+    blocked = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.download_path == str(dst)
+    assert blocked.failed_reason is not None
+    assert "could not remove stored import breadcrumb" in blocked.failed_reason
+    assert "requires manual cleanup before re-search" in blocked.failed_reason
+    assert dst.exists()
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+    # Once the mount/permissions recover, an explicit retry consumes the same
+    # durable breadcrumb, proves the placement is gone, and only then removes the
+    # unsafe torrent and re-arms the request.
+    deny_unlink = False
+    failed = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert failed is not None
+    assert failed.status == DownloadState.Failed.value
+    assert failed.download_path is None
+    assert not dst.exists()
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.searching
 
 
 async def test_import_unsafe_payload_does_not_release_existing_removal_guard(
@@ -569,7 +930,7 @@ async def test_import_unsafe_payload_does_not_release_existing_removal_guard(
         queue_service._end_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
 
 
-async def test_import_blocks_retryably_when_payload_manifest_listing_fails(
+async def test_import_defers_when_payload_manifest_listing_fails(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
     movies_root = tmp_path / "library"
@@ -597,10 +958,47 @@ async def test_import_blocks_retryably_when_payload_manifest_listing_fails(
     record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
 
     assert record is not None
-    assert record.status == DownloadState.ImportBlocked.value
-    assert record.failed_reason == "could not validate torrent payload manifest: QbittorrentError"
+    assert record.status == DownloadState.ImportPending.value
+    assert record.failed_reason is None
     assert qbt.removed == []
     assert not (movies_root / "The Matrix (1999)").exists()
+
+
+async def test_import_cycle_recovers_legacy_manifest_outage_block_automatically(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.import_blocked,
+        download_status=DownloadState.ImportBlocked.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.failed_reason = "could not validate torrent payload manifest: QbittorrentError"
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await run_import_cycle(
+            fs=LocalFileSystem(),
+            library=FakeLibrary(),
+            qbt=_qbt(video),
+            parser=GuessitParser(),
+            profile=default_profile(),
+            session=session,
+            movies_root=str(movies_root),
+        )
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+    assert download is not None and download.status == DownloadState.Imported.value
+    assert download.failed_reason is None
+    assert request is not None and request.status is RequestStatus.completed
 
 
 async def test_importing_movie_manifest_outage_preserves_owned_breadcrumb(
@@ -621,6 +1019,7 @@ async def test_importing_movie_manifest_outage_preserves_owned_breadcrumb(
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(dst)
+        _attest_payload_validation(session, dst, placement_owned=True)
         await session.commit()
     outage_qbt = _ListFilesFailsQbt(
         statuses=[
@@ -696,6 +1095,7 @@ async def test_importing_movie_uses_library_breadcrumb_when_client_status_missin
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
         await session.commit()
     library = FakeLibrary()
 
@@ -704,6 +1104,293 @@ async def test_importing_movie_uses_library_breadcrumb_when_client_status_missin
     assert record is not None
     assert record.status == DownloadState.Imported.value
     assert record.download_path == str(dst)
+    assert library.scanned == [str(dst.parent)]
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.completed
+
+
+async def test_statusless_movie_revalidates_identity_after_awaited_scan(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
+        await session.commit()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        FakeQbittorrent(),
+        _ReplaceMovieDuringScanLibrary(dst),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "changed after payload validation" in record.failed_reason
+    with dst.open("rb") as handle:
+        assert handle.read(11) == b"replacement"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
+async def test_statusless_movie_rejects_same_inode_rewrite_with_restored_mtime(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
+        await session.commit()
+
+    original = dst.stat()
+    with dst.open("r+b") as handle:
+        handle.write(b"changed")
+    os.utime(dst, ns=(original.st_atime_ns, original.st_mtime_ns))
+    rewritten = dst.stat()
+    assert rewritten.st_ino == original.st_ino
+    assert rewritten.st_size == original.st_size
+    assert rewritten.st_mtime_ns == original.st_mtime_ns
+    assert rewritten.st_ctime_ns != original.st_ctime_ns
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "awaits download client manifest validation" in record.failed_reason
+    assert library.scanned == []
+
+
+async def test_statusless_movie_ignores_attestation_from_prior_grab_lifecycle(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
+        session.add(
+            DownloadHistory(
+                tmdb_id=_TMDB_ID,
+                torrent_hash=_HASH,
+                event_type=DownloadHistoryEvent.grabbed,
+                source_title="replacement lifecycle",
+            )
+        )
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "awaits download client manifest validation" in record.failed_reason
+    assert library.scanned == []
+
+
+async def test_importing_movie_unvalidated_breadcrumb_waits_for_client_manifest(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        session.add(
+            DownloadHistory(
+                tmdb_id=_TMDB_ID,
+                torrent_hash=_HASH,
+                event_type=DownloadHistoryEvent.import_started,
+                source_title=None,
+                message=(
+                    "payload-validated import policy=v0 "
+                    "placement=stale ownership=placed: stale policy proof"
+                ),
+            )
+        )
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "awaits download client manifest validation" in record.failed_reason
+    assert library.scanned == []
+    assert dst.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+    recovered = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
+
+    assert recovered is not None
+    assert recovered.status == DownloadState.Imported.value
+    assert recovered.failed_reason is None
+    assert recovered.download_path == str(dst)
+
+
+async def test_statusless_movie_inaccessible_breadcrumb_is_never_cleared(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
+        await session.commit()
+    original_lstat = Path.lstat
+
+    def _permission_guard(path: Path) -> os.stat_result:
+        if path == dst:
+            raise PermissionError("simulated inaccessible mount")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", _permission_guard)
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "stored import breadcrumb" in record.failed_reason
+
+
+async def test_statusless_movie_dangling_symlink_breadcrumb_is_never_cleared(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(tmp_path / "missing-target.mkv")
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
+        await session.commit()
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "stored import breadcrumb" in record.failed_reason
+    assert dst.is_symlink()
+
+
+async def test_importing_movie_breadcrumb_scan_failure_preserves_only_copy_for_retry(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    _make_video(dst)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
+        await session.commit()
+
+    blocked = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), _ScanFailsLibrary()
+    )
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.failed_reason is not None
+    assert blocked.failed_reason.startswith("plex scan failed: PlexLibraryError")
+    assert blocked.download_path == str(dst)
+    assert dst.exists(), "a missing-client scan failure must retain the only media copy"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+    library = FakeLibrary()
+    imported = await _import(sessionmaker_, download_id, movies_root, FakeQbittorrent(), library)
+
+    assert imported is not None
+    assert imported.status == DownloadState.Imported.value
+    assert imported.download_path == str(dst)
+    assert dst.exists()
     assert library.scanned == [str(dst.parent)]
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
@@ -729,6 +1416,7 @@ async def test_importing_movie_breadcrumb_resume_rejects_mismatched_destination(
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(stale)
+        _attest_payload_validation(session, stale)
         await session.commit()
     library = FakeLibrary()
 
@@ -761,6 +1449,7 @@ async def test_importing_movie_breadcrumb_resume_defers_while_purge_deletes_dest
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
         await session.commit()
     library = FakeLibrary()
 
@@ -801,6 +1490,7 @@ async def test_importing_movie_breadcrumb_resume_defers_purge_during_scan(
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(dst)
+        _attest_payload_validation(session, dst)
         await session.commit()
     library = _PurgeDuringScanLibrary(
         fs=LocalFileSystem(library_roots=[str(movies_root)]),
@@ -1089,6 +1779,26 @@ class _WrongSameSizeFs(LocalFileSystem):
         raise FileExistsError(str(dst))
 
 
+class _CrashAfterPublishFs(LocalFileSystem):
+    """Simulate process death after the final library pathname becomes visible."""
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+        super().hardlink_or_copy(src, dst)
+        raise RuntimeError("simulated process death after placement publish")
+
+
+class _ReplaceAfterPublishFs(LocalFileSystem):
+    """Return the original publish token after replacing its pathname."""
+
+    def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity:
+        published = super().hardlink_or_copy(src, dst)
+        dst.unlink()
+        _make_video(dst, src.stat().st_size)
+        with dst.open("r+b") as handle:
+            handle.write(b"replacement")
+        return published
+
+
 async def _import_with_fs(
     sessionmaker_: SessionMaker,
     download_id: int,
@@ -1118,6 +1828,52 @@ class _ScanFailsLibrary(FakeLibrary):
         self.scanned.append(path)
         self.scan_calls.append((path, media_type))
         raise PlexLibraryError(f"plex scan failed for {path}")
+
+
+class _ReplaceMovieDuringScanLibrary(FakeLibrary):
+    def __init__(
+        self,
+        dst: Path,
+        *,
+        fail_scan: bool = False,
+        symlink_target: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._dst = dst
+        self._fail_scan = fail_scan
+        self._symlink_target = symlink_target
+
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+        self.scanned.append(path)
+        self.scan_calls.append((path, media_type))
+        self._dst.unlink()
+        if self._symlink_target is None:
+            _make_video(self._dst)
+            with self._dst.open("r+b") as handle:
+                handle.write(b"replacement")
+        else:
+            self._dst.symlink_to(self._symlink_target)
+        if self._fail_scan:
+            raise PlexLibraryError(f"plex scan failed for {path}")
+
+
+class _RemovePathDuringScanLibrary(FakeLibrary):
+    def __init__(self, target: Path) -> None:
+        super().__init__()
+        self._target = target
+
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+        self.scanned.append(path)
+        self.scan_calls.append((path, media_type))
+        self._target.unlink()
+
+
+class _FailsSecondScanLibrary(FakeLibrary):
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+        self.scanned.append(path)
+        self.scan_calls.append((path, media_type))
+        if len(self.scan_calls) == 2:
+            raise PlexLibraryError(f"second scoped scan failed for {path}")
 
 
 class _PurgeDuringScanLibrary(FakeLibrary):
@@ -1200,6 +1956,99 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
 
+    # The confirmed rollback also invalidates the old ``ownership=placed`` proof.
+    # If a user later supplies an identical file at the same destination, a retry
+    # may adopt and scan it but must never delete it on another scan failure.
+    _make_video(dst)
+    adopted = await _import(
+        sessionmaker_, download_id, movies_root, _qbt(video), _ScanFailsLibrary()
+    )
+    assert adopted is not None
+    assert adopted.status == DownloadState.ImportBlocked.value
+    assert adopted.download_path == str(dst)
+    assert dst.exists(), "a stale ownership proof must not delete a later adopted file"
+
+
+async def test_movie_scan_rollback_preserves_breadcrumb_when_unlink_is_denied(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    original_unlink = Path.unlink
+    deny_unlink = True
+
+    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
+        if deny_unlink and path == dst:
+            raise PermissionError("simulated read-only movie library")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _permission_guard)
+
+    blocked = await _import(
+        sessionmaker_, download_id, movies_root, _qbt(video), _ScanFailsLibrary()
+    )
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.download_path == str(dst)
+    assert blocked.failed_reason is not None
+    assert "manual cleanup before re-search" in blocked.failed_reason
+    assert dst.exists()
+
+    still_blocked = await _import(
+        sessionmaker_, download_id, movies_root, FakeQbittorrent(), FakeLibrary()
+    )
+    assert still_blocked is not None
+    assert still_blocked.status == DownloadState.ImportBlocked.value
+    assert still_blocked.download_path == str(dst)
+    assert dst.exists()
+
+    deny_unlink = False
+    recovered = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
+    assert recovered is not None
+    assert recovered.status == DownloadState.Imported.value
+    assert recovered.download_path == str(dst)
+
+
+async def test_live_safe_movie_never_overwrites_mismatched_existing_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    stale = movies_root / "Old Title (1990)" / "Old Title (1990).mkv"
+    _make_video(stale)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(stale)
+        await session.commit()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), FakeLibrary())
+
+    expected = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(stale)
+    assert record.failed_reason is not None
+    assert "does not match the current destination" in record.failed_reason
+    assert stale.exists()
+    assert not expected.exists()
+
 
 async def test_scan_failure_never_deletes_unproven_identical_destination_file(
     tmp_path: Path, sessionmaker_: SessionMaker
@@ -1233,7 +2082,7 @@ async def test_scan_failure_never_deletes_unproven_identical_destination_file(
     # nothing beats maybe-deleting the user's file.)
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
-    assert record.download_path is None
+    assert record.download_path == str(dst)
     assert dst.exists(), "scan-failure rollback deleted a file this import never placed"
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
@@ -1832,6 +2681,48 @@ def test_same_file_content_false_for_dangling_symlink(tmp_path: Path) -> None:
     )
 
 
+def test_tree_attestation_rejects_replacement_after_per_file_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    season_dir = tmp_path / "Season 01"
+    episode_1 = season_dir / "Show - S01E01.mkv"
+    episode_2 = season_dir / "Show - S01E02.mkv"
+    _make_video(episode_1)
+    _make_video(episode_2)
+    original_identity = import_service._payload_content_identity  # pyright: ignore[reportPrivateUsage]
+    identity_1 = original_identity(str(episode_1))
+    identity_2 = original_identity(str(episode_2))
+    assert identity_1 is not None and identity_2 is not None
+    observations = [
+        import_service._PlacedPath(episode_1, identity_1),  # pyright: ignore[reportPrivateUsage]
+        import_service._PlacedPath(episode_2, identity_2),  # pyright: ignore[reportPrivateUsage]
+    ]
+    calls = 0
+
+    def _replace_after_first_observation(path: str) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            episode_1.unlink()
+            _make_video(episode_1)
+            with episode_1.open("r+b") as handle:
+                handle.write(b"replacement")
+        return original_identity(path)
+
+    monkeypatch.setattr(
+        import_service,
+        "_payload_content_identity",
+        _replace_after_first_observation,
+    )
+
+    assert (
+        import_service._payload_identity_if_observations_match(  # pyright: ignore[reportPrivateUsage]
+            str(season_dir), observations
+        )
+        is None
+    )
+
+
 async def test_import_is_idempotent_on_an_already_imported_row(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -2007,6 +2898,7 @@ async def test_crash_resume_rolls_back_orphaned_placement_on_scan_failure(
             download_path=str(dst),  # breadcrumb that survived the crash
         )
         session.add(download)
+        _attest_payload_validation(session, dst, placement_owned=True)
         await session.commit()
         download_id, request_id = download.id, request.id
 
@@ -2021,6 +2913,39 @@ async def test_crash_resume_rolls_back_orphaned_placement_on_scan_failure(
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_movie_scan_failure_never_unlinks_symlink_replacement(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    target = tmp_path / "operator-owned.mkv"
+    _make_video(target)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = _ReplaceMovieDuringScanLibrary(
+        dst,
+        fail_scan=True,
+        symlink_target=target,
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(dst)
+    assert record.failed_reason is not None
+    assert "manual cleanup before re-search" in record.failed_reason
+    assert dst.is_symlink()
+    assert dst.resolve() == target
+    assert target.exists()
 
 
 class _MarkFailedMidImportQbt(FakeQbittorrent):
@@ -2195,7 +3120,7 @@ async def test_blocked_import_blocklists_grabbed_release_title_not_file_basename
             .all()
         )
     assert started and all(e.source_title is None for e in started)
-    assert all("movie.mkv" in (e.message or "") for e in started)
+    assert any("movie.mkv" in (e.message or "") for e in started)
 
     async with sessionmaker_() as session:
         await queue_service.mark_failed(
@@ -2347,11 +3272,12 @@ async def _import_tv(
     library: FakeLibrary,
     *,
     anime_tv_root: Path | None = None,
+    fs: LocalFileSystem | None = None,
 ) -> DownloadRecord | None:
     async with sessionmaker_() as session:
         return await import_download(
             download_id=download_id,
-            fs=LocalFileSystem(),
+            fs=fs or LocalFileSystem(),
             library=library,
             qbt=qbt,
             parser=GuessitParser(),
@@ -2550,6 +3476,164 @@ async def _seed_scoped_tv(
         return download.id, request.id, {1: season_1.id, 2: season_2.id}
 
 
+async def test_scoped_tv_unsafe_retry_clears_missing_pre_publish_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportPending.value
+    )
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    original_place = import_service._place_file_with_identity  # pyright: ignore[reportPrivateUsage]
+
+    def _crash_before_publish(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated process death before scoped publish")
+
+    monkeypatch.setattr(import_service, "_place_file_with_identity", _crash_before_publish)
+    with pytest.raises(RuntimeError, match="before scoped publish"):
+        await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    async with sessionmaker_() as session:
+        crashed = await session.get(Download, download_id)
+    assert crashed is not None
+    assert crashed.status == DownloadState.Importing.value
+    assert crashed.download_path == str(season_1_dir)
+    assert not season_1_dir.exists()
+
+    monkeypatch.setattr(import_service, "_place_file_with_identity", original_place)
+    unsafe_qbt = _qbt(
+        release_dir,
+        files=[
+            *_manifest_files(release_dir),
+            DownloadedFile(name="setup.exe", size_bytes=1024),
+        ],
+    )
+    recovered = await _import_tv(sessionmaker_, download_id, tv_root, unsafe_qbt, FakeLibrary())
+
+    assert recovered is not None
+    assert recovered.status == DownloadState.Failed.value
+    assert recovered.download_path is None
+    assert unsafe_qbt.removed == [(_HASH, True)]
+
+
+async def test_scoped_tv_identity_change_preserves_first_breadcrumb_and_defers_later_scope(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportPending.value
+    )
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+    season_1_episode = season_1_dir / "Some Show - S01E01.mkv"
+    library = _RemovePathDuringScanLibrary(season_1_episode)
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_1_dir)
+    assert record.failed_reason is not None
+    assert "changed after payload validation" in record.failed_reason
+    assert library.scan_calls == [(str(season_1_dir), "tv")]
+    assert not season_1_episode.exists()
+    assert not season_2_dir.exists()
+    async with sessionmaker_() as session:
+        season_1 = await session.get(SeasonRequest, season_ids[1])
+        season_2 = await session.get(SeasonRequest, season_ids[2])
+        imported_history = (
+            (
+                await session.execute(
+                    select(DownloadHistory).where(
+                        DownloadHistory.torrent_hash == _HASH,
+                        DownloadHistory.event_type == DownloadHistoryEvent.imported,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert season_1 is not None and season_1.status.value == "import_blocked"
+    assert season_2 is not None and season_2.status.value == "import_blocked"
+    assert imported_history == []
+
+
+async def test_scoped_tv_partial_cleanup_keeps_failed_scope_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportPending.value
+    )
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+    season_2_episode = season_2_dir / "Some Show - S02E01.mkv"
+    original_unlink = Path.unlink
+
+    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
+        if path == season_2_episode:
+            raise PermissionError("simulated read-only second season")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _permission_guard)
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(release_dir),
+        _FailsSecondScanLibrary(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_2_dir)
+    assert record.failed_reason is not None
+    assert "manual cleanup before re-search" in record.failed_reason
+    assert (season_1_dir / "Some Show - S01E01.mkv").exists()
+    assert season_2_episode.exists()
+    async with sessionmaker_() as session:
+        season_1 = await session.get(SeasonRequest, season_ids[1])
+        season_2 = await session.get(SeasonRequest, season_ids[2])
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert season_1 is not None and season_1.status.value == "completed"
+    assert season_2 is not None and season_2.status.value == "import_blocked"
+    assert {scope.season_number: scope.status for scope in scopes} == {
+        1: "imported",
+        2: "import_blocked",
+    }
+
+    repeated = await _import_tv(
+        sessionmaker_, download_id, tv_root, _qbt(release_dir), _ScanFailsLibrary()
+    )
+    assert repeated is not None
+    assert repeated.status == DownloadState.ImportBlocked.value
+    assert repeated.download_path == str(season_2_dir)
+    assert repeated.failed_reason is not None
+    assert "manual cleanup before re-search" in repeated.failed_reason
+    assert season_2_episode.exists()
+
+
 async def test_import_tv_scoped_unsafe_payload_fails_and_rearms_every_scope(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -2661,6 +3745,124 @@ async def test_import_tv_scoped_unsafe_payload_with_breadcrumb_blocks_for_manual
     assert record.download_path == str(season_dir)
     assert placed_episode.exists(), "placed library files must survive the block"
     assert qbt.removed == []
+
+
+async def test_import_tv_scoped_unvalidated_breadcrumb_waits_for_client_manifest(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 01"
+    placed_episode = season_dir / "Some Show - S01E01.mkv"
+    _make_video(placed_episode)
+    download_id, request_id, season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_dir)
+    assert record.failed_reason is not None
+    assert "awaits download client manifest validation" in record.failed_reason
+    assert library.scan_calls == []
+    assert placed_episode.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        seasons = [await session.get(SeasonRequest, season_id) for season_id in season_ids.values()]
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert request is not None and request.status is RequestStatus.import_blocked
+    assert all(season is not None and season.status.value == "import_blocked" for season in seasons)
+    assert all(scope.status == "import_blocked" for scope in scopes)
+
+
+async def test_scoped_attested_breadcrumb_reorders_resume_before_other_scopes(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+    _make_video(season_2_dir / "Some Show - S02E01.mkv")
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_2_dir)
+        _attest_payload_validation(session, season_2_dir)
+        await session.commit()
+
+    blocked = await _import_tv(
+        sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary()
+    )
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.download_path == str(season_2_dir)
+    assert blocked.failed_reason is not None
+    assert blocked.failed_reason.startswith("validated scoped import breadcrumb awaits")
+    assert "manifest validation" not in blocked.failed_reason
+
+    library = FakeLibrary()
+    recovered = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    assert recovered is not None
+    assert recovered.status == DownloadState.Imported.value
+    assert library.scan_calls == [
+        (str(season_2_dir), "tv"),
+        (str(season_1_dir), "tv"),
+    ]
+
+
+async def test_scoped_breadcrumb_for_unimportable_scope_is_never_overwritten(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+    retained = season_2_dir / "Some Show - S02E01.mkv"
+    _make_video(retained)
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_2_dir)
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_2_dir)
+    assert record.failed_reason is not None
+    assert "no importable attached scope" in record.failed_reason
+    assert retained.exists()
+    assert not season_1_dir.exists()
 
 
 async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
@@ -2810,6 +4012,7 @@ async def test_import_tv_uses_season_breadcrumb_when_client_status_missing(
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(season_dir)
+        _attest_payload_validation(session, season_dir)
         await session.commit()
     library = FakeLibrary()
 
@@ -2842,6 +4045,184 @@ async def test_import_tv_uses_season_breadcrumb_when_client_status_missing(
     assert all(row.message is not None and "Season 02" in row.message for row in history)
 
 
+async def test_statusless_tv_rejects_attested_season_after_episode_disappears(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    episode_1 = season_dir / "Some Show - S02E01.mkv"
+    episode_2 = season_dir / "Some Show - S02E02.mkv"
+    _make_video(episode_1)
+    _make_video(episode_2)
+    download_id, _request_id, season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        _attest_payload_validation(session, season_dir)
+        await session.commit()
+    episode_2.unlink()
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_dir)
+    assert record.failed_reason is not None
+    assert "awaits download client manifest validation" in record.failed_reason
+    assert episode_1.exists()
+    assert library.scan_calls == []
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+    assert season is not None and season.status.value == "import_blocked"
+
+
+async def test_statusless_tv_revalidates_complete_tree_after_awaited_scan(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    episode_1 = season_dir / "Some Show - S02E01.mkv"
+    episode_2 = season_dir / "Some Show - S02E02.mkv"
+    _make_video(episode_1)
+    _make_video(episode_2)
+    download_id, _request_id, season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        _attest_payload_validation(session, season_dir)
+        await session.commit()
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        FakeQbittorrent(),
+        _RemovePathDuringScanLibrary(episode_2),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(season_dir)
+    assert record.failed_reason is not None
+    assert "changed after payload validation" in record.failed_reason
+    assert episode_1.exists()
+    assert not episode_2.exists()
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+    assert season is not None and season.status.value == "import_blocked"
+
+
+async def test_crash_after_tv_publish_retains_planned_season_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, _season_id = await _seed_tv(sessionmaker_, season=2)
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    dst = season_dir / "Some Show - S02E01.mkv"
+
+    with pytest.raises(RuntimeError, match="process death after placement publish"):
+        await _import_tv(
+            sessionmaker_,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            FakeLibrary(),
+            fs=_CrashAfterPublishFs(),
+        )
+
+    async with sessionmaker_() as session:
+        crashed = await session.get(Download, download_id)
+    assert crashed is not None
+    assert crashed.status == DownloadState.Importing.value
+    assert crashed.download_path == str(season_dir)
+    assert dst.exists()
+
+    unsafe_qbt = _qbt(
+        release_dir,
+        files=[
+            *_manifest_files(release_dir),
+            DownloadedFile(name="setup.exe", size_bytes=1024),
+        ],
+    )
+    blocked = await _import_tv(sessionmaker_, download_id, tv_root, unsafe_qbt, FakeLibrary())
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.download_path == str(season_dir)
+    assert blocked.failed_reason is not None
+    assert "manual cleanup before re-search" in blocked.failed_reason
+    assert dst.exists()
+    assert unsafe_qbt.removed == []
+
+
+async def test_scalar_tv_unsafe_retry_clears_missing_pre_publish_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, _season_id = await _seed_tv(sessionmaker_, season=2)
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    original_place = import_service._place_file_with_identity  # pyright: ignore[reportPrivateUsage]
+
+    def _crash_before_publish(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated process death before first publish")
+
+    monkeypatch.setattr(import_service, "_place_file_with_identity", _crash_before_publish)
+    with pytest.raises(RuntimeError, match="before first publish"):
+        await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    async with sessionmaker_() as session:
+        crashed = await session.get(Download, download_id)
+    assert crashed is not None
+    assert crashed.status == DownloadState.Importing.value
+    assert crashed.download_path == str(season_dir)
+    assert not season_dir.exists()
+    # Also model death just after _place_file created its parent but before the
+    # filesystem primitive published the first episode.
+    season_dir.mkdir(parents=True)
+    publish_lock = season_dir / ".Some Show - S02E01.mkv.publish.lock"
+    publish_lock.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(import_service, "_place_file_with_identity", original_place)
+    unsafe_qbt = _qbt(
+        release_dir,
+        files=[
+            *_manifest_files(release_dir),
+            DownloadedFile(name="setup.exe", size_bytes=1024),
+        ],
+    )
+    deferred = await _import_tv(sessionmaker_, download_id, tv_root, unsafe_qbt, FakeLibrary())
+
+    assert deferred is not None
+    assert deferred.status == DownloadState.Importing.value
+    assert deferred.download_path == str(season_dir)
+    assert publish_lock.exists()
+    assert unsafe_qbt.removed == []
+
+    os.utime(publish_lock, (0, 0))
+    recovered = await _import_tv(sessionmaker_, download_id, tv_root, unsafe_qbt, FakeLibrary())
+
+    assert recovered is not None
+    assert recovered.status == DownloadState.Failed.value
+    assert recovered.download_path is None
+    assert not season_dir.exists()
+    assert unsafe_qbt.removed == [(_HASH, True)]
+
+
 async def test_import_tv_breadcrumb_resume_persists_installed_quality(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -2861,6 +4242,7 @@ async def test_import_tv_breadcrumb_resume_persists_installed_quality(
         assert download is not None
         download.download_path = str(season_dir)
         download.release_title = "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+        _attest_payload_validation(session, season_dir)
         await session.commit()
 
     record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
@@ -2890,6 +4272,7 @@ async def test_import_tv_retries_breadcrumb_after_status_missing_scan_failure(
         download = await session.get(Download, download_id)
         assert download is not None
         download.download_path = str(season_dir)
+        _attest_payload_validation(session, season_dir)
         await session.commit()
 
     first = await _import_tv(
@@ -3700,6 +5083,7 @@ async def test_import_tv_scan_failure_never_leaves_a_lying_imported_history_row(
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path is None
     season_dir = tv_root / "Some Show (2020)" / "Season 02"
     # Rolled back: neither placed episode survives the scan failure.
     assert not (season_dir / "Some Show - S02E01.mkv").exists()
@@ -3725,6 +5109,91 @@ async def test_import_tv_scan_failure_never_leaves_a_lying_imported_history_row(
     assert request is not None and request.status is RequestStatus.import_blocked
 
 
+async def test_tv_scan_rollback_preserves_partial_cleanup_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    retained = season_dir / "Some Show - S02E01.mkv"
+    removed = season_dir / "Some Show - S02E02.mkv"
+    original_unlink = Path.unlink
+
+    def _permission_guard(path: Path, missing_ok: bool = False) -> None:
+        if path == retained:
+            raise PermissionError("simulated read-only episode")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _permission_guard)
+
+    blocked = await _import_tv(
+        sessionmaker_, download_id, tv_root, _qbt(release_dir), _ScanFailsLibrary()
+    )
+
+    assert blocked is not None
+    assert blocked.status == DownloadState.ImportBlocked.value
+    assert blocked.download_path == str(season_dir)
+    assert blocked.failed_reason is not None
+    assert "manual cleanup before re-search" in blocked.failed_reason
+    assert retained.exists()
+    assert not removed.exists()
+
+    still_blocked = await _import_tv(
+        sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary()
+    )
+    assert still_blocked is not None
+    assert still_blocked.status == DownloadState.ImportBlocked.value
+    assert still_blocked.download_path == str(season_dir)
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+    assert season is not None and season.status.value == "import_blocked"
+
+    repeated = await _import_tv(
+        sessionmaker_, download_id, tv_root, _qbt(release_dir), _ScanFailsLibrary()
+    )
+    assert repeated is not None
+    assert repeated.status == DownloadState.ImportBlocked.value
+    assert repeated.download_path == str(season_dir)
+    assert repeated.failed_reason is not None
+    assert "manual cleanup before re-search" in repeated.failed_reason
+    assert retained.exists()
+
+
+async def test_live_safe_tv_never_overwrites_mismatched_existing_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    stale_dir = tv_root / "Some Show (2020)" / "Season 01"
+    stale_episode = stale_dir / "Some Show - S01E01.mkv"
+    _make_video(stale_episode)
+    download_id, _request_id, _season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(stale_dir)
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    expected_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path == str(stale_dir)
+    assert record.failed_reason is not None
+    assert "does not match the current season" in record.failed_reason
+    assert stale_episode.exists()
+    assert not expected_dir.exists()
+
+
 class _FailsOnSecondCallFs(LocalFileSystem):
     """A LocalFileSystem whose ``hardlink_or_copy`` succeeds for the FIRST file
     placed (whichever one the loop visits first -- directory iteration order is
@@ -3736,11 +5205,11 @@ class _FailsOnSecondCallFs(LocalFileSystem):
         super().__init__()
         self._calls = 0
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity:
         self._calls += 1
         if self._calls >= 2:
             raise OSError("simulated copy failure")
-        super().hardlink_or_copy(src, dst)
+        return super().hardlink_or_copy(src, dst)
 
 
 async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(
@@ -3776,6 +5245,7 @@ async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_his
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
+    assert record.download_path is None
     season_dir = tv_root / "Some Show (2020)" / "Season 02"
     # Whichever episode placed first was rolled back too; no *.mkv survives.
     if season_dir.exists():

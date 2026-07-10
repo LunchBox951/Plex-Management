@@ -227,6 +227,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.download_payload import (
     EMPTY_PAYLOAD_REJECTION_REASON,
+    PAYLOAD_REJECTION_REASON_PREFIX,
     format_payload_rejection,
     validate_payload_files,
 )
@@ -285,9 +286,6 @@ _logger = logging.getLogger(__name__)
 _TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATES)
 _PAYLOAD_VALIDATION_STATUS_VALUES = frozenset(s.value for s in ACTIVE_STATES) | frozenset(
     {DownloadState.ImportBlocked.value}
-)
-_MANUAL_CLEANUP_BREADCRUMB_REASON = (
-    "stored import breadcrumb requires manual cleanup before re-search"
 )
 _COMPLETE_PROGRESS = 1.0
 _PAYLOAD_COMPLETE_RAW_STATES = frozenset(
@@ -1137,18 +1135,14 @@ def _payload_manifest_is_complete(live: DownloadStatus) -> bool:
     return live.progress >= _COMPLETE_PROGRESS or live.raw_state in _PAYLOAD_COMPLETE_RAW_STATES
 
 
-def _has_manual_cleanup_breadcrumb(row: DownloadRecord) -> bool:
-    # Keyed on the marker itself, NOT ``row.season``: the manual-cleanup marker is only
-    # ever written by the TV import paths, and a multi-season (#173) scoped row carries
-    # its seasons in ``row.scopes`` with ``row.season`` None — requiring a scalar season
-    # here would let this validator auto-fail a cleanup-parked scoped row and delete the
-    # torrent while its placed season files linger.
-    return (
-        row.status == DownloadState.ImportBlocked.value
-        and row.download_path is not None
-        and row.failed_reason is not None
-        and _MANUAL_CLEANUP_BREADCRUMB_REASON in row.failed_reason
-    )
+def _has_protected_import_breadcrumb(row: DownloadRecord) -> bool:
+    # Every production writer stores only a Plex-library placement in
+    # ``download_path``. Older ImportBlocked rows predate today's cleanup marker (a
+    # partially successful scoped-TV import is the important example), so the path
+    # itself is a potential cleanup obligation even when it is not sufficient proof
+    # of deletion ownership. Never auto-remove their torrent and re-arm while that
+    # placement may remain in the library.
+    return row.download_path is not None
 
 
 async def _payload_safety_transitions(
@@ -1161,7 +1155,7 @@ async def _payload_safety_transitions(
     for row in rows:
         if row.status not in _PAYLOAD_VALIDATION_STATUS_VALUES:
             continue
-        if _has_manual_cleanup_breadcrumb(row):
+        if _has_protected_import_breadcrumb(row):
             continue
         live = snapshot.get(row.torrent_hash.lower())
         if live is None:
@@ -1227,7 +1221,20 @@ async def reconcile_and_list(
     now = _utcnow()
 
     snapshot = {status.info_hash.lower(): status for status in statuses}
-    transitions = reconcile(rows, statuses, now=now)
+    protected_ids = {row.id for row in rows if row.download_path is not None}
+    # A non-null path is a potential Plex-library placement/cleanup obligation.
+    # Preserve benign client-state updates, but suppress every automatic failure
+    # transition that could remove the torrent and re-arm while that placement
+    # remains. This also protects legacy Downloading/ClientMissing rows created by
+    # older import code, not only today's ImportBlocked representation.
+    transitions = [
+        transition
+        for transition in reconcile(rows, statuses, now=now)
+        if not (
+            transition.download_id in protected_ids
+            and transition.to_state is DownloadState.FailedPending
+        )
+    ]
     payload_transitions = await _payload_safety_transitions(qbt, rows, snapshot)
 
     # Honesty over silence: surface every unmapped raw client state on EVERY
@@ -1312,8 +1319,10 @@ async def reconcile_and_list(
     # own call, not this heal, is what completes it.
     rows_by_id = {row.id: row for row in rows}
     for detection in detect_stalls(rows, statuses, now=now):
-        if detection.download_id in transitions_by_id or _is_operator_claimed(
-            detection.download_id
+        if (
+            detection.download_id in protected_ids
+            or detection.download_id in transitions_by_id
+            or _is_operator_claimed(detection.download_id)
         ):
             continue
         stalled_row = rows_by_id.get(detection.download_id)
@@ -1345,6 +1354,10 @@ async def reconcile_and_list(
         event_row = rows_by_hash.get(event.torrent_hash.lower())
         if event_row is None:  # pragma: no cover - events derive from ``rows``
             continue
+        if event_row.download_path is not None:
+            # Without confirmed placement cleanup, Phase B/Phase C must not
+            # remove/re-arm a freshly detected failure automatically.
+            continue
         completions.append(
             _FailureCompletion(
                 download_id=event_row.id,
@@ -1362,6 +1375,12 @@ async def reconcile_and_list(
         if row.status != DownloadState.FailedPending.value:
             continue
         marker = _parse_operator_fail_marker(row.failed_reason)
+        if row.download_path is not None and (marker is None or not marker.operator):
+            # Old releases could strand a reconcile-owned failed_pending row while
+            # retaining a placement breadcrumb. Only an explicit operator marker
+            # may override that cleanup protection; automatic healing must keep the
+            # torrent, request, and durable pointer together.
+            continue
         # Actor-aware residual semantics: an OPERATOR marker heals with the
         # operator vocabulary; a RECONCILE done-record (a plain failure whose
         # removal already happened) heals with the reconcile defaults minus the
@@ -1422,11 +1441,13 @@ async def reconcile_and_list(
         return await download_repo.list_active(populate_existing=True)
 
     # Phase B: close the seeding leak (ADR-0014) AND, per issue #68, ensure each old
-    # torrent is gone BEFORE its request is re-armed. Best-effort per hash: a client
+    # torrent is gone BEFORE its request is re-armed. Best-effort per ordinary hash: a client
     # hiccup never undoes the committed Phase A, an already-gone hash (the common
     # case -- the row usually failed BECAUSE it went ClientMissing) is a no-op
     # success, and because it is logged-not-raised a removal failure does not block
-    # the Phase C completion below (the row still lands Failed + re-armed). An
+    # the Phase C completion below (the row still lands Failed + re-armed). Unsafe
+    # payload rejections are stricter: a failed removal keeps them failed_pending so
+    # a later cycle retries instead of abandoning attacker-controlled data. An
     # operator residual whose marker says remove=no is honored: no removal. The
     # claim registry is RE-CHECKED per completion IMMEDIATELY before its removal
     # await (pre-stamp invisibility fast-path, Phase B): a claim registered while an
@@ -1517,6 +1538,14 @@ async def reconcile_and_list(
                     "tmdb_id": completion.event.tmdb_id,
                 },
             )
+            if not removed_ok and completion.event.reason.startswith(
+                PAYLOAD_REJECTION_REASON_PREFIX
+            ):
+                _logger.warning(
+                    "keeping unsafe payload download %s pending until torrent removal succeeds",
+                    safe_int(completion.download_id),
+                )
+                continue
             # Persist the removal OUTCOME (see the two done-marker renderers): a
             # row whose delete just succeeded is CAS-restamped to remove=done and
             # committed AT ONCE -- durable even if this cycle's Phase C later
@@ -1630,6 +1659,12 @@ async def heal_failed_pending_without_client(session: AsyncSession) -> None:
         if row.status != DownloadState.FailedPending.value:
             continue
         marker = _parse_operator_fail_marker(row.failed_reason)
+        if row.download_path is not None and marker is not None and not marker.operator:
+            # Match full reconcile: a reconcile-owned remove=done residue may
+            # describe external torrent cleanup, but it is not proof that the
+            # retained Plex-library placement was cleaned. Only an explicit
+            # operator marker may override that obligation.
+            continue
         if marker is None or marker.flags.remove_torrent:
             awaiting_client += 1
             continue

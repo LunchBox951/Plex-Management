@@ -13,6 +13,7 @@ import pytest
 from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
 from plex_manager.adapters.filesystem.local import (
     _EMPTY_LOCK_STALE_SECONDS,  # pyright: ignore[reportPrivateUsage]
+    clear_stale_publish_locks,
 )
 
 
@@ -412,6 +413,25 @@ def test_publish_lock_fresh_empty_lock_is_not_reclaimed(tmp_path: Path) -> None:
 
     assert not dst.exists()
     assert lock.exists()  # preserved for the in-flight creator
+
+
+@pytest.mark.parametrize("artifact_kind", ["media", "symlink"])
+def test_pending_publish_lock_never_hides_protected_artifact(
+    tmp_path: Path, artifact_kind: str
+) -> None:
+    directory = tmp_path / artifact_kind
+    directory.mkdir()
+    lock = directory / ".episode.mkv.publish.lock"
+    lock.write_text("", encoding="utf-8")
+    artifact = directory / "episode.mkv"
+    if artifact_kind == "symlink":
+        artifact.symlink_to(tmp_path / "operator-owned.mkv")
+    else:
+        artifact.write_text("media", encoding="utf-8")
+
+    assert clear_stale_publish_locks(directory) == "protected"
+    assert lock.exists()
+    assert os.path.lexists(artifact)
 
 
 def test_cross_device_copy_preserves_active_publish_lock(

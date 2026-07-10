@@ -140,6 +140,83 @@ async def test_missing_beyond_grace_fails_blocklists_and_researches(
     assert qbt.removed == [(_HASH, True)]
 
 
+async def test_missing_beyond_grace_preserves_legacy_library_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+    placed = tmp_path / "library" / "Some Movie (2020)" / "Some Movie (2020).mkv"
+    placed.parent.mkdir(parents=True)
+    placed.write_bytes(b"placed")
+    async with sessionmaker_() as session:
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        download.download_path = str(placed)
+        await session.commit()
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(row for row in queue if row.torrent_hash == _HASH)
+    assert item.download_path == str(placed)
+    assert qbt.removed == []
+    assert placed.exists()
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status is RequestStatus.downloading
+    assert download.status != "failed"
+    assert download.download_path == str(placed)
+    assert blocklist == []
+
+
+async def test_failed_pending_heal_preserves_legacy_library_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    request_id = await _seed_request_with_download(
+        sessionmaker_,
+        first_seen_at=datetime.now(UTC) - timedelta(minutes=11),
+        download_status="failed_pending",
+    )
+    placed = tmp_path / "library" / "Some Movie (2020)" / "Some Movie (2020).mkv"
+    placed.parent.mkdir(parents=True)
+    placed.write_bytes(b"placed")
+    async with sessionmaker_() as session:
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        download.download_path = str(placed)
+        download.failed_reason = (
+            "reconcile failure in progress (blocklist=yes, remove=done, nonce=0)"
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(row for row in queue if row.torrent_hash == _HASH)
+    assert item.status == "failed_pending"
+    assert item.download_path == str(placed)
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        await queue_service.heal_failed_pending_without_client(session)
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, item.id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status is RequestStatus.downloading
+    assert download is not None and download.status == "failed_pending"
+    assert download.download_path == str(placed)
+    assert blocklist == []
+
+
 async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -266,6 +343,68 @@ async def test_unsafe_payload_manifest_fails_blocklists_researches_and_removes(
     assert download.status == "failed"
     assert download.failed_reason is not None
     assert "unsupported file type .exe" in download.failed_reason
+
+
+class _UnsafePayloadRemoveFailsQbt(FakeQbittorrent):
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        raise RuntimeError("simulated qBittorrent removal outage")
+
+
+async def test_unsafe_payload_removal_failure_stays_pending_and_retries(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+        raw_state="downloading",
+        progress=0.01,
+    )
+    files = {
+        _HASH: [
+            DownloadedFile(
+                name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/movie.mkv",
+                size_bytes=8_000_000_000,
+            ),
+            DownloadedFile(
+                name="Some.Movie.2020.1080p.WEB-DL.x264-GROUP/setup.exe",
+                size_bytes=1024,
+            ),
+        ]
+    }
+    failing_qbt = _UnsafePayloadRemoveFailsQbt(statuses=[live], files=files)
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(failing_qbt, session)
+
+    pending = next(item for item in queue if item.torrent_hash == _HASH)
+    assert pending.status == "failed_pending"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status is RequestStatus.downloading
+    assert download.failed_reason is not None
+    assert "unsupported file type .exe" in download.failed_reason
+    assert blocklist == []
+
+    recovered_qbt = FakeQbittorrent(statuses=[live], files=files)
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(recovered_qbt, session)
+
+    assert all(item.torrent_hash != _HASH for item in queue)
+    assert recovered_qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert request is not None and request.status is RequestStatus.searching
+    assert download.status == "failed"
+    assert len(blocklist) == 1
 
 
 async def test_payload_reason_survives_remove_done_phase_c_exhaustion(
@@ -464,17 +603,14 @@ async def test_import_blocked_unsafe_payload_is_rejected_by_reconcile(
     assert download.status == "failed"
 
 
-async def test_reconcile_preserves_manual_cleanup_tv_breadcrumb_block(
+async def test_reconcile_preserves_legacy_tv_breadcrumb_block(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
     season_dir = tmp_path / "tv" / "Some Show (2020)" / "Season 02"
     placed = season_dir / "Some Show - S02E01.mkv"
     placed.parent.mkdir(parents=True)
     placed.write_bytes(b"episode")
-    failed_reason = (
-        "torrent payload rejected: unsupported file type .exe; "
-        "stored import breadcrumb requires manual cleanup before re-search"
-    )
+    failed_reason = "legacy plex scan failed after placement"
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=603,
@@ -550,21 +686,17 @@ async def test_reconcile_preserves_manual_cleanup_tv_breadcrumb_block(
     assert download.download_path == str(season_dir)
 
 
-async def test_reconcile_preserves_manual_cleanup_block_for_scoped_download(
+async def test_reconcile_preserves_legacy_breadcrumb_for_scoped_download(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
     # A multi-season (#173) scoped row carries its seasons in DownloadScope rows with
-    # ``Download.season`` None. The manual-cleanup skip must key on the marker itself —
-    # requiring a scalar season would let the payload validator auto-fail this parked
-    # row and delete the torrent while its placed season files linger.
+    # ``Download.season`` None. Pre-security rows can have a generic block reason, so
+    # the durable library-placement path itself must prevent automatic removal.
     season_dir = tmp_path / "tv" / "Some Show (2020)" / "Season 01"
     placed = season_dir / "Some Show - S01E01.mkv"
     placed.parent.mkdir(parents=True)
     placed.write_bytes(b"episode")
-    failed_reason = (
-        "torrent payload rejected: unsupported file type .exe; "
-        "stored import breadcrumb requires manual cleanup before re-search"
-    )
+    failed_reason = "legacy partial scoped import blocked"
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=603,
@@ -3493,6 +3625,49 @@ async def test_stalled_dl_raw_state_past_threshold_is_auto_mark_failed(
     assert qbt.removed == [(_HASH, True)]
     assert len(history) == 1
     assert "stalled_progress" in (history[0].message or "")
+
+
+async def test_stall_heal_preserves_legacy_library_breadcrumb(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="downloading",
+        added_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+    placed = tmp_path / "library" / "Some Movie (2020)" / "Some Movie (2020).mkv"
+    placed.parent.mkdir(parents=True)
+    placed.write_bytes(b"placed")
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(placed)
+        await session.commit()
+    stale_activity = int((datetime.now(UTC) - timedelta(hours=5)).timestamp())
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=_TITLE,
+                raw_state="stalledDL",
+                last_activity_unix=stale_activity,
+            )
+        ]
+    )
+
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+    assert download is not None and download.status == "downloading"
+    assert download.download_path == str(placed)
+    assert request is not None and request.status is RequestStatus.downloading
+    assert blocklist == []
+    assert qbt.removed == []
+    assert placed.exists()
 
 
 async def test_stalled_dl_raw_state_with_recent_activity_is_not_healed(

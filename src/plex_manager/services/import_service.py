@@ -34,19 +34,22 @@ import contextlib
 import hashlib
 import logging
 import os
+import stat
 import weakref
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
+from plex_manager.adapters.filesystem.local import clear_stale_publish_locks
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.download_payload import (
     EMPTY_PAYLOAD_REJECTION_REASON,
+    PAYLOAD_VALIDATION_POLICY_VERSION,
     format_payload_rejection,
     validate_payload_files,
 )
@@ -73,7 +76,7 @@ from plex_manager.models import (
     DownloadScope,
     RequestStatus,
 )
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
+from plex_manager.ports.filesystem import VIDEO_EXTENSIONS, FilePlacementIdentity
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -115,6 +118,28 @@ PATH_NOT_VISIBLE_REASON_PREFIX: Final = "download path not visible inside the co
 _MANUAL_CLEANUP_BREADCRUMB_REASON: Final = (
     "stored import breadcrumb requires manual cleanup before re-search"
 )
+_PAYLOAD_VALIDATED_IMPORT_HISTORY_PREFIX: Final = (
+    f"payload-validated import policy={PAYLOAD_VALIDATION_POLICY_VERSION} "
+)
+_MANIFEST_OUTAGE_REASON_PREFIX: Final = "could not validate torrent payload manifest:"
+_UNVALIDATED_BREADCRUMB_REASON_PREFIX: Final = (
+    "stored import breadcrumb awaits download client manifest validation"
+)
+_UNVALIDATED_BREADCRUMB_REASON: Final = (
+    f"{_UNVALIDATED_BREADCRUMB_REASON_PREFIX}; {_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+)
+_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT: Final = "could not remove stored import breadcrumb"
+_PLACEMENT_IDENTITY_CHANGED_REASON: Final = (
+    "stored import breadcrumb changed after payload validation; "
+    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+)
+_SCOPED_BREADCRUMB_CLIENT_MISSING_REASON_PREFIX: Final = (
+    "validated scoped import breadcrumb awaits download client status"
+)
+_SCOPED_BREADCRUMB_CLIENT_MISSING_REASON: Final = (
+    f"{_SCOPED_BREADCRUMB_CLIENT_MISSING_REASON_PREFIX}; {_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+)
+_NO_FAILED_REASON_PREDICATE: Final = object()
 
 # States ``import_download`` will (re)process: a freshly-completed torrent, an
 # operator retry of a blocked one, and a row left mid-import by a crash — all
@@ -476,14 +501,15 @@ def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, i
     ]
 
 
-def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
+def _place_file(
+    fs: FileSystemPort, src: str, dst: Path
+) -> tuple[bool, FilePlacementIdentity | None]:
     """Hardlink/copy ``src`` to ``dst``, idempotently (sync I/O, run in a thread).
 
-    Returns ``True`` iff THIS call created ``dst``; ``False`` when ``dst`` was
-    already supplied by another writer — a prior fully-imported copy (idempotent
-    skip) or a concurrent import that won a placement race. The caller rolls ``dst``
-    back on a later failure ONLY when it actually placed it, so it never unlinks a
-    file another import (or the user) owns.
+    Returns whether THIS call created ``dst`` plus the publish primitive's
+    creation-bound identity. An already-supplied file returns ``(False, None)``.
+    The caller rolls ``dst`` back on a later failure only when the primitive's
+    identity still matches, so it never unlinks another import's or user's file.
 
     A fully-imported destination (same size) is left untouched. A *differently*-sized
     file already at ``dst`` (a user's library file, or a stale partial) is NEVER
@@ -496,14 +522,14 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     # the symlink entry (GHSA-8fj8) instead of surfacing the conflict below.
     if os.path.lexists(os.fspath(dst)):
         if _same_file_content(src, dst):
-            return False  # already fully imported here — idempotent skip; not ours
+            return False, None  # already fully imported here — idempotent skip; not ours
         # A differently-sized file is already at the destination: a user's
         # manually-managed library file, or a title Plex availability missed. NEVER
         # blind-delete it (that is data loss) — surface it as an import conflict the
         # operator resolves, instead of overwriting their file with the download.
         raise FileExistsError(f"destination already exists with different content: {dst}")
     try:
-        fs.hardlink_or_copy(Path(src), dst)
+        placement_identity = fs.hardlink_or_copy(Path(src), dst)
     except FileExistsError:
         # Lost a placement race: a concurrent import (the reconcile loop racing the
         # operator's POST /queue/{id}/import retry) created ``dst`` between the
@@ -511,9 +537,9 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
         # idempotent win for the other attempt, NOT a failure to block on; a
         # different size is a genuine conflict, surfaced like the pre-existing case.
         if os.path.lexists(os.fspath(dst)) and _same_file_content(src, dst):
-            return False  # the race winner's file — not ours to roll back
+            return False, None  # the race winner's file — not ours to roll back
         raise FileExistsError(f"destination already exists with different content: {dst}") from None
-    return True  # we created dst; a later failure may roll it back
+    return True, placement_identity  # a later failure may roll back only this identity
 
 
 def _file_digest(path: str | Path) -> bytes:
@@ -542,21 +568,150 @@ def _same_file_content(src: str, dst: Path) -> bool:
     return _file_digest(src) == _file_digest(dst)
 
 
-def _remove_quietly(path: Path) -> None:
-    """Best-effort unlink (rolling back a placed file when a later step fails)."""
+class _PlacedPath(NamedTuple):
+    path: Path
+    identity: str
+
+
+def _file_placement_identity(path: Path) -> FilePlacementIdentity | None:
+    try:
+        observed = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(observed.st_mode):
+        return None
+    return FilePlacementIdentity(
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        size=observed.st_size,
+        mtime_ns=observed.st_mtime_ns,
+        ctime_ns=observed.st_ctime_ns,
+        mode=observed.st_mode,
+    )
+
+
+def _place_file_with_identity(fs: FileSystemPort, src: str, dst: Path) -> tuple[bool, str | None]:
+    """Place/adopt a file and fingerprint that exact observation in one worker."""
+    placed, published_identity = _place_file(fs, src, dst)
+    observed_identity = _payload_content_identity(str(dst))
+    if placed and (
+        published_identity is None or _file_placement_identity(dst) != published_identity
+    ):
+        return placed, None
+    return placed, observed_identity
+
+
+def _payload_identity_if_observations_match(
+    download_path: str, observations: list[_PlacedPath]
+) -> str | None:
+    """Fingerprint a tree only while every placed/adopted file is unchanged."""
+    before = _payload_content_identity(download_path)
+    if before is None:
+        return None
+    if any(
+        _payload_content_identity(str(observed.path)) != observed.identity
+        for observed in observations
+    ):
+        return None
+    after = _payload_content_identity(download_path)
+    return before if after == before else None
+
+
+def _remove_quietly(path: Path, *, expected_identity: str | None = None) -> bool:
+    """Best-effort unlink; return whether the path is confirmed absent.
+
+    ``lexists``-style verification matters here: a dangling symlink still exists,
+    while an inaccessible parent can make a convenience ``exists()`` check look
+    false.  Treat every stat error except an actual ``FileNotFoundError`` as an
+    unverified removal so callers that own durable cleanup breadcrumbs fail closed.
+    """
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    # Cleanup owns regular files only. Never follow or unlink a symlink that may
+    # have replaced the attested placement during an awaited Plex scan.
+    if not stat.S_ISREG(before.st_mode):
+        return False
+    if expected_identity is not None and _payload_content_identity(str(path)) != expected_identity:
+        return False
     with contextlib.suppress(OSError):
         path.unlink()
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
-def _remove_quietly_many(paths: list[Path]) -> None:
-    """Best-effort unlink of every path THIS call placed (TV scan-failure rollback).
+def _remove_quietly_many(paths: list[_PlacedPath]) -> bool:
+    """Best-effort unlink every owned path and confirm whether all are absent.
 
     Unlike the movie path's single ``dst``, a season import can place several
     episode files before its one combined scan fails; each is rolled back the
     same best-effort way.
     """
-    for path in paths:
-        _remove_quietly(path)
+    all_removed = True
+    for placed in paths:
+        if not _remove_quietly(placed.path, expected_identity=placed.identity):
+            all_removed = False
+    return all_removed
+
+
+def _classify_stored_path(
+    path: Path,
+) -> Literal["missing", "file", "directory", "other", "unverified"]:
+    """Classify a breadcrumb without collapsing access errors into absence.
+
+    ``Path.exists`` / ``is_dir`` return false for several uninspectable states.
+    Cleanup pointers may be cleared only when ``lstat`` proves FileNotFound; a
+    dangling symlink or inaccessible mount remains an unresolved obligation.
+    """
+    try:
+        link_stat = path.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unverified"
+    if stat.S_ISLNK(link_stat.st_mode):
+        return "unverified"
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return "unverified"
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    return "other"
+
+
+def _stored_path_cleanup_state(
+    path: Path, *, allow_empty_directory: bool = False
+) -> Literal["absent", "defer", "protected"]:
+    """Classify whether a planned destination can be cleared, retried, or parked."""
+    kind = _classify_stored_path(path)
+    if kind == "missing":
+        return "absent"
+    if kind != "directory" or not allow_empty_directory:
+        return "protected"
+    lock_state = clear_stale_publish_locks(path)
+    if lock_state == "pending":
+        return "defer"
+    if lock_state == "protected":
+        return "protected"
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        # Non-empty, inaccessible, or concurrently changed: retain the pointer.
+        return "protected"
+    return "absent" if _classify_stored_path(path) == "missing" else "protected"
 
 
 # Per-download serialization. The reconcile loop and an operator's
@@ -621,6 +776,8 @@ async def _block(
     season: int | None = None,
     seasons: tuple[int, ...] = (),
     clear_download_path: bool = False,
+    download_path: str | None = None,
+    expected_failed_reason: str | None | object = _NO_FAILED_REASON_PREDICATE,
 ) -> None:
     """Move a download to the retryable ``ImportBlocked`` state, honestly.
 
@@ -645,13 +802,25 @@ async def _block(
     OWNING SEASON moves to ``import_blocked`` and the parent's rollup is recomputed
     from it. ``None`` (movie, the default) leaves the movie behaviour unchanged.
     """
-    blocked = await download_repo.update_status_if_in(
-        download_id,
-        DownloadState.ImportBlocked.value,
-        _RESUMABLE,
-        failed_reason=reason,
-        clear_download_path=clear_download_path,
-    )
+    if expected_failed_reason is _NO_FAILED_REASON_PREDICATE:
+        blocked = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.ImportBlocked.value,
+            _RESUMABLE,
+            failed_reason=reason,
+            clear_download_path=clear_download_path,
+            download_path=download_path,
+        )
+    else:
+        blocked = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.ImportBlocked.value,
+            _RESUMABLE,
+            failed_reason=reason,
+            clear_download_path=clear_download_path,
+            download_path=download_path,
+            require_failed_reason=cast(str | None, expected_failed_reason),
+        )
     if not blocked:
         # The row left ``_RESUMABLE`` underneath us (an operator's mark_failed
         # committed ``failed`` + blocklist + re-search during the validation gap).
@@ -783,6 +952,7 @@ async def _fail_unsafe_payload(
     season: int | None = None,
     seasons: tuple[int, ...] = (),
     owned_placement: Path | None = None,
+    owned_placement_identity: str | None = None,
 ) -> DownloadRecord | None:
     queue_service._begin_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
     try:
@@ -812,7 +982,37 @@ async def _fail_unsafe_payload(
         # ``Importing`` (still resumable), so a later cycle re-detects the unsafe payload
         # and retries the idempotent unlink.
         if owned_placement is not None:
-            await asyncio.to_thread(_remove_quietly, owned_placement)
+            placement_removed = await asyncio.to_thread(
+                _remove_quietly,
+                owned_placement,
+                expected_identity=owned_placement_identity,
+            )
+            if not placement_removed:
+                # The failed-pending CAS is still uncommitted. Roll it back before
+                # parking the row so the durable breadcrumb and unsafe torrent both
+                # remain available for an operator retry after permissions/mount state
+                # are repaired. Never clear the only cleanup pointer or delete the
+                # torrent while the placed library file may still exist.
+                await session.rollback()
+                await _block(
+                    session,
+                    download_repo,
+                    download_id,
+                    (
+                        f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                        f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                    ),
+                    request_id=request_id,
+                    season=season,
+                    seasons=seasons,
+                )
+                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            _invalidate_payload_placement_ownership(
+                session,
+                torrent_hash,
+                os.fspath(owned_placement),
+                tmdb_id=None,
+            )
             cleared = await download_repo.update_status_if_in(
                 download_id,
                 DownloadState.FailedPending.value,
@@ -843,30 +1043,39 @@ async def _fail_unsafe_payload(
                 "request_id": safe_int(request_id),
             },
         )
-        observed_failed_reason = reason
-        if removed_ok:
-            done_marker = queue_service._reconcile_removal_done_marker(reason)  # pyright: ignore[reportPrivateUsage]
-            restamped = await download_repo.update_status_if_in(
-                download_id,
-                DownloadState.FailedPending.value,
-                frozenset({DownloadState.FailedPending.value}),
-                failed_reason=done_marker,
-                require_failed_reason=reason,
+        if not removed_ok:
+            # Security rejections fail closed: keep the durable failed_pending row
+            # active so reconcile retries the owed torrent/data removal. Terminalizing
+            # here would drop the row from active reconciliation and re-arm a
+            # replacement while the unsafe payload remains in qBittorrent.
+            _logger.warning(
+                "keeping unsafe payload download %s pending until torrent removal succeeds",
+                safe_int(download_id),
             )
-            if not restamped:
-                await session.rollback()
-                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-            try:
-                await session.commit()
-            except SQLAlchemyError:
-                await session.rollback()
-                _logger.warning(
-                    "could not persist the unsafe payload removal outcome for download %s; "
-                    "the final failure commit will retry with the original payload reason",
-                    safe_int(download_id),
-                )
-            else:
-                observed_failed_reason = done_marker
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        observed_failed_reason = reason
+        done_marker = queue_service._reconcile_removal_done_marker(reason)  # pyright: ignore[reportPrivateUsage]
+        restamped = await download_repo.update_status_if_in(
+            download_id,
+            DownloadState.FailedPending.value,
+            frozenset({DownloadState.FailedPending.value}),
+            failed_reason=done_marker,
+            require_failed_reason=reason,
+        )
+        if not restamped:
+            await session.rollback()
+            return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        try:
+            await session.commit()
+        except SQLAlchemyError:
+            await session.rollback()
+            _logger.warning(
+                "could not persist the unsafe payload removal outcome for download %s; "
+                "the final failure commit will retry with the original payload reason",
+                safe_int(download_id),
+            )
+        else:
+            observed_failed_reason = done_marker
 
         request_repo = SqlRequestRepository(session)
         request = await request_repo.get(request_id)
@@ -944,10 +1153,14 @@ def _is_expected_movie_destination(
     return os.path.realpath(dst) == os.path.realpath(expected)
 
 
-def _owned_movie_breadcrumb_for_unsafe_rollback(
-    status: str, download_path: str | None, movies_root: str, title: str, year: int | None
+def _expected_movie_breadcrumb_for_unsafe_rollback(
+    status: str,
+    download_path: str | None,
+    movies_root: str,
+    title: str,
+    year: int | None,
 ) -> Path | None:
-    if status != DownloadState.Importing.value or download_path is None:
+    if download_path is None or status not in _RESUMABLE:
         return None
     path = Path(download_path)
     root_real = os.path.realpath(movies_root)
@@ -995,7 +1208,8 @@ async def _resume_breadcrumbed_tv_import(
             season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if not await asyncio.to_thread(os.path.isdir, season_dir):
+    breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, season_dir)
+    if breadcrumb_kind == "missing":
         await _block(
             session,
             download_repo,
@@ -1004,6 +1218,21 @@ async def _resume_breadcrumbed_tv_import(
             request_id=request.id,
             season=season,
             clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if breadcrumb_kind != "directory":
+        reason = (
+            "stored import breadcrumb could not be verified inside the container"
+            if breadcrumb_kind == "unverified"
+            else "stored import breadcrumb is not a tv season directory"
+        )
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            reason,
+            request_id=request.id,
+            season=season,
         )
         return await download_repo.get_by_hash(torrent_hash)
 
@@ -1041,6 +1270,20 @@ async def _resume_breadcrumbed_tv_import(
                 download_repo,
                 download_id,
                 f"plex scan failed: {type(exc).__name__}",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        # Plex scanning is an awaited external call. Re-bind the durable proof to
+        # what is on disk now so a file deletion/replacement during that gap cannot
+        # turn a previously validated season into a status-less finalization.
+        if not await _payload_manifest_was_validated(session, torrent_hash, str(season_dir)):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _PLACEMENT_IDENTITY_CHANGED_REASON,
                 request_id=request.id,
                 season=season,
             )
@@ -1111,6 +1354,7 @@ async def _reject_unsafe_payload_if_reported(
     season: int | None = None,
     seasons: tuple[int, ...] = (),
     owned_placement: Path | None = None,
+    owned_placement_identity: str | None = None,
     block_existing_breadcrumb: bool = False,
 ) -> DownloadRecord | None:
     if status is None:
@@ -1122,26 +1366,20 @@ async def _reject_unsafe_payload_if_reported(
     try:
         files = await qbt.list_files(torrent_hash)
     except QbittorrentError as exc:
-        if complete:
-            if owned_placement is not None or block_existing_breadcrumb:
-                # A transient manifest outage must not erase the durable marker
-                # that proves library files were already placed.  Leave an
-                # Importing row resumable, or preserve an existing manual-cleanup
-                # block, so a later unsafe retry cannot re-arm the torrent while
-                # orphaning those files.
-                await session.rollback()
-                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
-            await _block(
-                session,
-                download_repo,
-                download_id,
-                f"could not validate torrent payload manifest: {type(exc).__name__}",
-                request_id=request_id,
-                season=season,
-                seasons=seasons,
-            )
-            return await download_repo.get_by_hash(torrent_hash)
-        return None
+        # Match queue-side validation: a transient manifest endpoint outage defers
+        # without changing durable state. ImportPending/Importing remains auto-
+        # drainable, while an existing manual-cleanup block keeps its stronger reason.
+        # Turning a one-call outage into ImportBlocked permanently stranded otherwise
+        # safe unattended imports because the background cycle does not drain generic
+        # blocked rows.
+        _logger.warning(
+            "download %s: could not validate torrent payload manifest (%s); deferring import",
+            safe_int(download_id),
+            type(exc).__name__,
+            extra={"request_id": safe_int(request_id), "torrent_hash": safe_text(torrent_hash)},
+        )
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
     reason: str | None = None
     if not files:
         if complete:
@@ -1177,6 +1415,7 @@ async def _reject_unsafe_payload_if_reported(
         season=season,
         seasons=seasons,
         owned_placement=owned_placement,
+        owned_placement_identity=owned_placement_identity,
     )
 
 
@@ -1214,7 +1453,14 @@ async def _resume_breadcrumbed_movie_import(
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
-    if not await asyncio.to_thread(os.path.exists, dst):
+    breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, dst)
+    if breadcrumb_kind == "missing":
+        _invalidate_payload_placement_ownership(
+            session,
+            torrent_hash,
+            str(dst),
+            tmdb_id=request.tmdb_id,
+        )
         await _block(
             session,
             download_repo,
@@ -1222,6 +1468,20 @@ async def _resume_breadcrumbed_movie_import(
             "stored import breadcrumb is not visible inside the container",
             request_id=request.id,
             clear_download_path=True,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
+    if breadcrumb_kind != "file":
+        reason = (
+            "stored import breadcrumb could not be verified inside the container"
+            if breadcrumb_kind == "unverified"
+            else "stored import breadcrumb is not a regular movie file"
+        )
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            reason,
+            request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
 
@@ -1237,14 +1497,29 @@ async def _resume_breadcrumbed_movie_import(
         try:
             await library.trigger_scan(str(dst.parent), "movie")
         except (PlexLibraryError, PlexAuthError) as exc:
-            await asyncio.to_thread(_remove_quietly, dst)
+            # qBittorrent is already missing, so this breadcrumbed library file may
+            # be the only recoverable copy. Preserve it and its durable pointer on a
+            # transient Plex outage; an ImportBlocked retry below re-enters this scan
+            # path, matching the TV breadcrumb-resume posture.
             await _block(
                 session,
                 download_repo,
                 download_id,
                 f"plex scan failed: {type(exc).__name__}",
                 request_id=request.id,
-                clear_download_path=True,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        # The attested file may have been replaced while Plex was scanning. Never
+        # finalize a status-less breadcrumb unless its identity still matches the
+        # current lifecycle's validation proof after that awaited boundary.
+        if not await _payload_manifest_was_validated(session, torrent_hash, str(dst)):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _PLACEMENT_IDENTITY_CHANGED_REASON,
+                request_id=request.id,
             )
             return await download_repo.get_by_hash(torrent_hash)
 
@@ -1276,9 +1551,187 @@ async def _resume_breadcrumbed_movie_import(
         purge_service.end_placement(str(dst))
 
 
-def _can_resume_tv_breadcrumb_without_client_status(
-    download_status: str, failed_reason: str | None
+def _payload_placement_fingerprint(download_path: str) -> str:
+    normalized = os.path.normcase(os.path.abspath(os.path.normpath(download_path)))
+    return hashlib.sha256(os.fsencode(normalized)).hexdigest()
+
+
+def _payload_content_identity(download_path: str) -> str | None:
+    """Fingerprint the current non-symlink file/tree identity without reading media.
+
+    Device/inode/size/mtime plus the complete relative tree catches replacement,
+    deletion, addition, and in-place modification while avoiding a multi-gigabyte
+    digest on every resume. Any access error or special/symlink entry fails closed.
+    """
+    root = Path(download_path)
+    try:
+        root_stat = root.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(root_stat.st_mode):
+        return None
+    if stat.S_ISREG(root_stat.st_mode):
+        entries = [(".", root_stat)]
+    elif stat.S_ISDIR(root_stat.st_mode):
+        entries = [(".", root_stat)]
+        try:
+            descendants = sorted(
+                root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+            )
+            for descendant in descendants:
+                descendant_stat = descendant.lstat()
+                if stat.S_ISLNK(descendant_stat.st_mode) or not (
+                    stat.S_ISREG(descendant_stat.st_mode) or stat.S_ISDIR(descendant_stat.st_mode)
+                ):
+                    return None
+                entries.append((descendant.relative_to(root).as_posix(), descendant_stat))
+        except OSError:
+            return None
+    else:
+        return None
+
+    digest = hashlib.sha256()
+    for relative, entry_stat in entries:
+        digest.update(os.fsencode(relative))
+        digest.update(b"\0")
+        digest.update(
+            (
+                f"{entry_stat.st_dev}:{entry_stat.st_ino}:{entry_stat.st_size}:"
+                f"{entry_stat.st_mtime_ns}:{entry_stat.st_ctime_ns}:"
+                f"{stat.S_IFMT(entry_stat.st_mode)}"
+            ).encode()
+        )
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _payload_validation_attestation(
+    download_path: str,
+    *,
+    placement_owned: bool,
+    content_identity: str | None = None,
+) -> str:
+    ownership = "placed" if placement_owned else "adopted"
+    identity = content_identity or _payload_content_identity(download_path) or "unverified"
+    return (
+        f"{_PAYLOAD_VALIDATED_IMPORT_HISTORY_PREFIX}"
+        f"placement={_payload_placement_fingerprint(download_path)} "
+        f"identity={identity} "
+        f"ownership={ownership}:"
+    )
+
+
+async def _latest_payload_attestation(
+    session: AsyncSession, torrent_hash: str, download_path: str
+) -> str | None:
+    latest_grab_id = (
+        await session.execute(
+            select(func.max(DownloadHistory.id)).where(
+                DownloadHistory.torrent_hash == torrent_hash,
+                DownloadHistory.event_type == DownloadHistoryEvent.grabbed,
+            )
+        )
+    ).scalar_one_or_none()
+    path_prefix = (
+        f"{_PAYLOAD_VALIDATED_IMPORT_HISTORY_PREFIX}"
+        f"placement={_payload_placement_fingerprint(download_path)} "
+    )
+    stmt = (
+        select(DownloadHistory.message)
+        .where(
+            DownloadHistory.torrent_hash == torrent_hash,
+            DownloadHistory.event_type == DownloadHistoryEvent.import_started,
+            DownloadHistory.message.startswith(path_prefix),
+        )
+        .order_by(DownloadHistory.id.desc())
+        .limit(1)
+    )
+    if latest_grab_id is not None:
+        stmt = stmt.where(DownloadHistory.id > latest_grab_id)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _payload_manifest_was_validated(
+    session: AsyncSession, torrent_hash: str, download_path: str
 ) -> bool:
+    """Whether this torrent/path pair durably passed the current payload gate.
+
+    The proof is written only after the destination was placed or content-adopted,
+    in the same commit as its breadcrumb. It is bound to both the current policy
+    version, current grab lifecycle, exact destination, and current file/tree
+    identity; a pre-security crash row, older-policy proof, replaced file, missing
+    episode, or prior lifecycle therefore cannot authorize a status-less resume.
+    History also avoids abusing ``failed_reason``, which the UI renders as an error.
+    """
+    latest = await _latest_payload_attestation(session, torrent_hash, download_path)
+    current_identity = await asyncio.to_thread(_payload_content_identity, download_path)
+    return (
+        latest is not None
+        and current_identity is not None
+        and latest.startswith(
+            f"{_PAYLOAD_VALIDATED_IMPORT_HISTORY_PREFIX}"
+            f"placement={_payload_placement_fingerprint(download_path)} "
+            f"identity={current_identity} "
+        )
+    )
+
+
+async def _payload_placement_was_owned(
+    session: AsyncSession,
+    torrent_hash: str,
+    download_path: str,
+    *,
+    current_identity: str | None = None,
+) -> bool:
+    """Whether current identity matches this lifecycle's latest owned placement."""
+    latest = await _latest_payload_attestation(session, torrent_hash, download_path)
+    if current_identity is None:
+        current_identity = await asyncio.to_thread(_payload_content_identity, download_path)
+    return (
+        latest is not None
+        and current_identity is not None
+        and latest.startswith(
+            _payload_validation_attestation(
+                download_path,
+                placement_owned=True,
+                content_identity=current_identity,
+            )
+        )
+    )
+
+
+def _invalidate_payload_placement_ownership(
+    session: AsyncSession,
+    torrent_hash: str,
+    download_path: str,
+    *,
+    tmdb_id: int | None,
+) -> None:
+    """Make a confirmed rollback the latest path-specific ownership fact."""
+    invalidation = _payload_validation_attestation(
+        download_path,
+        placement_owned=False,
+        content_identity="cleared",
+    )
+    session.add(
+        DownloadHistory(
+            tmdb_id=tmdb_id,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.import_started,
+            source_title=None,
+            message=(f"{invalidation} placement ownership cleared after confirmed rollback"),
+        )
+    )
+
+
+def _can_resume_breadcrumb_without_client_status(
+    download_status: str, failed_reason: str | None, *, payload_validated: bool
+) -> bool:
+    # A breadcrumb alone is not proof that its torrent manifest passed the new
+    # payload gate: an Importing row can predate this security release. Only rows
+    # durably attested after a successful manifest check may finalize without client state.
+    if not payload_validated:
+        return False
     if download_status == DownloadState.Importing.value:
         return True
     return (
@@ -1295,6 +1748,7 @@ def _is_manual_cleanup_breadcrumb(
         download_status == DownloadState.ImportBlocked.value
         and download_path is not None
         and failed_reason is not None
+        and not failed_reason.startswith(_UNVALIDATED_BREADCRUMB_REASON_PREFIX)
         and _MANUAL_CLEANUP_BREADCRUMB_REASON in failed_reason
     )
 
@@ -1394,13 +1848,20 @@ async def _import_download_locked(
         # is_anime AND that root is configured; otherwise it falls back to the
         # normal tv_root exactly as before this feature existed.
         effective_tv_root = anime_tv_root if request.is_anime and anime_tv_root else tv_root
-        scope_records = [
+        all_scope_records = [
             scope
             for scope in await download_repo.list_scopes(download_id)
-            if scope.media_request_id == request.id
-            and scope.season is not None
-            and scope.status != "imported"
+            if scope.media_request_id == request.id and scope.season is not None
         ]
+        scope_records = [scope for scope in all_scope_records if scope.status != "imported"]
+        known_scope_seasons = tuple(
+            dict.fromkeys(cast(int, scope.season) for scope in all_scope_records)
+        )
+        imported_scope_seasons = tuple(
+            dict.fromkeys(
+                cast(int, scope.season) for scope in all_scope_records if scope.status == "imported"
+            )
+        )
         scope_targets = tuple(
             _TvImportTarget(
                 request=request,
@@ -1429,6 +1890,8 @@ async def _import_download_locked(
                 download_status=row.status,
                 download_path=row.download_path,
                 failed_reason=row.failed_reason,
+                known_scope_seasons=known_scope_seasons,
+                imported_scope_seasons=imported_scope_seasons,
                 fs=fs,
                 library=library,
                 qbt=qbt,
@@ -1498,8 +1961,33 @@ async def _import_download_locked(
     # Locate the completed video file on disk.
     status = await qbt.get_status(row.torrent_hash)
     download_path = row.download_path
+    row_status = row.status
+    row_failed_reason = row.failed_reason
     if status is None:
-        if row.status == DownloadState.Importing.value and download_path is not None:
+        if _is_manual_cleanup_breadcrumb(row.status, download_path, row.failed_reason):
+            # Keep an unlink-failed unsafe rollback parked with its breadcrumb and
+            # reason intact while the client is temporarily missing. Overwriting the
+            # marker here would let a later retry remove the torrent while the placed
+            # library file still exists.
+            return await download_repo.get_by_hash(torrent_hash)
+        payload_validated = download_path is not None and await _payload_manifest_was_validated(
+            session, torrent_hash, download_path
+        )
+        if download_path is not None and _can_resume_breadcrumb_without_client_status(
+            row.status, row.failed_reason, payload_validated=payload_validated
+        ):
+            if row.status == DownloadState.ImportBlocked.value:
+                resumed = await download_repo.update_status_if_in(
+                    download_id,
+                    DownloadState.Importing.value,
+                    frozenset({DownloadState.ImportBlocked.value}),
+                    clear_failed_reason=True,
+                    require_failed_reason=row.failed_reason,
+                )
+                if not resumed:
+                    await session.rollback()
+                    return await download_repo.get_by_hash(torrent_hash)
+                await session.commit()
             return await _resume_breadcrumbed_movie_import(
                 session=session,
                 download_repo=download_repo,
@@ -1511,15 +1999,86 @@ async def _import_download_locked(
                 movies_root=effective_movies_root,
                 download_path=download_path,
             )
+        if download_path is not None and not payload_validated:
+            # A pre-security-release breadcrumb has no durable proof that its torrent
+            # manifest passed this gate. Park visibly (preserving the path) instead of
+            # lying as perpetually Downloading; run_import_cycle auto-retries this exact
+            # reason so a returning client can validate and resume, while mark-failed
+            # remains a legal operator escape hatch from ImportBlocked.
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _UNVALIDATED_BREADCRUMB_REASON,
+                request_id=request.id,
+                expected_failed_reason=row.failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        if download_path is not None:
+            # A current-policy proof does not make every blocked state resumable.
+            # Preserve an accurate destination-conflict/validation reason rather
+            # than relabeling it as unvalidated and auto-retrying it forever.
+            return await download_repo.get_by_hash(torrent_hash)
         await _block(
             session,
             download_repo,
             download_id,
             "download client reported no status for payload validation",
             request_id=request.id,
+            expected_failed_reason=row.failed_reason,
         )
         return await download_repo.get_by_hash(torrent_hash)
     if _payload_manifest_is_complete(status):
+        if download_path is not None:
+            breadcrumb_cleanup = await asyncio.to_thread(
+                _stored_path_cleanup_state, Path(download_path)
+            )
+            if breadcrumb_cleanup == "absent":
+                # An unsafe-rollback attempt may have successfully unlinked its
+                # owned placement and then died before the path-clear transaction
+                # committed. Missing is the one state that proves the cleanup
+                # obligation is already resolved, so consume the stale pointer
+                # idempotently before adjudicating/removing the torrent again.
+                _invalidate_payload_placement_ownership(
+                    session,
+                    torrent_hash,
+                    download_path,
+                    tmdb_id=request.tmdb_id,
+                )
+                cleared = await download_repo.update_status_if_in(
+                    download_id,
+                    row_status,
+                    frozenset({row_status}),
+                    clear_download_path=True,
+                    require_failed_reason=row_failed_reason,
+                )
+                if not cleared:
+                    await session.rollback()
+                    return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+                await session.commit()
+                download_path = None
+        owned_candidate = _expected_movie_breadcrumb_for_unsafe_rollback(
+            row_status,
+            download_path,
+            effective_movies_root,
+            request.title,
+            request.year,
+        )
+        owned_placement = None
+        owned_placement_identity = None
+        if owned_candidate is not None:
+            candidate_identity = await asyncio.to_thread(
+                _payload_content_identity, os.fspath(owned_candidate)
+            )
+            if candidate_identity is not None and await _payload_placement_was_owned(
+                session,
+                torrent_hash,
+                os.fspath(owned_candidate),
+                current_identity=candidate_identity,
+            ):
+                owned_placement = owned_candidate
+                owned_placement_identity = candidate_identity
+        has_placement_breadcrumb = download_path is not None
         rejected = await _reject_unsafe_payload_if_reported(
             session=session,
             download_repo=download_repo,
@@ -1528,17 +2087,19 @@ async def _import_download_locked(
             torrent_hash=torrent_hash,
             status=status,
             request_id=request.id,
-            owned_placement=_owned_movie_breadcrumb_for_unsafe_rollback(
-                row.status,
-                row.download_path,
-                effective_movies_root,
-                request.title,
-                request.year,
-            ),
+            owned_placement=owned_placement,
+            owned_placement_identity=owned_placement_identity,
+            block_existing_breadcrumb=has_placement_breadcrumb and owned_placement is None,
         )
         if rejected is not None:
             return rejected
     if not _is_settled_for_import(status):
+        if download_path is not None:
+            # ``download_path`` is a durable Plex-library placement, not a qBt
+            # source path. Keep every placement-bearing row in its protected import
+            # state until the immutable manifest can be adjudicated; demoting it to
+            # Downloading would expose it to automatic torrent removal/re-search.
+            return await download_repo.get_by_hash(torrent_hash)
         # The row may be resumable because a prior reconcile saw completion, but the
         # live client can still be moving/downloading the payload. Do not validate or
         # import a changing file tree; re-arm the honest Downloading state and let the
@@ -1558,7 +2119,7 @@ async def _import_download_locked(
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
     try:
-        resolved = _resolve_content(status, row.download_path)
+        resolved = _resolve_content(status, download_path)
     except _UnsafeContentPathError as exc:
         await _block(session, download_repo, download_id, str(exc), request_id=request.id)
         return await download_repo.get_by_hash(torrent_hash)
@@ -1639,6 +2200,40 @@ async def _import_download_locked(
     ext = os.path.splitext(src)[1].lstrip(".")
     relative = plex_movie_relative_path(request.title, request.year, ext)
     dst = Path(effective_movies_root) / relative
+    if download_path is not None and os.path.realpath(download_path) != os.path.realpath(dst):
+        breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, Path(download_path))
+        if breadcrumb_kind == "missing":
+            _invalidate_payload_placement_ownership(
+                session,
+                torrent_hash,
+                download_path,
+                tmdb_id=request.tmdb_id,
+            )
+            cleared = await download_repo.update_status_if_in(
+                download_id,
+                row.status,
+                frozenset({row.status}),
+                clear_download_path=True,
+                require_failed_reason=row.failed_reason,
+            )
+            if not cleared:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash)
+            await session.commit()
+            download_path = None
+        else:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                (
+                    "stored movie import breadcrumb does not match the current destination; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                ),
+                request_id=request.id,
+                expected_failed_reason=row.failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
 
     if not await asyncio.to_thread(os.path.isdir, effective_movies_root):
         # A configured-but-invisible-in-this-container root (issue #132): never
@@ -1690,27 +2285,29 @@ async def _import_download_locked(
             DownloadState.Importing.value,
             _RESUMABLE,
             clear_failed_reason=True,
+            download_path=str(dst),
         )
         if not claimed:
             await session.rollback()
             return await download_repo.get_by_hash(torrent_hash)
-        session.add(
-            DownloadHistory(
-                tmdb_id=request.tmdb_id,
-                torrent_hash=torrent_hash,
-                event_type=DownloadHistoryEvent.import_started,
-                # NULL on purpose: queue_service._source_title_for returns the latest
-                # non-null history source_title for the blocklist, and the import file
-                # basename must NOT shadow the grabbed RELEASE title. Keep the basename in
-                # ``message`` only.
-                source_title=None,
-                message=f"importing {os.path.basename(src)} to {relative}",
-            )
+        import_started_history = DownloadHistory(
+            tmdb_id=request.tmdb_id,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.import_started,
+            # NULL on purpose: queue_service._source_title_for returns the latest
+            # non-null history source_title for the blocklist, and the import file
+            # basename must NOT shadow the grabbed RELEASE title. Keep the basename in
+            # ``message`` only.
+            source_title=None,
+            message=f"importing {os.path.basename(src)} to {relative}",
         )
+        session.add(import_started_history)
         await session.commit()
 
         try:
-            placed = await asyncio.to_thread(_place_file, fs, src, dst)
+            placed, observed_identity = await asyncio.to_thread(
+                _place_file_with_identity, fs, src, dst
+            )
         except FileExistsError as exc:
             # A pre-existing, differently-sized file at the destination (a user's file,
             # or a stale partial) — surfaced as a conflict, never overwritten.
@@ -1726,17 +2323,56 @@ async def _import_download_locked(
             )
             return await download_repo.get_by_hash(torrent_hash)
 
-        # Record the placed library file on the still-``Importing`` row BEFORE the scan,
-        # so a crash between placement and the ``Imported`` write leaves a durable
-        # breadcrumb: a resumed run finds ``download_path == dst`` (the file still on disk)
-        # and can roll that orphan back on a repeat scan failure (F8). Written ONLY when
-        # THIS attempt placed dst — a lost-race loser (placed is False) never stamps the
-        # winner's file (F3). The per-download lock means no other import races this write.
-        if placed:
-            await download_repo.update_status(
-                download_id, DownloadState.Importing.value, download_path=str(dst)
+        # Bind the current-policy manifest proof to this exact destination only AFTER
+        # placement/content-adoption succeeds. The breadcrumb and proof share one
+        # commit, so a crash between the earlier claim and the content check cannot
+        # make a stale path eligible for status-less resume. ``ownership=placed`` is
+        # distinct from an idempotently adopted identical file: only the former can
+        # later authorize automatic rollback deletion.
+        await download_repo.update_status(
+            download_id, DownloadState.Importing.value, download_path=str(dst)
+        )
+        content_identity = await asyncio.to_thread(_payload_content_identity, str(dst))
+        if (
+            observed_identity is None
+            or content_identity is None
+            or content_identity != observed_identity
+        ):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _PLACEMENT_IDENTITY_CHANGED_REASON,
+                request_id=request.id,
+                download_path=str(dst),
             )
-            await session.commit()
+            return await download_repo.get_by_hash(torrent_hash)
+        placement_owned = placed or (
+            await _payload_placement_was_owned(
+                session,
+                torrent_hash,
+                str(dst),
+                current_identity=content_identity,
+            )
+        )
+        validation_attestation = _payload_validation_attestation(
+            str(dst),
+            placement_owned=placement_owned,
+            content_identity=content_identity,
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.import_started,
+                source_title=None,
+                message=(
+                    f"{validation_attestation} "
+                    f"validated placement for {os.path.basename(src)} at {relative}"
+                ),
+            )
+        )
+        await session.commit()
 
         # Targeted Plex scan of the movie folder — the partial scan the prototype never
         # did. movies_root is a Plex library location (the picker guarantees the path↔
@@ -1745,9 +2381,10 @@ async def _import_download_locked(
         # orphan it (the retry re-places it).
         #
         # OWNERSHIP RULE (Codex PR #21): a file at dst may be rolled back ONLY on proof
-        # it is ours — THIS invocation placed it (``placed``), or a prior attempt of
-        # this row durably recorded placing it (the ``download_path == dst`` breadcrumb
-        # committed above / by the finalize). NEVER by content-match alone: a
+        # it is ours — THIS invocation placed it (``placed``), or the latest
+        # path-bound attestation says a prior attempt placed it. The breadcrumb alone
+        # is only a cleanup obligation, never deletion authority. NEVER infer ownership
+        # from content-match alone: a
         # same-content file that we did NOT place (a lost placement race, a
         # user's manually-supplied copy, a prior retry's winner) is byte-for-byte
         # indistinguishable from our own crashed-before-breadcrumb placement, so an
@@ -1764,21 +2401,60 @@ async def _import_download_locked(
         try:
             await library.trigger_scan(str(dst.parent), "movie")
         except (PlexLibraryError, PlexAuthError) as exc:
-            # ``row.download_path`` is read live here (the breadcrumb commit set it for a
-            # placed=True attempt; a crash-resume loaded it as dst). Safe only because the
-            # sessionmaker uses ``expire_on_commit=False`` and the claim CAS's
-            # ``synchronize_session="fetch"`` refreshes only ``status`` — changing either
-            # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
-            owns_placement = placed or row.download_path == str(dst)
+            # The latest path-specific attestation distinguishes a placement this
+            # importer owns from an identical user file it merely adopted. A confirmed
+            # rollback appends an invalidation before clearing the breadcrumb, so stale
+            # historical ownership can never authorize a later deletion.
+            current_identity = await asyncio.to_thread(_payload_content_identity, str(dst))
+            owns_placement = current_identity is not None and await _payload_placement_was_owned(
+                session,
+                torrent_hash,
+                str(dst),
+                current_identity=current_identity,
+            )
+            placement_removed = False
             if owns_placement:
-                await asyncio.to_thread(_remove_quietly, dst)
+                placement_removed = await asyncio.to_thread(
+                    _remove_quietly,
+                    dst,
+                    expected_identity=current_identity,
+                )
+                if placement_removed:
+                    _invalidate_payload_placement_ownership(
+                        session,
+                        torrent_hash,
+                        str(dst),
+                        tmdb_id=request.tmdb_id,
+                    )
+            reason = f"plex scan failed: {type(exc).__name__}"
+            if owns_placement and not placement_removed:
+                reason = (
+                    f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                )
+            elif placement_owned and not owns_placement:
+                # This attempt (or a prior current-lifecycle attempt) owned the
+                # attested file, but the pathname changed while Plex was awaited.
+                # Preserve the pointer and require review; the replacement is never
+                # deletion-authorized merely because it reused our destination.
+                reason = f"{reason}; {_MANUAL_CLEANUP_BREADCRUMB_REASON}"
             await _block(
                 session,
                 download_repo,
                 download_id,
-                f"plex scan failed: {type(exc).__name__}",
+                reason,
                 request_id=request.id,
-                clear_download_path=owns_placement,
+                clear_download_path=owns_placement and placement_removed,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        if not await _payload_manifest_was_validated(session, torrent_hash, str(dst)):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _PLACEMENT_IDENTITY_CHANGED_REASON,
+                request_id=request.id,
             )
             return await download_repo.get_by_hash(torrent_hash)
 
@@ -1861,6 +2537,8 @@ async def _import_tv_targets_locked(
     download_status: str,
     download_path: str | None,
     failed_reason: str | None,
+    known_scope_seasons: tuple[int, ...],
+    imported_scope_seasons: tuple[int, ...],
     fs: FileSystemPort,
     library: LibraryPort,
     qbt: DownloadClientPort,
@@ -1875,6 +2553,33 @@ async def _import_tv_targets_locked(
     target_seasons = tuple(dict.fromkeys(target.season for target in targets))
 
     status = await qbt.get_status(torrent_hash)
+    if download_path is not None:
+        breadcrumb_cleanup = await asyncio.to_thread(
+            _stored_path_cleanup_state,
+            Path(download_path),
+            allow_empty_directory=True,
+        )
+        if breadcrumb_cleanup == "defer":
+            return await download_repo.get_by_hash(torrent_hash)
+        if breadcrumb_cleanup == "absent":
+            _invalidate_payload_placement_ownership(
+                session,
+                torrent_hash,
+                download_path,
+                tmdb_id=request.tmdb_id,
+            )
+            cleared = await download_repo.update_status_if_in(
+                download_id,
+                download_status,
+                frozenset({download_status}),
+                clear_download_path=True,
+                require_failed_reason=failed_reason,
+            )
+            if not cleared:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            await session.commit()
+            download_path = None
     if status is None and _is_manual_cleanup_breadcrumb(
         download_status, download_path, failed_reason
     ):
@@ -1882,6 +2587,27 @@ async def _import_tv_targets_locked(
         # let this scoped row "resume" through ``_resolve_content``'s breadcrumb
         # fallback (re-importing the parked placement) or overwrite the manual-cleanup
         # reason. Leave the row parked until the client reports the torrent again.
+        return await download_repo.get_by_hash(torrent_hash)
+    if status is None and download_path is not None:
+        # This multi-scope path has no single safe status-less resume transaction.
+        # Park it visibly while retaining the placement; current-policy proof
+        # distinguishes a client outage from an old/unvalidated crash row.
+        payload_validated = await _payload_manifest_was_validated(
+            session, torrent_hash, download_path
+        )
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            (
+                _SCOPED_BREADCRUMB_CLIENT_MISSING_REASON
+                if payload_validated
+                else _UNVALIDATED_BREADCRUMB_REASON
+            ),
+            request_id=request.id,
+            seasons=target_seasons,
+            expected_failed_reason=failed_reason,
+        )
         return await download_repo.get_by_hash(torrent_hash)
     if status is not None and _payload_manifest_is_complete(status):
         # Scoped TV rows return through THIS helper, so without this gate they would
@@ -1899,14 +2625,13 @@ async def _import_tv_targets_locked(
             status=status,
             request_id=request.id,
             seasons=target_seasons,
-            block_existing_breadcrumb=(
-                (download_path is not None and download_status == DownloadState.Importing.value)
-                or _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason)
-            ),
+            block_existing_breadcrumb=download_path is not None,
         )
         if rejected is not None:
             return rejected
     if status is not None and not _is_settled_for_import(status):
+        if download_path is not None:
+            return await download_repo.get_by_hash(torrent_hash)
         deferred = await download_repo.update_status_if_in(
             download_id,
             DownloadState.Downloading.value,
@@ -1935,6 +2660,44 @@ async def _import_tv_targets_locked(
             )
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
+
+    if download_path is not None:
+        expected_scope_dirs = {
+            os.path.realpath(
+                Path(tv_root)
+                / plex_tv_season_relative_dir(request.title, request.year, known_season)
+            )
+            for known_season in known_scope_seasons
+        }
+        if os.path.realpath(download_path) not in expected_scope_dirs:
+            breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, Path(download_path))
+            if breadcrumb_kind == "missing":
+                cleared = await download_repo.update_status_if_in(
+                    download_id,
+                    download_status,
+                    frozenset({download_status}),
+                    clear_download_path=True,
+                    require_failed_reason=failed_reason,
+                )
+                if not cleared:
+                    await session.rollback()
+                    return await download_repo.get_by_hash(torrent_hash)
+                await session.commit()
+                download_path = None
+            else:
+                await _block(
+                    session,
+                    download_repo,
+                    download_id,
+                    (
+                        "stored scoped-tv import breadcrumb does not match any attached season; "
+                        f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                    ),
+                    request_id=request.id,
+                    seasons=target_seasons,
+                    expected_failed_reason=failed_reason,
+                )
+                return await download_repo.get_by_hash(torrent_hash)
 
     try:
         resolved = _resolve_content(status, download_path)
@@ -1996,6 +2759,7 @@ async def _import_tv_targets_locked(
 
     plans: list[_TvImportPlan] = []
     failures: list[_TvImportFailure] = []
+    unresolved_breadcrumb_real: str | None = None
     for target in targets:
         planned = _build_tv_import_plan(
             target=target,
@@ -2008,6 +2772,44 @@ async def _import_tv_targets_locked(
             failures.append(planned)
         else:
             plans.append(planned)
+
+    if download_path is not None:
+        breadcrumb_real = os.path.realpath(download_path)
+        matching_plan_index = next(
+            (
+                index
+                for index, plan in enumerate(plans)
+                if os.path.realpath(plan.season_dir) == breadcrumb_real
+            ),
+            None,
+        )
+        imported_scope_dirs = {
+            os.path.realpath(
+                Path(tv_root)
+                / plex_tv_season_relative_dir(request.title, request.year, imported_season)
+            )
+            for imported_season in imported_scope_seasons
+        }
+        if matching_plan_index is not None and matching_plan_index > 0:
+            # Re-adopt/scan the breadcrumbed placement before any later plan can
+            # replace the download row's single durable pointer.
+            plans.insert(0, plans.pop(matching_plan_index))
+        elif matching_plan_index is None and breadcrumb_real not in imported_scope_dirs:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                (
+                    "stored scoped-tv import breadcrumb has no importable attached scope; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                ),
+                request_id=request.id,
+                seasons=target_seasons,
+                expected_failed_reason=failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        if matching_plan_index is not None:
+            unresolved_breadcrumb_real = breadcrumb_real
 
     if not plans:
         await _block(
@@ -2060,25 +2862,51 @@ async def _import_tv_targets_locked(
         await session.commit()
 
         successful_dirs: list[Path] = []
-        for plan in plans:
-            placed_paths: list[Path] = []
+        cleanup_breadcrumb: Path | None = None
+        for plan_index, plan in enumerate(plans):
+            plan_has_existing_breadcrumb = unresolved_breadcrumb_real == os.path.realpath(
+                plan.season_dir
+            )
+            # Persist a non-authoritative planned destination before the first
+            # external write. A process death after any copy or failed rollback
+            # therefore leaves the exact cleanup obligation durable; only the
+            # post-placement attestation below grants validation/ownership proof.
+            await download_repo.update_status(
+                download_id,
+                DownloadState.Importing.value,
+                download_path=str(plan.season_dir),
+            )
+            await session.commit()
+            placed_paths: list[_PlacedPath] = []
+            observed_paths: list[_PlacedPath] = []
             imported: list[tuple[str, PurePosixPath]] = []
             for relative, result in plan.by_relative.items():
                 src = plan.abs_by_rel[result.video.relative_path]
                 dst = Path(tv_root) / relative
                 try:
-                    placed = await asyncio.to_thread(_place_file, fs, src, dst)
+                    placed, observed_identity = await asyncio.to_thread(
+                        _place_file_with_identity, fs, src, dst
+                    )
                 except (FileExistsError, OSError) as exc:
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
                     reason = (
                         str(exc)
                         if isinstance(exc, FileExistsError)
                         else f"import copy failed: {type(exc).__name__}"
                     )
+                    cleanup_incomplete = plan_has_existing_breadcrumb or not rollback_complete
+                    if cleanup_incomplete:
+                        reason = (
+                            f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                            f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                        )
+                        cleanup_breadcrumb = plan.season_dir
                     failures.append(_TvImportFailure(plan.target, reason))
                     break
+                observed_path = _PlacedPath(dst, observed_identity or "unverified")
+                observed_paths.append(observed_path)
                 if placed:
-                    placed_paths.append(dst)
+                    placed_paths.append(observed_path)
                 imported.append((os.path.basename(src), relative))
             else:
                 await download_repo.update_status(
@@ -2086,57 +2914,150 @@ async def _import_tv_targets_locked(
                     DownloadState.Importing.value,
                     download_path=str(plan.season_dir),
                 )
+                content_identity = await asyncio.to_thread(
+                    _payload_identity_if_observations_match,
+                    str(plan.season_dir),
+                    observed_paths,
+                )
+                if content_identity is None:
+                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    cleanup_breadcrumb = plan.season_dir
+                    failures.append(
+                        _TvImportFailure(
+                            plan.target,
+                            _PLACEMENT_IDENTITY_CHANGED_REASON,
+                        )
+                    )
+                    for deferred_plan in plans[plan_index + 1 :]:
+                        failures.append(
+                            _TvImportFailure(
+                                deferred_plan.target,
+                                "import deferred while stored placement cleanup remains unresolved",
+                            )
+                        )
+                    break
+                validation_attestation = _payload_validation_attestation(
+                    str(plan.season_dir),
+                    placement_owned=bool(placed_paths),
+                    content_identity=content_identity,
+                )
+                session.add(
+                    DownloadHistory(
+                        tmdb_id=plan.target.request.tmdb_id,
+                        torrent_hash=torrent_hash,
+                        event_type=DownloadHistoryEvent.import_started,
+                        source_title=None,
+                        message=(
+                            f"{validation_attestation} "
+                            f"validated scoped season {plan.target.season} placement"
+                        ),
+                    )
+                )
                 await session.commit()
+                scan_succeeded = True
                 try:
                     await library.trigger_scan(str(plan.season_dir), "tv")
                 except (PlexLibraryError, PlexAuthError) as exc:
+                    scan_succeeded = False
+                    rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    reason = f"plex scan failed: {type(exc).__name__}"
+                    cleanup_incomplete = plan_has_existing_breadcrumb or not rollback_complete
+                    if cleanup_incomplete:
+                        reason = (
+                            f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                            f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                        )
+                        cleanup_breadcrumb = plan.season_dir
+                    failures.append(_TvImportFailure(plan.target, reason))
+                if scan_succeeded and not await _payload_manifest_was_validated(
+                    session, torrent_hash, str(plan.season_dir)
+                ):
+                    scan_succeeded = False
                     await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    cleanup_breadcrumb = plan.season_dir
                     failures.append(
-                        _TvImportFailure(plan.target, f"plex scan failed: {type(exc).__name__}")
-                    )
-                    continue
-
-                for basename, relative in imported:
-                    session.add(
-                        DownloadHistory(
-                            tmdb_id=plan.target.request.tmdb_id,
-                            torrent_hash=torrent_hash,
-                            event_type=DownloadHistoryEvent.imported,
-                            source_title=None,
-                            message=f"imported {basename} to {relative}",
+                        _TvImportFailure(
+                            plan.target,
+                            _PLACEMENT_IDENTITY_CHANGED_REASON,
                         )
                     )
-                await season_request_service.set_library_path(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                    library_path=str(plan.season_dir),
-                )
-                installed_quality, installed_profile_index = _lowest_profile_quality(
-                    plan.accepted, profile
-                )
-                await season_request_service.set_installed_quality(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                    quality_id=installed_quality.id,
-                    profile_index=installed_profile_index,
-                )
-                await season_request_service.mark_completed(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                )
-                await _set_download_scope_status(
-                    session,
-                    download_id=download_id,
-                    scope_id=plan.target.scope_id,
-                    request_id=plan.target.request.id,
-                    season=plan.target.season,
-                    status="imported",
-                    completed=True,
-                )
-                successful_dirs.append(plan.season_dir)
+                if scan_succeeded:
+                    for basename, relative in imported:
+                        session.add(
+                            DownloadHistory(
+                                tmdb_id=plan.target.request.tmdb_id,
+                                torrent_hash=torrent_hash,
+                                event_type=DownloadHistoryEvent.imported,
+                                source_title=None,
+                                message=f"imported {basename} to {relative}",
+                            )
+                        )
+                    await season_request_service.set_library_path(
+                        session,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
+                        library_path=str(plan.season_dir),
+                    )
+                    installed_quality, installed_profile_index = _lowest_profile_quality(
+                        plan.accepted, profile
+                    )
+                    await season_request_service.set_installed_quality(
+                        session,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
+                        quality_id=installed_quality.id,
+                        profile_index=installed_profile_index,
+                    )
+                    await season_request_service.mark_completed(
+                        session,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
+                    )
+                    await _set_download_scope_status(
+                        session,
+                        download_id=download_id,
+                        scope_id=plan.target.scope_id,
+                        request_id=plan.target.request.id,
+                        season=plan.target.season,
+                        status="imported",
+                        completed=True,
+                    )
+                    successful_dirs.append(plan.season_dir)
+                    if plan_has_existing_breadcrumb:
+                        unresolved_breadcrumb_real = None
+
+            if cleanup_breadcrumb is not None:
+                for deferred_plan in plans[plan_index + 1 :]:
+                    failures.append(
+                        _TvImportFailure(
+                            deferred_plan.target,
+                            "import deferred while stored placement cleanup remains unresolved",
+                        )
+                    )
+                break
+
+        if cleanup_breadcrumb is not None:
+            for failure in failures:
+                await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
+            await download_repo.align_scalar_scope_with_active(download_id)
+            cleanup_reason = _failure_summary(failures)
+            if _MANUAL_CLEANUP_BREADCRUMB_REASON not in cleanup_reason:
+                # The capped multi-scope summary may omit the later physical
+                # cleanup failure. Force the durable/operator-visible marker
+                # outside that cap so status-less retries remain protected.
+                cleanup_reason = f"{cleanup_reason}; {_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+            finalized = await download_repo.update_status_if_in(
+                download_id,
+                DownloadState.ImportBlocked.value,
+                frozenset({DownloadState.Importing.value}),
+                download_path=str(cleanup_breadcrumb),
+                failed_reason=cleanup_reason,
+            )
+            if not finalized:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash)
+            await session.commit()
+            return await download_repo.get_by_hash(torrent_hash)
 
         if not successful_dirs:
             await _block(
@@ -2227,6 +3148,33 @@ async def _import_tv_locked(
     download_repo = SqlDownloadRepository(session)
 
     status = await qbt.get_status(torrent_hash)
+    if download_path is not None:
+        breadcrumb_cleanup = await asyncio.to_thread(
+            _stored_path_cleanup_state,
+            Path(download_path),
+            allow_empty_directory=True,
+        )
+        if breadcrumb_cleanup == "defer":
+            return await download_repo.get_by_hash(torrent_hash)
+        if breadcrumb_cleanup == "absent":
+            _invalidate_payload_placement_ownership(
+                session,
+                torrent_hash,
+                download_path,
+                tmdb_id=request.tmdb_id,
+            )
+            cleared = await download_repo.update_status_if_in(
+                download_id,
+                download_status,
+                frozenset({download_status}),
+                clear_download_path=True,
+                require_failed_reason=failed_reason,
+            )
+            if not cleared:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            await session.commit()
+            download_path = None
     if status is None:
         if _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason):
             # An ImportBlocked row already parked for manual cleanup keeps its
@@ -2238,8 +3186,11 @@ async def _import_tv_locked(
             # behind. Leave the row untouched until the client reports the torrent again
             # (or the operator clears the placed files).
             return await download_repo.get_by_hash(torrent_hash)
-        if download_path is not None and _can_resume_tv_breadcrumb_without_client_status(
-            download_status, failed_reason
+        payload_validated = download_path is not None and await _payload_manifest_was_validated(
+            session, torrent_hash, download_path
+        )
+        if download_path is not None and _can_resume_breadcrumb_without_client_status(
+            download_status, failed_reason, payload_validated=payload_validated
         ):
             if download_status == DownloadState.ImportBlocked.value:
                 resumed = await download_repo.update_status_if_in(
@@ -2267,6 +3218,19 @@ async def _import_tv_locked(
                 tv_root=tv_root,
                 download_path=download_path,
             )
+        if download_path is not None and not payload_validated:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _UNVALIDATED_BREADCRUMB_REASON,
+                request_id=request.id,
+                season=season,
+                expected_failed_reason=failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        if download_path is not None:
+            return await download_repo.get_by_hash(torrent_hash)
         await _block(
             session,
             download_repo,
@@ -2274,6 +3238,7 @@ async def _import_tv_locked(
             "download client reported no status for payload validation",
             request_id=request.id,
             season=season,
+            expected_failed_reason=failed_reason,
         )
         return await download_repo.get_by_hash(torrent_hash)
     if _payload_manifest_is_complete(status):
@@ -2286,19 +3251,13 @@ async def _import_tv_locked(
             status=status,
             request_id=request.id,
             season=season,
-            block_existing_breadcrumb=(
-                (
-                    download_path is not None
-                    and _can_resume_tv_breadcrumb_without_client_status(
-                        download_status, failed_reason
-                    )
-                )
-                or _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason)
-            ),
+            block_existing_breadcrumb=download_path is not None,
         )
         if rejected is not None:
             return rejected
     if not _is_settled_for_import(status):
+        if download_path is not None:
+            return await download_repo.get_by_hash(torrent_hash)
         deferred = await download_repo.update_status_if_in(
             download_id,
             DownloadState.Downloading.value,
@@ -2475,6 +3434,38 @@ async def _import_tv_locked(
         return await download_repo.get_by_hash(torrent_hash)
 
     season_dir = Path(tv_root) / plex_tv_season_relative_dir(request.title, request.year, season)
+    if download_path is not None and os.path.realpath(download_path) != os.path.realpath(
+        season_dir
+    ):
+        breadcrumb_kind = await asyncio.to_thread(_classify_stored_path, Path(download_path))
+        if breadcrumb_kind == "missing":
+            cleared = await download_repo.update_status_if_in(
+                download_id,
+                download_status,
+                frozenset({download_status}),
+                clear_download_path=True,
+                require_failed_reason=failed_reason,
+            )
+            if not cleared:
+                await session.rollback()
+                return await download_repo.get_by_hash(torrent_hash)
+            await session.commit()
+            download_path = None
+        else:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                (
+                    "stored tv import breadcrumb does not match the current season; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                ),
+                request_id=request.id,
+                season=season,
+                expected_failed_reason=failed_reason,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+    preserve_existing_breadcrumb = download_path is not None
     # PURGE-vs-IMPORT ordering rule (round 9; stated identically at
     # purge_service's registry): FIRST-REGISTERED WINS, loser defers fast. If an
     # eviction/correction purge is mid-delete on this season directory, SKIP
@@ -2499,25 +3490,21 @@ async def _import_tv_locked(
             download_id,
             DownloadState.Importing.value,
             _RESUMABLE,
-            # Clear any prior block reason on a clean retry (issue #73), mirroring the
-            # movie path: a row re-entering import from ``ImportBlocked`` must not carry
-            # its stale ``failed_reason`` forward into a successful import, or the queue
-            # and audit trail would keep showing a block that no longer applies.
             clear_failed_reason=True,
+            download_path=str(season_dir),
         )
         if not claimed:
             await session.rollback()
             return await download_repo.get_by_hash(torrent_hash)
 
-        session.add(
-            DownloadHistory(
-                tmdb_id=request.tmdb_id,
-                torrent_hash=torrent_hash,
-                event_type=DownloadHistoryEvent.import_started,
-                source_title=None,  # never shadow the grabbed release title
-                message=f"importing {len(by_relative)} episode(s) to {season_dir}",
-            )
+        import_started_history = DownloadHistory(
+            tmdb_id=request.tmdb_id,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.import_started,
+            source_title=None,  # never shadow the grabbed release title
+            message=f"importing {len(by_relative)} episode(s) to {season_dir}",
         )
+        session.add(import_started_history)
         await session.commit()
 
         # ``imported`` history rows are staged (basename, relative) here rather than
@@ -2528,20 +3515,34 @@ async def _import_tv_locked(
         # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
         # the audit trail claim an episode was imported when it was in fact deleted
         # moments later (honesty over silence: history must never lie about a rollback).
-        placed_paths: list[Path] = []
+        placed_paths: list[_PlacedPath] = []
+        observed_paths: list[_PlacedPath] = []
         imported: list[tuple[str, PurePosixPath]] = []
         for relative, result in by_relative.items():
             src = abs_by_rel[result.video.relative_path]
             dst = Path(tv_root) / relative
             try:
-                placed = await asyncio.to_thread(_place_file, fs, src, dst)
+                placed, observed_identity = await asyncio.to_thread(
+                    _place_file_with_identity, fs, src, dst
+                )
             except (FileExistsError, OSError) as exc:
-                await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                failed_destination_kind = await asyncio.to_thread(_classify_stored_path, dst)
                 reason = (
                     str(exc)
                     if isinstance(exc, FileExistsError)
                     else f"import copy failed: {type(exc).__name__}"
                 )
+                cleanup_incomplete = (
+                    preserve_existing_breadcrumb
+                    or not rollback_complete
+                    or failed_destination_kind != "missing"
+                )
+                if cleanup_incomplete:
+                    reason = (
+                        f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                        f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                    )
                 await _block(
                     session,
                     download_repo,
@@ -2549,10 +3550,14 @@ async def _import_tv_locked(
                     reason,
                     request_id=request.id,
                     season=season,
+                    clear_download_path=not cleanup_incomplete,
+                    download_path=str(season_dir) if cleanup_incomplete else None,
                 )
                 return await download_repo.get_by_hash(torrent_hash)
+            observed_path = _PlacedPath(dst, observed_identity or "unverified")
+            observed_paths.append(observed_path)
             if placed:
-                placed_paths.append(dst)
+                placed_paths.append(observed_path)
             imported.append((os.path.basename(src), relative))
 
         # download_path is stamped with the SEASON folder (not one file) purely for
@@ -2561,21 +3566,75 @@ async def _import_tv_locked(
         await download_repo.update_status(
             download_id, DownloadState.Importing.value, download_path=str(season_dir)
         )
+        content_identity = await asyncio.to_thread(
+            _payload_identity_if_observations_match,
+            str(season_dir),
+            observed_paths,
+        )
+        if content_identity is None:
+            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _PLACEMENT_IDENTITY_CHANGED_REASON,
+                request_id=request.id,
+                season=season,
+                download_path=str(season_dir),
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        validation_attestation = _payload_validation_attestation(
+            str(season_dir),
+            placement_owned=bool(placed_paths),
+            content_identity=content_identity,
+        )
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=torrent_hash,
+                event_type=DownloadHistoryEvent.import_started,
+                source_title=None,
+                message=(
+                    f"{validation_attestation} "
+                    f"validated {len(by_relative)} episode placement(s) at {season_dir}"
+                ),
+            )
+        )
         await session.commit()
 
         # ONE targeted scan of the whole season directory, never one per episode.
         try:
             await library.trigger_scan(str(season_dir), "tv")
         except (PlexLibraryError, PlexAuthError) as exc:
+            rollback_complete = await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            reason = f"plex scan failed: {type(exc).__name__}"
+            cleanup_incomplete = preserve_existing_breadcrumb or not rollback_complete
+            if cleanup_incomplete:
+                reason = (
+                    f"{reason}; {_OWNED_PLACEMENT_CLEANUP_FAILURE_FRAGMENT}; "
+                    f"{_MANUAL_CLEANUP_BREADCRUMB_REASON}"
+                )
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                reason,
+                request_id=request.id,
+                season=season,
+                clear_download_path=rollback_complete and not preserve_existing_breadcrumb,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        if not await _payload_manifest_was_validated(session, torrent_hash, str(season_dir)):
             await asyncio.to_thread(_remove_quietly_many, placed_paths)
             await _block(
                 session,
                 download_repo,
                 download_id,
-                f"plex scan failed: {type(exc).__name__}",
+                _PLACEMENT_IDENTITY_CHANGED_REASON,
                 request_id=request.id,
                 season=season,
-                clear_download_path=True,
+                download_path=str(season_dir),
             )
             return await download_repo.get_by_hash(torrent_hash)
 
@@ -2675,7 +3734,17 @@ async def run_import_cycle(
         # blocks it as a retryable ``ImportBlocked`` ("import has no owning request")
         # — so letting it through turns an invisible stuck row into a visible,
         # retryable block instead of silently skipping it every cycle.
-        if row.status in _AUTO_DRAIN:
+        if row.status in _AUTO_DRAIN or (
+            row.status == DownloadState.ImportBlocked.value
+            and row.failed_reason is not None
+            and row.failed_reason.startswith(
+                (
+                    _MANIFEST_OUTAGE_REASON_PREFIX,
+                    _UNVALIDATED_BREADCRUMB_REASON_PREFIX,
+                    _SCOPED_BREADCRUMB_CLIENT_MISSING_REASON_PREFIX,
+                )
+            )
+        ):
             try:
                 await import_download(
                     download_id=row.id,

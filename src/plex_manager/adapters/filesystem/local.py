@@ -16,14 +16,16 @@ import contextlib
 import errno
 import os
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import Literal
 
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
+from plex_manager.ports.filesystem import VIDEO_EXTENSIONS, FilePlacementIdentity
 
-__all__ = ["LocalFileSystem", "LocalFileSystemError"]
+__all__ = ["LocalFileSystem", "LocalFileSystemError", "clear_stale_publish_locks"]
 
 # os.link failures that genuinely warrant a content-copy fallback (cross-device,
 # hardlink-refusing / unsupported filesystem). Any OTHER errno (notably EEXIST —
@@ -32,6 +34,18 @@ __all__ = ["LocalFileSystem", "LocalFileSystemError"]
 _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
     {errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.EACCES}
 )
+
+
+def _placement_identity(observed: os.stat_result) -> FilePlacementIdentity:
+    return FilePlacementIdentity(
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        size=observed.st_size,
+        mtime_ns=observed.st_mtime_ns,
+        ctime_ns=observed.st_ctime_ns,
+        mode=observed.st_mode,
+    )
+
 
 #: Lowercased directory names whose contents are bonus material, not the main
 #: feature — skipped entirely when picking the largest video.
@@ -102,6 +116,54 @@ def _lock_is_stale(lock_path: Path) -> bool:
     except ValueError:
         return _lock_is_expired(lock_path)
     return not _pid_is_running(pid)
+
+
+def clear_stale_publish_locks(
+    directory: Path,
+) -> Literal["cleared", "pending", "protected"]:
+    """Remove only provably stale LocalFileSystem publish locks from a directory.
+
+    ``cleared`` means every entry was a regular stale ``*.publish.lock`` and was
+    removed (an already-empty directory also qualifies). ``pending`` means every
+    entry is a regular lock but at least one is live/young and may become stale.
+    Media, temp files, symlinks, unreadable entries, or races are ``protected``.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return "protected"
+    locks: list[tuple[Path, int, int]] = []
+    has_pending = False
+    for entry in entries:
+        if not entry.name.startswith(".") or not entry.name.endswith(".publish.lock"):
+            return "protected"
+        try:
+            observed = entry.lstat()
+        except OSError:
+            return "protected"
+        if not stat.S_ISREG(observed.st_mode):
+            return "protected"
+        if not _lock_is_stale(entry):
+            has_pending = True
+            continue
+        locks.append((entry, observed.st_dev, observed.st_ino))
+    if has_pending:
+        return "pending"
+    for lock, expected_device, expected_inode in locks:
+        try:
+            current = lock.lstat()
+            if (
+                current.st_dev != expected_device
+                or current.st_ino != expected_inode
+                or not _lock_is_stale(lock)
+            ):
+                return "protected"
+            lock.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "protected"
+    return "cleared"
 
 
 @contextlib.contextmanager
@@ -280,7 +342,7 @@ class LocalFileSystem:
             self._copy_no_overwrite(src, dst)
         src.unlink()
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path) -> FilePlacementIdentity:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
 
         A cross-device link raises ``OSError`` (``EXDEV``); some filesystems also
@@ -289,7 +351,12 @@ class LocalFileSystem:
         """
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _publish_link_no_overwrite(src, dst)
+            # Hold a descriptor to the exact inode being published. A pathname
+            # replacement after link(2), but before this method returns, cannot
+            # change the identity token returned to the importer.
+            with src.open("rb") as published:
+                _publish_link_no_overwrite(src, dst)
+                return _placement_identity(os.fstat(published.fileno()))
         except OSError as exc:
             # Only a genuine cross-device / hardlink-unsupported failure warrants a
             # copy. EEXIST (the destination already exists — e.g. a concurrent import
@@ -300,9 +367,9 @@ class LocalFileSystem:
             # Cross-device (or hardlink-refusing) filesystem: copy instead. A
             # copy actually consumes space, so preflight that the destination
             # filesystem can hold the source before writing a partial file.
-            self._copy_no_overwrite(src, dst)
+            return self._copy_no_overwrite(src, dst)
 
-    def _copy_no_overwrite(self, src: Path, dst: Path) -> None:
+    def _copy_no_overwrite(self, src: Path, dst: Path) -> FilePlacementIdentity:
         src_size = src.stat().st_size
         free = self.available_bytes(dst.parent)
         if free < src_size:
@@ -327,7 +394,13 @@ class LocalFileSystem:
                     f"copy of {src.name} is incomplete: expected {src_size} bytes, "
                     f"wrote {copied_size}; partial destination removed"
                 )
-            _publish_temp_no_overwrite(tmp_path, dst)
+            # Keep the completed temp inode open through publication. Whether the
+            # primitive links then unlinks the temp or renames it into place, fstat
+            # remains bound to the object actually published rather than whatever
+            # may subsequently appear at ``dst``.
+            with open(tmp_path, "rb") as published:
+                _publish_temp_no_overwrite(tmp_path, dst)
+                placement_identity = _placement_identity(os.fstat(published.fileno()))
             tmp_path = None
         except OSError:
             # The copy target is a temp file in dst.parent, never the final path,
@@ -342,6 +415,7 @@ class LocalFileSystem:
             if tmp_path is not None:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
+        return placement_identity
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.
