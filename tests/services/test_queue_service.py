@@ -550,6 +550,97 @@ async def test_reconcile_preserves_manual_cleanup_tv_breadcrumb_block(
     assert download.download_path == str(season_dir)
 
 
+async def test_reconcile_preserves_manual_cleanup_block_for_scoped_download(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A multi-season (#173) scoped row carries its seasons in DownloadScope rows with
+    # ``Download.season`` None. The manual-cleanup skip must key on the marker itself —
+    # requiring a scalar season would let the payload validator auto-fail this parked
+    # row and delete the torrent while its placed season files linger.
+    season_dir = tmp_path / "tv" / "Some Show (2020)" / "Season 01"
+    placed = season_dir / "Some Show - S01E01.mkv"
+    placed.parent.mkdir(parents=True)
+    placed.write_bytes(b"episode")
+    failed_reason = (
+        "torrent payload rejected: unsupported file type .exe; "
+        "stored import breadcrumb requires manual cleanup before re-search"
+    )
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.import_blocked,
+        )
+        session.add(request)
+        await session.flush()
+        season = SeasonRequest(
+            media_request_id=request.id,
+            season_number=1,
+            status=RequestStatus.import_blocked.value,
+        )
+        session.add(season)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status="import_blocked",
+            media_request_id=request.id,
+            tmdb_id=603,
+            season=None,
+            download_path=str(season_dir),
+            failed_reason=failed_reason,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=request.id,
+                season_request_id=season.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="import_blocked",
+            )
+        )
+        await session.commit()
+
+    live = DownloadStatus(
+        info_hash=_HASH,
+        name="Some.Show.S01.1080p.WEB-DL.x264-GROUP",
+        raw_state="stoppedUP",
+        progress=1.0,
+    )
+    qbt = FakeQbittorrent(
+        statuses=[live],
+        files={
+            _HASH: [
+                DownloadedFile(
+                    name="Some.Show.S01.1080p.WEB-DL.x264-GROUP/Some.Show.S01E01.mkv",
+                    size_bytes=8_000_000_000,
+                ),
+                DownloadedFile(
+                    name="Some.Show.S01.1080p.WEB-DL.x264-GROUP/setup.exe",
+                    size_bytes=1024,
+                ),
+            ]
+        },
+    )
+
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(i for i in queue if i.torrent_hash == _HASH)
+    assert item.status == "import_blocked"
+    assert qbt.removed == []
+    assert placed.exists()
+    async with sessionmaker_() as session:
+        download = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+    assert download.status == "import_blocked"
+    assert download.failed_reason == failed_reason
+
+
 async def test_safe_payload_manifest_still_advances_completed_download(
     sessionmaker_: SessionMaker,
 ) -> None:

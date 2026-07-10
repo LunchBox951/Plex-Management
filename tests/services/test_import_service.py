@@ -2494,6 +2494,175 @@ async def test_import_tv_shared_torrent_completes_each_attached_scope(
     assert all(scope.completed_at is not None for scope in scopes)
 
 
+async def _seed_scoped_tv(
+    sessionmaker_: SessionMaker, *, download_status: str
+) -> tuple[int, int, dict[int, int]]:
+    """Two-season scoped download; returns (download_id, request_id, season ids)."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=request.id, season_number=1, status=RequestStatus.downloading.value
+        )
+        season_2 = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.downloading.value
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=download_status,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status="active",
+                ),
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_2.id,
+                    season_number=2,
+                    scope_key="season:2|episodes:*",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+        return download.id, request.id, {1: season_1.id, 2: season_2.id}
+
+
+async def test_import_tv_scoped_unsafe_payload_fails_and_rearms_every_scope(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # Scoped TV rows return through _import_tv_targets_locked, which previously bypassed
+    # the unsafe-payload gate entirely: a valid episode plus setup.exe imported instead
+    # of failing. The gate must fail/blocklist the row and re-arm EVERY attached scope.
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    episode = release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(episode)
+    download_id, request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.ImportPending.value
+    )
+    qbt = _qbt(
+        release_dir,
+        files=[
+            DownloadedFile(
+                name="Some.Show.S01-S02.1080p.WEB-DL.x264-GRP/Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv",
+                size_bytes=episode.stat().st_size,
+            ),
+            DownloadedFile(
+                name="Some.Show.S01-S02.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024
+            ),
+        ],
+    )
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert record.failed_reason is not None
+    assert "unsupported file type .exe" in record.failed_reason
+    assert qbt.removed == [(_HASH, True)]
+    assert not (tv_root / "Some Show (2020)").exists()
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        entry = (await session.execute(select(Blocklist))).scalars().one()
+    assert {season.season_number: season.status for season in seasons} == {
+        1: "searching",
+        2: "searching",
+    }
+    assert {scope.season_number: scope.status for scope in scopes} == {
+        1: "failed",
+        2: "failed",
+    }
+    assert entry.media_type == "tv"
+
+
+async def test_import_tv_scoped_unsafe_payload_with_breadcrumb_blocks_for_manual_cleanup(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # A crash-resumed scoped Importing row whose breadcrumb proves placed library files
+    # must be parked for manual cleanup — never failed with the torrent removed, which
+    # would orphan those files.
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 01"
+    placed_episode = season_dir / "Some Show - S01E01.mkv"
+    _make_video(placed_episode)
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    episode = release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(episode)
+    download_id, _request_id, _season_ids = await _seed_scoped_tv(
+        sessionmaker_, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        await session.commit()
+    qbt = _qbt(
+        release_dir,
+        files=[
+            DownloadedFile(
+                name="Some.Show.S01-S02.1080p.WEB-DL.x264-GRP/Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv",
+                size_bytes=episode.stat().st_size,
+            ),
+            DownloadedFile(
+                name="Some.Show.S01-S02.1080p.WEB-DL.x264-GRP/setup.exe", size_bytes=1024
+            ),
+        ],
+    )
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "unsupported file type .exe" in record.failed_reason
+    assert "manual cleanup before re-search" in record.failed_reason
+    assert record.download_path == str(season_dir)
+    assert placed_episode.exists(), "placed library files must survive the block"
+    assert qbt.removed == []
+
+
 async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -2671,6 +2840,39 @@ async def test_import_tv_uses_season_breadcrumb_when_client_status_missing(
     assert request is not None and request.status is RequestStatus.completed
     assert len(history) == 2
     assert all(row.message is not None and "Season 02" in row.message for row in history)
+
+
+async def test_import_tv_breadcrumb_resume_persists_installed_quality(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # The placed Plex-shaped filenames carry no quality tokens, so the resume path must
+    # recompute installed quality from the grabbed release_title — otherwise a
+    # crash-resumed season completes with null quality metadata and search preview /
+    # season-pack decisions lose their upgrade basis.
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    _make_video(season_dir / "Some Show - S02E01.mkv")
+    download_id, _request_id, season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.download_path = str(season_dir)
+        download.release_title = "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+        await session.commit()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, FakeQbittorrent(), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None
+    assert season_row.status.value == "completed"
+    assert season_row.installed_quality_id is not None
+    assert season_row.installed_profile_index is not None
 
 
 async def test_import_tv_retries_breadcrumb_after_status_missing_scan_failure(

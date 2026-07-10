@@ -1138,9 +1138,13 @@ def _payload_manifest_is_complete(live: DownloadStatus) -> bool:
 
 
 def _has_manual_cleanup_breadcrumb(row: DownloadRecord) -> bool:
+    # Keyed on the marker itself, NOT ``row.season``: the manual-cleanup marker is only
+    # ever written by the TV import paths, and a multi-season (#173) scoped row carries
+    # its seasons in ``row.scopes`` with ``row.season`` None — requiring a scalar season
+    # here would let this validator auto-fail a cleanup-parked scoped row and delete the
+    # torrent while its placed season files linger.
     return (
         row.status == DownloadState.ImportBlocked.value
-        and row.season is not None
         and row.download_path is not None
         and row.failed_reason is not None
         and _MANUAL_CLEANUP_BREADCRUMB_REASON in row.failed_reason

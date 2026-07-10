@@ -781,6 +781,7 @@ async def _fail_unsafe_payload(
     reason: str,
     request_id: int,
     season: int | None = None,
+    seasons: tuple[int, ...] = (),
     owned_placement: Path | None = None,
 ) -> DownloadRecord | None:
     queue_service._begin_reconcile_removal_guard(download_id)  # pyright: ignore[reportPrivateUsage]
@@ -883,6 +884,12 @@ async def _fail_unsafe_payload(
         if not completed:
             await session.rollback()
             return await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+        # Mirror queue_service Phase C: resolve every still-unresolved durable scope row
+        # to a terminal ``failed`` in the same transaction as the terminal advance, so a
+        # multi-season (#173) row never leaves stale ``active`` scopes behind.
+        await queue_service._mark_download_scopes_terminal(  # pyright: ignore[reportPrivateUsage]
+            session, download_id, RequestStatus.failed.value
+        )
 
         await SqlBlocklistRepository(session).create(
             source_title=source_title,
@@ -893,22 +900,27 @@ async def _fail_unsafe_payload(
             media_type=(
                 request.media_type
                 if request is not None
-                else ("tv" if season is not None else "movie")
+                else ("tv" if season is not None or seasons else "movie")
             ),
         )
         if request is not None:
-            if season is not None:
+            # ``seasons`` (multi-scope #173 rows) takes precedence over the scalar
+            # ``season``: every attached season is re-armed, matching queue_service
+            # Phase C's per-scope re-arm.
+            target_seasons = seasons or ((season,) if season is not None else ())
+            if target_seasons:
                 season_repo = SqlSeasonRequestRepository(session)
-                row = await season_repo.ensure(
-                    request_id, season, status=RequestStatus.pending.value
-                )
-                await season_request_service.set_status_if_in(
-                    session,
-                    media_request_id=request_id,
-                    season_request_id=row.id,
-                    status=RequestStatus.searching.value,
-                    allowed_from=_REARMABLE_REQUEST_STATUS_VALUES,
-                )
+                for target_season in target_seasons:
+                    row = await season_repo.ensure(
+                        request_id, target_season, status=RequestStatus.pending.value
+                    )
+                    await season_request_service.set_status_if_in(
+                        session,
+                        media_request_id=request_id,
+                        season_request_id=row.id,
+                        status=RequestStatus.searching.value,
+                        allowed_from=_REARMABLE_REQUEST_STATUS_VALUES,
+                    )
             else:
                 await request_repo.set_status_if_in(
                     request_id,
@@ -961,6 +973,8 @@ async def _resume_breadcrumbed_tv_import(
     torrent_hash: str,
     fs: FileSystemPort,
     library: LibraryPort,
+    parser: ParserPort,
+    profile: QualityProfile,
     tv_root: str,
     download_path: str,
 ) -> DownloadRecord | None:
@@ -1058,6 +1072,24 @@ async def _resume_breadcrumbed_tv_import(
             season_number=season,
             library_path=str(season_dir),
         )
+        # Persist installed quality like the normal TV finalize paths do. The placed
+        # episode filenames are Plex-shaped (``Series - SxxEyy.ext``) and carry no
+        # quality tokens, so re-parsing them cannot recover the source quality; the
+        # grabbed ``release_title`` is the same string the grab decision ranked and is
+        # the truthful basis available at crash-resume time. When it is absent the
+        # column is honestly left null (as before) rather than stamped with a guess.
+        download_row = await session.get(Download, download_id)
+        release_title = download_row.release_title if download_row is not None else None
+        if release_title:
+            parsed = parser.parse(release_title)
+            installed_quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
+            await season_request_service.set_installed_quality(
+                session,
+                media_request_id=request.id,
+                season_number=season,
+                quality_id=installed_quality.id,
+                profile_index=profile.get_index(installed_quality.id),
+            )
         await season_request_service.mark_completed(
             session, media_request_id=request.id, season_number=season
         )
@@ -1077,6 +1109,7 @@ async def _reject_unsafe_payload_if_reported(
     status: DownloadStatus | None,
     request_id: int,
     season: int | None = None,
+    seasons: tuple[int, ...] = (),
     owned_placement: Path | None = None,
     block_existing_breadcrumb: bool = False,
 ) -> DownloadRecord | None:
@@ -1105,6 +1138,7 @@ async def _reject_unsafe_payload_if_reported(
                 f"could not validate torrent payload manifest: {type(exc).__name__}",
                 request_id=request_id,
                 season=season,
+                seasons=seasons,
             )
             return await download_repo.get_by_hash(torrent_hash)
         return None
@@ -1128,6 +1162,7 @@ async def _reject_unsafe_payload_if_reported(
             f"{reason}; {_MANUAL_CLEANUP_BREADCRUMB_REASON}",
             request_id=request_id,
             season=season,
+            seasons=seasons,
         )
         return await download_repo.get_by_hash(torrent_hash)
 
@@ -1140,6 +1175,7 @@ async def _reject_unsafe_payload_if_reported(
         reason=reason,
         request_id=request_id,
         season=season,
+        seasons=seasons,
         owned_placement=owned_placement,
     )
 
@@ -1390,7 +1426,9 @@ async def _import_download_locked(
             return await _import_tv_targets_locked(
                 download_id=download_id,
                 targets=scope_targets,
+                download_status=row.status,
                 download_path=row.download_path,
+                failed_reason=row.failed_reason,
                 fs=fs,
                 library=library,
                 qbt=qbt,
@@ -1820,7 +1858,9 @@ async def _import_tv_targets_locked(
     *,
     download_id: int,
     targets: tuple[_TvImportTarget, ...],
+    download_status: str,
     download_path: str | None,
+    failed_reason: str | None,
     fs: FileSystemPort,
     library: LibraryPort,
     qbt: DownloadClientPort,
@@ -1835,6 +1875,37 @@ async def _import_tv_targets_locked(
     target_seasons = tuple(dict.fromkeys(target.season for target in targets))
 
     status = await qbt.get_status(torrent_hash)
+    if status is None and _is_manual_cleanup_breadcrumb(
+        download_status, download_path, failed_reason
+    ):
+        # Same guard as the scalar TV path: a transient missing client status must not
+        # let this scoped row "resume" through ``_resolve_content``'s breadcrumb
+        # fallback (re-importing the parked placement) or overwrite the manual-cleanup
+        # reason. Leave the row parked until the client reports the torrent again.
+        return await download_repo.get_by_hash(torrent_hash)
+    if status is not None and _payload_manifest_is_complete(status):
+        # Scoped TV rows return through THIS helper, so without this gate they would
+        # bypass the unsafe-payload rejection entirely (the reconcile-side validator
+        # does not cover ``importing`` rows). A row whose breadcrumb proves placed
+        # library files (crash-resumed Importing, or an existing manual-cleanup block)
+        # is parked for manual cleanup instead of failed, so the torrent removal can
+        # never orphan those files; ``seasons`` re-arms every attached scope.
+        rejected = await _reject_unsafe_payload_if_reported(
+            session=session,
+            download_repo=download_repo,
+            qbt=qbt,
+            download_id=download_id,
+            torrent_hash=torrent_hash,
+            status=status,
+            request_id=request.id,
+            seasons=target_seasons,
+            block_existing_breadcrumb=(
+                (download_path is not None and download_status == DownloadState.Importing.value)
+                or _is_manual_cleanup_breadcrumb(download_status, download_path, failed_reason)
+            ),
+        )
+        if rejected is not None:
+            return rejected
     if status is not None and not _is_settled_for_import(status):
         deferred = await download_repo.update_status_if_in(
             download_id,
@@ -2191,6 +2262,8 @@ async def _import_tv_locked(
                 torrent_hash=torrent_hash,
                 fs=fs,
                 library=library,
+                parser=parser,
+                profile=profile,
                 tv_root=tv_root,
                 download_path=download_path,
             )
