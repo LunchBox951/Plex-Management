@@ -30,6 +30,7 @@ from plex_manager.ports.media_probe import (
     MediaProbeError,
     MediaProbePort,
     MediaProbeResult,
+    MediaProbeUnavailableError,
 )
 from plex_manager.ports.metadata import (
     MediaPage,
@@ -62,22 +63,29 @@ __all__ = [
 
 
 class FakeMediaProbe:
-    """Deterministic media probe: accept by default, reject selected basenames."""
+    """Accept by default; reject or mark selected basenames unavailable."""
 
     def __init__(
         self,
         *,
         rejected: Mapping[str, str] | None = None,
+        unavailable: Mapping[str, str] | None = None,
         raises: MediaProbeError | None = None,
     ) -> None:
         self.rejected = dict(rejected or {})
+        self.unavailable = dict(unavailable or {})
         self.raises = raises
         self.calls: list[Path] = []
+        self.timeouts: list[float | None] = []
 
-    def probe(self, path: Path) -> MediaProbeResult:
+    def probe(self, path: Path, *, timeout_seconds: float | None = None) -> MediaProbeResult:
         self.calls.append(path)
+        self.timeouts.append(timeout_seconds)
         if self.raises is not None:
             raise self.raises
+        unavailable_reason = self.unavailable.get(path.name)
+        if unavailable_reason is not None:
+            raise MediaProbeUnavailableError(unavailable_reason)
         reason = self.rejected.get(path.name)
         if reason is not None:
             raise MediaProbeError(reason)

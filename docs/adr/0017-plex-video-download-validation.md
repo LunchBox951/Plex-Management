@@ -61,11 +61,20 @@ Accepted suffixes are:
 ```
 
 This is deliberately narrower than Plex's bundled scanner list. In particular,
-`.vob` is excluded: although a standalone VOB may be probeable as an MPEG
-program stream, VOB is normally a component of `VIDEO_TS` optical-disc media,
-which Plex explicitly documents as unsupported. ISO/IMG images, `VIDEO_TS` and
-`BDMV` directory structures, archives, playlists/stream pointers, audio-only
-files, subtitle files, and artwork are not video import candidates.
+`.vob` is excluded. Some Plex server builds list VOB in their scanner package,
+and a standalone VOB can be a probeable MPEG program stream, but Plex's public
+support contract does not promise standalone VOB and explicitly excludes the
+`VIDEO_TS` structure VOB normally belongs to. The old generic
+`VIDEO_EXTENSIONS` policy did include `.vob`, so removing it is a deliberate,
+backward-incompatible conservative choice: an existing standalone-VOB download
+must be converted/remuxed to one of the 15 accepted suffixes before import.
+
+Filesystem discovery prunes any case-insensitive `BDMV` or `VIDEO_TS` directory
+component, including when the download content root is that directory (or one of
+its descendants). A standalone `.m2ts` outside such a disc tree remains an
+accepted candidate; path context, not the M2TS suffix itself, distinguishes it
+from a Blu-ray structure. ISO/IMG images, archives, playlists/stream pointers,
+audio-only files, subtitle files, and artwork are not video import candidates.
 
 The domain policy also maps each suffix to the atomic aliases ffprobe reports in
 its comma-separated `format.format_name` field. Closely related suffixes share a
@@ -84,21 +93,38 @@ demuxers used here:
 
 ### 2. Probe the bytes before applying the existing media gate
 
-Every candidate is inspected with ffprobe before the existing identity and
-quality validation runs. Acceptance requires all of the following:
+Every candidate allowed to continue is inspected with ffprobe before the
+existing identity and quality validation runs, subject to the whole-batch
+deadline below. Acceptance requires all of the following:
 
 1. ffprobe completes successfully and returns a recognized container family
    consistent with the path's accepted suffix;
-2. at least one real video stream exists; a file whose only video stream is
-   marked `attached_pic` (cover art) is not a video download;
+2. while inspecting at most 32 selected video packets, at least one packet maps
+   to a known, non-`attached_pic` video stream; a declared track or cover image
+   without real packet evidence is not a video download;
 3. the existing completed-file identity and quality gate accepts the candidate
    for the requested movie or episode; and
 4. normal sample/extra and naming rules still pass.
 
-Probe failure, malformed output, container/suffix mismatch, or no real video
-stream fails closed for that candidate. ffprobe receives the local path as one
-literal argument (never through a shell) and has a bounded wall-clock timeout so
-validation cannot become an unbounded import stall.
+Each ffprobe subprocess receives the local path as one literal argument (never
+through a shell), may open only the local `file` protocol, and has a 10-second
+wall-clock timeout. The whole download's probe batch has its own 30-second
+deadline, including executor queue time; each probe receives only the budget
+remaining after it starts running. A directory with many candidates therefore
+cannot multiply per-file limits into an unbounded import stall. Queued work is
+canceled at the deadline; an already-started bounded probe is joined through
+child-process kill/reap cleanup before the import returns.
+
+A deterministic media verdict (invalid bytes, container/suffix mismatch, no
+eligible packet) rejects only that candidate. A timeout, malformed probe
+protocol, or other result that cannot support a verdict is *inconclusive*. When
+at least one sibling verifies, inconclusive siblings are ignored and only the
+verified candidates continue to identity, quality, naming, and placement. When
+none verifies and any result was inconclusive, a pending/operator-retried import
+surfaces verification-unavailable through the existing `ImportBlocked` path; a
+crash-resumed `Importing` row remains auto-retryable rather than being converted
+into a permanent content verdict. If every candidate is deterministically
+rejected, the existing no-verified-video block is surfaced.
 
 For a movie, the importer selects among candidates using its existing feature
 selection rule and copies/hardlinks only the accepted feature. For TV/season
@@ -135,12 +161,16 @@ still not guarantee direct play everywhere.
 - The suffix policy is intentionally conservative, so a less common format that
   a particular Plex build can ingest may be rejected until it is researched and
   deliberately added.
-- ffprobe adds a subprocess at the import boundary. A wall-clock timeout and
-  typed, surfaced failures keep that cost bounded and diagnosable.
-- Successful validation means “recognized video container with a real video
-  stream,” not “guaranteed direct play on every Plex client.” Plex may still
-  transcode, and a corrupt segment beyond the bounded probe window can still fail
-  later during playback.
+- ffprobe adds subprocesses at the import boundary. Per-file and whole-batch
+  deadlines plus typed, surfaced failures keep that cost bounded and diagnosable.
+- Successful validation means “recognized video container with bounded evidence
+  of a real video packet,” not “the whole file decoded successfully” or
+  “guaranteed direct play on every Plex client.” Plex may still transcode, and a
+  corrupt segment beyond the bounded evidence can still fail later during
+  playback.
+- Standalone VOB imports that the old generic suffix set selected are now
+  intentionally blocked; this favors one conservative public policy over
+  preserving an implementation-derived compatibility edge.
 
 ## Explicit non-goals
 
@@ -161,9 +191,9 @@ still not guarantee direct play everywhere.
 - **Reject a torrent when any sibling is not allowlisted.** Rejected: it confuses
   library eligibility with payload security, rejects harmless release artifacts,
   and creates a much larger queue/removal/rollback contract.
-- **Trust the extension alone.** Rejected: renamed non-media, audio-only
-  containers, corrupt files, and cover-art-only files would still reach the
-  library.
+- **Trust the extension or declared stream alone.** Rejected: renamed non-media,
+  audio-only containers, header-only/zero-packet tracks, and cover-art-only files
+  would still reach the library.
 - **Copy Plex's entire bundled scanner extension list.** Rejected: the list is an
   implementation detail, is broader than the movie/TV formats we intend to
   import, and includes formats Plex's public guidance discourages or excludes.

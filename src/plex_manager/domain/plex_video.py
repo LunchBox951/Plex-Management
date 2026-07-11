@@ -20,6 +20,7 @@ __all__ = [
     "PLEX_VIDEO_EXTENSIONS",
     "PLEX_VIDEO_FORMATS",
     "expected_probe_formats",
+    "is_plex_disc_structure_path",
     "plex_video_extension",
 ]
 
@@ -32,6 +33,7 @@ _MPEG_TS_FORMATS = frozenset({"mpegts"})
 _FLV_FORMATS = frozenset({"flv"})
 _OGG_FORMATS = frozenset({"ogg"})
 _NO_FORMATS: frozenset[str] = frozenset()
+_DISC_STRUCTURE_DIR_NAMES = frozenset({"bdmv", "video_ts"})
 
 # Keep this mapping explicit.  Adding a suffix is a Plex-library policy change,
 # not a generic "ffprobe can decode it" decision.  In particular, DVD ``.vob``
@@ -59,15 +61,32 @@ PLEX_VIDEO_FORMATS: Mapping[str, frozenset[str]] = MappingProxyType(
 PLEX_VIDEO_EXTENSIONS: frozenset[str] = frozenset(PLEX_VIDEO_FORMATS)
 
 
+def is_plex_disc_structure_path(path: str) -> bool:
+    """Return whether any path component belongs to an optical-disc tree.
+
+    Plex does not treat ``BDMV``/``VIDEO_TS`` directory structures as ordinary
+    movie files. Matching is case-insensitive and accepts either path separator
+    because download-client paths may come from a different host platform.
+    """
+
+    normalized = PurePosixPath(path.replace("\\", "/"))
+    return any(part.casefold() in _DISC_STRUCTURE_DIR_NAMES for part in normalized.parts)
+
+
 def plex_video_extension(path: str) -> str | None:
     """Return ``path``'s supported, normalized suffix or ``None``.
 
     Both POSIX and Windows separators are accepted because download-client file
     manifests are not guaranteed to use the host platform's separator.  A
-    compound name is classified by its final suffix only.
+    compound name is classified by its final suffix only. Files inside a
+    ``BDMV``/``VIDEO_TS`` optical-disc tree are not standalone candidates even
+    when their suffix would otherwise be supported.
     """
 
-    suffix = PurePosixPath(path.replace("\\", "/")).suffix.casefold()
+    normalized = PurePosixPath(path.replace("\\", "/"))
+    if is_plex_disc_structure_path(path):
+        return None
+    suffix = normalized.suffix.casefold()
     if suffix in PLEX_VIDEO_FORMATS:
         return suffix
     return None

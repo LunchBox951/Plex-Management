@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from plex_manager.domain.media_match import matches_media
-from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
+from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS, plex_video_extension
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.release import ParsedRelease
@@ -49,6 +49,7 @@ from plex_manager.ports.parser import ParserPort
 
 __all__ = [
     "PLEX_VIDEO_EXTENSIONS",
+    "VIDEO_EXTENSIONS",
     "EpisodeImportRejection",
     "EpisodeImportResult",
     "ImportRejection",
@@ -59,6 +60,11 @@ __all__ = [
     "validate_import",
     "validate_season_import",
 ]
+
+# Compatibility name retained for callers that imported the old generic policy
+# from this module. It is the SAME immutable object, never a second allowlist
+# that could drift from the Plex-specific source of truth.
+VIDEO_EXTENSIONS = PLEX_VIDEO_EXTENSIONS
 
 # NB: ``PLEX_VIDEO_EXTENSIONS`` (imported above, re-exported via ``__all__``) is the
 # SAME set ``FileSystemPort.largest_video_file`` uses to SELECT the source file, so
@@ -216,16 +222,9 @@ def _basename(relative_path: str) -> str:
     return relative_path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
-def _extension(name: str) -> str:
-    """Return the lower-cased extension (``".mkv"``) or ``""`` when there is none."""
-    dot = name.rfind(".")
-    if dot <= 0:  # no dot, or a leading-dot dotfile with no real extension
-        return ""
-    return name[dot:].lower()
-
-
-def _is_video(name: str) -> bool:
-    return _extension(name) in PLEX_VIDEO_EXTENSIONS
+def _is_video(path: str) -> bool:
+    """Apply the shared suffix and optical-disc path policy."""
+    return plex_video_extension(path) is not None
 
 
 def _marker_key(marker_match: str) -> str:
@@ -319,7 +318,7 @@ def validate_import(
     videos = [
         video
         for video in files
-        if _is_video(_basename(video.relative_path))
+        if _is_video(video.relative_path)
         and not _looks_like_sample_name(_basename(video.relative_path), expected_title)
     ]
     if not videos:
@@ -485,7 +484,7 @@ def validate_season_import(
 
     for video in files:
         name = _basename(video.relative_path)
-        if not _is_video(name) or _looks_like_sample_name(name, expected_title):
+        if not _is_video(video.relative_path) or _looks_like_sample_name(name, expected_title):
             continue
 
         # Parse the FULL relative path (folder included) — see step 2 above.

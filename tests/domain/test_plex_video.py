@@ -8,6 +8,7 @@ from plex_manager.domain.plex_video import (
     PLEX_VIDEO_EXTENSIONS,
     PLEX_VIDEO_FORMATS,
     expected_probe_formats,
+    is_plex_disc_structure_path,
     plex_video_extension,
 )
 
@@ -64,6 +65,26 @@ def test_plex_video_extension_is_case_and_separator_insensitive(path: str, expec
 )
 def test_plex_video_extension_rejects_unsupported_or_missing_final_suffix(path: str) -> None:
     assert plex_video_extension(path) is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "Movie/BDMV/STREAM/00001.m2ts",
+        "Movie/bdmv/stream/00001.M2TS",
+        r"Movie\VIDEO_TS\feature.mpg",
+        "/downloads/ViDeO_tS/feature.mpeg",
+    ],
+)
+def test_disc_structure_components_disqualify_otherwise_supported_video(path: str) -> None:
+    assert is_plex_disc_structure_path(path)
+    assert plex_video_extension(path) is None
+    assert expected_probe_formats(path) == frozenset()
+
+
+def test_standalone_transport_stream_is_not_a_disc_structure() -> None:
+    assert not is_plex_disc_structure_path("Movie/feature.m2ts")
+    assert plex_video_extension("Movie/feature.m2ts") == ".m2ts"
 
 
 @pytest.mark.parametrize(

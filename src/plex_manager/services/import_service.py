@@ -34,6 +34,8 @@ import contextlib
 import hashlib
 import logging
 import os
+import threading
+import time
 import weakref
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -54,7 +56,7 @@ from plex_manager.domain.naming import (
     plex_tv_episode_relative_path,
     plex_tv_season_relative_dir,
 )
-from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
+from plex_manager.domain.plex_video import plex_video_extension
 from plex_manager.domain.quality import Quality
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
@@ -123,6 +125,12 @@ _IMPORT_READY_RAW_STATES: frozenset[str] = frozenset(
 # ``failed_reason`` joins together -- a 20+ episode pack where every file is
 # rejected must not produce an unreadably long string.
 _MAX_BLOCK_REASONS: Final = 10
+
+# Bound verification across the WHOLE candidate set, not merely each individual
+# ffprobe subprocess. The adapter has its own per-file timeout, but a release with
+# many candidates could otherwise make an import cycle wait N times that timeout
+# while probing serially.
+_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS: Final = 30.0
 
 # Bounded Finalizing (issue #158): "Finalizing" ("completed", not yet
 # "available") was previously an UNBOUNDED silent state -- a row whose Plex item
@@ -438,7 +446,7 @@ def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, i
         # found" ([]) -> whole-download block, never a silent skip.
         resolved = os.path.realpath(content_path)
         parent_real = os.path.realpath(root_path.parent)
-        if root_path.suffix.lower() not in PLEX_VIDEO_EXTENSIONS or not _is_within(
+        if plex_video_extension(os.fspath(root_path)) is None or not _is_within(
             parent_real, resolved
         ):
             return []
@@ -454,6 +462,41 @@ class _VideoVerificationError(RuntimeError):
     """A surfaced, retryable reason no candidate can enter a Plex library."""
 
 
+class _VideoVerificationUnavailableError(_VideoVerificationError):
+    """Verification could not establish whether any candidate was acceptable."""
+
+
+def _probe_before_deadline(
+    media_probe: MediaProbePort,
+    path: Path,
+    deadline: float,
+    started: threading.Event,
+    cancelled: threading.Event,
+) -> None:
+    """Run one synchronous probe using budget left after executor queueing."""
+    started.set()
+    if cancelled.is_set():
+        raise TimeoutError
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    media_probe.probe(path, timeout_seconds=remaining)
+
+
+async def _stop_or_join_probe_task(
+    task: asyncio.Task[None],
+    *,
+    started: threading.Event,
+    cancelled: threading.Event,
+) -> None:
+    """Cancel queued work or join a started probe through child-process cleanup."""
+    if not started.is_set():
+        cancelled.set()
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+
+
 async def _verified_plex_video_sources(
     media_probe: MediaProbePort,
     sources: list[tuple[str, int, str]],
@@ -465,8 +508,10 @@ async def _verified_plex_video_sources(
     a real (non-cover-art) video stream. A bad candidate is rejected individually:
     a download that also contains a valid matching feature/episode remains useful,
     and only accepted candidates can reach placement. A probe infrastructure
-    failure is different -- the result is unknown, so the whole import blocks
-    retryably rather than importing without verification.
+    failure leaves that ONE candidate unknown, so probing continues: verified
+    siblings remain useful, but a batch with no verified candidate is surfaced as
+    unavailable rather than importing without verification. The aggregate deadline
+    prevents a many-file release from multiplying the adapter's per-file timeout.
     """
     if not sources:
         raise _VideoVerificationError(
@@ -475,17 +520,65 @@ async def _verified_plex_video_sources(
 
     accepted: list[tuple[str, int, str]] = []
     rejected = 0
-    for source in sources:
+    unavailable = 0
+    unavailable_detail: str | None = None
+    deadline = time.monotonic() + _VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS
+    for index, source in enumerate(sources):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            unavailable += len(sources) - index
+            unavailable_detail = unavailable_detail or (
+                "verification batch exceeded its "
+                f"{_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS:g}-second deadline"
+            )
+            break
+        started = threading.Event()
+        cancelled = threading.Event()
+        probe_task = asyncio.create_task(
+            asyncio.to_thread(
+                _probe_before_deadline,
+                media_probe,
+                Path(source[0]),
+                deadline,
+                started,
+                cancelled,
+            )
+        )
         try:
-            await asyncio.to_thread(media_probe.probe, Path(source[0]))
+            async with asyncio.timeout(remaining):
+                await asyncio.shield(probe_task)
+        except TimeoutError:
+            await _stop_or_join_probe_task(
+                probe_task,
+                started=started,
+                cancelled=cancelled,
+            )
+            unavailable += len(sources) - index
+            unavailable_detail = unavailable_detail or (
+                "verification batch exceeded its "
+                f"{_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS:g}-second deadline"
+            )
+            break
+        except asyncio.CancelledError:
+            await _stop_or_join_probe_task(
+                probe_task,
+                started=started,
+                cancelled=cancelled,
+            )
+            raise
         except MediaProbeUnavailableError as exc:
-            raise _VideoVerificationError(f"video verification unavailable: {exc}") from exc
+            unavailable += 1
+            unavailable_detail = unavailable_detail or str(exc)
         except MediaProbeError:
             rejected += 1
         else:
             accepted.append(source)
 
     if not accepted:
+        if unavailable_detail is not None:
+            raise _VideoVerificationUnavailableError(
+                f"video verification unavailable: {unavailable_detail}"
+            )
         raise _VideoVerificationError(
             "no verified Plex-compatible video file found in the completed download "
             f"({rejected} candidate(s) rejected)"
@@ -495,7 +588,40 @@ async def _verified_plex_video_sources(
             "ignored %s candidate video file(s) that failed Plex media verification",
             safe_int(rejected),
         )
+    if unavailable:
+        _logger.warning(
+            "ignored %s candidate video file(s) whose Plex media verification was unavailable",
+            safe_int(unavailable),
+        )
     return accepted
+
+
+async def _refresh_resumed_import_after_probe_outage(
+    *,
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    torrent_hash: str,
+    download_id: int,
+    request_id: int,
+    reason: _VideoVerificationUnavailableError,
+    season: int | None = None,
+) -> DownloadRecord | None:
+    """Refresh a crash-resumed row before claiming it remains auto-retryable."""
+    await session.rollback()
+    current = await download_repo.get_by_hash(torrent_hash)
+    if current is None or current.status != DownloadState.Importing.value:
+        return current
+    extra = {"request_id": safe_int(request_id)}
+    if season is not None:
+        extra["season"] = safe_int(season)
+    _logger.warning(
+        "video verification unavailable while resuming download %s; "
+        "keeping Importing for automatic retry: %s",
+        safe_int(download_id),
+        reason,
+        extra=extra,
+    )
+    return current
 
 
 def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
@@ -875,6 +1001,7 @@ async def _import_download_locked(
     torrent_hash = row.torrent_hash
     season = row.season
     episodes = row.episodes_json
+    entered_importing = row.status == DownloadState.Importing.value
     if row.status not in _RESUMABLE:
         return await download_repo.get_by_hash(torrent_hash)  # already done / not importable
     if row.media_request_id is None:
@@ -933,6 +1060,7 @@ async def _import_download_locked(
                 session=session,
                 tv_root=effective_tv_root,
                 torrent_hash=torrent_hash,
+                entered_importing=entered_importing,
             )
         if season is None:  # pragma: no cover - grab_service always threads season for tv
             await _block(
@@ -958,6 +1086,7 @@ async def _import_download_locked(
             session=session,
             tv_root=effective_tv_root,
             torrent_hash=torrent_hash,
+            entered_importing=entered_importing,
         )
     if request.media_type != "movie":  # pragma: no cover - MediaType enum has only movie/tv
         await _block(
@@ -1043,6 +1172,24 @@ async def _import_download_locked(
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
     try:
         sources = await _verified_plex_video_sources(media_probe, sources)
+    except _VideoVerificationUnavailableError as exc:
+        if entered_importing:
+            return await _refresh_resumed_import_after_probe_outage(
+                session=session,
+                download_repo=download_repo,
+                torrent_hash=torrent_hash,
+                download_id=download_id,
+                request_id=request.id,
+                reason=exc,
+            )
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            str(exc),
+            request_id=request.id,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
             session,
@@ -1324,6 +1471,7 @@ async def _import_tv_targets_locked(
     session: AsyncSession,
     tv_root: str,
     torrent_hash: str,
+    entered_importing: bool,
 ) -> DownloadRecord | None:
     download_repo = SqlDownloadRepository(session)
     request = targets[0].request
@@ -1398,6 +1546,25 @@ async def _import_tv_targets_locked(
     sources = await asyncio.to_thread(_resolve_sources, fs, visible_content)
     try:
         sources = await _verified_plex_video_sources(media_probe, sources)
+    except _VideoVerificationUnavailableError as exc:
+        if entered_importing:
+            return await _refresh_resumed_import_after_probe_outage(
+                session=session,
+                download_repo=download_repo,
+                torrent_hash=torrent_hash,
+                download_id=download_id,
+                request_id=request.id,
+                reason=exc,
+            )
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            str(exc),
+            request_id=request.id,
+            seasons=target_seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
             session,
@@ -1614,6 +1781,7 @@ async def _import_tv_locked(
     session: AsyncSession,
     tv_root: str,
     torrent_hash: str,
+    entered_importing: bool,
 ) -> DownloadRecord | None:
     """Validate EVERY file in a completed TV season download; import whatever
     accepted, ONE Plex scan for the whole season, then mark the SEASON completed.
@@ -1706,6 +1874,26 @@ async def _import_tv_locked(
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
     try:
         sources = await _verified_plex_video_sources(media_probe, sources)
+    except _VideoVerificationUnavailableError as exc:
+        if entered_importing:
+            return await _refresh_resumed_import_after_probe_outage(
+                session=session,
+                download_repo=download_repo,
+                torrent_hash=torrent_hash,
+                download_id=download_id,
+                request_id=request.id,
+                reason=exc,
+                season=season,
+            )
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            str(exc),
+            request_id=request.id,
+            season=season,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
             session,
