@@ -8,7 +8,10 @@ gate against the real ``default_profile``.
 
 from __future__ import annotations
 
+from plex_manager.domain import import_validation
 from plex_manager.domain.import_validation import (
+    PLEX_VIDEO_EXTENSIONS,
+    VIDEO_EXTENSIONS,
     ImportRejectionReason,
     ImportValidation,
     SeasonImportValidation,
@@ -117,6 +120,11 @@ class FakeParser:
 _GIB = 1024 * 1024 * 1024
 
 
+def test_video_extensions_compatibility_export_is_the_plex_policy() -> None:
+    assert VIDEO_EXTENSIONS is PLEX_VIDEO_EXTENSIONS
+    assert "VIDEO_EXTENSIONS" in import_validation.__all__
+
+
 def _validate(*files: VideoFile) -> ImportValidation:
     return validate_import(
         list(files),
@@ -208,6 +216,19 @@ def test_no_video_file_rejects() -> None:
     assert result.accepted is False
     assert result.video is None
     assert result.parsed is None
+    assert [r.reason for r in result.rejections] == [ImportRejectionReason.NO_VIDEO_FILE]
+
+
+def test_movie_inside_disc_structure_is_not_a_video_candidate() -> None:
+    result = _validate(
+        VideoFile(
+            "The.Matrix.1999.1080p.BluRay/BDMV/STREAM/The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv",
+            8 * _GIB,
+        )
+    )
+
+    assert result.accepted is False
+    assert result.video is None
     assert [r.reason for r in result.rejections] == [ImportRejectionReason.NO_VIDEO_FILE]
 
 
@@ -627,6 +648,19 @@ def test_sample_and_nfo_are_silently_dropped() -> None:
         VideoFile("Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.nfo", 1024),
     )
     assert len(result.accepted) == 1
+    assert result.rejected == ()
+    assert result.skipped_not_requested == ()
+
+
+def test_tv_episode_inside_disc_structure_is_not_a_video_candidate() -> None:
+    result = _validate_season(
+        VideoFile(
+            "Breaking.Bad.S02/VIDEO_TS/Breaking.Bad.S02E01.1080p.WEB-DL.x264-GRP.mkv",
+            2 * _GIB,
+        )
+    )
+
+    assert result.accepted == ()
     assert result.rejected == ()
     assert result.skipped_not_requested == ()
 

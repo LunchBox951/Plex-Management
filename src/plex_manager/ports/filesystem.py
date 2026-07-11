@@ -10,31 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-__all__ = ["VIDEO_EXTENSIONS", "FileSystemPort"]
+from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
 
-#: Lowercased file suffixes (with the leading dot) that count as a video file
-#: when scanning a downloaded release for the main feature. Mirrors the common
-#: container set Radarr/Sonarr treat as video; sample and extras files are
-#: filtered by name, not by extension.
-VIDEO_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".mkv",
-        ".mp4",
-        ".avi",
-        ".m4v",
-        ".mov",
-        ".wmv",
-        ".mpg",
-        ".mpeg",
-        ".ts",
-        ".m2ts",
-        ".webm",
-        ".flv",
-        ".vob",
-        ".ogv",
-        ".divx",
-    }
-)
+__all__ = ["PLEX_VIDEO_EXTENSIONS", "VIDEO_EXTENSIONS", "FileSystemPort"]
+
+# Compatibility export for callers that predate the Plex-specific policy name.
+# New code should use ``PLEX_VIDEO_EXTENSIONS`` so the acceptance boundary is
+# explicit rather than looking like a generic list of every video-ish suffix.
+VIDEO_EXTENSIONS = PLEX_VIDEO_EXTENSIONS
 
 
 @runtime_checkable
