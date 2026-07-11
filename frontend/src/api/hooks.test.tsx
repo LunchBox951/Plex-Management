@@ -48,11 +48,14 @@ beforeEach(() => {
   vi.mocked(client.POST).mockReset()
   vi.mocked(client.PUT).mockReset()
   vi.mocked(client.DELETE).mockReset()
+  apiKeyLib.clearApiKey()
   setRealtimeConnected(false)
 })
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.restoreAllMocks()
+  apiKeyLib.clearApiKey()
 })
 
 describe('useUpdateSettings', () => {
@@ -246,6 +249,13 @@ describe('useRotateAppKey', () => {
       data: rotated,
       response: { status: 200 },
     })
+    const finishRotation = vi.fn(() => {
+      // The replacement must already be visible when the old-key barrier opens.
+      expect(apiKeyLib.getApiKey()).toBe('brand-new-key')
+    })
+    const beginRotationSpy = vi
+      .spyOn(apiKeyLib, 'beginApiKeyRotation')
+      .mockReturnValue(finishRotation)
     const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
@@ -254,11 +264,13 @@ describe('useRotateAppKey', () => {
     const outcome = await result.current.mutateAsync()
 
     expect(outcome.app_api_key).toBe('brand-new-key')
+    expect(beginRotationSpy).toHaveBeenCalledTimes(1)
     // Fails before the fix: a rotated key never written into THIS browser's
     // own store would 401 the very next request from the device that just
     // rotated it -- every other device is correctly locked out, but this one
     // must not be.
     expect(setApiKeySpy).toHaveBeenCalledWith('brand-new-key')
+    expect(finishRotation).toHaveBeenCalledTimes(1)
     // Minting flips the Access card from Generate to Rotate/Revoke: the status
     // query must be invalidated so the card reflects that a key now exists.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })

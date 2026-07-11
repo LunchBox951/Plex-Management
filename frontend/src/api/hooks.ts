@@ -7,7 +7,7 @@ import { useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
-import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
+import { beginApiKeyRotation, disableApiKeyAuth, setApiKey } from '../lib/apiKey'
 import type {
   AppApiKeyResponse,
   AppApiKeyStatusResponse,
@@ -258,10 +258,20 @@ export function useAppKeyStatus() {
 export function useRotateAppKey() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (): Promise<AppApiKeyResponse> =>
-      unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
-    onSuccess: (data) => {
-      setApiKey(data.app_api_key)
+    mutationFn: async (): Promise<AppApiKeyResponse> => {
+      const finishRotation = beginApiKeyRotation()
+      try {
+        const data = unwrap(await client.POST('/api/v1/settings/app-key/rotate'))
+        // Store the replacement BEFORE releasing the old-key barrier. Any SSE or
+        // REST 401 that raced the server-side stream close can then see that its
+        // credential is stale instead of clearing/disabling the rotation winner.
+        setApiKey(data.app_api_key)
+        return data
+      } finally {
+        finishRotation()
+      }
+    },
+    onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
     },
   })

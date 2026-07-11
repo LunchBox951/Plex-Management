@@ -27,6 +27,7 @@ function streamFromChunks(...chunks: string[]): ReadableStream<Uint8Array> {
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
+  apiKeyLib.clearApiKey()
   setRealtimeReloadRequired(false)
 })
 
@@ -104,6 +105,18 @@ describe('applyRealtimeEvent', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsDisk })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
+  })
+
+  it('invalidates Discover when a settings event arrives without a request topic', () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    applyRealtimeEvent(qc, { seq: 10, topics: ['settings'], reason: 'settings_updated' })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.settings })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.requests })
   })
 })
 
@@ -273,6 +286,51 @@ describe('startRealtimeStream authentication', () => {
     const eventTypes = dispatch.mock.calls.map(([event]) => event.type)
     expect(eventTypes).not.toContain(AUTH_INVALID_EVENT)
     expect(eventTypes).not.toContain(AUTH_EXPIRED_EVENT)
+
+    stop()
+    qc.clear()
+  })
+
+  it('waits for an in-flight rotation before judging an old-key 401', async () => {
+    vi.useFakeTimers()
+    apiKeyLib.setApiKey('old-key')
+    apiKeyLib.enableApiKeyAuth()
+    const finishRotation = apiKeyLib.beginApiKeyRotation()
+    const clearKey = vi.spyOn(apiKeyLib, 'clearApiKey')
+    const dispatch = vi.spyOn(window, 'dispatchEvent')
+    const fetchImpl = vi
+      .fn(async () => ({ status: 403, ok: false, body: null }) as unknown as Response)
+      .mockResolvedValueOnce(({ status: 401, ok: false, body: null }) as unknown as Response)
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const stop = startRealtimeStream({
+      queryClient: qc,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    // The reconnect was rejected after the server committed, but the rotate
+    // response has not delivered its replacement yet. The old key remains intact.
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(clearKey).not.toHaveBeenCalled()
+    expect(dispatch.mock.calls.map(([event]) => event.type)).not.toContain(AUTH_INVALID_EVENT)
+
+    // The rotation winner stores the new key before releasing the barrier. The
+    // deferred 401 is now stale and the next reconnect uses the replacement.
+    apiKeyLib.setApiKey('new-key')
+    finishRotation()
+    await vi.advanceTimersByTimeAsync(5)
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      '/api/v1/events',
+      expect.objectContaining({ headers: { 'X-Api-Key': 'new-key' } }),
+    )
+    expect(clearKey).not.toHaveBeenCalled()
+    expect(dispatch.mock.calls.map(([event]) => event.type)).not.toContain(AUTH_INVALID_EVENT)
 
     stop()
     qc.clear()

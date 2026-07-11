@@ -1,6 +1,11 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
-import { clearApiKey, getApiKey, isApiKeyAuthEnabled } from './apiKey'
+import {
+  clearApiKey,
+  getApiKey,
+  getPendingApiKeyRotation,
+  isApiKeyAuthEnabled,
+} from './apiKey'
 import { queryKeys } from './queryClient'
 import { setRealtimeConnected } from './realtimeState'
 import { setRealtimeReloadRequired } from './realtimeReload'
@@ -115,6 +120,9 @@ export function applyRealtimeEvent(qc: QueryClient, event: RealtimeEventPayload)
   if (topics.has('settings')) {
     void qc.invalidateQueries({ queryKey: queryKeys.settings })
     void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+    // Match the local settings mutation: TMDB credentials back every Discover
+    // cache, and Discover has no polling cadence to heal another tab on its own.
+    void qc.invalidateQueries({ queryKey: ['discover'] })
   }
   if (topics.has('access')) {
     void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
@@ -216,6 +224,16 @@ export function startRealtimeStream({
           if (key === null) {
             window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
             return
+          }
+          // Rotation commits before its HTTP response can hand this tab the new
+          // key, and the commit deliberately closes old-key streams. If that EOF
+          // reconnects quickly, defer judging its 401 until the local rotation
+          // settles. Success stores the replacement before releasing the barrier;
+          // failure leaves the old key current and therefore genuinely invalid.
+          let rotation = getPendingApiKeyRotation(key)
+          while (rotation !== null) {
+            await rotation
+            rotation = getPendingApiKeyRotation(key)
           }
           if (isApiKeyAuthEnabled() && key === getApiKey()) {
             clearApiKey()

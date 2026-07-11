@@ -10,7 +10,13 @@
  */
 import createClient, { type Middleware } from 'openapi-fetch'
 import type { paths } from './schema'
-import { clearApiKey, getApiKey, getSetupToken, isApiKeyAuthEnabled } from '../lib/apiKey'
+import {
+  clearApiKey,
+  getApiKey,
+  getPendingApiKeyRotation,
+  getSetupToken,
+  isApiKeyAuthEnabled,
+} from '../lib/apiKey'
 
 /** Fired when any call returns 409 `setup_required`; the shell routes to /setup. */
 export const SETUP_REQUIRED_EVENT = 'plexmgr:setup-required'
@@ -62,10 +68,9 @@ const authMiddleware: Middleware = {
       // 401 from an earlier request that used a now-replaced key must not clobber
       // a freshly pasted/valid key and undo recovery (#139).
       const sentKey = request.headers.get('X-Api-Key')
-      if (sentKey && sentKey === getApiKey()) {
-        clearApiKey()
-        emit(AUTH_INVALID_EVENT)
-      } else if (!sentKey) {
+      if (sentKey) {
+        rejectApiKeyIfCurrentAfterRotation(sentKey)
+      } else {
         // No current api key rode this request, yet it was rejected: the request
         // was relying on the browser session cookie, which is now missing/expired/
         // revoked. Signal so the gate re-checks auth and shows the login again.
@@ -76,6 +81,21 @@ const authMiddleware: Middleware = {
     }
     return response
   },
+}
+
+function rejectApiKeyIfCurrentAfterRotation(sentKey: string): void {
+  const rotation = getPendingApiKeyRotation(sentKey)
+  if (rotation !== null) {
+    // Do not return this promise to openapi-fetch: the rotate request's own 401
+    // must be allowed to reach the mutation so its finally block can release the
+    // barrier. Re-enter afterward to cover a back-to-back rotation of this key.
+    void rotation.then(() => rejectApiKeyIfCurrentAfterRotation(sentKey))
+    return
+  }
+  if (sentKey === getApiKey()) {
+    clearApiKey()
+    emit(AUTH_INVALID_EVENT)
+  }
 }
 
 function isUnsafeMethod(method: string): boolean {
