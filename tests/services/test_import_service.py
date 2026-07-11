@@ -1023,7 +1023,7 @@ async def test_probe_outage_refreshes_concurrently_changed_importing_row(
         FakeLibrary(),
         media_probe=probe,
     )
-    await changer
+    assert await changer is None
 
     assert record is not None
     assert record.status == DownloadState.Failed.value

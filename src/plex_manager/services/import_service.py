@@ -494,7 +494,7 @@ async def _stop_or_join_probe_task(
         cancelled.set()
         task.cancel()
     with contextlib.suppress(asyncio.CancelledError, Exception):
-        await task
+        _ = await task
 
 
 async def _verified_plex_video_sources(
