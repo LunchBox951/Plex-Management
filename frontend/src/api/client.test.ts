@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  beginApiKeyRotation,
   clearApiKey,
   enableApiKeyAuth,
   getApiKey,
   isApiKeyAuthEnabled,
   setApiKey,
 } from '../lib/apiKey'
+import { beginApiKeyRotation } from '../lib/apiKeyRotation'
 import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from './client'
 
 const h = vi.hoisted(() => ({

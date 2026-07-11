@@ -13,10 +13,10 @@ import type { paths } from './schema'
 import {
   clearApiKey,
   getApiKey,
-  getPendingApiKeyRotation,
   getSetupToken,
   isApiKeyAuthEnabled,
 } from '../lib/apiKey'
+import { getPendingApiKeyRotation } from '../lib/apiKeyRotation'
 
 /** Fired when any call returns 409 `setup_required`; the shell routes to /setup. */
 export const SETUP_REQUIRED_EVENT = 'plexmgr:setup-required'

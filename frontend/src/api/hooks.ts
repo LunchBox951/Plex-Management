@@ -7,7 +7,8 @@ import { useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
-import { beginApiKeyRotation, disableApiKeyAuth, setApiKey } from '../lib/apiKey'
+import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
+import { beginApiKeyRotation } from '../lib/apiKeyRotation'
 import type {
   AppApiKeyResponse,
   AppApiKeyStatusResponse,

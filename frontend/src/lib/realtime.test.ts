@@ -4,6 +4,7 @@ import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
 import { applyRealtimeEvent, parseSseStream, startRealtimeStream } from './realtime'
 import { queryKeys } from './queryClient'
 import * as apiKeyLib from './apiKey'
+import * as apiKeyRotationLib from './apiKeyRotation'
 import { getRealtimeReloadRequired, setRealtimeReloadRequired } from './realtimeReload'
 
 function streamFrom(text: string): ReadableStream<Uint8Array> {
@@ -295,7 +296,7 @@ describe('startRealtimeStream authentication', () => {
     vi.useFakeTimers()
     apiKeyLib.setApiKey('old-key')
     apiKeyLib.enableApiKeyAuth()
-    const finishRotation = apiKeyLib.beginApiKeyRotation()
+    const finishRotation = apiKeyRotationLib.beginApiKeyRotation()
     const clearKey = vi.spyOn(apiKeyLib, 'clearApiKey')
     const dispatch = vi.spyOn(window, 'dispatchEvent')
     const fetchImpl = vi

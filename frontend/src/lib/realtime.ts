@@ -1,11 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
-import {
-  clearApiKey,
-  getApiKey,
-  getPendingApiKeyRotation,
-  isApiKeyAuthEnabled,
-} from './apiKey'
+import { clearApiKey, getApiKey, isApiKeyAuthEnabled } from './apiKey'
+import { getPendingApiKeyRotation } from './apiKeyRotation'
 import { queryKeys } from './queryClient'
 import { setRealtimeConnected } from './realtimeState'
 import { setRealtimeReloadRequired } from './realtimeReload'

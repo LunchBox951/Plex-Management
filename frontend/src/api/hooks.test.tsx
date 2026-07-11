@@ -23,6 +23,7 @@ import {
   queryKeys,
 } from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
+import * as apiKeyRotationLib from '../lib/apiKeyRotation'
 import { setRealtimeConnected } from '../lib/realtimeState'
 import type {
   AppApiKeyResponse,
@@ -254,7 +255,7 @@ describe('useRotateAppKey', () => {
       expect(apiKeyLib.getApiKey()).toBe('brand-new-key')
     })
     const beginRotationSpy = vi
-      .spyOn(apiKeyLib, 'beginApiKeyRotation')
+      .spyOn(apiKeyRotationLib, 'beginApiKeyRotation')
       .mockReturnValue(finishRotation)
     const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
 
