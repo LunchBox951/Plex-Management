@@ -9,7 +9,7 @@ import { SetupGate } from './SetupGate'
 const h = vi.hoisted(() => ({
   setup: { data: { initialized: true, app_api_key: null }, isLoading: false, isError: false },
   auth: {
-    data: { authenticated: false, auth_method: null as string | null, user: null },
+    data: { authenticated: false, auth_method: null as string | null, is_admin: false, user: null },
     isLoading: false,
   },
   invalidateQueries: vi.fn(),
@@ -31,6 +31,12 @@ vi.mock('./PlexLogin', () => ({
 
 vi.mock('./KeyEntry', () => ({
   KeyEntry: () => <div>Mock Key Entry</div>,
+}))
+
+vi.mock('./RealtimeProvider', () => ({
+  RealtimeProvider: ({ children }: { children: ReactNode }) => (
+    <div data-testid="realtime-provider">{children}</div>
+  ),
 }))
 
 vi.mock('./ui/feedback', () => ({
@@ -59,7 +65,10 @@ vi.mock('@tanstack/react-query', async () => {
 describe('SetupGate auth routing', () => {
   beforeEach(() => {
     h.setup = { data: { initialized: true, app_api_key: null }, isLoading: false, isError: false }
-    h.auth = { data: { authenticated: false, auth_method: null, user: null }, isLoading: false }
+    h.auth = {
+      data: { authenticated: false, auth_method: null, is_admin: false, user: null },
+      isLoading: false,
+    }
     h.invalidateQueries.mockClear()
   })
 
@@ -67,18 +76,38 @@ describe('SetupGate auth routing', () => {
     render(<SetupGate />, { wrapper: MemoryRouter })
 
     expect(screen.getByText('Mock Plex Login')).toBeInTheDocument()
+    expect(screen.queryByTestId('realtime-provider')).not.toBeInTheDocument()
   })
 
-  it('skips Plex login once auth/me reports authenticated', () => {
-    h.auth = { data: { authenticated: true, auth_method: 'plex_session', user: null }, isLoading: false }
+  it('does not mount realtime for an authenticated shared user', () => {
+    h.auth = {
+      data: { authenticated: true, auth_method: 'plex_session', is_admin: false, user: null },
+      isLoading: false,
+    }
 
     render(<SetupGate />, { wrapper: MemoryRouter })
 
     expect(screen.queryByText('Mock Plex Login')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('realtime-provider')).not.toBeInTheDocument()
+  })
+
+  it('mounts realtime only after auth/me reports an authenticated admin', () => {
+    h.auth = {
+      data: { authenticated: true, auth_method: 'plex_session', is_admin: true, user: null },
+      isLoading: false,
+    }
+
+    render(<SetupGate />, { wrapper: MemoryRouter })
+
+    expect(screen.queryByText('Mock Plex Login')).not.toBeInTheDocument()
+    expect(screen.getByTestId('realtime-provider')).toBeInTheDocument()
   })
 
   it('refetches auth state when a session-expired event fires', () => {
-    h.auth = { data: { authenticated: true, auth_method: 'plex_session', user: null }, isLoading: false }
+    h.auth = {
+      data: { authenticated: true, auth_method: 'plex_session', is_admin: true, user: null },
+      isLoading: false,
+    }
 
     render(<SetupGate />, { wrapper: MemoryRouter })
     act(() => {
@@ -91,7 +120,10 @@ describe('SetupGate auth routing', () => {
   it('shows KeyEntry after an access-key 401, even with cached authenticated state', () => {
     // Authenticated via a stored access key: /auth/me is cached authenticated:true,
     // so protected screens (an empty <Outlet/>) render — KeyEntry is NOT shown yet.
-    h.auth = { data: { authenticated: true, auth_method: 'api_key', user: null }, isLoading: false }
+    h.auth = {
+      data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+      isLoading: false,
+    }
 
     render(<SetupGate />, { wrapper: MemoryRouter })
     expect(screen.queryByText('Mock Key Entry')).not.toBeInTheDocument()
@@ -106,5 +138,6 @@ describe('SetupGate auth routing', () => {
     expect(h.invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.authMe })
     expect(screen.getByText('Mock Key Entry')).toBeInTheDocument()
     expect(screen.queryByText('Mock Plex Login')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('realtime-provider')).not.toBeInTheDocument()
   })
 })

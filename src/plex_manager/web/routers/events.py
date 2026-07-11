@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
-from plex_manager.web.deps import require_api_key_short_session
+from plex_manager.web.deps import AuthContext, require_admin_short_session
 from plex_manager.web.events import RealtimeEvent, get_event_hub
 
 __all__ = ["router"]
@@ -16,22 +18,23 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/events",
     tags=["events"],
-    # Auth that owns a short-lived session and closes it BEFORE streaming begins,
-    # so the long-lived SSE connection never pins a DB connection (see
-    # ``require_api_key_short_session``). A plain ``Depends(require_api_key)`` would
-    # hold ``get_session``'s yield-scoped connection for the tab's whole lifetime.
-    dependencies=[Depends(require_api_key_short_session)],
 )
 
 _HEARTBEAT_SECONDS = 15.0
 
 
 @router.get("", response_class=EventSourceResponse)
-async def events_endpoint(request: Request) -> AsyncIterator[ServerSentEvent]:
-    """Stream realtime invalidation events for the authenticated SPA.
+async def events_endpoint(
+    request: Request,
+    auth: Annotated[AuthContext, Depends(require_admin_short_session)],
+) -> AsyncIterator[ServerSentEvent]:
+    """Stream realtime invalidation events for the authenticated admin SPA.
 
     The stream holds no DB session. Each event is a hint to refetch existing REST
     resources, so reconnects and overflow collapse to a broad ``sync`` event.
+    Shared Plex users retain the normal polling path instead: global queue,
+    blocklist, and request-activity signals would otherwise reveal admin-only or
+    other-user activity even when the REST resources themselves stay filtered.
     """
     # The pending ``subscription.get()`` is held as a *persistent* task and raced
     # against the heartbeat with ``asyncio.wait``, which leaves the loser pending
@@ -41,16 +44,32 @@ async def events_endpoint(request: Request) -> AsyncIterator[ServerSentEvent]:
     # cancellation path. Never cancelling the getter mid-flight keeps delivery
     # structurally lossless (north-star #3), independent of CPython internals; the
     # getter is only cancelled at teardown.
-    subscription = get_event_hub(request.app).subscribe()
+    subscription = get_event_hub(request.app).subscribe(
+        auth_method=auth.method.value,
+        user_id=auth.user_id,
+    )
+    loop = asyncio.get_running_loop()
+    lease_deadline: float | None = None
+    if auth.session_expires_at is not None:
+        remaining = (auth.session_expires_at - datetime.now(UTC)).total_seconds()
+        lease_deadline = loop.time() + max(0.0, remaining)
     getter: asyncio.Task[RealtimeEvent] | None = None
     try:
         while True:
             if await request.is_disconnected():
                 break
+            timeout = _HEARTBEAT_SECONDS
+            if lease_deadline is not None:
+                lease_remaining = lease_deadline - loop.time()
+                if lease_remaining <= 0:
+                    break
+                timeout = min(timeout, lease_remaining)
             if getter is None:
                 getter = asyncio.ensure_future(subscription.get())
-            done, _pending = await asyncio.wait({getter}, timeout=_HEARTBEAT_SECONDS)
+            done, _pending = await asyncio.wait({getter}, timeout=timeout)
             if getter not in done:
+                if lease_deadline is not None and loop.time() >= lease_deadline:
+                    break
                 # Heartbeat: the getter stays pending for the next iteration, so
                 # no enqueued event is ever discarded by a timeout cancellation.
                 yield ServerSentEvent(comment="ping")

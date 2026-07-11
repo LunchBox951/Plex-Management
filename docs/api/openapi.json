@@ -3413,7 +3413,7 @@
     },
     "/api/v1/events": {
       "get": {
-        "description": "Stream realtime invalidation events for the authenticated SPA.\n\nThe stream holds no DB session. Each event is a hint to refetch existing REST\nresources, so reconnects and overflow collapse to a broad ``sync`` event.",
+        "description": "Stream realtime invalidation events for the authenticated admin SPA.\n\nThe stream holds no DB session. Each event is a hint to refetch existing REST\nresources, so reconnects and overflow collapse to a broad ``sync`` event.\nShared Plex users retain the normal polling path instead: global queue,\nblocklist, and request-activity signals would otherwise reveal admin-only or\nother-user activity even when the REST resources themselves stay filtered.",
         "operationId": "events_endpoint_api_v1_events_get",
         "responses": {
           "200": {
@@ -3445,6 +3445,9 @@
         "security": [
           {
             "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
           }
         ],
         "summary": "Events Endpoint",

@@ -52,6 +52,7 @@ from plex_manager.web.deps import (
     require_api_key,
 )
 from plex_manager.web.errors import AppError
+from plex_manager.web.events import close_realtime_streams
 from plex_manager.web.schemas import AuthMeResponse, AuthUser, PlexSignInRequest
 
 __all__ = ["router"]
@@ -174,14 +175,23 @@ async def logout_endpoint(
     """Revoke the current Plex browser session and clear auth cookies."""
 
     token = request.cookies.get(SESSION_COOKIE_NAME)
+    revoked_user_id: int | None = None
     if token:
         result = await session.execute(
             select(AuthSession).where(AuthSession.token_hash == hash_session_token(token))
         )
         auth_session = result.scalars().first()
         if auth_session is not None and auth_session.revoked_at is None:
+            revoked_user_id = auth_session.user_id
             auth_session.revoked_at = datetime.now(UTC)
             await session.commit()
+    if revoked_user_id is not None:
+        close_realtime_streams(
+            request.app,
+            reason="session_logged_out",
+            auth_method=AuthMethod.plex_session.value,
+            user_id=revoked_user_id,
+        )
     _clear_session_cookies(response, request=request)
 
 

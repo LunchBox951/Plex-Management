@@ -136,6 +136,7 @@ async def test_evict_publishes_realtime_event_for_other_connected_clients(
     event = await subscription.get()
     assert event.topics == ("requests", "discover", "ops:disk", "ops:health")
     assert event.reason == "eviction"
+    subscription.close()
 
 
 async def test_evict_still_runs_when_the_automatic_switch_is_disabled(

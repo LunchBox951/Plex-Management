@@ -53,6 +53,7 @@ from plex_manager.web.deps import (
     load_system_settings,
     require_api_key,
 )
+from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers.settings import (
     _BOOL_SETTING_DEFAULTS,  # pyright: ignore[reportPrivateUsage]
 )
@@ -535,6 +536,12 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9201, tag="repoint-adm")
     other_cookies, _ = await _admin_session_cookies(app, plex_id=9202, tag="repoint-other")
     assert await _active_session_count(sessionmaker_) == 2
+    hub = get_event_hub(app)
+    admin_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=1)
+    other_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=2)
+    api_key_stream = hub.subscribe(auth_method=AuthMethod.api_key.value)
+    for subscription in (admin_stream, other_stream, api_key_stream):
+        _ = await subscription.get()  # initial sync
     probes: list[httpx.Request] = []
     await _use_transport(
         app,
@@ -554,6 +561,10 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the verified anchor
     assert await _active_session_count(sessionmaker_) == 0  # everyone, caller included
+    assert admin_stream.closed
+    assert other_stream.closed
+    assert not api_key_stream.closed  # recovery-key authority survives a Plex repoint
+    api_key_stream.close()
     # The ownership check presented the CALLER's own account OAuth token to plex.tv.
     ownership = [p for p in probes if p.url.host == "plex.tv"]
     assert ownership and ownership[0].headers.get("X-Plex-Token") == _SEED_OAUTH_TOKEN

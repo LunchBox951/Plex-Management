@@ -66,6 +66,8 @@ jobs:
           push: false
           load: true
           tags: ${{ steps.img.outputs.name }}:pr
+          build-args: |
+            PLEX_MANAGER_BUILD_ID=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -129,6 +131,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PLEX_MANAGER_BUILD_ID=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

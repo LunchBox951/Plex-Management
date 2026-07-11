@@ -8,9 +8,6 @@
   feel live without an operator poking it), [ADR-0009](0009-frontend-typed-spa.md)
   (the typed SPA + React Query cache these events invalidate).
 
-> This ADR may be renumbered at merge time if a sibling PR lands an ADR with the
-> same number first; the decision content is unaffected.
-
 ## Context
 
 The SPA's live surfaces (`/queue`, `/requests`, the Status cards) were polled on
@@ -35,9 +32,14 @@ battle-tested stack rather than re-derived (north-star #4):
 
 ## Decision
 
-Add an authenticated `GET /api/v1/events` **Server-Sent Events** stream that
-carries **coarse cache-invalidation hints**, backed by an in-process hub — and
-keep polling as a permanent, slowed-down safety net rather than removing it.
+Add an administrator-authenticated `GET /api/v1/events` **Server-Sent Events**
+stream that carries **coarse cache-invalidation hints**, backed by an in-process
+hub — and keep polling as a permanent, slowed-down safety net rather than
+removing it. Shared Plex users remain on the normal disconnected polling path:
+a global stream of queue, blocklist, and request-activity timing would disclose
+admin-only and other-user activity even if the REST resources themselves stayed
+filtered. A future shared-user realtime path must carry explicit per-user
+audiences rather than broadcast the same hub events.
 
 **SSE, not WebSocket.** The traffic is strictly server→client and low-volume;
 SSE is one long-lived `GET` over plain HTTP/1.1 with auto-reconnect semantics,
@@ -45,11 +47,14 @@ no second protocol, no upgrade handshake, and it flows through the same auth and
 proxy path as every other request. A bidirectional socket buys nothing here.
 
 **Coarse invalidation, not payload push.** Events name *topics*
-(`requests`, `queue`, `blocklist`, `ops:disk`, …), never row state. The client
-invalidates the matching React Query keys and refetches the existing typed DTOs.
-The REST endpoints stay the single source of truth (ADR-0009's contract is
-untouched), reconnect/overflow collapse to one broad `sync`, and there is no
-second, drift-prone serialization of domain state to keep in sync.
+(`requests`, `queue`, `blocklist`, `settings`, `access`, `ops:disk`, …), never
+row state or row IDs. The client invalidates the matching React Query keys and
+refetches the existing typed DTOs. The REST endpoints stay the single source of
+truth (ADR-0009's contract is untouched), reconnect/overflow collapse to one
+broad `sync`, and there is no second, drift-prone serialization of domain state
+to keep in sync.
+Background loops publish only when their pass actually changes persisted state;
+an idle reconciliation tick must not turn into another polling cadence by proxy.
 
 **A permanent polling floor (the load-bearing safety net).** When the stream is
 connected the client does **not** stop polling — it drops to a slow floor
@@ -76,23 +81,30 @@ still heals any client on a sibling worker. The scale-out path, when needed, is
 to replace the in-process hub with a shared broker / durable outbox behind the
 same `publish_realtime` seam — no call-site changes.
 
-**No DB session held for the stream's lifetime.** Auth validates the API key
+**No DB session held for the stream's lifetime.** Auth validates either the
+opt-in API key or the normal Plex session cookie, plus administrator authority,
 against a session opened and closed *before* streaming begins; the long-lived
 connection then holds no database connection, so open tabs cannot exhaust the
-small aiosqlite pool shared with the reconcile/autograb/eviction workers.
+small aiosqlite pool shared with the reconcile/autograb/eviction workers. A
+Plex-session stream has a lease capped at that session's expiry, and credential
+changes actively close affected streams: logout closes that user's session
+streams, key rotation/revocation closes API-key streams, and a verified Plex
+server repoint closes all old-domain Plex-session streams.
 
-**Version-aware reload.** The connect-time `sync` carries the server build; a
-reconnect reporting a different build (an `:edge` swap under a long-lived tab)
+**Version-aware reload.** Container builds inject the immutable source commit as
+`PLEX_MANAGER_BUILD_ID`; the connect-time `sync` carries that build identifier.
+A reconnect reporting a different build (an `:edge` swap under a long-lived tab)
 prompts the operator to reload rather than silently driving a stale bundle
 against a newer API — surfaced as a button, never an automatic reload
-(north-star #1).
+(north-star #1). Source/dev runs fall back to the package version.
 
 ## Consequences
 
-- Live surfaces update within the push latency in the common case, while steady-
-  state request volume drops by roughly an order of magnitude per open tab (fast
-  poll → slow floor) once the stream is up.
-- One new unauthenticated-until-validated streaming endpoint and one in-process
+- Admin live surfaces update within the push latency in the common case, while
+  steady-state request volume drops by roughly an order of magnitude per admin
+  tab (fast poll → slow floor) once the stream is up. Shared-user tabs retain the
+  regular disconnected polling cadence.
+- One new authenticated streaming endpoint and one in-process
   singleton (`app.state.realtime_hub`); no schema change, no new dependency
   beyond the FastAPI floor bump for `fastapi.sse`.
 - **Transport hygiene is required end to end.** `Cache-Control: no-cache` and

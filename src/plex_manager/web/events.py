@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ __all__ = [
     "EventSubscription",
     "RealtimeEvent",
     "close_realtime_streams",
+    "current_build_id",
     "get_event_hub",
     "publish_realtime",
     "warn_if_multiworker",
@@ -40,6 +42,8 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _STATE_ATTR = "realtime_hub"
+_BUILD_ID_ENV = "PLEX_MANAGER_BUILD_ID"
+_GUNICORN_WORKERS_RE = re.compile(r"(?:^|\s)(?:--workers|-w)(?:=|\s+)(\d+)(?:\s|$)")
 
 
 class _StreamClosed:
@@ -60,8 +64,6 @@ class RealtimeEvent:
     seq: int
     topics: tuple[str, ...]
     reason: str
-    request_id: int | None = None
-    download_id: int | None = None
     app_version: str | None = None
 
     def payload(self) -> dict[str, object]:
@@ -71,10 +73,6 @@ class RealtimeEvent:
             "topics": list(self.topics),
             "reason": self.reason,
         }
-        if self.request_id is not None:
-            data["request_id"] = self.request_id
-        if self.download_id is not None:
-            data["download_id"] = self.download_id
         if self.app_version is not None:
             data["app_version"] = self.app_version
         return data
@@ -87,9 +85,14 @@ class EventSubscription:
         self,
         hub: EventHub,
         queue: asyncio.Queue[RealtimeEvent | _StreamClosed],
+        *,
+        auth_method: str | None,
+        user_id: int | None,
     ) -> None:
         self._hub = hub
         self._queue = queue
+        self.auth_method = auth_method
+        self.user_id = user_id
         self._closed = False
 
     @property
@@ -157,11 +160,15 @@ class EventHub:
     def subscriber_count(self) -> int:
         return len(self._subscribers)
 
-    def subscribe(self) -> EventSubscription:
+    def subscribe(
+        self, *, auth_method: str | None = None, user_id: int | None = None
+    ) -> EventSubscription:
         """Subscribe a client and enqueue an initial sync event."""
         subscription = EventSubscription(
             self,
             asyncio.Queue(maxsize=self._max_queue_size),
+            auth_method=auth_method,
+            user_id=user_id,
         )
         self._subscribers.add(subscription)
         subscription.enqueue(
@@ -179,8 +186,6 @@ class EventHub:
         topics: Iterable[str],
         *,
         reason: str,
-        request_id: int | None = None,
-        download_id: int | None = None,
     ) -> RealtimeEvent:
         """Publish a coarse invalidation event to all current subscribers.
 
@@ -199,8 +204,6 @@ class EventHub:
             seq=seq,
             topics=topic_tuple,
             reason=reason,
-            request_id=request_id,
-            download_id=download_id,
         )
         if not self._subscribers:
             return event
@@ -209,9 +212,23 @@ class EventHub:
         return event
 
     def close_all(self, *, reason: str) -> None:
-        """Close every active subscription, usually after app-key rotation."""
+        """Close every active subscription."""
+        self.close_matching(reason=reason)
+
+    def close_matching(
+        self,
+        *,
+        reason: str,
+        auth_method: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Close subscriptions matching an optional credential/principal filter."""
         _ = reason
         for subscription in tuple(self._subscribers):
+            if auth_method is not None and subscription.auth_method != auth_method:
+                continue
+            if user_id is not None and subscription.user_id != user_id:
+                continue
             subscription.close()
 
     def unsubscribe(self, subscription: EventSubscription) -> None:
@@ -222,9 +239,19 @@ def get_event_hub(app: FastAPI) -> EventHub:
     """Return the app's realtime hub, creating it lazily for tests."""
     hub = getattr(app.state, _STATE_ATTR, None)
     if not isinstance(hub, EventHub):
-        hub = EventHub(app_version=__version__)
+        hub = EventHub(app_version=current_build_id())
         setattr(app.state, _STATE_ATTR, hub)
     return hub
+
+
+def current_build_id() -> str:
+    """Return the immutable image/build identifier advertised to open tabs.
+
+    Container CI injects the commit SHA. Source/dev runs fall back to the package
+    version, which keeps local tests deterministic without pretending ``0.0.0``
+    can distinguish deployed images.
+    """
+    return os.environ.get(_BUILD_ID_ENV) or __version__
 
 
 def warn_if_multiworker() -> None:
@@ -238,19 +265,20 @@ def warn_if_multiworker() -> None:
     the true worker count is not introspectable from inside a worker. This is a
     best-effort guard, deliberately noisy rather than silent (north-star #3).
     """
-    signals: dict[str, str] = {}
+    signals: set[str] = set()
     for var in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "WORKERS"):
         raw = os.environ.get(var)
         if raw is None:
             continue
         try:
             if int(raw) > 1:
-                signals[var] = raw
+                signals.add(var)
         except ValueError:
             continue
     gunicorn_args = os.environ.get("GUNICORN_CMD_ARGS", "")
-    if "--workers" in gunicorn_args or "-w " in gunicorn_args:
-        signals["GUNICORN_CMD_ARGS"] = gunicorn_args
+    gunicorn_workers = _GUNICORN_WORKERS_RE.search(gunicorn_args)
+    if gunicorn_workers is not None and int(gunicorn_workers.group(1)) > 1:
+        signals.add("GUNICORN_CMD_ARGS")
     if signals:
         _logger.warning(
             "realtime SSE hub is in-process and single-worker only, but a "
@@ -258,7 +286,7 @@ def warn_if_multiworker() -> None:
             "be dropped for clients on other workers — run a single worker or "
             "add a shared broker (ADR-0017 scale-out path). The client polling "
             "floor still heals the UI.",
-            ", ".join(f"{k}={v}" for k, v in sorted(signals.items())),
+            ", ".join(sorted(signals)),
         )
 
 
@@ -267,18 +295,24 @@ def publish_realtime(
     topics: Iterable[str],
     *,
     reason: str,
-    request_id: int | None = None,
-    download_id: int | None = None,
 ) -> RealtimeEvent:
     """Publish on ``app.state`` without exposing hub plumbing to routers."""
     return get_event_hub(app).publish(
         topics,
         reason=reason,
-        request_id=request_id,
-        download_id=download_id,
     )
 
 
-def close_realtime_streams(app: FastAPI, *, reason: str) -> None:
-    """Close authenticated streams, for example after app-key rotation."""
-    get_event_hub(app).close_all(reason=reason)
+def close_realtime_streams(
+    app: FastAPI,
+    *,
+    reason: str,
+    auth_method: str | None = None,
+    user_id: int | None = None,
+) -> None:
+    """Close streams invalidated by a credential or session state change."""
+    get_event_hub(app).close_matching(
+        reason=reason,
+        auth_method=auth_method,
+        user_id=user_id,
+    )

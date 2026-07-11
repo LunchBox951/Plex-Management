@@ -275,7 +275,6 @@ async def grab_endpoint(
                     http_request.app,
                     ("requests", "discover"),
                     reason="no_acceptable_release",
-                    request_id=request.id,
                 )
             else:
                 await session.rollback()
@@ -336,8 +335,6 @@ async def grab_endpoint(
         http_request.app,
         ("queue", "requests", "discover"),
         reason="grab",
-        request_id=item.media_request_id,
-        download_id=item.id,
     )
     return item
 
@@ -387,8 +384,6 @@ async def import_endpoint(
         http_request.app,
         ("queue", "requests", "discover"),
         reason="import",
-        request_id=item.media_request_id,
-        download_id=item.id,
     )
     return item
 
@@ -445,8 +440,6 @@ async def mark_failed_endpoint(
         http_request.app,
         ("queue", "requests", "blocklist", "discover"),
         reason="mark_failed",
-        request_id=item.media_request_id,
-        download_id=item.id,
     )
     return item
 
@@ -503,7 +496,5 @@ async def relocate_endpoint(
         http_request.app,
         ("queue",),
         reason="relocate",
-        request_id=item.media_request_id,
-        download_id=item.id,
     )
     return item

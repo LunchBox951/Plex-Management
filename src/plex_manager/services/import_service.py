@@ -1942,7 +1942,7 @@ async def run_import_cycle(
     tv_root: str | None = None,
     anime_movie_root: str | None = None,
     anime_tv_root: str | None = None,
-) -> None:
+) -> int:
     """Drain freshly-completed (and crash-stranded) imports. Needs the download
     client; the Movies/TV roots are each optional. One item failing never aborts
     the cycle.
@@ -1953,13 +1953,16 @@ async def run_import_cycle(
     than gating the whole cycle — an install with only ONE root configured still
     drains that type normally. ``anime_movie_root`` / ``anime_tv_root``
     (ADR-0015) are likewise optional overrides applied only to ``is_anime``
-    requests; see :func:`import_download`.
+    requests; see :func:`import_download`. Returns the number of downloads whose
+    persisted read model changed, so callers can avoid emitting idle cache
+    invalidations on every background tick.
 
     The completed -> available promotion is a SEPARATE pass
     (:func:`run_availability_cycle`) that needs only Plex, so it keeps working even
     when the download client is down or the Movies/TV root is unset.
     """
     download_repo = SqlDownloadRepository(session)
+    changed = 0
     for row in await download_repo.list_active():
         # Auto-drain EVERY resumable row, ownerless ones included (issue #74). A row
         # whose ``media_request_id`` is NULL used to be filtered out here and so sat
@@ -1970,7 +1973,7 @@ async def run_import_cycle(
         # retryable block instead of silently skipping it every cycle.
         if row.status in _AUTO_DRAIN:
             try:
-                await import_download(
+                result = await import_download(
                     download_id=row.id,
                     fs=fs,
                     library=library,
@@ -1983,17 +1986,20 @@ async def run_import_cycle(
                     anime_movie_root=anime_movie_root,
                     anime_tv_root=anime_tv_root,
                 )
+                if result is not None and result != row:
+                    changed += 1
             except Exception:
                 await session.rollback()
                 _logger.exception(
                     "import of download failed; will retry next cycle",
                     extra={"download_id": row.id},
                 )
+    return changed
 
 
 async def run_availability_cycle(
     *, library: LibraryPort, session: AsyncSession, now: datetime | None = None
-) -> None:
+) -> int:
     """Confirm ``completed`` ("Finalizing") movies/seasons are indexed in Plex and
     promote them to ``available``. Depends ONLY on Plex — so an import that already
     triggered a scan still reaches ``available`` even if the download client or the
@@ -2002,7 +2008,7 @@ async def run_availability_cycle(
     ``now`` is the instant elapsed-time math (the bounded-Finalizing warning,
     issue #158) is measured against; defaults to ``datetime.now(UTC)`` and exists
     purely so a test can inject a fixed/advancing clock instead of sleeping real
-    minutes.
+    minutes. Returns the number of movie/season rows promoted this pass.
 
     BATCHED, not per-row (issue #136): a burst of still-finalizing rows used to cost
     one ``is_available`` call PER row, and the adapter never trusts a cached absence
@@ -2051,6 +2057,7 @@ async def run_availability_cycle(
     failed" warning already logged above names the real cause.
     """
     effective_now = now if now is not None else datetime.now(UTC)
+    promoted = 0
     request_repo = SqlRequestRepository(session)
     completed_movies = [
         request
@@ -2134,6 +2141,7 @@ async def run_availability_cycle(
         try:
             await request_repo.mark_available(request.id)
             await session.commit()
+            promoted += 1
             _forget_unconfirmed(key)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
@@ -2281,6 +2289,7 @@ async def run_availability_cycle(
                     season_number=season_request.season_number,
                 )
                 await session.commit()
+                promoted += 1
                 _forget_unconfirmed(key)
             except (PlexLibraryError, PlexAuthError, NotImplementedError):
                 await session.rollback()
@@ -2308,3 +2317,4 @@ async def run_availability_cycle(
     ) - current_keys
     for key in stale_keys:
         _forget_unconfirmed(key)
+    return promoted

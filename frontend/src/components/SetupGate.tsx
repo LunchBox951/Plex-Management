@@ -101,6 +101,9 @@ export function SetupGate() {
   }
 
   if (auth.data?.authenticated) {
+    if (!auth.data.is_admin) {
+      return <Outlet />
+    }
     return (
       <RealtimeProvider>
         <Outlet />

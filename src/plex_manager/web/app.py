@@ -74,7 +74,13 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
 )
 from plex_manager.web.errors import install_error_handlers
-from plex_manager.web.events import EventHub, publish_realtime, warn_if_multiworker
+from plex_manager.web.events import (
+    EventHub,
+    current_build_id,
+    get_event_hub,
+    publish_realtime,
+    warn_if_multiworker,
+)
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
@@ -190,6 +196,8 @@ async def _reconcile_once(app: FastAPI) -> None:
     reconcile_status.mark_run_started()
     sessionmaker = app.state.sessionmaker
     client = app.state.http_client
+    changes = queue_service.ReconcileChanges()
+    realtime_topics: set[str] = set()
     async with sessionmaker() as session:
         library = await get_library_optional(session, client)
 
@@ -211,18 +219,13 @@ async def _reconcile_once(app: FastAPI) -> None:
             # availability commit, then fall through — no request stuck in "Finalizing"
             # while qBittorrent is down.
             try:
-                await queue_service.reconcile_and_list(qbt, session)
-                publish_realtime(
-                    app,
-                    ("queue", "requests", "discover"),
-                    reason="reconcile",
-                )
+                await queue_service.reconcile_and_list(qbt, session, changes=changes)
                 if library is not None:
                     movies_root = await get_movies_root_optional(session)
                     tv_root = await get_tv_root_optional(session)
                     anime_movie_root = await get_anime_movie_root_optional(session)
                     anime_tv_root = await get_anime_tv_root_optional(session)
-                    await import_service.run_import_cycle(
+                    imported = await import_service.run_import_cycle(
                         fs=get_filesystem(),
                         library=library,
                         qbt=qbt,
@@ -234,11 +237,8 @@ async def _reconcile_once(app: FastAPI) -> None:
                         anime_movie_root=anime_movie_root,
                         anime_tv_root=anime_tv_root,
                     )
-                    publish_realtime(
-                        app,
-                        ("queue", "requests", "discover"),
-                        reason="import_cycle",
-                    )
+                    if imported:
+                        realtime_topics.update(("queue", "requests", "discover"))
             except QbittorrentError as exc:
                 await session.rollback()
                 _logger.warning(
@@ -252,7 +252,7 @@ async def _reconcile_once(app: FastAPI) -> None:
                 # narrow DB-only heal on the rolled-back session; rows that need a
                 # removal keep waiting for the client to recover (counted + logged
                 # inside the heal, never silently dropped).
-                await queue_service.heal_failed_pending_without_client(session)
+                await queue_service.heal_failed_pending_without_client(session, changes=changes)
         else:
             # DB-only strand heal (queue_service module docstring, "Operator
             # provenance"): with qBittorrent UNCONFIGURED the reconcile cycle above
@@ -261,14 +261,29 @@ async def _reconcile_once(app: FastAPI) -> None:
             # client I/O) would otherwise sit at failed_pending forever on exactly
             # the installs that path exists for. Rows needing a removal still wait
             # for the client (logged inside the heal, never silently dropped).
-            await queue_service.heal_failed_pending_without_client(session)
+            await queue_service.heal_failed_pending_without_client(session, changes=changes)
 
         # Availability promotion (completed -> available) needs ONLY Plex, so it runs
         # even when qBittorrent is down or the Movies root was cleared after an
         # import already triggered a scan — no request stuck in "Finalizing".
         if library is not None:
-            await import_service.run_availability_cycle(library=library, session=session)
-            publish_realtime(app, ("requests", "discover"), reason="availability")
+            promoted = await import_service.run_availability_cycle(library=library, session=session)
+            if promoted:
+                realtime_topics.update(("requests", "discover"))
+
+    if changes.queue:
+        realtime_topics.add("queue")
+    if changes.requests:
+        realtime_topics.update(("requests", "discover"))
+    if changes.blocklist:
+        realtime_topics.add("blocklist")
+    if realtime_topics:
+        ordered_topics = tuple(
+            topic
+            for topic in ("queue", "requests", "blocklist", "discover")
+            if topic in realtime_topics
+        )
+        publish_realtime(app, ordered_topics, reason="reconcile_cycle")
 
     reconcile_status.mark_ok()
 
@@ -795,6 +810,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
+        get_event_hub(app).close_all(reason="shutdown")
         for task in background_tasks:
             task.cancel()
         # Await every cancelled task so its cleanup runs; return_exceptions=True
@@ -878,7 +894,7 @@ def create_app() -> FastAPI:
     # warn loudly if the environment hints at a multi-worker deployment that
     # would silently drop cross-worker events.
     warn_if_multiworker()
-    app.state.realtime_hub = EventHub(app_version=__version__)
+    app.state.realtime_hub = EventHub(app_version=current_build_id())
     app.add_middleware(SetupGuardMiddleware)
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:

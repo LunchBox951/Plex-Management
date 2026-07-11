@@ -177,10 +177,13 @@ export interface paths {
         };
         /**
          * Events Endpoint
-         * @description Stream realtime invalidation events for the authenticated SPA.
+         * @description Stream realtime invalidation events for the authenticated admin SPA.
          *
          *     The stream holds no DB session. Each event is a hint to refetch existing REST
          *     resources, so reconnects and overflow collapse to a broad ``sync`` event.
+         *     Shared Plex users retain the normal polling path instead: global queue,
+         *     blocklist, and request-activity signals would otherwise reveal admin-only or
+         *     other-user activity even when the REST resources themselves stay filtered.
          */
         get: operations["events_endpoint_api_v1_events_get"];
         put?: never;

@@ -264,6 +264,7 @@ __all__ = [
     "FailedPendingAdoptionRefusedError",
     "InvalidStateTransitionError",
     "OperatorClaimActiveError",
+    "ReconcileChanges",
     "RemovalInProgressError",
     "heal_failed_pending_without_client",
     "list_queue",
@@ -297,6 +298,20 @@ _REARMABLE_REQUEST_STATUS_VALUES: frozenset[str] = (
 _PHASE_C_MAX_ATTEMPTS = 3
 _PHASE_C_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.1)
 _UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import_blocked"})
+
+
+@dataclass
+class ReconcileChanges:
+    """Mutation summary for one reconcile/heal pass.
+
+    The web adapter uses this to publish one coalesced cache invalidation only
+    when persisted state actually changed. Keeping the summary optional preserves
+    the service's existing list-returning API for non-web callers and tests.
+    """
+
+    queue: bool = False
+    requests: bool = False
+    blocklist: bool = False
 
 
 @dataclass(frozen=True)
@@ -841,6 +856,7 @@ async def _handle_failed(
     session: AsyncSession,
     completion: _FailureCompletion,
     rows: list[DownloadRecord],
+    changes: ReconcileChanges | None = None,
 ) -> _FailedReArm | None:
     """Phase C completion for one failed download: advance ``failed_pending`` ->
     ``Failed`` (compare-and-swap), write the blocklist row (when the completion's
@@ -908,6 +924,14 @@ async def _handle_failed(
             safe_int(completion.download_id),
         )
         return None
+    if changes is not None:
+        changes.queue = True
+        changes.blocklist = changes.blocklist or completion.blocklist
+        changes.requests = (
+            changes.requests
+            or record.media_request_id is not None
+            or any(scope.media_request_id is not None for scope in record.scopes)
+        )
     await _mark_download_scopes_terminal(session, record.id, RequestStatus.failed.value)
 
     request_repo = SqlRequestRepository(session)
@@ -976,7 +1000,8 @@ async def _self_heal_stalled_download(
     detection: StallDetection,
     *,
     now: datetime,
-) -> None:
+    changes: ReconcileChanges | None = None,
+) -> bool:
     """Issue #165's minimal self-heal: mark-fail + blocklist a stalled download —
     the EXACT same :func:`mark_failed` call the operator's manual "mark failed +
     blocklist" button makes, so the existing single-owner claim/nonce protocol,
@@ -1040,7 +1065,7 @@ async def _self_heal_stalled_download(
             elapsed,
             exc,
         )
-        return
+        return False
     _logger.warning(
         "self-heal (issue #165): download %s auto mark-failed + blocklisted after a "
         "%s stall (elapsed=%s)",
@@ -1059,6 +1084,15 @@ async def _self_heal_stalled_download(
         )
     )
     await session.commit()
+    if changes is not None:
+        changes.queue = True
+        changes.requests = (
+            changes.requests
+            or row.media_request_id is not None
+            or any(scope.media_request_id is not None for scope in row.scopes)
+        )
+        changes.blocklist = True
+    return True
 
 
 async def list_queue(session: AsyncSession) -> list[QueueRecord]:
@@ -1085,8 +1119,14 @@ async def list_queue(session: AsyncSession) -> list[QueueRecord]:
 async def reconcile_and_list(
     qbt: DownloadClientPort,
     session: AsyncSession,
+    *,
+    changes: ReconcileChanges | None = None,
 ) -> list[DownloadRecord]:
-    """Reconcile active downloads against the client and return the live queue."""
+    """Reconcile active downloads against the client and return the live queue.
+
+    When ``changes`` is supplied it is updated only for writes that actually
+    landed, allowing the background web loop to avoid emitting idle invalidations.
+    """
     download_repo = SqlDownloadRepository(session)
     rows = await download_repo.list_active()
     statuses = await qbt.get_all_statuses()
@@ -1139,6 +1179,8 @@ async def reconcile_and_list(
             )
             if applied:
                 applied_transitions.append(transition)
+                if changes is not None:
+                    changes.queue = True
         elif live is not None:
             # Refresh live progress ONLY — never rewrite status. ``row.status`` is the
             # snapshot captured at list_active() time; an operator's import retry (or
@@ -1146,9 +1188,12 @@ async def reconcile_and_list(
             # qbt.get_all_statuses() await above, and writing the stale snapshot status
             # back would clobber that claim (defeating the import finalize CAS). A
             # progress-only update leaves any concurrent transition intact (G5).
-            await download_repo.refresh_progress(
-                row.id, progress=live.progress, seed_ratio=live.ratio
-            )
+            if row.progress != live.progress or row.seed_ratio != live.ratio:
+                await download_repo.refresh_progress(
+                    row.id, progress=live.progress, seed_ratio=live.ratio
+                )
+                if changes is not None:
+                    changes.queue = True
 
     # Phase A commit: persist the reconcile transitions (incl. Downloading ->
     # ``failed_pending``) + progress ONLY. The blocklist, the terminal ``Failed``
@@ -1176,7 +1221,14 @@ async def reconcile_and_list(
         stalled_row = rows_by_id.get(detection.download_id)
         if stalled_row is None:  # pragma: no cover - detections derive from rows
             continue
-        await _self_heal_stalled_download(session, qbt, stalled_row, detection, now=now)
+        await _self_heal_stalled_download(
+            session,
+            qbt,
+            stalled_row,
+            detection,
+            now=now,
+            changes=changes,
+        )
 
     # Build the set of failed rows to complete this cycle:
     #   1. Rows that transitioned TO ``failed_pending`` THIS cycle (CAS-APPLIED only
@@ -1434,7 +1486,7 @@ async def reconcile_and_list(
             for completion in completions:
                 if _is_operator_claimed(completion.download_id):
                     continue
-                rearm = await _handle_failed(session, completion, rows)
+                rearm = await _handle_failed(session, completion, rows, changes)
                 if rearm is not None:
                     rearms.append(rearm)
             for rearm in rearms:
@@ -1459,7 +1511,9 @@ async def reconcile_and_list(
     return await download_repo.list_active(populate_existing=True)
 
 
-async def heal_failed_pending_without_client(session: AsyncSession) -> None:
+async def heal_failed_pending_without_client(
+    session: AsyncSession, *, changes: ReconcileChanges | None = None
+) -> None:
     """DB-only Phase C for operator residuals needing no client I/O
     (``remove=no``, or ``remove=done`` — the removal already happened).
 
@@ -1533,7 +1587,7 @@ async def heal_failed_pending_without_client(session: AsyncSession) -> None:
         for completion in completions:
             if _is_operator_claimed(completion.download_id):
                 continue
-            rearm = await _handle_failed(session, completion, rows)
+            rearm = await _handle_failed(session, completion, rows, changes)
             if rearm is not None:
                 rearms.append(rearm)
         for rearm in rearms:

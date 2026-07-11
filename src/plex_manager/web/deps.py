@@ -143,6 +143,7 @@ __all__ = [
     "is_setup_token_required",
     "load_system_settings",
     "require_admin",
+    "require_admin_short_session",
     "require_api_key",
     "require_api_key_short_session",
     "require_setup_admin",
@@ -199,6 +200,7 @@ class AuthContext:
     email: str | None = None
     avatar_url: str | None = None
     is_admin: bool = False
+    session_expires_at: datetime | None = None
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -748,7 +750,8 @@ async def _session_auth_context(
     if row is None:
         return None
     auth_session, user = row
-    if _normalize_dt(auth_session.expires_at) <= now:
+    expires_at = _normalize_dt(auth_session.expires_at)
+    if expires_at <= now:
         return None
     if enforce_csrf:
         _require_csrf_for_session(request)
@@ -760,6 +763,7 @@ async def _session_auth_context(
         email=user.email,
         avatar_url=user.avatar_url,
         is_admin=user.permissions > 0,
+        session_expires_at=expires_at,
     )
 
 
@@ -851,6 +855,20 @@ async def require_admin(
 
     API-key and dev-bypass auth are administrator contexts. Plex session auth is
     administrator-only when the signed-in Plex account owns the configured server.
+    """
+    if not context.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
+    return context
+
+
+async def require_admin_short_session(
+    context: Annotated[AuthContext, Depends(require_api_key_short_session)],
+) -> AuthContext:
+    """Require an administrator without retaining a DB session.
+
+    Long-lived streams use this companion to :func:`require_admin`: credential
+    validation completes against a short-lived session before the response
+    starts, and shared Plex users stay on the privacy-safe polling path.
     """
     if not context.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")

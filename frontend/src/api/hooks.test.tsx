@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 import {
   useEvict,
   useMarkFailed,
+  useQueue,
   useRelocateDownload,
   useRequests,
   useRequestsInvalidated,
@@ -15,6 +16,8 @@ import {
 } from './hooks'
 import { client } from './client'
 import {
+  POLL_INTERVAL_MS,
+  QUEUE_REALTIME_FLOOR_MS,
   REQUESTS_POLL_INTERVAL_MS,
   REQUESTS_REALTIME_FLOOR_MS,
   queryKeys,
@@ -285,6 +288,57 @@ describe('useRevokeAppKey', () => {
 })
 
 describe('realtime polling fallback', () => {
+  it('keeps an explicitly disabled queue query completely idle', async () => {
+    vi.useFakeTimers()
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { queue: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useQueue({ enabled: false, poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(QUEUE_REALTIME_FLOOR_MS + POLL_INTERVAL_MS)
+    })
+    expect(client.GET).not.toHaveBeenCalled()
+    unmount()
+    qc.clear()
+  })
+
+  it('drops queue polling to its slow floor while realtime is connected', async () => {
+    vi.useFakeTimers()
+    setRealtimeConnected(true)
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { queue: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useQueue({ poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(QUEUE_REALTIME_FLOOR_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(2)
+    unmount()
+    qc.clear()
+  })
+
   it('keeps request polling while realtime is disconnected', async () => {
     vi.useFakeTimers()
     ;(client.GET as unknown as Mock).mockResolvedValue({

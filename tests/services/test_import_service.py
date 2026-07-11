@@ -1226,7 +1226,7 @@ async def test_run_import_cycle_drains_pending_download_to_completed(
     library = FakeLibrary()
 
     async with sessionmaker_() as session:
-        await run_import_cycle(
+        changed = await run_import_cycle(
             fs=LocalFileSystem(),
             library=library,
             qbt=_qbt(video),
@@ -1235,6 +1235,7 @@ async def test_run_import_cycle_drains_pending_download_to_completed(
             session=session,
             movies_root=str(movies_root),
         )
+    assert changed == 1
 
     async with sessionmaker_() as session:
         download = await session.get(Download, download_id)
@@ -1264,7 +1265,7 @@ async def test_run_import_cycle_blocks_ownerless_row_instead_of_skipping_it(
         download_id = download.id
 
     async with sessionmaker_() as session:
-        await run_import_cycle(
+        changed = await run_import_cycle(
             fs=LocalFileSystem(),
             library=FakeLibrary(),
             qbt=FakeQbittorrent(statuses=[]),
@@ -1273,6 +1274,7 @@ async def test_run_import_cycle_blocks_ownerless_row_instead_of_skipping_it(
             session=session,
             movies_root=str(tmp_path / "library"),
         )
+    assert changed == 1
 
     async with sessionmaker_() as session:
         download = await session.get(Download, download_id)
@@ -1296,7 +1298,8 @@ async def test_run_availability_cycle_promotes_completed_to_available_when_in_pl
     library = FakeLibrary(available={_TMDB_ID})
 
     async with sessionmaker_() as session:
-        await run_availability_cycle(library=library, session=session)
+        promoted = await run_availability_cycle(library=library, session=session)
+    assert promoted == 1
 
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
@@ -1316,7 +1319,8 @@ async def test_run_availability_cycle_leaves_completed_when_not_yet_in_plex(
     library = FakeLibrary(available=set())  # Plex has not indexed it yet
 
     async with sessionmaker_() as session:
-        await run_availability_cycle(library=library, session=session)
+        promoted = await run_availability_cycle(library=library, session=session)
+    assert promoted == 0
 
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
@@ -2487,7 +2491,7 @@ async def test_run_import_cycle_drains_a_tv_download_to_a_completed_season(
     library = FakeLibrary()
 
     async with sessionmaker_() as session:
-        await run_import_cycle(
+        changed = await run_import_cycle(
             fs=LocalFileSystem(),
             library=library,
             qbt=_qbt(release_dir),
@@ -2497,6 +2501,7 @@ async def test_run_import_cycle_drains_a_tv_download_to_a_completed_season(
             movies_root="/unused",
             tv_root=str(tv_root),
         )
+    assert changed == 1
 
     async with sessionmaker_() as session:
         download = await session.get(Download, download_id)
@@ -2520,7 +2525,8 @@ async def test_run_availability_cycle_promotes_a_completed_season_to_available(
     library = FakeLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})})
 
     async with sessionmaker_() as session:
-        await run_availability_cycle(library=library, session=session)
+        promoted = await run_availability_cycle(library=library, session=session)
+    assert promoted == 1
 
     async with sessionmaker_() as session:
         season_row = await session.get(SeasonRequest, season_id)
@@ -2542,7 +2548,8 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
     library = FakeLibrary(available_tv_seasons={})  # Plex has not indexed it yet
 
     async with sessionmaker_() as session:
-        await run_availability_cycle(library=library, session=session)
+        promoted = await run_availability_cycle(library=library, session=session)
+    assert promoted == 0
 
     async with sessionmaker_() as session:
         season_row = await session.get(SeasonRequest, season_id)
@@ -2660,7 +2667,8 @@ async def test_run_availability_cycle_no_completed_movies_skips_present_ids_enti
     """No completed movies pending -> not even one ``present_ids`` call is made."""
     library = FakeLibrary()
     async with sessionmaker_() as session:
-        await run_availability_cycle(library=library, session=session)
+        promoted = await run_availability_cycle(library=library, session=session)
+    assert promoted == 0
     assert library.present_ids_calls == 0
 
 
@@ -2719,7 +2727,8 @@ async def test_run_availability_cycle_no_completed_seasons_skips_season_presence
     """No completed seasons pending -> not even one ``season_presence`` call is made."""
     library = FakeLibrary()
     async with sessionmaker_() as session:
-        await run_availability_cycle(library=library, session=session)
+        promoted = await run_availability_cycle(library=library, session=session)
+    assert promoted == 0
     assert library.season_presence_calls == 0
 
 

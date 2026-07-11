@@ -65,7 +65,7 @@ from plex_manager.web.deps import (
     resolve_log_retention_days,
 )
 from plex_manager.web.errors import AppError
-from plex_manager.web.events import close_realtime_streams
+from plex_manager.web.events import close_realtime_streams, publish_realtime
 from plex_manager.web.schemas import (
     AppApiKeyResponse,
     AppApiKeyStatusResponse,
@@ -527,7 +527,12 @@ async def rotate_app_key_endpoint(
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         system.app_api_key = new_key
         await session.commit()
-    close_realtime_streams(request.app, reason="app_key_rotated")
+    close_realtime_streams(
+        request.app,
+        reason="app_key_rotated",
+        auth_method=AuthMethod.api_key.value,
+    )
+    publish_realtime(request.app, ("access",), reason="app_key_rotated")
     return AppApiKeyResponse(app_api_key=new_key)
 
 
@@ -576,6 +581,12 @@ async def revoke_app_key_endpoint(
                 raise HTTPException(status_code=409, detail="app_key_changed")
         system.app_api_key = None
         await session.commit()
+    close_realtime_streams(
+        request.app,
+        reason="app_key_revoked",
+        auth_method=AuthMethod.api_key.value,
+    )
+    publish_realtime(request.app, ("access",), reason="app_key_revoked")
 
 
 async def _verify_plex_repoint(
@@ -683,6 +694,7 @@ async def _verify_plex_repoint(
 @router.put("", responses=_PUT_SETTINGS_RESPONSES)
 async def put_settings_endpoint(
     body: SettingsUpdate,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     context: Annotated[AuthContext, Depends(require_admin)],
@@ -826,9 +838,25 @@ async def put_settings_endpoint(
             )
     await session.commit()
 
+    # Clear backend probe caches before publishing: a listening tab can refetch
+    # immediately on the SSE event, so publishing first could race it into the
+    # stale pre-update health snapshot.
     for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
         if written_fields.intersection(fields):
             health_cache.invalidate(subsystem)
+
+    if plex_identity_changed and machine_identifier is not None:
+        close_realtime_streams(
+            request.app,
+            reason="plex_server_repointed",
+            auth_method=AuthMethod.plex_session.value,
+        )
+    if written_fields or plex_identity_changed:
+        publish_realtime(
+            request.app,
+            ("settings", "ops:health"),
+            reason="settings_updated",
+        )
 
     return await _redacted(store)
 

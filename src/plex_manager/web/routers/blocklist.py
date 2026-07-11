@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.ports.repositories import BlocklistRecord
 from plex_manager.services import blocklist_service
 from plex_manager.web.deps import get_session, require_admin
+from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import BlocklistEntry, BlocklistResponse, ErrorDetail
 
 __all__ = ["router"]
@@ -53,6 +54,7 @@ async def list_blocklist(
 )
 async def delete_blocklist(
     blocklist_id: int,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> Response:
     """Remove a blocklist entry (operator un-blocklist)."""
@@ -62,4 +64,5 @@ async def delete_blocklist(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="blocklist_entry_not_found"
         ) from exc
+    publish_realtime(request.app, ("blocklist",), reason="blocklist_deleted")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

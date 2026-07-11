@@ -1,6 +1,6 @@
 import type { QueryClient } from '@tanstack/react-query'
-import { AUTH_INVALID_EVENT } from '../api/client'
-import { clearApiKey, getApiKey } from './apiKey'
+import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
+import { clearApiKey, getApiKey, isApiKeyAuthEnabled } from './apiKey'
 import { queryKeys } from './queryClient'
 import { setRealtimeConnected } from './realtimeState'
 import { setRealtimeReloadRequired } from './realtimeReload'
@@ -9,8 +9,6 @@ export interface RealtimeEventPayload {
   seq?: number
   topics: string[]
   reason?: string
-  request_id?: number
-  download_id?: number
   app_version?: string
 }
 
@@ -31,12 +29,25 @@ export async function parseSseStream(
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  let pendingCr = false
+
+  const normalizeChunk = (decoded: string, final = false): string => {
+    let text = (pendingCr ? '\r' : '') + decoded
+    pendingCr = false
+    // A CRLF terminator may straddle network chunks. Hold a trailing CR until
+    // the next decode so it is never mistaken for a standalone line ending.
+    if (!final && text.endsWith('\r')) {
+      pendingCr = true
+      text = text.slice(0, -1)
+    }
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
 
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
     onBytes?.()
-    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    buffer += normalizeChunk(decoder.decode(value, { stream: true }))
     let boundary = buffer.indexOf('\n\n')
     while (boundary !== -1) {
       const frame = buffer.slice(0, boundary)
@@ -46,7 +57,7 @@ export async function parseSseStream(
     }
   }
 
-  buffer += decoder.decode()
+  buffer += normalizeChunk(decoder.decode(), true)
   if (buffer.trim().length > 0) {
     emitFrame(buffer, onEvent)
   }
@@ -54,7 +65,7 @@ export async function parseSseStream(
 
 function emitFrame(frame: string, onEvent: (event: RealtimeEventPayload) => void): void {
   const data: string[] = []
-  for (const rawLine of frame.split('\n')) {
+  for (const rawLine of frame.split(/\r\n|\n|\r/)) {
     if (rawLine.length === 0 || rawLine.startsWith(':')) continue
     const colon = rawLine.indexOf(':')
     const field = colon === -1 ? rawLine : rawLine.slice(0, colon)
@@ -79,33 +90,34 @@ function isRealtimeEvent(value: unknown): value is RealtimeEventPayload {
 
 export function applyRealtimeEvent(qc: QueryClient, event: RealtimeEventPayload): void {
   const topics = new Set(event.topics)
-  const requestId = event.request_id
 
   if (topics.has('sync')) {
     void qc.invalidateQueries({ queryKey: queryKeys.requests })
     void qc.invalidateQueries({ queryKey: queryKeys.queue })
     void qc.invalidateQueries({ queryKey: ['discover'] })
     void qc.invalidateQueries({ queryKey: ['blocklist'] })
+    void qc.invalidateQueries({ queryKey: queryKeys.settings })
+    void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+    void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
     void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
     void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
   }
   if (topics.has('requests')) {
     void qc.invalidateQueries({ queryKey: queryKeys.requests })
-    if (typeof requestId === 'number') {
-      void qc.invalidateQueries({ queryKey: queryKeys.request(requestId) })
-    }
     void qc.invalidateQueries({ queryKey: ['discover'] })
   }
   if (topics.has('queue')) {
     void qc.invalidateQueries({ queryKey: queryKeys.queue })
-    if (typeof requestId === 'number') {
-      void qc.invalidateQueries({ queryKey: queryKeys.requests })
-      void qc.invalidateQueries({ queryKey: queryKeys.request(requestId) })
-      void qc.invalidateQueries({ queryKey: ['discover'] })
-    }
   }
   if (topics.has('blocklist')) {
     void qc.invalidateQueries({ queryKey: ['blocklist'] })
+  }
+  if (topics.has('settings')) {
+    void qc.invalidateQueries({ queryKey: queryKeys.settings })
+    void qc.invalidateQueries({ queryKey: queryKeys.plexLibraries })
+  }
+  if (topics.has('access')) {
+    void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
   }
   if (topics.has('ops:disk')) {
     void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
@@ -187,25 +199,37 @@ export function startRealtimeStream({
   async function run(): Promise<void> {
     let attempt = 0
     while (!stopped) {
-      const key = getApiKey()
-      if (!key) {
-        setRealtimeConnected(false)
-        await sleep(baseDelayMs)
-        continue
-      }
+      // Match the typed REST client's credential selection exactly: the recovery
+      // key is opt-in per tab; otherwise this same-origin request relies on the
+      // normal HTTP-only Plex session cookie.
+      const key = isApiKeyAuthEnabled() ? getApiKey() : null
 
       controller = new AbortController()
       let connectedAt: number | null = null
       try {
         const response = await fetchImpl('/api/v1/events', {
-          headers: { 'X-Api-Key': key },
+          credentials: 'same-origin',
+          ...(key ? { headers: { 'X-Api-Key': key } } : {}),
           signal: controller.signal,
         })
         if (response.status === 401) {
-          if (key === getApiKey()) {
+          if (key === null) {
+            window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
+            return
+          }
+          if (isApiKeyAuthEnabled() && key === getApiKey()) {
             clearApiKey()
             window.dispatchEvent(new Event(AUTH_INVALID_EVENT))
+            return
           }
+          // A slow 401 for an old/disabled key says nothing about the current
+          // credential. Reconnect using the now-current auth after backoff.
+          throw new Error('stale realtime credential rejected')
+        }
+        if (response.status === 403) {
+          // Realtime is admin-only so coarse queue/blocklist/activity signals
+          // never leak across shared users. Their normal disconnected polling
+          // cadence stays active and is the intended transport.
           return
         }
         if (!response.ok || response.body === null) {

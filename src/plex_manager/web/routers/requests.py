@@ -241,7 +241,6 @@ async def create_request_endpoint(
         http_request.app,
         ("requests", "discover"),
         reason="request_created" if result.created else "request_updated",
-        request_id=response_body.id,
     )
     return response_body
 
@@ -306,7 +305,6 @@ async def keep_forever_endpoint(
         http_request.app,
         ("requests", "discover", "ops:disk"),
         reason="request_updated",
-        request_id=response_body.id,
     )
     return response_body
 
@@ -416,7 +414,6 @@ async def report_issue_endpoint(
         http_request.app,
         ("requests", "queue", "blocklist", "discover"),
         reason="report_issue",
-        request_id=response_body.id,
     )
     return response_body
 
@@ -469,6 +466,5 @@ async def cancel_request_endpoint(
         http_request.app,
         ("requests", "queue", "discover"),
         reason="cancel_request",
-        request_id=response_body.id,
     )
     return response_body
