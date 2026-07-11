@@ -67,6 +67,7 @@ from plex_manager.web.deps import (
     get_filesystem,
     get_library_optional,
     get_log_retention_days,
+    get_media_probe,
     get_movies_root_optional,
     get_parser,
     get_prowlarr,
@@ -228,6 +229,7 @@ async def _reconcile_once(app: FastAPI) -> None:
                     anime_tv_root = await get_anime_tv_root_optional(session)
                     await import_service.run_import_cycle(
                         fs=get_filesystem(),
+                        media_probe=get_media_probe(),
                         library=library,
                         qbt=qbt,
                         parser=get_parser(),

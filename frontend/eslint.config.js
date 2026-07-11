@@ -20,6 +20,11 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
+      // eslint-plugin-react-hooks v7 turned on new React-Compiler rules that
+      // flag pre-existing patterns (5 sites). Warn, don't block, until those
+      // sites are refactored deliberately — tracked in a follow-up issue.
+      'react-hooks/set-state-in-effect': 'warn',
+      'react-hooks/refs': 'warn',
       'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
     },
   },

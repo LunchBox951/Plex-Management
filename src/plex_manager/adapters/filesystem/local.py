@@ -21,7 +21,7 @@ import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
+from plex_manager.domain.plex_video import is_plex_disc_structure_path, plex_video_extension
 
 __all__ = ["LocalFileSystem", "LocalFileSystemError"]
 
@@ -184,14 +184,20 @@ def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
 
     Shared by :meth:`LocalFileSystem.largest_video_file` (directory case) and
     :meth:`LocalFileSystem.list_video_files` -- the symlink/mount containment
-    checks and the extras/sample pruning are identical for both callers. ``abs``
-    is the realpath-resolved file (the actual bytes an import copies); ``rel`` is
-    the LITERAL (unresolved) path relative to ``root``, preserving the download's
-    own directory names (e.g. ``"Season 01/Show.S01E01.mkv"``) for token parsing.
-    Yields nothing when ``root`` itself is a symlink escaping its own parent
-    directory, or when ``root`` does not exist / is not a directory.
+    checks and the extras/sample/disc-structure pruning are identical for both
+    callers. ``abs`` is the realpath-resolved file (the actual bytes an import
+    copies); ``rel`` is the LITERAL (unresolved) path relative to ``root``,
+    preserving the download's own directory names (e.g.
+    ``"Season 01/Show.S01E01.mkv"``) for token parsing. Yields nothing when
+    ``root`` itself is inside a ``BDMV``/``VIDEO_TS`` structure, is a symlink
+    escaping its own parent directory, or does not exist / is not a directory.
     """
     root_path = Path(root)
+    if is_plex_disc_structure_path(os.fspath(root_path)):
+        # Catch both a content root named BDMV/VIDEO_TS and a client path rooted
+        # at one of its descendants (e.g. BDMV/STREAM). Without this root guard,
+        # pruning only ``dirnames`` below would be one level too late.
+        return
     # Containment anchor: a symlink (or nested mount) inside the download tree
     # must never let a yielded file resolve OUTSIDE it, or the importer would
     # copy an arbitrary file (e.g. /etc/passwd) into the public library.
@@ -208,16 +214,19 @@ def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
     if parent_real != os.sep and not _is_within(parent_real, root_real):
         return
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune extras / sample directories in place so os.walk skips them.
+        # Prune extras / sample / optical-disc directories in place so os.walk
+        # never offers their component streams as standalone import candidates.
         dirnames[:] = [
             name
             for name in dirnames
-            if name.lower() not in _EXTRAS_DIR_NAMES and "sample" not in name.lower()
+            if name.casefold() not in _EXTRAS_DIR_NAMES
+            and not is_plex_disc_structure_path(name)
+            and "sample" not in name.casefold()
         ]
         for filename in filenames:
             if "sample" in filename.lower():
                 continue
-            if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
+            if plex_video_extension(os.fspath(Path(dirpath) / filename)) is None:
                 continue
             literal_path = Path(dirpath) / filename
             candidate = os.path.realpath(literal_path)
@@ -346,11 +355,12 @@ class LocalFileSystem:
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.
 
-        Walks ``root`` keeping files whose suffix is in :data:`VIDEO_EXTENSIONS`,
-        skipping sample files and extras folders (featurettes / extras /
-        trailers). Returns the path with the greatest size, or ``None`` when no
-        eligible video exists. If ``root`` is itself a video file, it is
-        returned.
+        Walks ``root`` keeping files whose suffix is in
+        :data:`~plex_manager.domain.plex_video.PLEX_VIDEO_EXTENSIONS`,
+        skipping sample files, extras folders (featurettes / extras / trailers),
+        and ``BDMV``/``VIDEO_TS`` optical-disc structures. Returns the path with
+        the greatest size, or ``None`` when no eligible video exists. If ``root``
+        is itself a video file, it is returned.
         """
         root_path = Path(root)
         if root_path.is_file():
@@ -358,7 +368,7 @@ class LocalFileSystem:
             # a symlink escaping its own directory must not be followed and copied
             # into the public library.
             resolved = os.path.realpath(root_path)
-            if root_path.suffix.lower() in VIDEO_EXTENSIONS and _is_within(
+            if plex_video_extension(os.fspath(root_path)) is not None and _is_within(
                 os.path.realpath(root_path.parent), resolved
             ):
                 return resolved
@@ -379,10 +389,11 @@ class LocalFileSystem:
         ``relative_path`` is folder-qualified relative to ``root`` (e.g.
         ``"Season 01/Show.S01E01.mkv"``) -- needed to parse the season/episode out
         of a season-pack's directory structure, not just the filename. Sample
-        files and extras folders are skipped, mirroring
-        :meth:`largest_video_file`. Returns an empty list when no eligible video is
-        found. Unlike :meth:`largest_video_file`, ``root`` being itself a single
-        video file is not handled here -- a TV import always walks a directory.
+        files, extras folders, and ``BDMV``/``VIDEO_TS`` optical-disc structures
+        are skipped, mirroring :meth:`largest_video_file`. Returns an empty list
+        when no eligible video is found. Unlike :meth:`largest_video_file`,
+        ``root`` being itself a single video file is not handled here -- a TV
+        import always walks a directory.
         """
         return list(_iter_video_files(root))
 

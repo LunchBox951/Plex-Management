@@ -101,7 +101,9 @@ untouched by updates. See
 
 ## Developing
 
-Requires Python 3.12+ and Node.js 22+ with npm.
+Requires Python 3.12+, Node.js 22+ with npm, and `ffprobe` (provided by the
+FFmpeg package) for completed-video validation. The published Docker image
+already includes it.
 
 ```bash
 make install   # editable install + dev tools + pre-commit

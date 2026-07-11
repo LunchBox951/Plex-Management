@@ -7,6 +7,7 @@ standard. This guide covers the dev workflow.
 
 - Python **3.12+**
 - Node.js **22+** with npm
+- FFmpeg (`ffprobe` is used to validate completed video files before import)
 - Docker (for building/running the container)
 - `make` (optional, for the shortcuts below)
 

@@ -9,8 +9,11 @@ real bytes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +42,11 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.library import WatchState
+from plex_manager.ports.media_probe import (
+    MediaProbePort,
+    MediaProbeResult,
+    MediaProbeUnavailableError,
+)
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import (
@@ -53,7 +61,7 @@ from plex_manager.services.import_service import (
     run_availability_cycle,
     run_import_cycle,
 )
-from tests.web.fakes import FakeLibrary, FakeQbittorrent
+from tests.web.fakes import FakeLibrary, FakeMediaProbe, FakeQbittorrent
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -148,11 +156,13 @@ async def _import(
     library: FakeLibrary,
     *,
     anime_movie_root: Path | None = None,
+    media_probe: MediaProbePort | None = None,
 ) -> DownloadRecord | None:
     async with sessionmaker_() as session:
         return await import_download(
             download_id=download_id,
             fs=LocalFileSystem(),
+            media_probe=media_probe or FakeMediaProbe(),
             library=library,
             qbt=qbt,
             parser=GuessitParser(),
@@ -476,6 +486,7 @@ async def _import_with_fs(
         return await import_download(
             download_id=download_id,
             fs=fs,
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=qbt,
             parser=GuessitParser(),
@@ -775,7 +786,358 @@ async def test_import_with_no_video_file_is_blocked(
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
     assert record.failed_reason is not None
-    assert "no video file" in record.failed_reason
+    assert "no Plex-supported video file" in record.failed_reason
+
+
+async def test_import_ignores_non_video_siblings_and_associates_only_verified_video(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """Positive acceptance: unrelated payload siblings never enter the library."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    video = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    (release_dir / "setup.exe").write_bytes(b"not media")
+    (release_dir / "release.nfo").write_text("metadata")
+    (release_dir / "poster.jpg").write_bytes(b"image")
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(release_dir), library)
+
+    assert record is not None and record.status == DownloadState.Imported.value
+    movie_dir = movies_root / "The Matrix (1999)"
+    assert [path.name for path in movie_dir.iterdir()] == ["The Matrix (1999).mkv"]
+    assert library.scanned == [str(movie_dir)]
+
+
+async def test_import_rejects_renamed_non_video_before_library_association(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+    probe = FakeMediaProbe(rejected={video.name: "file could not be parsed as video"})
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        media_probe=probe,
+    )
+
+    assert record is not None and record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "no verified Plex-compatible video file" in record.failed_reason
+    assert library.scanned == []
+    assert not any(movies_root.iterdir())
+
+
+async def test_import_uses_verified_feature_when_larger_video_candidate_is_invalid(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    valid = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    invalid = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.PROPER.mkv"
+    _make_video(valid, size_bytes=80 * 1024 * 1024)
+    _make_video(invalid, size_bytes=120 * 1024 * 1024)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    probe = FakeMediaProbe(rejected={invalid.name: "container does not match suffix"})
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(release_dir),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+
+    assert record is not None and record.status == DownloadState.Imported.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.stat().st_size == 80 * 1024 * 1024
+
+
+async def test_import_uses_verified_movie_when_sibling_probe_is_unavailable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    unavailable = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.PROPER.mkv"
+    accepted = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(unavailable, size_bytes=120 * 1024 * 1024)
+    _make_video(accepted, size_bytes=80 * 1024 * 1024)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    probe = FakeMediaProbe(unavailable={unavailable.name: "ffprobe worker unavailable"})
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(release_dir),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+
+    assert record is not None and record.status == DownloadState.Imported.value
+    assert {path.name for path in probe.calls} == {accepted.name, unavailable.name}
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.stat().st_size == 80 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "download_status",
+    [DownloadState.ImportPending.value, DownloadState.ImportBlocked.value],
+)
+async def test_import_probe_outage_blocks_retryably_before_library_association(
+    tmp_path: Path, sessionmaker_: SessionMaker, download_status: str
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=download_status,
+    )
+    library = FakeLibrary()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        media_probe=FakeMediaProbe(raises=MediaProbeUnavailableError("ffprobe timed out")),
+    )
+
+    assert record is not None and record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason == "video verification unavailable: ffprobe timed out"
+    assert library.scanned == []
+    assert not any(movies_root.iterdir())
+
+
+async def test_import_probe_outage_keeps_crash_resumed_movie_auto_retryable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        media_probe=FakeMediaProbe(raises=MediaProbeUnavailableError("ffprobe timed out")),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Importing.value
+    assert record.failed_reason is None
+    assert library.scanned == []
+    assert not any(movies_root.iterdir())
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.downloading
+
+
+class _PausingUnavailableProbe:
+    """Pause in the probe thread so another DB session can change the row."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def probe(self, path: Path, *, timeout_seconds: float | None = None) -> MediaProbeResult:
+        del path
+        self.started.set()
+        assert self.release.wait(timeout=timeout_seconds or 2.0)
+        raise MediaProbeUnavailableError("paused probe unavailable")
+
+
+async def test_probe_outage_refreshes_concurrently_changed_importing_row(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    probe = _PausingUnavailableProbe()
+
+    async def change_row() -> None:
+        assert await asyncio.to_thread(probe.started.wait, 2.0)
+        async with sessionmaker_() as session:
+            row = await session.get(Download, download_id)
+            assert row is not None
+            row.status = DownloadState.Failed.value
+            row.failed_reason = "changed concurrently"
+            await session.commit()
+        probe.release.set()
+
+    changer = asyncio.create_task(change_row())
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+    assert await changer is None
+
+    assert record is not None
+    assert record.status == DownloadState.Failed.value
+    assert record.failed_reason == "changed concurrently"
+    assert not any(movies_root.iterdir())
+
+
+async def test_import_verification_has_one_aggregate_batch_deadline(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert vars(import_service)["_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS"] == 30.0
+    monkeypatch.setattr(import_service, "_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS", 0.0)
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    release_dir = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP"
+    first = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    second = release_dir / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.PROPER.mkv"
+    _make_video(first)
+    _make_video(second)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    probe = FakeMediaProbe()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(release_dir),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+
+    assert record is not None and record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "verification batch exceeded its 0-second deadline" in record.failed_reason
+    assert probe.calls == []
+    assert not any(movies_root.iterdir())
+
+
+async def test_verification_deadline_includes_executor_queue_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(import_service, "_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS", 0.01)
+    probe = FakeMediaProbe()
+
+    async def queued_to_thread(func: object, *args: object, **kwargs: object) -> object:
+        del func, args, kwargs
+        await asyncio.sleep(1.0)
+        raise AssertionError("queued probe should have been cancelled at the batch deadline")
+
+    monkeypatch.setattr(import_service.asyncio, "to_thread", queued_to_thread)
+
+    with pytest.raises(RuntimeError, match=r"verification batch exceeded its 0\.01-second"):
+        await import_service._verified_plex_video_sources(  # pyright: ignore[reportPrivateUsage]
+            probe,
+            [("/downloads/movie.mkv", 80 * 1024 * 1024, "movie.mkv")],
+        )
+
+    assert probe.calls == []
+
+
+class _DeadlineHonoringProbe:
+    """Test probe that consumes its supplied budget before returning a verdict."""
+
+    def __init__(self) -> None:
+        self.completed = False
+        self.timeout_seconds: float | None = None
+
+    def probe(self, path: Path, *, timeout_seconds: float | None = None) -> MediaProbeResult:
+        del path
+        assert timeout_seconds is not None and timeout_seconds > 0
+        self.timeout_seconds = timeout_seconds
+        # Simulate subprocess.run taking a little longer than its timeout while
+        # it kills and reaps the child. The import must join this cleanup.
+        time.sleep(timeout_seconds + 0.02)
+        self.completed = True
+        raise MediaProbeUnavailableError("deadline-aware probe timed out")
+
+
+async def test_import_waits_for_deadline_bounded_probe_work_to_finish(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(import_service, "_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS", 0.01)
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    probe = _DeadlineHonoringProbe()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+
+    assert probe.completed, "import returned while probe work was still running"
+    assert probe.timeout_seconds is not None and probe.timeout_seconds <= 0.01
+    assert record is not None and record.status == DownloadState.ImportBlocked.value
+    assert not any(movies_root.iterdir())
 
 
 async def test_import_movies_root_unset_is_an_honest_retryable_block(
@@ -796,6 +1158,7 @@ async def test_import_movies_root_unset_is_an_honest_retryable_block(
         record = await import_download(
             download_id=download_id,
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=FakeQbittorrent(),
             parser=GuessitParser(),
@@ -1228,6 +1591,7 @@ async def test_run_import_cycle_drains_pending_download_to_completed(
     async with sessionmaker_() as session:
         await run_import_cycle(
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=_qbt(video),
             parser=GuessitParser(),
@@ -1266,6 +1630,7 @@ async def test_run_import_cycle_blocks_ownerless_row_instead_of_skipping_it(
     async with sessionmaker_() as session:
         await run_import_cycle(
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=FakeLibrary(),
             qbt=FakeQbittorrent(statuses=[]),
             parser=GuessitParser(),
@@ -1699,11 +2064,13 @@ async def _import_tv(
     library: FakeLibrary,
     *,
     anime_tv_root: Path | None = None,
+    media_probe: MediaProbePort | None = None,
 ) -> DownloadRecord | None:
     async with sessionmaker_() as session:
         return await import_download(
             download_id=download_id,
             fs=LocalFileSystem(),
+            media_probe=media_probe or FakeMediaProbe(),
             library=library,
             qbt=qbt,
             parser=GuessitParser(),
@@ -1742,6 +2109,95 @@ async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
     assert season_row.status.value == "completed"
     assert request is not None
     assert request.status is RequestStatus.completed  # "Finalizing", not yet available
+
+
+async def test_import_tv_associates_only_verified_video_files(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    accepted = release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv"
+    rejected = release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(accepted)
+    _make_video(rejected)
+    (release_dir / "notes.nfo").write_text("not a library video")
+    download_id, _request_id, _season_id = await _seed_tv(sessionmaker_, season=2)
+    probe = FakeMediaProbe(rejected={rejected.name: "no real video stream"})
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(release_dir),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+
+    assert record is not None and record.status == DownloadState.Imported.value
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert [path.name for path in season_dir.iterdir()] == ["Some Show - S02E01.mkv"]
+
+
+async def test_import_tv_uses_verified_episode_when_sibling_probe_is_unavailable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    unavailable = release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv"
+    accepted = release_dir / "Some.Show.S02E02.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(unavailable)
+    _make_video(accepted)
+    download_id, _request_id, _season_id = await _seed_tv(sessionmaker_, season=2)
+    probe = FakeMediaProbe(unavailable={unavailable.name: "ffprobe worker unavailable"})
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(release_dir),
+        FakeLibrary(),
+        media_probe=probe,
+    )
+
+    assert record is not None and record.status == DownloadState.Imported.value
+    assert {path.name for path in probe.calls} == {accepted.name, unavailable.name}
+    season_dir = tv_root / "Some Show (2020)" / "Season 02"
+    assert [path.name for path in season_dir.iterdir()] == ["Some Show - S02E02.mkv"]
+
+
+async def test_import_tv_probe_outage_keeps_crash_resumed_season_auto_retryable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    video = tmp_path / "downloads" / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id, season_id = await _seed_tv(
+        sessionmaker_, season=2, download_status=DownloadState.Importing.value
+    )
+    library = FakeLibrary()
+
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(video),
+        library,
+        media_probe=FakeMediaProbe(raises=MediaProbeUnavailableError("ffprobe timed out")),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Importing.value
+    assert record.failed_reason is None
+    assert library.scan_calls == []
+    assert not any(tv_root.iterdir())
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        season = await session.get(SeasonRequest, season_id)
+    assert request is not None and request.status is RequestStatus.downloading
+    assert season is not None and season.status.value == "downloading"
 
 
 async def test_import_tv_shared_torrent_completes_each_attached_scope(
@@ -1844,6 +2300,108 @@ async def test_import_tv_shared_torrent_completes_each_attached_scope(
         2: "imported",
     }
     assert all(scope.completed_at is not None for scope in scopes)
+
+
+async def test_import_tv_probe_outage_keeps_crash_resumed_shared_scopes_auto_retryable(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        seasons = [
+            SeasonRequest(
+                media_request_id=request.id,
+                season_number=number,
+                status=RequestStatus.downloading.value,
+            )
+            for number in (1, 2)
+        ]
+        session.add_all(seasons)
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.Importing.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season.id,
+                    season_number=season.season_number,
+                    scope_key=f"season:{season.season_number}|episodes:*",
+                    status="active",
+                )
+                for season in seasons
+            ]
+        )
+        await session.commit()
+        download_id = download.id
+        request_id = request.id
+
+    library = FakeLibrary()
+    record = await _import_tv(
+        sessionmaker_,
+        download_id,
+        tv_root,
+        _qbt(release_dir),
+        library,
+        media_probe=FakeMediaProbe(raises=MediaProbeUnavailableError("ffprobe timed out")),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.Importing.value
+    assert record.failed_reason is None
+    assert library.scan_calls == []
+    assert not any(tv_root.iterdir())
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        season_rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert request is not None and request.status is RequestStatus.downloading
+    assert {season.season_number: season.status for season in season_rows} == {
+        1: "downloading",
+        2: "downloading",
+    }
+    assert {scope.season_number: scope.status for scope in scopes} == {
+        1: "active",
+        2: "active",
+    }
 
 
 async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
@@ -2291,6 +2849,7 @@ async def test_import_tv_root_unset_is_an_honest_retryable_block(
         record = await import_download(
             download_id=download_id,
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=FakeQbittorrent(),
             parser=GuessitParser(),
@@ -2442,6 +3001,7 @@ async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_his
         record = await import_download(
             download_id=download_id,
             fs=_FailsOnSecondCallFs(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=_qbt(release_dir),
             parser=GuessitParser(),
@@ -2489,6 +3049,7 @@ async def test_run_import_cycle_drains_a_tv_download_to_a_completed_season(
     async with sessionmaker_() as session:
         await run_import_cycle(
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=_qbt(release_dir),
             parser=GuessitParser(),
@@ -3320,6 +3881,7 @@ async def test_import_anime_movie_blocked_honestly_when_no_root_at_all_is_config
         record = await import_download(
             download_id=download_id,
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=FakeQbittorrent(),
             parser=GuessitParser(),
@@ -3360,6 +3922,7 @@ async def test_import_anime_only_install_imports_with_movies_root_unset(
         record = await import_download(
             download_id=download_id,
             fs=LocalFileSystem(),
+            media_probe=FakeMediaProbe(),
             library=library,
             qbt=_qbt(video),
             parser=GuessitParser(),
