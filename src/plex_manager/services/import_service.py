@@ -54,6 +54,7 @@ from plex_manager.domain.naming import (
     plex_tv_episode_relative_path,
     plex_tv_season_relative_dir,
 )
+from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
 from plex_manager.domain.quality import Quality
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
@@ -65,7 +66,7 @@ from plex_manager.models import (
     DownloadScope,
     RequestStatus,
 )
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
+from plex_manager.ports.media_probe import MediaProbeError, MediaProbeUnavailableError
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
+    from plex_manager.ports.media_probe import MediaProbePort
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import DownloadRecord, RequestRecord, SeasonRequestRecord
 
@@ -436,7 +438,7 @@ def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, i
         # found" ([]) -> whole-download block, never a silent skip.
         resolved = os.path.realpath(content_path)
         parent_real = os.path.realpath(root_path.parent)
-        if root_path.suffix.lower() not in VIDEO_EXTENSIONS or not _is_within(
+        if root_path.suffix.lower() not in PLEX_VIDEO_EXTENSIONS or not _is_within(
             parent_real, resolved
         ):
             return []
@@ -446,6 +448,54 @@ def _resolve_sources(fs: FileSystemPort, content_path: str) -> list[tuple[str, i
         (abs_path, size, os.path.relpath(abs_path, anchor))
         for abs_path, size, _rel in fs.list_video_files(content_path)
     ]
+
+
+class _VideoVerificationError(RuntimeError):
+    """A surfaced, retryable reason no candidate can enter a Plex library."""
+
+
+async def _verified_plex_video_sources(
+    media_probe: MediaProbePort,
+    sources: list[tuple[str, int, str]],
+) -> list[tuple[str, int, str]]:
+    """Keep only real, suffix-consistent video candidates accepted by ffprobe.
+
+    Extension filtering happens in :func:`_resolve_sources`; this second gate
+    proves that each surviving path is actually a parseable video container with
+    a real (non-cover-art) video stream. A bad candidate is rejected individually:
+    a download that also contains a valid matching feature/episode remains useful,
+    and only accepted candidates can reach placement. A probe infrastructure
+    failure is different -- the result is unknown, so the whole import blocks
+    retryably rather than importing without verification.
+    """
+    if not sources:
+        raise _VideoVerificationError(
+            "no Plex-supported video file found in the completed download"
+        )
+
+    accepted: list[tuple[str, int, str]] = []
+    rejected = 0
+    for source in sources:
+        try:
+            await asyncio.to_thread(media_probe.probe, Path(source[0]))
+        except MediaProbeUnavailableError as exc:
+            raise _VideoVerificationError(f"video verification unavailable: {exc}") from exc
+        except MediaProbeError:
+            rejected += 1
+        else:
+            accepted.append(source)
+
+    if not accepted:
+        raise _VideoVerificationError(
+            "no verified Plex-compatible video file found in the completed download "
+            f"({rejected} candidate(s) rejected)"
+        )
+    if rejected:
+        _logger.warning(
+            "ignored %s candidate video file(s) that failed Plex media verification",
+            safe_int(rejected),
+        )
+    return accepted
 
 
 def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
@@ -747,6 +797,7 @@ async def import_download(
     *,
     download_id: int,
     fs: FileSystemPort,
+    media_probe: MediaProbePort,
     library: LibraryPort,
     qbt: DownloadClientPort,
     parser: ParserPort,
@@ -783,6 +834,7 @@ async def import_download(
         return await _import_download_locked(
             download_id=download_id,
             fs=fs,
+            media_probe=media_probe,
             library=library,
             qbt=qbt,
             parser=parser,
@@ -799,6 +851,7 @@ async def _import_download_locked(
     *,
     download_id: int,
     fs: FileSystemPort,
+    media_probe: MediaProbePort,
     library: LibraryPort,
     qbt: DownloadClientPort,
     parser: ParserPort,
@@ -872,6 +925,7 @@ async def _import_download_locked(
                 targets=scope_targets,
                 download_path=row.download_path,
                 fs=fs,
+                media_probe=media_probe,
                 library=library,
                 qbt=qbt,
                 parser=parser,
@@ -896,6 +950,7 @@ async def _import_download_locked(
             episodes=episodes,
             download_path=row.download_path,
             fs=fs,
+            media_probe=media_probe,
             library=library,
             qbt=qbt,
             parser=parser,
@@ -986,12 +1041,14 @@ async def _import_download_locked(
         return await download_repo.get_by_hash(torrent_hash)
     content = visible_content
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
-    if not sources:
+    try:
+        sources = await _verified_plex_video_sources(media_probe, sources)
+    except _VideoVerificationError as exc:
         await _block(
             session,
             download_repo,
             download_id,
-            "no video file found in the download",
+            str(exc),
             request_id=request.id,
         )
         return await download_repo.get_by_hash(torrent_hash)
@@ -1259,6 +1316,7 @@ async def _import_tv_targets_locked(
     targets: tuple[_TvImportTarget, ...],
     download_path: str | None,
     fs: FileSystemPort,
+    media_probe: MediaProbePort,
     library: LibraryPort,
     qbt: DownloadClientPort,
     parser: ParserPort,
@@ -1338,12 +1396,14 @@ async def _import_tv_targets_locked(
         return await download_repo.get_by_hash(torrent_hash)
 
     sources = await asyncio.to_thread(_resolve_sources, fs, visible_content)
-    if not sources:
+    try:
+        sources = await _verified_plex_video_sources(media_probe, sources)
+    except _VideoVerificationError as exc:
         await _block(
             session,
             download_repo,
             download_id,
-            "no video file found in the download",
+            str(exc),
             request_id=request.id,
             seasons=target_seasons,
         )
@@ -1546,6 +1606,7 @@ async def _import_tv_locked(
     episodes: list[int] | None,
     download_path: str | None,
     fs: FileSystemPort,
+    media_probe: MediaProbePort,
     library: LibraryPort,
     qbt: DownloadClientPort,
     parser: ParserPort,
@@ -1643,12 +1704,14 @@ async def _import_tv_locked(
     content = visible_content
 
     sources = await asyncio.to_thread(_resolve_sources, fs, content)
-    if not sources:
+    try:
+        sources = await _verified_plex_video_sources(media_probe, sources)
+    except _VideoVerificationError as exc:
         await _block(
             session,
             download_repo,
             download_id,
-            "no video file found in the download",
+            str(exc),
             request_id=request.id,
             season=season,
         )
@@ -1933,6 +1996,7 @@ async def _import_tv_locked(
 async def run_import_cycle(
     *,
     fs: FileSystemPort,
+    media_probe: MediaProbePort,
     library: LibraryPort,
     qbt: DownloadClientPort,
     parser: ParserPort,
@@ -1973,6 +2037,7 @@ async def run_import_cycle(
                 await import_download(
                     download_id=row.id,
                     fs=fs,
+                    media_probe=media_probe,
                     library=library,
                     qbt=qbt,
                     parser=parser,

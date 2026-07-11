@@ -39,16 +39,16 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from plex_manager.domain.media_match import matches_media
+from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.quality_service import check_quality
 from plex_manager.domain.release import ParsedRelease
 from plex_manager.domain.season_pack import episode_numbers as _episode_numbers
 from plex_manager.domain.source_mapping import resolve_quality
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
 from plex_manager.ports.parser import ParserPort
 
 __all__ = [
-    "VIDEO_EXTENSIONS",
+    "PLEX_VIDEO_EXTENSIONS",
     "EpisodeImportRejection",
     "EpisodeImportResult",
     "ImportRejection",
@@ -60,7 +60,7 @@ __all__ = [
     "validate_season_import",
 ]
 
-# NB: ``VIDEO_EXTENSIONS`` (imported above, re-exported via ``__all__``) is the
+# NB: ``PLEX_VIDEO_EXTENSIONS`` (imported above, re-exported via ``__all__``) is the
 # SAME set ``FileSystemPort.largest_video_file`` uses to SELECT the source file, so
 # the selector and this validator can never disagree — a file picked as the source
 # but then rejected here as "no video" was a real beta bug.
@@ -225,7 +225,7 @@ def _extension(name: str) -> str:
 
 
 def _is_video(name: str) -> bool:
-    return _extension(name) in VIDEO_EXTENSIONS
+    return _extension(name) in PLEX_VIDEO_EXTENSIONS
 
 
 def _marker_key(marker_match: str) -> str:

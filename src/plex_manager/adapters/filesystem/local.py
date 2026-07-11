@@ -21,7 +21,7 @@ import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from plex_manager.ports.filesystem import VIDEO_EXTENSIONS
+from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
 
 __all__ = ["LocalFileSystem", "LocalFileSystemError"]
 
@@ -217,7 +217,7 @@ def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
         for filename in filenames:
             if "sample" in filename.lower():
                 continue
-            if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
+            if Path(filename).suffix.lower() not in PLEX_VIDEO_EXTENSIONS:
                 continue
             literal_path = Path(dirpath) / filename
             candidate = os.path.realpath(literal_path)
@@ -346,7 +346,8 @@ class LocalFileSystem:
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.
 
-        Walks ``root`` keeping files whose suffix is in :data:`VIDEO_EXTENSIONS`,
+        Walks ``root`` keeping files whose suffix is in
+        :data:`~plex_manager.domain.plex_video.PLEX_VIDEO_EXTENSIONS`,
         skipping sample files and extras folders (featurettes / extras /
         trailers). Returns the path with the greatest size, or ``None`` when no
         eligible video exists. If ``root`` is itself a video file, it is
@@ -358,7 +359,7 @@ class LocalFileSystem:
             # a symlink escaping its own directory must not be followed and copied
             # into the public library.
             resolved = os.path.realpath(root_path)
-            if root_path.suffix.lower() in VIDEO_EXTENSIONS and _is_within(
+            if root_path.suffix.lower() in PLEX_VIDEO_EXTENSIONS and _is_within(
                 os.path.realpath(root_path.parent), resolved
             ):
                 return resolved

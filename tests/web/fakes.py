@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI
@@ -25,6 +26,11 @@ from plex_manager.ports.download_client import (
 )
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState
+from plex_manager.ports.media_probe import (
+    MediaProbeError,
+    MediaProbePort,
+    MediaProbeResult,
+)
 from plex_manager.ports.metadata import (
     MediaPage,
     MediaSearchResult,
@@ -35,6 +41,7 @@ from plex_manager.ports.metadata import (
 from plex_manager.web.deps import (
     get_library,
     get_library_optional,
+    get_media_probe,
     get_prowlarr,
     get_qbittorrent,
     get_qbittorrent_optional,
@@ -43,6 +50,7 @@ from plex_manager.web.deps import (
 
 __all__ = [
     "FakeLibrary",
+    "FakeMediaProbe",
     "FakeProwlarr",
     "FakeQbittorrent",
     "FakeTmdb",
@@ -51,6 +59,30 @@ __all__ = [
     "override_adapters",
     "prerelease_only_candidates",
 ]
+
+
+class FakeMediaProbe:
+    """Deterministic media probe: accept by default, reject selected basenames."""
+
+    def __init__(
+        self,
+        *,
+        rejected: Mapping[str, str] | None = None,
+        raises: MediaProbeError | None = None,
+    ) -> None:
+        self.rejected = dict(rejected or {})
+        self.raises = raises
+        self.calls: list[Path] = []
+
+    def probe(self, path: Path) -> MediaProbeResult:
+        self.calls.append(path)
+        if self.raises is not None:
+            raise self.raises
+        reason = self.rejected.get(path.name)
+        if reason is not None:
+            raise MediaProbeError(reason)
+        return MediaProbeResult(container="matroska", video_codec="h264")
+
 
 _EPOCH = datetime(2020, 1, 1, tzinfo=UTC)
 
@@ -493,6 +525,7 @@ def override_adapters(
     prowlarr: IndexerPort | None = None,
     qbt: DownloadClientPort | None = None,
     library: LibraryPort | None = None,
+    media_probe: MediaProbePort | None = None,
 ) -> None:
     """Point the adapter dependencies at the supplied fakes.
 
@@ -512,3 +545,5 @@ def override_adapters(
     if library is not None:
         app.dependency_overrides[get_library] = lambda: library
         app.dependency_overrides[get_library_optional] = lambda: library
+    probe = media_probe or FakeMediaProbe()
+    app.dependency_overrides[get_media_probe] = lambda: probe
