@@ -61,11 +61,12 @@ redirect following. Redirects are reported as upstream failures and never get a
 second request carrying credentials to another origin.
 
 The process-wide upstream HTTP client rejects response cookies. qBittorrent's
-`SID` is captured by its adapter, removed from any injected shared jar, and sent
-through an explicit Cookie header only to that adapter's confined endpoints.
-This matters because standard cookie matching includes the hostname and path but
-not the port; a shared jar could otherwise forward an SID to another service on
-the same host.
+session cookie (`SID` on older releases and `QBT_SID_<port>` on 5.2+) is captured
+by its adapter, removed from any injected shared jar, and sent through an
+explicit Cookie header only to that adapter's confined endpoints. This matters
+because standard cookie matching includes the hostname and path but not the
+port; a shared jar could otherwise forward the session to another service on the
+same host.
 
 ### Stored credentials do not silently cross origins
 
@@ -84,6 +85,12 @@ the stored credential: different paths on one origin can route to different
 backends. The check happens before a Plex verification probe
 or any settings write, so a rejected update neither discloses a secret nor leaves
 partial configuration behind.
+
+The supported single-process deployment serializes that complete settings
+validation, probe, and commit sequence. Concurrent partial updates therefore
+cannot validate a secret against the old base and later commit it alongside a
+different request's newly written base. A future multi-worker deployment must
+replace the in-process guard with an equivalent database-level version or lock.
 
 ### Keep untrusted fetches on their stronger policy
 

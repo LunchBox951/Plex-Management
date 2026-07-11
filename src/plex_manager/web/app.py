@@ -887,7 +887,8 @@ def create_upstream_http_client() -> httpx.AsyncClient:
     A normal cookie jar matches by domain/path but not port. Keeping an upstream
     cookie on this process-wide client could therefore forward one service's
     credential to another service on the same hostname. qBittorrent captures and
-    sends its SID explicitly; all automatic response-cookie persistence is denied.
+    sends its session cookie explicitly; all automatic response-cookie persistence
+    is denied.
     """
     client = httpx.AsyncClient(timeout=30.0, trust_env=False)
     client.cookies.jar.set_policy(_RejectAllResponseCookies())

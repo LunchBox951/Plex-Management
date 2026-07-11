@@ -9,6 +9,7 @@ import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import pytest
@@ -537,6 +538,97 @@ async def test_put_changed_qbittorrent_base_accepts_explicit_empty_password(
         store = SettingsStore(session)
         assert await store.get("qbittorrent_url") == "http://new-service:8080"
         assert await store.get("qbittorrent_password") == ""
+
+
+async def test_put_serializes_destination_and_secret_updates(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A secret rotation cannot be paired with a concurrently repointed URL.
+
+    Hold a secret-only PUT immediately before its write, then start a URL+dummy
+    secret PUT. Without the endpoint-wide lock, the repoint commits while the
+    rotation is paused and the rotation subsequently overwrites only its secret,
+    leaving ``capture + fresh-secret``. The lock makes the repoint wait, re-read
+    the pair committed by the rotation, and atomically leave ``capture + dummy``.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://old-service:9696")
+        await store.set("prowlarr_api_key", "old-secret")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    from plex_manager.web.routers import settings as settings_router
+
+    class ObservedSettingsLock(asyncio.Lock):
+        """Signal when the second PUT has reached the contended lock."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.acquire_attempts = 0
+            self.second_waiting = asyncio.Event()
+
+        async def acquire(self) -> Literal[True]:
+            self.acquire_attempts += 1
+            if self.acquire_attempts == 2:
+                self.second_waiting.set()
+            return await super().acquire()
+
+    # A contended asyncio.Lock binds to this test's event loop. Install a fresh
+    # one so this regression stays independent of tests running in other loops.
+    observed_lock = ObservedSettingsLock()
+    monkeypatch.setattr(settings_router, "_settings_update_lock", observed_lock)
+
+    real_set = SettingsStore.set
+    rotation_ready = asyncio.Event()
+    release_rotation = asyncio.Event()
+
+    async def gated_set(store: SettingsStore, key: str, value: str) -> None:
+        if key == "prowlarr_api_key" and value == "fresh-secret":
+            rotation_ready.set()
+            await asyncio.wait_for(release_rotation.wait(), timeout=5.0)
+        await real_set(store, key, value)
+
+    monkeypatch.setattr(SettingsStore, "set", gated_set)
+
+    rotation = asyncio.create_task(
+        client.put(
+            "/api/v1/settings",
+            json={"prowlarr_api_key": "fresh-secret"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+    )
+    await asyncio.wait_for(rotation_ready.wait(), timeout=5.0)
+
+    repoint = asyncio.create_task(
+        client.put(
+            "/api/v1/settings",
+            json={
+                "prowlarr_url": "http://capture:9696",
+                "prowlarr_api_key": "dummy-secret",
+            },
+            headers={"X-Api-Key": _API_KEY},
+        )
+    )
+    await asyncio.wait_for(observed_lock.second_waiting.wait(), timeout=5.0)
+    assert not repoint.done()
+
+    release_rotation.set()
+    rotation_response, repoint_response = await asyncio.wait_for(
+        asyncio.gather(rotation, repoint), timeout=10.0
+    )
+
+    assert rotation_response.status_code == 200
+    assert repoint_response.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("prowlarr_url") == "http://capture:9696"
+        assert await store.get("prowlarr_api_key") == "dummy-secret"
 
 
 async def test_put_changed_plex_token_probes_with_the_new_token(

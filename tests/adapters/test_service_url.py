@@ -182,14 +182,78 @@ async def test_qbittorrent_authenticated_requests_and_retry_refuse_redirects(
     assert [request.url.path for request in calls] == expected_paths
 
 
-async def test_qbittorrent_sid_is_adapter_local_and_never_crosses_ports() -> None:
+@pytest.mark.parametrize(
+    ("cookie_name", "cookie_value"),
+    [
+        ("SID", "legacy-session"),
+        ("QBT_SID_8080", "AbCdEf0123456789+/AbCdEf012345"),
+    ],
+)
+async def test_qbittorrent_sends_the_exact_validated_session_cookie_name(
+    cookie_name: str, cookie_value: str
+) -> None:
+    cookie_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cookie_headers.append(request.headers.get("Cookie"))
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(
+                200,
+                text="Ok.",
+                headers={"Set-Cookie": f"{cookie_name}={cookie_value}; Path=/"},
+            )
+        if request.url.path == "/api/v2/torrents/info":
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        qbt = QbittorrentClient(client, "http://qb.local:8080", "user", "password")
+        await qbt.get_all_statuses()
+        assert list(client.cookies.jar) == []
+
+    assert cookie_headers == ["", f"{cookie_name}={cookie_value}"]
+
+
+@pytest.mark.parametrize(
+    "set_cookie",
+    [
+        "QBT_SID_not-a-port=session; Path=/",
+        "QBT_SID_65536=session; Path=/",
+        "SID=invalid:value; Path=/",
+        "SID; Path=/",
+    ],
+)
+async def test_qbittorrent_rejects_invalid_session_cookie_name_or_value(
+    set_cookie: str,
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text="Ok.", headers={"Set-Cookie": set_cookie})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        qbt = QbittorrentClient(client, "http://qb.local:8080", "user", "password")
+        with pytest.raises(QbittorrentError, match="invalid session cookie"):
+            await qbt.get_all_statuses()
+        assert list(client.cookies.jar) == []
+
+    assert [request.url.path for request in calls] == ["/api/v2/auth/login"]
+
+
+async def test_qbittorrent_session_is_adapter_local_and_never_crosses_ports() -> None:
     calls: list[tuple[int | None, str, str | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.url.port, request.url.path, request.headers.get("Cookie")))
         if request.url.path == "/api/v2/auth/login":
             sid = "first-session" if request.url.port == 8080 else "second-session"
-            return httpx.Response(200, text="Ok.", headers={"Set-Cookie": f"SID={sid}; Path=/"})
+            name = f"QBT_SID_{request.url.port}"
+            return httpx.Response(
+                200,
+                text="Ok.",
+                headers={"Set-Cookie": f"{name}={sid}; Path=/"},
+            )
         if request.url.path == "/api/v2/torrents/info":
             return httpx.Response(200, json=[])
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
@@ -203,7 +267,7 @@ async def test_qbittorrent_sid_is_adapter_local_and_never_crosses_ports() -> Non
 
     assert calls == [
         (8080, "/api/v2/auth/login", ""),
-        (8080, "/api/v2/torrents/info", "SID=first-session"),
+        (8080, "/api/v2/torrents/info", "QBT_SID_8080=first-session"),
         (9090, "/api/v2/auth/login", ""),
-        (9090, "/api/v2/torrents/info", "SID=second-session"),
+        (9090, "/api/v2/torrents/info", "QBT_SID_9090=second-session"),
     ]

@@ -2772,7 +2772,7 @@
             ]
           }
         ],
-        "description": "The validated credential set written on ``POST /setup/complete``.\n\n``plex_url``/``prowlarr_url``/``qbittorrent_url`` are REQUIRED and\nshape-checked (issue #44): unlike ``SettingsUpdate``'s partial-update\nsemantics, an empty string is REJECTED here (there is no \"leave unchanged\"\nconcept on a one-shot install), closing the direct-API-caller bypass of the\nwizard's live \"Test connection\" probes -- see ``_validate_service_url_shape``.",
+        "description": "The validated credential set written on ``POST /setup/complete``.\n\n``plex_url``/``prowlarr_url``/``qbittorrent_url`` are REQUIRED and\nshape-checked (issue #44): unlike ``SettingsUpdate``'s partial-update\nsemantics, an empty string is REJECTED here (there is no \"leave unchanged\"\nconcept on a one-shot install), closing the direct-API-caller bypass of the\nwizard's live \"Test connection\" probes -- see ``_validate_service_url_shape``.\n\n``plex_token`` may be omitted only when ``plex_url`` is a connection plex.tv\nadvertised for the signed-in owner's server. A custom URL requires an\nexplicitly supplied token so the stored owner token is never sent to an\nunlisted destination.",
         "properties": {
           "anime_movie_root": {
             "anyOf": [
@@ -2820,6 +2820,7 @@
                 "type": "null"
               }
             ],
+            "description": "May be omitted only when plex_url is a plex.tv-advertised connection; a custom URL requires an explicitly supplied Plex token.",
             "title": "Plex Token"
           },
           "plex_url": {

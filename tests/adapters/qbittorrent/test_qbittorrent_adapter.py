@@ -1,10 +1,10 @@
 """QbittorrentClient adapter tests — recorded ``/api/v2`` shapes via MockTransport.
 
-Covers: cookie login (``SID`` captured), magnet add (hash derived from the magnet
-``xt``), a 409-already-present add (treated as success), ``/torrents/info`` with
-several qBit-5 states including ``stoppedUP`` and ``metaDL`` (``raw_state`` kept
-verbatim), and remove. The password / SID are never asserted into logs. An
-OPTIONAL live smoke test is env-guarded.
+Covers: cookie login (legacy ``SID`` captured), magnet add (hash derived from the
+magnet ``xt``), a 409-already-present add (treated as success), ``/torrents/info``
+with several qBit-5 states including ``stoppedUP`` and ``metaDL`` (``raw_state``
+kept verbatim), and remove. The password / session cookie are never asserted into
+logs. An OPTIONAL live smoke test is env-guarded.
 """
 
 from __future__ import annotations

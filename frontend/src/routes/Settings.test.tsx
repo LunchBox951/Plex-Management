@@ -66,6 +66,142 @@ function lastBody(): SettingsUpdate {
   return h.mutateAsync.mock.calls[0]![0] as SettingsUpdate
 }
 
+const CONFIGURED_SERVICES: SettingsResponse = {
+  plex_url: 'http://plex:32400',
+  plex_token: '***',
+  prowlarr_url: 'http://prowlarr:9696/prowlarr',
+  prowlarr_api_key: '***',
+  qbittorrent_url: 'http://qb:8080',
+  qbittorrent_username: 'admin',
+  qbittorrent_password: '***',
+  tmdb_api_key: '***',
+  movies_root: '/media/movies',
+}
+
+function serviceSection(name: 'Plex' | 'Prowlarr' | 'qBittorrent') {
+  const section = screen.getByRole('heading', { name }).closest('section')
+  if (section === null) throw new Error(`${name} settings section not found`)
+  return within(section)
+}
+
+describe('Settings — changed service credential consent', () => {
+  beforeEach(() => {
+    h.mutateAsync.mockReset()
+    h.mutateAsync.mockResolvedValue({})
+    h.toast.mockReset()
+    h.settingsData = CONFIGURED_SERVICES
+    h.libraries = []
+    h.librariesError = null
+  })
+
+  it.each([
+    {
+      service: 'Plex' as const,
+      oldUrl: 'http://plex:32400',
+      newUrl: 'https://plex:32400',
+      field: 'Token',
+      credential: 'Plex token',
+      bodyKey: 'plex_token' as const,
+      value: 'new-plex-token',
+    },
+    {
+      service: 'Prowlarr' as const,
+      oldUrl: 'http://prowlarr:9696/prowlarr',
+      newUrl: 'http://prowlarr:9696/other',
+      field: 'API key',
+      credential: 'Prowlarr API key',
+      bodyKey: 'prowlarr_api_key' as const,
+      value: 'new-prowlarr-key',
+    },
+  ])(
+    'requires the configured $credential when its canonical base changes',
+    async ({ service, oldUrl, newUrl, field, credential, bodyKey, value }) => {
+      render(<Settings />, { wrapper: Wrapper })
+      const section = serviceSection(service)
+      const secret = section.getByLabelText(field)
+
+      expect(secret).not.toBeRequired()
+      expect(section.getByText('•••• set (leave blank to keep)')).toBeInTheDocument()
+
+      fireEvent.change(screen.getByDisplayValue(oldUrl), { target: { value: newUrl } })
+
+      expect(secret).toBeRequired()
+      expect(
+        section.getByText(`Re-enter the ${credential} because the service address changed.`),
+      ).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+      await waitFor(() =>
+        expect(h.toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: 'Save failed',
+            description: `Re-enter the ${credential} because the service address changed.`,
+          }),
+        ),
+      )
+      expect(h.mutateAsync).not.toHaveBeenCalled()
+
+      fireEvent.change(secret, { target: { value } })
+      fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+      await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+      expect(lastBody()[bodyKey]).toBe(value)
+    },
+  )
+
+  it('sends an explicit blank password when a configured qBittorrent base changes', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+    const section = serviceSection('qBittorrent')
+    const password = section.getByLabelText('Password')
+
+    fireEvent.change(screen.getByDisplayValue('http://qb:8080'), {
+      target: { value: 'http://qb:9090' },
+    })
+
+    expect(password).not.toBeRequired()
+    expect(section.getByText(/leave it blank only if the new service uses an empty password/i)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().qbittorrent_password).toBe('')
+  })
+
+  it('keeps all configured secrets optional for canonical-equivalent base spellings', async () => {
+    h.settingsData = {
+      ...CONFIGURED_SERVICES,
+      plex_url: 'HTTP://PLEX.local:80/plex/',
+      prowlarr_url: 'https://PROWLARR.local:443/prowlarr/',
+      qbittorrent_url: 'http://QB.local:80/qbt/',
+    }
+    render(<Settings />, { wrapper: Wrapper })
+
+    fireEvent.change(screen.getByDisplayValue('HTTP://PLEX.local:80/plex/'), {
+      target: { value: 'http://plex.local/plex' },
+    })
+    fireEvent.change(screen.getByDisplayValue('https://PROWLARR.local:443/prowlarr/'), {
+      target: { value: 'https://prowlarr.local/prowlarr' },
+    })
+    fireEvent.change(screen.getByDisplayValue('http://QB.local:80/qbt/'), {
+      target: { value: 'http://qb.local/qbt' },
+    })
+
+    for (const [service, field] of [
+      ['Plex', 'Token'],
+      ['Prowlarr', 'API key'],
+      ['qBittorrent', 'Password'],
+    ] as const) {
+      const section = serviceSection(service)
+      expect(section.getByLabelText(field)).not.toBeRequired()
+      expect(section.getByText('•••• set (leave blank to keep)')).toBeInTheDocument()
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody()).not.toHaveProperty('plex_token')
+    expect(lastBody()).not.toHaveProperty('prowlarr_api_key')
+    expect(lastBody()).not.toHaveProperty('qbittorrent_password')
+  })
+})
+
 describe('Settings — movies_root save payload (G2)', () => {
   beforeEach(() => {
     h.mutateAsync.mockReset()
@@ -94,6 +230,7 @@ describe('Settings — movies_root save payload (G2)', () => {
     fireEvent.change(screen.getByDisplayValue('http://old-plex:32400'), {
       target: { value: 'http://new-plex:32400' },
     })
+    fireEvent.change(screen.getByLabelText('Token'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().plex_url).toBe('http://new-plex:32400')
@@ -130,6 +267,7 @@ describe('Settings — movies_root save payload (G2)', () => {
       target: { value: 'http://new-plex:32400' },
     })
     expect(screen.getByLabelText('Movies library folder')).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Token'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().movies_root).toBe('')
@@ -201,6 +339,7 @@ describe('Settings — tv_root library picker (optional)', () => {
     fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
       target: { value: 'http://new-plex:32400' },
     })
+    fireEvent.change(screen.getByLabelText('Token'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().tv_root).toBe('')
@@ -217,6 +356,7 @@ describe('Settings — tv_root library picker (optional)', () => {
     })
 
     expect(screen.getByLabelText('TV library folder')).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Token'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().tv_root).toBe('')
@@ -296,6 +436,7 @@ describe('Settings — anime library roots (ADR-0015, optional)', () => {
     expect(screen.getByLabelText('Anime movies library folder')).toBeDisabled()
     expect(screen.getByLabelText('Anime TV library folder')).toBeDisabled()
     // Nothing stale selectable: saving carries no anime root from the old server.
+    fireEvent.change(screen.getByLabelText('Token'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().anime_movie_root).toBe('')
@@ -312,6 +453,7 @@ describe('Settings — anime library roots (ADR-0015, optional)', () => {
     fireEvent.change(screen.getByDisplayValue('http://plex:32400'), {
       target: { value: 'http://new-plex:32400' },
     })
+    fireEvent.change(screen.getByLabelText('Token'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
     expect(lastBody().anime_movie_root).toBe('')

@@ -2277,6 +2277,11 @@ export interface components {
          *     semantics, an empty string is REJECTED here (there is no "leave unchanged"
          *     concept on a one-shot install), closing the direct-API-caller bypass of the
          *     wizard's live "Test connection" probes -- see ``_validate_service_url_shape``.
+         *
+         *     ``plex_token`` may be omitted only when ``plex_url`` is a connection plex.tv
+         *     advertised for the signed-in owner's server. A custom URL requires an
+         *     explicitly supplied token so the stored owner token is never sent to an
+         *     unlisted destination.
          */
         SetupCompleteRequest: {
             /** Anime Movie Root */
@@ -2287,7 +2292,10 @@ export interface components {
             movies_root?: string | null;
             /** Plex Machine Identifier */
             plex_machine_identifier: string;
-            /** Plex Token */
+            /**
+             * Plex Token
+             * @description May be omitted only when plex_url is a plex.tv-advertised connection; a custom URL requires an explicitly supplied Plex token.
+             */
             plex_token?: string | null;
             /** Plex Url */
             plex_url: string;

@@ -162,6 +162,23 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
 # match).
 _rotate_lock = asyncio.Lock()
 
+# A settings update validates an EFFECTIVE destination/credential pair and then
+# writes its individual rows in one transaction.  Without serializing that whole
+# read-check-write sequence, two otherwise-valid partial PUTs can interleave: a
+# secret-only rotation can finish its checks against the old URL, a second request
+# can commit a new URL plus a dummy secret, and the first can then overwrite only
+# the secret -- silently pairing the fresh credential with the new destination.
+# Keep validation, live Plex probes, persistence, cache invalidation, and the
+# redacted response under one lock so every request reasons about the pair left by
+# its predecessor.
+#
+# Like ``_rotate_lock`` above, this is deliberately a SINGLE-PROCESS guard. The
+# supported uvicorn deployment runs one worker and the in-app background loops
+# already rely on that model. A future multi-worker deployment must replace this
+# with a database-level version/CAS or advisory lock spanning the same critical
+# section; an in-process lock alone would not coordinate separate workers.
+_settings_update_lock = asyncio.Lock()
+
 
 # The default each boolean key degrades to on an unrecognized stored value --
 # threaded into ``resolve_bool_setting`` so its WARNING names the actual
@@ -854,51 +871,62 @@ async def put_settings_endpoint(
     field, so the very next ``GET /health`` re-probes the NEW server instead of
     serving a stale pre-repoint ``ok``/``down`` card.
     """
-    await _validate_disk_pressure_pair(body, session)
+    # Security-critical read/check/write boundary: see ``_settings_update_lock``.
+    # The redacted response stays inside too, so a waiting PUT cannot change rows
+    # between this request's commit and the values it returns to the operator.
+    async with _settings_update_lock:
+        # Authentication dependencies use this same AsyncSession before the
+        # endpoint acquires the lock. End that read transaction now so a request
+        # that waited behind another PUT cannot retain a pre-lock database
+        # snapshot while validating its effective destination/credential pair.
+        # The dependencies leave only primitive AuthContext data and make no
+        # writes, so rolling their read transaction back is safe.
+        await session.rollback()
+        await _validate_disk_pressure_pair(body, session)
 
-    store = SettingsStore(session)
-    await _reject_changed_base_stored_credential_reuse(body, store)
-    # Verify BEFORE any write: a failed verification must leave nothing behind.
-    plex_identity_changed, machine_identifier = await _verify_plex_repoint(
-        body, session, store, client, context
-    )
-    # Likewise verify every submitted library root is visible to THIS container
-    # (issue #132) before anything is written.
-    resolved_roots = await _resolve_root_writes(body)
+        store = SettingsStore(session)
+        await _reject_changed_base_stored_credential_reuse(body, store)
+        # Verify BEFORE any write: a failed verification must leave nothing behind.
+        plex_identity_changed, machine_identifier = await _verify_plex_repoint(
+            body, session, store, client, context
+        )
+        # Likewise verify every submitted library root is visible to THIS container
+        # (issue #132) before anything is written.
+        resolved_roots = await _resolve_root_writes(body)
 
-    written_fields: set[str] = set()
-    for field in body.model_fields_set:
-        value = getattr(body, field)
-        if value is None:
-            continue
-        if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
-            continue
-        if field in resolved_roots:
-            value = resolved_roots[field]
-        await store.set(field, _to_stored_string(value))
-        written_fields.add(field)
-    if plex_identity_changed:
-        if machine_identifier is None:
-            # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
-            await store.delete(PLEX_MACHINE_ID_SETTING)
-        else:
-            # Verified repoint, all in this SAME transaction: cache the id just
-            # derived from the NEW server and revoke every ACTIVE session so
-            # nobody's old-server authority outlives the repoint (the caller's
-            # own session included, deliberately — see the docstring).
-            await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
-            await session.execute(
-                update(AuthSession)
-                .where(AuthSession.revoked_at.is_(None))
-                .values(revoked_at=datetime.now(UTC))
-            )
-    await session.commit()
+        written_fields: set[str] = set()
+        for field in body.model_fields_set:
+            value = getattr(body, field)
+            if value is None:
+                continue
+            if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
+                continue
+            if field in resolved_roots:
+                value = resolved_roots[field]
+            await store.set(field, _to_stored_string(value))
+            written_fields.add(field)
+        if plex_identity_changed:
+            if machine_identifier is None:
+                # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
+                await store.delete(PLEX_MACHINE_ID_SETTING)
+            else:
+                # Verified repoint, all in this SAME transaction: cache the id just
+                # derived from the NEW server and revoke every ACTIVE session so
+                # nobody's old-server authority outlives the repoint (the caller's
+                # own session included, deliberately — see the docstring).
+                await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
+                await session.execute(
+                    update(AuthSession)
+                    .where(AuthSession.revoked_at.is_(None))
+                    .values(revoked_at=datetime.now(UTC))
+                )
+        await session.commit()
 
-    for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
-        if written_fields.intersection(fields):
-            health_cache.invalidate(subsystem)
+        for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
+            if written_fields.intersection(fields):
+                health_cache.invalidate(subsystem)
 
-    return await _redacted(store)
+        return await _redacted(store)
 
 
 async def _validate_disk_pressure_pair(body: SettingsUpdate, session: AsyncSession) -> None:

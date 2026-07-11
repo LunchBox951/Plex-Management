@@ -2,11 +2,12 @@
 
 Talks to the qBittorrent WebUI API (``/api/v2``) over an injected
 ``httpx.AsyncClient``. Authentication is cookie-based: ``POST /auth/login`` yields
-an ``SID`` cookie held by this adapter and sent explicitly only to its configured
-service; a 403 on any later call triggers a transparent re-login. The process-wide
-client cookie jar is never the authority because cookies do not include ports and
-could otherwise cross configured services. The username, password and ``SID`` are
-NEVER logged.
+the legacy ``SID`` cookie or qBittorrent 5.2's ``QBT_SID_<port>`` cookie. Its exact
+validated name/value pair is held by this adapter and sent explicitly only to its
+configured service; a 403 on any later call triggers a transparent re-login. The
+process-wide client cookie jar is never the authority because cookies do not include
+ports and could otherwise cross configured services. The username, password and
+session cookie are NEVER logged.
 
 ``add`` returns the lowercased info-hash. It accepts a magnet URI directly, or an
 HTTP(S) URL which is resolved: a redirect to a magnet is followed (qBittorrent
@@ -73,7 +74,11 @@ _PROPERTIES_TTL_SECONDS: Final = 30.0
 # small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
 # real metafile yet still a hard ceiling against a hostile/unbounded source body.
 _MAX_TORRENT_BYTES: Final = 10 * 1024 * 1024
-_SID_VALUE_PATTERN: Final = r"[A-Za-z0-9._~-]+"
+_QBT_SESSION_COOKIE_PREFIX: Final = "QBT_SID_"
+_SESSION_COOKIE_NAME_PATTERN: Final = rf"(?:SID|{_QBT_SESSION_COOKIE_PREFIX}[1-9][0-9]{{0,4}})"
+# qBittorrent's current SID is standard Base64; the unreserved additions retain
+# compatibility with legacy values while excluding every Cookie-header delimiter.
+_SESSION_COOKIE_VALUE_PATTERN: Final = r"[A-Za-z0-9+/._~-]+={0,2}"
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
@@ -703,9 +708,9 @@ class QbittorrentClient:
             )
         self._logged_in = False
         # qBittorrent cookies are adapter-local, never process-wide. Standard
-        # cookie matching ignores ports, so a SID left in the injected shared
+        # cookie matching ignores ports, so a session left in the injected shared
         # client's jar could be sent to another service on the same hostname.
-        self._sid: str | None = None
+        self._session_cookie: tuple[str, str] | None = None
         # info_hash -> (fetched_at, properties json) — bounds /properties calls.
         self._properties_cache: dict[str, tuple[datetime, dict[str, object]]] = {}
         # Cached pause/resume-vs-stop/start decision (None until first probed).
@@ -736,28 +741,44 @@ class QbittorrentClient:
             raise QbittorrentError(f"qBittorrent request failed (HTTP {response.status_code})")
 
     # ---- auth ----------------------------------------------------------- #
-    def _discard_shared_sid_cookies(self) -> None:
-        """Remove qBittorrent SIDs that httpx copied into the shared cookie jar.
+    @staticmethod
+    def _valid_session_cookie_name(name: str) -> bool:
+        """Accept only qBittorrent's exact legacy/current cookie name shapes."""
+        if not re.fullmatch(_SESSION_COOKIE_NAME_PATTERN, name):
+            return False
+        if name == "SID":
+            return True
+        # The regex guarantees a non-empty decimal suffix. qBittorrent derives it
+        # from the WebUI listening port, whose valid range excludes zero.
+        return int(name.removeprefix(_QBT_SESSION_COOKIE_PREFIX)) <= 65535
+
+    def _discard_shared_session_cookies(self) -> None:
+        """Remove qBittorrent sessions copied into the shared cookie jar.
 
         Production's upstream client rejects response cookies globally, but
         callers may inject an ordinary client (including tests).  Requests below
         also carry an explicit Cookie header, so the jar is never read; removing
-        the copied value prevents an unrelated request using that injected client
-        from forwarding the SID by hostname-only cookie matching.
+        every legacy/current-name candidate prevents an unrelated request using
+        that injected client from forwarding it by hostname-only cookie matching.
+        Prefix candidates are removed even when their suffix is invalid, before
+        validation raises, so a malformed response cannot leave residue behind.
         """
         for cookie in tuple(self._client.cookies.jar):
-            if cookie.name != "SID":
+            if cookie.name != "SID" and not cookie.name.startswith(_QBT_SESSION_COOKIE_PREFIX):
                 continue
-            self._client.cookies.delete("SID", domain=cookie.domain, path=cookie.path)
+            self._client.cookies.delete(cookie.name, domain=cookie.domain, path=cookie.path)
 
     def _session_cookie_header(self) -> dict[str, str]:
         """An explicit header suppressing every shared-client cookie."""
-        return {"Cookie": f"SID={self._sid}" if self._sid is not None else ""}
+        if self._session_cookie is None:
+            return {"Cookie": ""}
+        name, value = self._session_cookie
+        return {"Cookie": f"{name}={value}"}
 
     async def _login(self) -> None:
-        """Authenticate and capture an adapter-local ``SID`` cookie."""
-        self._sid = None
-        self._discard_shared_sid_cookies()
+        """Authenticate and capture an adapter-local qBittorrent session cookie."""
+        self._session_cookie = None
+        self._discard_shared_session_cookies()
         try:
             response = await self._client.post(
                 self._service_url.endpoint(f"{_API}/auth/login"),
@@ -769,12 +790,24 @@ class QbittorrentClient:
             # qBittorrent unreachable during login (DNS / refused / timeout): surface
             # a retryable error rather than an opaque 500. No url/secret in the message.
             raise QbittorrentError("qBittorrent request failed") from exc
-        sid_values = [cookie.value for cookie in response.cookies.jar if cookie.name == "SID"]
-        self._discard_shared_sid_cookies()
-        sid = sid_values[-1] if sid_values else None
-        if sid is not None and not re.fullmatch(_SID_VALUE_PATTERN, sid):
-            raise QbittorrentError("qBittorrent returned an invalid session cookie")
-        self._sid = sid
+        session_cookies = [
+            (cookie.name, cookie.value)
+            for cookie in response.cookies.jar
+            if cookie.name == "SID" or cookie.name.startswith(_QBT_SESSION_COOKIE_PREFIX)
+        ]
+        self._discard_shared_session_cookies()
+        session_cookie = session_cookies[-1] if session_cookies else None
+        validated_session_cookie: tuple[str, str] | None = None
+        if session_cookie is not None:
+            name, value = session_cookie
+            if (
+                not self._valid_session_cookie_name(name)
+                or value is None
+                or not re.fullmatch(_SESSION_COOKIE_VALUE_PATTERN, value)
+            ):
+                raise QbittorrentError("qBittorrent returned an invalid session cookie")
+            validated_session_cookie = (name, value)
+        self._session_cookie = validated_session_cookie
         text = response.text.strip()
         status = response.status_code
         if status in (_HTTP_OK, _HTTP_NO_CONTENT) and text != "Fails.":
