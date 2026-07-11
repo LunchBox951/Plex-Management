@@ -41,6 +41,33 @@ def test_publish_with_no_subscribers_is_a_noop() -> None:
     bus.publish(DownloadFailed(torrent_hash="x", source_title="y", reason="z"))
 
 
+def test_subscriber_added_during_dispatch_is_not_invoked_until_next_publish() -> None:
+    """``publish`` must iterate a SNAPSHOT of the subscriber list (issue #110):
+    a handler that subscribes a new handler while dispatch is in flight must not
+    affect the CURRENT publish — the newly-added handler is only invoked
+    starting from the NEXT publish, never the one that triggered its
+    registration. Without the snapshot, mutating ``self._subscribers`` mid-
+    iteration could skip or double-invoke a handler depending on exactly where
+    the mutation lands relative to the live list."""
+    bus = EventBus()
+    calls: list[str] = []
+
+    def late_handler(_event: DownloadFailed) -> None:
+        calls.append("late")
+
+    def self_registering_handler(_event: DownloadFailed) -> None:
+        calls.append("first")
+        bus.subscribe(DownloadFailed, late_handler)
+
+    bus.subscribe(DownloadFailed, self_registering_handler)
+
+    bus.publish(DownloadFailed(torrent_hash="abc", source_title="Bad.Release", reason="stalled"))
+    assert calls == ["first"]  # late_handler registered too late for THIS publish
+
+    bus.publish(DownloadFailed(torrent_hash="def", source_title="Bad.Release", reason="stalled"))
+    assert calls == ["first", "first", "late"]  # now invoked on the NEXT publish
+
+
 def test_subscribers_are_keyed_by_concrete_event_type() -> None:
     @dataclass(frozen=True)
     class OtherEvent(Event):

@@ -1,9 +1,9 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Twelve tables back the alpha + beta pipeline: ``users``, ``settings``,
-``system_settings``, ``audit_log``, ``media_requests``, ``request_dedup_locks``,
-``season_requests``, ``downloads``, ``download_history``, ``blocklist``,
-``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
+Thirteen tables back the alpha + beta pipeline: ``users``, ``settings``,
+``system_settings``, ``auth_sessions``, ``audit_log``, ``media_requests``,
+``request_dedup_locks``, ``season_requests``, ``downloads``, ``download_history``,
+``blocklist``, ``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
 behaviour follow the persistence design (see the analysis extract's
 "Persistence + Schema Migrations" section, ADR-0007, and — for
 ``log_events``/``library_path``/``keep_forever``/the ``evicted`` status —
@@ -15,7 +15,8 @@ Conventions:
   from whether the ``Mapped`` type includes ``None``.
 * ``created_at``-style columns get ``server_default=func.now()`` so bulk inserts
   are timestamped by the database.
-* Enum-like columns use ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)``
+* Enum-like columns use named
+  ``sa.Enum(PyEnum, native_enum=False, create_constraint=True)`` constraints
   (a portable VARCHAR + CHECK on SQLite/PostgreSQL). ``downloads.status`` is a
   plain indexed ``String``: the canonical ``DownloadState`` StrEnum is owned by
   the P4 state machine and writes its values here, and the ``DownloadRecord`` DTO
@@ -38,11 +39,13 @@ from plex_manager.db import Base
 
 __all__ = [
     "AuditLog",
+    "AuthSession",
     "Blocklist",
     "BlocklistReason",
     "Download",
     "DownloadHistory",
     "DownloadHistoryEvent",
+    "DownloadScope",
     "LogEvent",
     "MediaRequest",
     "MediaType",
@@ -72,6 +75,7 @@ class RequestStatus(StrEnum):
     pending = "pending"
     searching = "searching"
     no_acceptable_release = "no_acceptable_release"
+    waiting_for_air_date = "waiting_for_air_date"
     downloading = "downloading"
     completed = "completed"
     available = "available"
@@ -142,11 +146,26 @@ class DownloadHistoryEvent(StrEnum):
     # ``event_type`` column, so neither member needs a migration of its own.
     reported = "reported"
     cancelled = "cancelled"
+    # Issue #165's minimal fixed-cooldown self-heal: the reconcile loop auto
+    # mark-fails a download stuck in metadata-fetching or with dead/frozen
+    # progress, exactly the operator's manual mark-failed button. UNLIKE
+    # ``reported``/``cancelled`` above, this one DOES need a migration:
+    # ``b7e2d4f6c8a1`` already gave this column a real CHECK constraint
+    # (``ck_download_history_event_type_enum``) enumerating every value at the
+    # time, so a migrated database's constraint would otherwise reject this new
+    # value outright — see ``26bc01829ae1_add_stalled_download_history_event_type``.
+    stalled = "stalled"
 
 
-def _enum(enum_cls: type[StrEnum]) -> sa.Enum:
+def _enum(enum_cls: type[StrEnum], *, name: str) -> sa.Enum:
     """Build a portable, non-native ``Enum`` column type for ``enum_cls``."""
-    return sa.Enum(enum_cls, native_enum=False, create_constraint=True, validate_strings=True)
+    return sa.Enum(
+        enum_cls,
+        name=name,
+        native_enum=False,
+        create_constraint=True,
+        validate_strings=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -163,7 +182,7 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String)
     avatar_url: Mapped[str | None] = mapped_column(String)
     encrypted_plex_token: Mapped[str | None] = mapped_column(EncryptedStr)
-    permissions: Mapped[int] = mapped_column(default=1, server_default=sa.text("1"))
+    permissions: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -228,6 +247,25 @@ class SystemSettings(Base):
     setup_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AuthSession(Base):
+    """HTTP-only browser session for a Plex-authenticated user.
+
+    Only the SHA-256 digest of the random cookie token is stored. Revocation sets
+    ``revoked_at`` rather than deleting so logout/session behavior remains
+    auditable without retaining a usable bearer token.
+    """
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AuditLog(Base):
     """An immutable record of a state-changing action."""
 
@@ -278,11 +316,13 @@ class MediaRequest(Base):
             unique=True,
             sqlite_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed', 'partially_available')"
+                "'waiting_for_air_date', 'downloading', 'import_blocked', "
+                "'completed', 'partially_available')"
             ),
             postgresql_where=sa.text(
                 "status IN ('pending', 'searching', 'no_acceptable_release', "
-                "'downloading', 'import_blocked', 'completed', 'partially_available')"
+                "'waiting_for_air_date', 'downloading', 'import_blocked', "
+                "'completed', 'partially_available')"
             ),
         ),
     )
@@ -290,10 +330,14 @@ class MediaRequest(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     tmdb_id: Mapped[int] = mapped_column(index=True)
-    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType))
+    media_type: Mapped[MediaType] = mapped_column(
+        _enum(MediaType, name="ck_media_requests_media_type_enum")
+    )
     title: Mapped[str] = mapped_column(String)
     year: Mapped[int | None] = mapped_column()
-    status: Mapped[RequestStatus] = mapped_column(_enum(RequestStatus), index=True)
+    status: Mapped[RequestStatus] = mapped_column(
+        _enum(RequestStatus, name="ck_media_requests_status_enum"), index=True
+    )
     is_anime: Mapped[bool | None] = mapped_column()
     # TMDB art persisted at request time so Requests / Queue rows can render a
     # poster (and the detail backdrop) without a per-row TMDB re-fetch.
@@ -328,6 +372,32 @@ class MediaRequest(Base):
     # the manual grab path never reads or writes them.
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Provenance marker (issue #156): ``True`` ONLY for a movie row this app's OWN
+    # eviction-guard fall-through created (``request_service.create_request``'s
+    # ``latest_request_evicted`` branch, ADR-0012) -- set regardless of what THAT
+    # call's own Plex probe reported (present, absent, or erroring; Codex round-2),
+    # never for an operator-initiated request, and in particular never for a #148
+    # forced re-acquire (which explicitly skips that guard). The eviction restore's
+    # redundant-regrab dedup (``eviction_service._cancel_redundant_movie_regrabs``)
+    # reads this so it cancels only regrabs IT ITSELF is responsible for, never a
+    # deliberate operator re-acquire that happens to be pre-grab in the same instant.
+    # LIFECYCLE (Codex round-2): the marker is retired -- cleared back to ``False``
+    # -- the moment this row stops being "some eviction's own in-flight regrab":
+    # when it is confirmed imported/watchable (``SqlRequestRepository.
+    # mark_available``) or when an operator re-arms it for a brand-new search
+    # (``SqlRequestRepository.reset_for_research``, report-issue). Without that,
+    # a marker surviving past either moment would let a LATER, UNRELATED
+    # eviction's restore cancel a row that no longer has anything to do with it.
+    # Nullable: every pre-existing row (and any row inserted outside this app's own
+    # create path) reads ``NULL`` -- treated as "not an eviction regrab", the safe
+    # default that never triggers an unintended cancel.
+    eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
+    # TV-only request intent for multi-season pack eligibility. ``whole_show`` means
+    # the operator asked for every tracked season; ``explicit_seasons`` means the
+    # operator named a finite season set, persisted in ``requested_seasons_json``.
+    tv_request_mode: Mapped[str | None] = mapped_column(String)
+    requested_seasons_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    requested_episodes_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
 
 
 class RequestDedupLock(Base):
@@ -342,7 +412,9 @@ class RequestDedupLock(Base):
     __tablename__ = "request_dedup_locks"
 
     tmdb_id: Mapped[int] = mapped_column(primary_key=True)
-    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType), primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(
+        _enum(MediaType, name="ck_request_dedup_locks_media_type_enum"), primary_key=True
+    )
 
 
 class SeasonRequest(Base):
@@ -369,7 +441,9 @@ class SeasonRequest(Base):
         ForeignKey("media_requests.id", ondelete="CASCADE"), index=True
     )
     season_number: Mapped[int] = mapped_column()
-    status: Mapped[RequestStatus] = mapped_column(_enum(RequestStatus), index=True)
+    status: Mapped[RequestStatus] = mapped_column(
+        _enum(RequestStatus, name="ck_season_requests_status_enum"), index=True
+    )
     # The final placed path this season's import wrote into — the per-season
     # mirror of ``MediaRequest.library_path`` (ADR-0012): same "store, never
     # reconstruct" rule, same eviction target. ``None`` for seasons imported
@@ -382,7 +456,30 @@ class SeasonRequest(Base):
     # season; ``next_search_at`` gates the next auto-grab search (``NULL`` = due now).
     search_attempts: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     next_search_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Quality imported for this season. Used by multi-season pack planning to
+    # decide whether overlap is a real upgrade or wasted same/lower-quality work.
+    installed_quality_id: Mapped[int | None] = mapped_column()
+    installed_profile_index: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
+    # ONLY for a season row ``season_request_service.ensure_seasons`` created because
+    # its newest tracked history was ``evicted`` -- the season-level eviction guard's
+    # own re-grab, set regardless of what THAT call's own Plex crawl reported
+    # (present, absent, or erroring; Codex round-2). A season NEWLY created for any
+    # other reason (never before tracked, or a genuinely fresh season not in the
+    # ``evicted_seasons`` set) stays ``NULL``/``False``. The eviction restore's
+    # redundant-sibling-regrab dedup (``eviction_service._cancel_redundant_season_
+    # regrabs``) reads this so it cancels only ITS OWN re-grabs, never an unrelated
+    # concurrent tracked season for the same show. LIFECYCLE (Codex round-2): retired
+    # -- cleared back to ``False`` -- the moment this row stops being "some
+    # eviction's own in-flight regrab": confirmed watchable
+    # (``SqlSeasonRequestRepository.mark_available``) or re-armed by an operator for
+    # a brand-new search (``season_request_service.reset_for_research``, via
+    # ``SqlSeasonRequestRepository.clear_eviction_regrab``) -- see
+    # ``MediaRequest.eviction_regrab``'s docstring for the full rationale. Nullable
+    # for the same
+    # backward-compat reason as the movie mirror.
+    eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
 
 
 class Download(Base):
@@ -436,7 +533,9 @@ class Download(Base):
     progress: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))
     seed_ratio: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))
     target_seed_ratio: Mapped[float] = mapped_column(default=1.0, server_default=sa.text("1"))
-    media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))
+    media_type: Mapped[MediaType | None] = mapped_column(
+        _enum(MediaType, name="ck_downloads_media_type_enum")
+    )
     tmdb_id: Mapped[int | None] = mapped_column()
     year: Mapped[int | None] = mapped_column()
     season: Mapped[int | None] = mapped_column()
@@ -451,6 +550,63 @@ class Download(Base):
     torrent_attempt: Mapped[int] = mapped_column(default=1, server_default=sa.text("1"))
     scored_releases_json: Mapped[list[dict[str, Any]] | None] = mapped_column(sa.JSON)
     download_path: Mapped[str | None] = mapped_column(String)
+    # The release ("download") title the grab decision picked -- the same value
+    # already written to ``DownloadHistory.source_title`` at grab time (issue
+    # #134). Denormalized here (rather than joined from ``download_history`` on
+    # every queue poll) so the hot 2s queue read stays a plain SELECT and the
+    # release name survives even if history is ever pruned. ``None`` for rows
+    # created before this column existed (backfilled best-effort by the adding
+    # migration) -- the queue UI degrades honestly (title -> release_title ->
+    # short hash).
+    release_title: Mapped[str | None] = mapped_column(String)
+
+
+class DownloadScope(Base):
+    """A logical TV scope attached to one physical torrent download.
+
+    ``downloads.torrent_hash`` remains the physical torrent identity. This table
+    records every season/episode target that torrent is expected to satisfy, so a
+    multi-season pack can be one client torrent with several durable TV scopes.
+    The scalar ``downloads.season`` / ``episodes_json`` columns remain as the
+    first/back-compat scope.
+    """
+
+    __tablename__ = "download_scopes"
+    __table_args__ = (
+        Index("ix_download_scopes_download", "download_id"),
+        Index("ix_download_scopes_request_scope", "media_request_id", "season_number"),
+        Index(
+            "uq_download_scopes_active_scope",
+            "media_request_id",
+            "scope_key",
+            unique=True,
+            sqlite_where=sa.text(
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+            ),
+            postgresql_where=sa.text(
+                "media_request_id IS NOT NULL AND status IN ('active', 'import_blocked')"
+            ),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    download_id: Mapped[int] = mapped_column(
+        ForeignKey("downloads.id", ondelete="CASCADE"), index=True
+    )
+    media_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("season_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_number: Mapped[int | None] = mapped_column()
+    episodes_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    scope_key: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(
+        String, default="active", server_default=sa.text("'active'")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DownloadHistory(Base):
@@ -461,7 +617,9 @@ class DownloadHistory(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     tmdb_id: Mapped[int | None] = mapped_column()
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
-    event_type: Mapped[DownloadHistoryEvent] = mapped_column(_enum(DownloadHistoryEvent))
+    event_type: Mapped[DownloadHistoryEvent] = mapped_column(
+        _enum(DownloadHistoryEvent, name="ck_download_history_event_type_enum")
+    )
     source_title: Mapped[str | None] = mapped_column(Text)
     quality_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
     indexer: Mapped[str | None] = mapped_column(String)
@@ -473,15 +631,20 @@ class Blocklist(Base):
     """A failed / reported-bad release. Checked before every grab (two-tier id)."""
 
     __tablename__ = "blocklist"
+    __table_args__ = (Index("ix_blocklist_tmdb_media", "tmdb_id", "media_type"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     torrent_hash: Mapped[str | None] = mapped_column(String, index=True)
     source_title: Mapped[str] = mapped_column(Text)
     indexer: Mapped[str | None] = mapped_column(String)
     protocol: Mapped[str | None] = mapped_column(String)
-    media_type: Mapped[MediaType | None] = mapped_column(_enum(MediaType))
+    media_type: Mapped[MediaType | None] = mapped_column(
+        _enum(MediaType, name="ck_blocklist_media_type_enum")
+    )
     tmdb_id: Mapped[int | None] = mapped_column()
-    reason: Mapped[BlocklistReason] = mapped_column(_enum(BlocklistReason))
+    reason: Mapped[BlocklistReason] = mapped_column(
+        _enum(BlocklistReason, name="ck_blocklist_reason_enum")
+    )
     added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )

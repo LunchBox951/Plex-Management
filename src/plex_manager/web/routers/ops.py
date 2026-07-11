@@ -42,6 +42,7 @@ from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service
 from plex_manager.services.eviction_service import EvictionOutcome
 from plex_manager.services.health_service import (
+    SUBSYSTEM_CACHE_KEYS,
     AutograbStatus,
     HealthCredentials,
     ReconcileStatus,
@@ -69,7 +70,7 @@ from plex_manager.web.deps import (
     get_reconcile_status,
     get_session,
     get_tv_root_optional,
-    require_api_key,
+    require_admin,
 )
 from plex_manager.web.schemas import (
     AutograbStatusItem,
@@ -96,7 +97,7 @@ _logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/v1/ops",
     tags=["ops"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 # Internal safety bounds — NOT web-editable settings: these guard the export
@@ -125,6 +126,15 @@ async def health_endpoint(
     auto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so
     polling this every few seconds never hammers an upstream or burns the TMDB
     rate limit."""
+    # Generation snapshot FIRST, strictly before the credential reads below
+    # (Codex round 3): the moment a credential leaves the store it can be
+    # superseded by a concurrent ``PUT /settings`` (whose commit bumps these
+    # generations via ``TtlCache.invalidate``), and only a snapshot that
+    # PRECEDES the read can prove no invalidation happened since -- see
+    # ``TtlCache``'s invariant. Taken any later, a save landing between the
+    # read and the snapshot would go unnoticed and the probe's stale result
+    # would be cached for another full TTL.
+    generations = cache.generation_snapshot(SUBSYSTEM_CACHE_KEYS)
     store = SettingsStore(session)
     creds = HealthCredentials(
         plex_url=await store.get("plex_url"),
@@ -147,6 +157,7 @@ async def health_endpoint(
         creds=creds,
         reconcile_status=reconcile_status,
         autograb_status=autograb_status,
+        generations=generations,
         library_roots={
             "movies_root": movies_root,
             "tv_root": tv_root,
@@ -160,7 +171,11 @@ async def health_endpoint(
     return HealthResponse(
         subsystems=[
             SubsystemHealthItem(
-                name=s.name, status=s.status, detail=s.detail, checked_at=s.checked_at
+                name=s.name,
+                status=s.status,
+                detail=s.detail,
+                checked_at=s.checked_at,
+                note=s.note,
             )
             for s in snapshot.subsystems
         ],
@@ -294,24 +309,28 @@ async def export_logs_endpoint(
     ``since`` through now (``since`` omitted defaults to the last 24h) — when
     both are supplied, ``correlation_id`` wins (a specific id's whole trail is
     the more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal
-    safety cap, not a policy setting) with an honest trailing note when
-    truncated. Rendered OLDEST-first (a coherent top-to-bottom story), unlike
-    the newest-first ``GET /logs`` list. ``Content-Disposition: attachment`` so
-    navigating straight to this URL downloads a file; a caller reading the body
-    via ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+    safety cap, not a policy setting); when the matching window exceeds the
+    cap, the OLDEST rows are kept (the root-cause lead-up survives) and the
+    newest overflow is what's dropped, with an honest trailing note. Rendered
+    OLDEST-first (a coherent top-to-bottom story), unlike the newest-first
+    ``GET /logs`` list. ``Content-Disposition: attachment`` so navigating
+    straight to this URL downloads a file; a caller reading the body via
+    ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
     """
     repo = SqlLogEventRepository(session)
     if correlation_id is not None:
-        page = await repo.list_events(correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS)
+        page = await repo.list_events(
+            correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS, oldest_first=True
+        )
     else:
         window_start = (
             since
             if since is not None
             else datetime.now(UTC) - timedelta(hours=_DEFAULT_EXPORT_WINDOW_HOURS)
         )
-        page = await repo.list_events(since=window_start, limit=_MAX_EXPORT_ROWS)
+        page = await repo.list_events(since=window_start, limit=_MAX_EXPORT_ROWS, oldest_first=True)
 
-    events = list(reversed(page.results))  # newest-first from the repo -> oldest-first
+    events = page.results  # repo already returns oldest-first
     truncated = page.total > len(page.results)
     headers = {"Content-Disposition": f'attachment; filename="{_export_filename(format)}"'}
 
@@ -334,9 +353,10 @@ async def export_logs_endpoint(
 
     lines = [f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {e.message}" for e in events]
     if truncated:
+        dropped = page.total - len(page.results)
         lines.append(
-            f"... truncated: {page.total - len(page.results)} more row(s) not shown "
-            f"(export is capped at {_MAX_EXPORT_ROWS}) ..."
+            f"... truncated: {dropped} newer row(s) not shown "
+            f"(export capped at the {_MAX_EXPORT_ROWS} oldest matching rows) ..."
         )
     return PlainTextResponse("\n".join(lines) + "\n", headers=headers)
 
@@ -380,9 +400,10 @@ async def _disk_root_item(
 ) -> DiskRootItem:
     """One configured root's usage gauge + its ranked eviction preview.
 
-    TTL-cached (~15s, keyed on ``root_path`` — see :func:`_get_disk_preview_cache`)
-    so a dashboard polling every ~15s never maps 1:1 onto a fresh Plex
-    ``watch_state`` call per title plus an ``os.walk`` per title on every poll.
+    TTL-cached (~15s, keyed on the role ``label`` + ``root_path`` — see the
+    ``cache_key`` note below and :func:`_get_disk_preview_cache`) so a dashboard
+    polling every ~15s never maps 1:1 onto a fresh Plex ``watch_state`` call per
+    title plus an ``os.walk`` per title on every poll.
 
     An unreadable root reports ``error`` set (zeroed gauges, no candidates —
     there is nothing to preview against); this is cached too, so a persistently
@@ -401,12 +422,18 @@ async def _disk_root_item(
     (logged), the same honest degraded-preview posture as an unreadable root,
     rather than 500ing the WHOLE ``/ops/disk`` response over one root's preview.
     """
-    # Key by media_type AND path: movies_root and tv_root can be configured to the
-    # SAME directory, and the movie vs TV preview of that path is different
-    # (different candidate sets). Keying on root_path alone would serve the first
-    # role's cached DiskRootItem for the second, duplicating one root and never
-    # computing the other's preview until the TTL expired.
-    cache_key = f"{media_type}:{root_path}"
+    # Key by the ROLE LABEL and path (#97): two roots can be configured to the
+    # SAME directory -- not only movies_root vs tv_root (different media_type),
+    # but also a normal vs anime root of the SAME media_type (e.g. movies_root and
+    # anime_movie_root both pointing at one shared movie tree). The cached value
+    # carries the role's ``label`` (``DiskRootItem.root``), so keying on
+    # ``media_type:root_path`` alone would serve the FIRST role's cached item --
+    # its label and all -- back for the second same-media_type role, collapsing
+    # two configured roots into one duplicated row and hiding the other from the
+    # Status response. The label is unique per role, so it keeps every configured
+    # root's preview distinct even when two share a path (and still differs across
+    # media_type, since each label maps to exactly one media_type).
+    cache_key = f"{label}:{root_path}"
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
@@ -538,10 +565,10 @@ async def disk_endpoint(
         )
     # ADR-0015 anime library routing — its own DiskRootItem rows, so a separate
     # anime disk is never a silent gap on the Status page. Cached (like every
-    # other root) by ``f"{media_type}:{root_path}"``; an operator who points an
-    # anime root at the SAME path as movies_root/tv_root gets the earlier
-    # role's cached entry back (same acceptable same-path caveat as pointing
-    # movies_root and tv_root at one shared path today).
+    # other root) by ``f"{label}:{root_path}"`` (#97): the role label keeps an
+    # anime root pointed at the SAME path as movies_root/tv_root as its OWN
+    # distinct row, rather than serving back the earlier role's cached entry and
+    # hiding one configured root.
     if anime_movie_root:
         roots.append(
             await _disk_root_item(
@@ -673,6 +700,20 @@ async def evict_endpoint(
                 media_type,
                 root,
             )
+            # Every root shares THIS request's single session, so a SQLAlchemy
+            # failure mid-sweep leaves it in a poisoned (aborted) transaction --
+            # without a rollback the NEXT root's sweep would then raise too,
+            # cascading one root's failure into every remaining root (#95). Roll
+            # back to a clean state before continuing; the rollback is itself
+            # guarded so even a broken session is logged, never masked.
+            try:
+                await session.rollback()
+            except Exception:
+                _logger.exception(
+                    "rollback after a failed eviction sweep for %s root %s also failed; continuing",
+                    media_type,
+                    root,
+                )
             errors.append(
                 EvictErrorItem(root=root_label, detail=f"sweep failed ({type(exc).__name__})")
             )

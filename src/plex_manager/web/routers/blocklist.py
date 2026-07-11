@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.ports.repositories import BlocklistRecord
 from plex_manager.services import blocklist_service
-from plex_manager.web.deps import get_session, require_api_key
+from plex_manager.web.deps import get_session, require_admin
 from plex_manager.web.schemas import BlocklistEntry, BlocklistResponse, ErrorDetail
 
 __all__ = ["router"]
@@ -17,7 +17,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/blocklist",
     tags=["blocklist"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 

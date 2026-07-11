@@ -247,6 +247,88 @@ def test_hardlinkless_publish_still_refuses_existing_destination(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["copied.mkv", "src.mkv"]
 
 
+def test_hardlinkless_publish_refuses_dangling_symlink_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-8fj8: ``Path.exists()`` follows symlinks, so a DANGLING symlink at
+    dst used to read as "absent" -- the copy-fallback publish would then
+    silently replace the symlink entry via ``os.rename``. A dangling symlink
+    must refuse exactly like a real existing file, and must be left untouched
+    (not resolved, not replaced)."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    target = tmp_path / "gone.mkv"  # never created -- dst is a DANGLING symlink
+    dst.symlink_to(target)
+    assert dst.is_symlink()
+    assert not dst.exists()  # confirms the dangling shape this test exercises
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.is_symlink()
+    assert os.readlink(dst) == os.fspath(target)
+    assert not target.exists()  # no real file was ever created at the target
+
+
+def test_move_refuses_dangling_symlink_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same GHSA-8fj8 guard, exercised through ``move`` instead of ``hardlink_or_copy``."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    target = tmp_path / "gone.mkv"
+    dst.symlink_to(target)
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().move(src, dst)
+
+    assert dst.is_symlink()
+    assert os.readlink(dst) == os.fspath(target)
+    assert not target.exists()
+    assert src.exists()  # move must not have consumed src on a refused publish
+
+
+def test_publish_lock_refuses_dangling_symlink_under_stale_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercises the OTHER GHSA-8fj8 site: the lock-contention early-exit in
+    ``_publish_lock`` (line ~114). A stale (dead-pid) lock is reclaimed, and the
+    dangling-symlink dst underneath it must still refuse, not be silently
+    replaced."""
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = tmp_path / "copied.mkv"
+    target = tmp_path / "gone.mkv"
+    dst.symlink_to(target)
+
+    lock_path = tmp_path / f".{dst.name}.publish.lock"
+    lock_path.write_text("999999999")  # a pid that cannot be running -- reclaimable
+
+    def _refuse_link(_src: str, _dst: str) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with pytest.raises(FileExistsError):
+        LocalFileSystem().hardlink_or_copy(src, dst)
+
+    assert dst.is_symlink()
+    assert os.readlink(dst) == os.fspath(target)
+    assert not target.exists()
+
+
 def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -684,6 +766,37 @@ def test_delete_rejects_symlink_escaping_the_configured_root(tmp_path: Path) -> 
         LocalFileSystem([os.fspath(root)]).delete(os.fspath(escaping_link))
 
     assert secret.exists()  # the real target outside the root is untouched
+
+
+def test_delete_rejects_outside_root_symlink_entry_pointing_inside_the_root(
+    tmp_path: Path,
+) -> None:
+    """Issue #141: a symlink ENTRY located OUTSIDE every configured root, whose
+    TARGET resolves INSIDE one, must be refused -- the mirror image of
+    ``test_delete_rejects_symlink_escaping_the_configured_root``. Before the fix,
+    ``resolve_guarded`` checked only the fully-dereferenced target's containment
+    (``/library/movie.mkv`` -- inside the root), so the guard passed; ``delete``
+    then unlinked the symlink ENTRY (``path`` itself, never its target, per its
+    own no-dereference contract for a final symlink) -- deleting an entry outside
+    every configured root."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    real_target = root / "movie.mkv"
+    real_target.write_bytes(b"x" * 100)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_link = outside / "link.mkv"
+    os.symlink(real_target, outside_link)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    assert fs.delete_guard_refuses(os.fspath(outside_link)) is True
+
+    with pytest.raises(LocalFileSystemError, match="outside every configured library root"):
+        fs.delete(os.fspath(outside_link))
+
+    assert outside_link.is_symlink()  # the outside-root symlink entry is untouched
+    assert real_target.exists()  # and the in-root target is untouched too
+    assert real_target.read_bytes() == b"x" * 100
 
 
 def test_delete_guard_refuses_agrees_with_delete_on_a_symlink_escaping_the_root(

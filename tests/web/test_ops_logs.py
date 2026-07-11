@@ -10,11 +10,13 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import LogEvent
 from plex_manager.services import log_capture_service
+from plex_manager.web.routers import ops as ops_router
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -229,3 +231,60 @@ async def test_export_time_window_excludes_events_older_than_default_24h(
     response = await client.get("/api/v1/ops/logs/export", headers=_HEADERS)
     assert "recent" in response.text
     assert "stale" not in response.text
+
+
+async def test_export_time_window_truncation_keeps_oldest_rows(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #96: before the fix, a truncated export kept the
+    NEWEST rows (a ``DESC ... LIMIT`` reversed in Python), silently dropping
+    the oldest/root-cause lead-up. With the cap forced below the seeded
+    count, the export must keep the oldest rows and name the newest as
+    dropped."""
+    monkeypatch.setattr(ops_router, "_MAX_EXPORT_ROWS", 2)
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _insert_event(
+        sessionmaker_, level="INFO", message="root", created_at=_NOW - timedelta(hours=3)
+    )
+    await _insert_event(
+        sessionmaker_, level="INFO", message="middle", created_at=_NOW - timedelta(hours=2)
+    )
+    await _insert_event(
+        sessionmaker_, level="INFO", message="latest", created_at=_NOW - timedelta(hours=1)
+    )
+
+    response = await client.get("/api/v1/ops/logs/export", headers=_HEADERS)
+    assert "root" in response.text
+    assert "middle" in response.text
+    assert "latest" not in response.text  # newest is the one dropped
+    assert "truncated" in response.text
+    assert "1 newer" in response.text
+
+
+async def test_export_json_truncation_reports_total_and_keeps_oldest(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ops_router, "_MAX_EXPORT_ROWS", 2)
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _insert_event(
+        sessionmaker_, level="INFO", message="root", created_at=_NOW - timedelta(hours=3)
+    )
+    await _insert_event(
+        sessionmaker_, level="INFO", message="middle", created_at=_NOW - timedelta(hours=2)
+    )
+    await _insert_event(
+        sessionmaker_, level="INFO", message="latest", created_at=_NOW - timedelta(hours=1)
+    )
+
+    response = await client.get(
+        "/api/v1/ops/logs/export", params={"format": "json"}, headers=_HEADERS
+    )
+    body = response.json()
+    assert body["total"] == 3
+    assert [e["message"] for e in body["events"]] == ["root", "middle"]

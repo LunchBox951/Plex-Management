@@ -15,7 +15,28 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["DownloadClientPort", "DownloadStatus", "DownloadedFile"]
+__all__ = ["AddResult", "DownloadClientPort", "DownloadStatus", "DownloadedFile"]
+
+
+class AddResult(BaseModel):
+    """The outcome of :meth:`DownloadClientPort.add`.
+
+    ``torrent_hash`` is the lowercased info-hash (``""`` when no hash could be
+    derived locally -- rare, an opaque ``.torrent`` URL the client fetched
+    itself). ``created`` is whether this call GENUINELY added a new torrent:
+    ``False`` means the client reported it ALREADY PRESENT (qBittorrent's 409
+    add response) and merely resolved to the existing torrent. The distinction
+    is load-bearing for failure cleanup: a grab that loses a race/CAS after the
+    add may remove (with data) only a torrent it actually created -- a reused
+    pre-existing torrent predates the grab (e.g. a still-seeding import whose
+    data can back a live library file via hardlink) and is never the grab's to
+    destroy.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    torrent_hash: str
+    created: bool
 
 
 class DownloadStatus(BaseModel):
@@ -61,10 +82,23 @@ class DownloadedFile(BaseModel):
 class DownloadClientPort(Protocol):
     """Add, monitor, and control torrents in the download client."""
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
-        """Add a torrent; return its lowercased info-hash.
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        """Add a torrent; return its lowercased info-hash + whether it was created.
 
-        A 409 (already present) resolves to the existing hash, never an error.
+        A 409 (already present) resolves to the existing hash, never an error --
+        reported honestly as ``created=False`` so a caller cleaning up after a
+        lost grab never removes a pre-existing torrent it did not create (see
+        :class:`AddResult`).
+
+        A non-empty ``save_path`` is a DIRECTED path (issues #133/#157) that the
+        implementation must actually honour: an install with global Automatic
+        Torrent Management enabled otherwise ignores the per-add path entirely
+        and places the torrent per its own category/auto rules, silently
+        defeating the direction. Implementations must therefore pin the ADDED
+        torrent to manual management whenever ``save_path`` is non-empty
+        (without touching the client's global AutoTMM setting or any other
+        torrent), and leave the torrent's management mode untouched when
+        ``save_path`` is empty (nothing to direct).
         """
         raise NotImplementedError
 
@@ -94,3 +128,20 @@ class DownloadClientPort(Protocol):
         """Return the torrent's files (relative path + size) so the importer can
         locate the completed video file."""
         raise NotImplementedError
+
+    async def get_default_save_path(self) -> str | None:
+        """Return the client's GLOBAL default save path (``None`` if unreadable).
+
+        Read-only: the port deliberately has no matching setter. This is a
+        DIAGNOSTIC signal (the setup/health visibility probe, issues #133/#157) --
+        never mutate the operator's shared qBittorrent instance's global config.
+        """
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        """Relocate an existing torrent's save directory (qBittorrent moves it
+        asynchronously; this call only requests the move and returns).
+
+        Per-torrent only -- this is the correction verb for a torrent stranded
+        outside the app's visible download mount (issues #133/#157), never a
+        bulk sweep and never the client's global default (see
+        :meth:`get_default_save_path`)."""

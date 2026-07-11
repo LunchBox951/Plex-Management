@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.models import User
 from plex_manager.repositories import SqlRequestRepository
 
 # The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
@@ -164,6 +165,64 @@ async def test_partial_unique_index_scoped_by_media_type(session: AsyncSession) 
     assert tv.id > 0
 
 
+async def test_find_in_library_prefers_own_then_ownerless_then_newest_foreign(
+    session: AsyncSession,
+) -> None:
+    """``prefer_user_id`` reorders WHICH terminal row wins when several exist:
+    the caller's OWN row first (even when it is the oldest), then an ownerless
+    claimable one, then anyone else's — while the unscoped default keeps the
+    pre-preference newest-row-wins behavior for admins/API-key automation."""
+    repo = SqlRequestRepository(session)
+    mine = User(username="mine")
+    other = User(username="other")
+    stranger = User(username="stranger")
+    session.add_all([mine, other, stranger])
+    await session.flush()
+
+    own_oldest = await repo.create(
+        tmdb_id=64, media_type="movie", title="Own", status="available", user_id=mine.id
+    )
+    ownerless_mid = await repo.create(
+        tmdb_id=64, media_type="movie", title="Ownerless", status="available"
+    )
+    foreign_newest = await repo.create(
+        tmdb_id=64, media_type="movie", title="Foreign", status="available", user_id=other.id
+    )
+
+    # Unscoped (admins / API-key automation): the newest row wins, as before.
+    unscoped = await repo.find_in_library(64, "movie")
+    assert unscoped is not None and unscoped.id == foreign_newest.id
+
+    # The caller's own row outranks BOTH newer rows.
+    preferred = await repo.find_in_library(64, "movie", prefer_user_id=mine.id)
+    assert preferred is not None and preferred.id == own_oldest.id
+
+    # A caller with NO row of their own: the ownerless row beats the foreign one.
+    claimable = await repo.find_in_library(64, "movie", prefer_user_id=stranger.id)
+    assert claimable is not None and claimable.id == ownerless_mid.id
+
+
+async def test_find_in_library_preference_picks_newest_within_a_rank(
+    session: AsyncSession,
+) -> None:
+    """Ties inside one ownership rank keep the newest-by-id order — the
+    preference only reorders BETWEEN ranks, matching the unscoped behavior."""
+    repo = SqlRequestRepository(session)
+    mine = User(username="rank-mine")
+    session.add(mine)
+    await session.flush()
+
+    await repo.create(
+        tmdb_id=65, media_type="movie", title="Older own", status="available", user_id=mine.id
+    )
+    newer_own = await repo.create(
+        tmdb_id=65, media_type="movie", title="Newer own", status="available", user_id=mine.id
+    )
+
+    preferred = await repo.find_in_library(65, "movie", prefer_user_id=mine.id)
+    assert preferred is not None and preferred.id == newer_own.id
+
+
 async def test_set_status_updates(session: AsyncSession) -> None:
     repo = SqlRequestRepository(session)
     created = await repo.create(tmdb_id=11, media_type="tv", title="Show", status="pending")
@@ -180,6 +239,45 @@ async def test_new_request_defaults_library_path_none_and_keep_forever_false(
     created = await repo.create(tmdb_id=12, media_type="movie", title="X", status="pending")
     assert created.library_path is None
     assert created.keep_forever is False
+
+
+async def test_tv_request_intent_round_trips(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=900,
+        media_type="tv",
+        title="Show",
+        status="pending",
+        tv_request_mode="explicit_seasons",
+        requested_seasons=[2, 1],
+    )
+
+    assert created.tv_request_mode == "explicit_seasons"
+    assert created.requested_seasons == (1, 2)
+
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.tv_request_mode == "explicit_seasons"
+    assert fetched.requested_seasons == (1, 2)
+
+
+async def test_set_tv_request_intent_promotes_to_whole_show(session: AsyncSession) -> None:
+    repo = SqlRequestRepository(session)
+    created = await repo.create(
+        tmdb_id=901,
+        media_type="tv",
+        title="Show",
+        status="pending",
+        tv_request_mode="explicit_seasons",
+        requested_seasons=[1],
+    )
+
+    await repo.set_tv_request_intent(created.id, mode="whole_show", requested_seasons=None)
+
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.tv_request_mode == "whole_show"
+    assert fetched.requested_seasons is None
 
 
 async def test_set_library_path_round_trips(session: AsyncSession) -> None:
@@ -349,3 +447,64 @@ async def test_display_statuses_returns_tv_parent_rollup(session: AsyncSession) 
 async def test_display_statuses_empty_input_returns_empty(session: AsyncSession) -> None:
     repo = SqlRequestRepository(session)
     assert await repo.display_statuses_by_tmdb_ids([]) == {}
+
+
+async def test_latest_request_evicted_reflects_the_newest_row(session: AsyncSession) -> None:
+    """``latest_request_evicted`` is the in-library short-circuit's stale-Plex guard
+    (ADR-0012): it reports whether the NEWEST request row for this media is
+    ``evicted``. Keyed on the newest id so a movie re-downloaded after an earlier
+    eviction (a later ``available`` row) is never falsely suppressed."""
+    repo = SqlRequestRepository(session)
+
+    # No rows at all -> not evicted.
+    assert await repo.latest_request_evicted(700, "movie") is False
+
+    # A lone evicted row -> True.
+    await repo.create(tmdb_id=700, media_type="movie", title="Gone", status="evicted")
+    assert await repo.latest_request_evicted(700, "movie") is True
+
+    # A NEWER available row for the same media (a legitimate re-download) -> False:
+    # the eviction is no longer the most recent history for this title.
+    await repo.create(tmdb_id=700, media_type="movie", title="Gone", status="available")
+    assert await repo.latest_request_evicted(700, "movie") is False
+
+    # Scoped to the (tmdb_id, media_type) namespace: a tv row with the same tmdb_id
+    # does not bleed into the movie answer.
+    await repo.create(tmdb_id=700, media_type="tv", title="Gone Show", status="evicted")
+    assert await repo.latest_request_evicted(700, "movie") is False
+    assert await repo.latest_request_evicted(700, "tv") is True
+
+
+async def test_latest_request_evicted_ignores_cancelled_rows(session: AsyncSession) -> None:
+    """An in-window re-grab the user then CANCELLED must not reset the eviction
+    stale-Plex guard: a cancellation says nothing about on-disk truth, so the
+    guard keys on the newest NON-cancelled row. Without this, evicted -> re-grab
+    (pending) -> cancel would let the NEXT re-request mint 'available' over the
+    file the sweep is still deleting."""
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=701, media_type="movie", title="Doomed", status="evicted")
+    assert await repo.latest_request_evicted(701, "movie") is True
+
+    # The in-window re-grab, cancelled by the user: newest row is now 'cancelled',
+    # but the newest NON-cancelled row is still the eviction.
+    await repo.create(tmdb_id=701, media_type="movie", title="Doomed", status="cancelled")
+    assert await repo.latest_request_evicted(701, "movie") is True
+
+    # A media whose ONLY row is cancelled has no eviction history -> False.
+    await repo.create(tmdb_id=702, media_type="movie", title="Other", status="cancelled")
+    assert await repo.latest_request_evicted(702, "movie") is False
+
+
+async def test_clear_library_path_if_set_is_a_single_winner_gate(session: AsyncSession) -> None:
+    """The guarded breadcrumb clear returns True exactly once -- the eviction
+    finalize's single-winner gate: only the pass that actually cleared it writes
+    the history row, so two racing resume/finalize passes never double-record."""
+    repo = SqlRequestRepository(session)
+    created = await repo.create(tmdb_id=703, media_type="movie", title="Gone", status="evicted")
+    await repo.set_library_path(created.id, "/media/movies/Gone.mkv")
+
+    assert await repo.clear_library_path_if_set(created.id) is True
+    assert await repo.clear_library_path_if_set(created.id) is False  # already cleared
+    fetched = await repo.get(created.id)
+    assert fetched is not None
+    assert fetched.library_path is None

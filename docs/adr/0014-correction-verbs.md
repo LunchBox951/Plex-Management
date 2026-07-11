@@ -107,13 +107,13 @@ omission** (exactly like `available`/`failed`/`evicted`), so a later fresh reque
 for the same media is allowed. `season_rollup` folds `cancelled` alongside `evicted`
 as a "gone" season (all-cancelled → `cancelled`).
 
-### Cross-branch note (auto-grab)
+### Auto-grab re-arm
 
-report-issue's re-arm point is where the parallel `feat/auto-grab` branch's
-per-request search backoff (`search_attempts`/`next_search_at`) must be reset once
-both merge — a report-issue re-search must not inherit the failed culprit's accrued
-backoff. Those columns do not exist on this branch, so `correction_service` carries
-a marked comment, not code.
+report-issue's re-arm point resets the auto-grab backoff
+(`search_attempts`/`next_search_at`) for the movie row or the reported TV season.
+An operator-triggered re-search must not inherit the failed culprit's accrued
+backoff; if it later parks again at `no_acceptable_release`, it starts the ladder
+over from the first delay.
 
 ## Consequences
 

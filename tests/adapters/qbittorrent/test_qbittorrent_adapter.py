@@ -130,14 +130,61 @@ def _client(
 
 async def test_add_magnet_returns_derived_hash() -> None:
     client = _client()
-    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
-    assert info_hash == MAGNET_HASH
+    result = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert result.torrent_hash == MAGNET_HASH
+    assert result.created is True  # a genuine new add -- the grab owns it
+
+
+async def test_add_with_directed_save_path_disables_autotmm() -> None:
+    """A non-empty ``save_path`` (issues #133/#157) must ALSO pin the torrent to
+    manual management -- otherwise a global-AutoTMM install ignores ``savepath``
+    entirely and places the torrent per its own category/auto rules."""
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add" and request.method == "POST":
+            calls.append(dict(httpx.QueryParams(request.content.decode())))
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).add(MAGNET, "/downloads/movies", "plex-manager")
+    assert calls == [
+        {
+            "savepath": "/downloads/movies",
+            "category": "plex-manager",
+            "autoTMM": "false",
+            "urls": MAGNET,
+        }
+    ]
+
+
+async def test_add_with_no_save_path_omits_autotmm() -> None:
+    """An empty ``save_path`` means nothing to direct -- ``autoTMM`` must be left
+    out entirely so the client's own auto-managed/manual mode is untouched."""
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add" and request.method == "POST":
+            calls.append(dict(httpx.QueryParams(request.content.decode())))
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).add(MAGNET, "", "plex-manager")
+    assert calls == [{"savepath": "", "category": "plex-manager", "urls": MAGNET}]
+    assert "autoTMM" not in calls[0]
 
 
 async def test_add_409_already_present_is_success() -> None:
     client = _client(_router(add_status=409))
-    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
-    assert info_hash == MAGNET_HASH
+    result = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    assert result.torrent_hash == MAGNET_HASH
+    # The honest already-present signal: the torrent PREDATES this call, so a
+    # lost-grab cleanup must never remove it with delete_files (round 8).
+    assert result.created is False
 
 
 async def test_login_failure_raises_auth_error() -> None:
@@ -275,6 +322,31 @@ async def test_list_files_error_status_raises_typed_error() -> None:
         await _client(handler).list_files(MAGNET_HASH)
 
 
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_list_files_redirect_status_raises_typed_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of qBittorrent) must be rejected
+    like any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes 3xx,
+    so the prior check would have read a redirect as a successful operation even
+    though the requested torrent-files listing never actually happened."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            # A valid JSON body on the redirect ensures this test only passes via
+            # the explicit 2xx-range check in _raise_for_status (issue #87): if
+            # that check were reverted to ``response.is_error``, the 3xx would
+            # sail past it and _decode_json would happily parse the empty-list
+            # body, silently reading the redirect as a successful (empty) files
+            # listing — the exact regression this test must catch.
+            return httpx.Response(status, json=[], headers={"Location": "/login"})
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError) as exc_info:
+        await _client(handler).list_files(MAGNET_HASH)
+    assert str(status) in str(exc_info.value)
+
+
 async def test_relogin_on_403() -> None:
     calls = {"login": 0, "info": 0}
 
@@ -318,7 +390,9 @@ async def test_add_torrent_file_url_computes_bencode_hash() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    info_hash = (
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    ).torrent_hash
     assert info_hash == _TORRENT_HASH
 
 
@@ -334,7 +408,9 @@ async def test_add_torrent_file_hashes_top_level_info_dict() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    info_hash = await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    info_hash = (
+        await _client(handler).add(DOWNLOAD_URL, "/downloads", "plex-manager")
+    ).torrent_hash
     assert info_hash == _TORRENT_HASH
     assert info_hash != hashlib.sha1(_FAKE_INFO_DICT).hexdigest()  # noqa: S324
 
@@ -349,7 +425,9 @@ async def test_add_http_redirect_to_magnet_is_followed() -> None:
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
 
-    info_hash = await _client(handler).add(REDIRECT_URL, "/downloads", "plex-manager")
+    info_hash = (
+        await _client(handler).add(REDIRECT_URL, "/downloads", "plex-manager")
+    ).torrent_hash
     assert info_hash == REDIRECT_HASH
 
 
@@ -581,7 +659,7 @@ async def test_add_torrent_from_configured_prowlarr_private_origin_is_allowed() 
         return httpx.Response(404)
 
     client = _client(handler, trusted_source_origin=PROWLARR_ORIGIN)
-    info_hash = await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")
+    info_hash = (await client.add(PROWLARR_DOWNLOAD_URL, "/downloads", "plex-manager")).torrent_hash
 
     assert info_hash == _TORRENT_HASH
     assert any(url.endswith("/api/v2/torrents/add") for url in seen)
@@ -698,7 +776,7 @@ async def test_malformed_trusted_origin_degrades_to_closed_veto(
     assert any("not a usable trusted source origin" in record.message for record in caplog.records)
 
     # Client healthy: a normal magnet add works.
-    info_hash = await client.add(MAGNET, "/downloads/movies", "plex-manager")
+    info_hash = (await client.add(MAGNET, "/downloads/movies", "plex-manager")).torrent_hash
     assert info_hash == MAGNET_HASH
 
     # Veto fully closed: private source URLs are still rejected (no accidental
@@ -1044,15 +1122,60 @@ async def test_add_base32_btih_magnet_normalizes_to_hex() -> None:
     assert len(b32) == 32  # base32 of 20 bytes is 32 chars
     base32_magnet = f"magnet:?xt=urn:btih:{b32}&dn=Test"
 
-    info_hash = await _client().add(base32_magnet, "/downloads/movies", "plex-manager")
+    info_hash = (
+        await _client().add(base32_magnet, "/downloads/movies", "plex-manager")
+    ).torrent_hash
     assert info_hash == MAGNET_HASH  # decoded to lowercase hex
 
 
 async def test_add_hex_btih_magnet_is_lowercased_as_is() -> None:
     """The 40-char hex form is left as-is (lowercased), not mangled."""
     upper_magnet = f"magnet:?xt=urn:btih:{MAGNET_HASH.upper()}&dn=Test"
-    info_hash = await _client().add(upper_magnet, "/downloads/movies", "plex-manager")
+    info_hash = (
+        await _client().add(upper_magnet, "/downloads/movies", "plex-manager")
+    ).torrent_hash
     assert info_hash == MAGNET_HASH
+
+
+async def test_add_invalid_base32_btih_magnet_raises_source_error() -> None:
+    """Issue #90: a 32-char ``btih`` that is NOT valid base32 (``0``/``1``/``8``/``9``
+    are outside the base32 alphabet) is a MALFORMED source, not a hash. It must raise
+    the typed ``QbittorrentSourceError`` -- flowing into the existing source-failure
+    taxonomy -- rather than passing the garbage through as a bogus 'hash' that could
+    never match the client snapshot (ClientMissing forever). No secret leak either."""
+    bad_b32 = "0" * 32  # 32 chars, but '0' is not a base32 digit -> binascii.Error
+    bad_magnet = f"magnet:?xt=urn:btih:{bad_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_non_ascii_btih_magnet_raises_source_error() -> None:
+    """A 32-char ``btih`` containing NON-ASCII text (e.g. percent-decoded invalid
+    bytes from an indexer magnet) makes ``b32decode`` raise a PLAIN ``ValueError``
+    ("string argument should contain only ASCII characters"), not
+    ``binascii.Error`` — it must land in the same typed taxonomy, never escape as
+    an unhandled 500 / out-of-taxonomy failure."""
+    bad_b32 = "é" * 32  # non-ASCII: plain ValueError before the alphabet check
+    bad_magnet = f"magnet:?xt=urn:btih:{bad_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_short_decoding_padded_btih_magnet_raises_source_error() -> None:
+    """Padding tricks ("A"*31 + "=") b32decode "successfully" — to 19 bytes. The
+    resulting 38-char "hex hash" could never match qBittorrent's 40-char snapshot
+    (ClientMissing forever), so a decode that is not exactly 20 bytes is the same
+    malformed source and must raise the typed error, not return a bogus hash."""
+    padded_b32 = "A" * 31 + "="  # decodes to 19 bytes, not a 20-byte info-hash
+    bad_magnet = f"magnet:?xt=urn:btih:{padded_b32}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
 
 
 async def test_transport_outage_raises_qbittorrent_error() -> None:
@@ -1119,6 +1242,93 @@ async def test_server_5xx_raises_qbittorrent_error() -> None:
 
     with pytest.raises(QbittorrentError):
         await _client(handler).get_all_statuses()
+
+
+async def test_get_default_save_path_reads_app_preferences() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/preferences" and request.method == "GET":
+            return httpx.Response(200, json={"save_path": "/home/lunchbox/Downloads"})
+        return httpx.Response(404, text="unhandled")
+
+    save_path = await _client(handler).get_default_save_path()
+    assert save_path == "/home/lunchbox/Downloads"
+
+
+async def test_get_default_save_path_missing_key_returns_none() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/preferences" and request.method == "GET":
+            return httpx.Response(200, json={})
+        return httpx.Response(404, text="unhandled")
+
+    assert await _client(handler).get_default_save_path() is None
+
+
+async def test_get_default_save_path_error_status_returns_none() -> None:
+    """A read-only diagnostic (issues #133/#157): a failure here must never raise
+    — the caller (setup/health probe) treats it as "could not read it", not a
+    hard failure of the whole qBittorrent check."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/preferences" and request.method == "GET":
+            return httpx.Response(500, text="boom")
+        return httpx.Response(404, text="unhandled")
+
+    assert await _client(handler).get_default_save_path() is None
+
+
+async def test_set_location_posts_hash_and_location() -> None:
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/setLocation" and request.method == "POST":
+            body = dict(httpx.QueryParams(request.content.decode()))
+            calls.append(body)
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).set_location(MAGNET_HASH.upper(), "/home/lunchbox/Downloads")
+    assert calls == [{"hashes": MAGNET_HASH, "location": "/home/lunchbox/Downloads"}]
+
+
+async def test_set_location_error_status_raises_typed_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/setLocation" and request.method == "POST":
+            return httpx.Response(403, text="Forbidden")
+        return httpx.Response(404, text="unhandled")
+
+    with pytest.raises(QbittorrentError):
+        await _client(handler).set_location(MAGNET_HASH, "/home/lunchbox/Downloads")
+
+
+async def test_set_location_drops_cached_properties_entry() -> None:
+    """After a relocate, the next ``get_save_path`` must re-read the client rather
+    than serve the pre-move path from the short-lived properties cache."""
+
+    paths = iter(["/downloads/movies", "/home/lunchbox/Downloads"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/setLocation" and request.method == "POST":
+            return httpx.Response(200, text="Ok.")
+        if request.url.path == "/api/v2/torrents/properties" and request.method == "GET":
+            return httpx.Response(200, json={"save_path": next(paths)})
+        return httpx.Response(404, text="unhandled")
+
+    client = _client(handler)
+    assert await client.get_save_path(MAGNET_HASH) == "/downloads/movies"
+    await client.set_location(MAGNET_HASH, "/home/lunchbox/Downloads")
+    assert await client.get_save_path(MAGNET_HASH) == "/home/lunchbox/Downloads"
 
 
 def test_adapter_satisfies_download_client_port() -> None:

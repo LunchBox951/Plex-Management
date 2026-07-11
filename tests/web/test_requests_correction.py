@@ -26,6 +26,7 @@ from plex_manager.models import (
     RequestStatus,
     Setting,
 )
+from plex_manager.web.deps import get_downloads_host_root
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -108,6 +109,7 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
             ]
         ),
     )
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
 
     response = await client.post(
         f"/api/v1/requests/{request_id}/report-issue",
@@ -124,6 +126,11 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
         downloads = (await session.execute(select(Download))).scalars().all()
     assert len(blocklist) == 1
     assert {d.torrent_hash for d in downloads if d.status != "imported"} == {_ALT}
+    # Issues #133/#157: the inline re-grab directs the replacement torrent at
+    # the derived HOST-namespace downloads root, not qBittorrent's own default.
+    assert len(qbt.added) == 1
+    _source, save_path, _category = qbt.added[0]
+    assert save_path == "/home/lunchbox/Downloads"
 
 
 async def test_report_issue_endpoint_purges_anime_content_under_the_anime_root(
@@ -436,6 +443,84 @@ async def test_cancel_endpoint_409_service_not_configured_with_active_torrent(
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
     assert row is not None and row.status == RequestStatus.downloading
+
+
+async def test_report_issue_endpoint_409_media_root_unavailable_is_actionable(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # A configured-but-EMPTY movies_root reads as "not mounted" (_root_is_mounted) --
+    # the Radarr-style unmounted-drive failsafe. The 409 must be an actionable
+    # envelope (message + hint + diagnostics.root), never a bare code.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    root = tmp_path / "movies"
+    root.mkdir()  # configured, but EMPTY -- reads as "not mounted"
+    movie_file = root / "Some Movie (2020).mkv"
+    await _set_setting(sessionmaker_, "movies_root", str(root))
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    override_adapters(app, library=FakeLibrary(), qbt=FakeQbittorrent(), prowlarr=FakeProwlarr([]))
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/report-issue",
+        json={"reason": "bad_quality"},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["detail"] == "media_root_unavailable"
+    assert body["message"]  # non-empty, operator-facing
+    assert body["hint"]  # non-empty, actionable next step
+    assert body["diagnostics"]["root"] == str(root)
+
+
+async def test_report_issue_endpoint_presence_only_no_culprit_reacquires(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    # Issue #131, endpoint-level twin of the service test: a purely
+    # presence-derived row (no library_path breadcrumb, no culprit download) must
+    # NOT 409 `media_root_unavailable` on an unmounted `movies_root` -- there is
+    # nothing of ours to protect. Contrast with the test above, whose row has a
+    # breadcrumb (via ``_seed_available_movie``) and correctly still 409s.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    root = tmp_path / "movies"  # never created -> unmounted
+    await _set_setting(sessionmaker_, "movies_root", str(root))
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            year=2020,
+            status=RequestStatus.available,
+            library_path=None,
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    override_adapters(
+        app,
+        library=FakeLibrary(),
+        qbt=FakeQbittorrent(),
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER", info_hash=_ALT)]
+        ),
+    )
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/report-issue",
+        json={"reason": "bad_quality"},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "downloading"
 
 
 async def test_report_issue_endpoint_409_when_an_active_sibling_exists(

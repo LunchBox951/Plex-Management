@@ -22,10 +22,23 @@ import type {
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
 
+// The caller's auth context, read by the modal to gate admin-only verbs. A
+// hoisted mutable holder (not mockReturnValue) so the per-role tests can flip it
+// and the top-level beforeEach below restores the admin default for every other
+// (admin-flow) describe block — vi.clearAllMocks clears calls, not return values.
+const authState = vi.hoisted(() => {
+  const admin = {
+    data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+    isLoading: false,
+  }
+  return { admin, current: admin as typeof admin | { data: unknown; isLoading: boolean } }
+})
+
 // No network and no Radix portals: the hooks and the Dialog/toast shells are replaced
 // with controllable stand-ins so the tests exercise only the modal's grab-gating (G3)
 // and report-gating (G6) logic.
 vi.mock('../api/hooks', () => ({
+  useAuthMe: vi.fn(() => authState.current),
   useCreateRequest: vi.fn(),
   useSearchPreview: vi.fn(),
   useGrab: vi.fn(),
@@ -39,6 +52,10 @@ vi.mock('../api/hooks', () => ({
   useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
+
+beforeEach(() => {
+  authState.current = authState.admin
+})
 
 vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
 
@@ -80,6 +97,12 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
         title: 'Test.Movie.1080p.WEB-DL',
         seeders: 10,
         info_hash: 'hash1',
+        covered_seasons: [],
+        target_seasons: [],
+        upgrade_seasons: [],
+        waste_seasons: [],
+        ignored_seasons: [],
+        skipped_seasons: [],
       },
     ],
     rejected: [],
@@ -373,6 +396,12 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test.Show.S02.1080p.WEB-DL',
       seeders: 10,
       info_hash: 'hash3',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
     }
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
     ;(useSearchPreview as unknown as Mock).mockReturnValue(
@@ -425,6 +454,12 @@ describe('TitleDetailModal — tv season selector', () => {
       title: 'Test.Show.S02.1080p.WEB-DL',
       seeders: 10,
       info_hash: 'hash2',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
     }
     const createRequestMock = mutation(created)
     const searchPreviewMock = mutation({
@@ -539,6 +574,51 @@ describe('TitleDetailModal — tv season selector', () => {
     // rather than the show's 'partially_available' rollup leaking through.
     fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
     expect(await screen.findByText(/in your library/i)).toBeInTheDocument()
+  })
+
+  it('matches queue rows by attached scope when the legacy season differs', () => {
+    const request: RequestResponse = {
+      id: 21,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'downloading' },
+      ],
+    }
+    const sharedPack: QueueItem = {
+      id: 31,
+      media_request_id: 21,
+      tmdb_id: 100,
+      season: 1,
+      episodes: null,
+      progress: 0.63,
+      seed_ratio: 0,
+      status: 'downloading',
+      torrent_hash: 'hash-shared-pack',
+      scopes: [
+        { media_request_id: 21, season: 1, episodes: null, status: 'active' },
+        { media_request_id: 21, season: 2, episodes: null, status: 'active' },
+      ],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [sharedPack] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    expect(screen.getByText('63%')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
   })
 })
 
@@ -741,6 +821,37 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(7))
   })
 
+  it('offers Cancel for a TV request waiting for its air date', async () => {
+    const tvTitle: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 77,
+      title: 'Future Show',
+      year: 2026,
+      library_state: 'none',
+    }
+    const waiting: RequestResponse = {
+      id: 21,
+      tmdb_id: 77,
+      media_type: 'tv',
+      title: 'Future Show',
+      status: 'waiting_for_air_date',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [{ season_number: 3, status: 'waiting_for_air_date' }],
+    }
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
+    const cancelMock = mutation({ ...waiting, status: 'cancelled' })
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
+    render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
+
+    expect(screen.getAllByText(/waiting for air date/i)).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: /cancel request/i }))
+    const confirms = screen.getAllByRole('button', { name: /cancel request/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(21))
+  })
+
   it('does not offer Cancel for an already-imported (available) request', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'available' })] },
@@ -806,5 +917,248 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     })
     render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — shared (non-admin) users get a request-only modal', () => {
+  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'available',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  function baseMocks() {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  }
+
+  function asSharedUser() {
+    authState.current = {
+      data: {
+        authenticated: true,
+        auth_method: 'plex_session',
+        is_admin: false,
+        user: { is_admin: false },
+      },
+      isLoading: false,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    baseMocks()
+  })
+
+  it('shows Request but hides Preview releases for a shared user (admin keeps both)', () => {
+    asSharedUser()
+    const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    // Preview drives the admin-only /search-preview: hidden, not a 403 machine.
+    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
+    unmount()
+
+    // Same render as an admin: both verbs are offered.
+    authState.current = authState.admin
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /preview releases/i })).toBeInTheDocument()
+  })
+
+  it('keeps the admin-only queue query disabled for a shared user', () => {
+    asSharedUser()
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    // GET /queue is require_admin: the query must be idle, not a 403 loop.
+    expect(useQueue).toHaveBeenCalledWith({ poll: true, enabled: false })
+  })
+
+  it('hides keep-forever, report and cancel from a shared user across states', () => {
+    asSharedUser()
+    // An available request (would offer keep-forever + report-issue to an admin).
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'available' })] },
+    })
+    const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument() // honest status stays
+    expect(screen.queryByText(/keep forever/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
+    unmount()
+
+    // A searching request (would offer Re-search + Cancel to an admin).
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'searching' })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/searching/i)).toBeInTheDocument() // honest status stays
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+
+  it('still offers "Request again" for a settled title to a shared user', () => {
+    // POST /requests is NOT admin-only: re-requesting an evicted/failed title is
+    // exactly the shared-user flow (the auto-grab worker does the rest).
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'evicted' })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /request again/i })).toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
+  const EMPTY_PREVIEW: SearchPreviewResponse = {
+    accepted: [],
+    rejected: [],
+    no_acceptable_release: true,
+  }
+
+  function created(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 31,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'pending',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  function baseMocks() {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(mutation(EMPTY_PREVIEW))
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  }
+
+  // Click through the confirm dialog: the opener and the dialog's confirm button
+  // share the "Re-acquire" name (same pattern as the cancel-request test above),
+  // so the LAST one is the dialog's.
+  async function confirmReacquire() {
+    fireEvent.click(screen.getByRole('button', { name: /^re-acquire$/i }))
+    expect(screen.getByText('Re-acquire this title?')).toBeInTheDocument()
+    const buttons = screen.getAllByRole('button', { name: /^re-acquire$/i })
+    fireEvent.click(buttons[buttons.length - 1]!)
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    baseMocks()
+  })
+
+  it('replaces Request with Re-acquire on a presence-only owned movie and force-creates', async () => {
+    // Owned per the Plex projection (library_state 'available') but NO tracked
+    // request row at all: "Request" would short-circuit straight back to a
+    // terminal available row with no grab, so the honest verb is Re-acquire.
+    const createMutation = mutation(created())
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, library_state: 'available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: /^re-acquire$/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
+
+    await confirmReacquire()
+    await waitFor(() =>
+      expect(createMutation.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 42,
+        media_type: 'movie',
+        force: true,
+      }),
+    )
+  })
+
+  it('offers Re-acquire beside report-issue on an available movie request and force-creates', async () => {
+    // A tracked request already sits terminal `available` — the stale phantom row.
+    // Re-acquire never re-arms it: the force-create makes a FRESH pending row.
+    const createMutation = mutation(created())
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [created({ id: 7, status: 'available' })] },
+    })
+
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, library_state: 'available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    // The available zone shows both verbs for an admin.
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+
+    await confirmReacquire()
+    await waitFor(() =>
+      expect(createMutation.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 42,
+        media_type: 'movie',
+        force: true,
+      }),
+    )
+  })
+
+  it('never offers Re-acquire for a TV title (movie-only; report-issue covers tv)', () => {
+    // An available tv season: report-issue is the per-season re-acquisition verb,
+    // so the movie-only Re-acquire button must NOT appear.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          {
+            id: 20,
+            tmdb_id: 100,
+            media_type: 'tv',
+            title: 'Test Show',
+            status: 'available',
+            is_anime: false,
+            keep_forever: false,
+            seasons: [{ season_number: 1, status: 'available' }],
+          } satisfies RequestResponse,
+        ],
+      },
+    })
+
+    render(
+      <TitleDetailModal
+        title={{
+          media_type: 'tv',
+          tmdb_id: 100,
+          title: 'Test Show',
+          year: 2022,
+          library_state: 'available',
+        }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^re-acquire$/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
   })
 })

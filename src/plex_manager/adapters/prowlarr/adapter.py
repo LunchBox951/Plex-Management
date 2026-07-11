@@ -40,6 +40,7 @@ from typing import Final, cast
 import httpx
 
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
+from plex_manager.headersafe import header_value_error
 
 __all__ = ["IndexerError", "IndexerRateLimitError", "ProwlarrIndexer"]
 
@@ -48,6 +49,7 @@ _logger = logging.getLogger(__name__)
 _SEARCH_PATH: Final = "/api/v1/search"
 _INDEXER_PATH: Final = "/api/v1/indexer"
 _HTTP_OK: Final = 200
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_BAD_REQUEST: Final = 400
 _DEFAULT_INDEXER_PRIORITY: Final = 25
 _PRIORITY_TTL_SECONDS: Final = 300.0
@@ -211,6 +213,23 @@ class ProwlarrIndexer:
     def __repr__(self) -> str:  # pragma: no cover - trivial, redacts the key
         return f"ProwlarrIndexer(base_url={self._base_url!r}, api_key=<redacted>)"
 
+    def _auth_headers(self) -> dict[str, str]:
+        """Return the ``X-Api-Key`` header, refusing a header-unsafe key up front.
+
+        Defense-in-depth for a stored key that bypassed the write-time header-safety
+        check (a ``dev_auth_bypass`` install, a legacy row written before that check
+        existed, or a hand-edited DB): an unsafe key would otherwise make httpx echo
+        the RAW key in ``str(exc)`` -- leaked by :meth:`_indexer_priorities`' priority
+        warning log for a CR/LF/NUL key -- or raise an uncaught ``UnicodeEncodeError``
+        (a 500) for a non-ASCII key. Fail fast with a credential-free
+        :class:`IndexerError` (a genuine config error, like the malformed-base-URL
+        branch below -- NOT the best-effort empty-map degradation) so the key never
+        rides, and is never echoed by, a failing request.
+        """
+        if header_value_error(self._api_key) is not None:
+            raise IndexerError("Prowlarr api key is not a valid credential value")
+        return {"X-Api-Key": self._api_key}
+
     def _build_params(self, request: IndexerSearchRequest) -> list[_QueryParam]:
         """Translate a domain search request into Prowlarr query params.
 
@@ -245,13 +264,21 @@ class ProwlarrIndexer:
     async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
         """Run ``request`` and return de-duplicated candidate releases."""
         priorities = await self._indexer_priorities()
+        # Guard THIS request's key too: a cached-priority hit skips
+        # _indexer_priorities' own guard, so the search path must not assume it ran.
+        headers = self._auth_headers()
         try:
             response = await self._client.get(
                 f"{self._base_url}{_SEARCH_PATH}",
                 params=self._build_params(request),
-                headers={"X-Api-Key": self._api_key},
+                headers=headers,
                 timeout=self._search_timeout,
             )
+        except httpx.InvalidURL as exc:
+            # A malformed stored base URL (issue #88): httpx.InvalidURL is NOT a
+            # RequestError subclass, so without this it would escape untyped as an
+            # opaque 500 instead of the intended indexer-unavailable response.
+            raise IndexerError("Prowlarr search request failed: invalid indexer URL") from exc
         except httpx.RequestError as exc:
             # Prowlarr unreachable (DNS / refused / timeout): surface a retryable
             # error rather than an opaque 500. No url/api key in the message.
@@ -261,9 +288,14 @@ class ProwlarrIndexer:
                 "Prowlarr returned HTTP 400 for the search — all indexers are "
                 "rate-limited or the query was rejected"
             )
-        if response.is_error:
-            # Non-400 HTTP failure (5xx / auth): surface a retryable IndexerError
-            # rather than letting httpx's HTTPStatusError escape (it embeds the url).
+        # Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        # (issue #87): ``is_error`` is only true for >=400, so a 3xx redirect (e.g. a
+        # proxy/auth redirect in front of Prowlarr) would read as a successful search
+        # even though it returned no actual release data.
+        if not (_HTTP_OK <= response.status_code < _HTTP_MULTIPLE_CHOICES):
+            # Non-400 HTTP failure (5xx / auth / redirect): surface a retryable
+            # IndexerError rather than letting httpx's HTTPStatusError escape (it
+            # embeds the url).
             raise IndexerError(f"Prowlarr search failed (HTTP {response.status_code})")
 
         try:
@@ -301,11 +333,27 @@ class ProwlarrIndexer:
         cached = self._priority_cache
         if cached is not None and (now - cached[0]).total_seconds() < _PRIORITY_TTL_SECONDS:
             return cached[1]
+        # A header-unsafe key is a genuine config error (every call fails
+        # identically), so -- like the malformed-URL branch below -- it raises
+        # IndexerError rather than degrading to the best-effort empty map, and does
+        # so BEFORE the request so httpx never echoes the raw key into the warning
+        # log's ``str(exc)``.
+        headers = self._auth_headers()
         try:
             response = await self._client.get(
                 f"{self._base_url}{_INDEXER_PATH}",
-                headers={"X-Api-Key": self._api_key},
+                headers=headers,
             )
+        except httpx.InvalidURL as exc:
+            # A malformed stored base URL (issue #88): unlike a transient network
+            # failure, every subsequent call with this same URL fails identically,
+            # so this is NOT degraded to the best-effort empty map below — it is a
+            # genuine configuration error and must surface as IndexerError rather
+            # than escape untyped (httpx.InvalidURL is NOT a RequestError/HTTPError
+            # subclass) or be silently swallowed into default priorities.
+            raise IndexerError(
+                "Prowlarr indexer priority lookup failed: invalid indexer URL"
+            ) from exc
         except httpx.HTTPError as exc:
             _logger.warning("could not fetch Prowlarr indexer priorities: %s", exc)
             return {}
@@ -373,7 +421,7 @@ class ProwlarrIndexer:
             publish_date=_parse_publish_date(row.get("publishDate")),
             imdb_id=_get_int(row, "imdbId"),
             tmdb_id=_get_int(row, "tmdbId"),
-            categories=_categories(row),
+            categories=tuple(_categories(row)),
             protocol=protocol,
         )
 

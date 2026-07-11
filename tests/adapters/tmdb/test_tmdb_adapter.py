@@ -228,6 +228,22 @@ async def test_search_year_filters_mixed_year_results() -> None:
     assert [(r.tmdb_id, r.media_type, r.year) for r in results] == [(27205, "movie", 2010)]
 
 
+async def test_search_cache_hit_returns_a_copy_never_the_cached_reference() -> None:
+    """Issue #106: ``_TtlCache.get`` used to hand back the SAME list object on
+    every hit within the TTL -- a caller mutating its own result (append/sort/
+    clear) would silently corrupt what every LATER cache hit returns. The cache
+    entry must now be immutable and every ``search`` call must get its own list."""
+    adapter = _adapter()
+    first = await adapter.search("inception")
+    assert len(first) == 2
+    first.append(first[0])  # a careless caller mutates the returned list in place
+    first.clear()  # ...and even empties it
+
+    second = await adapter.search("inception")  # served from the (still warm) cache
+    assert len(second) == 2  # completely unaffected by the first call's mutation
+    assert second is not first
+
+
 async def test_get_movie_maps_imdb_and_year() -> None:
     movie = await _adapter().get_movie(27205)
     assert movie is not None
@@ -461,6 +477,58 @@ async def test_discover_error_excludes_api_key() -> None:
     message = str(exc_info.value)
     assert API_KEY not in message
     assert "/movie/popular" in message
+
+
+async def test_search_404_raises_tmdb_api_error() -> None:
+    """A 404 on /search/multi means the route is wrong, NOT "no results" (issue
+    #89) — it must raise TmdbApiError rather than silently mapping to an empty
+    list, which would look identical to a legitimate no-match search."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"status_message": "not found"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    with pytest.raises(TmdbApiError) as exc_info:
+        await adapter.search("inception")
+    assert "/search/multi" in str(exc_info.value)
+
+
+async def test_list_endpoint_404_raises_tmdb_api_error() -> None:
+    """A 404 on a discover/list endpoint (e.g. /movie/popular) must raise, not
+    silently degrade to an empty page (issue #89) — same rationale as search."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"status_message": "not found"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    with pytest.raises(TmdbApiError) as exc_info:
+        await adapter.popular_movies()
+    assert "/movie/popular" in str(exc_info.value)
+
+
+async def test_detail_lookup_404_still_returns_none() -> None:
+    """Detail lookups (get_movie/get_tv_show) keep the 404 -> None contract
+    (issue #89): absence really is a valid answer for a single title lookup,
+    unlike search/list 404s which mean a broken route."""
+    assert await _adapter().get_movie(999999) is None
+
+
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_redirect_status_raises_tmdb_api_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of TMDB) must be rejected like
+    any other non-2xx (issue #87) — httpx.Response.is_error excludes 3xx, so the
+    prior check would have read a redirect as success."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"status_message": "redirected"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TmdbMetadata(client, API_KEY)
+    with pytest.raises(TmdbApiError) as exc_info:
+        await adapter.get_movie(27205)
+    assert str(status) in str(exc_info.value)
 
 
 def test_adapter_satisfies_metadata_port() -> None:

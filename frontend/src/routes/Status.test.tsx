@@ -1,8 +1,14 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ReactNode } from 'react'
+import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { useEvict, useOpsDisk, useOpsHealth, useSettings } from '../api/hooks'
 import type { DiskResponse, EvictResponse, HealthResponse, SettingsResponse } from '../api/types'
 import { Status } from './Status'
+
+// Status's disk-root error branch renders a LinkButton (a react-router <Link>),
+// so every render needs a Router in the tree -- mirrors Settings.test.tsx.
+const Wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
 
 // No network: the ops hooks are replaced with controllable stand-ins so the
 // test exercises only the Status page's own rendering + wiring.
@@ -96,7 +102,7 @@ describe('Status', () => {
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
 
     expect(screen.getByText('plex')).toBeInTheDocument()
     expect(screen.getByText('Healthy')).toBeInTheDocument()
@@ -106,12 +112,51 @@ describe('Status', () => {
     expect(screen.getByText('Not configured')).toBeInTheDocument()
   })
 
+  it('renders a subsystem\'s non-blocking note under its detail, distinct from a failure detail (issues #133/#157)', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        subsystems: [
+          {
+            name: 'qbittorrent',
+            status: 'ok',
+            detail: null,
+            note: "the client's default save path isn't visible inside this container",
+            checked_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    // Still reads "Healthy" -- the note never flips status -- but the caution
+    // is surfaced, not swallowed.
+    expect(screen.getByText('Healthy')).toBeInTheDocument()
+    expect(
+      screen.getByText(/default save path isn't visible inside this container/),
+    ).toBeInTheDocument()
+  })
+
+  it('renders no note line when a subsystem has none', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.queryByText(/⚠/)).not.toBeInTheDocument()
+  })
+
   it('renders the disk usage bar and eviction-candidate preview per root', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
 
     expect(screen.getByText('movies_root')).toBeInTheDocument()
     expect(screen.getByText('90% used')).toBeInTheDocument()
@@ -119,12 +164,12 @@ describe('Status', () => {
     expect(screen.getByText(/Old Watched Movie/)).toBeInTheDocument()
   })
 
-  it('surfaces an unreadable root\'s error instead of a fabricated gauge', () => {
+  it('surfaces an unreadable root\'s error instead of a fabricated gauge, with a Fix-in-Settings link', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({
       data: disk({
         roots: [
-          {
+          diskRoot({
             root: 'tv_root',
             path: '/library/tv',
             total_bytes: 0,
@@ -132,7 +177,7 @@ describe('Status', () => {
             used_percent: 0,
             error: 'No such file or directory',
             candidates: [],
-          },
+          }),
         ],
       }),
       isLoading: false,
@@ -140,8 +185,11 @@ describe('Status', () => {
     })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText(/isn't visible to Plex Manager/)).toBeInTheDocument()
     expect(screen.getByText('No such file or directory')).toBeInTheDocument()
+    const link = screen.getByRole('link', { name: /fix in settings/i })
+    expect(link).toHaveAttribute('href', '/settings')
   })
 
   it('"Free space now" triggers the evict mutation and reports an honest outcome', async () => {
@@ -151,7 +199,7 @@ describe('Status', () => {
     const mutateAsync = vi.fn().mockResolvedValue(evicted)
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync, isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
     fireEvent.click(screen.getByRole('button', { name: /free space now/i }))
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalled())
@@ -187,7 +235,7 @@ describe('Status', () => {
     const mutateAsync = vi.fn().mockResolvedValue(partial)
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync, isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
     fireEvent.click(screen.getByRole('button', { name: /free space now/i }))
 
     await waitFor(() =>
@@ -224,7 +272,7 @@ describe('Status', () => {
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
 
     // Never — a fresh boot must not read as "clean" just because failures==0.
     expect(screen.queryByText('running clean')).not.toBeInTheDocument()
@@ -252,7 +300,7 @@ describe('Status', () => {
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
 
     // The operator SEES the grab pipeline failing: a labelled, non-zero count.
     expect(screen.getByText('Cooling scopes')).toBeInTheDocument()
@@ -268,7 +316,7 @@ describe('Status', () => {
     })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
 
     // Candidates are listed (backend preview has no pressure gate), but the
     // page must say so isn't currently evicted — a healthy disk contradicting
@@ -286,7 +334,7 @@ describe('Status', () => {
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false }) // used_percent: 90
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
 
     // 90% used is below the (settings-supplied) 95% threshold — not under
     // pressure, even though it would have been against the hardcoded default.
@@ -305,7 +353,7 @@ describe('Status', () => {
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
-    render(<Status />)
+    render(<Status />, { wrapper: Wrapper })
     expect(screen.getByText(/couldn't load health/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /retry/i }))
     expect(refetch).toHaveBeenCalled()

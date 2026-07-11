@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from plex_manager.domain.quality import ALL_QUALITIES, WEBDL1080P
+from plex_manager.domain.quality import ALL_QUALITIES, SDTV, WEBDL1080P
 
 __all__ = [
     "DISALLOWED_BY_DEFAULT_IDS",
@@ -23,9 +23,12 @@ __all__ = [
 ]
 
 # Pre-release / screener / regional tiers rejected by the alpha default profile.
-# Ids: Unknown(0), WORKPRINT(24), CAM(25), TELESYNC(26), TELECINE(27),
-# DVDSCR(28), REGIONAL(29). Everything >= SDTV (weight 8) is allowed.
-DISALLOWED_BY_DEFAULT_IDS: frozenset[int] = frozenset({0, 24, 25, 26, 27, 28, 29})
+# Derived from the SDTV weight floor: every quality weighing less than SDTV
+# (weight 8) is disallowed. Currently resolves to Unknown(0), WORKPRINT(24),
+# CAM(25), TELESYNC(26), TELECINE(27), DVDSCR(28), REGIONAL(29).
+DISALLOWED_BY_DEFAULT_IDS: frozenset[int] = frozenset(
+    q.id for q in ALL_QUALITIES if q.weight < SDTV.weight
+)
 
 
 class QualityProfileItem(BaseModel):
@@ -50,7 +53,11 @@ class QualityProfile(BaseModel):
     id: int
     name: str
     cutoff_quality_id: int
-    items: list[QualityProfileItem] = Field(default_factory=list[QualityProfileItem])
+    # Immutable tuple (issue #106): a frozen model blocks reassigning
+    # ``profile.items`` but not appending to a plain list in place, which would
+    # corrupt every holder of a shared profile (e.g. the cached default profile
+    # returned by :func:`default_profile`). A ``list`` input is coerced by pydantic.
+    items: tuple[QualityProfileItem, ...] = Field(default_factory=tuple)
     min_format_score: int = 0
     upgrade_allowed: bool = True
 
@@ -69,13 +76,13 @@ def default_profile() -> QualityProfile:
     DVDSCR/REGIONAL and Unknown are disallowed (permanent reject); everything
     >= SDTV is allowed. The upgrade cutoff is WEBDL-1080p.
     """
-    items = [
+    items = tuple(
         QualityProfileItem(
             quality_id=quality.id,
             allowed=quality.id not in DISALLOWED_BY_DEFAULT_IDS,
         )
         for quality in ALL_QUALITIES
-    ]
+    )
     return QualityProfile(
         id=1,
         name="Default",

@@ -27,6 +27,7 @@ from plex_manager.services.log_capture_service import (
     configure_logging,
     drain_once,
     prune_once,
+    resolve_log_level,
     stop_logging,
 )
 
@@ -259,6 +260,88 @@ async def test_configure_logging_falls_back_to_info_on_an_unrecognized_level(
         stop_logging(attached, logger=test_logger)
 
 
+# --------------------------------------------------------------------------- #
+# resolve_log_level (issue #100)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected_level"),
+    [
+        ("debug", logging.DEBUG),
+        ("DEBUG", logging.DEBUG),
+        ("Info", logging.INFO),
+        ("WARNING", logging.WARNING),
+        ("10", logging.DEBUG),  # already-numeric level string
+        ("  warning  ", logging.WARNING),  # surrounding whitespace (env var hygiene)
+    ],
+)
+def test_resolve_log_level_normalizes_valid_inputs(configured: str, expected_level: int) -> None:
+    """Public entry point (exported for ``plex_manager.__main__`` -- issue #100)
+    for the exact normalization ``configure_logging`` already relies on: any
+    case of a standard level name, an already-numeric level string, and
+    incidental leading/trailing whitespace (an env var, not a Python literal,
+    so nothing strips it upstream) all resolve to the real stdlib int level."""
+    assert resolve_log_level(configured) == expected_level
+
+
+def test_resolve_log_level_falls_back_to_info_on_a_typo(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo'd or otherwise unrecognized level (e.g. a mistyped
+    ``PLEX_MANAGER_LOG_LEVEL``) must never raise -- it degrades to INFO with a
+    warning surfaced through this module's own logger, never a silent guess and
+    never a ``KeyError``/``ValueError`` that could crash a caller (uvicorn's
+    ``Config``, in ``__main__.main``) before the app's own tolerant lifespan
+    ever runs."""
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.log_capture_service"):
+        level = resolve_log_level("verbose")
+    assert level == logging.INFO
+    assert "verbose" in caplog.text
+
+
+def test_resolve_log_level_falls_back_to_info_on_a_negative_number_string() -> None:
+    # int() happily parses "-5"; resolve_log_level does not special-case a
+    # nonsensical numeric level -- unlike a typo it is a VALID stdlib int, so it
+    # passes straight through (mirrors int()'s own permissive behavior; the
+    # honesty invariant here is "never raise", not "reject every odd value").
+    assert resolve_log_level("-5") == -5
+
+
+@pytest.mark.parametrize("configured", ["trace", "TRACE", "  Trace  "])
+def test_resolve_log_level_maps_trace_to_debug_for_the_app_logger(configured: str) -> None:
+    """``trace`` is a REAL uvicorn ``--log-level`` name (see
+    ``uvicorn.config.LOG_LEVELS``) one rung below ``debug``, but stdlib
+    ``logging`` has no such level -- ``logging.getLevelNamesMapping()`` has no
+    ``'TRACE'`` entry unless some uvicorn ``Config`` has already registered it
+    as a process-wide side effect, which this resolver must not depend on (it
+    is exercised directly here with no uvicorn involved at all). For the
+    app's OWN stdlib logger -- the only consumer of this int, wired in via
+    ``configure_logging`` -- DEBUG is the honest analogue: the next real level
+    down from INFO. This must NOT go through the generic
+    unrecognized-name-warns-and-falls-back-to-INFO path: 'trace' is a
+    genuinely valid setting, not a typo, and downgrading it all the way to
+    INFO (skipping DEBUG entirely) would be a worse misrepresentation than
+    mapping it to DEBUG outright. Uvicorn's own, separately-normalized launch
+    argument (``plex_manager.__main__._uvicorn_log_level``) is what actually
+    preserves full uvicorn-native TRACE behavior for the ASGI server itself.
+    """
+    assert resolve_log_level(configured) == logging.DEBUG
+
+
+async def test_configure_logging_does_not_raise_on_trace(test_logger: logging.Logger) -> None:
+    """End-to-end sanity check for the app-side consumer: a 'trace'
+    ``config.log_level`` must reach ``configure_logging`` (called from the
+    real ASGI lifespan) exactly like any other value -- no crash, and the
+    logger ends up at DEBUG (see
+    ``test_resolve_log_level_maps_trace_to_debug_for_the_app_logger``)."""
+    handler = configure_logging("trace", logger=test_logger)
+    try:
+        assert test_logger.level == logging.DEBUG
+    finally:
+        stop_logging(handler, logger=test_logger)
+
+
 async def test_configure_logging_quiets_httpx_and_httpcore_even_at_debug(
     test_logger: logging.Logger,
 ) -> None:
@@ -277,6 +360,44 @@ async def test_configure_logging_quiets_httpx_and_httpcore_even_at_debug(
         try:
             assert httpx_logger.getEffectiveLevel() >= logging.WARNING
             assert httpcore_logger.getEffectiveLevel() >= logging.WARNING
+        finally:
+            stop_logging(attached, logger=test_logger)
+    finally:
+        httpx_logger.setLevel(saved_levels[0])
+        httpcore_logger.setLevel(saved_levels[1])
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        # A floor at/above WARNING is HONOURED (the pin quiets to the operator level):
+        # an ERROR operator can no longer receive lower-severity third-party WARNINGs.
+        ("ERROR", logging.ERROR),
+        ("CRITICAL", logging.CRITICAL),
+        # A floor below WARNING is CLAMPED UP to WARNING (the secret-safety floor):
+        # the pin only ever quiets relative to the operator level, never loosens it,
+        # so URL-bearing INFO records can never leak even at DEBUG.
+        ("WARNING", logging.WARNING),
+        ("INFO", logging.WARNING),
+        ("DEBUG", logging.WARNING),
+    ],
+)
+async def test_configure_logging_pins_third_party_to_max_of_floor_and_warning(
+    test_logger: logging.Logger, configured: str, expected: int
+) -> None:
+    # Issue #94: the httpx/httpcore pin is ``max(resolved_level, WARNING)`` -- it QUIETS
+    # relative to the operator's floor but NEVER loosens below WARNING. An operator who
+    # sets an ERROR floor must not still receive third-party WARNINGs in live/durable
+    # logs (the pre-fix defect), yet a DEBUG/INFO floor must still yield WARNING so the
+    # secret-safety guard holds.
+    httpx_logger = logging.getLogger("httpx")
+    httpcore_logger = logging.getLogger("httpcore")
+    saved_levels = (httpx_logger.level, httpcore_logger.level)
+    try:
+        attached = configure_logging(configured, logger=test_logger)
+        try:
+            assert httpx_logger.getEffectiveLevel() == expected
+            assert httpcore_logger.getEffectiveLevel() == expected
         finally:
             stop_logging(attached, logger=test_logger)
     finally:
@@ -353,6 +474,7 @@ class _FailingRepo:
         correlation_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> LogEventPage:
         raise NotImplementedError
 
@@ -555,7 +677,7 @@ async def test_prune_once_thirty_day_cap_applies_to_decision_and_auto_grab_rows(
         assert removed == 2
 
         remaining = await repo.list_events(limit=10)
-    assert remaining.results == []
+    assert remaining.results == ()
 
 
 async def test_prune_once_eventually_prunes_telemetry_rows_past_their_own_retention(
@@ -582,7 +704,7 @@ async def test_prune_once_eventually_prunes_telemetry_rows_past_their_own_retent
         assert removed == 1
 
         remaining = await repo.list_events(limit=10)
-    assert remaining.results == []
+    assert remaining.results == ()
 
 
 async def test_prune_once_telemetry_retention_never_shorter_than_the_operator_window(

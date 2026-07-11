@@ -27,11 +27,17 @@ from plex_manager.services.correction_service import (
     SeasonNotFoundError,
 )
 from plex_manager.services.library_roots import LibraryRoots
-from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
+from plex_manager.services.request_service import (
+    MediaNotFoundError,
+    NoAiredSeasonsError,
+    RequestOwnedByAnotherUserError,
+)
 from plex_manager.web.deps import (
+    AuthContext,
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
+    get_downloads_host_root,
     get_eviction_filesystem,
     get_library,
     get_library_optional,
@@ -44,8 +50,10 @@ from plex_manager.web.deps import (
     get_session,
     get_tmdb,
     get_tv_root_optional,
+    require_admin,
     require_api_key,
 )
+from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import (
     CreateRequestBody,
     ErrorDetail,
@@ -64,7 +72,6 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/requests",
     tags=["requests"],
-    dependencies=[Depends(require_api_key)],
 )
 
 # NB: no 409 "media type deferred" here -- ``CreateRequestBody.media_type`` is
@@ -74,6 +81,34 @@ router = APIRouter(
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
+    409: {"model": ErrorDetail, "description": "Already requested by another user"},
+}
+
+_REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {"model": ErrorDetail, "description": "Request or season not found"},
+    # This status code has TWO distinct producers, so BOTH shapes are documented
+    # via anyOf (the same pattern as setup/complete's 422 and PUT /settings): the
+    # string-detail ``HTTPException`` 409s (``not_reportable`` /
+    # ``active_duplicate`` -- ``ErrorDetail``) and the ``AppError`` 409
+    # (``media_root_unavailable`` -- an ``ErrorEnvelope`` whose message/hint/
+    # diagnostics carry the actionable broken-root guidance). Declaring only one
+    # model would make the generated TS client mis-model the other shape.
+    409: {
+        "description": (
+            "Not reportable in its current state, an active duplicate exists, or the "
+            "title's library folder isn't reachable from the app"
+        ),
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/ErrorDetail"},
+                        {"$ref": "#/components/schemas/ErrorEnvelope"},
+                    ]
+                }
+            }
+        },
+    },
 }
 
 
@@ -110,8 +145,23 @@ async def _to_response(
         is_anime=record.is_anime,
         poster_url=record.poster_url,
         backdrop_url=record.backdrop_url,
+        tv_request_mode=record.tv_request_mode,
+        requested_seasons=list(record.requested_seasons) if record.requested_seasons else None,
+        requested_episodes=(
+            {season: list(values) for season, values in record.requested_episodes.items()}
+            if record.requested_episodes
+            else None
+        ),
         seasons=(
-            [SeasonStatus(season_number=s.season_number, status=s.status) for s in seasons]
+            [
+                SeasonStatus(
+                    season_number=s.season_number,
+                    status=s.status,
+                    installed_quality_id=s.installed_quality_id,
+                    installed_profile_index=s.installed_profile_index,
+                )
+                for s in seasons
+            ]
             if seasons is not None
             else None
         ),
@@ -127,6 +177,7 @@ async def _to_response(
 async def create_request_endpoint(
     body: CreateRequestBody,
     response: Response,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
     tmdb: Annotated[MetadataPort, Depends(get_tmdb)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
@@ -139,6 +190,13 @@ async def create_request_endpoint(
     to ``request_service.create_request``, which tracks each named season as its
     own ``SeasonRequest`` row -- including on the dedup path, where a repeat POST
     with a NEW season list grows the tracked set rather than being dropped.
+
+    Re-acquire (issue #131): ``body.force`` (movie-only) bypasses the
+    already-in-library short-circuit so a title Plex still reports present -- but
+    whose file was deleted/replaced out-of-band -- yields a fresh, grabbable
+    ``pending`` request instead of a terminal ``available`` one. Same authZ as any
+    create; same response map (no new status codes) -- every dedup/ownership
+    guard below still applies unchanged.
     """
     try:
         result = await request_service.create_request_result(
@@ -148,11 +206,23 @@ async def create_request_endpoint(
             media_type=body.media_type,
             library=library,
             seasons=body.seasons,
+            episodes=body.episodes,
+            force=bool(body.force),
+            user_id=auth.user_id,
+            actor_is_admin=auth.is_admin,
         )
     except MediaNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="media_not_found",
+        ) from exc
+    except RequestOwnedByAnotherUserError as exc:
+        # Issue #58: a non-admin cannot dedup onto another user's active request
+        # (it would mutate/return a row they can't even see). Honest 409, not a
+        # silent no-op or a hidden mutation.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="requested_by_another_user",
         ) from exc
     except NoAiredSeasonsError as exc:
         # The show exists in TMDB but resolved to zero trackable seasons (a data
@@ -169,10 +239,13 @@ async def create_request_endpoint(
 
 @router.get("")
 async def list_requests_endpoint(
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestListResponse:
     """List all media requests."""
     records = await request_service.list_requests(session)
+    if not auth.is_admin:
+        records = [record for record in records if record.user_id == auth.user_id]
     # Batch every tv row's season rows in ONE query (avoids an N+1 query per tv
     # request that calling ``_to_response`` per-row without this would cause).
     tv_ids = [r.id for r in records if r.media_type == "tv"]
@@ -188,11 +261,12 @@ async def list_requests_endpoint(
 )
 async def get_request_endpoint(
     request_id: int,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestResponse:
     """Return a single media request, or 404."""
     record = await request_service.get_request(session, request_id)
-    if record is None:
+    if record is None or (not auth.is_admin and record.user_id != auth.user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
     return await _to_response(session, record)
 
@@ -201,6 +275,7 @@ async def get_request_endpoint(
 async def keep_forever_endpoint(
     request_id: int,
     body: KeepForeverBody,
+    _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestResponse:
     """Set or clear the operator's "keep forever" pin (ADR-0012).
@@ -219,10 +294,11 @@ async def keep_forever_endpoint(
     return await _to_response(session, record)
 
 
-@router.post("/{request_id}/report-issue")
+@router.post("/{request_id}/report-issue", responses=_REPORT_ISSUE_RESPONSES)
 async def report_issue_endpoint(
     request_id: int,
     body: ReportIssueBody,
+    _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     library: Annotated[LibraryPort, Depends(get_library)],
@@ -233,6 +309,7 @@ async def report_issue_endpoint(
     tv_root: Annotated[str | None, Depends(get_tv_root_optional)],
     anime_movie_root: Annotated[str | None, Depends(get_anime_movie_root_optional)],
     anime_tv_root: Annotated[str | None, Depends(get_anime_tv_root_optional)],
+    downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
 ) -> RequestResponse:
     """Report a bad imported/available movie or TV season (ADR-0014).
 
@@ -283,6 +360,7 @@ async def report_issue_endpoint(
             reason=body.reason,
             season=body.season,
             roots=roots,
+            save_path=downloads_host_root,
         )
     except correction_service.RequestNotFoundError as exc:
         raise HTTPException(
@@ -306,8 +384,14 @@ async def report_issue_endpoint(
             status_code=status.HTTP_409_CONFLICT, detail="active_duplicate"
         ) from exc
     except MediaRootUnavailableError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="media_root_unavailable"
+        raise AppError(
+            status_code=status.HTTP_409_CONFLICT,
+            code="media_root_unavailable",
+            message="The library folder for this title isn't reachable, so it can't be "
+            "re-requested safely.",
+            hint="Check the folder is mounted and visible to Plex Manager "
+            "(Settings → Library), then try again.",
+            diagnostics=({"root": exc.root_path} if exc.root_path else None),
         ) from exc
     return await _to_response(session, updated)
 
@@ -315,6 +399,7 @@ async def report_issue_endpoint(
 @router.post("/{request_id}/cancel")
 async def cancel_request_endpoint(
     request_id: int,
+    _admin: Annotated[AuthContext, Depends(require_admin)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
 ) -> RequestResponse:

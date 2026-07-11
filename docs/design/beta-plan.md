@@ -34,6 +34,11 @@ libraries, a backend image proxy, Plex-OAuth identity, and recommendation rows a
 **deferred to the next beta** — helpers branch on `media_type` so we are not
 painted into a corner.
 
+Historical note: TV season scoping later landed in the TV beta blueprint
+(`tv-beta-plan.md`) with per-season `SeasonRequest` rows and season-aware request,
+grab, import, and availability paths. This early beta plan remains the record of
+the movies-first phase.
+
 ## Architecture (recap)
 
 Ports-and-adapters; the `domain/` core stays pure. The beta is **remake, not

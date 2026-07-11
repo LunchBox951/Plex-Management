@@ -16,23 +16,35 @@ import os
 from typing import TYPE_CHECKING, Literal, cast
 
 import httpx
+from starlette.status import (
+    HTTP_403_FORBIDDEN,
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_502_BAD_GATEWAY,
+)
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
+from plex_manager.adapters.plex.oauth import find_owned_server
 from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
 )
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
+from plex_manager.headersafe import header_value_error
+from plex_manager.services.path_visibility import remap_to_visible
+from plex_manager.web.errors import AppError
 from plex_manager.web.schemas import PlexLibraryOption, ServiceValidateResponse
 from plex_manager.web.url_validation import url_shape_error
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from plex_manager.adapters.plex.oauth import PlexResource, PlexTvClient
     from plex_manager.ports.library import LibrarySection
 
 __all__ = [
+    "assert_admin_owns_server",
+    "assert_plex_token_authorized",
     "library_options",
     "validate_plex",
     "validate_prowlarr",
@@ -84,13 +96,34 @@ def _require_http_url(url: str) -> ServiceValidateResponse | None:
     return ServiceValidateResponse(ok=False, message=message)
 
 
+def _require_header_safe_credential(value: str, noun: str) -> ServiceValidateResponse | None:
+    """Reject a credential that cannot ride an HTTP header BEFORE any outbound
+    probe (mirrors :func:`_require_http_url`). ``noun`` names the credential in
+    the message (e.g. "Prowlarr API key"). Returns ``None`` when ``value`` is
+    acceptable.
+
+    The predicate itself lives in :mod:`plex_manager.headersafe` — see
+    :func:`~plex_manager.headersafe.header_value_error` for the two failure
+    modes this closes (a CR/LF credential leak via ``str(exc)``; an uncaught
+    ``UnicodeEncodeError``/500 on non-ASCII).
+    """
+    if header_value_error(value) is None:
+        return None
+    return ServiceValidateResponse(
+        ok=False, message=f"The {noun} contains characters that are not valid in an HTTP header."
+    )
+
+
 def _section_type(kind: Literal["movie", "show"]) -> Literal["movie", "tv"]:
     """Map Plex's own section-type vocabulary (``"show"``) to ours (``"tv"``)."""
     return "tv" if kind == "show" else "movie"
 
 
 def library_options(
-    sections: Sequence[LibrarySection], *, probe_writable: bool = True
+    sections: Sequence[LibrarySection],
+    *,
+    probe_writable: bool = True,
+    suggest_mounts: Sequence[str] = (),
 ) -> list[PlexLibraryOption]:
     """Map Plex's movie AND show sections to pickable library folders + writability.
 
@@ -107,21 +140,135 @@ def library_options(
     turn this into a pre-auth local-FS existence/writability oracle. With it False
     we report ``writable=None`` (UNKNOWN) — honest, never a faked bool — and never
     call ``_is_writable`` / ``os.access`` on an attacker-chosen path.
+
+    ``suggest_mounts`` (default ``()``, no remap attempted) is the set of KNOWN,
+    app-owned LIBRARY mounts (:data:`~plex_manager.services.path_visibility.
+    KNOWN_LIBRARY_MOUNTS`) to suffix-match a Plex-reported HOST path against (issue
+    #132) -- library locations only ever remap under ``/media``, never
+    ``/downloads``. ``probe_original`` mirrors ``probe_writable`` -- the SAME
+    pre-auth-oracle guard: pre-init (``probe_writable=False``) never stats the
+    raw, caller-supplied path, only candidate suffixes under the app's OWN
+    mounts; post-init (``probe_writable=True``, the operator's own creds) may
+    stat the raw path first. ``allow_mount_root`` is on: a whole-media-root Plex
+    library (the bind SOURCE root, e.g. ``/srv/media`` -> ``/media``) maps to the
+    mount root itself, which the suffix-only match could never reach.
+
+    A location the remap can't resolve is offered with NO suggestion -- the raw
+    Plex path plus the wizard/Settings visibility hint. Deliberately no guessing
+    (PR #147 round 3, maintainer decision): a short-lived "low-confidence
+    mount-root" suggestion was removed because a child section like
+    ``/srv/plex-data/Movies`` would misroute to the bare mount root; the rare
+    arbitrary-bind-root topology is served by manual entry instead.
     """
-    return [
-        PlexLibraryOption(
-            section_key=section.key,
-            title=section.title,
-            path=path,
-            section_type=_section_type(section.type),
-            writable=_is_writable(path) if probe_writable else None,
+    options: list[PlexLibraryOption] = []
+    for section in sections:
+        for path in section.locations:
+            suggested = (
+                remap_to_visible(
+                    path,
+                    suggest_mounts,
+                    probe_original=probe_writable,
+                    allow_mount_root=True,
+                )
+                if suggest_mounts
+                else None
+            )
+            effective = suggested or path
+            options.append(
+                PlexLibraryOption(
+                    section_key=section.key,
+                    title=section.title,
+                    path=path,
+                    section_type=_section_type(section.type),
+                    writable=_is_writable(effective) if probe_writable else None,
+                    suggested_path=suggested if (suggested and suggested != path) else None,
+                )
+            )
+    return options
+
+
+def assert_admin_owns_server(resources: Sequence[PlexResource], machine_identifier: str) -> None:
+    """403 ``server_not_owned`` unless ``machine_identifier`` is among the OWNED servers.
+
+    THE ownership assertion for anchoring the app to a Plex server, shared
+    verbatim by ``setup/validate/plex``, ``setup/complete``, and the SESSION-admin
+    path of ``PUT /settings``' repoint verification so they cannot drift:
+    ``resources`` must be the SIGNED-IN admin's own plex.tv resource list, and
+    ``machine_identifier`` an id derived live from the candidate server's
+    ``/identity`` — never a caller-supplied claim (see each endpoint's docstring
+    for why its inputs satisfy this).
+    """
+    if find_owned_server(resources, machine_identifier) is None:
+        raise AppError(
+            status_code=HTTP_403_FORBIDDEN,
+            code="server_not_owned",
+            message="Your Plex account does not own that server.",
+            hint="Choose a server your Plex account owns, or sign in with the owner account.",
         )
-        for section in sections
-        for path in section.locations
-    ]
 
 
-async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> ServiceValidateResponse:
+async def assert_plex_token_authorized(client: httpx.AsyncClient, url: str, token: str) -> None:
+    """Raise unless the Plex server at ``url`` ACCEPTS ``token`` on an authed call.
+
+    ``/identity`` is deliberately UNAUTHENTICATED (see :func:`validate_plex`'s
+    probe ordering below), so deriving a machine id proves reachability and
+    identity but says NOTHING about the credential. This is the shared
+    AUTHENTICATED bar for every path that PERSISTS a Plex identity
+    (``POST /setup/complete`` and ``PUT /settings``' repoint verification): the
+    same real-adapter ``list_sections`` call the validation path uses to catch
+    bad tokens, so a reachable server paired with a wrong/revoked token is a
+    FAILED verification — never a committed-but-unusable config.
+
+    A rejected token (``PlexAuthError``, HTTP 401/403 from Plex) is a 422
+    ``plex_token_invalid`` — the submitted config cannot be processed — reusing
+    the SAME stable code the envelope vocabulary already carries for a rejected
+    Plex credential. Any other failure (``PlexLibraryError``: transport error,
+    unexpected status, non-JSON 200) is the familiar 502
+    ``server_unreachable_from_backend`` envelope, matching the identity probe's
+    own failure mode. ``use_cache=False`` for the same reason as
+    :func:`validate_plex`: a verification must reflect the server as it is NOW,
+    never a section list cached from a previous healthy probe.
+
+    A header-unsafe token is rejected HERE, before ``PlexLibrary`` ever sends it
+    (reuses the SAME ``plex_token_invalid`` code a Plex-rejected token already
+    raises — no new envelope code): this is defense-in-depth for the callers
+    that persist a Plex identity (``POST /setup/complete``, ``PUT /settings``'
+    repoint) reaching this function directly, on top of :func:`validate_plex`'s
+    own pre-check on the wizard path.
+    """
+    if header_value_error(token) is not None:
+        raise AppError(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            code="plex_token_invalid",
+            message="The Plex token contains characters that are not valid in an HTTP header.",
+            hint="Re-copy the token from Plex; it must be a plain ASCII value.",
+        )
+    try:
+        await PlexLibrary(client, url, token).list_sections(use_cache=False)
+    except PlexAuthError as exc:
+        raise AppError(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            code="plex_token_invalid",
+            message="Plex rejected the token.",
+            hint="The server answered but refused this credential — check the Plex token.",
+        ) from exc
+    except PlexLibraryError as exc:
+        raise AppError(
+            status_code=HTTP_502_BAD_GATEWAY,
+            code="server_unreachable_from_backend",
+            message="Could not reach the Plex server.",
+            hint="Check the Plex URL and that the server is running, then try again.",
+        ) from exc
+
+
+async def validate_plex(
+    client: httpx.AsyncClient,
+    url: str,
+    token: str,
+    *,
+    identity_client: PlexTvClient | None = None,
+    suggest_mounts: Sequence[str] = (),
+) -> ServiceValidateResponse:
     """Validate Plex + token AND return the movie/tv library folders to pick from.
 
     Uses the real adapter (``list_sections``): one call both proves connectivity +
@@ -133,10 +280,37 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
     (via ``health_service._check_plex``) the live health-card probe -- both must
     always reflect reality, never a section list cached from a previous healthy
     probe up to 300s stale.
+
+    ``identity_client`` opts into the ownership-verifying variant the setup wizard
+    needs: when supplied, the server's ``/identity`` is probed FIRST (before the
+    section list) and its ``machineIdentifier`` is returned on the response so the
+    caller can assert the signed-in admin OWNS this server and store the id. The
+    probe raises :class:`PlexVerifyError` on a transport failure (rendered as a 502
+    ``server_unreachable_from_backend`` envelope) rather than being swallowed into a
+    generic ``ok=False`` — an unreachable candidate is an honest, retryable upstream
+    state. Left ``None`` (the health-card path) skips the probe entirely, so that
+    path issues no extra request and ``machine_identifier`` stays ``None``.
+
+    ``suggest_mounts`` (default ``()``) is forwarded to :func:`library_options` for
+    each reported library location — the setup wizard passes the known container
+    mounts so a HOST-shaped Plex location comes back with a container-visible
+    ``suggested_path``; :func:`~plex_manager.services.health_service._check_plex`
+    calls this with no ``suggest_mounts``, so the ~15s health poll adds no extra
+    filesystem probes.
     """
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
+    token_rejection = _require_header_safe_credential(token, "Plex token")
+    if token_rejection is not None:
+        return token_rejection
+    # Identity FIRST when asked: a transport failure here surfaces as the 502
+    # envelope (not the section-probe's ok=False), and Plex's /identity is
+    # unauthenticated, so a bad token still falls through to the honest "Plex
+    # rejected the token." from list_sections below.
+    machine_identifier = (
+        None if identity_client is None else await identity_client.fetch_server_identity(url, token)
+    )
     try:
         sections = await PlexLibrary(client, url, token).list_sections(use_cache=False)
     except PlexAuthError:
@@ -149,7 +323,7 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
     # caller-supplied Plex server, so never touch the local filesystem here (no
     # pre-auth existence/writability oracle). Writability is reported UNKNOWN
     # (None); the authenticated Settings picker fills in the real signal later.
-    libraries = library_options(sections, probe_writable=False)
+    libraries = library_options(sections, probe_writable=False, suggest_mounts=suggest_mounts)
     if not libraries:
         # Connectivity + token are fine, but an install with NEITHER a Movie NOR a
         # TV library cannot import anything (every scan would raise "no Plex
@@ -162,7 +336,12 @@ async def validate_plex(client: httpx.AsyncClient, url: str, token: str) -> Serv
             "add one in Plex, then test again.",
             libraries=[],
         )
-    return ServiceValidateResponse(ok=True, message="Connected to Plex.", libraries=libraries)
+    return ServiceValidateResponse(
+        ok=True,
+        message="Connected to Plex.",
+        libraries=libraries,
+        machine_identifier=machine_identifier,
+    )
 
 
 async def validate_prowlarr(
@@ -172,15 +351,21 @@ async def validate_prowlarr(
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
+    key_rejection = _require_header_safe_credential(api_key, "Prowlarr API key")
+    if key_rejection is not None:
+        return key_rejection
     try:
         response = await client.get(
             f"{url.rstrip('/')}/api/v1/system/status",
             headers={"X-Api-Key": api_key},
         )
     except httpx.HTTPError as exc:
-        # The api key travels in a header, not the URL, so str(exc) cannot leak it.
+        # The api key travels in a header, so an unsafe value (CR/LF, non-ASCII)
+        # would make httpx echo it raw in str(exc) or crash uncaught — the
+        # _require_header_safe_credential check above stops both before this
+        # request is ever sent. Only the exception *type* is surfaced here.
         return ServiceValidateResponse(
-            ok=False, message="Could not reach Prowlarr.", detail=str(exc)
+            ok=False, message="Could not reach Prowlarr.", detail=type(exc).__name__
         )
     if response.status_code == _HTTP_OK:
         try:
@@ -219,9 +404,28 @@ async def validate_prowlarr(
 
 
 async def validate_qbittorrent(
-    client: httpx.AsyncClient, url: str, username: str, password: str
+    client: httpx.AsyncClient,
+    url: str,
+    username: str,
+    password: str,
+    *,
+    download_mounts: Sequence[str] = (),
 ) -> ServiceValidateResponse:
-    """Check qBittorrent + credentials by logging in and listing torrents."""
+    """Check qBittorrent + credentials by logging in and listing torrents.
+
+    ``download_mounts`` (default ``()``, no extra probe) opts into a SECOND,
+    best-effort check (issues #133/#157): the client's GLOBAL default save path is
+    read (``get_default_save_path``) and remapped through
+    :func:`~plex_manager.services.path_visibility.remap_to_visible` against
+    ``download_mounts`` (the app's known ``/downloads`` bind(s)). A path that does
+    NOT resolve inside this container sets ``download_path_note`` -- purely
+    INFORMATIONAL, never a failure: Plex Manager directs every grab's ``save_path``
+    explicitly (see ``grab_service.grab``), so a default-path mismatch cannot strand
+    an import the way it could before that fix. Any failure of this SECOND probe
+    (a transport error, an unreadable ``/app/preferences``) is swallowed to "no
+    note" -- the connectivity check above already proved the credentials work, and
+    this extra diagnostic must never turn a working connection into ``ok=False``.
+    """
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
@@ -245,7 +449,23 @@ async def validate_qbittorrent(
         return ServiceValidateResponse(
             ok=False, message="Could not reach qBittorrent.", detail=str(exc)
         )
-    return ServiceValidateResponse(ok=True, message="Connected to qBittorrent.")
+    note: str | None = None
+    if download_mounts:
+        try:
+            default_path = await adapter.get_default_save_path()
+        except QbittorrentError:
+            # Best-effort only: the connectivity check above already succeeded, so
+            # this extra diagnostic failing must never flip ok=False.
+            default_path = None
+        if default_path and remap_to_visible(default_path, download_mounts) is None:
+            note = (
+                f"qBittorrent's default save path ({default_path}) isn't visible "
+                "inside this container; Plex Manager directs each download's save "
+                "path explicitly, so this does not block imports."
+            )
+    return ServiceValidateResponse(
+        ok=True, message="Connected to qBittorrent.", download_path_note=note
+    )
 
 
 async def validate_tmdb(client: httpx.AsyncClient, api_key: str) -> ServiceValidateResponse:

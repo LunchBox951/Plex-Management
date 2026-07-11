@@ -14,11 +14,18 @@ Mirrors Radarr's decision-engine specification pipeline, in a fixed order:
    download == one season data model can't satisfy several seasons from a single
    grab without stranding sibling ``SeasonRequest``s, so the beta posture is to
    never grab one, not to prefer it (see ADR/issue #24);
-4. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
+4. **season-pack-only gate** (``prefer_season_pack``) — when the operator
+   explicitly requested a WHOLE season (no specific episodes named), a release
+   that is not itself a season pack is a *permanent* rejection, never scored:
+   a single-episode release can never satisfy a whole-season request, so it must
+   never be auto-grabbed just because every season pack was exhausted/blocklisted
+   (issue #167 -- "The Last Man on Earth" S04 was auto-grabbed as single episodes
+   three times in production before this gate existed);
+5. **quality hard gate** (:func:`check_quality`) — a disallowed/absent quality is
    a *permanent* rejection and is never scored (north-star hard cutoff);
-5. **blocklist filter** — a previously failed/reported release is an
+6. **blocklist filter** — a previously failed/reported release is an
    unconditional skip;
-6. **score / sort** the survivors, best-first.
+7. **score / sort** the survivors, best-first.
 
 There is deliberately **no relaxed-fallback retry**: if nothing survives, the
 result carries ``no_acceptable_release=True`` as an observable state. The engine
@@ -26,8 +33,10 @@ never falls back to accepting a blocked or rejected source.
 
 Ranking among allowed releases uses :func:`compare_by_profile` as the primary key
 (profile order, not raw resolution), then seeders descending, then size as a
-stable final tiebreak. The numeric :attr:`ScoredRelease.score` encodes the same
-ordering for display.
+stable final tiebreak. The numeric :attr:`ScoredRelease.score` is assigned AFTER
+that sort as a strictly-decreasing projection of each release's final rank (best
+= highest), so it can never contradict the accepted order -- ``_compare``, not
+the score, is the sole ordering authority.
 
 Pure domain: ports Protocols + the local quality/release model + stdlib.
 """
@@ -45,14 +54,19 @@ from plex_manager.domain.quality_service import (
     compare_by_profile,
 )
 from plex_manager.domain.release import CandidateRelease, ParsedRelease, ScoredRelease
-from plex_manager.domain.season_pack import classify_release_scope
+from plex_manager.domain.season_pack import (
+    MultiSeasonRequestIntent,
+    classify_release_scope,
+    plan_multi_season_pack,
+)
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.ports.parser import ParserPort
 
-# Release scopes that satisfy a WHOLE-season grab and so earn the season-pack
-# preference: an exact single-season pack. It must rank ahead of a single-episode
-# release for a whole-season request, or a higher-seeded single episode could
-# out-rank a release that actually contains the whole requested season.
+# Release scopes that satisfy a WHOLE-season grab: an exact single-season pack.
+# When ``prefer_season_pack`` is set, anything outside this set is a *permanent*
+# rejection (the gate below, issue #167) -- a single-episode release can never
+# satisfy a whole-season request, so it must never be accepted just because
+# every season pack was exhausted/blocklisted.
 #
 # A multi-season pack (``S01-S03``) is DELIBERATELY excluded: it is permanently
 # rejected below (the ``_MULTI_SEASON_SCOPE`` gate) rather than preferred, so it
@@ -75,18 +89,6 @@ BlocklistCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 # the pure ``matches_media`` helper; the engine stays pure and only sees the hook.
 MediaMatchCheck = Callable[[CandidateRelease, ParsedRelease], bool]
 
-# Weighting so the composite score reproduces the comparator ordering: profile
-# index dominates the season-pack scope preference, which dominates seeders,
-# which dominates size. The gaps are far larger than any realistic field value
-# (seeders < 1e9, size < 1e15 bytes => contribution < 1e6).
-_INDEX_WEIGHT = 1e12
-# Only ever added when the caller opts in via ``prefer_season_pack`` (see
-# :func:`decide`); with the default ``prefer_season_pack=False`` every candidate's
-# contribution is 0, so the score is BYTE-IDENTICAL to the pre-season-pack engine.
-_SCOPE_WEIGHT = 1e9
-_SEEDER_WEIGHT = 1e3
-_SIZE_WEIGHT = 1e-9
-
 
 @dataclass(frozen=True)
 class DecisionResult:
@@ -95,22 +97,17 @@ class DecisionResult:
     ``accepted`` is sorted best-first. ``rejected`` pairs each discarded candidate
     with its (surfaced, never-swallowed) reason. ``no_acceptable_release`` is True
     iff ``accepted`` is empty.
+
+    Both collections are immutable tuples (issue #106): a frozen dataclass blocks
+    reassigning ``result.accepted`` but NOT mutating a plain list in place, and a
+    caller appending/sorting a shared ``DecisionResult`` (e.g. across the several
+    read sites in ``auto_grab_service``/``correction_service``/``queue.py``) would
+    silently corrupt every other holder of the same result.
     """
 
-    accepted: list[ScoredRelease]
-    rejected: list[tuple[CandidateRelease, RejectionReason]]
+    accepted: tuple[ScoredRelease, ...]
+    rejected: tuple[tuple[CandidateRelease, RejectionReason], ...]
     no_acceptable_release: bool
-
-
-def _score(profile_index: int, candidate: CandidateRelease, *, is_season_pack: bool) -> float:
-    seeders = candidate.seeders or 0
-    scope_bonus = _SCOPE_WEIGHT if is_season_pack else 0.0
-    return (
-        profile_index * _INDEX_WEIGHT
-        + scope_bonus
-        + seeders * _SEEDER_WEIGHT
-        + candidate.size_bytes * _SIZE_WEIGHT
-    )
 
 
 def decide(
@@ -121,16 +118,20 @@ def decide(
     is_blocklisted: BlocklistCheck,
     *,
     prefer_season_pack: bool = False,
+    multi_season_intent: MultiSeasonRequestIntent | None = None,
 ) -> DecisionResult:
     """Run the parse -> match -> gate -> filter -> rank pipeline over ``candidates``.
 
     ``prefer_season_pack`` (default ``False``, byte-identical to the pre-season-pack
     engine) is set by the caller only when the operator explicitly requested a
-    whole TV season: it adds a tiebreak (after profile order, before seeders) that
-    prefers a release :func:`~plex_manager.domain.season_pack.classify_release_scope`
-    classifies as a ``"season_pack"`` over one it does not. It never overrides the
-    quality/identity/blocklist gates -- a season pack that fails the profile gate is
-    still rejected.
+    whole TV season: any release :func:`~plex_manager.domain.season_pack.classify_release_scope`
+    does NOT classify as a ``"season_pack"`` then becomes a *permanent* rejection,
+    never scored (issue #167) -- a single-episode release can never satisfy a
+    whole-season request, so it must never be auto-grabbed just because every
+    season pack was exhausted/blocklisted. It never overrides the identity/
+    multi-season gates that run before it -- a release that fails one of those is
+    still rejected for that gate's reason -- and a season pack still must clear
+    the quality gate after it to be accepted.
     """
     accepted: list[ScoredRelease] = []
     rejected: list[tuple[CandidateRelease, RejectionReason]] = []
@@ -144,13 +145,22 @@ def decide(
             rejected.append((candidate, RejectionReason.WRONG_MEDIA))
             continue
 
-        # Multi-season-pack gate: mirrors Sonarr's MultiSeasonSpecification. This
-        # app's one-download-one-season model can't satisfy several seasons from a
-        # single grab (import would strand every sibling season's SeasonRequest),
-        # so a multi-season pack is a permanent rejection, never scored -- the
-        # beta posture is "borrow proven brains" (issue #24), not "prefer it".
-        if classify_release_scope(parsed) == _MULTI_SEASON_SCOPE:
+        scope = classify_release_scope(parsed)
+        multi_season_plan = None
+        if scope == _MULTI_SEASON_SCOPE and multi_season_intent is None:
             rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
+            continue
+
+        # Season-pack-only gate (issue #167): the operator explicitly requested a
+        # WHOLE season, so a release that is not itself a season pack can never
+        # satisfy the request -- it is a *permanent* rejection, never scored, not
+        # merely a scoring tiebreak. Without this, a single-episode release used
+        # to survive to scoring (and get auto-grabbed) once every season pack was
+        # exhausted/blocklisted -- confirmed live ("The Last Man on Earth" S04 was
+        # auto-grabbed as single episodes three times).
+        multi_season_with_intent = scope == _MULTI_SEASON_SCOPE and multi_season_intent is not None
+        if prefer_season_pack and scope not in _PACK_SCOPES and not multi_season_with_intent:
+            rejected.append((candidate, RejectionReason.NOT_SEASON_PACK))
             continue
 
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
@@ -160,6 +170,21 @@ def decide(
             rejected.append((candidate, verdict.reason or RejectionReason.QUALITY_NOT_WANTED))
             continue
 
+        if scope == _MULTI_SEASON_SCOPE:
+            if multi_season_intent is None:  # pragma: no cover - guarded above
+                rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
+                continue
+            season_numbers = parsed.season if isinstance(parsed.season, list) else []
+            multi_season_plan = plan_multi_season_pack(
+                pack_seasons=season_numbers,
+                candidate_quality_id=quality.id,
+                profile=profile,
+                intent=multi_season_intent,
+            )
+            if not multi_season_plan.accepted:
+                rejected.append((candidate, RejectionReason.MULTI_SEASON_PACK))
+                continue
+
         if is_blocklisted(candidate, parsed):
             rejected.append((candidate, RejectionReason.BLOCKLISTED))
             continue
@@ -167,14 +192,33 @@ def decide(
         # The quality passed the gate, so it is present in the profile.
         index = profile.get_index(quality.id)
         profile_index = index if index is not None else -1
-        is_season_pack = prefer_season_pack and classify_release_scope(parsed) in _PACK_SCOPES
         accepted.append(
             ScoredRelease(
                 candidate=candidate,
                 parsed=parsed,
                 quality=quality,
                 profile_index=profile_index,
-                score=_score(profile_index, candidate, is_season_pack=is_season_pack),
+                score=0.0,  # placeholder; real value is a post-sort rank projection (#105)
+                covered_seasons=(
+                    multi_season_plan.covered_seasons if multi_season_plan is not None else ()
+                ),
+                target_seasons=(
+                    multi_season_plan.target_seasons if multi_season_plan is not None else ()
+                ),
+                upgrade_seasons=(
+                    multi_season_plan.upgrade_seasons if multi_season_plan is not None else ()
+                ),
+                waste_seasons=(
+                    multi_season_plan.waste_seasons if multi_season_plan is not None else ()
+                ),
+                ignored_seasons=(
+                    multi_season_plan.ignored_seasons if multi_season_plan is not None else ()
+                ),
+                skipped_seasons=(
+                    (multi_season_plan.waste_seasons + multi_season_plan.ignored_seasons)
+                    if multi_season_plan is not None
+                    else ()
+                ),
             )
         )
 
@@ -182,6 +226,13 @@ def decide(
         by_quality = compare_by_profile(left.quality, right.quality, profile)
         if by_quality != 0:
             return by_quality
+        # Issue #167: the season-pack-only gate above already rejects every
+        # non-pack candidate before it reaches ``accepted`` when
+        # ``prefer_season_pack`` is set, so ``left_pack``/``right_pack`` are now
+        # always equal here and this block is a no-op for the pack-vs-non-pack
+        # case. Left in place (rather than deleted) because it is harmless and
+        # documents the ranking intent; it would only ever fire again if a future
+        # ``_PACK_SCOPES`` grew a second member.
         if prefer_season_pack:
             left_pack = classify_release_scope(left.parsed) in _PACK_SCOPES
             right_pack = classify_release_scope(right.parsed) in _PACK_SCOPES
@@ -196,8 +247,16 @@ def decide(
         return (left_size > right_size) - (left_size < right_size)
 
     accepted.sort(key=cmp_to_key(_compare), reverse=True)
+    # score is a DISPLAY projection of the comparator's final rank, never an
+    # input to it: assign strictly-decreasing by position so score order ==
+    # accepted order by construction (#105). The comparator, not the score, is
+    # the sole ordering authority.
+    ranked = [
+        scored.model_copy(update={"score": float(len(accepted) - position)})
+        for position, scored in enumerate(accepted)
+    ]
     return DecisionResult(
-        accepted=accepted,
-        rejected=rejected,
-        no_acceptable_release=len(accepted) == 0,
+        accepted=tuple(ranked),
+        rejected=tuple(rejected),
+        no_acceptable_release=not ranked,
     )

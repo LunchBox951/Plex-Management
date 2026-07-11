@@ -3,19 +3,43 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import text
+from pydantic import ValidationError
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.domain.eviction import EvictionCandidate, select_evictions
+from plex_manager.models import AuthSession, Setting, User
+from plex_manager.services import path_visibility
 from plex_manager.web.deps import (
+    AUTO_GRAB_ENABLED_DEFAULT,
+    DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+    DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+    EVICTION_ENABLED_DEFAULT,
+    EVICTION_GRACE_DAYS_DEFAULT,
+    EVICTION_GRACE_DAYS_MAX,
+    EVICTION_INTERVAL_MAX_MINUTES,
+    EVICTION_INTERVAL_MINUTES_DEFAULT,
     KNOWN_SETTING_KEYS,
+    LOG_RETENTION_DAYS_DEFAULT,
+    LOG_RETENTION_DAYS_MAX,
+    PLEX_MACHINE_ID_SETTING,
+    SECRET_SETTING_KEYS,
+    AuthContext,
+    AuthMethod,
     SettingsStore,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
+    get_auto_grab_enabled,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_eviction_enabled,
@@ -25,15 +49,39 @@ from plex_manager.web.deps import (
     get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
+    hash_session_token,
     load_system_settings,
     require_api_key,
 )
+from plex_manager.web.routers.settings import (
+    _BOOL_SETTING_DEFAULTS,  # pyright: ignore[reportPrivateUsage]
+)
 from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
+
+# The float/int typed-key groups MIRROR the explicit per-key resolver branches in
+# ``_sanitize_typed_settings`` (each key has its own resolver + default, so the
+# router has no generic tuple to import). The parity guard below asserts these
+# groups cover every non-str ``SettingsResponse`` field -- a new typed field
+# fails the guard until BOTH the sanitizer branch and this mirror are extended.
+_FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
+    "disk_pressure_threshold_percent",
+    "disk_pressure_target_percent",
+    "eviction_interval_minutes",
+)
+_INT_TYPED_SETTING_KEYS: tuple[str, ...] = ("eviction_grace_days", "log_retention_days")
+_BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _API_KEY = "settings-key"
+# Throwaway Plex credentials for the identity-cache/repoint tests. Held in NAMES
+# (not inline keyword literals) so ruff's S106 secret-in-call heuristic stays
+# quiet — fixture values, never real secrets. ``_SEED_PLEX_TOKEN`` is the stored
+# SERVICE token; ``_SEED_OAUTH_TOKEN`` is a session admin's ACCOUNT OAuth token
+# (what the repoint ownership check presents to plex.tv).
+_SEED_PLEX_TOKEN = "seed-plex-token"  # noqa: S105 — test fixture value, not a credential
+_SEED_OAUTH_TOKEN = "seed-admin-oauth-token"  # noqa: S105 — test fixture value, not a credential
 
 
 def test_every_known_setting_key_has_a_response_and_update_field() -> None:
@@ -62,6 +110,51 @@ def test_settings_update_rejects_target_above_threshold() -> None:
     SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=70.0)
 
 
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+def test_settings_update_rejects_header_unsafe_credential(field: str) -> None:
+    # A header-sink credential (plex_token -> X-Plex-Token, prowlarr_api_key ->
+    # X-Api-Key) that cannot ride its HTTP header is rejected at write time, before
+    # it can be stored and then leaked via httpx's str(exc) / crash the grab loop
+    # when an adapter sends it. CR/LF/NUL (a str(exc) leak) and non-ASCII (an
+    # uncaught UnicodeEncodeError/500) are the two closed failure modes.
+    from pydantic import ValidationError
+
+    for bad in ("key\r\ninjected", "key\x00nul", "kéy-nonascii"):
+        with pytest.raises(ValidationError):
+            SettingsUpdate.model_validate({field: bad})
+    # Header-safe inputs pass untouched so partial updates and the FE mask
+    # round-trip are unaffected: a plain ASCII key, the "***" redaction mask, and
+    # an absent field are all accepted.
+    SettingsUpdate.model_validate({field: "plain-ascii-key"})
+    SettingsUpdate.model_validate({field: "***"})
+    SettingsUpdate.model_validate({})
+
+
+@pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
+async def test_put_settings_422_never_echoes_the_submitted_credential(
+    client: httpx.AsyncClient, seed: SeedFn, field: str
+) -> None:
+    # north star #3: a header-unsafe credential submitted to PUT /settings is
+    # rejected (422), but the 422 body must NEVER echo the submitted value.
+    # FastAPI's DEFAULT handler returns the raw ``input``; the secret-redacting
+    # RequestValidationError handler scrubs it. Assert on the RAW response text so a
+    # leak anywhere in the body (input/ctx/msg) is caught.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    sentinel = "leak-SENTINEL-\r\nZZZINJECT"
+
+    response = await client.put(
+        "/api/v1/settings", json={field: sentinel}, headers={"X-Api-Key": _API_KEY}
+    )
+
+    assert response.status_code == 422
+    assert "SENTINEL" not in response.text
+    assert "ZZZINJECT" not in response.text
+    # The {"detail": [...]} envelope shape is preserved for the typed client.
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert any(err.get("loc", [])[-1:] == [field] for err in detail)
+
+
 async def test_get_starts_empty(client: httpx.AsyncClient, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
@@ -78,20 +171,86 @@ async def test_get_starts_with_tv_root_unset(client: httpx.AsyncClient, seed: Se
 
 
 async def test_put_tv_root_round_trips_independently_of_movies_root(
-    client: httpx.AsyncClient, seed: SeedFn
+    client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
 ) -> None:
     # tv_root is a plain (non-secret) path, just like movies_root, and settable
     # without touching movies_root -- the two roots are independently optional.
     await seed(initialized=True, app_api_key=_API_KEY)
+    root = tmp_path / "tv"
+    root.mkdir()
     put = await client.put(
-        "/api/v1/settings", json={"tv_root": "/library/tv"}, headers={"X-Api-Key": _API_KEY}
+        "/api/v1/settings", json={"tv_root": str(root)}, headers={"X-Api-Key": _API_KEY}
     )
     assert put.status_code == 200
-    assert put.json()["tv_root"] == "/library/tv"
+    assert put.json()["tv_root"] == str(root)
     assert put.json()["movies_root"] is None
 
     got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
-    assert got["tv_root"] == "/library/tv"
+    assert got["tv_root"] == str(root)
+
+
+async def test_put_root_not_visible_is_422(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "/nope"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 422
+    assert put.json()["detail"] == "library_root_unreachable"
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.json()["movies_root"] is None  # nothing was written
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") is None
+
+
+async def test_put_remaps_host_root_to_container_path(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mount = tmp_path / "media"
+    (mount / "Movies").mkdir(parents=True)
+    # Library roots are remapped under the LIBRARY mounts only (never /downloads).
+    # tmp dirs are never mount points, so relax the live-mount gate (the test seam).
+    monkeypatch.setattr(path_visibility, "KNOWN_LIBRARY_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "/definitely-not-a-real-host-path/Media/Movies"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    assert put.json()["movies_root"] == str(mount / "Movies")
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.json()["movies_root"] == str(mount / "Movies")
+
+
+async def test_put_blank_root_clears_without_probing(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Whitespace normalizes to "" (SettingsUpdate._blank_root_clears_to_unset) BEFORE
+    # the root-visibility gate ever runs -- a clear must never probe or 422.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "   "},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    assert put.json()["movies_root"] == ""
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == ""
+        assert await get_movies_root_optional(session) is None
 
 
 async def test_put_round_trips_and_redacts(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -108,6 +267,448 @@ async def test_put_round_trips_and_redacts(client: httpx.AsyncClient, seed: Seed
     got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
     assert got["plex_url"] == "http://plex.local:32400"
     assert got["tmdb_api_key"] == "***"
+
+
+# --------------------------------------------------------------------------- #
+# Repointing Plex is VERIFIED before commit (post-init sign-in trusts           #
+# PLEX_MACHINE_ID_SETTING; a changed plex_url/plex_token must probe the NEW     #
+# server's /identity first, then cache the freshly DERIVED id)                  #
+# --------------------------------------------------------------------------- #
+async def _seed_plex_identity(
+    sessionmaker_: SessionMaker,
+    *,
+    plex_url: str,
+    machine_id: str,
+    plex_token: str | None = _SEED_PLEX_TOKEN,
+) -> None:
+    """Store a plex_url (+ optional plex_token) + cached machine id, as setup would."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", plex_url)
+        if plex_token is not None:
+            await store.set("plex_token", plex_token)
+        await store.set(PLEX_MACHINE_ID_SETTING, machine_id)
+        await session.commit()
+
+
+async def _stored_machine_id(sessionmaker_: SessionMaker) -> str | None:
+    async with sessionmaker_() as session:
+        return await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING)
+
+
+async def _use_transport(app: FastAPI, transport: httpx.MockTransport) -> None:
+    """Swap the app's shared HTTP client for one backed by ``transport``."""
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=transport)
+
+
+def _owned_resource(machine_id: str) -> dict[str, object]:
+    """A plex.tv resource entry for a server the account OWNS."""
+    return {
+        "name": "New Box",
+        "clientIdentifier": machine_id,
+        "provides": "server",
+        "owned": True,
+        "connections": [],
+    }
+
+
+def _shared_resource(machine_id: str) -> dict[str, object]:
+    """A plex.tv resource entry for a server merely SHARED with the account."""
+    return {
+        "name": "Someone Elses Box",
+        "clientIdentifier": machine_id,
+        "provides": "server",
+        "owned": False,
+        "connections": [],
+    }
+
+
+def _repoint_transport(
+    *,
+    identity: str,
+    authorized: bool = True,
+    resources: list[dict[str, object]] | None = None,
+    probes: list[httpx.Request] | None = None,
+) -> httpx.MockTransport:
+    """Serve the repoint verification ladder: /identity, /library/sections, plex.tv.
+
+    ``authorized=False`` makes the AUTHENTICATED ``/library/sections`` check
+    answer 401 (a reachable server that rejects the token). ``resources=None``
+    makes any plex.tv ownership lookup FAIL the test loudly — the api-key path
+    must never consult it; session-caller tests pass a resource list instead.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if probes is not None:
+            probes.append(request)
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/resources":
+            if resources is None:
+                raise AssertionError("ownership must not be consulted on this path")
+            return httpx.Response(200, json=resources)
+        if request.url.path == "/identity":
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": identity}})
+        if request.url.path == "/library/sections":
+            if not authorized:
+                return httpx.Response(401)
+            return httpx.Response(200, json={"MediaContainer": {"Directory": []}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+def _no_probe_transport() -> httpx.MockTransport:
+    """Fail the test loudly if PUT /settings issues ANY live request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"PUT /settings must not probe here: {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+def _unreachable_transport() -> httpx.MockTransport:
+    """Simulate a syntactically-valid but unreachable/typo'd Plex url."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    return httpx.MockTransport(handler)
+
+
+async def test_put_changed_plex_url_stores_the_freshly_derived_machine_id(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Repointing plex_url probes the NEW server's /identity BEFORE committing and
+    caches the DERIVED id (better than the earlier clear-and-reprobe-per-sign-in:
+    the id was just derived, so sign-in keeps its no-re-probe fast path). The FE
+    round-trips the token as the '***' mask, so BOTH verification calls (the
+    /identity derive and the authenticated /library/sections check) must resolve
+    the EFFECTIVE token — the STORED real one — never the mask literal. An
+    api-key caller has no Plex account, so plex.tv ownership is never consulted
+    (``resources=None`` fails loudly if it were)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    probes: list[httpx.Request] = []
+    await _use_transport(app, _repoint_transport(identity="NEW-MID", probes=probes))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # derived, not cleared
+    # Both probes hit the SUBMITTED url with the STORED real token, not the mask.
+    assert [str(p.url) for p in probes] == [
+        "http://new:32400/identity",
+        "http://new:32400/library/sections",
+    ]
+    assert all(p.headers.get("X-Plex-Token") == _SEED_PLEX_TOKEN for p in probes)
+
+
+async def test_put_changed_plex_token_probes_with_the_new_token(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A real (non-masked) plex_token change is a repoint too: the stored url is
+    probed (identity + authenticated sections) with the REPLACEMENT token and the
+    derived id replaces the cache."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    probes: list[httpx.Request] = []
+    await _use_transport(app, _repoint_transport(identity="NEW-MID", probes=probes))
+
+    put = await client.put(
+        "/api/v1/settings", json={"plex_token": "new-token"}, headers={"X-Api-Key": _API_KEY}
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert [str(p.url) for p in probes] == [
+        "http://old:32400/identity",
+        "http://old:32400/library/sections",
+    ]
+    assert all(p.headers.get("X-Plex-Token") == "new-token" for p in probes)  # the NEW token
+
+
+async def test_put_unreachable_new_plex_url_is_502_and_commits_nothing(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """THE lockout guard: an admin typos plex_url (syntactically valid, but
+    unreachable / the wrong box). The PUT must fail with the same honest 502
+    envelope setup uses and commit NOTHING — old url intact, cached machine id
+    intact, every session intact. Committing + revoking here would leave a
+    keyless install with no working sign-in AND nobody signed in (DB surgery,
+    the never-locked-out violation)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9205, tag="typo")
+    await _use_transport(app, _unreachable_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://typo-wrong-host:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 502
+    assert put.json()["detail"] == "server_unreachable_from_backend"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    # The caller's session still works — they can immediately fix the typo.
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_masked_and_unchanged_plex_values_keep_cached_machine_id(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A round-tripped masked secret ('***') and a same-value plex_url are NOT
+    changes: no /identity probe fires (the transport fails loudly on ANY request)
+    and the still-valid cached machine id is kept."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    await _use_transport(app, _no_probe_transport())
+
+    # The FE round-trips the whole object: unchanged plex_url + masked plex_token.
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://old:32400", "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # kept, not dropped
+
+
+async def test_put_url_change_with_no_stored_token_skips_probe_and_keeps_sessions(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A HALF-configured identity (url changes, but no token exists anywhere)
+    cannot be verified: the write proceeds without a probe, the STALE cached id
+    is dropped (nothing may keep anchoring sign-in to the old server), and
+    sessions are NOT revoked — revocation rides only a VERIFIED repoint (an
+    incomplete identity can't mint sign-ins, so revoking would be the lockout
+    trap again)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(
+        sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID", plex_token=None
+    )
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9206, tag="half")
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None  # stale anchor dropped
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def _active_session_count(sessionmaker_: SessionMaker) -> int:
+    """Count auth sessions that are still usable (``revoked_at`` unset)."""
+    async with sessionmaker_() as session:
+        result = await session.execute(
+            select(func.count()).select_from(AuthSession).where(AuthSession.revoked_at.is_(None))
+        )
+        return result.scalar_one()
+
+
+async def test_put_plex_repoint_revokes_every_active_session_including_the_callers(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A VERIFIED repoint is an auth-domain change (ADR-0016): swapping the cached
+    machine id only fixes FUTURE sign-ins, so every already-minted session — whose
+    persisted ``User.permissions`` still encodes the OLD server's authority — must
+    be revoked in the same transaction. That includes the admin performing the
+    repoint (deliberate, honest self-lockout): their PUT still completes cleanly
+    (auth ran at dependency time), and their very NEXT request re-authenticates
+    against a server the probe just PROVED is answering."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9201, tag="repoint-adm")
+    other_cookies, _ = await _admin_session_cookies(app, plex_id=9202, tag="repoint-other")
+    assert await _active_session_count(sessionmaker_) == 2
+    probes: list[httpx.Request] = []
+    await _use_transport(
+        app,
+        _repoint_transport(
+            identity="NEW-MID", resources=[_owned_resource("NEW-MID")], probes=probes
+        ),
+    )
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=admin_cookies,
+        headers=admin_csrf,
+    )
+
+    # The write itself completes for the now-revoked caller — never a mid-request 401.
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the verified anchor
+    assert await _active_session_count(sessionmaker_) == 0  # everyone, caller included
+    # The ownership check presented the CALLER's own account OAuth token to plex.tv.
+    ownership = [p for p in probes if p.url.host == "plex.tv"]
+    assert ownership and ownership[0].headers.get("X-Plex-Token") == _SEED_OAUTH_TOKEN
+
+    # Both old-server sessions must re-sign-in against the NEW server.
+    assert (await client.get("/api/v1/settings", cookies=admin_cookies)).status_code == 401
+    assert (await client.get("/api/v1/settings", cookies=other_cookies)).status_code == 401
+    # The X-Api-Key recovery path is untouched — the repoint never locks the API out.
+    assert (
+        await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    ).status_code == 200
+
+
+async def test_put_reachable_but_unauthorized_token_is_422_and_commits_nothing(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """/identity is UNAUTHENTICATED, so reachability alone must not verify a
+    repoint: a reachable replacement server that REJECTS the effective token is
+    a failed verification — 422 ``plex_token_invalid`` (the same code the
+    envelope vocabulary already uses for a rejected Plex credential), with
+    NOTHING committed and every session intact."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9207, tag="badtoken")
+    await _use_transport(app, _repoint_transport(identity="NEW-MID", authorized=False))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 422
+    assert put.json()["detail"] == "plex_token_invalid"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_session_admin_repoint_to_non_owned_server_is_403(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The round-6 lockout class: a SESSION admin repointing to a valid,
+    reachable, token-accepting server they do NOT own would commit + revoke
+    everyone — and their next sign-in resolves NON-admin against the new machine
+    id, locking a keyless install out of Settings. The wizard's ownership bar
+    (403 ``server_not_owned``) must reject it BEFORE committing/revoking."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9208, tag="notowned")
+    # The account can SEE the new server (it is shared with them) but does not own it.
+    await _use_transport(
+        app,
+        _repoint_transport(identity="NEW-MID", resources=[_shared_resource("NEW-MID")]),
+    )
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 403
+    assert put.json()["detail"] == "server_not_owned"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
+    assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The documented asymmetry: an api-key admin has no Plex account, so its
+    bar is reachability + the AUTHENTICATED token check only — plex.tv ownership
+    is never consulted (``resources=None`` fails loudly if it were). A verified
+    api-key repoint still revokes every browser session; the api key itself is
+    untouched, which is exactly why the asymmetry is recoverable."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, _csrf = await _admin_session_cookies(app, plex_id=9209, tag="apikey-repoint")
+    assert await _active_session_count(sessionmaker_) == 1
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert await _active_session_count(sessionmaker_) == 0  # browser sessions revoked
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 401
+    # The api key keeps working — the recoverable half of the asymmetry.
+    assert (
+        await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    ).status_code == 200
+
+
+async def test_put_non_plex_fields_keep_sessions_active(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """A PUT that touches no Plex identity field is NOT a repoint: nobody is
+    signed out — and no live /identity probe fires — over a library-root or
+    Prowlarr edit (the transport fails loudly on ANY request)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9203, tag="non-plex")
+    await _use_transport(app, _no_probe_transport())
+    root = tmp_path / "tv"
+    root.mkdir()
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"tv_root": str(root), "prowlarr_url": "http://prowlarr.local:9696"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 1  # still signed in
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+
+
+async def test_put_masked_and_unchanged_plex_values_keep_sessions_active(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The masked-secret round-trip ('***') and a same-value plex_url are NOT
+    repoints (the same non-changes that keep the cached machine id): no probe
+    fires and the FE saving an unrelated field never signs the install out."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    cookies, csrf = await _admin_session_cookies(app, plex_id=9204, tag="masked")
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://old:32400", "plex_token": "***"},
+        cookies=cookies,
+        headers=csrf,
+    )
+
+    assert put.status_code == 200
+    assert await _active_session_count(sessionmaker_) == 1  # still signed in
+    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
 
 
 async def test_secret_is_stored_encrypted(
@@ -198,6 +799,69 @@ async def test_empty_string_root_reads_back_as_unset(
         assert await SettingsStore(session).get("tv_root") == ""
         assert await get_movies_root_optional(session) is None
         assert await get_tv_root_optional(session) is None
+
+
+async def test_whitespace_only_root_reads_back_as_unset(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #83: a whitespace-only root (e.g. an operator submitting a stray
+    space) is truthy in Python and has no "leave unchanged" ``None`` meaning --
+    unlike ``SetupCompleteRequest``, ``SettingsUpdate`` had no validator
+    stripping this, so it would previously be persisted VERBATIM and then read
+    back as a non-``None``, seemingly-configured root. ``PUT /settings`` must
+    normalize it to the SAME "" clear-to-unset write ``test_empty_string_root_
+    reads_back_as_unset`` above already covers, and every ``get_*_root_optional``
+    read must independently treat it as unset too (defense in depth)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    put = await client.put(
+        "/api/v1/settings",
+        json={"movies_root": "   ", "tv_root": "\t\n "},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert put.status_code == 200
+    # The redacted response mirrors the raw stored ("") value exactly like
+    # test_empty_string_root_reads_back_as_unset above -- it is the TYPED
+    # get_*_root_optional deps (checked below), not this response, that report
+    # "unset".
+    assert put.json()["movies_root"] == ""
+    assert put.json()["tv_root"] == ""
+
+    async with sessionmaker_() as session:
+        # Normalized to "" at write time (the model_validator), matching the
+        # established empty-string clear-to-unset convention.
+        assert await SettingsStore(session).get("movies_root") == ""
+        assert await SettingsStore(session).get("tv_root") == ""
+        assert await get_movies_root_optional(session) is None
+        assert await get_tv_root_optional(session) is None
+
+
+async def test_padded_non_blank_root_reads_back_byte_identical(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Codex P2: a stored root that is non-blank but carries incidental
+    leading/trailing whitespace (distinct from the ALL-whitespace case
+    ``test_whitespace_only_root_reads_back_as_unset`` above covers) must read
+    back through ``get_*_root_optional`` BYTE-IDENTICAL to what ``GET /settings``
+    displays (``SettingsStore.get``/``redacted`` never strip). ``_blank_to_none``
+    previously ``.strip()``-ed every non-``None`` value, which would silently
+    retarget import/scan/evict to a different directory than the one the
+    operator sees configured -- writing directly via ``SettingsStore`` here
+    (bypassing ``PUT /settings``'s schema validator, which only touches the
+    ALL-whitespace case) isolates ``_blank_to_none``'s own behavior against
+    already-stored data of this shape."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    padded = "  /media/movies  "
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("movies_root", padded)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # What GET /settings would display (SettingsStore.redacted() -> row.value,
+        # never stripped) ...
+        assert await SettingsStore(session).get("movies_root") == padded
+        # ... must match EXACTLY what the importer/eviction dependency resolves --
+        # never a trimmed variant of it.
+        assert await get_movies_root_optional(session) == padded
 
 
 # --------------------------------------------------------------------------- #
@@ -362,46 +1026,56 @@ async def test_get_starts_with_anime_roots_unset(client: httpx.AsyncClient, seed
 
 
 async def test_put_anime_roots_round_trip_independently_of_movies_and_tv_root(
-    client: httpx.AsyncClient, seed: SeedFn
+    client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
+    anime_movies = tmp_path / "anime-movies"
+    anime_movies.mkdir()
+    anime_tv = tmp_path / "anime-tv"
+    anime_tv.mkdir()
     put = await client.put(
         "/api/v1/settings",
-        json={"anime_movie_root": "/library/anime-movies", "anime_tv_root": "/library/anime-tv"},
+        json={"anime_movie_root": str(anime_movies), "anime_tv_root": str(anime_tv)},
         headers={"X-Api-Key": _API_KEY},
     )
     assert put.status_code == 200
     body = put.json()
-    assert body["anime_movie_root"] == "/library/anime-movies"
-    assert body["anime_tv_root"] == "/library/anime-tv"
+    assert body["anime_movie_root"] == str(anime_movies)
+    assert body["anime_tv_root"] == str(anime_tv)
     # Untouched by the anime-only PUT.
     assert body["movies_root"] is None
     assert body["tv_root"] is None
 
     got = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
-    assert got["anime_movie_root"] == "/library/anime-movies"
-    assert got["anime_tv_root"] == "/library/anime-tv"
+    assert got["anime_movie_root"] == str(anime_movies)
+    assert got["anime_tv_root"] == str(anime_tv)
 
 
 async def test_put_partial_anime_root_only_leaves_the_other_and_normal_roots_untouched(
-    client: httpx.AsyncClient, seed: SeedFn
+    client: httpx.AsyncClient, seed: SeedFn, tmp_path: Path
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir()
+    anime_movies = tmp_path / "anime-movies"
+    anime_movies.mkdir()
+    anime_tv = tmp_path / "anime-tv"
+    anime_tv.mkdir()
     await client.put(
         "/api/v1/settings",
-        json={"movies_root": "/library/movies", "anime_movie_root": "/library/anime-movies"},
+        json={"movies_root": str(movies_root), "anime_movie_root": str(anime_movies)},
         headers={"X-Api-Key": _API_KEY},
     )
     put = await client.put(
         "/api/v1/settings",
-        json={"anime_tv_root": "/library/anime-tv"},
+        json={"anime_tv_root": str(anime_tv)},
         headers={"X-Api-Key": _API_KEY},
     )
     assert put.status_code == 200
     body = put.json()
-    assert body["anime_tv_root"] == "/library/anime-tv"
-    assert body["anime_movie_root"] == "/library/anime-movies"  # untouched by this partial PUT
-    assert body["movies_root"] == "/library/movies"  # untouched by this partial PUT
+    assert body["anime_tv_root"] == str(anime_tv)
+    assert body["anime_movie_root"] == str(anime_movies)  # untouched by this partial PUT
+    assert body["movies_root"] == str(movies_root)  # untouched by this partial PUT
 
 
 async def test_empty_string_anime_root_reads_back_as_unset(
@@ -561,6 +1235,820 @@ async def test_put_single_field_threshold_above_stored_target_still_succeeds(
     async with sessionmaker_() as session:
         assert await get_disk_pressure_threshold_percent(session) == 90.0
         assert await get_disk_pressure_target_percent(session) == 80.0  # untouched
+
+
+# --------------------------------------------------------------------------- #
+# Non-finite / overflow typed settings (issue #92): reject on write, tolerate
+# on read. A stored ``inf``/``nan`` (or a finite-but-huge value) must never
+# hang the eviction loop's ``asyncio.sleep`` or 500 ``GET /settings``.
+# --------------------------------------------------------------------------- #
+def test_settings_update_rejects_non_finite_interval() -> None:
+    """Model-level guard (mirrors ``test_settings_update_rejects_target_above_
+    threshold`` above): every non-finite value AND anything past the upper
+    ceiling must fail construction, while the ceiling itself and an ordinary
+    value both still construct fine."""
+    for bad in (float("inf"), float("nan"), float("-inf"), EVICTION_INTERVAL_MAX_MINUTES + 1):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(eviction_interval_minutes=bad)
+    SettingsUpdate(eviction_interval_minutes=EVICTION_INTERVAL_MAX_MINUTES)  # boundary, inclusive
+    SettingsUpdate(eviction_interval_minutes=45.0)  # an ordinary value still works
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("eviction_interval_minutes", float("inf")),
+        ("eviction_interval_minutes", float("nan")),
+        ("eviction_interval_minutes", EVICTION_INTERVAL_MAX_MINUTES + 1),
+        ("disk_pressure_threshold_percent", float("inf")),
+        ("disk_pressure_threshold_percent", float("nan")),
+        ("eviction_grace_days", EVICTION_GRACE_DAYS_MAX + 1),
+        ("log_retention_days", LOG_RETENTION_DAYS_MAX + 1),
+    ],
+)
+async def test_put_rejects_non_finite_and_overflow_operability_settings(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    bad_value: float,
+) -> None:
+    """Extends ``test_put_rejects_out_of_range_operability_settings`` (which
+    already covers ``150``/``0``/``-1``) with the non-finite and
+    finite-but-over-the-new-ceiling cases -- each must 422 AND never persist
+    (mirroring ``..._does_not_persist`` above).
+
+    Built as raw wire bytes via the stdlib's OWN ``json.dumps`` (default
+    ``allow_nan=True``) rather than httpx's ``json=`` convenience: httpx
+    encodes with ``allow_nan=False`` and would raise ``ValueError`` in the
+    TEST CLIENT itself before a non-finite value ever reached the server --
+    masking the very case under test. The ``Infinity``/``NaN`` tokens this
+    produces are exactly what a non-Python client (or hand-crafted request)
+    would send, and Starlette's request-side ``json.loads`` (default
+    ``allow_nan=True``) accepts them.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY, "Content-Type": "application/json"}
+
+    put = await client.put(
+        "/api/v1/settings",
+        content=json.dumps({field: bad_value}).encode(),
+        headers=headers,
+    )
+    assert put.status_code == 422
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get(field) is None
+
+
+async def test_put_rejects_wire_level_numeric_overflow_as_non_finite(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A ``1e400`` numeral folds to ``inf`` at the JSON PARSER (``json.loads``),
+    not via Python already having collapsed the float literal at import time --
+    distinct from the ``float("inf")`` case above, which never touches the
+    number parser at all. Sent as raw wire bytes (not httpx's ``json=`` kwarg,
+    which would just re-serialize an already-``inf`` Python float as the
+    ``Infinity`` token) so the overflow-during-parse path is genuinely
+    exercised."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY, "Content-Type": "application/json"}
+
+    put = await client.put(
+        "/api/v1/settings",
+        content=b'{"eviction_interval_minutes": 1e400}',
+        headers=headers,
+    )
+    assert put.status_code == 422
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("eviction_interval_minutes") is None
+
+
+async def test_put_accepts_upper_bound_operability_settings(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The new ``le`` bounds must not over-reject their own boundary value."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    update = {
+        "eviction_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
+        "eviction_grace_days": EVICTION_GRACE_DAYS_MAX,
+        "log_retention_days": LOG_RETENTION_DAYS_MAX,
+    }
+
+    put = await client.put("/api/v1/settings", json=update, headers=headers)
+    assert put.status_code == 200
+    body = put.json()
+    assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
+    assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+
+    got = (await client.get("/api/v1/settings", headers=headers)).json()
+    assert got == body
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
+        assert await get_eviction_grace_days(session) == EVICTION_GRACE_DAYS_MAX
+        assert await get_log_retention_days(session) == LOG_RETENTION_DAYS_MAX
+
+
+@pytest.mark.parametrize("stored", ["inf", "nan", "-inf"])
+async def test_get_eviction_interval_minutes_falls_back_on_non_finite_stored_value(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_interval_minutes", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_eviction_interval_minutes(session)
+
+    assert value == EVICTION_INTERVAL_MINUTES_DEFAULT
+    assert "eviction_interval_minutes" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        # Non-positive: an EXCLUSIVE lower bound with no safe floor to clamp to
+        # (a zero/negative sleep hot-spins the loop) -> the default.
+        ("0", EVICTION_INTERVAL_MINUTES_DEFAULT),
+        ("-5", EVICTION_INTERVAL_MINUTES_DEFAULT),
+        # Above the cap: CLAMPED to it (round 3) -- a pre-bounds huge interval
+        # meant "sweep almost never"; degrading it to the 30-minute default
+        # would make sweeps orders of magnitude more frequent on upgrade.
+        (str(EVICTION_INTERVAL_MAX_MINUTES + 1), EVICTION_INTERVAL_MAX_MINUTES),
+        ("45", 45.0),
+        (str(EVICTION_INTERVAL_MAX_MINUTES), EVICTION_INTERVAL_MAX_MINUTES),
+    ],
+)
+async def test_get_eviction_interval_minutes_degrades_out_of_range_stored_value(
+    sessionmaker_: SessionMaker, stored: str, expected: float
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_interval_minutes", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_interval_minutes(session) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected", "degraded"),
+    [
+        # Negative: the floor (0 = immediately evictable) is the DESTRUCTIVE
+        # end of the scale, so never a floor-clamp -> the safe default.
+        ("-1", EVICTION_GRACE_DAYS_DEFAULT, True),
+        # Above the cap: CLAMPED (round 3) -- a pre-bounds huge grace was a
+        # legitimate "never age-evict"; the 30-day default would suddenly make
+        # month-old titles evictable on upgrade (data-destructive).
+        (str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX, True),
+        ("14", 14, False),
+        ("abc", EVICTION_GRACE_DAYS_DEFAULT, True),
+    ],
+)
+async def test_get_eviction_grace_days_degrades_negative_or_overflow(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: int,
+    degraded: bool,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_grace_days", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_eviction_grace_days(session)
+
+    assert value == expected
+    if degraded:
+        assert "eviction_grace_days" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected", "degraded"),
+    [
+        # Negative -> default (a future cutoff would wholesale-delete logs; the
+        # 0 floor would retain nothing -- both destructive, never clamped to).
+        ("-1", LOG_RETENTION_DAYS_DEFAULT, True),
+        # Above the cap: CLAMPED (round 3) -- a pre-bounds huge retention meant
+        # "keep everything"; the 7-day default would delete logs on upgrade.
+        (str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_MAX, True),
+        ("14", 14, False),
+        ("abc", LOG_RETENTION_DAYS_DEFAULT, True),
+    ],
+)
+async def test_get_log_retention_days_degrades_negative_or_overflow(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: int,
+    degraded: bool,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("log_retention_days", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_log_retention_days(session)
+
+    assert value == expected
+    if degraded:
+        assert "log_retention_days" in caplog.text
+
+
+async def test_get_settings_does_not_500_on_non_finite_stored_interval(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Headline AC2: a stored non-finite value must not 500 ``GET /settings`` --
+    proves the ``json.dumps(..., allow_nan=False)`` render path is avoided."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_interval_minutes", "inf")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["eviction_interval_minutes"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt"),
+    [
+        ("disk_pressure_threshold_percent", "not-a-number"),
+        ("eviction_grace_days", "1.5"),
+        ("log_retention_days", "abc"),
+        ("eviction_enabled", "maybe"),
+        ("eviction_interval_minutes", "inf"),
+    ],
+)
+async def test_get_settings_tolerates_corrupt_stored_typed_values(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    corrupt: str,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set(field, corrupt)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body[field] is None
+    # An unrelated, uncorrupted plaintext field is unaffected by the sanitizer.
+    assert body["plex_url"] == "http://plex.example.com:32400"
+
+
+async def test_get_settings_preserves_valid_typed_values(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Regression guard: the sanitizer must null ONLY corrupt values, never a
+    valid stored one."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    valid: dict[str, str] = {
+        "disk_pressure_threshold_percent": "88.5",
+        "disk_pressure_target_percent": "75.0",
+        "eviction_grace_days": "14",
+        "eviction_enabled": "false",
+        "eviction_proactive_enabled": "true",
+        "eviction_interval_minutes": "45.0",
+        "log_retention_days": "3",
+    }
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        for key, value in valid.items():
+            await store.set(key, value)
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["disk_pressure_threshold_percent"] == 88.5
+    assert body["disk_pressure_target_percent"] == 75.0
+    assert body["eviction_grace_days"] == 14
+    assert body["eviction_enabled"] is False
+    assert body["eviction_proactive_enabled"] is True
+    assert body["eviction_interval_minutes"] == 45.0
+    assert body["log_retention_days"] == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "stored", "expected"),
+    [
+        # Finite, in-shape, JSON-serialisable -- so the unparsable/non-finite
+        # checks alone all pass it -- yet each is out of the SettingsUpdate bound
+        # the write path enforces. GET must present the EFFECTIVE value the
+        # runtime getter resolves it to (round 3): a CLAMPED upper-bound value
+        # is displayed (nulling it would make the page claim the default while
+        # the loop runs the clamped MAX), a value degraded to the DEFAULT is
+        # null (the page then displays that same default). Either way the
+        # displayed value is one PUT accepts, so the form always re-saves.
+        (
+            "eviction_interval_minutes",
+            str(EVICTION_INTERVAL_MAX_MINUTES + 1),
+            EVICTION_INTERVAL_MAX_MINUTES,
+        ),
+        ("eviction_interval_minutes", "0", None),  # gt=0 -- exclusive bound, no floor to clamp to
+        ("disk_pressure_threshold_percent", "150", 100.0),  # clamp: stored >100 meant "never trip"
+        ("disk_pressure_target_percent", "-1", None),  # default 80 (<= default threshold 90)
+        ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX),
+        ("log_retention_days", str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_MAX),
+    ],
+)
+async def test_get_settings_presents_finite_out_of_range_typed_values_as_effective(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    stored: str,
+    expected: float | None,
+) -> None:
+    """GET presents the same effective value the runtime getter resolves an
+    out-of-range stored value to: the clamped bound for upper-bound violations
+    (upgrade-safe -- see the ``web.deps`` resolver policy), null (-> the default
+    the page renders) when the fallback IS the default. Never the raw
+    out-of-range number PUT would 422 on the next save."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set(field, stored)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body[field] == expected
+    # An unrelated, in-range plaintext field is untouched by the sanitizer.
+    assert body["plex_url"] == "http://plex.example.com:32400"
+
+
+async def test_get_settings_preserves_boundary_typed_values(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The inclusive bounds themselves are valid values PUT accepts -- GET must
+    preserve a stored value sitting exactly AT a ceiling (or the ge=0 floor),
+    never over-null it as if it were out of range."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    boundary: dict[str, str] = {
+        "disk_pressure_threshold_percent": "100",  # le=100, inclusive
+        "disk_pressure_target_percent": "0",  # ge=0, inclusive
+        "eviction_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),  # le, inclusive
+        "eviction_grace_days": str(EVICTION_GRACE_DAYS_MAX),
+        "log_retention_days": str(LOG_RETENTION_DAYS_MAX),
+    }
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        for key, value in boundary.items():
+            await store.set(key, value)
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["disk_pressure_threshold_percent"] == 100.0
+    assert body["disk_pressure_target_percent"] == 0.0
+    assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
+    assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+
+
+# --------------------------------------------------------------------------- #
+# Getter <-> GET sanitizer agreement on a corrupt stored value (rounds 2-3).
+# For EVERY typed setting the runtime getter (what the eviction/auto-grab loops
+# read), the GET /settings sanitizer (what the page shows), and the PUT validator
+# must agree on what an out-of-range / unrecognized stored value means -- the page
+# must never claim a state the running service isn't in (honesty over silence).
+# Round 3 adds the DIRECTIONAL policy: upper-bound violations CLAMP (and GET
+# shows the clamped value); lower-bound violations and garbage DEFAULT (and GET
+# shows null, which the page renders as that same default).
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("field", "getter", "stored", "expected_value", "expected_get"),
+    [
+        # >100 CLAMPS to 100 (a pre-bounds 150 meant "never trip"; the default
+        # 90 would START evicting at 90% on upgrade) -- and GET shows 100.0,
+        # never null (null would render as the default the sweep is NOT using).
+        (
+            "disk_pressure_threshold_percent",
+            get_disk_pressure_threshold_percent,
+            "150",
+            100.0,
+            100.0,
+        ),
+        # <0 defaults (the 0 floor = permanently "under pressure") -- GET null.
+        (
+            "disk_pressure_threshold_percent",
+            get_disk_pressure_threshold_percent,
+            "-1",
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+            None,
+        ),
+        # Target >100 clamps to 100, then the PAIR rule pulls it down to the
+        # (defaulted, unset-threshold) 90 -- displayed as 90, the exact value
+        # select_evictions runs with.
+        (
+            "disk_pressure_target_percent",
+            get_disk_pressure_target_percent,
+            "150",
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+            DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
+        ),
+        # Target <0 defaults to 80, which sits below the default threshold 90 --
+        # the effective value IS the default, so GET's null is truthful.
+        (
+            "disk_pressure_target_percent",
+            get_disk_pressure_target_percent,
+            "-1",
+            DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
+            None,
+        ),
+    ],
+)
+async def test_corrupt_disk_pressure_percent_getter_and_get_agree(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    getter: Callable[[AsyncSession], Awaitable[float]],
+    stored: str,
+    expected_value: float,
+    expected_get: float | None,
+) -> None:
+    """Round-2 finding 1 + round-3 finding 1: an out-of-``[0, 100]`` stored
+    disk-pressure percent degrades DIRECTIONALLY (clamp high / default low), and
+    the runtime getter and ``GET /settings`` are asserted together on the same
+    stored value so they can never drift: the getter returns the effective value
+    (with a WARNING naming the key) AND GET presents exactly that state (the
+    clamped number, or null when the effective value IS the default)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, stored)
+        await session.commit()
+
+    # Runtime getter (what _eviction_tick reads): the effective value + WARNING.
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await getter(session)
+    assert value == expected_value
+    assert field in caplog.text
+
+    # GET /settings (what the page shows) presents the SAME state the getter
+    # resolved -- agreement, never a page claiming a percentage the sweep isn't
+    # actually using.
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()[field] == expected_get
+
+
+async def test_over_cap_grace_days_clamps_instead_of_defaulting(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-3 P1: a stored ``eviction_grace_days`` past the cap (``3651`` -- a
+    legitimate pre-bounds way to effectively DISABLE age-based eviction) must
+    CLAMP to ``EVICTION_GRACE_DAYS_MAX``, not fall back to the 30-day default:
+    the default would suddenly make every watched title older than 30 days
+    eviction-eligible on upgrade (data-destructive). GET presents the clamped
+    value -- nulling it would make the page claim a 30-day grace while
+    ``_eviction_tick`` runs the 3650-day MAX."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    over_cap = str(EVICTION_GRACE_DAYS_MAX + 1)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_grace_days", over_cap)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_eviction_grace_days(session)
+    assert value == EVICTION_GRACE_DAYS_MAX  # the safer LONGER grace, not the default
+    assert value != EVICTION_GRACE_DAYS_DEFAULT
+    assert "eviction_grace_days" in caplog.text
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
+
+
+async def test_corrupt_target_with_valid_threshold_degrades_to_workable_pair(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-3 finding 2: a valid stored ``threshold=50`` with a corrupt
+    ``target=-1`` must NOT resolve per-side to the inverted pair ``(50, 80)`` --
+    ``select_evictions`` starts ``projected = used_pct`` and stops the moment
+    ``projected <= target``, so any used%% in the 50-80 band would trip the
+    sweep yet select NOTHING (a silent dead band the form cannot even re-save).
+    The pair rule clamps the substituted target down to the threshold:
+    ``(50, 50)`` -- the minimal eviction consistent with the operator's own
+    threshold -- and getter/GET agree on that exact pair."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("disk_pressure_threshold_percent", "50")
+        await store.set("disk_pressure_target_percent", "-1")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            threshold = await get_disk_pressure_threshold_percent(session)
+            target = await get_disk_pressure_target_percent(session)
+    assert threshold == 50.0  # the valid stored side is preserved
+    assert target == 50.0  # pair-clamped, never the inverted default 80
+    assert "disk_pressure_target_percent" in caplog.text
+
+    # The resolved pair is genuinely WORKABLE: at 60% used (inside what would
+    # have been the dead band), select_evictions actually selects the eligible
+    # candidate instead of stopping instantly on projected <= target.
+    candidate = EvictionCandidate(
+        request_id=1,
+        media_type="movie",
+        title="Stale Movie",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=datetime.now(UTC) - timedelta(days=365),
+        keep_forever=False,
+        in_flight=False,
+        library_path="/library/movies/stale.mkv",
+        size_percent=15.0,
+    )
+    selected = select_evictions(
+        [candidate],
+        used_pct=60.0,
+        threshold_pct=threshold,
+        target_pct=target,
+        grace_cutoff=datetime.now(UTC) - timedelta(days=30),
+    )
+    assert selected == [candidate]
+
+    # GET presents the SAME effective pair the sweep runs with -- and (50, 50)
+    # is a pair the form can re-save (target <= threshold passes PUT).
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["disk_pressure_threshold_percent"] == 50.0
+    assert body["disk_pressure_target_percent"] == 50.0
+
+
+@pytest.mark.parametrize("stored", [" false ", "False", "FALSE", "false\n"])
+@pytest.mark.parametrize(
+    ("field", "getter"),
+    [
+        ("eviction_enabled", get_eviction_enabled),
+        ("auto_grab_enabled", get_auto_grab_enabled),
+    ],
+)
+async def test_padded_or_cased_false_bool_still_disables(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    getter: Callable[[AsyncSession], Awaitable[bool]],
+    stored: str,
+) -> None:
+    """Round-3 finding 3: the pre-#142 parser compared ``raw.strip().lower()``,
+    so a persisted whitespace-padded/case-variant ``false`` meant DISABLED. The
+    ``TypeAdapter`` path must preserve that contract (strip + case-insensitive
+    tokens) -- otherwise ``" false "`` becomes "unrecognized" and the ``True``
+    default silently re-enables eviction/auto-grab on upgrade. GET agrees:
+    the page shows ``false``, never null (which would render the enabled
+    default)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await getter(session) is False  # still disabled, not defaulted to True
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()[field] is False
+
+
+async def test_padded_true_bool_still_enables_proactive(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The strip/case contract cuts both ways: a padded ``" TRUE "`` stored for
+    a default-FALSE setting (proactive eviction) keeps meaning enabled -- and
+    GET shows ``true`` rather than null (which would render the disabled
+    default)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("eviction_proactive_enabled", " TRUE ")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_proactive_enabled(session) is True
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["eviction_proactive_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "getter", "default"),
+    [
+        ("eviction_enabled", get_eviction_enabled, EVICTION_ENABLED_DEFAULT),
+        ("auto_grab_enabled", get_auto_grab_enabled, AUTO_GRAB_ENABLED_DEFAULT),
+    ],
+)
+async def test_unrecognized_bool_getter_and_get_agree_on_default(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    getter: Callable[[AsyncSession], Awaitable[bool]],
+    default: bool,
+) -> None:
+    """Finding 2: an UNRECOGNIZED stored boolean (``"maybe"``) used to be silently
+    read as ``False`` by the loop while ``GET /settings`` nulled it (→ the page
+    showed the default ``True``) -- the loop was OFF while the page said ON. The
+    getter must now fall back to the default (with a WARNING) for an unrecognized
+    token, matching the GET sanitizer's null (→ default display) exactly."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, "maybe")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await getter(session)
+    assert value is default
+    assert field in caplog.text
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()[field] is None
+
+
+async def test_bool_getter_honors_explicit_stored_false(sessionmaker_: SessionMaker) -> None:
+    """The unrecognized-value fallback must NOT swallow a legitimately stored
+    ``"false"``: it is a recognized token, so an operator who turned a loop OFF
+    keeps it OFF (``False``), never resurrected to the ``True`` default. Guards the
+    fix from over-degrading a valid negative into the enabled default."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("eviction_enabled", "false")
+        await store.set("auto_grab_enabled", "false")
+        await store.set("eviction_proactive_enabled", "false")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert await get_eviction_enabled(session) is False
+        assert await get_auto_grab_enabled(session) is False
+        assert await get_eviction_proactive_enabled(session) is False
+
+
+def test_typed_setting_key_groups_cover_all_typed_response_fields() -> None:
+    """Parity guard (mirrors ``test_every_known_setting_key_has_a_response_and_
+    update_field`` above): the union of the three ``_*_TYPED_SETTING_KEYS``
+    tuples the sanitizer walks must equal every ``KNOWN_SETTING_KEYS`` entry
+    whose ``SettingsResponse`` field is NOT a plain ``str`` -- i.e. every
+    numeric/bool typed setting -- and none of them may be a secret. Otherwise a
+    future typed field could be added to the response without ever being
+    routed through ``_sanitize_typed_settings``, silently reopening the 500."""
+    from typing import get_args
+
+    typed_keys = (
+        set(_FLOAT_TYPED_SETTING_KEYS)
+        | set(_INT_TYPED_SETTING_KEYS)
+        | set(_BOOL_TYPED_SETTING_KEYS)
+    )
+    expected = {
+        key
+        for key in KNOWN_SETTING_KEYS
+        if str not in get_args(SettingsResponse.model_fields[key].annotation)
+    }
+    assert typed_keys == expected
+    assert typed_keys.isdisjoint(SECRET_SETTING_KEYS)
+
+
+# --------------------------------------------------------------------------- #
+# Health-probe cache invalidation on credential save (issue #93)
+# --------------------------------------------------------------------------- #
+_HEALTH_HEADERS = {"X-Api-Key": _API_KEY}
+
+
+async def test_put_settings_invalidates_health_cache_for_the_written_subsystem(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A credential save must not leave the OLD cached probe sitting around for
+    up to ``SUBSYSTEM_PROBE_TTL_SECONDS`` -- the very next ``GET /health`` after
+    fixing (or breaking) a subsystem must re-probe it, not echo the pre-edit
+    result. Uses prowlarr (not plex) fields: a changed prowlarr_url/api_key never
+    enters the Plex repoint verification ladder (:func:`_verify_plex_repoint`),
+    so this stays a plain settings save with no live upstream probe -- the
+    honest, simplest path to exercise the cache-invalidation contract itself."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # Warm every subsystem's cache entry (all unconfigured -> "not_configured").
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("prowlarr") is not None
+    assert cache.get("tmdb") is not None
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"prowlarr_url": "http://prowlarr.local", "prowlarr_api_key": "tok"},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 200
+
+    # The edited subsystem's cache entry is gone...
+    assert cache.get("prowlarr") is None
+    # ...but this is a TARGETED invalidation -- an unrelated subsystem's still-
+    # valid cached probe must survive untouched.
+    assert cache.get("tmdb") is not None
+
+
+async def test_put_settings_with_no_credential_fields_leaves_health_cache_alone(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A PUT that writes only a non-credential field (e.g. an eviction knob) must
+    invalidate nothing -- no subsystem's config actually changed."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("plex") is not None
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"eviction_enabled": False},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 200
+    assert cache.get("plex") is not None
+
+
+async def test_put_settings_secret_mask_round_trip_does_not_invalidate_health_cache(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A secret field sent back as the ``"***"`` redaction mask is a documented
+    no-op write (see ``put_settings_endpoint``) -- it must not count as "this
+    subsystem's credentials changed" and invalidate a still-valid cached probe."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.local")
+        await store.set("plex_token", "tok")
+        await session.commit()
+
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("plex") is not None
+
+    # Sending back ONLY the masked secret (e.g. a FE form that re-submits every
+    # field it displays, including the "***" it read from GET) writes nothing
+    # for plex -- SettingsStore.set is never called for this field.
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_token": "***"},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 200
+    assert cache.get("plex") is not None
+
+
+async def test_put_settings_does_not_invalidate_health_cache_on_failed_save(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A rejected (422) write must leave any still-valid cached probe exactly as
+    it was -- a failed save changed nothing, so nothing should be invalidated."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    warm = await client.get("/api/v1/ops/health", headers=_HEALTH_HEADERS)
+    assert warm.status_code == 200
+    cache = app.state.health_cache
+    assert cache.get("plex") is not None
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "not a url at all"},
+        headers=_HEALTH_HEADERS,
+    )
+    assert put.status_code == 422
+    assert cache.get("plex") is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -745,7 +2233,12 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
     new_key = first.json()["app_api_key"]
 
     # The racing second request already passed require_api_key against the old key.
-    app.dependency_overrides[require_api_key] = lambda: None
+    # ``require_api_key`` now returns an ``AuthContext`` (was ``None``); the stale
+    # racer authenticated via the static key, so mirror that method here so the
+    # rotate handler takes its api-key CAS path and the guard sees an admin.
+    app.dependency_overrides[require_api_key] = lambda: AuthContext(
+        method=AuthMethod.api_key, is_admin=True
+    )
     try:
         stale = await client.post(
             "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
@@ -760,3 +2253,565 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
         system = await load_system_settings(session)
         assert system is not None
         assert system.app_api_key == new_key
+
+
+async def test_settings_store_set_recovers_from_concurrent_first_write(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #91: two concurrent first writes to a brand-new key must not 500.
+
+    ``SettingsStore.set()`` used to be a plain read-then-insert with no conflict
+    recovery: two sessions racing to set the SAME never-before-seen key (e.g.
+    two concurrent setup submissions both writing ``movies_root`` for the first
+    time) could both pass the "row not found" check and both attempt an INSERT,
+    and the loser's flush would raise an uncaught ``IntegrityError``.
+
+    Simulated deterministically exactly like
+    ``test_create_request_recovers_from_active_dedup_conflict``: a "winner"
+    session commits the first row for the key, then this session's OWN initial
+    ``_row`` lookup is stubbed to report "not found" once (as if it ran before
+    the winner's insert became visible), forcing it down the insert path so its
+    flush collides on the real unique index.
+    """
+    async with sessionmaker_() as winner_session:
+        await SettingsStore(winner_session).set("movies_root", "/winner")
+        await winner_session.commit()
+
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_row(self, key)
+
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
+
+    async with sessionmaker_() as loser_session:
+        # Must not raise IntegrityError (or anything else) out of set().
+        await SettingsStore(loser_session).set("movies_root", "/loser")
+        await loser_session.commit()
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Setting).where(Setting.key == "movies_root")))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # never two rows for the same key
+    # The recovered row was updated with THIS call's value, not silently
+    # discarded in favor of the winner's -- an upsert, not a "first write wins".
+    assert rows[0].value == "/loser"
+
+
+async def test_settings_store_set_collision_recovery_does_not_lose_earlier_writes(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-transaction collision on a LATER key must not roll back an EARLIER
+    key's already-flushed write in the same request.
+
+    Both ``PUT /settings`` (looping over ``body.model_fields_set``) and
+    ``POST /setup/complete`` (writing ~12 keys) call ``set()`` repeatedly inside
+    ONE transaction, committing once at the end. The first-write-collision
+    recovery used to call a full ``session.rollback()``, which discards the
+    ENTIRE transaction, not just the failed INSERT -- so a collision on a LATER
+    key in the loop silently dropped every EARLIER key this same request had
+    already written, returning 200 with quietly missing data. That directly
+    violates "honesty over silence": the original loud, retryable 500 got traded
+    for a silent partial write. The recovery must instead be scoped to a
+    SAVEPOINT around just the failing INSERT, leaving prior flushes in the same
+    transaction intact.
+    """
+    async with sessionmaker_() as winner_session:
+        await SettingsStore(winner_session).set("tv_root", "/winner")
+        await winner_session.commit()
+
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
+        if key == "tv_root" and calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_row(self, key)
+
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
+
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        # Earlier key in the SAME transaction: a brand-new key, flushed
+        # successfully and still only pending (not yet committed).
+        await store.set("movies_root", "/same-txn")
+        # Later key in the SAME transaction collides with the winner's
+        # already-committed row and must recover without nuking the above.
+        await store.set("tv_root", "/loser")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # The earlier write must have survived the later key's collision
+        # recovery -- not silently discarded despite the 200/commit.
+        assert await SettingsStore(session).get("movies_root") == "/same-txn"
+        # The upsert semantics for the colliding key itself are unaffected.
+        assert await SettingsStore(session).get("tv_root") == "/loser"
+
+
+async def test_settings_store_set_if_absent_creates_and_returns_value_when_missing(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The genuine first create: the key persists this call's value and returns
+    it, so the caller can adopt the return value unconditionally."""
+    async with sessionmaker_() as session:
+        returned = await SettingsStore(session).set_if_absent("movies_root", "/minted")
+        await session.commit()
+
+    assert returned == "/minted"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == "/minted"
+
+
+async def test_settings_store_set_if_absent_returns_existing_value_without_overwrite(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """An already-persisted value is returned untouched and the candidate is
+    discarded — create-once, where ``set()`` would have upserted the candidate."""
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("movies_root", "/original")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        returned = await SettingsStore(session).set_if_absent("movies_root", "/candidate")
+        await session.commit()
+
+    assert returned == "/original"
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("movies_root") == "/original"
+
+
+async def test_settings_store_set_if_absent_adopts_winner_on_concurrent_first_create(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create-once counterpart of
+    ``test_settings_store_set_recovers_from_concurrent_first_write``: same race,
+    OPPOSITE resolution. ``set()`` resolves its first-write collision to
+    last-write-wins (right for preferences); ``set_if_absent()`` must resolve it
+    to FIRST-write-wins (right for minted identities like the plex.tv client
+    identifier, which must never rotate): the loser's recovery ADOPTS the
+    winner's committed value — returning it to the caller — and never overwrites
+    it. Simulated identically: the winner commits first, then the loser's own
+    initial ``_row`` lookup is stubbed to report "not found" once (as if it ran
+    before the winner's insert became visible), forcing it down the insert path
+    so its flush collides on the real unique index.
+    """
+    async with sessionmaker_() as winner_session:
+        await SettingsStore(winner_session).set("movies_root", "/winner")
+        await winner_session.commit()
+
+    real_row = SettingsStore._row  # pyright: ignore[reportPrivateUsage]
+    calls = {"n": 0}
+
+    async def racing_row(self: SettingsStore, key: str) -> Setting | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_row(self, key)
+
+    monkeypatch.setattr(SettingsStore, "_row", racing_row)
+
+    async with sessionmaker_() as loser_session:
+        # Must not raise — and must hand back the WINNER's value, not its own.
+        returned = await SettingsStore(loser_session).set_if_absent("movies_root", "/loser")
+        await loser_session.commit()
+
+    assert returned == "/winner"  # the loser converged on the persisted identity
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Setting).where(Setting.key == "movies_root")))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1  # never two rows for the same key
+    # The winner's value survived intact: create-once means the stored identity
+    # never rotates, no matter how many racers arrive after it persisted.
+    assert rows[0].value == "/winner"
+
+
+async def test_settings_store_set_if_absent_routes_secret_keys_to_encrypted_column(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Secret routing parity with ``set()``: a secret key created via
+    ``set_if_absent`` lands in the encrypted column, never plaintext at rest."""
+    plaintext = "first-write-tmdb-secret"
+    async with sessionmaker_() as session:
+        returned = await SettingsStore(session).set_if_absent("tmdb_api_key", plaintext)
+        await session.commit()
+    assert returned == plaintext
+
+    # Inspect the raw columns, bypassing the EncryptedStr decryption layer.
+    async with sessionmaker_() as session:
+        raw_value, raw_encrypted, is_secret = (
+            await session.execute(
+                text(
+                    "SELECT value, encrypted_value, is_secret "
+                    "FROM settings WHERE key = 'tmdb_api_key'"
+                )
+            )
+        ).one()
+    assert bool(is_secret) is True
+    assert raw_value is None  # the plaintext column is never used for a secret
+    assert raw_encrypted is not None
+    assert plaintext not in raw_encrypted  # at-rest value is ciphertext, not plaintext
+
+
+async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The revoke null-hole: a rotate that OBSERVED a key must not resurrect it.
+
+    A rotation authenticates against the live key, then a concurrent REVOKE clears
+    the stored key to NULL before this request writes. The old CAS skipped its
+    check whenever the stored key was null ('nothing to compare, just mint') and so
+    minted a fresh key — silently undoing the revoke. The fixed CAS treats a null
+    stored key as the genuine first-key generate ONLY when this request also
+    observed null; here it observed a non-null key, so it must 409 and leave the
+    revoke standing (no key resurrected).
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    state = {"raced": False}
+
+    async def revoking_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        if not state["raced"]:
+            # Fire once: a competing REVOKE clears the key on a separate session
+            # AFTER this rotation authenticated against it but BEFORE it writes.
+            state["raced"] = True
+            async with sessionmaker_() as other:
+                other_row = await real_ensure(other)
+                other_row.app_api_key = None
+                await other.commit()
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", revoking_ensure)
+
+    losing = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert losing.status_code == 409
+    assert losing.json()["detail"] == "app_key_changed"
+
+    # The revoke held: no key was resurrected by the losing rotation.
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None
+
+
+async def _admin_session_cookies(
+    app: FastAPI, *, plex_id: int, tag: str, plex_oauth_token: str | None = _SEED_OAUTH_TOKEN
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Mint a live ADMIN (owner) browser session; returns (cookies, csrf headers).
+
+    ``plex_oauth_token`` seeds ``User.encrypted_plex_token`` by default — Plex
+    sign-in always stores the account token, and the repoint ownership check
+    reads it. Pass ``None`` only to model the degenerate token-less row.
+    """
+    token = f"admin-session-{tag}"
+    csrf = f"csrf-{tag}"
+    async with app.state.sessionmaker() as session:
+        user = User(
+            plex_id=plex_id,
+            username=f"owner-{tag}",
+            permissions=1,
+            encrypted_plex_token=plex_oauth_token,
+        )
+        session.add(user)
+        await session.flush()
+        session.add(
+            AuthSession(
+                user_id=user.id,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    return {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
+
+
+async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two Plex-SESSION admins rotating concurrently: exactly one wins, one 409s.
+
+    Session auth never presents an ``X-Api-Key`` header, so the CAS compares the
+    stored key against the value each request's session LOADED at auth time. Both
+    requests are forced into the handler (each having observed the OLD key)
+    before either commits — the same rendezvous as the api-key barrier test
+    above. Were the CAS still gated to ``AuthMethod.api_key`` (the wave-2
+    finding), both would 200 and the second would silently clobber the first's
+    freshly minted key — the exact dead-key race the CAS exists to prevent.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies_a, headers_a = await _admin_session_cookies(app, plex_id=9101, tag="a")
+    cookies_b, headers_b = await _admin_session_cookies(app, plex_id=9102, tag="b")
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    both_in_handler = asyncio.Barrier(2)
+
+    async def rendezvous_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        await asyncio.wait_for(both_in_handler.wait(), timeout=5.0)
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", rendezvous_ensure)
+    # A CONTENDED asyncio.Lock binds to the event loop of the test that first
+    # contended it (the api-key barrier test above); this test runs in its own
+    # loop, so give it a fresh, loop-local lock — same serialization semantics.
+    monkeypatch.setattr(settings_router, "_rotate_lock", asyncio.Lock())
+
+    first, second = await asyncio.gather(
+        client.post("/api/v1/settings/app-key/rotate", cookies=cookies_a, headers=headers_a),
+        client.post("/api/v1/settings/app-key/rotate", cookies=cookies_b, headers=headers_b),
+    )
+
+    # Exactly one 200 (the winner) and one honest 409 (the loser) — never two 200s.
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    winner, loser = (first, second) if first.status_code == 200 else (second, first)
+    assert loser.json()["detail"] == "app_key_changed"
+
+    # The stored key is the winner's minted key — the loser did not clobber it
+    # with a second, unreturned key (which would strand the winner's client on a
+    # dead key).
+    new_key = winner.json()["app_api_key"]
+    assert new_key != _API_KEY
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == new_key
+
+
+# --------------------------------------------------------------------------- #
+# Opt-in recovery key — status / generate-from-null / revoke (keyless setup)
+# --------------------------------------------------------------------------- #
+async def test_app_key_status_false_on_fresh_keyless_init(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """A fresh install mints no key (setup is keyless), so status reports absence.
+
+    ``GET /app-key/status`` answers the Settings→Access UI's Generate-vs-Rotate
+    question WITHOUT the break-glass reveal. With no key stored, the only way in
+    is a Plex-session admin, so authenticate that way.
+    """
+    await seed(initialized=True)
+    cookies, _ = await _admin_session_cookies(app, plex_id=7001, tag="status-empty")
+
+    response = await client.get("/api/v1/settings/app-key/status", cookies=cookies)
+    assert response.status_code == 200
+    assert response.json() == {"exists": False}
+
+
+async def test_app_key_status_true_when_a_key_exists_without_revealing_it(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key/status", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json() == {"exists": True}
+    # The status probe never discloses the plaintext key — only its existence.
+    assert _API_KEY not in response.text
+
+
+async def test_app_key_status_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key/status")
+    assert response.status_code == 401
+
+
+async def test_reveal_app_key_404s_when_no_key_exists(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Reveal on a keyless install is an honest 404 envelope, not a bare 409.
+
+    The structured ``app_key_not_set`` envelope carries an operator-facing hint so
+    the UI can nudge toward Generate rather than surface an opaque failure.
+    """
+    await seed(initialized=True)
+    cookies, _ = await _admin_session_cookies(app, plex_id=7002, tag="reveal-absent")
+
+    response = await client.get("/api/v1/settings/app-key", cookies=cookies)
+    assert response.status_code == 404
+    body = response.json()
+    assert body["detail"] == "app_key_not_set"
+    assert body["hint"]  # a non-empty nudge toward generating one
+
+
+async def test_generate_app_key_from_null_mints_and_flips_status_true(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Rotate IS the generate path when no key exists: it mints, returns once, and
+    flips status to present; the freshly minted key then authenticates + reveals."""
+    await seed(initialized=True)
+    cookies, csrf = await _admin_session_cookies(app, plex_id=7003, tag="generate")
+
+    generate = await client.post("/api/v1/settings/app-key/rotate", cookies=cookies, headers=csrf)
+    assert generate.status_code == 200
+    new_key = generate.json()["app_api_key"]
+    assert len(new_key) > 20  # matches setup's historical token_urlsafe(32) shape
+
+    # Status now reports a key exists, without disclosing it.
+    status_after = await client.get(
+        "/api/v1/settings/app-key/status", headers={"X-Api-Key": new_key}
+    )
+    assert status_after.status_code == 200
+    assert status_after.json() == {"exists": True}
+
+    # The freshly minted key authenticates and reveals its own plaintext.
+    reveal = await client.get("/api/v1/settings/app-key", headers={"X-Api-Key": new_key})
+    assert reveal.status_code == 200
+    assert reveal.json() == {"app_api_key": new_key}
+
+
+async def test_revoke_app_key_returns_204_and_old_key_401s(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Revoke clears the stored key: 204 no-content, the old key 401s everywhere,
+    and status flips back to absent (checked via a Plex-session admin, since the
+    revoked key can no longer authenticate)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    key_headers = {"X-Api-Key": _API_KEY}
+
+    revoke = await client.delete("/api/v1/settings/app-key", headers=key_headers)
+    assert revoke.status_code == 204
+    assert revoke.content == b""  # 204 carries no body
+
+    # The revoked key no longer authenticates anywhere.
+    dead = await client.get("/api/v1/settings", headers=key_headers)
+    assert dead.status_code == 401
+
+    # A Plex-session admin still gets in and sees the key is gone.
+    cookies, _ = await _admin_session_cookies(app, plex_id=7004, tag="revoked")
+    status_after = await client.get("/api/v1/settings/app-key/status", cookies=cookies)
+    assert status_after.status_code == 200
+    assert status_after.json() == {"exists": False}
+
+
+async def test_revoke_app_key_requires_authentication(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.delete("/api/v1/settings/app-key")
+    assert response.status_code == 401
+
+
+async def test_revoke_app_key_is_idempotent_when_no_key_exists(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Revoking a keyless install is a no-op 204, not an error — the end state
+    (no key) is the same whether or not one was present."""
+    await seed(initialized=True)
+    cookies, csrf = await _admin_session_cookies(app, plex_id=7005, tag="revoke-noop")
+
+    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    assert revoke.status_code == 204
+    assert revoke.content == b""
+
+
+async def test_revoke_app_key_cas_rejects_stale_revoke_after_concurrent_rotation(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale revoke must not wipe a key rotated in between (lost update).
+
+    The revoke authenticates against the live key; a concurrent ROTATE then commits
+    a fresh key before this request writes ``None``. The earlier draft loaded
+    ``system`` and unconditionally cleared it, silently clobbering the rotation. The
+    revoke CAS (mirroring the rotate CAS) must re-read under the lock, see the key
+    is no longer the value it observed, and 409 — leaving the rotated key intact.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import settings as settings_router
+
+    real_ensure = settings_router.ensure_system_settings
+    winner_key = "rotated-mid-revoke-0123456789abcdef"
+    state = {"raced": False}
+
+    async def racing_ensure(session: AsyncSession) -> object:
+        row = await real_ensure(session)
+        if not state["raced"]:
+            # Fire once: a competing ROTATE commits a new key on a separate session
+            # AFTER this revoke authenticated against the old key but BEFORE it writes.
+            state["raced"] = True
+            async with sessionmaker_() as other:
+                other_row = await real_ensure(other)
+                other_row.app_api_key = winner_key
+                await other.commit()
+        return row
+
+    monkeypatch.setattr(settings_router, "ensure_system_settings", racing_ensure)
+
+    losing = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert losing.status_code == 409
+    assert losing.json()["detail"] == "app_key_changed"
+
+    # The concurrently-rotated key survived — the stale revoke did not wipe it.
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == winner_key
+
+
+async def test_revoke_app_key_leaves_key_none_on_success(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A normal (non-raced) revoke still commits ``None`` and returns 204 under the
+    new CAS: the observed key matches the stored key, so the clear proceeds."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    revoke = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert revoke.status_code == 204
+    assert revoke.content == b""
+
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None
+
+
+async def test_revoke_app_key_via_session_auth_clears_present_key(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A Plex-SESSION admin revoking a PRESENT key exercises the CAS's other
+    ``observed`` source: session auth carries no ``X-Api-Key`` header, so the CAS
+    compares against the value this request's session loaded at auth time. An
+    unraced revoke must therefore still clear the key (204), not spuriously 409.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, csrf = await _admin_session_cookies(app, plex_id=7006, tag="revoke-present")
+
+    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    assert revoke.status_code == 204
+    assert revoke.content == b""
+
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None

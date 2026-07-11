@@ -14,7 +14,7 @@ and the ``LogEvent`` repository backing the durable, LLM-diagnosable log store.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -26,10 +26,12 @@ __all__ = [
     "BlocklistRepository",
     "DownloadRecord",
     "DownloadRepository",
+    "DownloadScopeRecord",
     "LogEventCreate",
     "LogEventPage",
     "LogEventRecord",
     "LogEventRepository",
+    "QueueRecord",
     "RequestRecord",
     "RequestRepository",
     "SeasonRequestRecord",
@@ -56,6 +58,16 @@ class RequestRecord(BaseModel):
     # ``None`` until import/availability time sets it (or for a tv rollup row,
     # where the breadcrumb lives per-season on ``SeasonRequestRecord`` instead).
     library_path: str | None = None
+    # WHEN this request's import finalized (``mark_completed``) / became
+    # watchable (``mark_available``) -- i.e. the instant "Finalizing" began.
+    # ``None`` for a request that has never imported. The bounded-Finalizing
+    # warning (issue #158, ``import_service.run_availability_cycle``) reads this
+    # as the anchor for "elapsed time since completed" -- persisted and exact
+    # (survives a restart), unlike the in-memory fallback anchor a TV
+    # ``SeasonRequestRecord`` must use (it carries no per-season mirror of this
+    # column; see ``SqlRequestRepository.heal_completed_at``'s docstring on why
+    # one is deliberately deferred).
+    completed_at: datetime | None = None
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` must never
     # select this title, regardless of watch state or disk pressure.
     keep_forever: bool = False
@@ -66,6 +78,16 @@ class RequestRecord(BaseModel):
     # TV mirror lives on ``SeasonRequestRecord``.
     search_attempts: int = 0
     next_search_at: datetime | None = None
+    # Provenance marker (ADR-0012, issue #156): ``True`` only for a row THIS app's
+    # own eviction-guard fall-through created -- never an operator-initiated
+    # request (in particular never a #148 forced re-acquire). See
+    # ``MediaRequest.eviction_regrab``'s docstring for the full rationale.
+    eviction_regrab: bool = False
+    # TV-only request intent used by multi-season pack planning. ``None`` for
+    # movies and legacy rows.
+    tv_request_mode: str | None = None
+    requested_seasons: tuple[int, ...] | None = None
+    requested_episodes: dict[int, tuple[int, ...]] | None = None
 
 
 class DownloadRecord(BaseModel):
@@ -90,7 +112,59 @@ class DownloadRecord(BaseModel):
     media_type: str | None = None
     failed_reason: str | None = None
     first_seen_at: datetime | None = None
+    # When this download was grabbed (``downloads.added_at``, server-defaulted at
+    # row creation, and explicitly RE-STAMPED to now by
+    # ``grab_service._reuse_terminal_row`` when a terminal row is resurrected for
+    # a fresh grab under the same torrent hash) — distinct from ``first_seen_at``,
+    # which is ONLY the missing-grace anchor (stamped when a torrent first
+    # vanishes from the client). The stall self-heal (issue #165) anchors both its
+    # stall shapes on this: it correctly represents "since we started waiting" for
+    # a fresh grab, while ``first_seen_at`` is usually unset for a healthy,
+    # present torrent. Re-stamping on reuse (hardening finding) is what keeps that
+    # true across a resurrection -- without it a reused row would carry the STALE
+    # original grab time, letting the very next reconcile tick immediately
+    # misjudge the brand-new grab as stalled.
+    added_at: datetime | None = None
     download_path: str | None = None
+    # The release ("download") title the grab decision picked -- the same value
+    # already written to ``DownloadHistory.source_title`` at grab time and used
+    # for blocklisting (``blocklist_service.source_title_for``). Denormalized
+    # onto the row itself (issue #134) so the queue can show it without a join
+    # into the append-only history log. ``None`` for a pre-migration row with no
+    # backfillable history.
+    release_title: str | None = None
+    scopes: tuple[DownloadScopeRecord, ...] = ()
+
+
+class DownloadScopeRecord(BaseModel):
+    """One logical TV scope attached to a physical download."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    download_id: int
+    media_request_id: int | None = None
+    season_request_id: int | None = None
+    season: int | None = None
+    episodes: list[int] | None = None
+    status: str = "active"
+    completed_at: datetime | None = None
+
+
+class QueueRecord(DownloadRecord):
+    """``DownloadRecord`` enriched with the two ``MediaRequest``-only fields the
+    live queue view needs to render a human-legible row (issue #134): the media
+    ``title`` and its ``poster_url``. Sourced by
+    ``SqlDownloadRepository.list_active_for_queue``'s LEFT OUTER JOIN against
+    ``MediaRequest`` -- OUTER because ``media_request_id`` is nullable (SET NULL
+    when the owning request is deleted), so an orphaned download still produces a
+    row here, just with both fields ``None`` (honesty over silence: the row
+    always renders). Deliberately NOT used by ``list_active`` / the reconciler --
+    that domain-facing read stays on the plain ``DownloadRecord`` contract.
+    """
+
+    title: str | None = None
+    poster_url: str | None = None
 
 
 class SeasonRequestRecord(BaseModel):
@@ -112,11 +186,19 @@ class SeasonRequestRecord(BaseModel):
     # The per-season mirror of ``RequestRecord.library_path`` (ADR-0012): the
     # final placed path this season's import wrote into, ``None`` until set.
     library_path: str | None = None
+    installed_quality_id: int | None = None
+    installed_profile_index: int | None = None
     # Auto-grab scheduling (ADR-0013): the per-season mirror of
     # ``RequestRecord.search_attempts`` / ``next_search_at`` -- a TV grab is always
     # per-season, so the backoff ladder is tracked here.
     search_attempts: int = 0
     next_search_at: datetime | None = None
+    # The season-level mirror of ``RequestRecord.eviction_regrab`` (issue #156):
+    # ``True`` only for a season row ``season_request_service.ensure_seasons``
+    # created because Plex reported it present yet its newest tracked history was
+    # ``evicted`` -- the season-level eviction guard's own re-grab. See
+    # ``SeasonRequest.eviction_regrab``'s docstring.
+    eviction_regrab: bool = False
 
 
 class BlocklistRecord(BaseModel):
@@ -184,7 +266,10 @@ class LogEventPage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     total: int
-    results: list[LogEventRecord]
+    # Immutable tuple (issue #106): a frozen model blocks reassigning
+    # ``page.results`` but not appending to a plain list in place. A ``list``
+    # input is coerced by pydantic.
+    results: tuple[LogEventRecord, ...]
 
 
 @runtime_checkable
@@ -226,16 +311,39 @@ class RequestRepository(Protocol):
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return an existing non-terminal request for this media, for dedup."""
 
-    async def find_in_library(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
-        """Return the latest already-in-library (available/completed) request.
+    async def find_in_library(
+        self, tmdb_id: int, media_type: str, *, prefer_user_id: int | None = None
+    ) -> RequestRecord | None:
+        """Return an already-in-library (available/completed) request for dedup.
 
         Dedups the Plex-availability short-circuit: a repeat request for a movie
         already recorded as available returns that row instead of a duplicate.
+
+        ``prefer_user_id`` scopes WHICH terminal row is returned when several
+        exist for the same media (a legitimate state — see the remove-then-
+        reacquire flow): a row owned by that user is preferred, then an ownerless
+        (claimable) one, then anyone else's; newest-by-id within each rank. This
+        is the per-user visibility rule for shared (non-admin) sessions — without
+        it, another user's NEWER terminal row shadows the caller's own older one
+        and turns their re-request into a spurious ``requested_by_another_user``
+        rejection. ``None`` (the default; admins and API-key automation) returns
+        the newest row unconditionally, the pre-preference behavior.
+        """
+        raise NotImplementedError
+
+    async def latest_request_evicted(self, tmdb_id: int, media_type: str) -> bool:
+        """Whether the NEWEST request row for this media is ``evicted`` (ADR-0012).
+
+        Lets the in-library short-circuit refuse to trust a STALE Plex 'present'
+        reading during the eviction delete window (the sweep commits ``evicted``
+        before it unlinks the file and before the post-delete Plex refresh), so a
+        re-request re-grabs instead of minting an ``available`` row over a doomed
+        file. See ``SqlRequestRepository.latest_request_evicted``'s docstring.
         """
         raise NotImplementedError
 
     async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]]
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
     ) -> dict[tuple[int, str], str]:
         """Batch the DISPLAY request status per ``(tmdb_id, media_type)`` for tiles.
 
@@ -248,6 +356,12 @@ class RequestRepository(Protocol):
         ``MediaRequest.status`` carries the persisted per-season rollup
         (``partially_available``/...), so no per-season fan-out is needed. Keys with
         no request row are simply ABSENT from the mapping (never a fabricated status).
+
+        ``for_user_id`` scopes the lookup to ONE user's own request rows -- the
+        per-user visibility rule for shared (non-admin) sessions, mirroring the
+        requests list/get filtering exactly (``user_id == for_user_id``; ownerless
+        rows are excluded too, just as the list hides them). ``None`` (the
+        default) is unscoped: admins and API-key automation see every row.
         """
         raise NotImplementedError
 
@@ -263,21 +377,49 @@ class RequestRepository(Protocol):
         user_id: int | None = None,
         poster_url: str | None = None,
         backdrop_url: str | None = None,
+        eviction_regrab: bool = False,
+        tv_request_mode: str | None = None,
+        requested_seasons: Sequence[int] | None = None,
+        requested_episodes: Mapping[int, Sequence[int]] | None = None,
     ) -> RequestRecord:
-        """Insert a new request and return the persisted record."""
+        """Insert a new request and return the persisted record.
+
+        ``eviction_regrab`` (issue #156) stamps the provenance marker: ``True``
+        only when THIS insert is the eviction-guard fall-through (``request_
+        service.create_request``'s ``latest_request_evicted`` branch), never for
+        an ordinary or forced (#148) request.
+        """
+        raise NotImplementedError
+
+    async def set_tv_request_intent(
+        self,
+        request_id: int,
+        *,
+        mode: str,
+        requested_seasons: Sequence[int] | None,
+        requested_episodes: Mapping[int, Sequence[int]] | None = None,
+    ) -> None:
+        """Persist TV request intent for multi-season pack planning."""
         raise NotImplementedError
 
     async def set_status(self, request_id: int, status: str) -> None:
         """Update a request's status."""
 
     async def set_status_if_in(
-        self, request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_unpinned: bool = False,
     ) -> bool:
-        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
+        (and, with ``require_unpinned``, only if not ``keep_forever``-pinned).
 
         Returns whether the row was actually updated -- ``False`` means a
-        genuinely concurrent writer already moved it elsewhere. The eviction
-        sweep's authoritative double-count guard (ADR-0012, C6): see
+        genuinely concurrent writer already moved it elsewhere (or pinned it). The
+        eviction sweep's authoritative double-count guard (ADR-0012, C6) and, with
+        ``require_unpinned``, its pre-delete pin-safe CLAIM (#67): see
         ``SqlRequestRepository.set_status_if_in``'s docstring.
         """
         raise NotImplementedError
@@ -378,13 +520,31 @@ class DownloadRepository(Protocol):
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         """Insert a new download and return the persisted record.
 
         ``episodes`` (TV only) persists to ``Download.episodes_json``: ``None``
         means import every valid video file found for the season; an explicit list
-        scopes the import to those episode numbers only.
+        scopes the import to those episode numbers only. ``release_title`` is the
+        grab decision's release name (issue #134) -- the same value the caller
+        already writes to ``DownloadHistory.source_title``.
         """
+        raise NotImplementedError
+
+    async def ensure_scope(
+        self,
+        download_id: int,
+        *,
+        media_request_id: int | None,
+        season: int | None,
+        episodes: list[int] | None = None,
+    ) -> DownloadScopeRecord:
+        """Attach a logical TV scope to an existing physical download."""
+        raise NotImplementedError
+
+    async def list_scopes(self, download_id: int) -> list[DownloadScopeRecord]:
+        """List logical scopes attached to ``download_id``."""
         raise NotImplementedError
 
     async def update_status(
@@ -460,6 +620,18 @@ class SeasonRequestRepository(Protocol):
         """List season requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Season numbers whose NEWEST row (across this ``tmdb_id``'s ``tv``
+        requests) is ``evicted`` (ADR-0012).
+
+        ``ensure_seasons`` subtracts these from Plex's ``present_seasons`` snapshot
+        so a season the disk-pressure sweep is mid-deleting is never created or
+        re-armed straight to ``available`` off a STALE 'present' reading -- the
+        season-level twin of :meth:`RequestRepository.latest_request_evicted`. See
+        ``SqlSeasonRequestRepository.evicted_seasons``'s docstring.
+        """
+        raise NotImplementedError
+
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[SeasonRequestRecord]:
@@ -485,13 +657,20 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def ensure(
-        self, media_request_id: int, season_number: int, *, status: str
+        self,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
         """Idempotently return the ``(media_request_id, season_number)`` row.
 
         Creates it with ``status`` if it does not yet exist; if it already exists,
         returns the EXISTING row unchanged (``status`` is only the value used on
         first creation, never applied to an already-established season).
+        ``eviction_regrab`` (issue #156) is likewise only applied on first
+        creation -- see ``SeasonRequest.eviction_regrab``'s docstring.
 
         Race-safe under the unconditional ``uq_season_requests_media_season``
         unique index: two callers racing to lazily-create the SAME season resolve
@@ -505,9 +684,16 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def set_status_if_in(
-        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        season_request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_parent_unpinned: bool = False,
     ) -> bool:
-        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``.
+        """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
+        (and, with ``require_parent_unpinned``, only if the PARENT show is not
+        ``keep_forever``-pinned).
 
         The season-granularity mirror of ``RequestRepository.set_status_if_in``;
         see ``SqlSeasonRequestRepository.set_status_if_in``'s docstring.
@@ -539,6 +725,12 @@ class SeasonRequestRepository(Protocol):
         The per-season mirror of :meth:`RequestRepository.set_library_path` --
         same "set once, never reconstruct" rule, same eviction target.
         """
+        raise NotImplementedError
+
+    async def set_installed_quality(
+        self, season_request_id: int, *, quality_id: int, profile_index: int | None
+    ) -> None:
+        """Store the imported quality breadcrumb for this season."""
         raise NotImplementedError
 
 
@@ -640,8 +832,9 @@ class LogEventRepository(Protocol):
         correlation_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> LogEventPage:
-        """Return a page of log records, newest first, optionally filtered.
+        """Return a page of log records, newest first by default, optionally filtered.
 
         ``level`` matches the exact stored level name (e.g. ``"ERROR"``) --
         mirrors the plain-string status filters elsewhere in this module, no
@@ -652,6 +845,12 @@ class LogEventRepository(Protocol):
         -- the same identifiers ``GET /ops/logs/export`` assembles one trail for.
         ``limit``/``offset`` page the (already filtered) result set; ``total`` on
         the returned page is the filtered count, not the whole table's.
+
+        ``oldest_first`` defaults to ``False`` (newest-first, unchanged). When
+        ``True``, rows are ordered ``created_at ASC, id ASC`` instead -- the
+        ordering ``GET /ops/logs/export`` uses so that a window exceeding the
+        export cap keeps the OLDEST matching rows (the root-cause lead-up),
+        not the newest (see issue #96).
         """
         raise NotImplementedError
 

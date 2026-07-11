@@ -9,8 +9,10 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
+from plex_manager.services import path_visibility
 from plex_manager.services.health_service import ReconcileStatus
 from plex_manager.web.deps import SettingsStore
 
@@ -98,6 +100,45 @@ async def test_prowlarr_reports_ok_then_down_once_configured(
     assert down_body["prowlarr"]["detail"] is not None
 
 
+async def test_qbittorrent_carries_a_note_when_its_default_save_path_is_invisible(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issues #133/#157: the ``/ops/health`` surface carries the SAME
+    non-blocking save-path-visibility signal setup validation does."""
+
+    def _never_a_mount(_path: str) -> bool:
+        return False
+
+    monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_mount)
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://qb.local")
+        await store.set("qbittorrent_username", "admin")
+        await store.set("qbittorrent_password", "pw")
+        await session.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/torrents/info":
+            return httpx.Response(200, json=[])
+        if path == "/api/v2/app/preferences":
+            return httpx.Response(
+                200, json={"save_path": "/definitely-not-a-real-host-path/Downloads"}
+            )
+        raise AssertionError(f"unexpected path {path}")  # pragma: no cover
+
+    await _use_transport(app, handler)
+    response = await client.get("/api/v1/ops/health", headers=_HEADERS)
+    by_name = {s["name"]: s for s in response.json()["subsystems"]}
+    assert by_name["qbittorrent"]["status"] == "ok"
+    assert by_name["qbittorrent"]["note"] is not None
+    assert "/definitely-not-a-real-host-path/Downloads" in by_name["qbittorrent"]["note"]
+
+
 async def test_subsystem_probe_is_ttl_cached_across_requests(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
 ) -> None:
@@ -121,6 +162,51 @@ async def test_subsystem_probe_is_ttl_cached_across_requests(
     # The second call within the TTL window reuses the cached probe result --
     # the whole point of the cache (never hammer an upstream on every poll).
     assert calls["n"] == 1
+
+
+async def test_health_generation_snapshot_covers_the_credential_read(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex round 3: the endpoint's generation snapshot must be taken BEFORE
+    its ``SettingsStore`` credential reads, or an invalidation landing in the
+    gap between the credential read and the probes (a ``PUT /settings`` racing
+    this request) post-dates a probe-time snapshot and the stale, old-credential
+    probe result gets cached for another full TTL. Hooks the endpoint's LAST
+    credential read to fire the invalidation in exactly that gap."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://prowlarr.local")
+        await store.set("prowlarr_api_key", "old-key")
+        await session.commit()
+
+    await _use_transport(app, lambda _r: httpx.Response(200, json={"version": "1.0"}))
+
+    real_get = SettingsStore.get
+
+    async def get_then_invalidate(self: SettingsStore, key: str) -> str | None:
+        value = await real_get(self, key)
+        if key == "tmdb_api_key":
+            # The endpoint's LAST credential read: the (old) prowlarr key has
+            # already left the store, no probe has started yet -- a settings
+            # save committing right here invalidates "prowlarr" in the exact
+            # window a probe-time snapshot cannot see.
+            app.state.health_cache.invalidate("prowlarr")
+        return value
+
+    monkeypatch.setattr(SettingsStore, "get", get_then_invalidate)
+
+    response = await client.get("/api/v1/ops/health", headers=_HEADERS)
+    assert response.status_code == 200
+    by_name = {s["name"]: s for s in response.json()["subsystems"]}
+    # The response honestly reports what the old-credential probe saw...
+    assert by_name["prowlarr"]["status"] == "ok"
+    # ...but that stale result must NOT have been cached: the mid-request
+    # invalidation wins, and the next poll re-probes with fresh credentials.
+    assert app.state.health_cache.get("prowlarr") is None
+    # The fence is per-key: subsystems the mid-request save didn't touch
+    # cached their (not_configured) results normally.
+    assert app.state.health_cache.get("plex") is not None
 
 
 async def test_health_reports_disk_gauge_for_a_configured_root(

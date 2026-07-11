@@ -7,11 +7,11 @@ wiring is a drop-in later. All methods are async.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Collection, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 __all__ = ["LibraryPort", "LibrarySection", "WatchState"]
 
@@ -36,12 +36,34 @@ class WatchState(BaseModel):
     (``domain/eviction.py``) treats a missing timestamp as never-eligible
     regardless of ``watched``, so this keeps the two signals honestly aligned at
     the source.
+
+    ``last_viewed_at`` is always tz-AWARE once constructed (issue #82): eviction
+    and retention-telemetry both subtract it against UTC-aware cutoffs
+    (``domain/eviction.py``, ``services/retention_telemetry_service.py``'s own
+    ``_as_utc``), and a naive value straight off a careless adapter/fake would
+    raise ``TypeError`` deep inside that arithmetic instead of at this boundary.
+    A naive input is NORMALIZED by re-attaching UTC -- mirroring the identically
+    named ``_as_utc`` idiom already used at every other naive-datetime boundary in
+    this codebase (``repositories/downloads.py``, ``repositories/log_events.py``,
+    ``repositories/requests.py``, ``repositories/season_requests.py``,
+    ``services/retention_telemetry_service.py``) -- rather than rejected: every one
+    of those precedents treats "naive but was always meant as UTC" as the honest
+    normalization, never a hard failure over a timezone a well-behaved caller
+    simply forgot to attach.
     """
 
     model_config = ConfigDict(frozen=True)
 
     watched: bool
     last_viewed_at: datetime | None = None
+
+    @field_validator("last_viewed_at")
+    @classmethod
+    def _normalize_naive_to_utc(cls, value: datetime | None) -> datetime | None:
+        """Re-attach UTC to a naive ``last_viewed_at`` (see class docstring)."""
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 @runtime_checkable
@@ -81,22 +103,93 @@ class LibraryPort(Protocol):
         SINGLE library crawl instead of one per season. Always reflects the library
         as it is NOW (like ``is_available(use_cache=False)`` — never trusts a cached
         absence); empty when the show is absent or has no indexed season.
+
+        NOTE: this crawls EVERY show section's full ``/all`` listing to build the
+        whole-library season map (see the adapter's ``_collect_present_tv_seasons``).
+        A caller that only needs a KNOWN set of shows' seasons should use
+        :meth:`season_presence` instead — it still costs exactly one page-walk, but
+        answers only the requested ids rather than the whole library's map.
+        """
+        raise NotImplementedError
+
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        """Return the season numbers present for EACH show in ``tmdb_ids``, via ONE
+        BATCH-shaped targeted lookup.
+
+        Unlike :meth:`present_seasons` (which crawls every show section's FULL
+        listing to answer for ANY one show, repeated per caller), this resolves
+        ALL of ``tmdb_ids`` from a SINGLE page-walk across every show section —
+        cost model: one page-walk total, plus one ``/children`` fetch per matched
+        item (not per requested id — a show may have more than one matching item,
+        see below) — the batch availability reconcile
+        (``import_service.run_availability_cycle``) depends on this to check every
+        distinct pending show in a tick without re-paging the library once per
+        show. A tmdb id absent from every show section maps to an empty
+        ``frozenset`` (never omitted from the returned mapping).
+
+        A show can legitimately have MORE THAN ONE matching item across (or within)
+        show sections — e.g. the same title catalogued in both a "TV Shows" and an
+        "Anime" section, or a duplicate entry in one section — so an implementation
+        MUST union the present seasons across every item matching a given tmdb id,
+        never just the first match. Returning only the first hit's seasons can
+        under-report a season that is actually present on a later duplicate,
+        stranding it at "Finalizing" forever.
+
+        Always reads FRESH (like ``present_seasons`` — never trusts a cached
+        absence): a season that just finished indexing must be seen on the very
+        next check, not held stale for a cache TTL.
+
+        Failure isolation (round 4, #136 review): a requested id is present as a
+        KEY in the returned mapping only when its lookup SUCCEEDED — an empty
+        ``frozenset`` genuinely means "no seasons present", while an id OMITTED
+        from the mapping means its lookup FAILED and the caller must treat it as
+        unknown/retry-next-cycle, never as "not yet available". This matters
+        because one show's underlying metadata lookup can fail independently
+        (e.g. a row deleted between an earlier crawl and this lookup, or a
+        persistently bad row returning 404/500) without that being a genuine
+        whole-batch transport failure — an implementation MUST isolate a single
+        show's lookup failure from the rest of the batch rather than letting it
+        abort every other requested id. A whole-batch transport failure (the
+        page-walk itself failing) is still allowed to raise
+        ``PlexLibraryError``/``PlexAuthError`` — the caller's own try/except
+        around the whole call handles that, leaving every requested id
+        unresolved for that tick.
         """
         raise NotImplementedError
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         """Return the subset of ``(tmdb_id, media_type)`` pairs present in the library.
 
-        The BATCH presence accessor for tile decoration (Discover/Search): a whole
-        page's keys are answered from AT MOST one movie crawl plus one show crawl
-        total -- never one library read per title (the prototype's "20 tiles = 20
-        crawls" anti-pattern). Cache-backed (``use_cache=True`` semantics): tiles are
-        HINTS and tolerate the short presence-cache staleness, so this reads the
-        warmed full-crawl snapshot rather than re-paging Plex per page-load. The
-        authoritative fresh dedup decision stays on the create path
-        (``is_available(use_cache=False)``), never here.
+        The BATCH presence accessor for tile decoration (Discover/Search) AND for
+        the availability reconcile cycle: a whole page's (or tick's) keys are
+        answered from AT MOST one movie crawl plus one show crawl total -- never
+        one library read per title (the prototype's "20 tiles = 20 crawls"
+        anti-pattern).
+
+        ``refresh_absent=False`` (the default, used by tile decoration): trusts a
+        warmed snapshot as-is, even if it does not contain one of the queried keys
+        -- tiles are HINTS and tolerate the short presence-cache staleness, so a
+        miss pages Plex once and warms the cache for the next page-load, but a hit
+        is never re-verified. The authoritative fresh dedup decision stays on the
+        create path (``is_available(use_cache=False)``), never here.
+
+        ``refresh_absent=True`` (used by the availability reconcile cycle,
+        ``import_service.run_availability_cycle``): trusts a cached PRESENCE but
+        never a cached ABSENCE for a queried key, mirroring ``is_available``'s
+        contract at batch granularity -- a warmed snapshot that does not confirm
+        EVERY queried key as present triggers exactly one fresh crawl before
+        answering (never per-key, never more than one crawl per call). This
+        matters because a Plex partial scan is asynchronous: the scan-triggered
+        cache invalidation (``trigger_scan``) can be followed by a reconcile tick
+        that pages Plex BEFORE indexing finishes, caching that miss; without
+        ``refresh_absent`` a subsequent tick would trust that stale absence for
+        the rest of the cache TTL instead of promoting the title on the very next
+        tick after it actually finishes indexing.
 
         Presence is SHOW-LEVEL for TV (the show is in the library), the granularity
         a tile needs -- per-season detail stays in the title modal. Only ever yields
@@ -107,6 +200,45 @@ class LibraryPort(Protocol):
         """
         raise NotImplementedError
 
+    async def confirm_paths(
+        self,
+        media_type: Literal["movie", "tv"],
+        library_paths: Collection[str],
+    ) -> frozenset[str]:
+        """GUID-INDEPENDENT fallback: confirm ``library_paths`` by DIRECTORY-PREFIX
+        match against the file path(s) Plex reports for its indexed items (issue
+        #158).
+
+        Some titles are matched by Plex's metadata provider to an item that carries
+        no ``tmdb://`` (or even a WRONG/unrelated) guid -- new/obscure releases, or a
+        provider mismatch -- so GUID-based confirmation (:meth:`present_ids`)
+        can never succeed for them, no matter how long the import cycle waits.
+        This is the app's OWN fallback: it knows exactly which folder it placed a
+        completed download's file(s) into (the ``library_path`` breadcrumb,
+        ADR-0012), so it can ask "did Plex index a file *there*", independent of
+        which (or whether any) guid Plex's provider assigned.
+
+        ``library_paths`` are CONTAINER-namespace directories (a movie's folder, or
+        a TV season's directory) -- never a bare file. Each is confirmed when SOME
+        item's reported file path, after translating the section's own
+        HOST-namespace location the same way :meth:`trigger_scan` reverses it, sits
+        AT or BELOW that directory. Matching is PURELY by path -- never by title or
+        year -- so a same-title/same-year but genuinely different file can never
+        false-confirm.
+
+        Batched like :meth:`present_ids`/:meth:`season_presence`: every requested
+        path is answered from ONE crawl of the relevant (movie or show) sections,
+        never one crawl per path -- a caller with many pending rows in one tick
+        still costs a single pass. Returns the SUBSET of ``library_paths`` that
+        confirmed; a path with no match (including one under no known section at
+        all) is simply absent from the result, never raised. A genuine crawl
+        failure (the section walk itself failing) is allowed to raise
+        ``PlexLibraryError``/``PlexAuthError`` -- the caller's own try/except
+        handles that exactly like :meth:`present_ids`'s batch failure, leaving
+        every queried path unconfirmed for this tick's retry.
+        """
+        raise NotImplementedError
+
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         """Ask the media server to scan ``path`` (partial-scan when supported).
 
@@ -114,7 +246,13 @@ class LibraryPort(Protocol):
         ``path``-prefix match (movie sections for movies, show sections for TV),
         so a TV season folder is never matched against a movie section (or vice
         versa) and the full-refresh fallback stays scoped to the relevant kind.
+
+        Raises ``NotImplementedError`` by default (issue #81): a silent no-op
+        default would let a future adapter or fake falsely report a completed
+        Plex scan after an import or purge, so a missing override must fail
+        loudly at call time instead.
         """
+        raise NotImplementedError
 
     async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
         """Return the configured library sections.

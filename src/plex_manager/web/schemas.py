@@ -13,10 +13,22 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from plex_manager.headersafe import HEADER_VALUE_MESSAGE, header_value_error
+from plex_manager.web.settings_bounds import (
+    DISK_PRESSURE_PERCENT_MAX,
+    DISK_PRESSURE_PERCENT_MIN,
+    EVICTION_GRACE_DAYS_MAX,
+    EVICTION_INTERVAL_MAX_MINUTES,
+    LOG_RETENTION_DAYS_MAX,
+)
 from plex_manager.web.url_validation import url_shape_error
 
 __all__ = [
     "AcceptedRelease",
+    "AppApiKeyResponse",
+    "AppApiKeyStatusResponse",
+    "AuthMeResponse",
+    "AuthUser",
     "BlocklistEntry",
     "BlocklistResponse",
     "CreateRequestBody",
@@ -28,6 +40,7 @@ __all__ = [
     "DiskResponse",
     "DiskRootItem",
     "ErrorDetail",
+    "ErrorEnvelope",
     "EvictErrorItem",
     "EvictResponse",
     "EvictionCandidateItem",
@@ -40,6 +53,10 @@ __all__ = [
     "LogsResponse",
     "LogsTailResponse",
     "PlexLibraryOption",
+    "PlexServerConnection",
+    "PlexServerOption",
+    "PlexServersResponse",
+    "PlexSignInRequest",
     "PlexValidateRequest",
     "ProwlarrValidateRequest",
     "QbittorrentValidateRequest",
@@ -47,6 +64,7 @@ __all__ = [
     "QualityProfileResponse",
     "QueueItem",
     "QueueResponse",
+    "QueueScope",
     "ReconcileStatusItem",
     "RejectedRelease",
     "ReportIssueBody",
@@ -83,16 +101,41 @@ class ErrorDetail(BaseModel):
     detail: str
 
 
+class ErrorEnvelope(BaseModel):
+    """Structured error body for auth/setup failures (north star #3).
+
+    The richer sibling of :class:`ErrorDetail`, rendered by
+    ``web.errors.install_error_handlers``. ``detail`` stays the stable machine
+    code the SPA's humanizer keys on; ``message``/``hint`` are operator-facing
+    prose; ``diagnostics`` carries only NON-secret context (host, status, ...) —
+    a secret NEVER appears here. ``hint``/``diagnostics`` are omitted from the
+    wire when absent, so a client reads their absence, not an empty value.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
+    message: str
+    hint: str | None = None
+    diagnostics: dict[str, str] | None = None
+
+
 # --------------------------------------------------------------------------- #
 # Setup wizard — connection validation (unauthenticated, pre-init)
 # --------------------------------------------------------------------------- #
 class PlexValidateRequest(BaseModel):
-    """Candidate Plex credentials to test (``POST /setup/validate/plex``)."""
+    """Candidate Plex server to test (``POST /setup/validate/plex``).
+
+    ``token`` is OPTIONAL: omitted (``None``) means "use the signed-in admin's
+    stored Plex OAuth token" — the wizard's happy path never re-types a token, it
+    only supplies ``url`` for a chosen (or custom) server. A non-null ``token`` is
+    the explicit custom-credential override.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     url: str
-    token: str
+    token: str | None = None
 
 
 class ProwlarrValidateRequest(BaseModel):
@@ -146,6 +189,63 @@ class PlexLibraryOption(BaseModel):
     # is set only by the authenticated Settings picker, where the operator's own
     # stored creds make the probe legitimate.
     writable: bool | None = None
+    # A container-visible remap of ``path`` (see ``services.path_visibility``) when
+    # ``path`` is a HOST-namespace location this server can't see under its own
+    # mounts -- e.g. Plex reports ``/home/Media/Movies`` but this container only
+    # sees ``/media/Movies``. ``None`` when ``path`` already resolves here, or no
+    # remap exists. The picker UIs prefer this as the option's STORED value, so
+    # selecting it round-trips a path the write-time gate (setup/settings) accepts
+    # without a second remap.
+    suggested_path: str | None = None
+    # NOTE (PR #147 round 3, maintainer decision): a short-lived
+    # ``low_confidence_suggested_path`` mount-root GUESS briefly lived here within
+    # this PR and was removed before release -- an unresolvable Plex location must
+    # never be dressed up as a pickable ``/media``, even flagged low-confidence (a
+    # child section like ``/srv/plex-data/Movies`` would misroute to the bare mount
+    # root). The rare arbitrary-bind-root topology is served by manual entry plus
+    # the wizard's visibility hint instead. The field never shipped in a release,
+    # so removing it breaks no released client.
+
+
+ProbeStatusField = Literal["ok", "unreachable"]
+
+
+class PlexServerConnection(BaseModel):
+    """One advertised address for an owned Plex server, with its probe verdict.
+
+    ``uri`` is the exact connection plex.tv reports (``local`` marks a LAN address;
+    ``relay`` a plex.tv relay). ``status`` is this backend's OWN reachability probe
+    of ``{uri}/identity`` — ``"ok"`` when it answered, ``"unreachable"`` when the
+    backend could not reach it (with ``error_code`` naming why). A dead connection
+    is surfaced honestly, never dropped, so the operator can pick a reachable one.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    uri: str
+    local: bool
+    relay: bool
+    status: ProbeStatusField
+    error_code: str | None = None
+
+
+class PlexServerOption(BaseModel):
+    """One of the signed-in admin's OWNED Plex servers, offered by the wizard."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    machine_identifier: str
+    connections: list[PlexServerConnection]
+
+
+class PlexServersResponse(BaseModel):
+    """The admin's owned Plex servers with each connection probed
+    (``GET /setup/plex/servers``)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    servers: list[PlexServerOption]
 
 
 class ServiceValidateResponse(BaseModel):
@@ -155,7 +255,18 @@ class ServiceValidateResponse(BaseModel):
     For Plex, ``libraries`` carries the movie AND tv library folders (each tagged
     by ``section_type``) so the UI can offer pick-lists for ``movies_root`` /
     ``tv_root`` instead of a typed path. ``None`` for every other service (and for
-    a failed Plex check)."""
+    a failed Plex check). ``machine_identifier`` is the probed Plex server's
+    ``machineIdentifier`` (from its ``/identity``) — set only when the caller asked
+    for the ownership-verifying variant of the Plex probe, so setup can assert
+    ownership and store the id; ``None`` otherwise.
+
+    ``download_path_note`` (qBittorrent only, issues #133/#157) is a NON-blocking,
+    informational message: set only on an ``ok=True`` qBittorrent check whose
+    client-reported default save path is NOT visible inside this container. It never
+    flips ``ok`` to ``False`` -- Plex Manager directs every grab's ``save_path``
+    explicitly (never relies on this default), so the mismatch is honestly
+    surfaced but does not block setup/health. ``None`` for every other service, and
+    for qBittorrent whenever the default path IS visible or could not be read."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -163,6 +274,48 @@ class ServiceValidateResponse(BaseModel):
     message: str
     detail: str | None = None
     libraries: list[PlexLibraryOption] | None = None
+    machine_identifier: str | None = None
+    download_path_note: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Browser authentication — Plex sign-in
+# --------------------------------------------------------------------------- #
+class PlexSignInRequest(BaseModel):
+    """A browser-obtained plex.tv token to verify server-side (``POST /auth/plex``).
+
+    The browser ran the plex.tv PIN flow itself; the backend re-derives identity
+    and server ownership from this token before writing any user or session, so
+    the token is never trusted for its claims — only used to call plex.tv.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    auth_token: str
+
+
+class AuthUser(BaseModel):
+    """Current signed-in Plex user."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    plex_id: int | None
+    username: str
+    email: str | None = None
+    avatar_url: str | None = None
+    is_admin: bool = False
+
+
+class AuthMeResponse(BaseModel):
+    """Current app authentication state."""
+
+    model_config = ConfigDict(frozen=True)
+
+    authenticated: bool
+    auth_method: Literal["api_key", "plex_session", "dev_bypass"] | None = None
+    is_admin: bool = False
+    user: AuthUser | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +361,16 @@ class SetupCompleteRequest(BaseModel):
     )
 
     plex_url: str
-    plex_token: str
+    # The wizard's chosen server — ADVISORY only: ``/setup/complete`` re-derives the
+    # persisted id live from the submitted server's ``/identity`` and re-asserts
+    # ownership, so a direct API caller cannot pair server-X creds with server-Y's
+    # id (see ``web.routers.setup.complete``). Post-init sign-in then resolves
+    # server access from the STORED (derived) id without re-probing /identity.
+    plex_machine_identifier: str
+    # OPTIONAL: ``None`` (omitted) means "persist the signed-in admin's stored Plex
+    # OAuth token" — the keyless wizard never re-types the token. A non-null value is
+    # an explicit custom-credential override.
+    plex_token: str | None = None
     prowlarr_url: str
     prowlarr_api_key: str
     qbittorrent_url: str
@@ -246,6 +408,30 @@ class SetupCompleteRequest(BaseModel):
             raise ValueError(message)
         return value
 
+    @field_validator("plex_token", "prowlarr_api_key")
+    @classmethod
+    def _validate_header_safe_credential(cls, value: str | None) -> str | None:
+        """Reject a credential that cannot ride its outbound HTTP header BEFORE it
+        is persisted (the header-safety persistence bypass).
+
+        ``plex_token`` rides ``X-Plex-Token`` and ``prowlarr_api_key`` rides
+        ``X-Api-Key``. A CR/LF/NUL value makes httpx echo the RAW credential in
+        ``str(exc)`` (a secret leak through any adapter that logs a chained
+        transport error -- e.g. ``ProwlarrIndexer._indexer_priorities``' priority
+        warning), and a non-ASCII value makes httpx's ASCII header encoder raise an
+        uncaught ``UnicodeEncodeError`` (a 500). The wizard's live "Test connection"
+        probes already reject such a value up front
+        (:func:`~plex_manager.web.setup_validation._require_header_safe_credential`);
+        enforcing the SAME predicate here -- shared verbatim with ``SettingsUpdate``
+        -- closes the direct-API / keyless-token bypass so a header-unsafe credential
+        can never be stored and then leaked (or crash the grab loop) when an adapter
+        later sends it as a header. ``None`` (an omitted ``plex_token``) is
+        header-safe and passes untouched.
+        """
+        if value and header_value_error(value) is not None:
+            raise ValueError(HEADER_VALUE_MESSAGE)
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def require_at_least_one_library_root(cls, data: Any) -> Any:
@@ -275,12 +461,13 @@ class SetupCompleteRequest(BaseModel):
 
 
 class SetupStatusResponse(BaseModel):
-    """Install state. ``app_api_key`` is populated only once initialized."""
+    """Install state: whether setup is finished, and whether the optional pre-init
+    hardening token is required. No app key is ever minted or served — Plex sign-in
+    is the sole credential model (there is no one-time key to disclose)."""
 
     model_config = ConfigDict(frozen=True)
 
     initialized: bool
-    app_api_key: str | None = None
     setup_token_required: bool = False
 
 
@@ -313,12 +500,17 @@ class SettingsResponse(BaseModel):
     anime_movie_root: str | None = None
     anime_tv_root: str | None = None
     # Operability beta (ADR-0012) — the eviction/log-retention knobs from
-    # ``web.deps.KNOWN_SETTING_KEYS``. ``None`` means "unset" (the typed getters
-    # in ``web.deps`` — e.g. ``get_eviction_grace_days`` — fall back to their own
-    # safe default in that case; this response mirrors what is actually STORED,
-    # not the effective fallback, matching ``movies_root``/``tv_root`` above).
+    # ``web.deps.KNOWN_SETTING_KEYS``. ``None`` means "unset OR degraded to the
+    # default" (the typed getters in ``web.deps`` — e.g.
+    # ``get_eviction_grace_days`` — resolve to their safe default in that
+    # case). A VALID stored value is mirrored verbatim; a corrupt/out-of-range
+    # one is presented as the EFFECTIVE value the runtime resolves it to (a
+    # clamped bound, the disk-pressure pair rule) or ``None`` when that
+    # effective value IS the default — see ``web.routers.settings.
+    # _sanitize_typed_settings``, which shares the ``web.deps`` resolvers so
+    # this response can never claim a state the running loops aren't in.
     # Stored as plain-text ``settings.value`` strings; pydantic coerces the
-    # stored string into the typed field below on the way out.
+    # (sanitized) string into the typed field below on the way out.
     disk_pressure_threshold_percent: float | None = None
     disk_pressure_target_percent: float | None = None
     eviction_grace_days: int | None = None
@@ -334,19 +526,33 @@ class SettingsResponse(BaseModel):
 
 
 class AppApiKeyResponse(BaseModel):
-    """The current (reveal) or freshly-minted (rotate) app ``X-Api-Key``, in plaintext.
+    """The current (reveal) or freshly-minted (generate/rotate) app ``X-Api-Key``.
 
-    Authenticated-only (both endpoints require a currently-valid ``X-Api-Key``):
-    reveal is the belt-and-braces recovery path for a lost/forgotten key on a
-    device that still has it saved, and rotate mints and returns a brand-new key
-    ONCE — the plaintext is never retrievable again after this response, only the
-    Fernet-encrypted column at rest (matching the one-time disclosure setup's
-    ``/complete`` already gives the initial key).
+    Authenticated-only (Plex session or currently-valid ``X-Api-Key``). Setup mints
+    NO key — this is an OPT-IN recovery/automation credential the operator generates
+    on demand from Settings → Access. Reveal is the break-glass path for a key
+    lost/forgotten on a device that still has it saved; generate/rotate mints and
+    returns a brand-new key ONCE — the plaintext is never retrievable again after
+    this response, only the Fernet-encrypted column at rest.
     """
 
     model_config = ConfigDict(frozen=True)
 
     app_api_key: str
+
+
+class AppApiKeyStatusResponse(BaseModel):
+    """Whether an app ``X-Api-Key`` recovery key currently exists — never the key.
+
+    Powers the Settings → Access control's Generate-vs-Rotate/Revoke choice
+    WITHOUT the break-glass reveal: ``exists`` is ``True`` once a key has been
+    generated (and not since revoked), ``False`` on a fresh keyless install (setup
+    mints nothing) or after a revoke. The plaintext is never serialized here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    exists: bool
 
 
 class SettingsUpdate(BaseModel):
@@ -398,14 +604,27 @@ class SettingsUpdate(BaseModel):
     # semantics; bounded with ``ge``/``le`` so a malformed operator input is a
     # visible 422, not a value that silently sails past ``web.deps``'s own
     # unset/unparsable fallback (that fallback only guards a CORRUPT stored
-    # value, not a bad NEW value coming in over this endpoint).
-    disk_pressure_threshold_percent: float | None = Field(default=None, ge=0, le=100)
-    disk_pressure_target_percent: float | None = Field(default=None, ge=0, le=100)
-    eviction_grace_days: int | None = Field(default=None, ge=0)
+    # value, not a bad NEW value coming in over this endpoint). The upper
+    # bounds on ``eviction_grace_days``/``eviction_interval_minutes``/
+    # ``log_retention_days`` (issue #92) ALSO reject ``Infinity``/``NaN`` with
+    # no separate ``isfinite`` validator needed: a non-finite value fails every
+    # ``gt``/``ge``/``le`` comparison (``NaN`` fails all of them; ``+inf``
+    # fails ``le``; ``-inf`` fails ``ge``/``gt``), so a would-be
+    # ``mode="after"`` isfinite check would be unreachable dead code -- these
+    # bounds ARE the finiteness guard.
+    disk_pressure_threshold_percent: float | None = Field(
+        default=None, ge=DISK_PRESSURE_PERCENT_MIN, le=DISK_PRESSURE_PERCENT_MAX
+    )
+    disk_pressure_target_percent: float | None = Field(
+        default=None, ge=DISK_PRESSURE_PERCENT_MIN, le=DISK_PRESSURE_PERCENT_MAX
+    )
+    eviction_grace_days: int | None = Field(default=None, ge=0, le=EVICTION_GRACE_DAYS_MAX)
     eviction_enabled: bool | None = Field(default=None)
     eviction_proactive_enabled: bool | None = Field(default=None)
-    eviction_interval_minutes: float | None = Field(default=None, gt=0)
-    log_retention_days: int | None = Field(default=None, ge=0)
+    eviction_interval_minutes: float | None = Field(
+        default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
+    )
+    log_retention_days: int | None = Field(default=None, ge=0, le=LOG_RETENTION_DAYS_MAX)
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)
@@ -426,6 +645,46 @@ class SettingsUpdate(BaseModel):
         message = url_shape_error(value)
         if message is not None:
             raise ValueError(message)
+        return value
+
+    @field_validator("plex_token", "prowlarr_api_key")
+    @classmethod
+    def _validate_header_safe_credential(cls, value: str | None) -> str | None:
+        """Reject a header-unsafe credential at write time (the persistence bypass).
+
+        The write-time twin of ``SetupCompleteRequest._validate_header_safe_credential``
+        (see its docstring for the two failure modes -- a ``str(exc)`` credential
+        leak and an uncaught ``UnicodeEncodeError``/500 -- that a header-unsafe
+        ``plex_token`` / ``prowlarr_api_key`` triggers once an adapter sends it as a
+        header). ``None`` (leave unchanged) and the ``"***"`` redaction mask are both
+        header-safe and pass untouched, so the FE's mask round-trip and partial
+        updates are unaffected; only a genuinely header-unsafe NEW value is rejected
+        (422) before it is ever stored.
+        """
+        if value and header_value_error(value) is not None:
+            raise ValueError(HEADER_VALUE_MESSAGE)
+        return value
+
+    @field_validator(*_LIBRARY_ROOT_FIELDS)
+    @classmethod
+    def _blank_root_clears_to_unset(cls, value: str | None) -> str | None:
+        """Normalize a whitespace-only root to ``""`` (explicit clear-to-unset).
+
+        Unlike ``SetupCompleteRequest``'s ``require_at_least_one_library_root``
+        (a ``model_validator`` that runs on the one-shot wizard body), this
+        partial-update model has no equivalent pass -- so an operator submitting
+        a stray space via ``PUT /settings`` would otherwise sail straight through
+        (a non-empty string is not ``None``, so it is never treated as "leave
+        unchanged") and get persisted verbatim as the stored root. Mapping it to
+        ``""`` instead reuses this class's OWN already-established "empty string
+        = explicit clear" wire semantics (see the class docstring), so a
+        whitespace-only submission behaves exactly like an intentional clear
+        rather than silently configuring a bogus, effectively-blank root. A
+        genuinely non-empty value (however it's padded) is returned unchanged --
+        this validator only ever touches the all-whitespace case.
+        """
+        if value is not None and not value.strip():
+            return ""
         return value
 
     @model_validator(mode="after")
@@ -539,6 +798,25 @@ class CreateRequestBody(BaseModel):
     # ``_season_numbers``. A repeat POST with a NEW season list GROWS the tracked
     # set rather than being dropped by the request-level dedup.
     seasons: list[int] | None = None
+    # TV only: explicit episode targets keyed by season number. Supplying this
+    # records an ``explicit_episodes`` TV intent and creates season rows for the
+    # map's keys. Values are the episode numbers requested within that season.
+    episodes: dict[int, list[int]] | None = None
+    # Re-acquire (issue #131): force a fresh grabbable request even when the movie
+    # is still reported present in Plex (its file was deleted/replaced out-of-band),
+    # instead of the normal already-in-library short-circuit that returns a
+    # terminal 'available' row with no grab. MOVIE ONLY -- ignored for a tv
+    # request (per-season re-acquisition is the report-issue verb's job). Same
+    # authZ as any create (``require_api_key``); every dedup/ownership guard still
+    # applies (see ``request_service.create_request_result``).
+    #
+    # Modeled as an optional tri-state (``bool | None``), never omitted/None
+    # meaning "normal create", NOT a bare ``bool = False`` -- mirrors ``seasons``'
+    # own None-default convention. A bare boolean default emits a JSON-schema
+    # ``default`` that openapi-typescript then treats as a REQUIRED client field
+    # (see ``CreateRequestBody`` in the generated ``schema.d.ts``), which would
+    # break every existing caller that omits this field entirely.
+    force: bool | None = None
 
 
 class ReportIssueBody(BaseModel):
@@ -564,6 +842,8 @@ class SeasonStatus(BaseModel):
 
     season_number: int
     status: str
+    installed_quality_id: int | None = None
+    installed_profile_index: int | None = None
 
 
 class RequestResponse(BaseModel):
@@ -580,6 +860,9 @@ class RequestResponse(BaseModel):
     is_anime: bool = False
     poster_url: str | None = None
     backdrop_url: str | None = None
+    tv_request_mode: str | None = None
+    requested_seasons: list[int] | None = None
+    requested_episodes: dict[int, list[int]] | None = None
     # TV only: this show's per-season rollup, ordered by season number. ``None``
     # for a movie (movies have no ``SeasonRequest`` rows). ``status`` above is the
     # COMPUTED fold of these (``domain.season_rollup.rollup_status``).
@@ -604,9 +887,17 @@ class RequestListResponse(BaseModel):
 class SearchPreviewRequest(BaseModel):
     """Preview by ``request_id`` OR by an explicit media descriptor.
 
-    When ``request_id`` is set the other fields are ignored (resolved from the
-    stored request). Otherwise ``tmdb_id``, ``media_type`` and ``title`` are
-    required.
+    When ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are
+    resolved from the stored request and any values passed for them are ignored;
+    ``season`` comes from this body. ``episodes`` also comes from this body when
+    present; when omitted, a stored ``explicit_episodes`` request supplies the
+    selected season's episode target. Otherwise (no ``request_id``) ``tmdb_id``,
+    ``media_type`` and ``title`` are required.
+
+    Every TV preview is per-season: the endpoint REJECTS (422) a tv media type
+    previewed with no ``season``, and REJECTS (422) a non-tv (movie) media type
+    previewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's
+    scope guard exactly, so an invalid combination never reaches the indexer.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -621,6 +912,16 @@ class SearchPreviewRequest(BaseModel):
     # empty means "the whole season" -- this is also what makes ``decision_service.
     # preview`` prefer a season-pack release over an equivalent single episode.
     episodes: list[int] | None = None
+
+    @field_validator("episodes")
+    @classmethod
+    def _normalize_empty_episodes(cls, value: list[int] | None) -> list[int] | None:
+        """Coerce ``[]`` to ``None`` (issue #102): both mean "whole season", but
+        ``None`` is the canonical whole-season scope value. Normalizing here -- at
+        the schema boundary -- means an unnormalized ``[]`` can never reach a
+        stored ``episodes_json`` or a reuse/import scope check in the first place.
+        """
+        return value or None
 
 
 class AcceptedRelease(BaseModel):
@@ -637,6 +938,12 @@ class AcceptedRelease(BaseModel):
     indexer: str
     info_hash: str | None = None
     guid: str
+    covered_seasons: tuple[int, ...] = ()
+    target_seasons: tuple[int, ...] = ()
+    upgrade_seasons: tuple[int, ...] = ()
+    waste_seasons: tuple[int, ...] = ()
+    ignored_seasons: tuple[int, ...] = ()
+    skipped_seasons: tuple[int, ...] = ()
 
 
 class RejectedRelease(BaseModel):
@@ -661,6 +968,21 @@ class SearchPreviewResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # Queue (downloads + reconciled status)
 # --------------------------------------------------------------------------- #
+class QueueScope(BaseModel):
+    """One logical TV scope attached to a queue download."""
+
+    model_config = ConfigDict(frozen=True)
+
+    media_request_id: int | None = None
+    season: int | None = None
+    episodes: list[int] | None = None
+    status: str = "active"
+
+
+def _empty_queue_scopes() -> list[QueueScope]:
+    return []
+
+
 class QueueItem(BaseModel):
     """A tracked download in the live queue."""
 
@@ -679,6 +1001,17 @@ class QueueItem(BaseModel):
     season: int | None = None
     episodes: list[int] | None = None
     failed_reason: str | None = None
+    # Human-legible identity (issue #134): all three degrade honestly to
+    # ``None`` rather than swallowing a missing join/backfill -- an orphaned
+    # download (its request deleted), a pre-migration row with no backfillable
+    # history, or a hashless/legacy row all still render, just without these.
+    # ``title``/``poster_url`` come from the owning ``MediaRequest`` (``None``
+    # for an orphan); ``release_title`` is the grab decision's own release name
+    # persisted at grab time, independent of the request link.
+    title: str | None = None
+    poster_url: str | None = None
+    release_title: str | None = None
+    scopes: list[QueueScope] = Field(default_factory=_empty_queue_scopes)
 
 
 class QueueResponse(BaseModel):
@@ -695,11 +1028,13 @@ class GrabRequest(BaseModel):
     With neither ``info_hash`` nor ``guid`` set, the highest-ranked accepted
     release is grabbed ("grab top"). For a TV request, ``season`` scopes both the
     indexer search and the stored download to that season; ``episodes`` further
-    scopes it to those specific episode number(s) (``None``/empty = the whole
-    season). Every TV grab is per-season: the endpoint REJECTS (422) a tv request
-    grabbed with no ``season``, and REJECTS (422) a non-tv (movie) request grabbed
-    WITH a ``season`` -- the branch is always the request's actual media type,
-    never merely whether ``season`` happens to be set.
+    scopes it to those specific episode number(s). When omitted, stored
+    ``explicit_episodes`` request intent supplies the selected season's target;
+    explicit ``None``/empty = the whole season. Every TV grab is per-season: the
+    endpoint REJECTS (422) a tv request grabbed with no ``season``, and REJECTS
+    (422) a non-tv (movie) request grabbed WITH a ``season`` -- the branch is
+    always the request's actual media type, never merely whether ``season``
+    happens to be set.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -709,6 +1044,16 @@ class GrabRequest(BaseModel):
     guid: str | None = None
     season: int | None = None
     episodes: list[int] | None = None
+
+    @field_validator("episodes")
+    @classmethod
+    def _normalize_empty_episodes(cls, value: list[int] | None) -> list[int] | None:
+        """Coerce ``[]`` to ``None`` (issue #102): both mean "whole season", but
+        ``None`` is the canonical whole-season scope value. Normalizing here -- at
+        the schema boundary -- means an unnormalized ``[]`` can never reach a
+        stored ``episodes_json`` or a reuse/import scope check in the first place.
+        """
+        return value or None
 
 
 # --------------------------------------------------------------------------- #
@@ -771,13 +1116,19 @@ class QualityProfileResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 class SubsystemHealthItem(BaseModel):
     """One upstream's reachability, as ``services.health_service.SubsystemHealth``
-    reports it. ``not_configured`` is honest -- never confused with ``down``."""
+    reports it. ``not_configured`` is honest -- never confused with ``down``.
+
+    ``note`` (qBittorrent only, issues #133/#157) is a NON-blocking, informational
+    signal -- e.g. the client's default save path isn't visible inside this
+    container -- distinct from ``detail`` (which carries only FAILURE diagnostics,
+    ``None`` whenever ``status == "ok"``). ``None`` for every other subsystem."""
 
     model_config = ConfigDict(frozen=True)
 
     name: str
     status: Literal["ok", "degraded", "down", "not_configured"]
     detail: str | None = None
+    note: str | None = None
     checked_at: datetime
 
 

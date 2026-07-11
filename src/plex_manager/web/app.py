@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Any, Literal, cast
 
 import httpx
 from fastapi import APIRouter, FastAPI
@@ -29,7 +29,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings, validate_startup_exposure
+from plex_manager.config import get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -47,7 +47,9 @@ from plex_manager.services.health_service import (
     read_disk_usage,
 )
 from plex_manager.web.deps import (
+    CSRF_HEADER_NAME,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
+    SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
     ensure_system_settings,
     get_anime_movie_root_optional,
@@ -55,6 +57,7 @@ from plex_manager.web.deps import (
     get_auto_grab_enabled,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
+    get_downloads_host_root,
     get_eviction_enabled,
     get_eviction_filesystem,
     get_eviction_grace_days,
@@ -70,7 +73,9 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_tv_root_optional,
 )
+from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.middleware import SetupGuardMiddleware
+from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
 from plex_manager.web.routers import ops as ops_router
@@ -229,6 +234,22 @@ async def _reconcile_once(app: FastAPI) -> None:
                     "running availability pass anyway",
                     type(exc).__name__,
                 )
+                # A remove=no operator residual needs NO client I/O, so an OUTAGE
+                # must not strand it for the outage's whole duration any more than
+                # an unconfigured client may (the branch below) -- run the same
+                # narrow DB-only heal on the rolled-back session; rows that need a
+                # removal keep waiting for the client to recover (counted + logged
+                # inside the heal, never silently dropped).
+                await queue_service.heal_failed_pending_without_client(session)
+        else:
+            # DB-only strand heal (queue_service module docstring, "Operator
+            # provenance"): with qBittorrent UNCONFIGURED the reconcile cycle above
+            # never runs, so a remove=no operator residual (mark_failed with
+            # remove_torrent=False -- which by the operator's own choice needs NO
+            # client I/O) would otherwise sit at failed_pending forever on exactly
+            # the installs that path exists for. Rows needing a removal still wait
+            # for the client (logged inside the heal, never silently dropped).
+            await queue_service.heal_failed_pending_without_client(session)
 
         # Availability promotion (completed -> available) needs ONLY Plex, so it runs
         # even when qBittorrent is down or the Movies root was cleared after an
@@ -298,6 +319,7 @@ async def _autograb_once(app: FastAPI) -> None:
             profile=get_quality_profile(),
             qbt=qbt,
             cooldowns=_get_autograb_cooldowns(app),
+            save_path=get_downloads_host_root(),
         )
     # Surface how many scopes are CURRENTLY in a grab-pipeline cooldown (ADR-0013
     # round-3 #2), independent of the ok/error verdict below: a non-zero count is the
@@ -526,30 +548,17 @@ async def _eviction_tick(app: FastAPI) -> float:
                             root,
                         )
 
-            evicted = await eviction_service.run_eviction_sweep(
-                session=session,
-                library=library,
-                fs=fs,
-                media_type=media_type,
-                root_path=root,
-                all_roots=all_roots,
-                threshold_pct=threshold_pct,
-                target_pct=target_pct,
-                grace_days=grace_days,
-            )
-            if evicted:
-                _logger.info(
-                    "evicted %d %s title(s) from %s under disk pressure",
-                    len(evicted),
-                    media_type,
-                    root,
-                )
-            if proactive_enabled:
-                # A SEPARATE pass, never gated on the pressure sweep above having
-                # fired: opting in means "also clear past-grace watched content
-                # regardless of usage". Candidates the pressure sweep already
-                # evicted are naturally absent here (no longer `available`).
-                proactive_evicted = await eviction_service.run_eviction_sweep(
+            # Wrapped in its OWN try/except + guarded rollback, exactly like the
+            # telemetry sweep above (and for the same reason): every root shares
+            # THIS tick's single session, so a SQLAlchemy failure mid-sweep leaves
+            # that session in a poisoned (aborted) transaction. Without the
+            # rollback the NEXT root's sweep -- and the proactive pass just below
+            # -- would then raise too, so ONE root's failure would silently skip
+            # every remaining root this tick. Roll back to a clean state before
+            # continuing; the rollback is itself guarded so even a broken session
+            # is logged, never masked.
+            try:
+                evicted = await eviction_service.run_eviction_sweep(
                     session=session,
                     library=library,
                     fs=fs,
@@ -559,15 +568,75 @@ async def _eviction_tick(app: FastAPI) -> float:
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,
-                    proactive=True,
                 )
-                if proactive_evicted:
-                    _logger.info(
-                        "proactively evicted %d %s title(s) from %s (past grace)",
-                        len(proactive_evicted),
+            except Exception:
+                _logger.exception(
+                    "eviction sweep failed for %s root %s; continuing with remaining roots",
+                    media_type,
+                    root,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    _logger.exception(
+                        "rollback after a failed eviction sweep for %s root %s "
+                        "also failed; continuing",
                         media_type,
                         root,
                     )
+            else:
+                if evicted:
+                    _logger.info(
+                        "evicted %d %s title(s) from %s under disk pressure",
+                        len(evicted),
+                        media_type,
+                        root,
+                    )
+            if proactive_enabled:
+                # A SEPARATE pass, never gated on the pressure sweep above having
+                # fired: opting in means "also clear past-grace watched content
+                # regardless of usage". Candidates the pressure sweep already
+                # evicted are naturally absent here (no longer `available`). Same
+                # guarded-rollback wrapper as the pressure sweep above -- a
+                # proactive-pass failure on one root must not poison the shared
+                # session for the next root either.
+                try:
+                    proactive_evicted = await eviction_service.run_eviction_sweep(
+                        session=session,
+                        library=library,
+                        fs=fs,
+                        media_type=media_type,
+                        root_path=root,
+                        all_roots=all_roots,
+                        threshold_pct=threshold_pct,
+                        target_pct=target_pct,
+                        grace_days=grace_days,
+                        proactive=True,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "proactive eviction sweep failed for %s root %s; "
+                        "continuing with remaining roots",
+                        media_type,
+                        root,
+                    )
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        _logger.exception(
+                            "rollback after a failed proactive eviction sweep for "
+                            "%s root %s also failed; continuing",
+                            media_type,
+                            root,
+                        )
+                else:
+                    if proactive_evicted:
+                        _logger.info(
+                            "proactively evicted %d %s title(s) from %s (past grace)",
+                            len(proactive_evicted),
+                            media_type,
+                            root,
+                        )
     return interval_minutes * 60.0
 
 
@@ -672,19 +741,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         system = await ensure_system_settings(session)
         initialized = system.initialized
         await session.commit()
-    # Uniform launch-path guard (Codex PR #21): every launch path — the console
-    # entry point / Docker entrypoint AND anything serving
-    # ``plex_manager.web.app:app`` directly — passes through this lifespan, so
-    # enforcing here (and ONLY here) means advertisement and enforcement cannot
-    # diverge. Tokenless + bypass-off would otherwise deadlock first-run setup
-    # (the pre-init gate 401s every call while /setup/status honestly advertises
-    # no token) — and loosening pre-init auth instead would expose the
-    # validate/* SSRF probes and let anyone who can reach the port claim the
-    # install. Enforced AFTER the ``initialized`` read because only a
-    # FIRST-RUN-CAPABLE server is refused: an initialized install is API-key
-    # gated everywhere and never consults the setup token again, so it must
-    # keep restarting/upgrading tokenless.
-    validate_startup_exposure(get_settings(), initialized=initialized)
     prepare_encryption(initialized=initialized)
 
     app.state.http_client = create_upstream_http_client()
@@ -719,6 +775,73 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         log_capture_service.stop_logging(log_handler)
 
 
+def _install_cookie_security_scheme(app: FastAPI) -> None:
+    """Advertise the ``plexmgr.session`` cookie as a first-class auth scheme.
+
+    Every protected route accepts EITHER the ``X-Api-Key`` header (the recovery/
+    automation credential) OR the browser session cookie (the normal path — see
+    ``deps.authenticate_request``), but FastAPI only emits the ``APIKeyHeader``
+    scheme it can see as an explicit dependency. That leaves the exported contract
+    dishonest: a client generated from it would believe cookie auth does not exist
+    and that ``/auth/logout`` needs an api key. This wraps ``app.openapi`` to add the
+    ``APIKeyCookie`` scheme and rewrite each api-key-secured operation's requirement
+    to the honest OR. Safe methods accept either credential. Unsafe methods accept
+    either the ``X-Api-Key`` header OR the browser session cookie together with the
+    double-submit ``X-CSRF-Token`` header; a single security requirement object is
+    OpenAPI's AND, while the list is OR.
+    """
+    default_openapi = app.openapi
+    api_key_only: list[dict[str, list[str]]] = [{"APIKeyHeader": []}]
+    api_key_or_cookie: list[dict[str, list[str]]] = [
+        {"APIKeyHeader": []},
+        {"APIKeyCookie": []},
+    ]
+    api_key_or_cookie_with_csrf: list[dict[str, list[str]]] = [
+        {"APIKeyHeader": []},
+        {"APIKeyCookie": [], "CSRFHeader": []},
+    ]
+    unsafe_methods = {"post", "put", "patch", "delete"}
+
+    def openapi_with_cookie() -> dict[str, Any]:
+        schema = default_openapi()
+        components: dict[str, Any] = schema.get("components", {})
+        schemes: dict[str, Any] | None = components.get("securitySchemes")
+        if schemes is None:
+            return schema
+        schemes.setdefault(
+            "APIKeyCookie",
+            {
+                "type": "apiKey",
+                "in": "cookie",
+                "name": SESSION_COOKIE_NAME,
+            },
+        )
+        schemes.setdefault(
+            "CSRFHeader",
+            {
+                "type": "apiKey",
+                "in": "header",
+                "name": CSRF_HEADER_NAME,
+            },
+        )
+        paths: dict[str, Any] = schema.get("paths", {})
+        for path_item in paths.values():
+            operations: dict[str, Any] = path_item
+            for method, value in operations.items():
+                if not isinstance(value, dict):
+                    continue
+                operation = cast(dict[str, Any], value)
+                if operation.get("security") == api_key_only:
+                    operation["security"] = (
+                        api_key_or_cookie_with_csrf
+                        if method in unsafe_methods
+                        else api_key_or_cookie
+                    )
+        return schema
+
+    app.openapi = openapi_with_cookie
+
+
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
@@ -726,8 +849,12 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:
         app.add_exception_handler(adapter_error, _adapter_error_handler)
+    # Structured auth/setup failures (north star #3): AppError + the plex.tv
+    # verification error render the code+message+hint+diagnostics envelope.
+    install_error_handlers(app)
     app.include_router(router)
     app.include_router(setup_router.router)
+    app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
     app.include_router(requests_router.router)
@@ -736,6 +863,7 @@ def create_app() -> FastAPI:
     app.include_router(blocklist_router.router)
     app.include_router(quality_profile_router.router)
     app.include_router(ops_router.router)
+    _install_cookie_security_scheme(app)
     # Mount the built SPA LAST so its catch-all fallback has the lowest match
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
     mount_spa(app)

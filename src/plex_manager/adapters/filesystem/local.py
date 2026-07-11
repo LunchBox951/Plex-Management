@@ -111,7 +111,10 @@ def _publish_lock(dst: Path):
         try:
             lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            if dst.exists():
+            # lexists, not exists: a DANGLING symlink at dst must still refuse (GHSA-8fj8)
+            # -- exists() follows the link and reads a dangling one as absent, which
+            # would let a stale/planted symlink fall through as if dst were free.
+            if os.path.lexists(os.fspath(dst)):
                 raise FileExistsError(os.fspath(dst)) from None
             if _lock_is_stale(lock_path):
                 with contextlib.suppress(FileNotFoundError):
@@ -142,11 +145,16 @@ def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
     ~2x the title's size transiently and failing with a spurious ENOSPC on a
     barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
     PUBLISHER is preserved by the per-destination ``_publish_lock`` plus the
-    ``dst.exists()`` check made under it — every publisher in this module takes
-    that same lock before touching ``dst``.
+    ``os.path.lexists(dst)`` check made under it — every publisher in this
+    module takes that same lock before touching ``dst``.
     """
     with _publish_lock(dst):
-        if dst.exists():
+        # lexists, not exists: on a hardlink-refusing filesystem the copy fallback
+        # below is os.rename, which WOULD silently replace a dangling symlink's
+        # entry (exists() reads a dangling link as absent) -- GHSA-8fj8. This is
+        # the critical backstop, immediately before the link/rename attempt, under
+        # the lock every publisher in this module takes before touching dst.
+        if os.path.lexists(os.fspath(dst)):
             raise FileExistsError(os.fspath(dst))
         try:
             os.link(tmp_path, os.fspath(dst))
@@ -379,8 +387,9 @@ class LocalFileSystem:
         return list(_iter_video_files(root))
 
     def resolve_guarded(self, path: str) -> str | None:
-        """Resolve ``path`` to its realpath, returning it ONLY if that resolved
-        target sits within a configured library root -- else ``None`` (a refusal).
+        """Resolve ``path`` to its realpath, returning it ONLY if BOTH ``path``'s
+        own entry location AND that resolved target sit within a configured
+        library root -- else ``None`` (a refusal).
 
         The SINGLE resolve-and-check that both :meth:`delete` and
         :meth:`delete_guard_refuses` share, so ``path``'s symlink chain is resolved
@@ -388,12 +397,37 @@ class LocalFileSystem:
         this returned and never re-resolves ``path`` afterwards, so a symlinked path
         COMPONENT repointed AFTER the containment check can no longer redirect the
         removal outside every root (the guard/delete TOCTOU) -- there is no second
-        resolution left to disagree with the checked one. ``path`` is resolved with
-        :func:`os.path.realpath` (dereferencing every symlink in the chain,
-        mirroring :func:`_iter_video_files`'s containment check), and it fails
-        CLOSED -- an empty ``path``, or no configured roots, returns ``None``.
+        resolution left to disagree with the checked one.
+
+        TWO containment checks, both required (issue #141) -- a single realpath
+        check is not enough:
+
+        1. The ENTRY's own location must sit within a root. Computed by
+           resolving every ANCESTOR directory component (dereferencing a
+           symlinked ancestor dir, matching this method's existing containment
+           semantics for intermediate components) while leaving the FINAL
+           component un-dereferenced -- i.e. where ``path`` itself, as a
+           directory entry, actually lives. Without this, an outside-root
+           symlink whose TARGET resolves inside a root (``/tmp/link.mkv ->
+           /library/movie.mkv``) would pass containment on the target alone,
+           and :meth:`delete` -- which unlinks the SYMLINK ENTRY, never its
+           target, when ``path`` is a symlink -- would then unlink
+           ``/tmp/link.mkv``, an entry outside every configured root.
+        2. The fully-resolved target (:func:`os.path.realpath`, dereferencing
+           EVERY symlink in the chain including the final component) must also
+           sit within a root -- the pre-existing check, which still refuses an
+           INSIDE-root symlink whose target escapes (``/library/link.mkv ->
+           /etc/passwd``): its entry location passes check 1, but its resolved
+           target fails check 2.
+
+        Fails CLOSED on either check -- an empty ``path``, or no configured
+        roots, returns ``None``.
         """
         if not path:
+            return None
+        entry_dir = os.path.dirname(path) or "."
+        entry_location = os.path.join(os.path.realpath(entry_dir), os.path.basename(path))
+        if not any(_is_within(root, entry_location) for root in self._library_roots):
             return None
         real = os.path.realpath(path)
         if not any(_is_within(root, real) for root in self._library_roots):

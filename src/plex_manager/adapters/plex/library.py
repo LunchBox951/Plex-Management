@@ -28,18 +28,23 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Final, Literal, cast
 
 import httpx
 
+from plex_manager.headersafe import header_value_error
+from plex_manager.logsafe import safe_int
 from plex_manager.ports.library import LibrarySection, WatchState
+from plex_manager.services import path_visibility
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
 
 _logger = logging.getLogger(__name__)
 
+_HTTP_OK: Final = 200
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_UNAUTHORIZED: Final = 401
 _HTTP_FORBIDDEN: Final = 403
 _PAGE_SIZE: Final = 100
@@ -255,11 +260,6 @@ def _season_watch_state_from_entry(entry: Mapping[str, object]) -> WatchState:
     return WatchState(watched=watched, last_viewed_at=last_viewed_at)
 
 
-def _section_covers(section: LibrarySection, path: str) -> bool:
-    """Whether any of the section's locations is a path-prefix of ``path``."""
-    return any(_is_path_prefix(location, path) for location in section.locations)
-
-
 def _is_path_prefix(prefix: str, path: str) -> bool:
     """True if ``prefix`` is ``path`` or a parent directory of it (segment-aware).
 
@@ -267,6 +267,79 @@ def _is_path_prefix(prefix: str, path: str) -> bool:
     """
     norm = prefix.rstrip("/")
     return path == norm or path.startswith(f"{norm}/")
+
+
+def _container_to_host_scan_path(location: str, path: str) -> str | None:
+    """Reverse a Docker host->container remap: the HOST path Plex should scan.
+
+    ``path`` is a CONTAINER path the importer/eviction placed into (e.g.
+    ``/media/Movies/Title (Year)``); ``location`` is a section location as Plex
+    reported it, in the HOST namespace (e.g. ``/srv/media/Movies``). After a Docker
+    host/container split the container path never prefix-matches the host location,
+    so a plain ``_is_path_prefix`` check always misses and every remapped root
+    would fall back to a full-library refresh.
+
+    Reverse the mapping the SAME way :func:`path_visibility.remap_to_visible` built
+    it forward: strip a known container mount prefix from ``path``, align the
+    location's trailing components against what remains, and re-anchor the leftover
+    tail on the HOST ``location``. Purely lexical (no filesystem probe); anchoring on
+    the known mount prefix keeps it precise -- a section whose location merely shares
+    a trailing name but doesn't sit under the same mount does not spuriously match.
+    Returns ``None`` when ``path`` isn't under any known mount, or shares no
+    directory with ``location`` below it (e.g. a whole-media-root/mount-root remap,
+    which has no shared component to anchor on and honestly falls back to a full
+    refresh).
+    """
+    path_comps = [c for c in path.split("/") if c]
+    loc_comps = [c for c in location.split("/") if c]
+    for mount in path_visibility.KNOWN_CONTAINER_MOUNTS:
+        mount_comps = [c for c in mount.split("/") if c]
+        if not mount_comps or path_comps[: len(mount_comps)] != mount_comps:
+            continue
+        below = path_comps[len(mount_comps) :]
+        # Longest run where the location's tail meets the path's head below the
+        # mount -- longest first so the deepest shared directory wins.
+        for k in range(min(len(loc_comps), len(below)), 0, -1):
+            if loc_comps[-k:] == below[:k]:
+                tail = below[k:]
+                host = "/" + "/".join(loc_comps)
+                return f"{host}/{'/'.join(tail)}" if tail else host
+    return None
+
+
+def _extract_file_paths(item: Mapping[str, object]) -> list[str]:
+    """Every ``Media[].Part[].file`` path Plex reports for one item (HOST namespace).
+
+    A movie item carries one (rarely more, e.g. a multi-part edition) ``Media``
+    entry; an episode item (fetched with ``type=4``, see
+    :meth:`PlexLibrary.confirm_paths`) carries its own. Absent/malformed entries
+    are skipped rather than raising -- a single odd item must never abort the
+    whole crawl.
+    """
+    paths: list[str] = []
+    for media in _as_sequence(item.get("Media")):
+        for part in _as_sequence(_as_mapping(media).get("Part")):
+            file_path = _get_str(_as_mapping(part), "file")
+            if file_path is not None:
+                paths.append(file_path)
+    return paths
+
+
+def _section_scan_path(section: LibrarySection, path: str) -> str | None:
+    """The Plex(host)-namespace path to refresh for ``path`` in ``section``, or None.
+
+    Prefers a direct prefix match (no host/container split, or Plex itself sees the
+    container paths) so ``path`` is refreshed verbatim; otherwise reverses the
+    Docker remap via :func:`_container_to_host_scan_path`. ``None`` when this
+    section does not cover ``path`` at all.
+    """
+    for location in section.locations:
+        if _is_path_prefix(location, path):
+            return path
+        host = _container_to_host_scan_path(location, path)
+        if host is not None:
+            return host
+    return None
 
 
 class PlexLibrary:
@@ -303,6 +376,19 @@ class PlexLibrary:
         and the status only — httpx's own error embeds the URL, so it must never
         escape. JSON is NOT decoded here (refresh returns an empty body).
         """
+        if header_value_error(self._token) is not None:
+            # A stored token that cannot ride the ``X-Plex-Token`` header: a
+            # CR/LF/NUL value would make httpx echo the RAW token in ``str(exc)``
+            # (a credential leak through a chained transport error), and a non-ASCII
+            # value would raise an uncaught ``UnicodeEncodeError`` (a 500). Fail as a
+            # surfaced ``PlexAuthError`` -- the token is not a usable credential --
+            # WITHOUT ever placing it in a header. Defense-in-depth for a token that
+            # bypassed the write-time header-safety check (a ``dev_auth_bypass``
+            # install, or a legacy row); the ``oauth.py`` adapter guards its own
+            # plex.tv/identity sinks the same way (``_require_header_safe_token``).
+            raise PlexAuthError(
+                "Plex rejected the request: the stored token is not a valid credential value"
+            )
         request_headers: dict[str, str] = {
             "X-Plex-Token": self._token,
             "Accept": "application/json",
@@ -325,7 +411,11 @@ class PlexLibrary:
                 f"Plex rejected the request to {path} (HTTP {status}): "
                 "the token is missing or invalid"
             )
-        if response.is_error:
+        # Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        # (issue #87): ``is_error`` is only true for >=400, so a 3xx redirect (e.g. a
+        # proxy/auth redirect in front of Plex) would read as success even though the
+        # requested scan/query never actually ran.
+        if not (_HTTP_OK <= status < _HTTP_MULTIPLE_CHOICES):
             raise PlexLibraryError(f"Plex request to {path} failed (HTTP {status})")
         return response
 
@@ -488,6 +578,79 @@ class PlexLibrary:
                 break
             start += _PAGE_SIZE
 
+    async def _collect_section_file_paths(
+        self, key: str, paths: list[str], *, extra_params: Mapping[str, str] | None = None
+    ) -> None:
+        """Walk one section's items page-by-page, collecting every file path.
+
+        ``extra_params`` scopes the query -- :meth:`confirm_paths` passes
+        ``{"type": "4"}`` on a SHOW section so this crawls EVERY episode ("leaf")
+        across the whole section directly, in ONE flat paged walk (Plex's numeric
+        type filter: 1=movie, 2=show, 3=season, 4=episode) -- never one
+        ``/children`` fetch per show. Left unset (movie sections), the section's
+        own ``/all`` already lists movie items directly.
+        """
+        start = 0
+        params: dict[str, str] = dict(extra_params or {})
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                params,
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                paths.extend(_extract_file_paths(_as_mapping(item)))
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
+
+    async def confirm_paths(
+        self,
+        media_type: Literal["movie", "tv"],
+        library_paths: Collection[str],
+    ) -> frozenset[str]:
+        """See :meth:`LibraryPort.confirm_paths`.
+
+        ONE crawl of every candidate (movie or show) section for the WHOLE call,
+        regardless of how many ``library_paths`` are queried -- TV episodes are
+        fetched directly via the section's flat ``type=4`` listing (never a
+        per-show ``/children``/``allLeaves`` fetch), so the cost model matches
+        :meth:`present_ids`'s "one crawl, not one per row". Each queried path is
+        confirmed by reversing the section's HOST-namespace location the same way
+        :meth:`trigger_scan` does (:func:`_section_scan_path`) and checking whether
+        any crawled file path sits at/under that reversed directory
+        (:func:`_is_path_prefix`) -- directory-prefix, never title/year.
+        """
+        wanted = frozenset(p for p in library_paths if p)
+        if not wanted:
+            return frozenset()
+        section_type: Literal["movie", "show"] = "movie" if media_type == "movie" else "show"
+        candidate_sections = [s for s in await self.list_sections() if s.type == section_type]
+        if not candidate_sections:
+            return frozenset()
+        file_paths: list[str] = []
+        # Episodes only exist as their own leaf rows (type=4) on a SHOW section --
+        # the section's default ``/all`` lists shows, not episodes.
+        extra_params = {"type": "4"} if media_type == "tv" else None
+        for section in candidate_sections:
+            await self._collect_section_file_paths(
+                section.key, file_paths, extra_params=extra_params
+            )
+        confirmed: set[str] = set()
+        for library_path in wanted:
+            for section in candidate_sections:
+                scan_path = _section_scan_path(section, library_path)
+                if scan_path is not None and any(
+                    _is_path_prefix(scan_path, fp) for fp in file_paths
+                ):
+                    confirmed.add(library_path)
+                    break
+        return frozenset(confirmed)
+
     async def _collect_present_show_ids(self) -> frozenset[int]:
         """Page every SHOW section and gather the tmdb ids of its shows (guid-only).
 
@@ -507,7 +670,10 @@ class PlexLibrary:
         return frozenset(present)
 
     async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         """The batch presence accessor — see :meth:`LibraryPort.present_ids`.
 
@@ -516,23 +682,36 @@ class PlexLibrary:
         crawl), TV shows from ``_PRESENT_SHOW_TMDB_CACHE`` (one show-section guid
         crawl, no per-show ``/children``). A section type is crawled ONLY when a key
         of that type is present, so a movie-only page never touches the show sections
-        (and vice versa). Cached-presence-only, like the other tile-facing reads: a
-        warmed snapshot is trusted (tiles tolerate the short TTL); a miss pages Plex
-        once and warms the cache for the next page-load.
+        (and vice versa).
+
+        With ``refresh_absent=False`` (tile decoration's default): cached-presence-
+        only, like the other tile-facing reads — a warmed snapshot is trusted as-is
+        (tiles tolerate the short TTL); a miss pages Plex once and warms the cache
+        for the next page-load.
+
+        With ``refresh_absent=True`` (the availability reconcile cycle): a warmed
+        snapshot is trusted ONLY if it already confirms every requested id of that
+        media type as present; otherwise one fresh crawl runs before answering —
+        still at most one crawl per media type, never one per key. This mirrors
+        ``is_available``'s "trust cached presence, never cached absence" contract:
+        a partial scan's cache invalidation (``trigger_scan``) fires before Plex
+        finishes indexing, so the very next crawl can cache a still-pending title as
+        absent; without this, that stale absence would be trusted for the rest of
+        the TTL instead of self-correcting on the next reconcile tick.
         """
         movie_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "movie"}
         show_ids = {tmdb_id for tmdb_id, media_type in keys if media_type == "tv"}
         present_movies: frozenset[int] = frozenset()
         if movie_ids:
             cached_movies = _PRESENT_TMDB_CACHE.get(self._cache_key)
-            if cached_movies is None:
+            if cached_movies is None or (refresh_absent and not movie_ids.issubset(cached_movies)):
                 cached_movies = await self._collect_present_tmdb_ids()
                 _PRESENT_TMDB_CACHE.set(self._cache_key, cached_movies)
             present_movies = cached_movies
         present_shows: frozenset[int] = frozenset()
         if show_ids:
             cached_shows = _PRESENT_SHOW_TMDB_CACHE.get(self._cache_key)
-            if cached_shows is None:
+            if cached_shows is None or (refresh_absent and not show_ids.issubset(cached_shows)):
                 cached_shows = await self._collect_present_show_ids()
                 _PRESENT_SHOW_TMDB_CACHE.set(self._cache_key, cached_shows)
             present_shows = cached_shows
@@ -560,6 +739,167 @@ class PlexLibrary:
         present = await self._collect_present_tv_seasons()
         _TV_SEASONS_CACHE.set(self._cache_key, present)
         return present.get(tmdb_id, frozenset())
+
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        """The seasons present for EVERY show in ``tmdb_ids`` — ONE targeted
+        page-walk, not a per-show library crawl.
+
+        Walks each show section's ``/all`` listing EXACTLY ONCE (never once per
+        requested id), recording the ``ratingKey`` of every item whose guid(s)
+        resolve to a requested tmdb id — see ``_collect_target_rating_keys``. A
+        given tmdb id can match MORE than one item (the same show catalogued in
+        two show sections, e.g. a separate "TV Shows" and "Anime" library, or a
+        duplicate entry within one section), so every matched item's ``/children``
+        is fetched and the resulting season sets are UNIONed per tmdb id — using
+        only the first match would under-report a season only present on a later
+        duplicate. Cost model: one page-walk across all show sections, plus one
+        ``/children`` fetch per MATCHED item (>= the number of requested ids that
+        are actually present, never more sections walked). Exists so the
+        availability reconcile cycle (``import_service.run_availability_cycle``)
+        can resolve every distinct pending show in a tick from a single
+        whole-library page-walk, instead of paying one page-walk per show.
+
+        The SECTION page-walk itself is all-or-nothing: a failure walking a show
+        section's ``/all`` listing is a genuine whole-pass transport failure and
+        is allowed to propagate (``PlexLibraryError``/``PlexAuthError``) — the
+        caller's whole-pass try/except handles that. But each MATCHED show's own
+        ``/children`` union (see ``_fetch_present_seasons``) is isolated in its
+        own try/except (round 4, #136 review): one show's metadata row being
+        deleted between the page-walk and this lookup, or persistently
+        returning a 404/500, must not abort every OTHER pending show's lookup in
+        the same batch. On a per-show failure, a warning is logged naming the
+        tmdb id and that id is OMITTED FROM THE RETURNED MAPPING ENTIRELY —
+        never mapped to an empty frozenset, which would dishonestly claim "no
+        seasons present" for a show whose presence is actually unknown. The
+        caller (``run_availability_cycle``) must treat a missing key as
+        "retry next cycle", not "not yet available".
+
+        Always re-pages fresh (never trusts a cached absence, mirroring
+        ``present_seasons``): a season that just finished indexing must be seen
+        immediately, not held stale for the cache TTL. Write-through: every id
+        that MATCHED at least one item AND resolved successfully is merged into
+        the shared ``_TV_SEASONS_CACHE`` snapshot (creating one if none is warm
+        yet) so a subsequent ``is_available``/``present_seasons`` call for the
+        SAME show inside this TTL window sees this fresh read rather than a
+        stale one -- a show NOT among the merged ids simply misses the cache and
+        triggers its own full re-crawl, same as today. A requested id with NO
+        matching item anywhere maps to an empty frozenset in the return value
+        (still present as a key — never omitted) but is deliberately NOT written
+        to the cache: ``_is_tv_available`` treats a cached key as "show present"
+        for whole-show checks, so caching the miss would report a
+        never-indexed show as available for the rest of the TTL. A requested id
+        whose lookup FAILED touches the cache in NEITHER direction: it DID match
+        a rating key, so it is never added to the unmatched/eviction set (its
+        state is unknown, not absent) and nothing is written for it either.
+        """
+        wanted = set(tmdb_ids)
+        if not wanted:
+            return {}
+        rating_keys_by_tmdb_id: dict[int, list[str]] = {}
+        for section in await self.list_sections():
+            if section.type != "show":
+                continue
+            await self._collect_target_rating_keys(section.key, wanted, rating_keys_by_tmdb_id)
+        result: dict[int, frozenset[int]] = {}
+        failed_ids: set[int] = set()
+        incomplete_ids: set[int] = set()
+        for tmdb_id in wanted:
+            seasons: set[int] = set()
+            any_failed = False
+            for rating_key in rating_keys_by_tmdb_id.get(tmdb_id, []):
+                try:
+                    seasons |= await self._fetch_present_seasons(rating_key)
+                except (PlexLibraryError, PlexAuthError) as exc:
+                    _logger.warning(
+                        "season lookup failed for a show entry tmdb_id=%s (%s)",
+                        safe_int(tmdb_id),
+                        exc,
+                    )
+                    any_failed = True
+                    # Keep going: a LATER duplicate entry may still confirm
+                    # seasons — positive evidence must not be discarded because
+                    # a stale/broken duplicate errored first (or vice versa).
+            if any_failed and not seasons:
+                # No positive evidence at all — state unknown, omit the id so
+                # the caller retries next cycle.
+                failed_ids.add(tmdb_id)
+                continue
+            if any_failed:
+                # PARTIAL union: some duplicate(s) failed but at least one
+                # confirmed seasons. Confirmed presence is sound to promote on
+                # (a season Plex reports IS present), so it goes in the RETURN
+                # value — but the union may be incomplete, so it must never be
+                # written through to the cache snapshot.
+                incomplete_ids.add(tmdb_id)
+            result[tmdb_id] = frozenset(seasons)
+        # ONLY ids that matched at least one item (and resolved successfully) are
+        # merged into the cache: ``_is_tv_available`` treats a cached KEY as "show
+        # present" for whole-show checks, so a no-match id must never be WRITTEN
+        # as an empty present key (a never-indexed show would answer True within
+        # the TTL) -- and, symmetrically, a fresh no-match read must EVICT any
+        # stale cached entry for that id (a show REMOVED from Plex since the
+        # snapshot warmed would otherwise keep answering True from the old entry
+        # for the rest of the TTL). The RETURN value still carries the empty
+        # frozenset for a no-match id — only the cache treats it as an eviction.
+        # A FAILED id is excluded from both ``matched_only`` and ``unmatched``: it
+        # is not evicted (it DID match a rating key -- its state is unknown, not
+        # absent) and nothing about it is written to the cache either. An
+        # INCOMPLETE id (partial duplicate failure, positive union returned) is
+        # likewise returned to the caller but never cached -- its union may be
+        # missing seasons that only lived on the failed duplicate.
+        matched_only = {
+            tmdb_id: seasons
+            for tmdb_id, seasons in result.items()
+            if rating_keys_by_tmdb_id.get(tmdb_id) and tmdb_id not in incomplete_ids
+        }
+        unmatched = wanted - matched_only.keys() - failed_ids - incomplete_ids
+        cached = _TV_SEASONS_CACHE.get(self._cache_key)
+        if matched_only or (cached is not None and unmatched & cached.keys()):
+            updated = dict(cached) if cached is not None else {}
+            for tmdb_id in unmatched:
+                updated.pop(tmdb_id, None)
+            updated.update(matched_only)
+            _TV_SEASONS_CACHE.set(self._cache_key, updated)
+        return result
+
+    async def _collect_target_rating_keys(
+        self, key: str, wanted: set[int], rating_keys_by_tmdb_id: dict[int, list[str]]
+    ) -> None:
+        """Walk one show section's items page-by-page, recording the ``ratingKey``
+        of every item whose guid(s) resolve to a tmdb id in ``wanted``.
+
+        A single item can only match one requested tmdb id per its own guid(s), but
+        a requested id can accumulate MULTIPLE rating keys across calls (this
+        section holding a duplicate entry, or a later section holding the same
+        show) — see :meth:`season_presence` on why every match's seasons must be
+        unioned rather than only the first.
+        """
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                entry = _as_mapping(item)
+                ids: set[int] = set()
+                _collect_item_tmdb_ids(entry, ids)
+                matched_ids = ids & wanted
+                if not matched_ids:
+                    continue
+                rating_key = _get_str(entry, "ratingKey")
+                if rating_key is None:
+                    continue
+                for tmdb_id in matched_ids:
+                    rating_keys_by_tmdb_id.setdefault(tmdb_id, []).append(rating_key)
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
 
     async def _collect_present_tv_seasons(self) -> dict[int, frozenset[int]]:
         """Page every show section and gather each show's present seasons.
@@ -634,28 +974,42 @@ class PlexLibrary:
         and show sections for TV, so a TV season folder is never matched against a
         movie section (or vice versa).
 
-        The section whose location is a parent of ``path`` gets a partial refresh
-        of just that path. If NO section covers it (a path-mapping difference
-        between the app and Plex, or Plex didn't report locations), we do a real
-        FULL refresh of each candidate section instead — heavier, but it actually
-        indexes the new file, unlike refreshing with a path Plex does not own (a
-        silent no-op that would strand the request at "Finalizing"). With no
-        candidate section at all, raise so the import blocks honestly. A 2xx
-        (possibly empty body) is success. After scanning, the presence cache for
-        ``media_type`` is invalidated so the availability check re-pages Plex
-        instead of returning a pre-import snapshot.
+        ``path`` arrives in the CONTAINER namespace (the importer/eviction placed
+        into a container-visible root), while Plex reports its section locations in
+        the HOST namespace, so after a Docker host/container split the two never
+        prefix-match directly. :func:`_section_scan_path` reverses that remap from
+        the section's own locations + the same suffix logic
+        :mod:`~plex_manager.services.path_visibility` uses forward, translating the
+        container path back to the HOST path Plex actually knows -- so a targeted
+        partial refresh of just that path still works instead of a full-library
+        refresh. If NO section covers it (a genuine path-mapping difference, a
+        mount-root remap with no shared directory to anchor on, or Plex not
+        reporting locations), we do a real FULL refresh of each candidate section
+        instead — heavier, but it actually indexes the new file, unlike refreshing
+        with a path Plex does not own (a silent no-op that would strand the request
+        at "Finalizing"). With no candidate section at all, raise so the import
+        blocks honestly. A 2xx (possibly empty body) is success. After scanning, the
+        presence cache for ``media_type`` is invalidated so the availability check
+        re-pages Plex instead of returning a pre-import snapshot.
         """
         section_type: Literal["movie", "show"] = "movie" if media_type == "movie" else "show"
         candidate_sections = [s for s in await self.list_sections() if s.type == section_type]
         if not candidate_sections:
             raise PlexLibraryError(f"no Plex {section_type} library section to scan into")
-        matched = [s for s in candidate_sections if _section_covers(s, path)]
+        matched = [
+            (section, scan_path)
+            for section in candidate_sections
+            if (scan_path := _section_scan_path(section, path)) is not None
+        ]
         try:
             if matched:
-                # The raw path is handed to httpx as a query param so it is
-                # percent-encoded exactly once (pre-quoting here would double-encode).
-                for section in matched:
-                    await self._request(f"/library/sections/{section.key}/refresh", {"path": path})
+                # The reverse-mapped HOST path is handed to httpx as a query param so
+                # it is percent-encoded exactly once (pre-quoting here would double-
+                # encode).
+                for section, scan_path in matched:
+                    await self._request(
+                        f"/library/sections/{section.key}/refresh", {"path": scan_path}
+                    )
             else:
                 _logger.warning(
                     "import path is not under any Plex %s section location; "

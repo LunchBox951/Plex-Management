@@ -19,6 +19,7 @@ from plex_manager.models import (
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -28,7 +29,8 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.web.deps import SettingsStore
+from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
+from plex_manager.web.deps import SettingsStore, get_downloads_host_root
 from tests.web.fakes import (
     FakeLibrary,
     FakeProwlarr,
@@ -55,12 +57,14 @@ async def _insert_download(
     torrent_hash: str,
     status: str,
     first_seen_at: datetime | None = None,
+    failed_reason: str | None = None,
 ) -> int:
     async with sm() as session:
         row = Download(
             torrent_hash=torrent_hash,
             status=status,
             first_seen_at=first_seen_at,
+            failed_reason=failed_reason,
             tmdb_id=603,
         )
         session.add(row)
@@ -125,6 +129,180 @@ async def test_grab_creates_download_and_history_and_is_idempotent(
     assert len(qbt.added) == 1
 
 
+async def test_grab_directs_save_path_to_the_derived_downloads_host_root(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Issues #133/#157: ``grab()`` must no longer be handed ``save_path=""``
+    (which leaves the torrent landing in qBittorrent's own, possibly invisible,
+    default dir) -- the endpoint threads the derived HOST-namespace downloads
+    root through to the client's ``add`` call."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 201
+    assert len(qbt.added) == 1
+    _source, save_path, _category = qbt.added[0]
+    assert save_path == "/home/lunchbox/Downloads"
+
+
+async def test_grab_leaves_qbittorrent_default_in_charge_when_no_root_derivable(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """With no host downloads root derivable (bare metal, no Docker split), the
+    prior behaviour is unchanged: an empty ``save_path`` leaves qBittorrent's own
+    default directory in charge."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=_GOOD_HASH, seeders=42)]),
+        qbt=qbt,
+    )
+    app.dependency_overrides[get_downloads_host_root] = lambda: ""
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+    assert response.status_code == 201
+    _source, save_path, _category = qbt.added[0]
+    assert save_path == ""
+
+
+_STRANDED_HASH = "e" * 40
+
+
+async def test_relocate_endpoint_requests_the_move(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): /home/lunchbox/x",
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "import_blocked"
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+
+
+async def test_relocate_endpoint_404s_for_a_missing_download(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, qbt=FakeQbittorrent())
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post("/api/v1/queue/999999/relocate", headers=_HEADERS)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "download_not_found"
+
+
+async def test_relocate_endpoint_409s_for_a_non_relocatable_row(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_, torrent_hash=_STRANDED_HASH, status="downloading"
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "not_relocatable"
+    assert qbt.relocated == []
+
+
+async def test_relocate_endpoint_409s_when_no_downloads_root_derivable(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): x",
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: ""
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "downloads_root_unavailable"
+    assert qbt.relocated == []
+
+
+async def test_relocate_endpoint_409s_when_superseded_by_a_newer_block_reason(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A concurrent Retry Import re-blocking the row with a genuinely different
+    reason while the relocate's own status write is in flight must surface
+    honestly (409 ``relocation_superseded``), never get silently clobbered by
+    the relocate's stale 'relocation requested' message."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(
+        sessionmaker_,
+        torrent_hash=_STRANDED_HASH,
+        status=DownloadState.ImportBlocked.value,
+        failed_reason=PATH_NOT_VISIBLE_REASON_PREFIX
+        + "(check volume mounts / content mismatch): /home/lunchbox/x",
+    )
+
+    newer_reason = "no video file found in the completed torrent"
+
+    class _ReblockingQbt(FakeQbittorrent):
+        async def set_location(self, info_hash: str, save_path: str) -> None:
+            await super().set_location(info_hash, save_path)
+            async with sessionmaker_() as racer_session:
+                row = await racer_session.get(Download, download_id)
+                assert row is not None
+                row.failed_reason = newer_reason
+                await racer_session.commit()
+
+    qbt = _ReblockingQbt()
+    override_adapters(app, qbt=qbt)
+    app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
+
+    response = await client.post(f"/api/v1/queue/{download_id}/relocate", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "relocation_superseded"
+    # The move was still requested of qBittorrent...
+    assert qbt.relocated == [(_STRANDED_HASH, "/home/lunchbox/Downloads")]
+    # ...but the row keeps the racer's fresher reason, never overwritten.
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        assert row.failed_reason == newer_reason
+
+
 def test_queue_contract_documents_manual_error_bodies(app: FastAPI) -> None:
     paths = app.openapi()["paths"]
 
@@ -185,6 +363,130 @@ async def test_get_queue_is_passive_and_does_not_reconcile(
         importing = await session.get(Download, importing_id)
     assert downloading is not None and downloading.status == "downloading"
     assert importing is not None and importing.status == "importing"
+
+
+async def test_get_queue_enriches_rows_with_media_title_poster_and_release_title(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The human-legible queue row (issue #134): a GET /queue row carries the owning
+    MediaRequest's title/poster_url alongside the grab's own release_title, so the
+    operator can tell downloads apart without decoding a torrent-hash fragment."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            poster_url="https://image.tmdb.org/poster.jpg",
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash="d" * 40,
+                status="downloading",
+                media_request_id=request.id,
+                release_title="Some.Movie.2020.1080p.WEB-DL.x264-GROUP",
+            )
+        )
+        await session.commit()
+
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 200
+    [item] = [i for i in response.json()["queue"] if i["torrent_hash"] == "d" * 40]
+    assert item["title"] == "Some Movie"
+    assert item["poster_url"] == "https://image.tmdb.org/poster.jpg"
+    assert item["release_title"] == "Some.Movie.2020.1080p.WEB-DL.x264-GROUP"
+
+
+async def test_get_queue_exposes_tv_download_scopes(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=900,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=request.id, season_number=1, status=RequestStatus.downloading.value
+        )
+        season_2 = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.downloading.value
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash="f" * 40,
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=900,
+            season=1,
+            episodes_json=[1],
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    episodes_json=[1],
+                    scope_key="season:1|episodes:[1]",
+                    status="active",
+                ),
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_2.id,
+                    season_number=2,
+                    episodes_json=None,
+                    scope_key="season:2|episodes:*",
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 200
+    [item] = [i for i in response.json()["queue"] if i["torrent_hash"] == "f" * 40]
+    assert item["season"] == 1
+    assert item["episodes"] == [1]
+    assert [
+        {"season": scope["season"], "episodes": scope["episodes"], "status": scope["status"]}
+        for scope in item["scopes"]
+    ] == [
+        {"season": 1, "episodes": [1], "status": "active"},
+        {"season": 2, "episodes": None, "status": "active"},
+    ]
+
+
+async def test_get_queue_orphaned_download_still_renders_with_none_title_and_poster(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A download whose owning request was deleted (media_request_id SET NULL) must
+    still render as a queue row (honesty over silence) -- title/poster_url honestly
+    None, degrading to release_title/hash on the frontend, never dropped."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(sessionmaker_, torrent_hash="e" * 40, status="downloading")
+
+    response = await client.get("/api/v1/queue", headers=_HEADERS)
+    assert response.status_code == 200
+    [item] = [i for i in response.json()["queue"] if i["id"] == download_id]
+    assert item["title"] is None
+    assert item["poster_url"] is None
+    assert item["release_title"] is None
 
 
 async def test_mark_failed_blocklists(
@@ -411,6 +713,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -443,6 +746,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
             year=year,
             season=season,
             media_type=media_type,
+            release_title=release_title,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -840,6 +1144,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
         season: int | None = None,
         episodes: list[int] | None = None,
         media_type: str | None = None,
+        release_title: str | None = None,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -872,6 +1177,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
             year=year,
             season=season,
             media_type=media_type,
+            release_title=release_title,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -1119,6 +1425,130 @@ async def test_grab_threads_season_and_episodes_into_search_and_queue_item(
     assert prowlarr.searched[-1].episode == "5"
 
 
+async def test_grab_omitted_episodes_inherits_explicit_episode_request(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "episodes": {"2": [5]}},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S02E05.1080p.WEB-DL.x264-GROUP", info_hash="5" * 40)]
+    )
+    override_adapters(app, prowlarr=prowlarr, qbt=FakeQbittorrent())
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["season"] == 2
+    assert body["episodes"] == [5]
+    assert prowlarr.searched[-1].season == 2
+    assert prowlarr.searched[-1].episode == "5"
+
+
+async def test_grab_empty_episodes_persists_none_whole_season_scope(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #102: a hand-crafted ``episodes: []`` body must persist ``None``
+    (whole-season), not an empty scoped list -- the schema boundary normalizes
+    it BEFORE it ever reaches ``episodes_json`` or the same-hash scope attachment
+    path."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="6" * 40)]
+        ),
+        qbt=FakeQbittorrent(),
+    )
+
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2, "episodes": []},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 201
+    assert response.json()["episodes"] is None
+
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == "6" * 40))
+        ).scalar_one()
+    assert row.episodes_json is None  # never persisted as []
+
+
+async def test_grab_empty_episodes_then_whole_season_regrab_is_idempotent(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #102 end-to-end: a first grab with a hand-crafted ``episodes: []``
+    normalizes to ``None`` on persist, so a LATER legitimate whole-season
+    re-grab of the SAME release (``episodes`` omitted) is recognized as the
+    same scope -- an idempotent no-op, not a spurious 409 scope conflict."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    release = candidate("Some.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="6" * 40)
+    override_adapters(app, prowlarr=FakeProwlarr([release]), qbt=FakeQbittorrent())
+
+    first = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2, "episodes": []},
+        headers=_HEADERS,
+    )
+    assert first.status_code == 201
+
+    override_adapters(app, prowlarr=FakeProwlarr([release]), qbt=FakeQbittorrent())
+    second = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert second.status_code == 201  # not a scope-conflict 409
+    assert second.json()["id"] == first.json()["id"]
+
+
 async def test_grab_tv_without_season_rejected_422_and_adds_nothing(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
@@ -1226,3 +1656,37 @@ async def test_grab_movie_with_season_rejected_422_and_adds_nothing(
         assert downloads == []
         seasons = (await session.execute(select(SeasonRequest))).scalars().all()
         assert seasons == []
+
+
+async def test_mark_failed_409s_removal_in_progress_when_claim_flagged(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Ownership protocol step 5 (queue_service docstring): while another
+    # mark-failed's torrent removal is in flight for this download, a superseding
+    # command is refused with an honest 409 ``removal_in_progress`` -- the delete
+    # is already irreversible, so promising remove_torrent=false would lie.
+    from plex_manager.services.queue_service import (
+        _mark_removal_in_flight,  # pyright: ignore[reportPrivateUsage]
+        _OperatorFailFlags,  # pyright: ignore[reportPrivateUsage]
+        _register_operator_claim,  # pyright: ignore[reportPrivateUsage]
+        _release_operator_claim,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    download_id = await _insert_download(sessionmaker_, torrent_hash="e" * 40, status="downloading")
+
+    token = _register_operator_claim(
+        download_id, _OperatorFailFlags(blocklist=True, remove_torrent=True)
+    )
+    _mark_removal_in_flight(download_id, token)
+    try:
+        response = await client.post(
+            f"/api/v1/queue/{download_id}/mark-failed",
+            params={"remove_torrent": "false"},
+            headers=_HEADERS,
+        )
+    finally:
+        _release_operator_claim(download_id, token)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "removal_in_progress"

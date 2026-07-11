@@ -36,7 +36,7 @@ def test_parsed_release_defaults() -> None:
     assert parsed.source is QualitySource.UNKNOWN
     assert parsed.resolution is Resolution.UNKNOWN
     assert parsed.modifier is Modifier.NONE
-    assert parsed.languages == []
+    assert parsed.languages == ()
     assert parsed.revision == Revision()
     assert parsed.season is None
     assert parsed.episode is None
@@ -82,6 +82,37 @@ def test_parsed_release_is_frozen() -> None:
         parsed.clean_title = "mutated"  # type: ignore[misc]
 
 
+def test_parsed_release_languages_is_an_immutable_tuple() -> None:
+    """Issue #106: ``frozen=True`` blocks reassigning ``parsed.languages`` but
+    never stopped a plain list from being mutated IN PLACE -- corrupting every
+    other holder of a shared ``ParsedRelease``. A ``list`` input is coerced to
+    a tuple; the source list's own later mutation must never leak in."""
+    source = ["eng", "fra"]
+    parsed = ParsedRelease(
+        raw_title="x",
+        clean_title="x",
+        languages=source,  # pyright: ignore[reportArgumentType]
+    )
+    assert parsed.languages == ("eng", "fra")
+    assert isinstance(parsed.languages, tuple)
+    source.append("deu")  # mutate the ORIGINAL list after construction
+    assert parsed.languages == ("eng", "fra")  # unaffected
+
+
+def test_candidate_release_categories_is_an_immutable_tuple() -> None:
+    candidate = CandidateRelease(
+        guid="g1",
+        title="t",
+        size_bytes=1,
+        indexer_id=1,
+        indexer_name="idx",
+        publish_date=datetime(2023, 1, 1, tzinfo=UTC),
+        categories=[2000, 2040],  # pyright: ignore[reportArgumentType]
+    )
+    assert isinstance(candidate.categories, tuple)
+    assert candidate.categories == (2000, 2040)
+
+
 def test_candidate_release_defaults() -> None:
     candidate = CandidateRelease(
         guid="g1",
@@ -93,15 +124,15 @@ def test_candidate_release_defaults() -> None:
     )
     assert candidate.protocol == "torrent"
     assert candidate.indexer_priority == 25
-    assert candidate.categories == []
+    assert candidate.categories == ()
     assert candidate.magnet_url is None
 
 
 def test_indexer_search_request_defaults() -> None:
     request = IndexerSearchRequest()
     assert request.media_type == "search"
-    assert request.categories == []
-    assert request.indexer_ids == []
+    assert request.categories == ()
+    assert request.indexer_ids == ()
 
 
 def test_scored_release_holds_quality_dataclass() -> None:

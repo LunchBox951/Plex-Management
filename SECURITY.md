@@ -27,9 +27,11 @@ there is no bug-bounty program.
 - Service credentials (Plex token, TMDB / Prowlarr / qBittorrent keys) are entered
   through the in-app setup wizard and **stored encrypted at rest**, never in the
   image or in `.env`.
-- First-run setup is guarded by `PLEX_MANAGER_SETUP_TOKEN` in the stock Docker
-  Compose deployment, and the default published host bind is loopback-only. Keep
-  that token out of issue reports, logs, screenshots, and public compose examples.
+- First-run setup is claimed by the first Plex server owner to sign in, and the
+  default published host bind is loopback-only. `PLEX_MANAGER_SETUP_TOKEN` is
+  optional hardening; when configured it must be supplied as `X-Setup-Token`
+  before pre-init sign-in/setup can proceed. Keep that token out of issue
+  reports, logs, screenshots, and public compose examples.
 - Secrets **must never be written to logs**. The log capture pipeline stores
   already-formatted messages and context rather than redacting after capture, so
   the control is call-site hygiene plus tests and quieter `httpx`/`httpcore`

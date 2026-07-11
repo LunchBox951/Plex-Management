@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
+from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.repositories import SeasonRequestRecord
 
 if TYPE_CHECKING:
@@ -46,8 +46,13 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         status=row.status.value,
         tmdb_id=tmdb_id,
         library_path=row.library_path,
+        installed_quality_id=row.installed_quality_id,
+        installed_profile_index=row.installed_profile_index,
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
+        # NULL (every pre-migration row) reads as ``False`` -- the safe default
+        # (see ``SeasonRequest.eviction_regrab``'s docstring in ``models.py``).
+        eviction_regrab=bool(row.eviction_regrab),
     )
 
 
@@ -125,6 +130,144 @@ class SqlSeasonRequestRepository:
             grouped.setdefault(row.media_request_id, []).append(_to_record(row, tmdb_id))
         return grouped
 
+    async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
+        """Season numbers whose NEWEST tracked row (across every ``tv``
+        ``MediaRequest`` for this ``tmdb_id``) is ``evicted`` (ADR-0012).
+
+        ``season_request_service.ensure_seasons`` subtracts these from Plex's fresh
+        ``present_seasons`` snapshot, so a season the disk-pressure sweep is
+        mid-deleting -- or has just deleted, before the post-delete Plex refresh
+        lands -- is never created or re-armed straight to ``available`` off a STALE
+        'present' reading (the season-level twin of
+        ``SqlRequestRepository.latest_request_evicted``; see its docstring for the
+        eviction delete window this closes). It re-grabs (``pending``) instead.
+
+        Keyed on the NEWEST NON-``cancelled`` row PER SEASON (the highest ``id``
+        among every ``MediaRequest`` sharing this ``tmdb_id``, since a title
+        accrues several rows over its lifetime -- see
+        ``uq_media_requests_active``): a season legitimately re-downloaded after
+        an earlier eviction (its newest row now ``available``) is NOT falsely
+        suppressed, only one whose most recent history really is an eviction.
+        ``cancelled`` rows are IGNORED outright, exactly like
+        ``SqlRequestRepository.latest_request_evicted`` (see there): a
+        cancellation says nothing about on-disk truth, so an in-window re-grab
+        the user then cancelled must not reset this guard for the NEXT
+        re-request while the sweep is still deleting the season's files. Movies
+        never reach here -- only ``tv`` parents own ``season_requests`` rows --
+        but the ``media_type`` filter is kept explicit against a ``tmdb_id``
+        shared across the movie/tv namespaces.
+        """
+        stmt = (
+            select(SeasonRequest.season_number, SeasonRequest.status)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType.tv,
+                SeasonRequest.status != RequestStatus.cancelled,
+            )
+            .order_by(SeasonRequest.season_number, SeasonRequest.id)
+        )
+        # Ascending ``id`` per season means the LAST row seen for each season is its
+        # newest (cancelled rows already filtered out above); keep only the newest
+        # status, then filter to the evicted ones.
+        newest: dict[int, RequestStatus] = {}
+        for season_number, status in (await self._session.execute(stmt)).all():
+            newest[season_number] = status
+        return frozenset(s for s, status in newest.items() if status == RequestStatus.evicted)
+
+    async def list_sibling_seasons(
+        self, tmdb_id: int, season_number: int, statuses: frozenset[str], exclude_id: int
+    ) -> list[SeasonRequestRecord]:
+        """Every OTHER request's row for the SAME ``(tmdb_id, season_number)``
+        whose status is in ``statuses``, oldest first.
+
+        The season-granularity mirror of ``SqlRequestRepository.list_for_media``
+        (see there), for the eviction restore's re-grab reconciliation
+        (ADR-0012 #67): a title accrues several ``MediaRequest`` rows over its
+        lifetime, so an in-window re-request for a WHOLLY evicted show tracks
+        this same season under a NEWER parent -- those duplicates are what the
+        restore cancels when the file never actually left. ``exclude_id`` is the
+        restored row itself. A plain read, not a CAS: the caller re-compares via
+        :meth:`set_status_if_in`.
+        """
+        stmt = (
+            select(SeasonRequest, MediaRequest.tmdb_id)
+            .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType.tv,
+                SeasonRequest.season_number == season_number,
+                SeasonRequest.id != exclude_id,
+                SeasonRequest.status.in_([RequestStatus(s) for s in statuses]),
+            )
+            .order_by(SeasonRequest.id)
+        )
+        return [
+            _to_record(row, parent_tmdb_id)
+            for row, parent_tmdb_id in (await self._session.execute(stmt)).all()
+        ]
+
+    async def clear_library_path_if_set(
+        self,
+        season_request_id: int,
+        *,
+        expected_path: str | None = None,
+        expected_statuses: frozenset[str] | None = None,
+    ) -> bool:
+        """Null the season's eviction breadcrumb ONLY if currently set (and, with
+        ``expected_path``, only if it still holds EXACTLY that value; with
+        ``expected_statuses``, only if it is still in one of those statuses);
+        return whether this call actually cleared it.
+
+        The season-granularity mirror of ``SqlRequestRepository.
+        clear_library_path_if_set`` (see there, including the ``expected_path``
+        value predicate): the eviction finalize's single-winner gate -- only the
+        finalize/recovery pass that actually cleared the breadcrumb writes the
+        eviction history row, and a clear predicated on the OBSERVED stale path
+        can never wipe the fresh breadcrumb a replacement import stamped onto
+        the row mid-recovery.
+        """
+        predicates = [
+            SeasonRequest.id == season_request_id,
+            SeasonRequest.library_path.is_not(None),
+        ]
+        if expected_path is not None:
+            predicates.append(SeasonRequest.library_path == expected_path)
+        if expected_statuses is not None:
+            predicates.append(
+                SeasonRequest.status.in_([RequestStatus(status) for status in expected_statuses])
+            )
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(SeasonRequest)
+                .where(*predicates)
+                .values(library_path=None)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def other_row_claims_path(
+        self, library_path: str, *, exclude_season_request_id: int | None = None
+    ) -> bool:
+        """Whether any (other) season row currently claims ``library_path``.
+
+        The season-granularity mirror of ``SqlRequestRepository.
+        other_row_claims_path`` (see there): the eviction recovery pass's
+        finalized-vs-interrupted discriminator. ``evicted``/``cancelled`` rows do
+        not count as claims; ``exclude_season_request_id`` is the row being
+        recovered itself.
+        """
+        predicates = [
+            SeasonRequest.library_path == library_path,
+            SeasonRequest.status.notin_([RequestStatus.evicted, RequestStatus.cancelled]),
+        ]
+        if exclude_season_request_id is not None:
+            predicates.append(SeasonRequest.id != exclude_season_request_id)
+        stmt = select(SeasonRequest.id).where(*predicates).limit(1)
+        return (await self._session.execute(stmt)).scalars().first() is not None
+
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
         stmt = select(SeasonRequest)
         if status is not None:
@@ -186,16 +329,25 @@ class SqlSeasonRequestRepository:
         await self._session.flush()
 
     async def ensure(
-        self, media_request_id: int, season_number: int, *, status: str
+        self,
+        media_request_id: int,
+        season_number: int,
+        *,
+        status: str,
+        eviction_regrab: bool = False,
     ) -> SeasonRequestRecord:
         existing = await self._find(media_request_id, season_number)
         if existing is not None:
+            # ``eviction_regrab`` is ONLY the value used on first creation, exactly
+            # like ``status`` above (see the docstring) -- an already-established
+            # season's provenance marker is never retroactively applied here.
             return _to_record(existing, await self._tmdb_id_for(media_request_id))
 
         row = SeasonRequest(
             media_request_id=media_request_id,
             season_number=season_number,
             status=RequestStatus(status),
+            eviction_regrab=eviction_regrab,
         )
         try:
             # A SAVEPOINT (not a full transaction rollback): on IntegrityError only
@@ -231,10 +383,17 @@ class SqlSeasonRequestRepository:
         await self._session.flush()
 
     async def set_status_if_in(
-        self, season_request_id: int, status: str, allowed_from: frozenset[str]
+        self,
+        season_request_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        require_parent_unpinned: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
-        status is in ``allowed_from``. Returns whether a row was actually updated.
+        status is in ``allowed_from`` (and, with ``require_parent_unpinned``, only
+        if the PARENT show is not ``keep_forever``-pinned). Returns whether a row
+        was actually updated.
 
         The season-granularity mirror of ``SqlRequestRepository.set_status_if_in``
         (see its docstring for the full rationale) -- the eviction sweep's
@@ -243,13 +402,36 @@ class SqlSeasonRequestRepository:
         recomputes the parent rollup, but ONLY when this CAS actually changed
         the row -- a losing sweep must never re-derive (and re-persist) a
         rollup off a row it did not actually get to move.
+
+        ``require_parent_unpinned`` (opt-in for the eviction CLAIM, ADR-0012 #67)
+        folds the TV pin into the compared predicate. The pin lives on the PARENT
+        ``MediaRequest`` (``keep_forever``), never on the season row, so -- unlike
+        the movie CAS, which compares ``keep_forever`` on its own row -- this needs
+        a correlated ``EXISTS`` subquery: the UPDATE additionally requires that NO
+        parent row with this season's ``media_request_id`` is pinned. Because the
+        eviction claim now runs this CAS BEFORE any filesystem delete, a pin that
+        commits on the parent after a season candidate was assembled but before the
+        claim makes the UPDATE match zero rows -- the DATABASE atomically refuses to
+        delete a season whose show was just pinned, rather than a read-then-act
+        check that a concurrent pin could slip past.
         """
+        predicates = [
+            SeasonRequest.id == season_request_id,
+            SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
+        ]
+        if require_parent_unpinned:
+            parent_pinned = (
+                select(MediaRequest.id)
+                .where(
+                    MediaRequest.id == SeasonRequest.media_request_id,
+                    MediaRequest.keep_forever.is_(True),
+                )
+                .exists()
+            )
+            predicates.append(~parent_pinned)
         stmt = (
             update(SeasonRequest)
-            .where(
-                SeasonRequest.id == season_request_id,
-                SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
-            )
+            .where(*predicates)
             .values(status=RequestStatus(status))
             .execution_options(synchronize_session="fetch")
         )
@@ -261,8 +443,22 @@ class SqlSeasonRequestRepository:
         await self.set_status(season_request_id, RequestStatus.completed.value)
 
     async def mark_available(self, season_request_id: int) -> None:
-        """Set ``available`` (Plex-confirmed: ``leafCount>0`` for this season)."""
-        await self.set_status(season_request_id, RequestStatus.available.value)
+        """Set ``available`` (Plex-confirmed: ``leafCount>0`` for this season).
+
+        Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2) --
+        the season-level twin of ``SqlRequestRepository.mark_available``'s same
+        clear; see its docstring for the full rationale. Deliberately its OWN
+        write (not a delegation to :meth:`set_status`, which every OTHER
+        in-flight transition -- e.g. ``downloading`` -- also uses and where the
+        marker must still stand): only THIS confirmed-watchable moment retires
+        the marker.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.status = RequestStatus.available
+        row.eviction_regrab = False
+        await self._session.flush()
 
     async def set_library_path(self, season_request_id: int, library_path: str) -> None:
         """Store the final placed path this season's import wrote into (ADR-0012)."""
@@ -270,6 +466,16 @@ class SqlSeasonRequestRepository:
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = library_path
+        await self._session.flush()
+
+    async def set_installed_quality(
+        self, season_request_id: int, *, quality_id: int, profile_index: int | None
+    ) -> None:
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.installed_quality_id = quality_id
+        row.installed_profile_index = profile_index
         await self._session.flush()
 
     async def clear_library_path(self, season_request_id: int) -> None:
@@ -285,4 +491,27 @@ class SqlSeasonRequestRepository:
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = None
+        await self._session.flush()
+
+    async def clear_eviction_regrab(self, season_request_id: int) -> None:
+        """Null the eviction-regrab provenance marker (issue #156 lifecycle fix,
+        Codex round-2).
+
+        Called from ``season_request_service.reset_for_research`` (ADR-0014's
+        report-issue verb): the operator re-arming this season for a BRAND-NEW
+        search is the row leaving "THIS eviction's own in-flight regrab" behind --
+        it is now the operator's own deliberate re-search, whatever its
+        provenance was before. Without this, a stale marker on a row later
+        re-armed here could let a DIFFERENT, unrelated eviction's failed-delete
+        restore (``eviction_service._cancel_redundant_season_regrabs``) cancel the
+        operator's live re-search purely because of the row's old history. A
+        SEPARATE call (not folded into :meth:`set_status`, which every OTHER
+        in-flight transition also uses and where the marker must still stand)
+        mirrors :meth:`mark_available`'s own dedicated clear. No-op-safe if the
+        row vanished.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.eviction_regrab = False
         await self._session.flush()

@@ -120,7 +120,7 @@ async def test_search_maps_and_dedupes_by_guid() -> None:
     assert first.size_bytes == 8589934592
     assert first.seeders == 120
     assert first.leechers == 8
-    assert first.categories == [2000, 2040]
+    assert first.categories == (2000, 2040)
     assert first.imdb_id == 1375666
     assert first.tmdb_id == 27205
     assert first.publish_date.year == 2023
@@ -219,8 +219,8 @@ async def test_search_builds_expected_query_params() -> None:
             imdb_id="944947",
             season=2,
             episode="5",
-            categories=[5000, 5040],
-            indexer_ids=[7],
+            categories=(5000, 5040),
+            indexer_ids=(7,),
         )
     )
     params = dict(captured["params"])
@@ -270,6 +270,32 @@ async def test_rate_limit_error_excludes_api_key() -> None:
         pytest.fail("expected IndexerRateLimitError")
 
 
+@pytest.mark.parametrize("bad_key", ["key\r\ninjected", "key\x00nul", "kéy-nonascii"])
+async def test_header_unsafe_api_key_raises_without_echoing(bad_key: str) -> None:
+    """Defense-in-depth: a stored key that cannot ride the ``X-Api-Key`` header (a
+    dev-bypass / legacy row that skipped the write-time check) must fail as a
+    credential-free ``IndexerError`` -- never echo the RAW key via httpx's
+    ``str(exc)`` in ``_indexer_priorities``' warning log (CR/LF/NUL), never crash
+    with an uncaught ``UnicodeEncodeError`` (non-ASCII). The key never rides a
+    request at all."""
+    sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        nonlocal sent
+        sent += 1
+        return httpx.Response(200, json=[])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ProwlarrIndexer(client, BASE_URL, bad_key)
+    try:
+        with pytest.raises(IndexerError) as exc_info:
+            await adapter.search(IndexerSearchRequest(query="x"))
+        assert bad_key not in str(exc_info.value)
+        assert sent == 0
+    finally:
+        await client.aclose()
+
+
 async def test_transport_outage_raises_indexer_error() -> None:
     """Prowlarr unreachable surfaces a wrapped, retryable IndexerError — never an
     opaque httpx error -> 500. (The priority pre-fetch failing is swallowed; the
@@ -284,6 +310,21 @@ async def test_transport_outage_raises_indexer_error() -> None:
     assert BASE_URL not in str(exc_info.value)
 
 
+async def test_malformed_stored_base_url_raises_indexer_error() -> None:
+    """A malformed stored base URL (e.g. a corrupted Settings row) makes httpx
+    raise ``InvalidURL`` while BUILDING the request — before any transport I/O.
+    ``InvalidURL`` is NOT a ``RequestError`` subclass (issue #88), so without an
+    explicit catch it would escape untyped as an opaque 500 instead of the
+    intended indexer-unavailable ``IndexerError``. The malformed port breaks the
+    indexer-priority lookup first (best-effort no longer applies to a config
+    error) and that is what search() observes."""
+    client = httpx.AsyncClient()
+    adapter = ProwlarrIndexer(client, "http://prowlarr.local:notaport", API_KEY)
+    with pytest.raises(IndexerError):
+        await adapter.search(IndexerSearchRequest(query="x"))
+    await client.aclose()
+
+
 async def test_search_5xx_raises_indexer_error() -> None:
     """A non-400 HTTP failure (5xx) on the search is wrapped as IndexerError."""
 
@@ -294,6 +335,29 @@ async def test_search_5xx_raises_indexer_error() -> None:
 
     with pytest.raises(IndexerError):
         await _adapter(handler).search(IndexerSearchRequest(query="x"))
+
+
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_search_redirect_status_raises_indexer_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of Prowlarr) must be rejected
+    like any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes
+    3xx, so the prior check would have read a redirect as a successful search
+    even though it returned no actual release data."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexer":
+            return httpx.Response(200, json=INDEXERS)
+        # A JSON body on the redirect ensures this test only passes via the
+        # explicit 2xx-range status check (issue #87): if that check were
+        # reverted to ``response.is_error``, the 3xx would fall through to
+        # response.json(), succeed (the body is valid JSON), and the redirect
+        # would be silently read as a successful empty search — the exact
+        # regression this test must catch.
+        return httpx.Response(status, headers={"Location": "/login"}, json=[])
+
+    with pytest.raises(IndexerError) as exc_info:
+        await _adapter(handler).search(IndexerSearchRequest(query="x"))
+    assert str(status) in str(exc_info.value)
 
 
 async def test_search_non_json_200_raises_indexer_error() -> None:

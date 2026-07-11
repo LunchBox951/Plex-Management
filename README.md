@@ -14,15 +14,16 @@ single app — with two differences that define the project:
 > import, Plex scan, Plex availability dedupe, disk-pressure eviction,
 > operability (health/logs/retention/eviction), auto-grab, and in-app correction
 > surfaces. A 7-day live beta run is set to begin gathering real-world data ahead
-> of a v1 stable promotion. Plex OAuth and the bundled host updater are still
-> deferred.
+> of a v1 stable promotion. Browser Plex sign-in/session auth is built; the
+> bundled host updater is still deferred.
 
 ## What works now (beta)
 
 - **First-run setup wizard** (`/api/v1/setup/*`): validate and store
   Plex/Prowlarr/qBittorrent/TMDB credentials — encrypted at rest, never logged.
-- **API-key auth** (`X-Api-Key`) on every protected route; a setup guard blocks
-  the API until the install is initialized.
+- **Plex browser sign-in** with HTTP-only session cookies for normal UI access,
+  plus an optional `X-Api-Key` recovery/automation key on protected routes; a
+  setup guard blocks the protected API until the install is initialized.
 - **Web UI** for setup, discovery, requests, queue management, status, logs,
   settings, blocklist, and quality-profile inspection.
 - **TMDB discovery** → **request** a movie/show (anime auto-tagged).
@@ -44,9 +45,9 @@ single app — with two differences that define the project:
 The typed contract for all of this is published at
 [`docs/api/openapi.json`](docs/api/openapi.json) (regenerate with `make openapi`).
 
-**Deferred**: Plex OAuth and a bundled host auto-updater. The release workflow can
-promote an already-built image to `:stable`, but the host-side pull/restart
-mechanism is still operator-managed.
+**Deferred**: a bundled host auto-updater. The release workflow can promote an
+already-built image to `:stable`, but the host-side pull/restart mechanism is
+still operator-managed.
 
 ## Why
 
@@ -76,19 +77,19 @@ recovery, troubleshooting — happens in the browser** (see
 
 ```bash
 cp .env.example .env
-python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_urlsafe(32))" >> .env
 # adjust image, bind mounts, database URL, and host bind/port as needed
 docker compose up -d
-# then open http://127.0.0.1:8000 and enter the setup token from .env
+# then open http://127.0.0.1:8000 and sign in with the Plex server owner
 ```
 
 Before starting the container, set `PLEX_MANAGER_MEDIA_ROOT` and
 `PLEX_MANAGER_DOWNLOADS_ROOT` in `.env` to host directories that contain the Plex
 libraries and qBittorrent downloads. They are mounted as `/media` and `/downloads`
 inside the container; the setup wizard paths must use those in-container paths.
-The stock compose file publishes only on `127.0.0.1` and requires
-`PLEX_MANAGER_SETUP_TOKEN` so a fresh uninitialized install cannot be claimed
-remotely. Use an SSH tunnel or reverse proxy for first setup; only set
+The stock compose file publishes only on `127.0.0.1`. A default install claims
+first-run setup when the first Plex server owner signs in; for extra hardening,
+set `PLEX_MANAGER_SETUP_TOKEN` before starting and send it from the setup UI
+(`X-Setup-Token`). Use an SSH tunnel or reverse proxy for first setup; only set
 `PLEX_MANAGER_HOST_BIND=0.0.0.0` when the host is intentionally exposed.
 
 Each host is *designed* to auto-pull its release channel (the updater mechanism —
@@ -111,10 +112,11 @@ make run       # http://localhost:8000  (/health to verify, /docs for the API)
 make openapi   # regenerate docs/api/openapi.json from the live app
 ```
 
-Before `make run`, create `.env` and set `PLEX_MANAGER_SETUP_TOKEN`; the local
-server refuses first-run startup without it. For short-lived local API/docs work
-only, `PLEX_MANAGER_DEV_AUTH_BYPASS=true make run` skips both setup-token and
-API-key checks.
+For short-lived local API/docs work only,
+`PLEX_MANAGER_DEV_AUTH_BYPASS=true make run` skips both setup-token and auth
+checks. Otherwise the local server supports the same first-run Plex sign-in flow
+as Docker; set `PLEX_MANAGER_SETUP_TOKEN` only when you want the optional
+pre-init hardening token.
 
 Project layout and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 

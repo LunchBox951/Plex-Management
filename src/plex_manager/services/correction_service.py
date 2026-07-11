@@ -17,8 +17,14 @@ a terminal):
   run the SAME decision-engine -> grab path the grab endpoint uses, so the re-search
   happens inline -- the blocklist now excludes the bad release, guaranteeing a
   DIFFERENT one is grabbed (or the honest ``no_acceptable_release`` park if nothing is
-  acceptable). The synchronous re-grab IS the auto re-search AND the undo (the
-  content comes back), which is why no recycle bin is needed for the beta.
+  acceptable). Following ``auto_grab_service``'s operational-vs-park taxonomy, ONLY a
+  genuinely empty acceptable-release set (or every candidate per-release-unusable)
+  parks ``no_acceptable_release``; an OPERATIONAL failure -- the indexer unreachable
+  during the re-search, the download client erroring, or a grab that left a live
+  untracked torrent -- must NOT park (that would LIE about content exhaustion) and
+  instead leaves the scope at the already-committed ``searching`` for the merged
+  auto-grab worker to retry. The synchronous re-grab IS the auto re-search AND the undo
+  (the content comes back), which is why no recycle bin is needed for the beta.
 
   Ordering rationale (ADR-0014 race fix): steps (c)/(d) are IRREVERSIBLE, so the
   slot claim (b) runs first and is committed atomically WITH them -- SQLite
@@ -56,16 +62,20 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.prowlarr.adapter import IndexerError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError, QbittorrentSourceError
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
+    Download,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
@@ -81,6 +91,7 @@ from plex_manager.services import (
     season_request_service,
 )
 from plex_manager.services.auto_grab_service import MAX_GRAB_ATTEMPTS_PER_SCOPE
+from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
 from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
 
@@ -93,7 +104,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.indexer import IndexerPort
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.parser import ParserPort
-    from plex_manager.ports.repositories import RequestRecord, SeasonRequestRecord
+    from plex_manager.ports.repositories import DownloadRecord, RequestRecord, SeasonRequestRecord
     from plex_manager.services.library_roots import LibraryRoots
 
 __all__ = [
@@ -101,14 +112,19 @@ __all__ = [
     "REPORTABLE_STATUS_VALUES",
     "ActiveDuplicateError",
     "DownloadClientRequiredError",
+    "DownloadNotFoundError",
+    "DownloadsRootUnavailableError",
     "ImportInProgressError",
     "MediaRootUnavailableError",
     "NotCancellableError",
+    "NotRelocatableError",
     "NotReportableError",
+    "RelocationSupersededError",
     "ReportSeasonRequiredError",
     "RequestNotFoundError",
     "SeasonNotFoundError",
     "cancel_request",
+    "relocate_stranded_download",
     "report_issue",
 ]
 
@@ -138,6 +154,7 @@ CANCELLABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.pending.value,
         RequestStatus.searching.value,
         RequestStatus.no_acceptable_release.value,
+        RequestStatus.waiting_for_air_date.value,
         RequestStatus.downloading.value,
     }
 )
@@ -158,6 +175,7 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.completed.value,
     }
 )
+_UNRESOLVED_SCOPE_STATUSES: Final[frozenset[str]] = frozenset({"active", "import_blocked"})
 
 # The PER-RELEASE grab failures the inline re-grab falls through on (mirroring
 # ``auto_grab_service``'s per-release set): the ATTEMPTED release is unusable --
@@ -165,53 +183,110 @@ _UNCANCELLABLE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 # is raised BEFORE anything reaches the client; it subclasses ``QbittorrentError``
 # so it MUST be caught before ``_DOWNLOAD_CLIENT_ERRORS`` or a bad source would be
 # mistreated as a client outage and the scope silently left at ``searching``), or
-# its hash is already active under a different scope/request -- while a LOWER-
-# ranked accepted replacement may still be grabbable. The re-grab tries the next
-# candidate (bounded) and only parks when the list/cap exhausts.
+# its hash is already active under a different request -- while a LOWER-ranked
+# accepted replacement may still be grabbable. The re-grab tries the next candidate
+# (bounded) and only parks when the list/cap exhausts.
 _PER_RELEASE_GRAB_ERRORS: Final = (
     grab_service.NoGrabSourceError,
-    grab_service.DownloadScopeConflictError,
     grab_service.TorrentAlreadyTrackedError,
     QbittorrentSourceError,
 )
 
-# The remaining grab-path exceptions the inline re-grab may raise (all defined in
-# ``grab_service``). A report-issue that has ALREADY purged + blocklisted must not
-# then 500/409 on a grab hiccup: it lands on the honest, retryable
-# ``no_acceptable_release`` park instead, exactly like the grab endpoint's own
-# empty-preview branch -- the request is left visible and re-searchable.
-# (``NoGrabSourceError``/``DownloadScopeConflictError`` are listed for
-# completeness but are consumed by the per-release fall-through above first.)
-_GRAB_ERRORS: Final = (
-    grab_service.NoGrabSourceError,
-    grab_service.GrabError,
+# The OPERATIONAL grab-pipeline failure the inline re-grab may raise: qBittorrent
+# ACCEPTED the torrent but no info-hash could be derived (an opaque URL, and the
+# indexer supplied none either), leaving a LIVE, untracked torrent and no
+# ``Download`` row. Mirrors ``auto_grab_service``'s ``GrabError`` handling: this is
+# NOT "nothing acceptable" -- releases exist; the grab PIPELINE failed -- so parking
+# ``no_acceptable_release`` would LIE. The handler leaves the scope at the
+# ``searching`` committed at (b) for the merged auto-grab worker to retry, and does
+# NOT try another candidate (a second grab against the live orphan would double-
+# download).
+_GRAB_OPERATIONAL_ERRORS: Final = (grab_service.GrabError,)
+
+# The SCOPE-level grab refusals the inline re-grab may raise (all defined in
+# ``grab_service``). Unlike the per-release failures, these apply to the whole SCOPE,
+# not this one release, so trying a lower-ranked candidate cannot help: the scope now
+# has an active download (``AlreadyDownloadingError``), or is terminal / mis-shaped
+# (``RequestNotActiveError`` / ``SeasonRequiredError``). Mirrors auto-grab's
+# settle-and-leave: discard the partial write and LEAVE the scope's committed
+# ``searching`` as-is -- never a ``no_acceptable_release`` park (that would LIE:
+# releases exist; the grab was refused for a scope reason, not exhaustion).
+_GRAB_SCOPE_REFUSALS: Final = (
     grab_service.AlreadyDownloadingError,
-    grab_service.DownloadScopeConflictError,
     grab_service.RequestNotActiveError,
     grab_service.SeasonRequiredError,
 )
 
 # The indexer failures the inline RE-SEARCH (``decision_service.preview`` ->
-# ``prowlarr.search``) may raise. Like ``_GRAB_ERRORS`` for the grab step, a
-# report-issue that has ALREADY blocklisted + purged must not then propagate a
-# Prowlarr transport/rate-limit/HTTP failure out as a 5xx that leaves the row lying
-# as ``searching`` with nothing in flight: it lands on the honest, retryable
-# ``no_acceptable_release`` park instead. ``IndexerRateLimitError`` is a subclass of
-# ``IndexerError`` and so is covered.
+# ``prowlarr.search``) may raise. Mirrors ``auto_grab_service``'s raised-search
+# handling: a report-issue that has ALREADY blocklisted + purged must not propagate a
+# Prowlarr transport/rate-limit/HTTP failure out as a 5xx -- but this is an
+# OPERATIONAL failure (Prowlarr down / rate-limited), NOT content exhaustion, so it
+# must NOT park ``no_acceptable_release`` either (that would LIE: releases may well
+# exist; the INDEXER is unreachable). The scope is LEFT at the ``searching`` committed
+# at (b) for the merged auto-grab worker to retry on its next tick.
+# ``IndexerRateLimitError`` is a subclass of ``IndexerError`` and so is covered.
 _INDEXER_ERRORS: Final = (IndexerError,)
 
 # The download-client failures the inline RE-GRAB (``grab_service.grab`` ->
-# ``qbt.add``) may raise. Unlike ``_GRAB_ERRORS`` (application-level grab refusals),
-# these are an OPERATIONAL client failure -- qBittorrent is unreachable / erroring
-# -- AFTER the blocklist/purge/reset already committed. Following ADR-0013's
-# park-vs-operational distinction, this must NOT park ``no_acceptable_release`` (that
-# would LIE: releases exist; it is the CLIENT that failed, exactly like auto-grab's
-# ``GrabError`` handling). The report-issue handler catches this family and LEAVES
-# the scope at ``searching`` -- the merged auto-grab worker picks up an eager
-# ``searching`` scope on its next tick, so the state self-heals -- rather than
-# letting a 502 escape after a successful correction. ``QbittorrentAuthError`` is a
-# subclass of ``QbittorrentError`` and so is covered.
+# ``qbt.add``) may raise. Unlike the SCOPE refusals (``_GRAB_SCOPE_REFUSALS``) and the
+# per-release failures, these are an OPERATIONAL client failure -- qBittorrent is
+# unreachable / erroring -- AFTER the blocklist/purge/reset already committed.
+# Following ADR-0013's park-vs-operational distinction, this must NOT park
+# ``no_acceptable_release`` (that would LIE: releases exist; it is the CLIENT that
+# failed, exactly like auto-grab's ``GrabError`` handling). The report-issue handler
+# catches this family and LEAVES the scope at ``searching`` -- the merged auto-grab
+# worker picks up an eager ``searching`` scope on its next tick, so the state
+# self-heals -- rather than letting a 502 escape after a successful correction.
+# ``QbittorrentSourceError`` is caught FIRST by the inner per-release handler (it
+# subclasses ``QbittorrentError`` but is a source veto, not an outage), and
+# ``QbittorrentAuthError`` is a subclass of ``QbittorrentError`` and so is covered.
 _DOWNLOAD_CLIENT_ERRORS: Final = (QbittorrentError,)
+
+
+async def _multi_season_intent_for_request(
+    session: AsyncSession,
+    request: RequestRecord,
+) -> MultiSeasonRequestIntent | None:
+    if request.media_type != "tv" or request.tv_request_mode not in {
+        "whole_show",
+        "explicit_seasons",
+        "explicit_episodes",
+    }:
+        return None
+    season_rows = await SqlSeasonRequestRepository(session).list_for_request(request.id)
+    requested = (
+        request.requested_seasons
+        or tuple(sorted(request.requested_episodes or {}))
+        or tuple(row.season_number for row in season_rows)
+    )
+    return MultiSeasonRequestIntent(
+        mode="whole_show" if request.tv_request_mode == "whole_show" else "explicit_seasons",
+        requested_seasons=tuple(requested),
+        seasons=tuple(
+            SeasonPackSeasonState(
+                season_number=row.season_number,
+                status=row.status,
+                installed_quality_id=row.installed_quality_id,
+                installed_profile_index=row.installed_profile_index,
+            )
+            for row in season_rows
+        ),
+    )
+
+
+async def _mark_download_scopes_terminal(
+    session: AsyncSession, download_id: int, status: str
+) -> None:
+    await session.execute(
+        update(DownloadScope)
+        .where(
+            DownloadScope.download_id == download_id,
+            DownloadScope.status.in_(_UNRESOLVED_SCOPE_STATUSES),
+        )
+        .values(status=status)
+    )
+
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal
 # state EXCEPT ``importing``. An ``importing`` row is mid-copy/scan: failing it would
@@ -293,9 +368,15 @@ class MediaRootUnavailableError(Exception):
     existed lives under ``movies_root``/``tv_root``. Raised when that owning root
     is unmounted/empty, when the breadcrumb sits under NONE of the configured
     roots (an honest, correctable refusal rather than a silent blocklist+re-grab
-    against a file we cannot locate to purge), and when a NO-breadcrumb row's
-    media-type-appropriate fallback root is unset/unmounted (see the failsafe
-    comment in :func:`report_issue`).
+    against a file we cannot locate to purge), and when a NO-breadcrumb row that
+    HAS a culprit download's media-type-appropriate fallback root is unset/
+    unmounted (see the failsafe comment in :func:`report_issue`).
+
+    Issue #131: a row with NEITHER a breadcrumb NOR a culprit download is purely
+    presence-derived (recorded available straight from Plex) -- there is nothing
+    of ours to protect, so the fallback check is SKIPPED for it and this error is
+    never raised on its account; see the reacquire relaxation in
+    :func:`report_issue`.
     """
 
     def __init__(self, request_id: int, root_path: str | None) -> None:
@@ -373,6 +454,79 @@ class DownloadClientRequiredError(Exception):
         )
 
 
+class DownloadNotFoundError(Exception):
+    """No download exists for the given id (HTTP 404)."""
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(f"download {download_id} does not exist")
+
+
+class NotRelocatableError(Exception):
+    """The download is not an import-blocked, path-invisible row (HTTP 409).
+
+    :func:`relocate_stranded_download` is scoped EXACTLY to the "download path not
+    visible inside the container" block (issues #133/#157) -- never a general-purpose
+    mover. A download in any other state (or ``import_blocked`` for a DIFFERENT
+    reason, e.g. a genuinely bad/wrong-media file) has nothing a relocate would fix,
+    so it is refused rather than silently no-op'd.
+    """
+
+    def __init__(self, download_id: int, status: str) -> None:
+        self.download_id = download_id
+        self.status = status
+        super().__init__(
+            f"download {download_id} (status={status!r}) is not a path-invisible "
+            f"import-blocked row; nothing to relocate"
+        )
+
+
+class DownloadsRootUnavailableError(Exception):
+    """No HOST-namespace downloads root could be derived (HTTP 409).
+
+    The root-guard for :func:`relocate_stranded_download`: it may ONLY ever direct
+    qBittorrent to move a torrent INTO the app's own derived downloads root
+    (``path_visibility.resolve_downloads_host_root``), never a caller-chosen or
+    guessed path. When ``PLEX_MANAGER_DOWNLOADS_ROOT`` is unset, there is nothing
+    safe to relocate into -- refuse rather than send qBittorrent an
+    empty/placeholder location.
+    """
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        super().__init__(
+            f"cannot relocate download {download_id}: no downloads host root could be derived"
+        )
+
+
+class RelocationSupersededError(Exception):
+    """The row was re-blocked with a NEWER, different reason while the
+    relocation was in flight (HTTP 409).
+
+    :func:`relocate_stranded_download` observes the row's ``failed_reason`` up
+    front and issues the (async) ``qbt.set_location`` request; a concurrent
+    "Retry import" can re-block the SAME (still ``import_blocked``) row with a
+    genuinely different diagnosis (e.g. "no video file found") in the gap
+    before this function's own terminal write. The terminal write is a
+    compare-and-swap gated on BOTH the status AND the exact ``failed_reason``
+    observed at entry, so a losing CAS here means a fresher block reason
+    already won -- overwriting it would silently discard that newer diagnosis
+    (the bug this guards against). The relocation request was still issued to
+    qBittorrent (this is only about which message the row now carries); the
+    operator sees the newer, truthful reason rather than a stale "relocation
+    requested" message that no longer matches reality.
+    """
+
+    def __init__(self, download_id: int, current_reason: str | None) -> None:
+        self.download_id = download_id
+        self.current_reason = current_reason
+        super().__init__(
+            f"download {download_id} was re-blocked with a newer reason "
+            f"({current_reason!r}) while its relocation was in flight; the move "
+            "was still requested, but the row's message was left as-is"
+        )
+
+
 def _root_is_mounted(root_path: str | None) -> bool:
     """Whether ``root_path`` is a present, non-empty directory (an active mount).
 
@@ -428,13 +582,23 @@ async def report_issue(
     reason: str,
     season: int | None,
     roots: LibraryRoots,
+    save_path: str = "",
 ) -> RequestRecord:
     """Report a bad imported file: blocklist + purge (torrent + library) + re-search.
 
+    ``save_path`` (issues #133/#157) is threaded verbatim into the inline
+    replacement :func:`grab_service.grab` call below: the caller (the report-issue
+    endpoint) resolves the HOST-namespace downloads root once
+    (``path_visibility.resolve_downloads_host_root``) and passes it here, so the
+    replacement torrent lands under the mounted ``/downloads`` bind exactly like a
+    manual grab. ``""`` (the default) leaves qBittorrent's own default in charge,
+    unchanged prior behaviour.
+
     Returns the updated request record (re-read after the inline re-grab, so its
-    status reflects ``downloading`` on a successful replacement grab, or
-    ``no_acceptable_release`` / the season rollup when nothing acceptable was
-    found). See the module docstring for the full ordered flow and the caveats.
+    status reflects ``downloading`` on a successful replacement grab,
+    ``no_acceptable_release`` / the season rollup when nothing acceptable was found, or
+    ``searching`` when an OPERATIONAL failure -- see below -- left the scope for the
+    auto-grab worker). See the module docstring for the full ordered flow and caveats.
 
     Re-grab client failure (ADR-0013 park-vs-operational): if the inline re-grab's
     ``qbt.add`` raises a download-client error (``_DOWNLOAD_CLIENT_ERRORS``) AFTER the
@@ -456,6 +620,18 @@ async def report_issue(
     mistaken for the client outage its base class signals, which would strand
     the promised synchronous re-grab at ``searching`` (worst with auto-grab
     disabled: nothing would ever retry it).
+
+    Re-search / operational-grab failures (issue #71, mirroring auto-grab's
+    operational-vs-park taxonomy): an indexer failure during the inline RE-SEARCH
+    (``_INDEXER_ERRORS`` -- Prowlarr down / rate-limited), an operational GRAB failure
+    that left a live untracked torrent (``_GRAB_OPERATIONAL_ERRORS`` --
+    ``grab_service.GrabError``), or a scope-level grab refusal (``_GRAB_SCOPE_REFUSALS``
+    -- the scope now has an active download, or is terminal / mis-shaped) are all
+    OPERATIONAL, NOT content exhaustion, and so must NOT park ``no_acceptable_release``
+    (a LIE: releases exist / may exist; the PIPELINE failed). Each LEAVES the scope at
+    the ``searching`` committed at (b) for the merged auto-grab worker to retry --
+    identical to the download-client-outage handling above. ONLY a genuinely empty
+    acceptable-release set (or every candidate per-release-unusable) parks.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -478,6 +654,18 @@ async def report_issue(
     if active_sibling is not None and active_sibling.id != request_id:
         raise ActiveDuplicateError(request_id, active_sibling.id)
 
+    # Resolve the culprit release from the IMPORTED download for (request, season) --
+    # the row that actually placed the file being reported (and whose torrent still
+    # hardlink-seeds it), never merely the newest attempt: a season already available
+    # can carry a NEWER supplementary/failed row over the older imported one, and
+    # blocklisting/removing that would leave the real seed untouched so the purge frees
+    # nothing (ADR-0014). ``None`` when the title was recorded available straight from
+    # Plex (no download of ours) -- the blocklist/remove steps below are then skipped.
+    # Resolved here, BEFORE the Foot-gun failsafe below, because the failsafe's
+    # no-breadcrumb fallback needs to know whether there is a culprit to protect.
+    download_repo = SqlDownloadRepository(session)
+    culprit = await download_repo.find_latest_imported_for_request(request_id, season=target.season)
+
     # Foot-gun failsafe (ADR-0015 fix): refuse if the breadcrumb's own root is
     # unmounted/empty (see MediaRootUnavailableError). The root to verify is DERIVED
     # from the stored ``library_path`` -- the DEEPEST configured root containing it
@@ -490,18 +678,27 @@ async def report_issue(
     # Checked BEFORE any blocklist/remove/flip so a missing drive aborts the whole
     # verb rather than firing against content that is not really gone.
     #
-    # A row with NO breadcrumb (a title recorded available straight from Plex, or one
-    # predating the library_path column) has no path to derive an owner from, so the
-    # failsafe falls back to the media-type-appropriate root (the anime root for an
-    # is_anime row when configured, else the normal root -- the pre-fix pick, and the
-    # same root the file most plausibly lives under). Skipping the check entirely
-    # would let a report against an unmounted library blocklist + re-grab a duplicate
-    # of a file that is still really there once the drive returns.
+    # A row with NO breadcrumb but a CULPRIT download (a legacy row predating the
+    # library_path column, whose torrent may still hardlink-seed the file) has no
+    # path to derive an owner from, so the failsafe falls back to the media-type-
+    # appropriate root (the anime root for an is_anime row when configured, else the
+    # normal root -- the pre-fix pick, and the same root the file most plausibly
+    # lives under). Skipping the check entirely would let a report against an
+    # unmounted library blocklist the good release and re-grab a duplicate of a file
+    # that is still really there once the drive returns.
+    #
+    # Issue #131 relaxation: a row with NEITHER a breadcrumb NOR a culprit is
+    # PURELY presence-derived (recorded available straight from Plex; nothing of
+    # ours ever placed it). There is nothing to blocklist (culprit is None) and
+    # nothing to purge (no breadcrumb), so an unmounted fallback root protects no
+    # file of ours -- the mount check is SKIPPED and the verb proceeds straight to
+    # the honest re-arm + re-search reacquire semantics instead of a confusing 409
+    # dead-end (the operator has no file of ours to lose either way).
     if target.library_path is not None:
         check_root = deepest_containing_root(target.library_path, roots.configured())
         if check_root is None or not await asyncio.to_thread(_root_is_mounted, check_root):
             raise MediaRootUnavailableError(request_id, check_root or target.library_path)
-    else:
+    elif culprit is not None:
         fallback_root = roots.fallback_for(request.media_type, is_anime=request.is_anime)
         if not await asyncio.to_thread(_root_is_mounted, fallback_root):
             raise MediaRootUnavailableError(request_id, fallback_root)
@@ -510,16 +707,6 @@ async def report_issue(
     media_type = "tv" if is_tv else "movie"
     season_note = f" season {target.season}" if target.season is not None else ""
     log_extra: dict[str, object] = {"request_id": safe_int(request_id), "tmdb_id": request.tmdb_id}
-
-    # Resolve the culprit release from the IMPORTED download for (request, season) --
-    # the row that actually placed the file being reported (and whose torrent still
-    # hardlink-seeds it), never merely the newest attempt: a season already available
-    # can carry a NEWER supplementary/failed row over the older imported one, and
-    # blocklisting/removing that would leave the real seed untouched so the purge frees
-    # nothing (ADR-0014). ``None`` when the title was recorded available straight from
-    # Plex (no download of ours) -- the blocklist/remove steps below are then skipped.
-    download_repo = SqlDownloadRepository(session)
-    culprit = await download_repo.find_latest_imported_for_request(request_id, season=target.season)
 
     # (a) blocklist the culprit release (nothing to blocklist if the title was
     # recorded available straight from Plex, with no download of ours). A REVERSIBLE
@@ -603,7 +790,7 @@ async def report_issue(
                 purge.detail,
                 extra=log_extra,
             )
-        elif purge.outcome is PurgeOutcome.error:
+        elif purge.outcome in {PurgeOutcome.error, PurgeOutcome.deferred}:
             purge_ok = False
             _logger.warning(
                 "report-issue purge of %r failed (%s); re-searching anyway but keeping "
@@ -673,6 +860,12 @@ async def report_issue(
     # season dir, never a single episode), so re-fetching only the culprit's episode
     # subset would leave the season with the OTHER (also-deleted) episodes missing while
     # marking it done. A season-directory purge must drive a season-level re-search.
+    multi_season_intent = await _multi_season_intent_for_request(session, request)
+    scope_episodes_by_season = (
+        {season: list(values) for season, values in request.requested_episodes.items()}
+        if request.requested_episodes
+        else None
+    )
     try:
         result = await decision_service.preview(
             prowlarr,
@@ -685,35 +878,41 @@ async def report_issue(
             year=request.year,
             season=target.season,
             episodes=None,
+            multi_season_intent=multi_season_intent,
         )
     except _INDEXER_ERRORS as exc:
         # The re-search could not reach the indexer AFTER the blocklist/purge/reset
-        # already committed. Park honestly (retryable) rather than propagate a 5xx that
-        # leaves the row lying as 'searching' with nothing actually in flight -- exactly
-        # the posture the empty-preview / grab-failure branches take.
+        # already committed. This is OPERATIONAL (Prowlarr down / rate-limited), NOT
+        # content exhaustion -- mirroring auto-grab's raised-search taxonomy -- so it
+        # must NOT park ``no_acceptable_release`` (that would LIE: releases may exist;
+        # the INDEXER is unreachable) and must NOT propagate a 5xx. Leave the scope at
+        # the ``searching`` committed at (b): the merged auto-grab worker picks up an
+        # eager ``searching`` scope on its next tick, so the state self-heals. The
+        # re-read below then returns 'searching' (a 200).
         _logger.warning(
-            "report-issue re-search for %r failed to reach the indexer (%s); parking as "
-            "no_acceptable_release (retryable)",
+            "report-issue re-search for %r failed to reach the indexer (%s); leaving the "
+            "scope at 'searching' for the auto-grab worker to retry",
             safe_text(request.title),
             type(exc).__name__,
             extra=log_extra,
         )
-        await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
     else:
         if not result.accepted:
             await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
         else:
             # Try the accepted replacements in rank order, mirroring auto-grab's
-            # bounded fall-through: a PER-RELEASE failure on the top pick (its
-            # source is unusable/vetoed, or its hash is already tracked
-            # elsewhere) must not sink the whole correction -- a lower-ranked
-            # replacement may still grab. Only when the list (or the shared
-            # attempt cap) exhausts with nothing grabbed does the scope park on
-            # the honest, retryable ``no_acceptable_release``. Any settling
-            # failure (an operational client outage, an application-level grab
-            # refusal) is handled by the outer except clauses exactly as before.
+            # bounded fall-through AND its operational-vs-park taxonomy.
+            # ``park_scope`` starts True and is cleared by ANY settling outcome (a
+            # grab, an operational grab failure, or a scope-level refusal); only a
+            # PER-RELEASE failure on every attempted candidate leaves it True, so the
+            # scope parks on the honest, retryable ``no_acceptable_release`` -- exactly
+            # the park an empty preview takes. An OPERATIONAL failure (the download
+            # client unreachable, or a grab that left a live untracked torrent) must
+            # NEVER park -- that would LIE: releases exist; the PIPELINE failed -- so
+            # it leaves the scope at the ``searching`` committed at (b) for the merged
+            # auto-grab worker to retry.
             try:
-                grabbed = False
+                park_scope = True
                 for scored in result.accepted[:MAX_GRAB_ATTEMPTS_PER_SCOPE]:
                     try:
                         await grab_service.grab(
@@ -725,8 +924,10 @@ async def report_issue(
                             year=request.year,
                             season=target.season,
                             episodes=None,
+                            scope_episodes_by_season=scope_episodes_by_season,
+                            save_path=save_path,
                         )
-                        grabbed = True
+                        park_scope = False
                         break
                     except _PER_RELEASE_GRAB_ERRORS as exc:
                         # This RELEASE is unusable (nothing live to track --
@@ -734,6 +935,7 @@ async def report_issue(
                         # anything reaches the client, and must not be mistaken
                         # for the client outage its base class signals); discard
                         # the partial write and try the next-ranked replacement.
+                        # ``park_scope`` stays True, so an EXHAUSTED list parks.
                         await session.rollback()
                         _logger.warning(
                             "report-issue re-grab for %r: replacement release "
@@ -742,9 +944,45 @@ async def report_issue(
                             type(exc).__name__,
                             extra=log_extra,
                         )
-                if not grabbed:
-                    # Every attempted replacement was unusable: the SAME honest
-                    # park an empty preview takes -- never a silent 'searching'.
+                    except _GRAB_OPERATIONAL_ERRORS as exc:
+                        # qBittorrent ACCEPTED the torrent but no info-hash could be
+                        # derived -> a LIVE, untracked torrent now exists. Mirrors
+                        # auto-grab's ``GrabError`` handling: OPERATIONAL, NOT "nothing
+                        # acceptable". Discard the partial write, do NOT try another
+                        # candidate (a second grab against the orphan would double-
+                        # download), do NOT park (that would LIE), and leave the scope
+                        # at the ``searching`` committed at (b) for the auto-grab worker.
+                        await session.rollback()
+                        park_scope = False
+                        _logger.warning(
+                            "report-issue re-grab for %r left a live untracked torrent "
+                            "(%s); leaving the scope at 'searching' for the auto-grab "
+                            "worker to retry",
+                            safe_text(request.title),
+                            type(exc).__name__,
+                            extra=log_extra,
+                        )
+                        break
+                    except _GRAB_SCOPE_REFUSALS as exc:
+                        # A SCOPE-level refusal (the scope now has an active download,
+                        # or is terminal / mis-shaped): another candidate cannot help.
+                        # Mirrors auto-grab's settle-and-leave -- discard the partial
+                        # write, do NOT park (not exhaustion), and leave the scope's
+                        # committed ``searching`` as-is.
+                        await session.rollback()
+                        park_scope = False
+                        _logger.warning(
+                            "report-issue re-grab for %r refused (%s); leaving the scope "
+                            "for the auto-grab worker",
+                            safe_text(request.title),
+                            type(exc).__name__,
+                            extra=log_extra,
+                        )
+                        break
+                if park_scope:
+                    # Every attempted replacement was per-release unusable (list or
+                    # attempt cap exhausted): the SAME honest park an empty preview
+                    # takes -- never a silent 'searching'.
                     await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
             except _DOWNLOAD_CLIENT_ERRORS as exc:
                 # OPERATIONAL client failure (qBittorrent unreachable/erroring), NOT
@@ -761,15 +999,6 @@ async def report_issue(
                     type(exc).__name__,
                     extra=log_extra,
                 )
-            except _GRAB_ERRORS as exc:
-                _logger.warning(
-                    "report-issue re-grab for %r failed (%s); parking as "
-                    "no_acceptable_release (retryable)",
-                    safe_text(request.title),
-                    type(exc).__name__,
-                    extra=log_extra,
-                )
-                await _park_no_acceptable(session, request_id, target.season, is_tv=is_tv)
 
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
@@ -780,14 +1009,28 @@ async def report_issue(
 async def _park_no_acceptable(
     session: AsyncSession, request_id: int, season: int | None, *, is_tv: bool
 ) -> None:
-    """Land the request/season on the honest ``no_acceptable_release`` dead-end."""
+    """Land the request/season on the honest ``no_acceptable_release`` dead-end.
+
+    Both branches now go through a genuine compare-and-swap (issue #72) --
+    ``request_service`` / ``season_request_service.mark_no_acceptable_release``
+    -- so a concurrent writer that already moved the row out of the parkable set
+    (e.g. a racing grab landed it on ``downloading``) is left alone rather than
+    silently regressed: the CAS's boolean return decides whether to commit this
+    write, never whether to raise or retry. This function's own caller
+    (``report_issue``) always re-reads the request's ACTUAL row afterward, so the
+    response reflects the true state regardless of whether this particular write
+    landed.
+    """
     if is_tv and season is not None:
-        await season_request_service.mark_no_acceptable_release(
+        parked = await season_request_service.mark_no_acceptable_release(
             session, media_request_id=request_id, season_number=season
         )
+    else:
+        parked = await request_service.mark_no_acceptable_release(session, request_id)
+    if parked:
         await session.commit()
     else:
-        await request_service.mark_no_acceptable_release(session, request_id)
+        await session.rollback()
 
 
 async def cancel_request(
@@ -804,13 +1047,13 @@ async def cancel_request(
     status (kept only for history; nothing re-grabbed). Returns the updated record.
 
     ``qbt`` may be ``None``: a cancel for a ``pending``/``searching``/
-    ``no_acceptable_release`` request with NO active download rows is a PURE DB settle
-    that never touches the client, so it must still work on an install with qBittorrent
-    unconfigured (the endpoint resolves it via ``get_qbittorrent_optional``). Active
-    rows ARE discovered first; only if there are torrents to remove but ``qbt is None``
-    is :class:`DownloadClientRequiredError` raised -- BEFORE any state change (the
-    endpoint maps it to an honest 409 ``service_not_configured``), never a silent skip
-    that would leak a seeding torrent.
+    ``no_acceptable_release``/``waiting_for_air_date`` request with NO active download
+    rows is a PURE DB settle that never touches the client, so it must still work on an
+    install with qBittorrent unconfigured (the endpoint resolves it via
+    ``get_qbittorrent_optional``). Active rows ARE discovered first; only if there are
+    torrents to remove but ``qbt is None`` is :class:`DownloadClientRequiredError`
+    raised -- BEFORE any state change (the endpoint maps it to an honest 409
+    ``service_not_configured``), never a silent skip that would leak a seeding torrent.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
@@ -886,6 +1129,7 @@ async def cancel_request(
             # rather than half-cancelling around a finalizing import.
             await session.rollback()
             raise ImportInProgressError(request_id)
+        await _mark_download_scopes_terminal(session, row.id, RequestStatus.cancelled.value)
         hashes_to_remove.append(row.torrent_hash)
 
     if request.media_type == "tv":
@@ -935,4 +1179,105 @@ async def cancel_request(
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
         raise RequestNotFoundError(request_id)
+    return updated
+
+
+async def relocate_stranded_download(
+    session: AsyncSession,
+    qbt: DownloadClientPort,
+    *,
+    download_id: int,
+    downloads_host_root: str,
+) -> DownloadRecord:
+    """Relocate an import-blocked, path-invisible download into the mounted
+    downloads root (issues #133/#157), then leave it retryable so the operator's
+    existing "Retry import" (``POST /queue/{id}/import``) picks it up once
+    qBittorrent settles the (async) move.
+
+    Scoped EXACTLY to the honest "download path not visible inside the container"
+    block :mod:`~plex_manager.services.import_service` stamps when qBittorrent's
+    reported content sits outside every mounted ``/downloads`` bind --
+    :class:`NotRelocatableError` for any other row (including a DIFFERENT
+    ``import_blocked`` reason, e.g. a genuinely bad/wrong-media file, which
+    relocating could never fix).
+
+    Root-guarded: the ONLY destination this function will ever hand qBittorrent is
+    ``downloads_host_root`` -- the app's OWN derived downloads root
+    (``path_visibility.resolve_downloads_host_root``), never an operator- or
+    caller-supplied path (there is no path parameter to override). When that root
+    could not be derived (``PLEX_MANAGER_DOWNLOADS_ROOT`` unset -- bare metal, no
+    Docker split), :class:`DownloadsRootUnavailableError` refuses rather than
+    relocating into a guessed/empty location.
+
+    qBittorrent moves content ASYNCHRONOUSLY: :meth:`~plex_manager.ports.
+    download_client.DownloadClientPort.set_location` only REQUESTS the move and
+    returns -- this function does not wait for, or otherwise verify, completion
+    (wait-free, honest: the caller sees the request as ACCEPTED, never as
+    already-imported). A ``QbittorrentError`` from that call propagates UNCAUGHT
+    (never swallowed) so the operator sees the real client failure rather than a
+    falsely "accepted" relocation.
+
+    The row is left ``import_blocked`` -- still retryable by the SAME existing
+    import-retry endpoint (``import_download``'s ``_RESUMABLE`` set already
+    includes ``import_blocked``) -- but its ``failed_reason`` is refreshed to say a
+    relocation was requested, so the operator sees the CURRENT truth instead of the
+    stale pre-relocation "not visible" message while the move is in flight. A retry
+    attempted before the move settles simply re-blocks (honestly) with a fresh "not
+    visible" reason if qBittorrent has not finished moving the content yet.
+
+    The terminal write is a compare-and-swap gated on BOTH the row's status
+    still being ``import_blocked`` AND its ``failed_reason`` still being the
+    EXACT value observed at entry (:class:`RelocationSupersededError` on a
+    miss). Gating on status alone would let a concurrent "Retry import" that
+    re-blocks the row -- still ``import_blocked``, but with a NEWER, different
+    diagnosis (e.g. "no video file found") -- get silently clobbered by this
+    function's stale "relocation requested" message, discarding the fresher,
+    truthful reason. The relocation is still requested of qBittorrent either
+    way; only which message the row ends up carrying is at stake.
+    """
+    if not downloads_host_root:
+        raise DownloadsRootUnavailableError(download_id)
+    row = await session.get(Download, download_id)
+    if row is None:
+        raise DownloadNotFoundError(download_id)
+    if row.status != DownloadState.ImportBlocked.value or not (row.failed_reason or "").startswith(
+        PATH_NOT_VISIBLE_REASON_PREFIX
+    ):
+        raise NotRelocatableError(download_id, row.status)
+
+    torrent_hash = row.torrent_hash
+    observed_reason = row.failed_reason
+    # qBittorrent errors propagate uncaught (honesty over silence): the operator sees
+    # the real client failure rather than a falsely "accepted" relocation.
+    await qbt.set_location(torrent_hash, downloads_host_root)
+
+    download_repo = SqlDownloadRepository(session)
+    moved = await download_repo.update_status_if_in(
+        download_id,
+        DownloadState.ImportBlocked.value,
+        frozenset({DownloadState.ImportBlocked.value}),
+        failed_reason=(
+            f"relocation to {downloads_host_root} requested; retry the import once "
+            "qBittorrent finishes moving the content"
+        ),
+        require_failed_reason=observed_reason,
+    )
+    if not moved:
+        # The row was re-blocked (or otherwise changed) with a DIFFERENT reason
+        # than the one observed at entry while ``qbt.set_location`` was in
+        # flight -- e.g. a concurrent Retry Import's fresher, genuinely
+        # different diagnosis. The relocate already happened on qBittorrent's
+        # side, but overwriting the row's message now would clobber that newer
+        # truth with our stale "relocation requested" text -- surface it
+        # honestly instead of silently accepting whichever state won.
+        await session.rollback()
+        current = await session.get(Download, download_id)
+        raise RelocationSupersededError(
+            download_id, current.failed_reason if current is not None else None
+        )
+
+    await session.commit()
+    updated = await download_repo.get_by_hash(torrent_hash)
+    if updated is None:  # pragma: no cover - just operated on this row
+        raise LookupError(f"download for hash {torrent_hash} vanished mid-relocate")
     return updated

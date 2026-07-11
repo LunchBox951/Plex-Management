@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -14,9 +15,10 @@ from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import (
+    correction_service,
     grab_service,
     import_service,
     queue_service,
@@ -25,18 +27,18 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
-    DownloadScopeConflictError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
 )
-from plex_manager.services.queue_service import InvalidStateTransitionError
+from plex_manager.services.queue_service import InvalidStateTransitionError, RemovalInProgressError
 from plex_manager.web.deps import (
     ServiceNotConfiguredError,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
+    get_downloads_host_root,
     get_filesystem,
     get_library,
     get_movies_root_optional,
@@ -47,14 +49,15 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_session,
     get_tv_root_optional,
-    require_api_key,
+    require_admin,
 )
-from plex_manager.web.routers.search_preview import run_preview
+from plex_manager.web.routers.search_preview import run_preview, stored_episodes_for_request
 from plex_manager.web.schemas import (
     ErrorDetail,
     GrabRequest,
     QueueItem,
     QueueResponse,
+    QueueScope,
     SearchPreviewRequest,
 )
 
@@ -63,7 +66,7 @@ __all__ = ["router"]
 router = APIRouter(
     prefix="/api/v1/queue",
     tags=["queue"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
 )
 
 _QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -94,6 +97,16 @@ _GRAB_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 
 def _to_item(record: DownloadRecord) -> QueueItem:
+    """Map a download record to the wire ``QueueItem``.
+
+    Accepts either a plain ``DownloadRecord`` (the grab/import/mark-failed
+    mutation endpoints, which never join ``MediaRequest``) or the queue-list's
+    enriched ``QueueRecord`` (a ``DownloadRecord`` subtype) -- ``title`` /
+    ``poster_url`` are only ever populated for the latter; a plain
+    ``DownloadRecord`` renders those two ``None`` (honest degrade, not a lie),
+    while ``release_title`` -- persisted on the download row itself -- is
+    always available regardless of which record type this is.
+    """
     return QueueItem(
         id=record.id,
         torrent_hash=record.torrent_hash,
@@ -105,11 +118,23 @@ def _to_item(record: DownloadRecord) -> QueueItem:
         season=record.season,
         episodes=record.episodes,
         failed_reason=record.failed_reason,
+        title=record.title if isinstance(record, QueueRecord) else None,
+        poster_url=record.poster_url if isinstance(record, QueueRecord) else None,
+        release_title=record.release_title,
+        scopes=[
+            QueueScope(
+                media_request_id=scope.media_request_id,
+                season=scope.season,
+                episodes=scope.episodes,
+                status=scope.status,
+            )
+            for scope in record.scopes
+        ],
     )
 
 
 def _select_release(
-    accepted: list[ScoredRelease],
+    accepted: Sequence[ScoredRelease],
     grab: GrabRequest,
 ) -> ScoredRelease:
     """Pick the operator's chosen release, or the top-ranked one if none given."""
@@ -149,6 +174,7 @@ async def grab_endpoint(
     prowlarr: Annotated[IndexerPort, Depends(get_prowlarr)],
     parser: Annotated[ParserPort, Depends(get_parser)],
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
+    downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
 ) -> QueueItem:
     """Grab a release for a request: a chosen one, or the top accepted pick."""
     request = await request_service.get_request(session, body.request_id)
@@ -188,12 +214,24 @@ async def grab_endpoint(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
         )
 
+    effective_episodes = stored_episodes_for_request(
+        request,
+        season=body.season,
+        episodes=body.episodes,
+        episodes_was_provided="episodes" in body.model_fields_set,
+    )
+    scope_episodes_by_season = (
+        {season: list(values) for season, values in request.requested_episodes.items()}
+        if request.media_type == "tv" and request.requested_episodes
+        else None
+    )
+
     result = await run_preview(
         # Carry season/episodes so a TV grab searches (and later records) the
         # right scope; both are None for a movie and so leave movie behaviour
         # unchanged.
         SearchPreviewRequest(
-            request_id=body.request_id, season=body.season, episodes=body.episodes
+            request_id=body.request_id, season=body.season, episodes=effective_episodes
         ),
         session,
         prowlarr,
@@ -213,19 +251,26 @@ async def grab_endpoint(
             request.id, season=body.season
         )
         if active is None:
+            # Both services are FLUSH-ONLY -- a genuine compare-and-swap (issue
+            # #72), not read-then-write -- so this caller owns the commit boundary
+            # for both branches uniformly, and commits ONLY when the CAS actually
+            # won: a concurrent writer that already moved the row out of the
+            # parkable set (e.g. a racing grab landed it on ``downloading``
+            # between the ``find_active_for_request`` re-check above and this
+            # write) is left alone rather than silently regressed.
             if body.season is not None:
                 # TV: record the dead-end on the SEASON so it is visible + retryable
                 # per season, and let the parent MediaRequest.status stay a computed
-                # rollup (never a direct write _recompute_parent would clobber). The
-                # season service is FLUSH-ONLY by contract, so this caller owns the
-                # commit boundary (request_service.mark_no_acceptable_release, the
-                # movie path, commits internally instead).
-                await season_request_service.mark_no_acceptable_release(
+                # rollup (never a direct write _recompute_parent would clobber).
+                parked = await season_request_service.mark_no_acceptable_release(
                     session, media_request_id=request.id, season_number=body.season
                 )
+            else:
+                parked = await request_service.mark_no_acceptable_release(session, request.id)
+            if parked:
                 await session.commit()
             else:
-                await request_service.mark_no_acceptable_release(session, request.id)
+                await session.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
 
     scored = _select_release(result.accepted, body)
@@ -238,7 +283,9 @@ async def grab_endpoint(
             tmdb_id=request.tmdb_id,
             year=request.year,
             season=body.season,
-            episodes=body.episodes,
+            episodes=effective_episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+            save_path=downloads_host_root,
         )
     except NoGrabSourceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_grab_source") from exc
@@ -261,13 +308,6 @@ async def grab_endpoint(
         # refuse the parallel grab instead of spawning a second active row.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
-        ) from exc
-    except DownloadScopeConflictError as exc:
-        # The same physical torrent is already downloading for a DIFFERENT season
-        # (a multi-season pack re-grabbed per season). Refused honestly rather than
-        # returned as a no-op that would leave this season untracked.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="download_scope_conflict"
         ) from exc
     except TorrentAlreadyTrackedError as exc:
         # The same torrent hash is already actively owned by a different request.
@@ -365,5 +405,62 @@ async def mark_failed_endpoint(
     except InvalidStateTransitionError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="invalid_state_transition"
+        ) from exc
+    except RemovalInProgressError as exc:
+        # Ownership protocol step 5 (queue_service module docstring): another
+        # mark-failed's torrent removal is mid-flight for this download, so its
+        # remove decision is already irreversible -- superseding it would lie.
+        # Honest 409; the operator retries once the in-flight call resolves.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="removal_in_progress"
+        ) from exc
+    return _to_item(record)
+
+
+@router.post("/{download_id}/relocate", responses=_QUEUE_ERROR_RESPONSES)
+async def relocate_endpoint(
+    download_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
+    downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
+) -> QueueItem:
+    """Operator correction: relocate an import-blocked, path-invisible download
+    into the mounted downloads root (issues #133/#157).
+
+    Scoped to EXACTLY the honest "download path not visible inside the
+    container" block (409 ``not_relocatable`` for any other row/reason). qBittorrent
+    moves content asynchronously -- this call only REQUESTS the move and returns; the
+    operator retries the import (``POST /queue/{id}/import``, already retryable —
+    ``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:
+    only ever relocates INTO the app's own derived downloads root (409
+    ``downloads_root_unavailable`` when that root cannot be derived — bare metal, no
+    Docker split), never an arbitrary path. If a concurrent Retry Import re-blocks
+    the row with a newer, different reason before this call's own status write
+    lands, the move was still requested but the row's message is left alone (409
+    ``relocation_superseded`` — re-fetch the queue item to see the current reason).
+    """
+    try:
+        record = await correction_service.relocate_stranded_download(
+            session,
+            qbt,
+            download_id=download_id,
+            downloads_host_root=downloads_host_root,
+        )
+    except correction_service.DownloadNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found"
+        ) from exc
+    except correction_service.NotRelocatableError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_relocatable") from exc
+    except correction_service.DownloadsRootUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="downloads_root_unavailable"
+        ) from exc
+    except correction_service.RelocationSupersededError as exc:
+        # The move was still requested of qBittorrent; a concurrent Retry Import
+        # re-blocked the row with a newer, different reason before our own status
+        # write landed -- surface that honestly rather than clobber it silently.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="relocation_superseded"
         ) from exc
     return _to_item(record)

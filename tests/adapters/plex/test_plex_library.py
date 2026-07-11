@@ -202,6 +202,33 @@ async def test_list_sections_cache_is_keyed_by_token_not_just_url() -> None:
     assert calls["n"] == 2  # token-A is still served from its own cache entry
 
 
+@pytest.mark.parametrize("bad_token", ["tok\r\ninjected", "tok\x00nul", "tokén-nonascii"])
+async def test_header_unsafe_token_raises_plex_auth_error_without_request(
+    bad_token: str,
+) -> None:
+    """Defense-in-depth: a stored token that cannot ride the ``X-Plex-Token`` header
+    (a CR/LF/NUL value would leak the RAW token via httpx's ``str(exc)``; a non-ASCII
+    value an uncaught ``UnicodeEncodeError``/500) fails as a surfaced ``PlexAuthError``,
+    WITHOUT the token ever being placed in a request. Mirrors the oauth adapter's own
+    ``_require_header_safe_token`` guard for the one remaining plex header sink."""
+    sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        nonlocal sent
+        sent += 1
+        return httpx.Response(200, json=SECTIONS)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = PlexLibrary(client, base_url=PLEX_URL, token=bad_token)
+    try:
+        with pytest.raises(PlexAuthError) as exc_info:
+            await adapter.list_sections()
+        assert bad_token not in str(exc_info.value)
+        assert sent == 0
+    finally:
+        await client.aclose()
+
+
 # --------------------------------------------------------------------------- #
 # is_available — GUID parsing
 # --------------------------------------------------------------------------- #
@@ -339,6 +366,417 @@ async def test_present_seasons_resolves_every_season_in_a_single_crawl() -> None
     assert calls["n"] == 3
 
 
+# --------------------------------------------------------------------------- #
+# season_presence — BATCH targeted lookup, NOT a whole-library crawl (#136)
+# --------------------------------------------------------------------------- #
+# Three shows in the SAME show section (ratingKeys 100/200/300); the target
+# (tmdb 2000) sits in the MIDDLE so a test proves the lookup actually matches by
+# tmdb id rather than happening to grab the first/last item.
+SHOWS_ALL_MULTI: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 3,
+        "Metadata": [
+            {"ratingKey": "100", "guid": "plex://show/aaa", "Guid": [{"id": "tmdb://1000"}]},
+            {"ratingKey": "200", "guid": "plex://show/bbb", "Guid": [{"id": "tmdb://2000"}]},
+            {"ratingKey": "300", "guid": "plex://show/ccc", "Guid": [{"id": "tmdb://3000"}]},
+        ],
+    }
+}
+
+SEASONS_FOR_SHOW_100_MULTI: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 1, "leafCount": 5}]}
+}
+
+SEASONS_FOR_SHOW_200: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 2,
+        "Metadata": [
+            {"index": 1, "leafCount": 8},  # season 1, present
+            {"index": 2, "leafCount": 0},  # season 2 announced, no episodes yet
+        ],
+    }
+}
+
+SEASONS_FOR_SHOW_300: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 1, "leafCount": 4}]}
+}
+
+
+def _make_multi_show_handler(calls: dict[str, int]) -> Callable[[httpx.Request], httpx.Response]:
+    """Serves 3 shows in one section, each with its OWN ``/children`` endpoint, so
+    a test can prove ``season_presence`` fetches ONLY the requested shows'
+    children -- never a show that was NOT part of the request -- unlike a
+    whole-library season crawl. Only ratingKey 200 (tmdb 2000) has a real
+    ``/children`` response wired here; 100/300's fetch hard-fails, so a test that
+    requests ONLY {2000} proves those two are never touched."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        if path in ("/library/metadata/100/children", "/library/metadata/300/children"):
+            pytest.fail(f"season_presence must not fetch children for a non-target show: {path}")
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+def _make_multi_show_handler_all_seasons(
+    calls: dict[str, int],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Same 3-show section as :func:`_make_multi_show_handler`, but ALL THREE
+    shows' ``/children`` are real (no hard-fail) -- used by tests that
+    deliberately request all three ids in one batch call."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/100/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_100_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        if path == "/library/metadata/300/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_300)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+# Two show sections ("TV Shows" + "Anime") each holding a DIFFERENT item that
+# resolves to the SAME tmdb id (7000) -- a show catalogued in both a normal TV
+# library and a separate Anime library, or duplicated within one section, is the
+# exact scenario finding 1 (#136 review) requires a union over, not a first-match.
+SECTIONS_TWO_SHOW: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 3,
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"id": 1, "path": "/data/movies"}],
+            },
+            {
+                "key": "2",
+                "title": "TV Shows",
+                "type": "show",
+                "Location": [{"id": 3, "path": "/data/tv"}],
+            },
+            {
+                "key": "5",
+                "title": "Anime",
+                "type": "show",
+                "Location": [{"id": 6, "path": "/data/anime"}],
+            },
+        ],
+    }
+}
+
+TV_SHOWS_WITH_DUP: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {"ratingKey": "500", "guid": "plex://show/dup-tv", "Guid": [{"id": "tmdb://7000"}]},
+        ],
+    }
+}
+
+ANIME_SHOWS_WITH_DUP: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {"ratingKey": "600", "guid": "plex://show/dup-anime", "Guid": [{"id": "tmdb://7000"}]},
+        ],
+    }
+}
+
+SEASONS_FOR_SHOW_500: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 1, "leafCount": 3}]}
+}
+
+SEASONS_FOR_SHOW_600: dict[str, Any] = {
+    "MediaContainer": {"size": 1, "Metadata": [{"index": 2, "leafCount": 5}]}
+}
+
+
+def _duplicate_show_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    assert TOKEN not in str(request.url)
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_TWO_SHOW)
+    if path == "/library/sections/2/all":
+        return httpx.Response(200, json=TV_SHOWS_WITH_DUP)
+    if path == "/library/sections/5/all":
+        return httpx.Response(200, json=ANIME_SHOWS_WITH_DUP)
+    if path == "/library/metadata/500/children":
+        return httpx.Response(200, json=SEASONS_FOR_SHOW_500)
+    if path == "/library/metadata/600/children":
+        return httpx.Response(200, json=SEASONS_FOR_SHOW_600)
+    return httpx.Response(404, json={})
+
+
+async def test_season_presence_returns_seasons_for_the_target_show() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_multi_show_handler(calls), base_url="http://season-presence:32400")
+    assert await adapter.season_presence({2000}) == {2000: frozenset({1})}
+
+
+async def test_season_presence_empty_for_absent_show() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_multi_show_handler(calls), base_url="http://season-presence-absent:32400"
+    )
+    assert await adapter.season_presence({9999}) == {9999: frozenset()}
+    # No show matched -- ``/children`` is never touched at all.
+    assert not any(path.startswith("/library/metadata/") for path in calls)
+
+
+async def test_season_presence_evicts_a_stale_cache_entry_on_a_no_match_read() -> None:
+    """Regression (symmetric to the no-poison case): a show that WAS cached as
+    present but has since been REMOVED from Plex must be evicted from the TV
+    seasons snapshot by a fresh no-match read — otherwise a season-scoped
+    ``is_available`` inside the TTL keeps answering True from the stale entry."""
+    calls: dict[str, int] = {}
+    removed = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            if removed:
+                return httpx.Response(200, json={"MediaContainer": {"size": 0, "Metadata": []}})
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://season-presence-evict-stale:32400")
+    # Warm the snapshot: the show is present with season 1.
+    assert await adapter.season_presence({2000}) == {2000: frozenset({1})}
+    # The show vanishes from Plex; a fresh read returns empty AND must evict
+    # the stale cache entry...
+    removed = True
+    assert await adapter.season_presence({2000}) == {2000: frozenset()}
+    # ...so a season-scoped availability check inside the TTL answers False
+    # instead of True-from-the-stale-snapshot.
+    assert await adapter.is_available(2000, "tv", season=1) is False
+
+
+async def test_season_presence_never_caches_a_no_match_id_as_present() -> None:
+    """Regression: a requested id with NO matching item must not be written to the
+    TV seasons cache. ``_is_tv_available`` treats a cached KEY as "show present"
+    for whole-show checks, so caching the miss's empty set would flip a later
+    ``is_available(tmdb_id, "tv")`` inside the TTL to True for a show Plex has
+    never indexed."""
+    calls: dict[str, int] = {}
+    # The permissive handler: the later ``is_available`` legitimately performs a
+    # full crawl on its cache miss (that miss IS the point of the test).
+    adapter = _adapter(
+        _make_multi_show_handler_all_seasons(calls),
+        base_url="http://season-presence-no-poison:32400",
+    )
+    assert await adapter.season_presence({9999}) == {9999: frozenset()}
+    # Within the cache TTL: the whole-show availability check must still answer
+    # False (fresh re-crawl finding nothing), not True from a poisoned snapshot.
+    assert await adapter.is_available(9999, "tv") is False
+
+
+async def test_season_presence_empty_batch_returns_empty_mapping_without_any_request() -> None:
+    """An empty ``tmdb_ids`` collection must short-circuit -- no reason to walk any
+    section when nothing was asked for."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_multi_show_handler(calls), base_url="http://season-presence-empty:32400"
+    )
+    assert await adapter.season_presence([]) == {}
+    assert calls == {}
+
+
+async def test_season_presence_does_not_crawl_the_whole_library() -> None:
+    """The proof this exists for (#136): resolving a small requested subset of
+    shows' seasons must cost O(1) HTTP calls (sections + the owning show
+    section's listing, walked ONCE, + only the REQUESTED shows' OWN
+    ``/children``) -- never one ``/children`` fetch per show in the library
+    (which is what ``present_seasons``/``is_available`` pay to answer for ANY
+    show), and never a fetch for a show that was not part of the request."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_multi_show_handler(calls), base_url="http://season-presence-o1:32400")
+    seasons = await adapter.season_presence({2000})
+    assert seasons == {2000: frozenset({1})}
+    assert calls["/library/sections"] == 1
+    assert calls["/library/sections/2/all"] == 1
+    assert calls["/library/metadata/200/children"] == 1
+    # The OTHER two shows' children were never fetched (enforced by the handler's
+    # own pytest.fail above; re-asserted here for a clear failure message too).
+    assert "/library/metadata/100/children" not in calls
+    assert "/library/metadata/300/children" not in calls
+    # Movie section untouched -- this is a TV-only targeted lookup.
+    assert "/library/sections/1/all" not in calls
+
+
+async def test_season_presence_one_page_walk_for_n_shows() -> None:
+    """(#136 review finding 2) A batch call naming N distinct target shows must
+    still walk the show section's ``/all`` listing EXACTLY ONCE -- never once per
+    requested id -- regardless of N. All three shows in the section are
+    requested here (N=3) and the page-walk count must stay 1, not 3."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_multi_show_handler_all_seasons(calls), base_url="http://season-presence-batch:32400"
+    )
+    result = await adapter.season_presence({1000, 2000, 3000})
+    assert result == {
+        1000: frozenset({1}),
+        2000: frozenset({1}),
+        3000: frozenset({1}),
+    }
+    assert calls["/library/sections/2/all"] == 1
+    # One /children fetch per MATCHED show -- three requested ids, three matches.
+    assert calls["/library/metadata/100/children"] == 1
+    assert calls["/library/metadata/200/children"] == 1
+    assert calls["/library/metadata/300/children"] == 1
+
+
+async def test_season_presence_unions_seasons_across_duplicate_show_entries() -> None:
+    """(#136 review finding 1) The same tmdb id catalogued in TWO show sections
+    (a separate 'TV Shows' and 'Anime' library is a real deployment shape) must
+    have its present seasons UNIONED across every matching item. Returning only
+    the first match's seasons would under-report a season present only on the
+    OTHER duplicate, stalling that season at 'Finalizing' forever."""
+    adapter = _adapter(_duplicate_show_handler, base_url="http://season-presence-dup:32400")
+    result = await adapter.season_presence({7000})
+    # Season 1 comes from the "TV Shows" entry (ratingKey 500), season 2 from the
+    # "Anime" entry (ratingKey 600) -- the union of both, not just one.
+    assert result == {7000: frozenset({1, 2})}
+
+
+async def test_season_presence_returns_partial_union_when_one_duplicate_fails() -> None:
+    """(round 6, #136 review) When duplicates exist and one entry's ``/children``
+    fails while another CONFIRMS seasons, the confirmed partial union must be
+    RETURNED (positive evidence is sound to promote on — omitting the id would
+    strand a Plex-confirmed season at 'Finalizing' behind a broken duplicate)
+    but must NOT be written through to the cache: the union may be missing
+    seasons that only live on the failed duplicate, so a later season-scoped
+    check re-crawls fresh instead of trusting an incomplete snapshot."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS_TWO_SHOW)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=TV_SHOWS_WITH_DUP)
+        if path == "/library/sections/5/all":
+            return httpx.Response(200, json=ANIME_SHOWS_WITH_DUP)
+        if path == "/library/metadata/500/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_500)
+        if path == "/library/metadata/600/children":
+            return httpx.Response(500, json={})  # the broken duplicate
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://season-presence-partial-dup:32400")
+    # The healthy "TV Shows" duplicate confirmed season 1 — returned despite the
+    # broken "Anime" duplicate erroring.
+    assert await adapter.season_presence({7000}) == {7000: frozenset({1})}
+    # The incomplete union was NOT cached: a season-scoped check for season 2
+    # (which lives only on the failed duplicate) re-crawls fresh rather than
+    # answering False from a partial snapshot. The fresh crawl in this handler
+    # errors on 600's children too, so the honest outcome is the adapter's own
+    # error — NOT a confident False produced by an incomplete cache entry.
+    with pytest.raises(PlexLibraryError):
+        await adapter.is_available(7000, "tv", season=2)
+
+
+async def test_season_presence_isolates_a_single_show_failure_in_the_same_batch() -> None:
+    """(round 4, #136 review) One show's ``/children`` fetch returning a 500 inside
+    an otherwise-successful batch call must not abort the OTHER show's lookup.
+    The failed show is OMITTED from the returned mapping entirely (never mapped
+    to an empty frozenset -- that would dishonestly claim "no seasons present"
+    for a show whose presence is actually unknown); the healthy show's entry is
+    still cached from this same call; and a subsequent check for the FAILED show
+    still re-crawls fresh once the underlying fault clears -- it was poisoned
+    neither as present nor as absent by the earlier failure."""
+    calls: dict[str, int] = {}
+    show_100_should_fail = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(200, json=SHOWS_ALL_MULTI)
+        if path == "/library/metadata/100/children":
+            if show_100_should_fail:
+                return httpx.Response(500, json={})
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_100_MULTI)
+        if path == "/library/metadata/200/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_200)
+        if path == "/library/metadata/300/children":
+            return httpx.Response(200, json=SEASONS_FOR_SHOW_300)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://season-presence-isolate:32400")
+    result = await adapter.season_presence({1000, 2000})
+    # The healthy show (2000) resolves; the failing show (1000) is omitted
+    # entirely -- never present as a key with a dishonest empty frozenset.
+    assert result == {2000: frozenset({1})}
+    assert 1000 not in result
+
+    # The healthy show's entry was written through to the cache by that same
+    # call: a season-scoped availability check must not need another
+    # ``/children`` fetch.
+    children_200_calls = calls["/library/metadata/200/children"]
+    assert await adapter.is_available(2000, "tv", season=1) is True
+    assert calls["/library/metadata/200/children"] == children_200_calls
+
+    # The failed show (1000) was cached in NEITHER direction. Once the
+    # underlying fault clears, a fresh check must see it as present -- not
+    # stuck absent from a poisoned miss...
+    show_100_should_fail = False
+    assert await adapter.is_available(1000, "tv", season=1) is True
+    # ...and re-running the batch lookup for it must actually re-crawl (not
+    # trust a stale cached absence either).
+    assert await adapter.season_presence({1000}) == {1000: frozenset({1})}
+
+
+async def test_season_presence_is_never_cached_absence() -> None:
+    """Mirrors ``present_seasons``'/``is_available``'s "never trust a cached
+    absence" contract: a season that just finished indexing must be seen on the
+    very next call, even if an earlier snapshot is warm in the shared cache."""
+    calls = {"n": 0}
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _tv_handler(request)
+
+    adapter = _adapter(counting, base_url="http://season-presence-fresh:32400")
+    # Warm the shared snapshot cache via present_seasons (season 2 reads absent).
+    assert await adapter.present_seasons(1399) == frozenset({0, 1})
+    warmed_calls = calls["n"]
+    # season_presence re-pages fresh rather than trusting the warm (absent) cache.
+    assert await adapter.season_presence({1399}) == {1399: frozenset({0, 1})}
+    assert calls["n"] > warmed_calls
+
+
 async def test_is_available_tv_caches_presence_but_repages_absence() -> None:
     calls = {"n": 0}
 
@@ -463,6 +901,114 @@ async def test_trigger_scan_tv_invalidates_the_show_presence_cache() -> None:
     assert calls["/library/sections/2/all"] == 2  # re-crawled, not served stale
 
 
+async def test_present_ids_refresh_absent_repages_a_still_pending_movie() -> None:
+    """P2 (#136 review): the availability reconcile cycle passes
+    ``refresh_absent=True`` so a movie that is still indexing when the FIRST crawl
+    of a tick runs (caching that absence) is NOT held absent for the rest of the
+    300s TTL -- the very next tick must see it once Plex catches up, exactly like
+    the old per-row ``is_available`` did."""
+    state = {"indexed": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/1/all":
+            metadata = list(MOVIES_ALL["MediaContainer"]["Metadata"])
+            if state["indexed"]:
+                metadata = [
+                    *metadata,
+                    {"guid": "plex://movie/new", "Guid": [{"id": "tmdb://999999"}]},
+                ]
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"size": len(metadata), "Metadata": metadata}},
+            )
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://present-refresh-absent:32400")
+    # Tick 1: the new movie hasn't finished indexing yet -- the crawl (correctly)
+    # reads it absent, and that snapshot is cached for the TTL.
+    present = await adapter.present_ids([(999999, "movie")], refresh_absent=True)
+    assert present == frozenset()
+
+    # Plex finishes indexing between ticks; nothing invalidates the cache (this is
+    # exactly the race the finding describes -- the warm snapshot is now WRONG).
+    state["indexed"] = True
+
+    # Tick 2: refresh_absent=True must not trust that warm-but-wrong snapshot --
+    # 999999 is still not confirmed present in it, so one fresh crawl runs.
+    present = await adapter.present_ids([(999999, "movie")], refresh_absent=True)
+    assert present == frozenset({(999999, "movie")})
+
+
+async def test_present_ids_refresh_absent_still_trusts_a_confirmed_presence() -> None:
+    """``refresh_absent=True`` must not force a crawl on EVERY call -- only when
+    the snapshot fails to confirm a queried key. A snapshot that already contains
+    every queried movie as present is trusted with zero extra HTTP calls."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_counting_grid_handler(calls), base_url="http://present-refresh-ok:32400"
+    )
+    await adapter.present_ids([(27205, "movie")], refresh_absent=True)
+    warmed = calls["_total"]
+    # 27205 is already confirmed present in the warm snapshot -- no re-crawl.
+    present = await adapter.present_ids([(27205, "movie")], refresh_absent=True)
+    assert present == frozenset({(27205, "movie")})
+    assert calls["_total"] == warmed
+
+
+async def test_present_ids_default_still_trusts_a_warm_cache_when_a_key_is_absent() -> None:
+    """The tile-decoration default (``refresh_absent=False``) is UNCHANGED: a
+    stale absence is harmless for a page-load hint and must not force an extra
+    crawl on every page load."""
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_counting_grid_handler(calls), base_url="http://present-default:32400")
+    await adapter.present_ids([(27205, "movie")])
+    warmed = calls["_total"]
+    # 55555 is not in the warmed snapshot -- default behavior trusts the cache
+    # anyway and does NOT re-page.
+    present = await adapter.present_ids([(55555, "movie")])
+    assert present == frozenset()
+    assert calls["_total"] == warmed
+
+
+async def test_present_ids_refresh_absent_repages_a_still_pending_show() -> None:
+    """Same never-trust-a-cached-absence contract, TV side: a show whose presence
+    hasn't been crawled fresh since it finished indexing must not be held absent
+    for the rest of the TTL when ``refresh_absent=True``."""
+    state = {"indexed": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/2/all":
+            metadata = list(SHOWS_ALL["MediaContainer"]["Metadata"])
+            if state["indexed"]:
+                metadata = [
+                    *metadata,
+                    {
+                        "ratingKey": "200",
+                        "guid": "plex://show/new",
+                        "Guid": [{"id": "tmdb://8888"}],
+                    },
+                ]
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"size": len(metadata), "Metadata": metadata}},
+            )
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://present-refresh-absent-tv:32400")
+    present = await adapter.present_ids([(8888, "tv")], refresh_absent=True)
+    assert present == frozenset()
+
+    state["indexed"] = True
+    present = await adapter.present_ids([(8888, "tv")], refresh_absent=True)
+    assert present == frozenset({(8888, "tv")})
+
+
 async def test_present_ids_propagates_auth_error() -> None:
     # Honesty: a 401 must PROPAGATE (the router degrades to no-badge on it), never be
     # swallowed into an empty "nothing present" set (the prototype's swallowed-False bug).
@@ -481,6 +1027,179 @@ async def test_present_ids_propagates_library_error() -> None:
     adapter = _adapter(handler, base_url="http://present-500:32400")
     with pytest.raises(PlexLibraryError):
         await adapter.present_ids([(1399, "tv")])
+
+
+# --------------------------------------------------------------------------- #
+# confirm_paths — GUID-independent path-based confirmation fallback (#158)
+# --------------------------------------------------------------------------- #
+# Plex reports its section locations (and every item's file path) in the HOST
+# namespace; the app's own ``library_path`` breadcrumb is the CONTAINER-namespace
+# remap -- mirrors ``SECTIONS_HOST_NAMESPACE`` above.
+CONFIRM_PATHS_SECTIONS: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"path": "/srv/media/Movies"}],
+            },
+            {
+                "key": "2",
+                "title": "TV",
+                "type": "show",
+                "Location": [{"path": "/srv/media/TV"}],
+            },
+        ]
+    }
+}
+
+# A movie item whose guid(s) carry NO tmdb id at all (issue #158's exact bug: the
+# metadata provider matched this file to something with only an imdb guid) --
+# GUID confirmation can never succeed for it; only its file PATH proves it is the
+# app's own import.
+MOVIES_WITH_FILES: dict[str, Any] = {
+    "MediaContainer": {
+        "Metadata": [
+            {
+                "guid": "plex://movie/unrelated",
+                "Guid": [{"id": "imdb://tt3900000"}],
+                "Media": [{"Part": [{"file": "/srv/media/Movies/Obsession (2026)/Obsession.mkv"}]}],
+            }
+        ]
+    }
+}
+
+# Fetched via the section's flat ``type=4`` (episode) listing -- one episode leaf
+# under a season directory, no per-show ``/children``/``allLeaves`` involved.
+EPISODES_WITH_FILES: dict[str, Any] = {
+    "MediaContainer": {
+        "Metadata": [
+            {
+                "Media": [
+                    {
+                        "Part": [
+                            {
+                                "file": (
+                                    "/srv/media/TV/Some Show (2019)/Season 02/"
+                                    "Some Show - S02E01 - Pilot.mkv"
+                                )
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+}
+
+
+def _make_confirm_paths_handler(
+    calls: dict[str, int],
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=CONFIRM_PATHS_SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(200, json=MOVIES_WITH_FILES)
+        if path == "/library/sections/2/all":
+            # Episodes are fetched DIRECTLY from the section's flat listing
+            # (type=4), never one ``/children`` call per show.
+            assert request.url.params.get("type") == "4"
+            return httpx.Response(200, json=EPISODES_WITH_FILES)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_confirm_paths_movie_matches_by_directory_prefix_after_namespace_remap() -> None:
+    # The container library_path (/media/...) sits under the container remap of
+    # the section's HOST location (/srv/media/Movies) -- confirmation must
+    # reverse that host/container split the same way trigger_scan does, then
+    # match the reversed directory as a PREFIX of the reported file, never by
+    # title/year.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-movie:32400")
+    confirmed = await adapter.confirm_paths("movie", ["/media/Movies/Obsession (2026)"])
+    assert confirmed == frozenset({"/media/Movies/Obsession (2026)"})
+
+
+async def test_confirm_paths_movie_no_match_for_an_unrelated_directory() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_confirm_paths_handler(calls), base_url="http://confirm-movie-miss:32400"
+    )
+    confirmed = await adapter.confirm_paths("movie", ["/media/Movies/Some Other Film (1999)"])
+    assert confirmed == frozenset()
+
+
+async def test_confirm_paths_tv_season_matches_an_episode_leaf_under_the_season_dir() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-tv:32400")
+    confirmed = await adapter.confirm_paths("tv", ["/media/TV/Some Show (2019)/Season 02"])
+    assert confirmed == frozenset({"/media/TV/Some Show (2019)/Season 02"})
+    assert calls["/library/sections/2/all"] == 1  # one flat crawl, no per-show fetch
+
+
+async def test_confirm_paths_tv_season_no_match_for_a_different_season() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-tv-miss:32400")
+    confirmed = await adapter.confirm_paths("tv", ["/media/TV/Some Show (2019)/Season 01"])
+    assert confirmed == frozenset()
+
+
+async def test_confirm_paths_batches_many_paths_into_one_crawl_per_media_type() -> None:
+    # Bounded cost (issue #158): however many rows are queried in one call, the
+    # underlying section crawl happens exactly ONCE -- never once per path.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-batch:32400")
+    confirmed = await adapter.confirm_paths(
+        "movie",
+        [
+            "/media/Movies/Obsession (2026)",
+            "/media/Movies/Another One (2021)",
+            "/media/Movies/Yet Another (2022)",
+        ],
+    )
+    assert confirmed == frozenset({"/media/Movies/Obsession (2026)"})
+    assert calls["/library/sections/1/all"] == 1
+
+
+async def test_confirm_paths_empty_input_touches_no_network() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_confirm_paths_handler(calls), base_url="http://confirm-empty:32400")
+    confirmed = await adapter.confirm_paths("movie", [])
+    assert confirmed == frozenset()
+    assert calls == {}
+
+
+async def test_confirm_paths_no_candidate_section_returns_empty_without_a_crawl() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=ONE_MOVIE_SECTION)  # no show section at all
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url="http://confirm-no-section:32400")
+    confirmed = await adapter.confirm_paths("tv", ["/media/TV/Anything/Season 01"])
+    assert confirmed == frozenset()
+
+
+async def test_confirm_paths_propagates_a_crawl_transport_failure() -> None:
+    # Mirrors present_ids/season_presence: a genuine crawl failure must PROPAGATE
+    # so the caller's own try/except leaves every queried path unconfirmed for
+    # this tick's retry, never swallowed into a false "nothing confirmed".
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=CONFIRM_PATHS_SECTIONS)
+        return httpx.Response(500, json={"error": "boom"})
+
+    adapter = _adapter(handler, base_url="http://confirm-crawl-fail:32400")
+    with pytest.raises(PlexLibraryError):
+        await adapter.confirm_paths("movie", ["/media/Movies/Obsession (2026)"])
 
 
 # --------------------------------------------------------------------------- #
@@ -607,6 +1326,80 @@ async def test_trigger_scan_tv_raises_when_no_show_section_exists() -> None:
         await adapter.trigger_scan("/data/tv/anything", "tv")
 
 
+# Plex reports its section locations in the HOST namespace (``/srv/media/...``),
+# while the importer places into the CONTAINER-visible remap (``/media/...``).
+SECTIONS_HOST_NAMESPACE: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"path": "/srv/media/Movies"}],
+            },
+            {
+                "key": "4",
+                "title": "Movies 4K",
+                "type": "movie",
+                "Location": [{"path": "/mnt/other/Films"}],
+            },
+            {
+                "key": "2",
+                "title": "TV",
+                "type": "show",
+                "Location": [{"path": "/srv/media/TV"}],
+            },
+        ]
+    }
+}
+
+
+def _make_host_namespace_handler(record: list[tuple[str, str | None]]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS_HOST_NAMESPACE)
+        match = re.fullmatch(r"/library/sections/(\d+)/refresh", path)
+        if match:
+            record.append((match.group(1), request.url.params.get("path")))
+            return httpx.Response(200)
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_trigger_scan_reverse_maps_a_remapped_container_path() -> None:
+    # The container path ``/media/Movies/Title (2020)`` sits under the container
+    # remap (``/media``) of the section's HOST location ``/srv/media/Movies``. A
+    # plain prefix check would miss and full-refresh every movie section; the
+    # reverse map re-anchors it as the HOST path ``/srv/media/Movies/Title (2020)``
+    # Plex actually knows, so ONLY the owning section gets a targeted partial scan.
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_host_namespace_handler(record), base_url="http://scan-remap:32400")
+    await adapter.trigger_scan("/media/Movies/Title (2020)", "movie")
+    assert record == [("1", "/srv/media/Movies/Title (2020)")]
+
+
+async def test_trigger_scan_reverse_maps_a_remapped_tv_season_path() -> None:
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_host_namespace_handler(record), base_url="http://scan-remap-tv:32400")
+    await adapter.trigger_scan("/media/TV/Some Show (2019)/Season 02", "tv")
+    assert record == [("2", "/srv/media/TV/Some Show (2019)/Season 02")]
+
+
+async def test_trigger_scan_full_refresh_when_container_path_shares_no_directory() -> None:
+    # A container path under a mount but sharing NO directory with any section
+    # location (e.g. a mount-root remap) has nothing to anchor on: honest full
+    # refresh of every movie section, never a wrong-path targeted no-op.
+    record: list[tuple[str, str | None]] = []
+    adapter = _adapter(_make_host_namespace_handler(record), base_url="http://scan-noanchor:32400")
+    await adapter.trigger_scan("/media/Unknown (2021)", "movie")
+    assert {key for key, _ in record} == {"1", "4"}
+    assert all(scan_path is None for _key, scan_path in record)  # full refresh: no path param
+
+
 # --------------------------------------------------------------------------- #
 # Error boundary — secrets never leak
 # --------------------------------------------------------------------------- #
@@ -631,6 +1424,24 @@ async def test_server_error_raises_plex_library_error_without_token(status: int)
         return httpx.Response(status, json={"error": "boom"})
 
     adapter = _adapter(handler, base_url=f"http://err-{status}:32400")
+    with pytest.raises(PlexLibraryError) as exc_info:
+        await adapter.list_sections()
+    message = str(exc_info.value)
+    assert TOKEN not in message
+    assert str(status) in message
+
+
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_redirect_status_raises_plex_library_error(status: int) -> None:
+    """A 3xx (e.g. a proxy/auth redirect in front of Plex) must be rejected like
+    any other non-2xx (issue #87) — ``httpx.Response.is_error`` excludes 3xx, so
+    the prior check would have read a redirect as a successful scan/query even
+    though it never actually reached Plex."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers={"Location": "/web/login"})
+
+    adapter = _adapter(handler, base_url=f"http://redirect-{status}:32400")
     with pytest.raises(PlexLibraryError) as exc_info:
         await adapter.list_sections()
     message = str(exc_info.value)
@@ -688,6 +1499,22 @@ def test_adapter_satisfies_library_port() -> None:
     from plex_manager.ports.library import LibraryPort
 
     assert isinstance(_adapter(_main_handler), LibraryPort)
+
+
+def test_package_root_re_exports_typed_errors() -> None:
+    """The Plex adapter package root must re-export ``PlexAuthError`` and
+    ``PlexLibraryError`` (issue #113), matching every sibling adapter package
+    (``prowlarr``, ``tmdb``, ``qbittorrent``) which all expose their public
+    typed errors at ``__init__``, not just their implementation submodule — a
+    caller following that established contract must not hit an ``ImportError``
+    for the Plex adapter alone."""
+    from plex_manager.adapters.plex import PlexAuthError as RootAuthError
+    from plex_manager.adapters.plex import PlexLibrary as RootLibrary
+    from plex_manager.adapters.plex import PlexLibraryError as RootLibraryError
+
+    assert RootAuthError is PlexAuthError
+    assert RootLibraryError is PlexLibraryError
+    assert RootLibrary is PlexLibrary
 
 
 SECTIONS_NO_MOVIE: dict[str, Any] = {

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from plex_manager.models import AuthSession, User
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
+from plex_manager.web.deps import hash_session_token
 from tests.web.fakes import FakeLibrary, FakeTmdb, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -30,6 +33,25 @@ def _tmdb() -> FakeTmdb:
             _SHOW_ID: TvMetadata(tmdb_id=_SHOW_ID, title="Some Show", year=2020, season_count=2),
         },
     )
+
+
+async def _shared_user_cookies(app: FastAPI) -> tuple[dict[str, str], dict[str, str]]:
+    token = "shared-session-token"  # noqa: S105 - fake cookie token for test auth
+    csrf = "shared-csrf-token"
+    async with app.state.sessionmaker() as session:
+        user = User(plex_id=5001, username="shared-user", permissions=0)
+        session.add(user)
+        await session.flush()
+        session.add(
+            AuthSession(
+                user_id=user.id,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    return {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
 
 
 async def test_create_resolves_detail_and_lists(
@@ -72,6 +94,83 @@ async def test_create_dedups_active_request(
     assert len(listed.json()["requests"]) == 1
 
 
+async def test_shared_user_requests_are_limited_to_their_own_records(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            movies={
+                603: MovieMetadata(tmdb_id=603, title="The Matrix", year=1999),
+                604: MovieMetadata(tmdb_id=604, title="Dark City", year=1998),
+            }
+        ),
+    )
+    shared_cookies, shared_headers = await _shared_user_cookies(app)
+
+    own = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    assert own.status_code == 201
+
+    admin = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 604, "media_type": "movie"},
+        headers=_HEADERS,
+    )
+    assert admin.status_code == 201
+
+    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["requests"]] == [own.json()["id"]]
+
+    hidden = await client.get(f"/api/v1/requests/{admin.json()['id']}", cookies=shared_cookies)
+    assert hidden.status_code == 404
+
+    pin = await client.post(
+        f"/api/v1/requests/{own.json()['id']}/keep-forever",
+        json={"keep_forever": True},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    assert pin.status_code == 403
+    assert pin.json()["detail"] == "admin_required"
+
+
+async def test_shared_user_dedup_claims_unowned_request_into_their_list(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb())
+    shared_cookies, shared_headers = await _shared_user_cookies(app)
+
+    # The api-key automation path creates a request with NO user identity.
+    admin = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 603, "media_type": "movie"}, headers=_HEADERS
+    )
+    assert admin.status_code == 201
+
+    # A shared user requesting the same title dedups onto that ownerless request.
+    shared = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    assert shared.status_code == 200
+    assert shared.json()["id"] == admin.json()["id"]
+
+    # It is now adopted by the requester, so it shows up in THEIR filtered list
+    # rather than succeeding yet vanishing behind the per-user filter.
+    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["requests"]] == [admin.json()["id"]]
+
+
 async def test_create_records_already_in_plex_as_available(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
@@ -100,6 +199,60 @@ async def test_create_proceeds_when_not_in_plex(
     assert created.json()["status"] == "pending"
 
 
+async def test_create_force_reacquire_returns_pending_201(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # Re-acquire (issue #131): `force=True` bypasses the already-in-library
+    # short-circuit even though Plex still reports the movie present, proving the
+    # endpoint threads `force` through to `create_request_result`. Contrast with the
+    # SAME library state minus `force` (a different tmdb id), which still
+    # short-circuits to `available`.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            movies={
+                603: MovieMetadata(tmdb_id=603, title="The Matrix", year=1999),
+                604: MovieMetadata(tmdb_id=604, title="Dark City", year=1998),
+            }
+        ),
+        library=FakeLibrary(available={603, 604}),
+    )
+
+    forced = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie", "force": True},
+        headers=_HEADERS,
+    )
+    assert forced.status_code == 201
+    assert forced.json()["status"] == "pending"
+
+    not_forced = await client.post(
+        "/api/v1/requests", json={"tmdb_id": 604, "media_type": "movie"}, headers=_HEADERS
+    )
+    assert not_forced.status_code == 201
+    assert not_forced.json()["status"] == "available"
+
+
+async def test_create_force_reacquire_allowed_for_shared_user(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # Same authZ bar as any create (`require_api_key`): a non-admin shared user can
+    # force-reacquire too -- this is NOT an admin-gated verb.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb(), library=FakeLibrary(available={603}))
+    shared_cookies, shared_headers = await _shared_user_cookies(app)
+
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie", "force": True},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["status"] == "pending"
+
+
 async def test_create_unknown_media_is_404(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
@@ -112,7 +265,7 @@ async def test_create_unknown_media_is_404(
     assert response.json()["detail"] == "media_not_found"
 
 
-async def test_create_tv_request_with_no_aired_seasons_is_404(
+async def test_create_tv_request_with_no_aired_seasons_waits(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
@@ -121,11 +274,15 @@ async def test_create_tv_request_with_no_aired_seasons_is_404(
     response = await client.post(
         "/api/v1/requests", json={"tmdb_id": 44, "media_type": "tv"}, headers=_HEADERS
     )
-    assert response.status_code == 404
-    assert response.json()["detail"] == "no_aired_seasons"
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "waiting_for_air_date"
+    assert body["tv_request_mode"] == "whole_show"
 
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
-    assert listed.json()["requests"] == []
+    listed_body = listed.json()["requests"]
+    assert len(listed_body) == 1
+    assert listed_body[0]["status"] == "waiting_for_air_date"
 
 
 def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
@@ -134,9 +291,13 @@ def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
     assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
         "/ErrorDetail"
     )
-    # No 409 documented: media_type is Literal["movie", "tv"], so an unsupported
-    # type is already FastAPI's 422 -- the old media_type_deferred 409 was dead code.
-    assert "409" not in responses
+    # 409 documents the honest "already requested by another user" rejection
+    # (issue #58): a non-admin cannot dedup onto a foreign-owned active request.
+    # (This is NOT the old media_type_deferred 409, which was dead code -- an
+    # unsupported media_type is a Literal, so FastAPI already 422s it.)
+    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorDetail"
+    )
 
 
 def test_get_request_contract_documents_not_found(app: FastAPI) -> None:

@@ -53,9 +53,9 @@ Design decisions (see ADR-0013):
   guid/info_hash, season, attempt context) so "how often did the same source
   persistently fail" is answerable from ``log_events`` after the beta week; a
   per-cycle ``source_failures`` count is folded into the closing summary INFO. Its
-  sibling per-release failures ({``NoGrabSourceError``, ``DownloadScopeConflictError``,
-  ``TorrentAlreadyTrackedError``}) keep the lighter "type name only" logging -- there
-  is no beta-week data need for those.
+  sibling per-release failures ({``NoGrabSourceError``, ``TorrentAlreadyTrackedError``})
+  keep the lighter "type name only" logging -- there is no beta-week data need for
+  those.
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
+from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
 from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -79,7 +80,6 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
-    DownloadScopeConflictError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
@@ -395,9 +395,10 @@ async def _park(
     scope: _PendingScope,
     clock: Callable[[], datetime],
 ) -> bool:
-    """Record a nothing-acceptable result: schedule the backoff + mark the honest
-    ``no_acceptable_release`` park state, then commit. Returns ``True`` if it parked,
-    ``False`` if a racing active download made parking wrong (see below).
+    """Record a nothing-acceptable result: mark the honest ``no_acceptable_release``
+    park state via a compare-and-swap FIRST, then -- ONLY if it actually won --
+    schedule the backoff and commit both together. Returns ``True`` if it parked,
+    ``False`` if a racing writer made parking wrong (see below).
 
     The SAME honest dead-end the manual ``/queue/grab`` endpoint uses
     (``request_service`` / ``season_request_service.mark_no_acceptable_release``,
@@ -413,6 +414,18 @@ async def _park(
     same way, so mirror it: re-check ``find_active_for_request`` immediately before
     the write and, if a download appeared, skip the park entirely (no status write,
     no backoff bump) and report it un-parked.
+
+    Issue #72 -- the CAS itself, not just the pre-check above: that re-check only
+    closes the gap up to THIS instant -- a concurrent writer can still win the race
+    in the (tiny) window between it and the actual status write below.
+    ``mark_no_acceptable_release`` now performs a genuine ``set_status_if_in``
+    compare-and-swap (the database's ``WHERE status IN (...)`` decides at write
+    time, never this function's stale read), so that window is closed too, and its
+    boolean return lets this function tell a real park apart from a lost race. The
+    backoff write (``schedule_search``) only happens -- and only gets committed --
+    AFTER a WON CAS: a lost race is rolled back and reported un-parked WITHOUT
+    ever touching ``search_attempts`` / ``next_search_at``, so a park that did not
+    happen can never advance the backoff ladder either.
 
     Codex round-3 #3 -- stale park base: the backoff is scheduled from a FRESH clock
     read at the actual park moment, never a ``now`` captured at cycle start. A slow
@@ -434,23 +447,38 @@ async def _park(
     if scope.season is not None:  # TV season
         if scope.season_request_id is None:  # pragma: no cover - a tv scope always has one
             return False
+        parked = await season_request_service.mark_no_acceptable_release(
+            session, media_request_id=scope.request_id, season_number=scope.season
+        )
+        if not parked:
+            await session.rollback()
+            _logger.info(
+                "auto-grab: lost the park race to a concurrent writer; leaving scope "
+                "as-is (no backoff written)",
+                extra={"request_id": scope.request_id, "season": scope.season},
+            )
+            return False
         await season_repo.schedule_search(
             scope.season_request_id,
             search_attempts=scheduled_attempts,
             next_search_at=scheduled_at,
         )
         # Flush-only; this function owns the commit boundary.
-        await season_request_service.mark_no_acceptable_release(
-            session, media_request_id=scope.request_id, season_number=scope.season
-        )
     else:  # movie
+        parked = await request_service.mark_no_acceptable_release(session, scope.request_id)
+        if not parked:
+            await session.rollback()
+            _logger.info(
+                "auto-grab: lost the park race to a concurrent writer; leaving scope "
+                "as-is (no backoff written)",
+                extra={"request_id": scope.request_id},
+            )
+            return False
         await request_repo.schedule_search(
             scope.request_id,
             search_attempts=scheduled_attempts,
             next_search_at=scheduled_at,
         )
-        # Commits internally (movie path); the extra commit below is then a no-op.
-        await request_service.mark_no_acceptable_release(session, scope.request_id)
     await session.commit()
     return True
 
@@ -466,6 +494,7 @@ async def run_grab_cycle(
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
     cooldowns: CooldownRegistry | None = None,
+    save_path: str = "",
 ) -> AutograbCycleResult:
     """Run one auto-grab pass: search the due scopes and grab / park each.
 
@@ -482,10 +511,9 @@ async def run_grab_cycle(
       scope to ``downloading`` and commits), falling through to the next-ranked
       accepted release -- bounded by :data:`MAX_GRAB_ATTEMPTS_PER_SCOPE` -- when the
       top pick hits a PER-RELEASE grab failure ({``NoGrabSourceError``,
-      ``QbittorrentSourceError``, ``DownloadScopeConflictError``,
-      ``TorrentAlreadyTrackedError``}); if nothing is acceptable, or every accepted
-      release is ungrabbable, park it at ``no_acceptable_release`` and schedule the
-      escalating backoff.
+      ``QbittorrentSourceError``, ``TorrentAlreadyTrackedError``}); if nothing is
+      acceptable, or every accepted release is ungrabbable, park it at
+      ``no_acceptable_release`` and schedule the escalating backoff.
 
     A search that RAISES (Prowlarr unreachable / rate-limited -- the ``IndexerPort``
     contract raises rather than returning ``[]``) is NOT caught here: it propagates
@@ -513,6 +541,15 @@ async def run_grab_cycle(
     cooldown event so a slow cycle schedules from the real event time, not a stale
     cycle-start base (Codex round-3 #3); it defaults to the wall clock. Both are
     injectable for deterministic tests.
+
+    ``save_path`` (issues #133/#157) is threaded verbatim into every
+    :func:`grab_service.grab` call: the caller (``web/app.py``'s ``_autograb_once``)
+    resolves the HOST-namespace downloads root once per cycle
+    (``path_visibility.resolve_downloads_host_root``) and passes it here, so an
+    auto-grabbed torrent lands under the mounted ``/downloads`` bind exactly like a
+    manual grab, rather than qBittorrent's own (possibly invisible) default.
+    ``""`` (the default) leaves qBittorrent's own default in charge, unchanged
+    prior behaviour.
     """
     now = now or datetime.now(UTC)
     # Park + cooldown scheduling read the clock FRESH at each event (round-3 #3); the
@@ -564,8 +601,41 @@ async def run_grab_cycle(
             if parent is None:  # pragma: no cover - the FK guarantees the parent row
                 continue
             title, year, media_type = parent.title, parent.year, "tv"
+            stored_episodes = (
+                parent.requested_episodes.get(scope.season) if parent.requested_episodes else None
+            )
+            scope_episodes = list(stored_episodes) if stored_episodes is not None else None
+            scope_episodes_by_season = (
+                {season: list(values) for season, values in parent.requested_episodes.items()}
+                if parent.requested_episodes
+                else None
+            )
+            sibling_seasons = await season_repo.list_for_request(parent.id)
+            requested = (
+                parent.requested_seasons
+                or tuple(sorted(parent.requested_episodes or {}))
+                or tuple(row.season_number for row in sibling_seasons)
+            )
+            multi_season_intent = MultiSeasonRequestIntent(
+                mode=(
+                    "whole_show" if parent.tv_request_mode == "whole_show" else "explicit_seasons"
+                ),
+                requested_seasons=tuple(requested),
+                seasons=tuple(
+                    SeasonPackSeasonState(
+                        season_number=row.season_number,
+                        status=row.status,
+                        installed_quality_id=row.installed_quality_id,
+                        installed_profile_index=row.installed_profile_index,
+                    )
+                    for row in sibling_seasons
+                ),
+            )
         else:  # movie
             title, year, media_type = scope.title or "", scope.year, "movie"
+            scope_episodes = None
+            scope_episodes_by_season = None
+            multi_season_intent = None
 
         searched += 1
         # NOTE: deliberately NOT wrapped -- a raised indexer error must propagate
@@ -580,13 +650,14 @@ async def run_grab_cycle(
             media_type=media_type,
             year=year,
             season=scope.season,
-            episodes=None,
+            episodes=scope_episodes,
+            multi_season_intent=multi_season_intent,
         )
 
         # Try the accepted releases in rank order until one grabs. Only the four
         # PER-RELEASE failures {NoGrabSourceError, QbittorrentSourceError,
-        # DownloadScopeConflictError, TorrentAlreadyTrackedError} -- none of which
-        # leaves anything live to track -- fall through to the next-ranked candidate;
+        # TorrentAlreadyTrackedError} -- none of which leaves anything live to track
+        # for this scope -- fall through to the next-ranked candidate;
         # every OTHER outcome settles the scope on the spot
         # (a grab, an operational GrabError, or a concurrency/shape refusal), so a
         # single top-pick hiccup never hides a grabbable lower-ranked release behind
@@ -611,7 +682,18 @@ async def run_grab_cycle(
                     tmdb_id=scope.tmdb_id,
                     year=year,
                     season=scope.season,
-                    episodes=None,
+                    episodes=scope_episodes,
+                    scope_episodes_by_season=scope_episodes_by_season,
+                    save_path=save_path,
+                    # The decision's premise rides with the action: this scope
+                    # was selected because the season read as DUE at selection
+                    # time. If the eviction recovery folds it to 'available'
+                    # (file never left disk) before grab()'s own fresh read,
+                    # grab refuses up front instead of mistaking the fold for
+                    # an intentional reopen (see grab()'s docstring). Movies
+                    # need no premise: every non-due movie status is terminal,
+                    # so grab's up-front gate already refuses it.
+                    expected_season_status=scope.status if scope.season is not None else None,
                 )
                 grabbed += 1
                 park_scope = False
@@ -777,15 +859,11 @@ async def run_grab_cycle(
                 )
             except (
                 NoGrabSourceError,
-                DownloadScopeConflictError,
                 TorrentAlreadyTrackedError,
             ) as exc:
                 # A release WAS accepted but cannot be grabbed right now, and NOTHING
                 # is left live to track: no usable source (``NoGrabSourceError`` --
-                # raised BEFORE anything is handed to the client); the same physical
-                # torrent is already active for a DIFFERENT scope of THIS request
-                # (``DownloadScopeConflictError`` -- a multi-season pack; the re-add
-                # is a qBittorrent no-op, so nothing is orphaned); or the torrent's
+                # raised BEFORE anything is handed to the client); or the torrent's
                 # hash is already tracked by a DIFFERENT request entirely
                 # (``TorrentAlreadyTrackedError`` -- that request's download owns the
                 # physical torrent, so any add was an idempotent no-op on an

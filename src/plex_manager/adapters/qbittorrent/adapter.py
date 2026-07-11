@@ -46,7 +46,7 @@ import anyio.to_thread
 import httpcore
 import httpx
 
-from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
+from plex_manager.ports.download_client import AddResult, DownloadedFile, DownloadStatus
 
 __all__ = [
     "QbittorrentAuthError",
@@ -60,6 +60,7 @@ _logger = logging.getLogger(__name__)
 _API: Final = "/api/v2"
 _HTTP_OK: Final = 200
 _HTTP_NO_CONTENT: Final = 204
+_HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
@@ -213,15 +214,33 @@ def _normalize_btih(value: str) -> str:
     32-char base32 encoding of the same 20-byte hash. qBittorrent always reports
     the hex form, so a base32 magnet must be decoded to hex — otherwise the stored
     hash never matches the client snapshot and the reconciler treats the torrent as
-    ``ClientMissing`` forever. A 40-char hex value is returned lowercased; any other
-    shape is passed through lowercased (best effort — nothing is swallowed).
+    ``ClientMissing`` forever. A valid 40-char hex value is returned lowercased; a
+    valid 32-char base32 value is decoded to its hex form.
+
+    A 32-char value that is NOT valid base32 is a MALFORMED source, not a hash:
+    raising :class:`QbittorrentSourceError` routes it through the existing typed
+    source-error taxonomy (the manual grab's ``torrent_source_unresolvable`` /
+    auto-grab's per-release source-failure path) rather than passing the garbage
+    through as if it were a real hash — a value that could never match the client
+    snapshot, stranding the download as ``ClientMissing`` forever (north star #3:
+    surface the malformed source, don't swallow it).
     """
     if len(value) == 32:
         try:
-            # b32decode raises binascii.Error (a ValueError subclass) on bad input.
-            return base64.b32decode(value.upper()).hex()
-        except ValueError:
-            return value.lower()
+            # b32decode raises binascii.Error (a ValueError subclass) on
+            # non-alphabet input, but a non-ASCII value raises a PLAIN
+            # ValueError before the alphabet is even checked — catch the
+            # base class so both malformed shapes stay in the taxonomy.
+            decoded = base64.b32decode(value.upper())
+        except ValueError as exc:
+            raise QbittorrentSourceError("invalid base32 btih in magnet source") from exc
+        # Padding tricks ("A"*31 + "=") decode "successfully" to fewer than the
+        # 20 bytes a real info-hash has; the resulting short hex could never
+        # match qBittorrent's 40-char snapshot, so it is the same malformed
+        # source, not a hash.
+        if len(decoded) != 20:
+            raise QbittorrentSourceError("base32 btih decodes to a non-20-byte hash")
+        return decoded.hex()
     return value.lower()
 
 
@@ -231,7 +250,10 @@ def _info_hash_from_magnet(magnet: str) -> str | None:
     Total: an UNPARSABLE magnet (an attacker-controlled redirect can supply e.g.
     ``magnet://[::1x/…`` whose bogus netloc makes ``urlparse`` raise ValueError)
     returns ``None`` — no hash derivable — instead of escaping the source-error
-    taxonomy with a raw ValueError.
+    taxonomy with a raw ValueError. A present-but-MALFORMED ``btih`` (invalid
+    base32) instead raises :class:`QbittorrentSourceError` via
+    :func:`_normalize_btih` — a typed source error IN the taxonomy, never garbage
+    passed through as a hash (see that function's docstring).
     """
     try:
         parsed = urlparse(magnet)
@@ -691,8 +713,13 @@ class QbittorrentClient:
         carries the status code only — never the url or any secret. Auth (403) is
         already handled by ``_request``'s transparent re-login, so a status reaching
         here is a genuine, surfaced failure.
+
+        Checks the full 2xx range explicitly rather than ``httpx.Response.is_error``
+        (issue #87): ``is_error`` is only true for >=400, so a 3xx redirect (e.g. a
+        proxy/auth redirect in front of qBittorrent) would read as success even
+        though the requested operation never actually ran.
         """
-        if response.is_error:
+        if not (_HTTP_OK <= response.status_code < _HTTP_MULTIPLE_CHOICES):
             raise QbittorrentError(f"qBittorrent request failed (HTTP {response.status_code})")
 
     # ---- auth ----------------------------------------------------------- #
@@ -859,10 +886,27 @@ class QbittorrentClient:
         ) as client:
             return await self._resolve_http_source_with_client(client, url)
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
-        """Add a torrent; return its lowercased info-hash.
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        """Add a torrent; return its lowercased info-hash + whether it was created.
 
-        A 409 (already present) resolves to the computed hash rather than erroring.
+        A 409 (already present) resolves to the computed hash rather than
+        erroring, reported honestly as ``created=False``: qBittorrent's 409 is
+        the one signal that the torrent PREDATES this call, and the caller's
+        lost-grab cleanup must never destroy (``delete_files=True``) a torrent
+        it merely reused -- its data can back a live library file via hardlink
+        (see :class:`~plex_manager.ports.download_client.AddResult`).
+
+        When ``save_path`` is non-empty (a directed path -- issues #133/#157),
+        the request ALSO carries ``autoTMM: "false"``: an install with global
+        Automatic Torrent Management enabled otherwise ignores the per-add
+        ``savepath`` field entirely and lets category/auto rules place the
+        torrent, silently defeating the whole save-path direction. Sending the
+        flag pins this ONE torrent to manual management so ``savepath`` is
+        actually honoured, without touching the client's global AutoTMM
+        setting or any other torrent. When ``save_path`` is empty (nothing to
+        direct), ``autoTMM`` is omitted entirely -- the client's own
+        auto-managed/manual mode for this torrent is left untouched, exactly
+        the prior behaviour.
         """
         urls_value: str | None = None
         torrent_bytes: bytes | None = None
@@ -901,6 +945,13 @@ class QbittorrentClient:
             info_hash = _info_hash_from_magnet(magnet_or_url)
 
         form: dict[str, str] = {"savepath": save_path, "category": category}
+        if save_path:
+            # A directed save path only takes effect when this torrent is NOT
+            # auto-managed -- otherwise a global AutoTMM install silently
+            # relocates it per category/auto rules, ignoring ``savepath``
+            # entirely. Manual-manage just THIS add; omitted (below) when
+            # there is no directed path, leaving the client's own mode alone.
+            form["autoTMM"] = "false"
         files: dict[str, tuple[str, bytes, str]] | None = None
         if urls_value is not None:
             form["urls"] = urls_value
@@ -913,13 +964,17 @@ class QbittorrentClient:
             raise QbittorrentError(
                 f"qBittorrent rejected the torrent (HTTP {response.status_code})"
             )
+        # The 409 branch of _is_add_success is "already present, resolved to the
+        # existing torrent" -- the honest created=False signal (every other
+        # success shape means the client actually accepted a new add).
+        created = response.status_code != _HTTP_CONFLICT
 
         if info_hash is not None:
-            return info_hash.lower()
+            return AddResult(torrent_hash=info_hash.lower(), created=created)
         # No locally-derivable hash (rare: opaque .torrent URL qBit fetched). Best
         # effort: the caller can reconcile by category on the next poll.
         _logger.warning("added torrent but could not derive its info-hash locally")
-        return ""
+        return AddResult(torrent_hash="", created=created)
 
     # ---- status --------------------------------------------------------- #
     async def get_status(self, info_hash: str) -> DownloadStatus | None:
@@ -1022,6 +1077,39 @@ class QbittorrentClient:
                     DownloadedFile(name=_s(entry.get("name")), size_bytes=_i(entry.get("size")))
                 )
         return out
+
+    async def get_default_save_path(self) -> str | None:
+        """Return the client's GLOBAL default save path via ``GET /app/preferences``.
+
+        Read-only diagnostic (setup/health visibility probe, issues #133/#157) --
+        this adapter never posts to ``/app/setPreferences``; there is no matching
+        setter on the port (see :meth:`set_location`'s docstring). A non-2xx
+        response or a missing/blank ``save_path`` key returns ``None`` -- honestly
+        "could not read it", never a guessed path.
+        """
+        response = await self._request("GET", "/app/preferences")
+        if response.status_code != _HTTP_OK:
+            return None
+        payload = _as_dict(_decode_json(response, "/app/preferences"))
+        return _s(payload.get("save_path")) or None
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        """Relocate ``info_hash``'s save directory via ``POST /torrents/setLocation``.
+
+        qBittorrent moves the content asynchronously; this call only requests the
+        move (surfacing a non-2xx as the usual typed :class:`QbittorrentError`) and
+        returns -- it does not wait for, or otherwise confirm, completion. The
+        cached ``/torrents/properties`` entry is dropped so the next
+        :meth:`get_save_path` re-reads the client rather than serving the
+        pre-move path for up to :data:`_PROPERTIES_TTL_SECONDS`.
+        """
+        response = await self._request(
+            "POST",
+            "/torrents/setLocation",
+            data={"hashes": info_hash.lower(), "location": save_path},
+        )
+        self._raise_for_status(response)
+        self._properties_cache.pop(info_hash.lower(), None)
 
     async def _fetch_properties(self, info_hash: str) -> dict[str, object] | None:
         """Fetch ``/torrents/properties`` for ``info_hash``, cached briefly.

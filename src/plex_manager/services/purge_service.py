@@ -10,8 +10,9 @@ authoritative record; a client/Plex/FS hiccup here must never undo it:
   ``library_path`` breadcrumb, plus the hardlink-aware reclaimable-bytes
   accounting (measured BEFORE the delete, since a file's link count can only be
   read while it still exists). Returns a :class:`PurgeResult` classifying the
-  outcome (``deleted`` / ``refused`` by the containment guard / ``error``); the
-  CALLER logs, so each keeps its own context-appropriate message and logger.
+  outcome (``deleted`` / ``refused`` by the containment guard / ``deferred`` to
+  an active import / ``error``); the CALLER logs, so each keeps its own
+  context-appropriate message and logger.
 * :func:`trigger_library_scan` — the best-effort Plex refresh (delete-file-then-
   trigger_scan is how a title/season is removed from Plex; there is no
   ``LibraryPort`` delete API and none is needed).
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
@@ -46,12 +48,103 @@ if TYPE_CHECKING:
 __all__ = [
     "PurgeOutcome",
     "PurgeResult",
+    "begin_placement",
+    "end_placement",
+    "end_purge",
     "purge_library_path",
     "remove_torrent",
     "trigger_library_scan",
 ]
 
 _logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# In-process purge-vs-import path serialization (PR #117 round 9).
+#
+# During an eviction's committed-claim window a fast re-request (terminal-row
+# reuse of a still-seeding torrent makes the re-import near-instant) can be
+# PLACING the replacement into the same deterministic movie/season directory
+# that the purge's rmtree is walking -- the purge would delete files the import
+# just placed and committed. Both actors run in this one process (the same
+# honest in-process scope as the eviction sweep latch), so a pair of refcounted
+# path registries serializes them.
+#
+# ORDERING RULE (stated identically at the import site): FIRST-REGISTERED WINS,
+# and the loser defers fast rather than waiting -- the check-and-register below
+# has no ``await`` between them, so it is atomic on the single event loop:
+#
+# * ``purge_library_path`` defers (``PurgeOutcome.deferred`` with an explicit
+#   detail) when an import is mid-placement into a conflicting path. That is NOT
+#   an ordinary unlink failure for eviction: a replacement import may be about to
+#   own the path, so the old eviction claim stays published with its breadcrumb
+#   for the next recovery pass to adjudicate. Report-issue keeps the breadcrumb
+#   like a retryable delete failure.
+# * ``begin_placement`` (called by ``import_service`` before its ``Importing``
+#   claim) refuses when a purge is mid-delete on a conflicting path: the import
+#   attempt is skipped for THIS cycle and honestly retried on the next one (the
+#   row stays ``ImportPending``, which every import cycle re-picks).
+#
+# Paths conflict on equality OR containment (a movie FILE placement vs a purge
+# of its ``Title (Year)/`` directory; an episode file vs its season directory).
+_ACTIVE_PURGE_PATHS: dict[str, int] = {}
+_ACTIVE_PLACEMENT_PATHS: dict[str, int] = {}
+
+
+def _normalize_guard_path(path: str) -> str:
+    """Normalize for registry comparison (no symlink resolution: the stored
+    breadcrumb and the import's computed destination share the same textual
+    root, and the target may not exist yet)."""
+    return os.path.abspath(os.path.normpath(path))
+
+
+def _conflicts_with(path: str, registry: dict[str, int]) -> bool:
+    """Whether ``path`` equals, contains, or is contained by any registered path."""
+    norm = _normalize_guard_path(path)
+    return any(
+        norm == other or norm.startswith(other + os.sep) or other.startswith(norm + os.sep)
+        for other in registry
+    )
+
+
+def _register(path: str, registry: dict[str, int]) -> None:
+    norm = _normalize_guard_path(path)
+    registry[norm] = registry.get(norm, 0) + 1
+
+
+def _unregister(path: str, registry: dict[str, int]) -> None:
+    norm = _normalize_guard_path(path)
+    count = registry.get(norm, 0) - 1
+    if count > 0:
+        registry[norm] = count
+    else:
+        registry.pop(norm, None)
+
+
+def begin_placement(library_path: str) -> bool:
+    """Register an import placement into ``library_path``; ``False`` = refuse.
+
+    ``False`` means a purge is mid-delete on a conflicting path (see the
+    ordering rule above): the caller must SKIP this import attempt -- honestly
+    retryable on the next import cycle -- rather than place files into a
+    directory an rmtree is walking. On ``True`` the placement is registered and
+    the caller MUST pair it with :func:`end_placement` (try/finally) once the
+    placement + finalize commit are done, so a purge arriving mid-placement
+    defers instead of deleting freshly placed files.
+    """
+    if _conflicts_with(library_path, _ACTIVE_PURGE_PATHS):
+        return False
+    _register(library_path, _ACTIVE_PLACEMENT_PATHS)
+    return True
+
+
+def end_placement(library_path: str) -> None:
+    """Release a :func:`begin_placement` registration (refcounted)."""
+    _unregister(library_path, _ACTIVE_PLACEMENT_PATHS)
+
+
+def end_purge(library_path: str) -> None:
+    """Release a held purge registration (refcounted)."""
+    _unregister(library_path, _ACTIVE_PURGE_PATHS)
 
 
 class PurgeOutcome(StrEnum):
@@ -63,6 +156,9 @@ class PurgeOutcome(StrEnum):
     #: The root-containment guard refused: the path resolves outside every
     #: configured library root (a stale/misconfigured breadcrumb). Nothing deleted.
     refused = "refused"
+    #: A replacement import is actively placing into this path. Nothing deleted;
+    #: eviction should leave the claim/breadcrumb for later recovery.
+    deferred = "deferred"
     #: An ``OSError`` (permission denied, I/O error) while deleting. Nothing (or
     #: only part of a tree) deleted; the caller may retry later.
     error = "error"
@@ -83,7 +179,9 @@ class PurgeResult:
     detail: str | None = None
 
 
-async def purge_library_path(fs: FileSystemPort, library_path: str) -> PurgeResult:
+async def purge_library_path(
+    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool = False
+) -> PurgeResult:
     """Root-guarded delete of ``library_path`` + hardlink-aware freed-bytes accounting.
 
     Both the size accounting and the delete are real, synchronous disk I/O
@@ -97,34 +195,54 @@ async def purge_library_path(fs: FileSystemPort, library_path: str) -> PurgeResu
     idempotent no-op success. Classifies the result rather than logging it: the
     caller (eviction / report-issue) owns the context-specific message + logger.
     """
-    # Fail an out-of-root breadcrumb CLOSED and FAST, BEFORE the (potentially huge,
-    # recursive) reclaimable_bytes walk. A stale/misconfigured breadcrumb can point at
-    # an existing directory outside every configured root (an old library root, or even
-    # ``/``); measuring it first would walk that whole outside tree only for the delete
-    # below to then refuse it. ``delete_guard_refuses`` is the same walk-free
-    # containment predicate ``delete`` applies (the exact refusal decision, as a
-    # read-only query), so this changes nothing for an in-root path -- it only short-
-    # circuits the exact paths ``delete`` was always going to refuse.
-    if await asyncio.to_thread(fs.delete_guard_refuses, library_path):
+    # PURGE-vs-IMPORT ordering rule (see the registry block above): defer to an
+    # import that is mid-placement into this path -- deleting under it would eat
+    # files the import is about to (or just did) commit as placed. ``deferred`` is
+    # distinct from a real unlink failure because eviction must not restore the
+    # old owner while a replacement import may be finalizing that same path.
+    # Check-and-register has no await between them.
+    if _conflicts_with(library_path, _ACTIVE_PLACEMENT_PATHS):
         return PurgeResult(
-            PurgeOutcome.refused, 0, "path resolves outside every configured library root"
+            PurgeOutcome.deferred, 0, "deferred: an import is placing into this path"
         )
-
-    # Reclaimable bytes MUST be read before the delete: a file's link count is
-    # only knowable while the path still exists (hardlink-aware accounting, ADR-0012
-    # / ADR-0014). A measurement failure is "unknown -> 0", never an abort.
+    _register(library_path, _ACTIVE_PURGE_PATHS)
+    release_registration = True
     try:
-        freed_bytes = await asyncio.to_thread(fs.reclaimable_bytes, library_path)
-    except OSError:
-        freed_bytes = 0
+        # Fail an out-of-root breadcrumb CLOSED and FAST, BEFORE the (potentially
+        # huge, recursive) reclaimable_bytes walk. A stale/misconfigured breadcrumb
+        # can point at an existing directory outside every configured root (an old
+        # library root, or even ``/``); measuring it first would walk that whole
+        # outside tree only for the delete below to then refuse it.
+        # ``delete_guard_refuses`` is the same walk-free containment predicate
+        # ``delete`` applies (the exact refusal decision, as a read-only query), so
+        # this changes nothing for an in-root path -- it only short-circuits the
+        # exact paths ``delete`` was always going to refuse.
+        if await asyncio.to_thread(fs.delete_guard_refuses, library_path):
+            return PurgeResult(
+                PurgeOutcome.refused, 0, "path resolves outside every configured library root"
+            )
 
-    try:
-        await asyncio.to_thread(fs.delete, library_path)
-    except LocalFileSystemError as exc:
-        return PurgeResult(PurgeOutcome.refused, 0, str(exc))
-    except OSError as exc:
-        return PurgeResult(PurgeOutcome.error, 0, type(exc).__name__)
-    return PurgeResult(PurgeOutcome.deleted, freed_bytes)
+        # Reclaimable bytes MUST be read before the delete: a file's link count is
+        # only knowable while the path still exists (hardlink-aware accounting,
+        # ADR-0012 / ADR-0014). A measurement failure is "unknown -> 0", never an
+        # abort.
+        try:
+            freed_bytes = await asyncio.to_thread(fs.reclaimable_bytes, library_path)
+        except OSError:
+            freed_bytes = 0
+
+        try:
+            await asyncio.to_thread(fs.delete, library_path)
+        except LocalFileSystemError as exc:
+            return PurgeResult(PurgeOutcome.refused, 0, str(exc))
+        except OSError as exc:
+            return PurgeResult(PurgeOutcome.error, 0, type(exc).__name__)
+        if hold_purge_registration:
+            release_registration = False
+        return PurgeResult(PurgeOutcome.deleted, freed_bytes)
+    finally:
+        if release_registration:
+            _unregister(library_path, _ACTIVE_PURGE_PATHS)
 
 
 async def trigger_library_scan(
@@ -166,7 +284,7 @@ async def remove_torrent(
     *,
     context: str,
     extra: dict[str, object] | None = None,
-) -> None:
+) -> bool:
     """Best-effort ``qbt.remove(delete_files=True)`` — closes the seeding leak.
 
     A blocklisted / cancelled / reported download must not keep seeding and
@@ -175,6 +293,13 @@ async def remove_torrent(
     (honesty over silence) but never raised: the caller's blocklist/status writes
     have already committed and must not be undone by a client hiccup — the leak is
     made VISIBLE in the log rather than aborting the correction.
+
+    Returns whether the client call SUCCEEDED (an already-gone hash counts as
+    success). ``queue_service`` uses this to persist the removal outcome into its
+    provenance marker (``remove=done``): a durable "already removed" record must
+    only be written for a removal that actually happened, so a client hiccup
+    returns ``False`` and the marker keeps saying the removal is still owed.
+    Callers that only need the best-effort behaviour may ignore the result.
 
     ``context`` is a static caller description, logged verbatim (never an
     interpolated request-derived string — log-injection convention); the
@@ -194,3 +319,5 @@ async def remove_torrent(
             exc_info=True,
             extra=extra,
         )
+        return False
+    return True

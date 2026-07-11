@@ -40,6 +40,32 @@ _PRECEDENCE_STATUSES: tuple[str, ...] = (
     "no_acceptable_release",
 )
 
+# The complete, legitimate season-status vocabulary (issue #79): every bare-string
+# value a real ``SeasonRequest.status`` can ever hold. Deliberately EXCLUDES
+# ``partially_available`` -- that value is PARENT-ONLY, the rollup OUTPUT this
+# very function produces for a show, never a value a single season's own status
+# column can legitimately carry -- plus anything not in this set at all (a typo,
+# a migration gap, or a future ``RequestStatus`` member added here without first
+# updating this allowlist). Checked up front so such a value is a loud, honest
+# ``ValueError`` at the fold boundary instead of silently falling through the
+# branches below to the terminal ``"failed"`` and reporting a false settled
+# failure for the whole show.
+_VALID_SEASON_STATUSES: frozenset[str] = frozenset(
+    {
+        "pending",
+        "searching",
+        "no_acceptable_release",
+        "waiting_for_air_date",
+        "downloading",
+        "completed",
+        "available",
+        "failed",
+        "import_blocked",
+        "evicted",
+        "cancelled",
+    }
+)
+
 
 def rollup_status(season_statuses: Sequence[str]) -> str:
     """Fold every tracked season's status into the parent request's status.
@@ -81,11 +107,27 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
     on an empty sequence —
     a TV request always has at least one season once ``ensure_seasons`` has run, so
     an empty rollup input is a caller bug, never a state to silently guess at.
+
+    Also raises :class:`ValueError` (issue #79) when any status is OUTSIDE the
+    ten-member season-status vocabulary above -- most notably the PARENT-ONLY
+    ``"partially_available"`` (this function's own rollup OUTPUT, never a value a
+    real season row's status column can hold), but equally any unrecognized string
+    (a typo, a migration gap, or a future ``RequestStatus`` member added without
+    first updating :data:`_VALID_SEASON_STATUSES`). Silently folding such a value
+    through the branches below would land it in the terminal ``"failed"`` and
+    report a false settled failure for the whole show -- honesty over silence
+    means that surfaces as a loud error at the fold boundary instead.
     """
     if not season_statuses:
         raise ValueError("rollup_status requires at least one season status")
 
     statuses = set(season_statuses)
+    unknown = statuses - _VALID_SEASON_STATUSES
+    if unknown:
+        raise ValueError(
+            "rollup_status received unknown or parent-only season status value(s): "
+            f"{sorted(unknown)!r}"
+        )
 
     for status in _PRECEDENCE_STATUSES:
         if status in statuses:
@@ -101,6 +143,9 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         # the whole show rolls up to the SETTLED ``cancelled`` too. Mirrors the
         # all-``evicted`` case just above -- a fresh request re-tracks the show.
         return "cancelled"
+
+    if statuses == {"waiting_for_air_date"}:
+        return "waiting_for_air_date"
 
     # Only pending/available/completed/failed/evicted/cancelled remain among the
     # season statuses. ``evicted`` and ``cancelled`` fold alongside available/
@@ -134,4 +179,6 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
         return "partially_available"
     if "pending" in statuses:
         return "pending"
+    if "waiting_for_air_date" in statuses:
+        return "waiting_for_air_date"
     return "failed"

@@ -20,6 +20,20 @@ release to an acceptable quality. Every value they return is rejected by the
 default profile, so classifying *down* into them is always safe and classifying
 *up* is impossible. Both invariants are asserted at import time.
 
+NO RELEASE-GROUP STRIPPING (deliberate, matches Radarr): the reject nets run
+over the UNMODIFIED raw title. A release group literally named after a reject
+token (``-SCR``, ``-R5``, ``-HQCAM``) therefore false-rejects an otherwise
+clean release — a documented, intent-pinned limitation. Stripping the group
+tag first was attempted and refined through five review rounds (embedded
+titles -> path duplicates -> dot-attached markers -> hyphen-attached markers
+-> segment-end/bracketed body markers); every refinement produced a new
+laundering counterexample, because the strip only changes net behavior when
+the group name collides with a reject token — which is exactly the case where
+removal can hide a genuine marker. Radarr's ``QualityParser`` runs its source
+regexes over the full name with no group exclusion and accepts the same
+false-positive class. Failing toward rejection is visible and retryable;
+laundering a CAM/screener into the library is silent and unbounded.
+
 Pure domain: stdlib (``re``) + pydantic DTOs + the local quality model. No I/O,
 no guessit import here.
 """
@@ -32,8 +46,11 @@ from typing import cast
 
 from plex_manager.domain.quality import (
     ALL_QUALITIES,
+    BLURAY480P,
+    BLURAY720P,
     BRDISK,
     CAM,
+    DVDR,
     DVDSCR,
     RAWHD,
     REGIONAL,
@@ -211,6 +228,9 @@ def map_source(fields: Mapping[str, object], raw_title: str) -> QualitySource:
         else:
             base = _SOURCE_MAP.get(raw_source, QualitySource.UNKNOWN)
 
+    # The net runs over the UNMODIFIED title -- deliberately no release-group
+    # stripping (see the module docstring): a group named after a reject token
+    # false-rejects, which is the safe, visible direction.
     forced = _reject_net(raw_title)
     if forced is not None:
         return forced
@@ -245,6 +265,8 @@ def map_modifier(fields: Mapping[str, object], raw_title: str) -> Modifier:
         return Modifier.SCREENER
     if any("region" in other for other in others):
         return Modifier.REGIONAL
+    # As in map_source, the net sees the UNMODIFIED title -- no release-group
+    # stripping (see the module docstring for the rationale).
     forced = _reject_modifier_net(raw_title)
     if forced is not None:
         return forced
@@ -358,7 +380,7 @@ def to_parsed_release(fields: Mapping[str, object], raw_title: str) -> ParsedRel
         modifier=modifier,
         revision=revision,
         release_group=_coerce_str(fields.get("release_group")),
-        languages=_as_str_list(fields.get("language")),
+        languages=tuple(_as_str_list(fields.get("language"))),
         edition=_coerce_str(fields.get("edition")),
         hardcoded_subs=None,
     )
@@ -381,7 +403,45 @@ def resolve_quality(source: QualitySource, resolution: Resolution, modifier: Mod
     if modifier == Modifier.REGIONAL:
         return REGIONAL
     if modifier == Modifier.REMUX:
-        return REMUX2160P if resolution == Resolution.R2160P else REMUX1080P
+        if source in (QualitySource.BLURAY, QualitySource.UNKNOWN):
+            # Mirrors Radarr's remux handling for a BluRay source (QualityParser
+            # bluray branch) and for NO source (the sourceMatch == null && remux
+            # branch): 2160p -> Remux2160p, 1080p -> Remux1080p, and below the
+            # remux floor the release is still a *BluRay-family* file, so 720p ->
+            # Bluray720p and 480p -> Bluray480p rather than Unknown. Without the
+            # explicit 720p/480p arms, a no-source remux at those resolutions
+            # fell to the UNKNOWN guard and a previously-accepted release was
+            # rejected outright.
+            if resolution == Resolution.R2160P:
+                return REMUX2160P
+            if resolution == Resolution.R1080P:
+                return REMUX1080P
+            if resolution == Resolution.R720P:
+                return BLURAY720P
+            if resolution == Resolution.R480P:
+                return BLURAY480P
+            if source == QualitySource.BLURAY and resolution == Resolution.UNKNOWN:
+                # A BluRay remux with no parseable resolution: mirror Radarr's
+                # QualityParser bluray branch, which after its resolution-specific
+                # returns treats a still-unresolved sourced remux as Remux1080p
+                # ("Treat a remux without a source as 1080p, not 720p; 720p remux
+                # should fallback as 720p BluRay"). Without this, a clear BluRay
+                # remux fell through to the source-only fallback (Bluray-480p),
+                # under-ranking it below plain 720p/1080p.
+                return REMUX1080P
+            # Remaining cells fall through: a *known* BluRay resolution at
+            # 360p/540p/576p takes the source+resolution lookup, and an UNKNOWN
+            # source at those resolutions (or with no resolution at all) hits the
+            # UNKNOWN guard -- exactly Radarr's outcome, whose no-source branch
+            # skips them and whose QualityFinder(BLURAY, 480, REMUX) fallback
+            # resolves to Unknown (no remux tier exists at SD).
+        elif source == QualitySource.DVD:
+            # Conservative in-tier choice (documented divergence from Radarr,
+            # which yields plain DVD for a remux word and reserves DVD-R for
+            # disc tokens): a DVD source with a remux word never resolves to a
+            # BluRay-Remux tier.
+            return DVDR
+        # WEBDL/WEBRIP/TV ignore the modifier and fall through unchanged.
     if modifier == Modifier.BRDISK:
         return BRDISK
     if modifier == Modifier.RAWHD:

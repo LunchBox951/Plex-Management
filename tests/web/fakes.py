@@ -9,7 +9,7 @@ faked.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.ports.download_client import (
+    AddResult,
     DownloadClientPort,
     DownloadedFile,
     DownloadStatus,
@@ -157,7 +158,7 @@ class FakeTmdb:
 
     @staticmethod
     def _page(items: list[MediaSearchResult]) -> MediaPage:
-        return MediaPage(page=1, total_pages=1, total_results=len(items), results=list(items))
+        return MediaPage(page=1, total_pages=1, total_results=len(items), results=tuple(items))
 
     async def trending_movies(self, page: int = 1) -> MediaPage:
         return self._page(self.trending)
@@ -196,27 +197,38 @@ class FakeQbittorrent:
         *,
         files: dict[str, list[DownloadedFile]] | None = None,
         source_errors: set[str] | None = None,
+        pre_existing: set[str] | None = None,
+        default_save_path: str | None = None,
     ) -> None:
         self.statuses = statuses or []
         self.files = files or {}
         self.added: list[tuple[str, str, str]] = []
         self.removed: list[tuple[str, bool]] = []
+        # The client's canned GLOBAL default save path (``get_default_save_path``)
+        # and a recorder of every ``set_location`` call (lowercased hash, target).
+        self.default_save_path = default_save_path
+        self.relocated: list[tuple[str, str]] = []
         # Sources (a magnet/HTTP url) for which ``add`` raises
         # :class:`QbittorrentSourceError`, mirroring the real adapter's honest
         # "HTTP source resolved to neither a magnet nor a hashable .torrent" — the
         # client is healthy, the SOURCE is unusable. The real adapter raises this
         # BEFORE the add POST, so a matched source is NEVER recorded in ``added``.
         self.source_errors = source_errors or set()
+        # Lowercased hashes ``add`` reports as ALREADY PRESENT (the real
+        # adapter's 409 branch): the AddResult comes back ``created=False``, so
+        # a lost-grab cleanup must leave the pre-existing torrent untouched.
+        self.pre_existing = pre_existing or set()
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> str:
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         if magnet_or_url in self.source_errors:
             raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
         self.added.append((magnet_or_url, save_path, category))
         # Mirror the real adapter: derive the info-hash from the magnet's btih.
         marker = "urn:btih:"
+        torrent_hash = ""
         if marker in magnet_or_url:
-            return magnet_or_url.split(marker, 1)[1].split("&", 1)[0].lower()
-        return ""
+            torrent_hash = magnet_or_url.split(marker, 1)[1].split("&", 1)[0].lower()
+        return AddResult(torrent_hash=torrent_hash, created=torrent_hash not in self.pre_existing)
 
     async def get_status(self, info_hash: str) -> DownloadStatus | None:
         for status in self.statuses:
@@ -245,6 +257,12 @@ class FakeQbittorrent:
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         return list(self.files.get(info_hash.lower(), []))
 
+    async def get_default_save_path(self) -> str | None:
+        return self.default_save_path
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        self.relocated.append((info_hash.lower(), save_path))
+
 
 class FakeLibrary:
     """In-memory :class:`LibraryPort`: a set of in-library tmdb ids + scan recorder.
@@ -268,6 +286,27 @@ class FakeLibrary:
     caller resolved -- e.g. ``eviction_service``'s below-threshold pre-check test
     asserts this stays EMPTY, proving the sweep never pays for a Plex round-trip
     when there is no disk pressure to relieve.
+
+    Call counters (issue #136 -- batched availability reconcile): ``is_available_calls``
+    counts every :meth:`is_available` call, ``present_ids_calls`` every
+    :meth:`present_ids` call (``present_ids_refresh_absent_calls`` records the
+    ``refresh_absent`` flag passed to each one, so a test can assert the reconcile
+    cycle asks for the never-trust-a-cached-absence contract), and
+    ``season_presence_calls`` counts every :meth:`season_presence` call (a whole
+    BATCH of tmdb ids per call, mirroring ``PlexLibrary``'s one-page-walk-per-call
+    shape) -- ``season_presence_call_ids`` additionally records the ``frozenset``
+    of ids requested by each call, so a test can assert BOTH "exactly one call for
+    the whole tick" (``season_presence_calls == 1``) and "that one call named every
+    distinct pending show" (``season_presence_call_ids == [frozenset({...})]``). A
+    caller asserts against these to prove a reconcile pass makes AT MOST one
+    ``present_ids`` call and exactly ONE ``season_presence`` call per tick --
+    never one ``season_presence`` call per show, never one ``is_available`` call
+    per row. ``confirm_paths_calls`` (issue #158) mirrors the same discipline for
+    the GUID-independent path-based fallback: each entry is the
+    ``(media_type, frozenset(library_paths))`` one :meth:`confirm_paths` call was
+    asked to resolve, so a test can assert the reconcile cycle batches every
+    distinct GUID-miss row's path check into ONE call per media type per tick,
+    never one per row.
     """
 
     def __init__(
@@ -278,19 +317,58 @@ class FakeLibrary:
         sections: list[LibrarySection] | None = None,
         watch_states: dict[tuple[int, str, int | None], WatchState] | None = None,
         raises: Exception | None = None,
+        raises_for_shows: dict[int, Exception] | None = None,
+        season_presence_raises: Exception | None = None,
+        movie_file_paths: Collection[str] | None = None,
+        tv_file_paths: Collection[str] | None = None,
+        confirm_paths_raises: Exception | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
         self.sections = sections or []
+        # Path-based confirmation fallback (issue #158): every file path Plex
+        # "knows about" for movies/tv, INDEPENDENT of the guid-keyed
+        # ``available_ids``/``available_tv_seasons`` above -- lets a test model a
+        # GUID-miss row (absent from those) that is still confirmable by path, the
+        # whole point of the fallback. Plain strings, no host/container remap
+        # simulated here (that translation is exercised against the real
+        # ``PlexLibrary`` adapter in ``tests/adapters/plex/test_plex_library.py``);
+        # callers here pass paths already in whatever single namespace the test
+        # wants both sides compared in.
+        self.movie_file_paths = list(movie_file_paths or ())
+        self.tv_file_paths = list(tv_file_paths or ())
+        self.confirm_paths_raises = confirm_paths_raises
+        self.confirm_paths_calls: list[tuple[str, frozenset[str]]] = []
         self.scanned: list[str] = []
         self.scan_calls: list[tuple[str, str]] = []
         self.watch_states = watch_states or {}
         self.watch_state_calls: list[tuple[int, str, int | None]] = []
-        # When set, ``is_available``/``present_seasons`` raise this instead of
-        # returning -- lets a caller exercise the best-effort "log and treat as
-        # not-present" error path (see request_service._already_in_library /
-        # _present_seasons_or_empty, season_request_service._present_seasons).
+        # When set, ``is_available``/``present_seasons``/``present_ids``/
+        # ``season_presence`` raise this instead of returning -- lets a caller
+        # exercise the best-effort "log and treat as not-present" error path (see
+        # request_service._already_in_library / _present_seasons_or_empty,
+        # season_request_service._present_seasons).
         self.raises = raises
+        # Per-show override for ``season_presence`` ONLY (round 4, #136 review):
+        # mirrors the real adapter's per-show isolation -- a tmdb id that is a key
+        # here has its OWN ``/children``-equivalent lookup fail, so it is OMITTED
+        # from the returned mapping entirely (never raised, never mapped to an
+        # empty frozenset). Every OTHER requested id in the same call still
+        # resolves normally -- see ``LibraryPort.season_presence``'s contract.
+        # Use ``season_presence_raises`` below to model a genuine WHOLE-BATCH
+        # transport failure instead (the page-walk itself failing).
+        self.raises_for_shows = raises_for_shows or {}
+        # Whole-batch transport-failure knob for ``season_presence`` ONLY: the
+        # real ``PlexLibrary.season_presence``'s section page-walk is
+        # all-or-nothing, so a genuine transport failure fails the ENTIRE call
+        # (every requested id unresolved), unlike ``raises_for_shows`` above
+        # which isolates a single id's own lookup.
+        self.season_presence_raises = season_presence_raises
+        self.is_available_calls = 0
+        self.present_ids_calls = 0
+        self.present_ids_refresh_absent_calls: list[bool] = []
+        self.season_presence_calls = 0
+        self.season_presence_call_ids: list[frozenset[int]] = []
 
     async def is_available(
         self,
@@ -300,6 +378,7 @@ class FakeLibrary:
         use_cache: bool = True,
         season: int | None = None,
     ) -> bool:
+        self.is_available_calls += 1
         if self.raises is not None:
             raise self.raises
         # No cache to bypass; ``use_cache`` is accepted to match LibraryPort.
@@ -317,11 +396,49 @@ class FakeLibrary:
         # crawl); empty for an absent show, matching the real adapter.
         return self.available_tv_seasons.get(tmdb_id, frozenset())
 
-    async def present_ids(
-        self, keys: Sequence[tuple[int, Literal["movie", "tv"]]]
-    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        wanted = frozenset(tmdb_ids)
+        self.season_presence_calls += 1
+        self.season_presence_call_ids.append(wanted)
+        # A genuine whole-batch transport failure (the section page-walk itself
+        # failing) -- the ENTIRE call raises, matching the real adapter's
+        # all-or-nothing page-walk posture. See ``season_presence_raises``'s
+        # docstring in ``__init__``.
+        if self.season_presence_raises is not None:
+            raise self.season_presence_raises
         if self.raises is not None:
             raise self.raises
+        # A BATCH lookup for every requested show in ONE call -- mirrors
+        # ``PlexLibrary.season_presence``'s contract (fresh, one page-walk
+        # regardless of how many shows are requested); the fake answers it from the
+        # same seasons map ``present_seasons`` uses. Every requested id is present
+        # as a key (empty frozenset when the show is untracked) EXCEPT one whose
+        # id is in ``raises_for_shows`` -- that id's own lookup "failed" and is
+        # OMITTED from the mapping entirely, mirroring the real adapter's
+        # per-show isolation (round 4, #136 review) rather than raising the
+        # whole call.
+        return {
+            tmdb_id: self.available_tv_seasons.get(tmdb_id, frozenset())
+            for tmdb_id in wanted
+            if tmdb_id not in self.raises_for_shows
+        }
+
+    async def present_ids(
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        self.present_ids_calls += 1
+        self.present_ids_refresh_absent_calls.append(refresh_absent)
+        if self.raises is not None:
+            raise self.raises
+        # The fake has no cache to "refresh" -- ``available_ids``/``available_tv_seasons``
+        # are always read live, so it already answers as freshly as
+        # ``refresh_absent=True`` would force the real adapter to. ``refresh_absent``
+        # is recorded (not applied) so a caller-side test can assert
+        # ``run_availability_cycle`` requests the fresh-on-absence contract from the
+        # reconcile cycle without needing to model the adapter's cache here.
         # Movie presence from the in-library id set; show-level TV presence from the
         # seasons map's keys (a show is "present" if any season is tracked) -- the
         # granularity the batch tile accessor needs. Mirrors PlexLibrary.present_ids.
@@ -330,6 +447,22 @@ class FakeLibrary:
             for key in keys
             if (key[1] == "movie" and key[0] in self.available_ids)
             or (key[1] == "tv" and key[0] in self.available_tv_seasons)
+        )
+
+    async def confirm_paths(
+        self, media_type: Literal["movie", "tv"], library_paths: Collection[str]
+    ) -> frozenset[str]:
+        wanted = frozenset(p for p in library_paths if p)
+        self.confirm_paths_calls.append((media_type, wanted))
+        if self.confirm_paths_raises is not None:
+            raise self.confirm_paths_raises
+        if self.raises is not None:
+            raise self.raises
+        known = self.movie_file_paths if media_type == "movie" else self.tv_file_paths
+        return frozenset(
+            library_path
+            for library_path in wanted
+            if any(fp == library_path or fp.startswith(f"{library_path}/") for fp in known)
         )
 
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:

@@ -24,6 +24,7 @@ from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
 from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
 from plex_manager.ports.library import LibraryPort
 from plex_manager.web import app as app_module
+from plex_manager.web.deps import ServiceNotConfiguredError
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -195,3 +196,125 @@ async def test_reconcile_imports_when_only_movies_root_unset(
     assert download.failed_reason == "movies library root is not configured"
     assert request is not None
     assert request.status == RequestStatus.import_blocked
+
+
+async def test_reconcile_once_heals_db_only_strand_when_qbt_unconfigured(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With qBittorrent UNCONFIGURED the cycle cannot reconcile at all, but a
+    remove=no operator residual (mark_failed with remove_torrent=False -- the
+    exact flow such installs rely on) needs NO client I/O, so ``_reconcile_once``
+    must still heal it via the DB-only branch: download Failed, request re-armed,
+    the operator's no-blocklist choice honored."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            year=1999,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash="deadbeef03",
+            status=DownloadState.FailedPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=1999,
+            failed_reason="operator mark-failed in progress (blocklist=no, remove=no, nonce=902)",
+        )
+        session.add(download)
+        await session.commit()
+        download_id, request_id = download.id, request.id
+
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
+    )
+
+    async def _no_qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+        raise ServiceNotConfiguredError("qbittorrent")
+
+    async def _no_library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return None
+
+    monkeypatch.setattr(app_module, "get_qbittorrent", _no_qbt)
+    monkeypatch.setattr(app_module, "get_library_optional", _no_library)
+
+    try:
+        await app_module._reconcile_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+    assert download is not None
+    assert download.status == DownloadState.Failed.value  # healed without a client
+    assert download.failed_reason == "marked failed by operator"
+    assert request is not None
+    assert request.status == RequestStatus.searching  # re-armed
+
+
+async def test_reconcile_outage_tick_still_heals_db_only_strand(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6: a qBittorrent OUTAGE (configured client, status poll raising
+    QbittorrentError) must not strand a remove=no operator residual for the
+    outage's whole duration -- its heal needs no client I/O, so the outage branch
+    runs the same narrow DB-only heal the unconfigured branch does, on the same
+    tick."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            year=1999,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        download = Download(
+            torrent_hash="deadbeef04",
+            status=DownloadState.FailedPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=1999,
+            failed_reason="operator mark-failed in progress (blocklist=no, remove=no, nonce=902)",
+        )
+        session.add(download)
+        await session.commit()
+        download_id, request_id = download.id, request.id
+
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
+    )
+
+    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+        return _OutageQbittorrent(QbittorrentError("qBittorrent request failed"))
+
+    async def _no_library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return None
+
+    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "get_library_optional", _no_library)
+
+    try:
+        await app_module._reconcile_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+    assert download is not None
+    assert download.status == DownloadState.Failed.value  # healed despite the outage
+    assert download.failed_reason == "marked failed by operator"
+    assert request is not None
+    assert request.status == RequestStatus.searching  # re-armed on the outage tick

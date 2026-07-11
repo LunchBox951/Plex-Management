@@ -45,6 +45,14 @@ def test_safe_text_leaves_clean_text_unchanged() -> None:
         ("line1\rline2", "line1 line2"),
         ("line1\r\nline2", "line1  line2"),  # both chars collapse, one space each
         ("\n\rboundary", "  boundary"),
+        ("a\vb", "a b"),
+        ("a\fb", "a b"),
+        ("a\x1cb", "a b"),
+        ("a\x1db", "a b"),
+        ("a\x1eb", "a b"),
+        ("a\x85b", "a b"),
+        ("a\u2028b", "a b"),
+        ("a\u2029b", "a b"),
     ],
 )
 def test_safe_text_collapses_crlf_to_spaces(raw: str, expected: str) -> None:
@@ -58,6 +66,16 @@ def test_safe_text_neutralizes_a_forged_log_record() -> None:
     cleaned = safe_text(forged)
     assert "\n" not in cleaned
     assert "\r" not in cleaned
+
+
+def test_safe_text_neutralizes_unicode_line_forgery() -> None:
+    """GHSA-6gm2: ``safe_text`` used to strip only ``\\r``/``\\n``, missing the
+    other line-boundary chars ``str.splitlines()`` (and many log renderers)
+    honor. Every one of them must be neutralized, not just CR/LF."""
+    forged = "42\u2028ERROR:root:pwned"
+    cleaned = safe_text(forged)
+    for boundary in "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029":
+        assert boundary not in cleaned
 
 
 @pytest.mark.parametrize(
