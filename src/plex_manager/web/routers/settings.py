@@ -729,11 +729,11 @@ async def _reject_changed_base_stored_credential_reuse(
     different reverse-proxy prefix on the same origin can route to another
     backend, so only the exact canonical base may reuse a stored credential.
     """
-    protected: tuple[tuple[str, str, str], ...] = (
-        ("prowlarr_url", "prowlarr_api_key", "Prowlarr API key"),
-        ("qbittorrent_url", "qbittorrent_password", "qBittorrent password"),
+    protected: tuple[tuple[str, str, str, bool], ...] = (
+        ("prowlarr_url", "prowlarr_api_key", "Prowlarr API key", False),
+        ("qbittorrent_url", "qbittorrent_password", "qBittorrent password", True),
     )
-    for url_field, secret_field, secret_label in protected:
+    for url_field, secret_field, secret_label, empty_secret_is_configured in protected:
         submitted_url = (
             getattr(body, url_field)
             if url_field in body.model_fields_set and getattr(body, url_field) is not None
@@ -750,7 +750,13 @@ async def _reject_changed_base_stored_credential_reuse(
             and getattr(body, secret_field) not in (None, SECRET_MASK)
             else None
         )
-        if await store.get(secret_field) and submitted_secret is None:
+        stored_secret = await store.get(secret_field)
+        # qBittorrent accepts an intentionally empty password; Prowlarr treats
+        # an empty API key as unconfigured and therefore sends no credential.
+        stored_credential_exists = (
+            stored_secret is not None if empty_secret_is_configured else bool(stored_secret)
+        )
+        if stored_credential_exists and submitted_secret is None:
             raise AppError(
                 status_code=422,
                 code="credential_reentry_required",

@@ -479,6 +479,61 @@ async def test_put_changed_service_destination_refuses_stored_secret_reuse(
         assert await store.get(secret_field) == "stored-secret"
 
 
+async def test_put_changed_qbittorrent_destination_refuses_stored_empty_password_reuse(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A configured empty password still requires explicit destination consent."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://old-service:8080")
+        await store.set("qbittorrent_password", "")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"qbittorrent_url": "http://new-service:8080"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 422
+    assert put.json()["detail"] == "credential_reentry_required"
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("qbittorrent_url") == "http://old-service:8080"
+        assert await store.get("qbittorrent_password") == ""
+
+
+async def test_put_changed_prowlarr_destination_allows_unconfigured_empty_api_key(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """An empty Prowlarr key is unconfigured, so no credential can cross origins."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://old-service:8080")
+        await store.set("prowlarr_api_key", "")
+        await session.commit()
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"prowlarr_url": "http://new-service:8080"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("prowlarr_url") == "http://new-service:8080"
+        assert await store.get("prowlarr_api_key") == ""
+
+
 @pytest.mark.parametrize(
     ("url_field", "secret_field"),
     [

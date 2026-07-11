@@ -165,6 +165,44 @@ describe('Settings — changed service credential consent', () => {
     expect(lastBody().qbittorrent_password).toBe('')
   })
 
+  it.each([
+    {
+      service: 'Plex' as const,
+      oldUrl: 'http://plex:32400',
+      field: 'Token',
+      urlKey: 'plex_url' as const,
+      secretKey: 'plex_token' as const,
+    },
+    {
+      service: 'Prowlarr' as const,
+      oldUrl: 'http://prowlarr:9696/prowlarr',
+      field: 'API key',
+      urlKey: 'prowlarr_url' as const,
+      secretKey: 'prowlarr_api_key' as const,
+    },
+    {
+      service: 'qBittorrent' as const,
+      oldUrl: 'http://qb:8080',
+      field: 'Password',
+      urlKey: 'qbittorrent_url' as const,
+      secretKey: 'qbittorrent_password' as const,
+    },
+  ])(
+    'allows clearing the configured $service URL without re-entering or overwriting its secret',
+    async ({ service, oldUrl, field, urlKey, secretKey }) => {
+      render(<Settings />, { wrapper: Wrapper })
+      const secret = serviceSection(service).getByLabelText(field)
+
+      fireEvent.change(screen.getByDisplayValue(oldUrl), { target: { value: '' } })
+
+      expect(secret).not.toBeRequired()
+      fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+      await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+      expect(lastBody()[urlKey]).toBe('')
+      expect(lastBody()).not.toHaveProperty(secretKey)
+    },
+  )
+
   it('keeps all configured secrets optional for canonical-equivalent base spellings', async () => {
     h.settingsData = {
       ...CONFIGURED_SERVICES,

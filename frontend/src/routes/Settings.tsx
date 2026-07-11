@@ -168,7 +168,10 @@ function canonicalServiceBase(value: string): string | null {
 }
 
 function serviceBaseChanged(current: string, stored: string): boolean {
-  if (current === stored) return false
+  // An explicit blank disables the integration; it does not authorize a new
+  // credential destination. Keep the stored secret untouched so re-enabling at
+  // any non-blank base still requires fresh consent.
+  if (current === '' || current === stored) return false
   const currentBase = canonicalServiceBase(current)
   const storedBase = canonicalServiceBase(stored)
   return currentBase === null || storedBase === null || currentBase !== storedBase
