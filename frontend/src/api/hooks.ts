@@ -259,21 +259,18 @@ export function useAppKeyStatus() {
 export function useRotateAppKey() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (): Promise<AppApiKeyResponse> => {
-      const finishRotation = beginApiKeyRotation()
-      try {
-        const data = unwrap(await client.POST('/api/v1/settings/app-key/rotate'))
-        // Store the replacement BEFORE releasing the old-key barrier. Any SSE or
-        // REST 401 that raced the server-side stream close can then see that its
-        // credential is stale instead of clearing/disabling the rotation winner.
-        setApiKey(data.app_api_key)
-        return data
-      } finally {
-        finishRotation()
-      }
-    },
-    onSuccess: () => {
+    mutationFn: async (): Promise<AppApiKeyResponse> =>
+      unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
+    onMutate: () => beginApiKeyRotation(),
+    onSuccess: (data) => {
+      // Store the replacement BEFORE onSettled releases the old-key barrier.
+      // Any SSE or REST 401 that raced the server-side stream close can then see
+      // that its credential is stale instead of disabling the rotation winner.
+      setApiKey(data.app_api_key)
       void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
+    },
+    onSettled: (_data, _error, _variables, finishRotation) => {
+      finishRotation?.()
     },
   })
 }
