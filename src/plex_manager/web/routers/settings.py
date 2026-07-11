@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
 
 from plex_manager.adapters.plex.oauth import PlexTvClient
+from plex_manager.adapters.service_url import same_service_base
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, User
@@ -110,19 +111,20 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorEnvelope,
         "description": "The signed-in admin has no Plex account on file to verify ownership",
     },
-    # This status code has THREE distinct producers, so all three shapes are
+    # This status code has THREE distinct response shapes, so all three are
     # documented (mirroring queue.py's ``_GRAB_ERROR_RESPONSES`` /
     # search_preview.py's anyOf, which document the same body-validation-vs-app-error
     # collision): FastAPI's own request-body validation (``HTTPValidationError``),
     # ``_validate_disk_pressure_pair``'s plain ``HTTPException`` (``ErrorDetail``),
-    # and the repoint verification ladder's ``plex_token_invalid`` ``AppError``
-    # (``ErrorEnvelope``). Declaring only ``ErrorEnvelope`` here would silently
-    # overwrite FastAPI's auto-generated validation-error entry instead of adding
-    # to it.
+    # and application-validation ``AppError`` values (``plex_token_invalid`` or
+    # ``credential_reentry_required``, both ``ErrorEnvelope``). Declaring only
+    # ``ErrorEnvelope`` here would silently overwrite FastAPI's auto-generated
+    # validation-error entry instead of adding to it.
     422: {
         "description": (
             "Request validation failed, the disk-pressure pair would invert, "
-            "or the replacement Plex server rejected the effective Plex token"
+            "a changed service destination requires credential re-entry, or the "
+            "replacement Plex server rejected the effective Plex token"
         ),
         "content": {
             "application/json": {
@@ -594,8 +596,9 @@ async def _verify_plex_repoint(
     * ``(True, machine_id)`` — the identity changes, the EFFECTIVE (post-PUT)
       url+token pair is complete, and the full verification ladder passed. The
       effective value of each half is this PUT's submitted value when it
-      carries one, else the currently-stored value — so a masked/omitted token
-      still probes with the STORED real token when only ``plex_url`` changed.
+      carries one, else the currently-stored value.  A masked/omitted token may
+      reuse the stored value only when the submitted URL normalizes to the exact
+      same configured base; any destination change requires explicit re-entry.
     * ``(True, None)`` — the identity changes but the effective pair is
       INCOMPLETE (a half-configured install, or an explicit clear-to-``""``).
       There is nothing to probe; the caller keeps the settings write but treats
@@ -654,6 +657,26 @@ async def _verify_plex_repoint(
     effective_token = submitted_token if submitted_token is not None else stored_token
     if not effective_url or not effective_token:
         return True, None
+    # Never forward the STORED token to a newly submitted origin.  A URL-only
+    # repoint used to send the encrypted-at-rest credential to that host during
+    # /identity and /library/sections verification *before* ownership was known.
+    # Even a path-prefix change on the same origin can route to another backend,
+    # so anything other than the exact canonical base requires the operator to
+    # explicitly re-enter the token they are authorizing us to send.
+    if (
+        submitted_url is not None
+        and submitted_token is None
+        and stored_token
+        and (not stored_url or not same_service_base(submitted_url, stored_url))
+    ):
+        raise AppError(
+            status_code=422,
+            code="credential_reentry_required",
+            message="Changing the Plex server address requires the Plex token again.",
+            hint=(
+                "Re-enter the Plex token so a stored credential is never sent to a new destination."
+            ),
+        )
     plex_tv = PlexTvClient(
         client,
         client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
@@ -676,6 +699,50 @@ async def _verify_plex_repoint(
         resources = await plex_tv.fetch_resources(admin_oauth_token)
         assert_admin_owns_server(resources, machine_identifier)
     return True, machine_identifier
+
+
+async def _reject_changed_base_stored_credential_reuse(
+    body: SettingsUpdate, store: SettingsStore
+) -> None:
+    """Require explicit secret re-entry when a configured service base changes.
+
+    Prowlarr and qBittorrent are not probed during a settings write, so a URL-only
+    change would otherwise be committed and the next health/search/reconcile call
+    would silently send their encrypted stored credential to the new destination.  A
+    different reverse-proxy prefix on the same origin can route to another
+    backend, so only the exact canonical base may reuse a stored credential.
+    """
+    protected: tuple[tuple[str, str, str], ...] = (
+        ("prowlarr_url", "prowlarr_api_key", "Prowlarr API key"),
+        ("qbittorrent_url", "qbittorrent_password", "qBittorrent password"),
+    )
+    for url_field, secret_field, secret_label in protected:
+        submitted_url = (
+            getattr(body, url_field)
+            if url_field in body.model_fields_set and getattr(body, url_field) is not None
+            else None
+        )
+        if not isinstance(submitted_url, str) or not submitted_url:
+            continue
+        stored_url = await store.get(url_field)
+        if stored_url and same_service_base(submitted_url, stored_url):
+            continue
+        submitted_secret = (
+            getattr(body, secret_field)
+            if secret_field in body.model_fields_set
+            and getattr(body, secret_field) not in (None, SECRET_MASK)
+            else None
+        )
+        if await store.get(secret_field) and submitted_secret is None:
+            raise AppError(
+                status_code=422,
+                code="credential_reentry_required",
+                message=f"Changing the service address requires the {secret_label} again.",
+                hint=(
+                    f"Re-enter the {secret_label} so a stored credential is never sent "
+                    "to a new destination."
+                ),
+            )
 
 
 @router.put("", responses=_PUT_SETTINGS_RESPONSES)
@@ -712,10 +779,12 @@ async def put_settings_endpoint(
     effective token (``/identity`` is unauthenticated, so reachability alone
     would bless a wrong/revoked token), then — for Plex-SESSION callers — the
     wizard's ownership assertion. The same code paths ``/setup/complete`` and
-    ``/setup/validate/plex`` use, resolving a masked/omitted token to the stored
-    real one. Only a server that passes gets committed: the settings are
-    written, the freshly DERIVED id replaces the cached one (better than
-    clearing it — it was just derived, so sign-in never needs a per-request
+    ``/setup/validate/plex`` use. A masked/omitted token is resolved to the
+    stored real one only when the configured base is unchanged after
+    normalization; a new path, scheme, host, or port requires explicit token
+    re-entry before any probe. Only a server that passes gets committed: the
+    settings are written, the freshly DERIVED id replaces the cached one (better
+    than clearing it — it was just derived, so sign-in never needs a per-request
     re-probe), and every active browser session is revoked. Any verification
     failure is its honest envelope (502 unreachable, 422 ``plex_token_invalid``,
     403 ``server_not_owned``) with NOTHING committed and every session intact —
@@ -788,6 +857,7 @@ async def put_settings_endpoint(
     await _validate_disk_pressure_pair(body, session)
 
     store = SettingsStore(session)
+    await _reject_changed_base_stored_credential_reuse(body, store)
     # Verify BEFORE any write: a failed verification must leave nothing behind.
     plex_identity_changed, machine_identifier = await _verify_plex_repoint(
         body, session, store, client, context

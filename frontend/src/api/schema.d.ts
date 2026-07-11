@@ -704,10 +704,12 @@ export interface paths {
          *     effective token (``/identity`` is unauthenticated, so reachability alone
          *     would bless a wrong/revoked token), then — for Plex-SESSION callers — the
          *     wizard's ownership assertion. The same code paths ``/setup/complete`` and
-         *     ``/setup/validate/plex`` use, resolving a masked/omitted token to the stored
-         *     real one. Only a server that passes gets committed: the settings are
-         *     written, the freshly DERIVED id replaces the cached one (better than
-         *     clearing it — it was just derived, so sign-in never needs a per-request
+         *     ``/setup/validate/plex`` use. A masked/omitted token is resolved to the
+         *     stored real one only when the configured base is unchanged after
+         *     normalization; a new path, scheme, host, or port requires explicit token
+         *     re-entry before any probe. Only a server that passes gets committed: the
+         *     settings are written, the freshly DERIVED id replaces the cached one (better
+         *     than clearing it — it was just derived, so sign-in never needs a per-request
          *     re-probe), and every active browser session is revoked. Any verification
          *     failure is its honest envelope (502 unreachable, 422 ``plex_token_invalid``,
          *     403 ``server_not_owned``) with NOTHING committed and every session intact —
@@ -1059,10 +1061,12 @@ export interface paths {
          * Validate Plex Endpoint
          * @description Test a candidate Plex server AND assert the signed-in admin owns it.
          *
-         *     The server is probed with the body's token override, or (the wizard's happy
-         *     path) the admin's stored OAuth token. Ownership is asserted against the SIGNED-IN
-         *     admin's plex.tv resources (always their own account), so a custom token can
-         *     never configure a server they do not own.
+         *     The server is probed with the body's explicit token override, or (the
+         *     wizard's happy path) the admin's stored OAuth token.  Before the stored token
+         *     is sent, the candidate must exactly match a connection plex.tv advertised
+         *     for one of that admin's owned servers.  An explicit-token custom URL keeps
+         *     the supported manual path, but the live machine-id ownership assertion still
+         *     prevents it from configuring a server the signed-in admin does not own.
          */
         post: operations["validate_plex_endpoint_api_v1_setup_validate_plex_post"];
         delete?: never;
@@ -1819,9 +1823,9 @@ export interface components {
          * @description Candidate Plex server to test (``POST /setup/validate/plex``).
          *
          *     ``token`` is OPTIONAL: omitted (``None``) means "use the signed-in admin's
-         *     stored Plex OAuth token" — the wizard's happy path never re-types a token, it
-         *     only supplies ``url`` for a chosen (or custom) server. A non-null ``token`` is
-         *     the explicit custom-credential override.
+         *     stored Plex OAuth token" — the wizard's happy path never re-types a token and
+         *     supplies an advertised server connection. A non-null ``token`` is the
+         *     explicit credential authorization required for a custom URL.
          */
         PlexValidateRequest: {
             /** Token */
@@ -3352,7 +3356,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Request validation failed, the disk-pressure pair would invert, or the replacement Plex server rejected the effective Plex token */
+            /** @description Request validation failed, the disk-pressure pair would invert, a changed service destination requires credential re-entry, or the replacement Plex server rejected the effective Plex token */
             422: {
                 headers: {
                     [name: string]: unknown;

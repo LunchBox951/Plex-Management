@@ -11,13 +11,15 @@ The wizard, in order:
   advertised connection probed for reachability from THIS backend (a dead
   connection is annotated, never dropped — the operator picks a reachable one).
 * ``POST /validate/{plex,prowlarr,qbittorrent,tmdb}`` are the live "Test
-  connection" probes. ``validate/plex`` additionally asserts the probed server's
-  ``machineIdentifier`` is one the signed-in admin OWNS (else 403), and returns it
-  so ``complete`` can store it.
+  connection" probes. ``validate/plex`` additionally confines stored-token use
+  to an advertised connection, asserts the probed server's ``machineIdentifier``
+  is one the signed-in admin OWNS (else 403), and returns it so ``complete`` can
+  store it.
 * ``POST /complete`` is one-shot and keyless: a conditional update claims
   ``initialized`` (a concurrent second caller is rejected 409), the validated creds
   are stored, and ``plex_token`` defaults to the signed-in admin's stored OAuth
-  token. The stored ``plex_machine_identifier`` is RE-DERIVED live from the
+  token only for an advertised connection (a custom URL supplies its token
+  explicitly). The stored ``plex_machine_identifier`` is RE-DERIVED live from the
   submitted server's ``/identity`` and ownership-asserted again (the body's id is
   advisory at most — a direct API caller cannot pair server-X creds with
   server-Y's id). It never touches the sign-in claim's ``setup_started_at``.
@@ -47,6 +49,7 @@ from plex_manager.adapters.plex.oauth import (
 )
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
+from plex_manager.headersafe import header_value_error
 from plex_manager.models import SystemSettings, User
 from plex_manager.services import path_visibility
 from plex_manager.web.deps import (
@@ -75,6 +78,7 @@ from plex_manager.web.schemas import (
     TmdbValidateRequest,
 )
 from plex_manager.web.setup_validation import (
+    assert_admin_owns_connection,
     assert_admin_owns_server,
     assert_plex_token_authorized,
     validate_plex,
@@ -82,6 +86,7 @@ from plex_manager.web.setup_validation import (
     validate_qbittorrent,
     validate_tmdb,
 )
+from plex_manager.web.url_validation import url_shape_error
 
 __all__ = ["router"]
 
@@ -294,23 +299,41 @@ async def validate_plex_endpoint(
 ) -> ServiceValidateResponse:
     """Test a candidate Plex server AND assert the signed-in admin owns it.
 
-    The server is probed with the body's token override, or (the wizard's happy
-    path) the admin's stored OAuth token. Ownership is asserted against the SIGNED-IN
-    admin's plex.tv resources (always their own account), so a custom token can
-    never configure a server they do not own.
+    The server is probed with the body's explicit token override, or (the
+    wizard's happy path) the admin's stored OAuth token.  Before the stored token
+    is sent, the candidate must exactly match a connection plex.tv advertised
+    for one of that admin's owned servers.  An explicit-token custom URL keeps
+    the supported manual path, but the live machine-id ownership assertion still
+    prevents it from configuring a server the signed-in admin does not own.
     """
     admin_token = await _admin_plex_token(session, context)
+    effective_token = body.token if body.token is not None else admin_token
+    # Keep malformed URL/credential rejection ahead of *every* outbound call,
+    # including the new plex.tv allowlist lookup.  validate_plex repeats these
+    # checks as defense in depth for its non-router callers.
+    if (url_error := url_shape_error(body.url)) is not None:
+        return ServiceValidateResponse(ok=False, message=url_error)
+    if header_value_error(effective_token) is not None:
+        return ServiceValidateResponse(
+            ok=False,
+            message="The Plex token contains characters that are not valid in an HTTP header.",
+        )
     plex_tv = await _plex_tv_client(session, client)
+    resources = await plex_tv.fetch_resources(admin_token)
+    # Preflight the destination BEFORE the stored admin token can be sent to it.
+    # An explicit token is the supported custom-URL authorization; the machine-id
+    # ownership assertion below still applies to both paths.
+    if body.token is None:
+        assert_admin_owns_connection(resources, body.url)
     result = await validate_plex(
         client,
         body.url,
-        body.token or admin_token,
+        effective_token,
         identity_client=plex_tv,
         suggest_mounts=path_visibility.KNOWN_LIBRARY_MOUNTS,
     )
     if not result.ok or result.machine_identifier is None:
         return result
-    resources = await plex_tv.fetch_resources(admin_token)
     assert_admin_owns_server(resources, result.machine_identifier)
     return result
 
@@ -415,14 +438,21 @@ async def complete(
         # (their resource list is the ownership source of truth), even when the
         # body carries an explicit service-token override.
         admin_token = await _admin_plex_token(session, context)
-        if plex_token is None:
+        uses_stored_admin_token = plex_token is None
+        if uses_stored_admin_token:
             plex_token = admin_token
         plex_tv = await _plex_tv_client(session, client)
+        resources = await plex_tv.fetch_resources(admin_token)
+        # The default token is a stored OAuth credential.  Only a connection
+        # plex.tv advertised for this owner may receive it.  An explicitly
+        # supplied token keeps the documented custom-server path; the derived
+        # machine id is still ownership-checked below before anything is stored.
+        if uses_stored_admin_token:
+            assert_admin_owns_connection(resources, body.plex_url)
         machine_identifier = await plex_tv.fetch_server_identity(body.plex_url, plex_token)
         # /identity is unauthenticated: prove the RESOLVED token is actually
         # accepted by this server before anything is claimed or stored.
         await assert_plex_token_authorized(client, body.plex_url, plex_token)
-        resources = await plex_tv.fetch_resources(admin_token)
         assert_admin_owns_server(resources, machine_identifier)
 
     # Every submitted library root must be visible to THIS container (issue #132)

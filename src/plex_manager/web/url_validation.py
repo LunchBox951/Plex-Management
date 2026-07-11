@@ -17,23 +17,34 @@ adapter libraries.
 
 from __future__ import annotations
 
+import re
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
+
+from plex_manager.adapters.service_url import ServiceUrl
 
 __all__ = [
     "INVALID_IPV4_MESSAGE",
     "INVALID_IPV6_MESSAGE",
     "INVALID_URL_MESSAGE",
     "IPV6_ZONE_ID_MESSAGE",
+    "PATH_CHARACTERS_MESSAGE",
+    "PATH_TRAVERSAL_MESSAGE",
     "QUERY_FRAGMENT_MESSAGE",
     "UNPARSEABLE_URL_MESSAGE",
+    "URL_CREDENTIALS_MESSAGE",
     "url_shape_error",
 ]
 
 INVALID_URL_MESSAGE = "Enter a valid http(s) URL."
 QUERY_FRAGMENT_MESSAGE = "Base URL must not contain a query or fragment."
+URL_CREDENTIALS_MESSAGE = "Base URL must not contain a username or password."
+PATH_TRAVERSAL_MESSAGE = "Base URL path must not contain dot-segments."
+PATH_CHARACTERS_MESSAGE = (
+    "Base URL path may contain only letters, numbers, slashes, and . _ ~ - characters."
+)
 INVALID_IPV4_MESSAGE = "Invalid IPv4 address in host."
 INVALID_IPV6_MESSAGE = "Invalid IPv6 address in host."
 # Deliberately a SEPARATE message from INVALID_IPV6_MESSAGE: a zone-bearing
@@ -51,11 +62,11 @@ _IPV4_SHAPED_CHARS = frozenset("0123456789.")
 def url_shape_error(url: str) -> str | None:
     """Return an error message if ``url`` is not a plausible http(s) URL, else ``None``.
 
-    This is honest input hygiene, NOT a claimed SSRF sanitizer: it narrows the
-    scheme to ``http``/``https`` and requires a hostname, but the host/port/path
-    itself is still fully operator-controlled by design (these are URLs for an
-    operator-supplied, usually-private service -- see the SSRF risk-acceptance
-    note on alert #247). Its job is only to turn an obviously-broken input
+    This is honest input hygiene, not a public-IP-only SSRF filter: it narrows the
+    scheme to ``http``/``https``, requires a hostname, and restricts the optional
+    reverse-proxy prefix to unambiguous path segments. The host/port itself stays
+    operator-controlled by design (these are usually private services). Its job
+    is to turn an unsafe or obviously-broken input
     (``file://...``, a scheme-less string, an empty host) into a clear,
     retryable rejection instead of an opaque ``httpx`` transport error (at probe
     time) or a confusing downstream failure (at write time). Returns ``None``
@@ -150,7 +161,7 @@ def url_shape_error(url: str) -> str | None:
     to pass; those fail later, if at all, as honest retryable connect/DNS
     errors, not parser crashes.
     """
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in url):
+    if "\\" in url or any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in url):
         return INVALID_URL_MESSAGE
     try:
         parts = urlsplit(url)
@@ -170,6 +181,17 @@ def url_shape_error(url: str) -> str | None:
     # which splits to an EMPTY query) is rejected too.
     if "?" in url or "#" in url:
         return QUERY_FRAGMENT_MESSAGE
+    # Credentials embedded in the authority are never needed for these
+    # integrations (their credentials have explicit, encrypted settings).  More
+    # importantly, accepting userinfo makes browser-style backslash/userinfo
+    # ambiguities capable of changing the effective host at the HTTP client.
+    if parts.username is not None or parts.password is not None:
+        return URL_CREDENTIALS_MESSAGE
+    if re.fullmatch(r"(?:/[A-Za-z0-9._~-]*)*", parts.path) is None:
+        return PATH_CHARACTERS_MESSAGE
+    decoded_path = unquote(parts.path)
+    if "//" in decoded_path or any(segment in {".", ".."} for segment in decoded_path.split("/")):
+        return PATH_TRAVERSAL_MESSAGE
     if "[" in parts.netloc:
         # A bracketed host must be a plain, zone-free IPv6 literal. urlsplit
         # already rejected most invalid bracket content above; this closes what it
@@ -201,6 +223,10 @@ def url_shape_error(url: str) -> str | None:
     # can never use this value, so reject it now.
     try:
         _ = httpx.URL(url).host
+        # Adapter-side construction repeats the same fail-closed policy for a
+        # legacy/corrupt stored value.  Keeping this final check here guarantees
+        # a value accepted for persistence can also cross that runtime boundary.
+        ServiceUrl.parse(url)
     except Exception:
         return UNPARSEABLE_URL_MESSAGE
     return None

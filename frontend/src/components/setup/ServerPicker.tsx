@@ -9,8 +9,9 @@ import { CenteredSpinner } from '../ui/feedback'
 
 /**
  * A verified Plex server, handed up to the wizard once the backend has confirmed
- * the signed-in admin owns it. `token` is present only for a custom-credential
- * override; omitted, `POST /setup/complete` reuses the admin's stored OAuth token.
+ * the signed-in admin owns it. `token` is required for a custom URL; it is
+ * omitted only for a plex.tv-advertised connection, where `POST /setup/complete`
+ * can safely reuse the admin's stored OAuth token.
  */
 export interface VerifiedServer {
   url: string
@@ -68,7 +69,7 @@ function asDisplayError(err: unknown): ApiError {
 /**
  * Step 2 of the wizard: pick the Plex server this app manages. The signed-in
  * admin's OWNED servers are listed (each connection probed + ranked); "Custom"
- * reveals a URL + optional token override for an address plex.tv doesn't
+ * reveals a URL + required explicit token for an address plex.tv doesn't
  * advertise. Verify calls the ownership-checking probe; on success the verified
  * server (with its libraries + machine identifier) is handed up via `onVerified`,
  * on failure the honest {@link AuthErrorCard} is shown.
@@ -117,6 +118,9 @@ export function ServerPicker({
     const url = inCustom ? customUrl.trim() : effectiveUri
     if (url === '') return
     const token = inCustom ? customToken.trim() : ''
+    // The backend may reuse the signed-in admin's token only for a connection
+    // advertised by plex.tv. Custom URLs must carry an explicitly entered token.
+    if (inCustom && token === '') return
     const body = token !== '' ? { url, token } : { url }
     try {
       const res = await validate.mutateAsync(body)
@@ -137,7 +141,10 @@ export function ServerPicker({
   }
 
   const verifyDisabled =
-    validate.isPending || (inCustom ? customUrl.trim() === '' : effectiveUri === '')
+    validate.isPending ||
+    (inCustom
+      ? customUrl.trim() === '' || customToken.trim() === ''
+      : effectiveUri === '')
 
   return (
     <section className="rounded-2xl border border-hairline bg-surface p-5">
@@ -187,10 +194,11 @@ export function ServerPicker({
                 onChange={(e) => setCustomUrl(e.target.value)}
               />
               <Field
-                label="Plex token (optional)"
+                label="Plex token (required)"
                 type="password"
                 autoComplete="off"
-                hint="Uses your Plex sign-in token unless you provide one."
+                required
+                hint="Custom server URLs require an explicit token; your saved sign-in token is not sent to an unlisted address."
                 value={customToken}
                 onChange={(e) => setCustomToken(e.target.value)}
               />

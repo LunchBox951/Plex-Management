@@ -22,9 +22,10 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0014](0014-correction-verbs.md) | Correction verbs — report-issue (blocklist + purge + re-search) and cancel | Accepted |
 | [0015](0015-anime-library-routing.md) | Anime library routing (optional anime roots, routing only) | Accepted |
 | [0016](0016-plex-oauth-owner-sessions.md) | Plex-first setup + browser-side Plex sign-in (single verify endpoint, session cookie) | Accepted |
+| [0017](0017-origin-confined-service-urls.md) | Origin-confined service URLs and explicit changed-destination credential consent | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
-first frontend-alpha session; 0010–0016 across the subsequent beta feature
+first frontend-alpha session; 0010–0017 across the subsequent beta feature
 sessions (each ADR's own header carries its date). Full context:
 [`docs/design/overview.md`](../design/overview.md).

@@ -251,14 +251,25 @@ async def _use_transport(app: FastAPI, handler: Handler) -> None:
     app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def _owned_server(machine_id: str = _PLEX_MACHINE_ID) -> dict[str, object]:
+def _owned_server(
+    machine_id: str = _PLEX_MACHINE_ID, *, uri: str = "http://plex.local:32400"
+) -> dict[str, object]:
     return {
         "name": "Apollo",
         "product": "Plex Media Server",
         "clientIdentifier": machine_id,
         "provides": "server",
         "owned": True,
-        "connections": [],
+        "connections": [
+            {
+                "uri": uri,
+                "address": "plex.local",
+                "port": 32400,
+                "local": True,
+                "relay": False,
+                "protocol": "http",
+            }
+        ],
     }
 
 
@@ -1021,6 +1032,67 @@ async def test_validate_plex_foreign_server_is_not_owned(
     assert response.json()["detail"] == "server_not_owned"
 
 
+async def test_validate_plex_rejects_unadvertised_origin_before_sending_token(
+    admin_client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.host == "plex.tv":
+            return httpx.Response(200, json=[_owned_server()])
+        raise AssertionError("an unadvertised origin must not receive the stored Plex token")
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://169.254.169.254:80"},
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "server_not_owned"
+    assert [request.url.host for request in calls] == ["plex.tv"]
+
+
+async def test_validate_plex_allows_custom_origin_with_explicit_token(
+    admin_client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.host == "plex.tv":
+            return httpx.Response(200, json=[_owned_server()])
+        if request.url.path == "/identity":
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"machineIdentifier": _PLEX_MACHINE_ID}},
+            )
+        if request.url.path == "/library/sections":
+            assert request.headers["X-Plex-Token"] == "custom-token"
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"Directory": [_MOVIE_SECTION]}},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/plex",
+        json={"url": "http://custom-plex.local:32400", "token": "custom-token"},
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert [request.url.host for request in calls] == [
+        "plex.tv",
+        "custom-plex.local",
+        "custom-plex.local",
+    ]
+
+
 async def test_validate_plex_does_not_probe_filesystem(
     admin_client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1035,7 +1107,13 @@ async def test_validate_plex_does_not_probe_filesystem(
 
     monkeypatch.setattr(setup_validation, "_is_writable", spy)
     attacker_section = {**_MOVIE_SECTION, "Location": [{"path": "/etc"}, {"path": "/root/secret"}]}
-    await _use_transport(app, _plex_probe_handler(sections=[attacker_section]))
+    await _use_transport(
+        app,
+        _plex_probe_handler(
+            sections=[attacker_section],
+            resources=[_owned_server(uri="http://attacker.plex:32400")],
+        ),
+    )
 
     response = await admin_client.post(
         "/api/v1/setup/validate/plex",

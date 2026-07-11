@@ -2,9 +2,11 @@
 
 Talks to the qBittorrent WebUI API (``/api/v2``) over an injected
 ``httpx.AsyncClient``. Authentication is cookie-based: ``POST /auth/login`` yields
-an ``SID`` cookie (held by the client's cookie jar); a 403 on any later call
-triggers a transparent re-login. The username, password and ``SID`` are NEVER
-logged.
+an ``SID`` cookie held by this adapter and sent explicitly only to its configured
+service; a 403 on any later call triggers a transparent re-login. The process-wide
+client cookie jar is never the authority because cookies do not include ports and
+could otherwise cross configured services. The username, password and ``SID`` are
+NEVER logged.
 
 ``add`` returns the lowercased info-hash. It accepts a magnet URI directly, or an
 HTTP(S) URL which is resolved: a redirect to a magnet is followed (qBittorrent
@@ -36,6 +38,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
@@ -46,6 +49,7 @@ import anyio.to_thread
 import httpcore
 import httpx
 
+from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.ports.download_client import AddResult, DownloadedFile, DownloadStatus
 
 __all__ = [
@@ -69,6 +73,7 @@ _PROPERTIES_TTL_SECONDS: Final = 30.0
 # small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
 # real metafile yet still a hard ceiling against a hostile/unbounded source body.
 _MAX_TORRENT_BYTES: Final = 10 * 1024 * 1024
+_SID_VALUE_PATTERN: Final = r"[A-Za-z0-9._~-]+"
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause/resume to stop/start.
 _STOP_START_MIN_WEBAPI: Final = (2, 11, 0)
@@ -662,7 +667,11 @@ class QbittorrentClient:
         trusted_source_origin: str | None = None,
     ) -> None:
         self._client = client
-        self._base_url = base_url.rstrip("/")
+        try:
+            self._service_url = ServiceUrl.parse(base_url)
+        except InvalidServiceUrl as exc:
+            raise QbittorrentError("qBittorrent service URL is invalid") from exc
+        self._base_url = self._service_url.base
         self._username = username
         self._password = password
         self._source_client = source_client
@@ -693,6 +702,10 @@ class QbittorrentClient:
                 "Prowlarr URL in Settings)"
             )
         self._logged_in = False
+        # qBittorrent cookies are adapter-local, never process-wide. Standard
+        # cookie matching ignores ports, so a SID left in the injected shared
+        # client's jar could be sent to another service on the same hostname.
+        self._sid: str | None = None
         # info_hash -> (fetched_at, properties json) — bounds /properties calls.
         self._properties_cache: dict[str, tuple[datetime, dict[str, object]]] = {}
         # Cached pause/resume-vs-stop/start decision (None until first probed).
@@ -723,18 +736,45 @@ class QbittorrentClient:
             raise QbittorrentError(f"qBittorrent request failed (HTTP {response.status_code})")
 
     # ---- auth ----------------------------------------------------------- #
+    def _discard_shared_sid_cookies(self) -> None:
+        """Remove qBittorrent SIDs that httpx copied into the shared cookie jar.
+
+        Production's upstream client rejects response cookies globally, but
+        callers may inject an ordinary client (including tests).  Requests below
+        also carry an explicit Cookie header, so the jar is never read; removing
+        the copied value prevents an unrelated request using that injected client
+        from forwarding the SID by hostname-only cookie matching.
+        """
+        for cookie in tuple(self._client.cookies.jar):
+            if cookie.name != "SID":
+                continue
+            self._client.cookies.delete("SID", domain=cookie.domain, path=cookie.path)
+
+    def _session_cookie_header(self) -> dict[str, str]:
+        """An explicit header suppressing every shared-client cookie."""
+        return {"Cookie": f"SID={self._sid}" if self._sid is not None else ""}
+
     async def _login(self) -> None:
-        """Authenticate and capture the ``SID`` cookie in the client jar."""
+        """Authenticate and capture an adapter-local ``SID`` cookie."""
+        self._sid = None
+        self._discard_shared_sid_cookies()
         try:
             response = await self._client.post(
-                f"{self._base_url}{_API}/auth/login",
+                self._service_url.endpoint(f"{_API}/auth/login"),
                 data={"username": self._username, "password": self._password},
-                headers={"Referer": self._base_url},
+                headers={"Referer": self._base_url, "Cookie": ""},
+                follow_redirects=False,
             )
         except httpx.RequestError as exc:
             # qBittorrent unreachable during login (DNS / refused / timeout): surface
             # a retryable error rather than an opaque 500. No url/secret in the message.
             raise QbittorrentError("qBittorrent request failed") from exc
+        sid_values = [cookie.value for cookie in response.cookies.jar if cookie.name == "SID"]
+        self._discard_shared_sid_cookies()
+        sid = sid_values[-1] if sid_values else None
+        if sid is not None and not re.fullmatch(_SID_VALUE_PATTERN, sid):
+            raise QbittorrentError("qBittorrent returned an invalid session cookie")
+        self._sid = sid
         text = response.text.strip()
         status = response.status_code
         if status in (_HTTP_OK, _HTTP_NO_CONTENT) and text != "Fails.":
@@ -767,16 +807,31 @@ class QbittorrentClient:
         """Send an authenticated request, re-logging in once on a 403."""
         if not self._logged_in:
             await self._login()
-        url = f"{self._base_url}{_API}{path}"
+        try:
+            url = self._service_url.endpoint(f"{_API}{path}")
+        except InvalidServiceUrl as exc:
+            raise QbittorrentError("qBittorrent endpoint path is invalid") from exc
         try:
             response = await self._client.request(
-                method, url, params=params, data=data, files=files
+                method,
+                url,
+                params=params,
+                data=data,
+                files=files,
+                headers=self._session_cookie_header(),
+                follow_redirects=False,
             )
             if response.status_code == _HTTP_FORBIDDEN:
                 self._logged_in = False
                 await self._login()
                 response = await self._client.request(
-                    method, url, params=params, data=data, files=files
+                    method,
+                    url,
+                    params=params,
+                    data=data,
+                    files=files,
+                    headers=self._session_cookie_header(),
+                    follow_redirects=False,
                 )
         except httpx.RequestError as exc:
             # qBittorrent down or network failure mid-request: surface a retryable
