@@ -9,6 +9,7 @@
 @theme {
   --color-bg: #0a0c10; /* app background */
   --color-surface: #12151b; /* cards, modals, rows */
+  --color-surface-deep: #0d0f14; /* recessed panels, inputs, log list */
   --color-poster: #15171c; /* poster placeholder */
 
   --color-ink: #f4f1ea; /* primary text */
@@ -16,6 +17,7 @@
   --color-faint: #7a8089; /* meta / mono captions */
 
   --color-gold: #e7c27d; /* primary action / brand */
+  --color-gold-hover: #f0d49b; /* explicit primary-action hover */
   --color-gold-ink: #1a1206; /* text on gold */
 
   --color-available: #60c48e; /* in library / completed */
