@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useLayoutEffect, useMemo, useRef } from 'react'
 import type { DiscoverResult } from '../api/types'
 import type { StatusPresentation } from '../lib/status'
 import { PosterCard } from './ui/PosterCard'
@@ -28,12 +28,47 @@ interface RowProps {
   quickRequestable?: (item: DiscoverResult) => boolean
 }
 
+const LOOP_ITEM_TARGET = 20
+const LOOP_COPY_COUNT = 3
+const WRAP_EPSILON = 5
 /** How far each chevron scrolls — a little under one viewport of posters. */
 const SCROLL_STEP = 600
 
+interface LoopTile {
+  item: DiscoverResult
+  slotIndex: number
+  copyIndex: number
+}
+
+/** Repeat short rows into a useful loop runway without changing the source array. */
+function padLoopItems(items: DiscoverResult[]): DiscoverResult[] {
+  if (items.length === 0 || items.length >= LOOP_ITEM_TARGET) return items
+  return Array.from({ length: LOOP_ITEM_TARGET }, (_, index) => items[index % items.length]!)
+}
+
+function measureSetWidth(track: HTMLDivElement): number {
+  const firstCopy = track.querySelector<HTMLElement>('[data-loop-copy-start="0"]')
+  const secondCopy = track.querySelector<HTMLElement>('[data-loop-copy-start="1"]')
+  if (!firstCopy || !secondCopy) return 0
+  return secondCopy.offsetLeft - firstCopy.offsetLeft
+}
+
+/** Move between content-identical copies when a native scroll reaches a physical edge. */
+function wrapAtEdge(track: HTMLDivElement, setWidth: number): void {
+  if (setWidth <= 0) return
+  const maxScroll = track.scrollWidth - track.clientWidth
+  if (maxScroll <= 0) return
+
+  if (track.scrollLeft <= WRAP_EPSILON) {
+    track.scrollLeft += setWidth
+  } else if (track.scrollLeft >= maxScroll - WRAP_EPSILON) {
+    track.scrollLeft -= setWidth
+  }
+}
+
 /**
- * A titled, horizontally-scrollable poster strip. Chevrons scroll the track and
- * self-disable at each end; on touch/trackpad the native scroll still works.
+ * A titled, horizontally-scrollable poster strip. Three content-identical copies
+ * make native scrolling and chevron navigation appear continuous in either direction.
  */
 export function Row({
   title,
@@ -44,32 +79,73 @@ export function Row({
   quickRequestable,
 }: RowProps) {
   const trackRef = useRef<HTMLDivElement>(null)
-  const [atStart, setAtStart] = useState(true)
-  const [atEnd, setAtEnd] = useState(false)
+  const setWidthRef = useRef(0)
+  const logicalItems = useMemo(() => padLoopItems(items), [items])
+  const loopTiles = useMemo<LoopTile[]>(
+    () =>
+      Array.from({ length: LOOP_COPY_COUNT }, (_, copyIndex) =>
+        logicalItems.map((item, slotIndex) => ({ item, slotIndex, copyIndex })),
+      ).flat(),
+    [logicalItems],
+  )
+  const logicalIdentity = useMemo(
+    () => items.map((item) => `${item.media_type}:${item.tmdb_id}`).join('|'),
+    [items],
+  )
 
-  const updateEdges = useCallback(() => {
-    const el = trackRef.current
-    if (!el) return
-    const maxScroll = el.scrollWidth - el.clientWidth
-    setAtStart(el.scrollLeft <= 1)
-    // 1px slack so sub-pixel rounding doesn't leave the arrow stuck enabled.
-    setAtEnd(el.scrollLeft >= maxScroll - 1)
-  }, [])
+  useLayoutEffect(() => {
+    const track = trackRef.current
+    if (!track || logicalIdentity.length === 0) return
 
-  useEffect(() => {
-    const el = trackRef.current
-    if (!el) return
-    updateEdges()
-    el.addEventListener('scroll', updateEdges, { passive: true })
-    window.addEventListener('resize', updateEdges)
-    return () => {
-      el.removeEventListener('scroll', updateEdges)
-      window.removeEventListener('resize', updateEdges)
+    const initialWidth = measureSetWidth(track)
+    setWidthRef.current = initialWidth
+    if (initialWidth > 0) track.scrollLeft = initialWidth
+
+    const handleScroll = () => wrapAtEdge(track, setWidthRef.current)
+    const handleResize = () => {
+      const nextWidth = measureSetWidth(track)
+      if (nextWidth <= 0) return
+
+      const previousWidth = setWidthRef.current
+      if (previousWidth > 0 && nextWidth !== previousWidth) {
+        const proportionalPosition = track.scrollLeft / previousWidth
+        setWidthRef.current = nextWidth
+        track.scrollLeft = proportionalPosition * nextWidth
+      } else {
+        setWidthRef.current = nextWidth
+      }
+      wrapAtEdge(track, nextWidth)
     }
-  }, [updateEdges, items.length])
+    const resizeObserver =
+      typeof ResizeObserver === 'function' ? new ResizeObserver(handleResize) : null
+
+    track.addEventListener('scroll', handleScroll, { passive: true })
+    resizeObserver?.observe(track)
+    return () => {
+      track.removeEventListener('scroll', handleScroll)
+      resizeObserver?.disconnect()
+      setWidthRef.current = 0
+    }
+  }, [logicalIdentity])
 
   const scrollBy = (delta: number) => {
-    trackRef.current?.scrollBy({ left: delta, behavior: 'smooth' })
+    const track = trackRef.current
+    if (!track) return
+
+    const setWidth = setWidthRef.current
+    const maxScroll = track.scrollWidth - track.clientWidth
+    if (setWidth > 0) {
+      if (delta < 0 && track.scrollLeft < SCROLL_STEP + WRAP_EPSILON) {
+        track.scrollLeft += setWidth
+      } else if (delta > 0 && maxScroll - track.scrollLeft < SCROLL_STEP + WRAP_EPSILON) {
+        track.scrollLeft -= setWidth
+      }
+    }
+
+    const reducedMotion =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    track.scrollBy({ left: delta, behavior: reducedMotion ? 'auto' : 'smooth' })
   }
 
   if (items.length === 0 && !loading) return null
@@ -78,24 +154,19 @@ export function Row({
     <section className="mb-8">
       <div className="mb-3 flex items-center justify-between gap-4">
         <h2 className="font-display text-lg font-bold text-ink">{title}</h2>
-        <div className="flex gap-1.5">
-          <ChevronButton
-            direction="left"
-            disabled={atStart}
-            onClick={() => scrollBy(-SCROLL_STEP)}
-          />
-          <ChevronButton
-            direction="right"
-            disabled={atEnd}
-            onClick={() => scrollBy(SCROLL_STEP)}
-          />
-        </div>
+        {items.length > 0 ? (
+          <div className="flex gap-1.5">
+            <ChevronButton direction="left" onClick={() => scrollBy(-SCROLL_STEP)} />
+            <ChevronButton direction="right" onClick={() => scrollBy(SCROLL_STEP)} />
+          </div>
+        ) : null}
       </div>
 
       <div className="relative">
         <div
           ref={trackRef}
-          className="flex snap-x snap-mandatory gap-4 overflow-x-auto scroll-smooth pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          data-row-track
+          className="flex snap-x snap-mandatory gap-4 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         >
           {items.length === 0 && loading
             ? Array.from({ length: 8 }, (_, i) => (
@@ -104,11 +175,14 @@ export function Row({
                   className="aspect-[2/3] w-[150px] shrink-0 snap-start animate-pulse rounded-[7px] bg-poster ring-1 ring-white/5"
                 />
               ))
-            : items.map((item) => {
+            : loopTiles.map(({ item, slotIndex, copyIndex }) => {
                 const state = tileState?.(item) ?? null
                 return (
                   <div
-                    key={`${item.media_type}-${item.tmdb_id}`}
+                    key={`${item.media_type}-${item.tmdb_id}-slot-${slotIndex}-copy-${copyIndex}`}
+                    data-loop-copy={copyIndex}
+                    data-loop-slot={slotIndex}
+                    data-loop-copy-start={slotIndex === 0 ? copyIndex : undefined}
                     className="w-[150px] shrink-0 snap-start"
                   >
                     <PosterCard
@@ -130,8 +204,11 @@ export function Row({
         </div>
 
         {/* Right-edge fade hints there's more to scroll. */}
-        {!atEnd ? (
-          <div className="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-bg to-transparent" />
+        {items.length > 0 ? (
+          <div
+            data-row-end-fade
+            className="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-bg to-transparent"
+          />
         ) : null}
       </div>
     </section>
@@ -140,18 +217,16 @@ export function Row({
 
 interface ChevronButtonProps {
   direction: 'left' | 'right'
-  disabled: boolean
   onClick: () => void
 }
 
-function ChevronButton({ direction, disabled, onClick }: ChevronButtonProps) {
+function ChevronButton({ direction, onClick }: ChevronButtonProps) {
   return (
     <button
       type="button"
       onClick={onClick}
-      disabled={disabled}
       aria-label={direction === 'left' ? 'Scroll left' : 'Scroll right'}
-      className="flex size-8 items-center justify-center rounded-full bg-white/8 text-muted ring-1 ring-inset ring-white/10 transition-colors hover:text-ink hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-white/8 disabled:hover:text-muted"
+      className="flex size-8 items-center justify-center rounded-full bg-white/8 text-muted ring-1 ring-inset ring-white/10 transition-colors hover:bg-white/12 hover:text-ink"
     >
       <svg
         viewBox="0 0 24 24"

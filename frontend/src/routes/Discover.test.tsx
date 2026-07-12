@@ -228,7 +228,7 @@ describe('Discover — quick-request freshness gate (Codex P2)', () => {
     // so the one-click Request is safe to offer.
     mockRequests([])
     render(<Discover />)
-    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: REQUEST_MOVIE })).not.toHaveLength(0)
   })
 })
 
@@ -247,7 +247,9 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       render(<Discover />)
       expect(screen.queryByRole('button', { name: REQUEST_SHOW })).not.toBeInTheDocument()
       // The tile itself still opens the detail modal — the correction path.
-      fireEvent.click(screen.getByRole('button', { name: /Fresh Show/ }))
+      fireEvent.click(
+        screen.getAllByRole('button', { name: 'View details for Fresh Show (2021)' })[0]!,
+      )
       expect(screen.getByRole('heading', { name: 'Fresh Show' })).toBeInTheDocument()
     },
   )
@@ -261,7 +263,7 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       requestRow({ tmdb_id: SHOW.tmdb_id, media_type: 'movie', title: 'Same-id Movie', status: 'failed' }),
     ])
     render(<Discover />)
-    expect(screen.getByRole('button', { name: REQUEST_SHOW })).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: REQUEST_SHOW })).not.toHaveLength(0)
   })
 
   it('keeps the quick-request action for a MOVIE with settled request history', () => {
@@ -272,6 +274,6 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       requestRow({ tmdb_id: MOVIE.tmdb_id, media_type: 'movie', title: 'Fresh Movie', status: 'cancelled' }),
     ])
     render(<Discover />)
-    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: REQUEST_MOVIE })).not.toHaveLength(0)
   })
 })
