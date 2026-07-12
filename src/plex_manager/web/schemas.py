@@ -127,9 +127,9 @@ class PlexValidateRequest(BaseModel):
     """Candidate Plex server to test (``POST /setup/validate/plex``).
 
     ``token`` is OPTIONAL: omitted (``None``) means "use the signed-in admin's
-    stored Plex OAuth token" — the wizard's happy path never re-types a token, it
-    only supplies ``url`` for a chosen (or custom) server. A non-null ``token`` is
-    the explicit custom-credential override.
+    stored Plex OAuth token" — the wizard's happy path never re-types a token and
+    supplies an advertised server connection. A non-null ``token`` is the
+    explicit credential authorization required for a custom URL.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -341,6 +341,11 @@ class SetupCompleteRequest(BaseModel):
     semantics, an empty string is REJECTED here (there is no "leave unchanged"
     concept on a one-shot install), closing the direct-API-caller bypass of the
     wizard's live "Test connection" probes -- see ``_validate_service_url_shape``.
+
+    ``plex_token`` may be omitted only when ``plex_url`` is a connection plex.tv
+    advertised for the signed-in owner's server. A custom URL requires an
+    explicitly supplied token so the stored owner token is never sent to an
+    unlisted destination.
     """
 
     model_config = ConfigDict(
@@ -368,9 +373,16 @@ class SetupCompleteRequest(BaseModel):
     # server access from the STORED (derived) id without re-probing /identity.
     plex_machine_identifier: str
     # OPTIONAL: ``None`` (omitted) means "persist the signed-in admin's stored Plex
-    # OAuth token" — the keyless wizard never re-types the token. A non-null value is
-    # an explicit custom-credential override.
-    plex_token: str | None = None
+    # OAuth token" for an advertised connection — the keyless wizard never re-types
+    # the token. A non-null value is the explicit credential authorization required
+    # for a custom URL.
+    plex_token: str | None = Field(
+        default=None,
+        description=(
+            "May be omitted only when plex_url is a plex.tv-advertised connection; "
+            "a custom URL requires an explicitly supplied Plex token."
+        ),
+    )
     prowlarr_url: str
     prowlarr_api_key: str
     qbittorrent_url: str

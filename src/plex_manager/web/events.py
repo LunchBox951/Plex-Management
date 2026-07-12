@@ -141,7 +141,7 @@ class EventHub:
 
     This is deliberately single-process (see the module docstring's single-worker
     invariant). If the app later runs multiple workers, this must be replaced with
-    a shared broker or durable outbox — the documented scale-out path in ADR-0017.
+    a shared broker or durable outbox — the documented scale-out path in ADR-0019.
 
     ``app_version`` is stamped into every connect-time ``sync`` event so a client
     that reconnects after a rolling ``:edge`` image swap (ADR-0004) can detect the
@@ -284,7 +284,7 @@ def warn_if_multiworker() -> None:
             "realtime SSE hub is in-process and single-worker only, but a "
             "multi-worker configuration was detected (%s); realtime events will "
             "be dropped for clients on other workers — run a single worker or "
-            "add a shared broker (ADR-0017 scale-out path). The client polling "
+            "add a shared broker (ADR-0019 scale-out path). The client polling "
             "floor still heals the UI.",
             ", ".join(sorted(signals)),
         )

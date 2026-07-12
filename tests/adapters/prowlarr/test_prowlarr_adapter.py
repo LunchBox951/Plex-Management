@@ -319,9 +319,8 @@ async def test_malformed_stored_base_url_raises_indexer_error() -> None:
     indexer-priority lookup first (best-effort no longer applies to a config
     error) and that is what search() observes."""
     client = httpx.AsyncClient()
-    adapter = ProwlarrIndexer(client, "http://prowlarr.local:notaport", API_KEY)
     with pytest.raises(IndexerError):
-        await adapter.search(IndexerSearchRequest(query="x"))
+        ProwlarrIndexer(client, "http://prowlarr.local:notaport", API_KEY)
     await client.aclose()
 
 

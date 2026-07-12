@@ -130,10 +130,10 @@ export function useSetupPlexServers(enabled: boolean, setupToken = '') {
 
 /**
  * Test a candidate Plex server AND assert the signed-in admin owns it
- * (`POST /setup/validate/plex`). `token` is OPTIONAL: omitted, the backend probes
- * with the admin's stored Plex OAuth token (the wizard's happy path — a picked
- * owned server never re-types a token); a supplied `token` is the explicit
- * custom-credential override. On success the response carries the server's
+ * (`POST /setup/validate/plex`). `token` may be omitted only for a plex.tv-
+ * advertised connection, which the backend probes with the admin's stored Plex
+ * OAuth token. A custom URL requires an explicit `token`. On success the response
+ * carries the server's
  * `machine_identifier` (for `plex_machine_identifier` on complete) and its
  * `libraries` (to drive the library-root pickers).
  */
@@ -148,7 +148,7 @@ export function useValidatePlex() {
 }
 
 // Plex is NOT here: its connection is verified on the wizard's server step via
-// `useValidatePlex` (owned-server ownership + optional token), never as a typed
+// `useValidatePlex` (owned-server ownership + conditional token), never as a typed
 // service card. These are the three card-driven services only.
 export type SetupService = 'prowlarr' | 'qbittorrent' | 'tmdb'
 

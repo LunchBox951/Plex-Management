@@ -91,7 +91,7 @@ describe('ServerPicker', () => {
     )
   })
 
-  it('validates a typed custom URL with an optional token override', async () => {
+  it('requires an explicit token before validating a typed custom URL', async () => {
     h.validate.mockResolvedValue(plexOk({ machine_identifier: 'MID-CUSTOM' }))
     const onVerified = vi.fn()
     render(<ServerPicker onVerified={onVerified} />)
@@ -100,8 +100,20 @@ describe('ServerPicker', () => {
     fireEvent.change(screen.getByLabelText('Server URL'), {
       target: { value: 'http://custom:32400' },
     })
-    fireEvent.change(screen.getByLabelText(/plex token/i), { target: { value: 'custom-token' } })
-    fireEvent.click(screen.getByRole('button', { name: /verify/i }))
+    const token = screen.getByLabelText('Plex token (required)')
+    const verify = screen.getByRole('button', { name: /verify/i })
+
+    expect(token).toBeRequired()
+    expect(
+      screen.getByText(/custom server URLs require an explicit token/i),
+    ).toBeInTheDocument()
+    expect(verify).toBeDisabled()
+    fireEvent.click(verify)
+    expect(h.validate).not.toHaveBeenCalled()
+
+    fireEvent.change(token, { target: { value: 'custom-token' } })
+    expect(verify).toBeEnabled()
+    fireEvent.click(verify)
 
     await waitFor(() =>
       expect(h.validate).toHaveBeenCalledWith({ url: 'http://custom:32400', token: 'custom-token' }),
@@ -138,6 +150,7 @@ describe('ServerPicker', () => {
     // No select to pick from; the custom URL field is offered instead.
     expect(screen.queryByLabelText('Plex server')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Server URL')).toBeInTheDocument()
+    expect(screen.getByLabelText('Plex token (required)')).toBeRequired()
   })
 
   it('gates owned-server discovery until the setup token is ready (no premature cached 401)', () => {

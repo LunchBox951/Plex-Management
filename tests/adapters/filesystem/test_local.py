@@ -520,6 +520,65 @@ def test_largest_video_file_returns_none_for_non_video_file_root(tmp_path: Path)
     assert LocalFileSystem().largest_video_file(os.fspath(doc)) is None
 
 
+def test_video_discovery_keeps_standalone_m2ts_and_excludes_standalone_vob(
+    tmp_path: Path,
+) -> None:
+    standalone = tmp_path / "movie.m2ts"
+    standalone.write_bytes(b"x" * 100)
+    (tmp_path / "legacy.vob").write_bytes(b"x" * 1000)
+
+    fs = LocalFileSystem()
+
+    assert fs.largest_video_file(os.fspath(tmp_path)) == os.fspath(standalone.resolve())
+    assert [rel for _abs, _size, rel in fs.list_video_files(os.fspath(tmp_path))] == ["movie.m2ts"]
+
+
+def test_video_discovery_prunes_nested_disc_image_directories(tmp_path: Path) -> None:
+    standalone = tmp_path / "feature.m2ts"
+    standalone.write_bytes(b"x" * 100)
+    bdmv_stream = tmp_path / "BDMV" / "STREAM"
+    bdmv_stream.mkdir(parents=True)
+    (bdmv_stream / "00001.m2ts").write_bytes(b"x" * 5000)
+    video_ts = tmp_path / "vIdEo_Ts"
+    video_ts.mkdir()
+    # Use an otherwise-supported suffix to prove the directory context itself
+    # prunes the tree; the independent standalone-.vob exclusion is tested above.
+    (video_ts / "title.mpg").write_bytes(b"x" * 6000)
+
+    fs = LocalFileSystem()
+
+    assert fs.largest_video_file(os.fspath(tmp_path)) == os.fspath(standalone.resolve())
+    assert [rel for _abs, _size, rel in fs.list_video_files(os.fspath(tmp_path))] == [
+        "feature.m2ts"
+    ]
+
+
+@pytest.mark.parametrize("disc_dir_name", ["BDMV", "video_ts", "ViDeO_tS"])
+def test_video_discovery_rejects_disc_image_content_root(
+    tmp_path: Path, disc_dir_name: str
+) -> None:
+    disc_root = tmp_path / disc_dir_name
+    stream = disc_root / "STREAM"
+    stream.mkdir(parents=True)
+    (stream / "feature.m2ts").write_bytes(b"x" * 1000)
+
+    fs = LocalFileSystem()
+
+    assert fs.largest_video_file(os.fspath(disc_root)) is None
+    assert fs.list_video_files(os.fspath(disc_root)) == []
+
+
+def test_video_discovery_rejects_single_file_root_inside_disc_structure(tmp_path: Path) -> None:
+    stream = tmp_path / "BDMV" / "STREAM" / "00001.m2ts"
+    stream.parent.mkdir(parents=True)
+    stream.write_bytes(b"x" * 1000)
+
+    fs = LocalFileSystem()
+
+    assert fs.largest_video_file(os.fspath(stream)) is None
+    assert fs.list_video_files(os.fspath(stream)) == []
+
+
 def test_adapter_satisfies_filesystem_port() -> None:
     from plex_manager.ports.filesystem import FileSystemPort
 

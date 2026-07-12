@@ -23,12 +23,13 @@ from starlette.status import (
 )
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
-from plex_manager.adapters.plex.oauth import find_owned_server
+from plex_manager.adapters.plex.oauth import find_owned_server, owned_servers
 from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
 )
+from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError, TmdbMetadata
 from plex_manager.headersafe import header_value_error
 from plex_manager.services.path_visibility import remap_to_visible
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibrarySection
 
 __all__ = [
+    "assert_admin_owns_connection",
     "assert_admin_owns_server",
     "assert_plex_token_authorized",
     "library_options",
@@ -207,6 +209,42 @@ def assert_admin_owns_server(resources: Sequence[PlexResource], machine_identifi
         )
 
 
+def assert_admin_owns_connection(resources: Sequence[PlexResource], url: str) -> None:
+    """Reject a candidate URL unless plex.tv advertised it for an owned server.
+
+    This check runs *before* a setup probe sends the signed-in account's stored
+    OAuth token to the candidate.  The later machine-identifier ownership check
+    remains mandatory defense in depth, but cannot protect a token already sent
+    to an attacker-chosen origin.  Exact canonical base matching preserves the
+    server picker's legitimate local/relay choices without turning a trusted
+    origin into a wildcard for arbitrary reverse-proxy paths.
+    """
+    try:
+        candidate = ServiceUrl.parse(url).base
+    except InvalidServiceUrl as exc:
+        raise AppError(
+            status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+            code="invalid_service_url",
+            message="The Plex server URL is invalid.",
+            hint="Choose one of the server connections reported by Plex.",
+        ) from exc
+    for server in owned_servers(resources):
+        for connection in server.connections:
+            try:
+                if ServiceUrl.parse(connection.uri).base == candidate:
+                    return
+            except InvalidServiceUrl:
+                # One malformed plex.tv-advertised connection must not make a
+                # different, valid connection unusable.  It simply cannot match.
+                continue
+    raise AppError(
+        status_code=HTTP_403_FORBIDDEN,
+        code="server_not_owned",
+        message="That address is not an advertised connection for your Plex servers.",
+        hint="Choose a connection listed by Plex, then try again.",
+    )
+
+
 async def assert_plex_token_authorized(client: httpx.AsyncClient, url: str, token: str) -> None:
     """Raise unless the Plex server at ``url`` ACCEPTS ``token`` on an authed call.
 
@@ -355,10 +393,14 @@ async def validate_prowlarr(
     if key_rejection is not None:
         return key_rejection
     try:
+        service_url = ServiceUrl.parse(url)
         response = await client.get(
-            f"{url.rstrip('/')}/api/v1/system/status",
+            service_url.endpoint("/api/v1/system/status"),
             headers={"X-Api-Key": api_key},
+            follow_redirects=False,
         )
+    except InvalidServiceUrl:
+        return ServiceValidateResponse(ok=False, message="Enter a valid http(s) URL.")
     except httpx.HTTPError as exc:
         # The api key travels in a header, so an unsafe value (CR/LF, non-ASCII)
         # would make httpx echo it raw in str(exc) or crash uncaught — the
@@ -429,8 +471,8 @@ async def validate_qbittorrent(
     rejection = _require_http_url(url)
     if rejection is not None:
         return rejection
-    adapter = QbittorrentClient(client, url, username, password)
     try:
+        adapter = QbittorrentClient(client, url, username, password)
         await adapter.get_all_statuses()
     except QbittorrentAuthError:
         return ServiceValidateResponse(

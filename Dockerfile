@@ -50,6 +50,13 @@ ENV PYTHONUNBUFFERED=1 \
     PLEX_MANAGER_HOST=0.0.0.0
 WORKDIR /app
 
+# Validate downloaded candidates by their actual media container/streams before
+# they can enter a Plex library.  ffprobe ships in Debian's ffmpeg package; keep
+# it in the runtime stage only (the builder never probes media).
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Patch the base image's own system pip too (same CVE-2026-1703). The app runs
 # from the copied venv and never invokes this pip, but Trivy scans the whole
 # filesystem and we surface every finding, so we fix the fixable ones outright.

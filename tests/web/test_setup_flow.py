@@ -88,6 +88,14 @@ _REMOTE_CONN: dict[str, object] = {
     "local": False,
     "relay": False,
 }
+_CONFIGURED_CONN: dict[str, object] = {
+    "protocol": "http",
+    "address": "plex.local",
+    "port": 32400,
+    "uri": "http://plex.local:32400",
+    "local": True,
+    "relay": False,
+}
 
 _A_PLAYER: dict[str, object] = {
     "name": "A Player",
@@ -107,7 +115,7 @@ def _owned_server(
         "clientIdentifier": machine_id,
         "provides": "server",
         "owned": True,
-        "connections": [_LOCAL_CONN, _REMOTE_CONN] if connections is None else connections,
+        "connections": [_CONFIGURED_CONN] if connections is None else connections,
     }
 
 
@@ -205,7 +213,12 @@ async def test_servers_lists_owned_server_with_probed_connections(
         if host == "plex.tv" and path == "/api/v2/resources":
             assert request.headers.get("X-Plex-Token")
             return httpx.Response(
-                200, json=[_owned_server(), _shared_server("shared-x"), _A_PLAYER]
+                200,
+                json=[
+                    _owned_server(connections=[_LOCAL_CONN, _REMOTE_CONN]),
+                    _shared_server("shared-x"),
+                    _A_PLAYER,
+                ],
             )
         if path == "/identity":
             if host == "localhost":
@@ -524,6 +537,58 @@ async def test_complete_ignores_a_forged_machine_id_and_stores_the_derived_one(
     async with sessionmaker_() as session:
         # The DERIVED id won; the forged claim was never persisted.
         assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) == _MACHINE_ID
+
+
+async def test_complete_rejects_unadvertised_origin_before_sending_stored_token(
+    client: httpx.AsyncClient, app: FastAPI, sessionmaker_: SessionMaker
+) -> None:
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.host == "plex.tv":
+            return httpx.Response(200, json=[_owned_server()])
+        raise AssertionError("an unadvertised origin must not receive the stored Plex token")
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    body = {**_complete_body(), "plex_url": "http://unadvertised.local:32400"}
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_CSRF_HEADERS)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "server_not_owned"
+    assert [request.url.host for request in calls] == ["plex.tv"]
+    async with sessionmaker_() as session:
+        row = await session.get(SystemSettings, 1)
+        assert row is not None
+        assert row.initialized is False
+
+
+async def test_complete_allows_custom_origin_with_explicit_token(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    await _seed_admin_session(sessionmaker_)
+    _authenticate(client)
+    await _use_transport(
+        app,
+        _validate_transport(identity=_MACHINE_ID, resources=[_owned_server()]),
+    )
+    body = {
+        **_complete_body(str(tmp_path)),
+        "plex_url": "http://custom-plex.local:32400",
+        "plex_token": "custom-token",
+    }
+    response = await client.post("/api/v1/setup/complete", json=body, headers=_CSRF_HEADERS)
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("plex_url") == "http://custom-plex.local:32400"
+        assert await store.get("plex_token") == "custom-token"
 
 
 async def test_complete_rejects_a_server_the_admin_does_not_own(

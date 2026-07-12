@@ -1,4 +1,4 @@
-# ADR-0017: Realtime SSE invalidations over a permanent polling floor
+# ADR-0019: Realtime SSE invalidations over a permanent polling floor
 
 - **Status:** Accepted
 - **Date:** 2026-07-04

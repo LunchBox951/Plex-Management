@@ -1,7 +1,7 @@
 import { QueryClient } from '@tanstack/react-query'
 
 /**
- * Polling cadence for the live surfaces. The realtime SSE stream (ADR-0017)
+ * Polling cadence for the live surfaces. The realtime SSE stream (ADR-0019)
  * invalidates these same caches when connected, but polling never stops — it
  * drops to a slow floor (below) as a permanent safety net against a dead or
  * zombied stream. When disconnected, the fast cadence takes over.

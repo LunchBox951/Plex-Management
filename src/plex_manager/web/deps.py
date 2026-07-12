@@ -45,6 +45,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.adapters.media_probe.ffprobe import FfprobeMediaProbe
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibrary
 from plex_manager.adapters.prowlarr.adapter import ProwlarrIndexer
@@ -58,6 +59,7 @@ from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
+from plex_manager.ports.media_probe import MediaProbePort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.services import log_capture_service, path_visibility
@@ -127,6 +129,7 @@ __all__ = [
     "get_library_optional",
     "get_log_handler",
     "get_log_retention_days",
+    "get_media_probe",
     "get_movies_root",
     "get_movies_root_optional",
     "get_parser",
@@ -1027,6 +1030,11 @@ def get_filesystem() -> FileSystemPort:
     :func:`get_eviction_filesystem` instead, never this one.
     """
     return LocalFileSystem()
+
+
+def get_media_probe() -> MediaProbePort:
+    """Return the bounded ffprobe adapter used before library placement."""
+    return FfprobeMediaProbe()
 
 
 def get_eviction_filesystem(

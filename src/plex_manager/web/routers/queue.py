@@ -14,6 +14,7 @@ from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
+from plex_manager.ports.media_probe import MediaProbePort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -41,6 +42,7 @@ from plex_manager.web.deps import (
     get_downloads_host_root,
     get_filesystem,
     get_library,
+    get_media_probe,
     get_movies_root_optional,
     get_parser,
     get_prowlarr,
@@ -347,6 +349,7 @@ async def import_endpoint(
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     library: Annotated[LibraryPort, Depends(get_library)],
     fs: Annotated[FileSystemPort, Depends(get_filesystem)],
+    media_probe: Annotated[MediaProbePort, Depends(get_media_probe)],
     parser: Annotated[ParserPort, Depends(get_parser)],
     profile: Annotated[QualityProfile, Depends(get_quality_profile)],
     movies_root: Annotated[str | None, Depends(get_movies_root_optional)],
@@ -367,6 +370,7 @@ async def import_endpoint(
     record = await import_service.import_download(
         download_id=download_id,
         fs=fs,
+        media_probe=media_probe,
         library=library,
         qbt=qbt,
         parser=parser,
