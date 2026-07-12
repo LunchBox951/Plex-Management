@@ -127,6 +127,12 @@ def test_backs_up_db_and_key_as_unit_when_migration_pending(tmp_path: Path) -> N
     assert copied_key.read_bytes() == key_path.read_bytes()
     assert (copied_key.stat().st_mode & 0o777) == 0o600
 
+    # Manifest records the FILE_INCLUDED state, not the env or lost-key wording.
+    manifest = (result / "MANIFEST.txt").read_text(encoding="utf-8")
+    assert "secret.key (mode 0600)" in manifest
+    assert "NO KEY" not in manifest
+    assert "this install's key is supplied via" not in manifest
+
 
 def test_snapshot_captures_uncommitted_wal_rows(tmp_path: Path) -> None:
     """A plain ``shutil.copy`` of the main .db file must FAIL this test.
@@ -219,20 +225,36 @@ def test_snapshot_naive_copy_would_miss_uncheckpointed_wal_rows(tmp_path: Path) 
 def test_missing_key_backs_up_db_only_nonfatal(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Lost-key case: no secret.key AND no env override -- a DB-only backup.
+
+    The manifest must say so LOUDLY and must NOT claim the install uses
+    PLEX_MANAGER_FERNET_KEY (telling the operator to restore an env value that
+    never existed was the round-2 finding): the runbook has to send them hunting
+    for the ORIGINAL key, not a nonexistent env secret.
+    """
     settings = _settings(tmp_path)
     data_dir = Path(settings.data_dir)
     db_path = data_dir / "plex_manager.db"
     _stamp_db(db_path, _real_old_rev())
-    # No secret.key written and no override -- key genuinely absent from backup.
+    # No secret.key written and no override -- the key is genuinely absent everywhere.
 
-    with caplog.at_level(logging.INFO, logger=db_backup.logger.name):
+    with caplog.at_level(logging.WARNING, logger=db_backup.logger.name):
         result = db_backup.create_pre_migration_backup(settings)
 
     assert result is not None
     assert (result / "plex_manager.db").exists()
-    assert (result / "MANIFEST.txt").exists()
     assert not (result / "secret.key").exists()
-    assert any("preserve" in record.message.lower() for record in caplog.records)
+    assert any(
+        "NO encryption key" in record.message and "DATABASE-ONLY" in record.message
+        for record in caplog.records
+    )
+    manifest = (result / "MANIFEST.txt").read_text(encoding="utf-8")
+    assert "NO KEY" in manifest
+    assert "DATABASE-ONLY" in manifest
+    assert "recover it separately" in manifest
+    # Must NOT tell the operator this install's key lives in the env -- it doesn't.
+    assert "this install's key is supplied via" not in manifest
+    assert "Ensure the SAME PLEX_MANAGER_FERNET_KEY" not in manifest
 
 
 def test_non_sqlite_is_skipped_with_notice(
@@ -368,7 +390,13 @@ def test_env_override_key_not_copied_even_when_stale_file_present(
     # The stale on-disk key must NOT be embedded in the backup.
     assert not (result / "secret.key").exists()
     manifest = (result / "MANIFEST.txt").read_text(encoding="utf-8")
-    assert "PLEX_MANAGER_FERNET_KEY" in manifest
+    # The manifest must record the ENV-RESIDENT state: the key exists (in the
+    # operator's environment) and the restore step is to re-supply that same
+    # value -- distinct from the lost-key DB-only wording (round-2 finding).
+    assert "this install's key is supplied via" in manifest
+    assert "Ensure the SAME PLEX_MANAGER_FERNET_KEY" in manifest
+    assert "NO KEY" not in manifest
+    assert "DATABASE-ONLY" not in manifest
     assert any(
         "PLEX_MANAGER_FERNET_KEY" in record.message and "not copied" in record.message.lower()
         for record in caplog.records

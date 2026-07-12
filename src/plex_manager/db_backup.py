@@ -19,6 +19,7 @@ relying on Alembic downgrade scripts as a general rollback path.
 
 from __future__ import annotations
 
+import enum
 import logging
 import os
 import shutil
@@ -165,9 +166,24 @@ def _fernet_env_override_configured(settings: Settings) -> bool:
     return bool(settings.fernet_key.get_secret_value())
 
 
-def _copy_key(settings: Settings, dest_dir: Path) -> bool:
+class KeyDisposition(enum.Enum):
+    """How the ACTIVE encryption key relates to a backup (drives the manifest).
+
+    Three honestly-distinct states -- a bare "key included yes/no" conflated the
+    env-override case (the key exists, in the operator's environment) with the
+    lost-key case (no key exists ANYWHERE), and the manifest then told a
+    key-less install to "restore your PLEX_MANAGER_FERNET_KEY value" that never
+    existed.
+    """
+
+    FILE_INCLUDED = enum.auto()  # secret.key was copied into the backup dir
+    ENV_OVERRIDE = enum.auto()  # key lives in PLEX_MANAGER_FERNET_KEY; not embedded
+    MISSING = enum.auto()  # no key anywhere -- this is a DB-only backup
+
+
+def _copy_key(settings: Settings, dest_dir: Path) -> KeyDisposition:
     """Copy the ACTIVE Fernet key into the backup dir, preserving 0600. Returns
-    whether a key file was included in the backup.
+    where the active key actually lives (:class:`KeyDisposition`).
 
     Mirrors the encryption layer's key resolution (:func:`get_fernet` /
     :func:`ensure_secret_key`): a configured ``PLEX_MANAGER_FERNET_KEY`` override
@@ -177,7 +193,9 @@ def _copy_key(settings: Settings, dest_dir: Path) -> bool:
     backup while the manifest claimed the recovery unit was complete; restoring
     that unit after a rollback would leave the database undecryptable. In that
     case the active key lives only in the operator's environment/secret store and
-    is recorded (not embedded) as such."""
+    is recorded (not embedded) as such. When NO key exists anywhere the backup is
+    DB-only and both the log and the manifest say so loudly instead of pointing
+    at an env value that does not exist."""
     if _fernet_env_override_configured(settings):
         logger.warning(
             "Encryption key is provided via PLEX_MANAGER_FERNET_KEY (env "
@@ -187,33 +205,65 @@ def _copy_key(settings: Settings, dest_dir: Path) -> bool:
             "PLEX_MANAGER_FERNET_KEY value separately -- it and the database are "
             "one recovery unit; a replacement key cannot decrypt existing ciphertext."
         )
-        return False
+        return KeyDisposition.ENV_OVERRIDE
     key = secret_key_path(settings)
     if not key.exists():
-        logger.info(
-            "No encryption key file at %s and no PLEX_MANAGER_FERNET_KEY override; "
-            "this backup will not include a key. If this install stores encrypted "
-            "data, preserve the key separately -- the database and key are one "
-            "recovery unit; a replacement key cannot decrypt existing ciphertext.",
+        logger.warning(
+            "NO encryption key found: no key file at %s and no "
+            "PLEX_MANAGER_FERNET_KEY override. This is a DATABASE-ONLY backup. "
+            "If this install stores encrypted data, the original key must be "
+            "recovered separately -- the database and key are one recovery unit; "
+            "a replacement key cannot decrypt existing ciphertext.",
             key,
         )
-        return False
+        return KeyDisposition.MISSING
     dest = dest_dir / _KEY_COPY_NAME
     shutil.copy2(key, dest)
     os.chmod(dest, 0o600)
-    return True
+    return KeyDisposition.FILE_INCLUDED
 
 
-def _write_manifest(dest_dir: Path, from_rev: str | None, key_included: bool) -> None:
-    """Write a human-readable restore runbook alongside the backed-up files."""
+def _write_manifest(dest_dir: Path, from_rev: str | None, key_disposition: KeyDisposition) -> None:
+    """Write a human-readable restore runbook alongside the backed-up files.
+
+    The key section distinguishes THREE states honestly (see
+    :class:`KeyDisposition`): key file included / key is env-resident (restore
+    the ``PLEX_MANAGER_FERNET_KEY`` secret) / NO key found (DB-only backup, the
+    original key must be recovered separately) -- so the runbook never tells a
+    key-less install to restore an env value that does not exist.
+    """
     timestamp = datetime.now(UTC).isoformat()
     from_label = from_rev or "base (no migrations applied yet)"
-    key_line = (
-        f"  - {_KEY_COPY_NAME} (mode 0600)"
-        if key_included
-        else "  - (no key file -- this install uses PLEX_MANAGER_FERNET_KEY; "
-        "preserve that value separately)"
-    )
+    if key_disposition is KeyDisposition.FILE_INCLUDED:
+        key_source = "<data_dir>/secret.key (key file, included in this backup)"
+        key_line = f"  - {_KEY_COPY_NAME} (mode 0600)"
+        key_restore = f"""\
+  3. Copy {_KEY_COPY_NAME} from this backup back into the data directory as
+     secret.key, preserving mode 0600 (`chmod 600 secret.key`)."""
+    elif key_disposition is KeyDisposition.ENV_OVERRIDE:
+        key_source = "PLEX_MANAGER_FERNET_KEY (env override -- NOT embedded in this backup)"
+        key_line = (
+            "  - (no key file -- this install's key is supplied via the\n"
+            "    PLEX_MANAGER_FERNET_KEY environment variable/secret, which is NOT\n"
+            "    embedded in this backup; preserve that value separately)"
+        )
+        key_restore = """\
+  3. Ensure the SAME PLEX_MANAGER_FERNET_KEY value that was active at backup
+     time is configured on the deployment (this backup contains no key file;
+     the env secret IS the key half of this recovery unit)."""
+    else:  # KeyDisposition.MISSING
+        key_source = "NONE FOUND at backup time (no secret.key, no PLEX_MANAGER_FERNET_KEY)"
+        key_line = (
+            "  - !! NO KEY: no secret.key file and no PLEX_MANAGER_FERNET_KEY\n"
+            "    override existed when this backup was taken. This is a\n"
+            "    DATABASE-ONLY backup -- it is NOT a complete recovery unit."
+        )
+        key_restore = """\
+  3. WARNING: this backup contains NO key and none was configured when it was
+     taken. Encrypted columns in the restored database can only be decrypted
+     with the ORIGINAL key -- recover it separately (a prior backup, your
+     secret store, an old volume). Do NOT mint a new key and expect existing
+     secrets to work."""
     manifest = f"""\
 Plex Manager -- pre-migration backup
 =====================================
@@ -221,7 +271,7 @@ Plex Manager -- pre-migration backup
 Created (UTC):        {timestamp}
 Database revision:    {from_label}
 Source database:      see the app's PLEX_MANAGER_DATABASE_URL at backup time
-Source key:           <data_dir>/secret.key (or PLEX_MANAGER_FERNET_KEY override)
+Source key:           {key_source}
 
 Contents of this directory:
   - {_DB_COPY_NAME} (WAL-consistent snapshot, taken before `alembic upgrade head`)
@@ -237,10 +287,7 @@ Restore steps:
   1. Stop the container.
   2. Copy {_DB_COPY_NAME} back into the data directory, replacing the current
      database file (match the filename your PLEX_MANAGER_DATABASE_URL expects).
-  3. If {_KEY_COPY_NAME} is present in this backup, copy it back into the data
-     directory as secret.key, preserving mode 0600 (`chmod 600 secret.key`).
-     If it is not present, restore your saved PLEX_MANAGER_FERNET_KEY value
-     instead.
+{key_restore}
   4. Re-point the deployment at the older image tag that matches this
      database revision (same-schema rollback: just re-point; cross-migration
      rollback: this backup unit IS the recovery path -- see ADR-0021).
@@ -357,19 +404,19 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     staging.mkdir(parents=True, exist_ok=True)
     try:
         _snapshot_sqlite(db_path, staging / _DB_COPY_NAME)
-        key_included = _copy_key(settings, staging)
-        _write_manifest(staging, current, key_included)
+        key_disposition = _copy_key(settings, staging)
+        _write_manifest(staging, current, key_disposition)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     os.replace(staging, dest)
 
     logger.info(
-        "Pre-migration backup written to %s (from rev %s, key_included=%s) -- "
+        "Pre-migration backup written to %s (from rev %s, key=%s) -- "
         "restore this DB+key unit if the upgrade must be rolled back.",
         dest,
         current,
-        key_included,
+        key_disposition.name,
     )
 
     _prune(dest.parent)

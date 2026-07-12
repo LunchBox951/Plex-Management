@@ -146,12 +146,22 @@ credentials, the recovery API key, or magnet links already stored in the
 database — losing the key without a copy of it makes an otherwise-intact
 database backup useless for recovering those secrets.
 
-Every container start that finds a pending migration automatically snapshots
-this unit *before* applying it, into
+On the **SQLite** deployment, every container start that finds a pending
+migration automatically snapshots this unit *before* applying it, into
 `<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/` (the database file, the
-key, and a `MANIFEST.txt` restore runbook), pruned to the most recent 5. This is
-advisory and best-effort — fail-loud but never fatal to startup — not a
-replacement for your own backup strategy.
+key file when one exists, and a `MANIFEST.txt` restore runbook), pruned to the
+most recent 5. This is advisory and best-effort — fail-loud but never fatal to
+startup — not a replacement for your own backup strategy. Know its limits:
+
+- **`PLEX_MANAGER_FERNET_KEY` deployments:** the automatic backup is
+  **database-only**. The active key lives in your environment/secret store, so
+  no key file is written into the backup (a stale on-disk `secret.key`, if one
+  is left over, is deliberately *not* copied — it is not the active key). You
+  must preserve the `PLEX_MANAGER_FERNET_KEY` value yourself; it is the key
+  half of the recovery unit, and the `MANIFEST.txt` records this.
+- **PostgreSQL deployments:** **no automatic backup is taken at all.** Take
+  your own `pg_dump` (below) *and* save the key before upgrading — do not rely
+  on a `pre-migrate-*` directory existing.
 
 **SQLite (the default, named-volume) deployment:**
 ```bash
