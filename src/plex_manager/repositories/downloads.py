@@ -101,6 +101,7 @@ def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -
         episodes=row.episodes_json,
         media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
+        retry_count=row.retry_count,
         first_seen_at=_as_utc(row.first_seen_at),
         added_at=_as_utc(row.added_at),
         timeout_at=_as_utc(row.timeout_at),
@@ -662,6 +663,7 @@ class SqlDownloadRepository:
         added_at: datetime | None = None,
         timeout_at: datetime | None = None,
         clear_timeout_at: bool = False,
+        retry_count: int | None = None,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -698,6 +700,12 @@ class SqlDownloadRepository:
         overloading ``None`` to mean BOTH "leave unchanged" and "clear" would
         leave a stale 45m/3h deadline on a row that has already left every
         download phase, misleading the observability column it was added for.
+
+        ``retry_count`` (issue #180) lets a caller re-anchor the probe-outage retry
+        count on the SAME CAS as the transition -- ``grab_service._reuse_terminal_row``
+        passes ``0`` so a terminal row resurrected for a fresh grab starts its own
+        honest count instead of inheriting one from a prior, unrelated life of the
+        same torrent-hash row. ``None`` (the default) leaves the column untouched.
 
         ``require_failed_reason`` (default: no predicate) additionally constrains the
         WHERE to rows whose CURRENT ``failed_reason`` exactly equals the given value
@@ -745,6 +753,8 @@ class SqlDownloadRepository:
             values["timeout_at"] = None
         elif timeout_at is not None:
             values["timeout_at"] = timeout_at
+        if retry_count is not None:
+            values["retry_count"] = retry_count
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))
@@ -769,6 +779,28 @@ class SqlDownloadRepository:
                 episodes=episodes,
             )
         return updated
+
+    async def increment_retry_count_if_in(
+        self, download_id: int, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap bump of ``retry_count`` by 1 (issue #180).
+
+        Gated on the row's CURRENT persisted status still being in
+        ``allowed_from`` -- mirrors :meth:`update_status_if_in`'s CAS
+        discipline: a row an operator moved elsewhere (e.g. ``mark_failed``
+        committing in a separate session during the caller's async gap) is
+        never touched. Returns whether the row was updated; the caller already
+        holds the PRE-increment count from its own prior read, so it can
+        derive the new count as ``previous + 1`` without a second read.
+        """
+        stmt = (
+            update(Download)
+            .where(Download.id == download_id, Download.status.in_(allowed_from))
+            .values(retry_count=Download.retry_count + 1)
+            .execution_options(synchronize_session="fetch")
+        )
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
 
     async def update_scope_status_if_in(
         self,
