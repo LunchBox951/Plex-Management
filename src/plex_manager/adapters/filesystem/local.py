@@ -213,6 +213,15 @@ def _open_parent_nofollow(start_dir: str, components: list[str], original_path: 
                     dir_fd=dir_fd,
                 )
             except FileNotFoundError:
+                # An intermediate ancestor is already gone -- idempotent no-op
+                # for the caller, but `dir_fd` is still OPEN right here: it is
+                # not the BaseException handler below (a `return` is not an
+                # exception) and there is no other cleanup on this path, so it
+                # must be closed explicitly before returning or it leaks for
+                # the life of the process -- on a long-running daemon retrying
+                # this exact idempotent path repeatedly, that walks toward
+                # EMFILE and takes down every other file operation.
+                os.close(dir_fd)
                 return None
             except OSError as exc:
                 if exc.errno in (errno.ELOOP, errno.ENOTDIR):

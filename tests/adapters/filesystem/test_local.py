@@ -1093,6 +1093,39 @@ def test_delete_missing_intermediate_dir_is_idempotent_noop(tmp_path: Path) -> N
     LocalFileSystem([os.fspath(root)]).delete(os.fspath(never_existed))  # must not raise
 
 
+def test_delete_missing_intermediate_dir_does_not_leak_a_file_descriptor(
+    tmp_path: Path,
+) -> None:
+    """P1 regression: the no-follow parent walk opens ``start_dir`` (and each
+    intermediate ancestor) via ``os.open``, and on a MISSING intermediate
+    ancestor -- exactly the idempotent-retry case above -- it used to
+    ``return None`` straight out of the loop's ``except FileNotFoundError``
+    branch WITHOUT closing the still-open ``dir_fd``: that ``return`` is not an
+    exception, so the surrounding ``except BaseException`` cleanup never ran.
+    A single call leaking one fd is invisible to
+    ``test_delete_missing_intermediate_dir_is_idempotent_noop`` (which only
+    asserts non-raising), but a long-running daemon retrying this exact
+    idempotent path repeatedly leaks one fd per call, walking toward EMFILE and
+    taking down every other file operation in the process. Assert the
+    process's open-fd count is unchanged across many repeats of the no-op
+    delete."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    never_existed = root / "Gone" / "movie.mkv"
+    fs = LocalFileSystem([os.fspath(root)])
+
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("requires /proc/self/fd (Linux)")
+
+    before = len(os.listdir(fd_dir))
+    for _ in range(200):
+        fs.delete(os.fspath(never_existed))  # must not raise, must not leak
+    after = len(os.listdir(fd_dir))
+
+    assert after == before
+
+
 def test_delete_surfaces_ancestor_tamper_rather_than_silently_skipping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
