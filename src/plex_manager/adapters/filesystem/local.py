@@ -16,6 +16,7 @@ import contextlib
 import errno
 import os
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
@@ -177,6 +178,56 @@ def _publish_link_no_overwrite(src: Path, dst: Path) -> None:
 def _is_within(root_real: str, candidate_real: str) -> bool:
     """True if ``candidate_real`` is ``root_real`` or sits under it (both realpaths)."""
     return candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
+
+
+def _open_parent_nofollow(start_dir: str, components: list[str], original_path: str) -> int | None:
+    """Open the delete leaf's PARENT directory via a no-follow ``openat`` walk,
+    anchored at ``start_dir`` -- a canonical, symlink-free directory (the
+    ``dirname`` of a configured library root's realpath).
+
+    This is the enforcement layer that closes the ancestor-symlink-swap TOCTOU a
+    pathname re-check cannot: every INTERMEDIATE component (``components[:-1]``
+    -- the last component is the leaf itself, left for the caller to inspect and
+    remove) is opened relative to the PREVIOUS component's already-open file
+    descriptor with ``O_NOFOLLOW | O_DIRECTORY``. A concurrent actor who renames
+    an ancestor and replaces it with a symlink (or a non-directory) between the
+    containment check and this walk cannot redirect it: the kernel refuses that
+    open (``ELOOP``/``ENOTDIR``) rather than following it, so the swap is
+    SURFACED as a refusal (north-star #3: honesty), never silently traversed.
+    Contrast a second ``os.path.realpath``/``os.path.lexists`` call, which would
+    simply re-resolve through the swapped component and hand back a DIFFERENT
+    real path than the one already checked.
+
+    Returns the parent directory's fd (the caller must ``os.close`` it), or
+    ``None`` when an intermediate ancestor no longer exists at all -- an
+    idempotent no-op, matching :meth:`LocalFileSystem.delete`'s existing
+    "already gone" contract for a path that vanished out-of-band.
+    """
+    dir_fd = os.open(start_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in components[:-1]:
+            try:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise LocalFileSystemError(
+                        f"refusing to delete {original_path!r}: an ancestor changed to a "
+                        "symlink or non-directory during deletion (containment could not "
+                        "be guaranteed)"
+                    ) from exc
+                raise
+            os.close(dir_fd)
+            dir_fd = next_fd
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
 
 
 def _iter_video_files(root: str) -> Iterator[tuple[str, int, str]]:
@@ -397,6 +448,33 @@ class LocalFileSystem:
         """
         return list(_iter_video_files(root))
 
+    def _guarded_resolution(self, path: str) -> tuple[str, str, str] | None:
+        """The shared resolve-and-check behind :meth:`resolve_guarded`,
+        :meth:`delete_guard_refuses`, and :meth:`delete` -- returning, in
+        addition to the resolved target, the configured root that anchors
+        ``path``'s own entry location so :meth:`delete` can walk down to it via
+        no-follow file descriptors rather than a second pathname resolution.
+
+        Returns ``(root_real, entry_location, real)`` where ``root_real`` is the
+        configured root (already a realpath, per the constructor) containing
+        ``entry_location``; or ``None`` (a refusal) if either containment check
+        fails. See :meth:`resolve_guarded` for the two-check rationale (issue
+        #141) -- unchanged here, only the return value is richer.
+        """
+        if not path:
+            return None
+        entry_dir = os.path.dirname(path) or "."
+        entry_location = os.path.join(os.path.realpath(entry_dir), os.path.basename(path))
+        root_real = next(
+            (root for root in self._library_roots if _is_within(root, entry_location)), None
+        )
+        if root_real is None:
+            return None
+        real = os.path.realpath(path)
+        if not any(_is_within(root, real) for root in self._library_roots):
+            return None
+        return root_real, entry_location, real
+
     def resolve_guarded(self, path: str) -> str | None:
         """Resolve ``path`` to its realpath, returning it ONLY if BOTH ``path``'s
         own entry location AND that resolved target sit within a configured
@@ -434,16 +512,8 @@ class LocalFileSystem:
         Fails CLOSED on either check -- an empty ``path``, or no configured
         roots, returns ``None``.
         """
-        if not path:
-            return None
-        entry_dir = os.path.dirname(path) or "."
-        entry_location = os.path.join(os.path.realpath(entry_dir), os.path.basename(path))
-        if not any(_is_within(root, entry_location) for root in self._library_roots):
-            return None
-        real = os.path.realpath(path)
-        if not any(_is_within(root, real) for root in self._library_roots):
-            return None
-        return real
+        resolution = self._guarded_resolution(path)
+        return None if resolution is None else resolution[2]
 
     def delete_guard_refuses(self, path: str) -> bool:
         """Whether :meth:`delete` would REFUSE ``path`` as outside every configured
@@ -474,54 +544,89 @@ class LocalFileSystem:
         library root, and a caller passing a wrong path is a bug worth surfacing
         loudly even if that wrong path happens not to exist.
 
-        ``path`` is resolved EXACTLY ONCE (via :meth:`resolve_guarded`) and it is
-        that single resolved target -- the one whose containment was checked -- that
-        is removed below; ``path`` is never re-resolved afterwards. This closes a
-        guard/delete TOCTOU: were the containment check and the removal to resolve
-        ``path`` independently, a symlinked path COMPONENT repointed between them
-        could send the removal outside every configured root even though the check
-        passed. There is no such second resolution here.
+        ``path`` is resolved EXACTLY ONCE (via :meth:`_guarded_resolution`), and
+        the removal below never re-resolves ``path`` through a SECOND pathname
+        lookup at all -- not even the ``os.path.lexists``/``islink``/``isdir``
+        re-checks a naive "resolve once, then act on the string" fix would still
+        perform. Those pathname syscalls re-traverse every ancestor component
+        from the kernel's current view of the tree, so if a writable ancestor
+        directory is renamed and replaced with a symlink BETWEEN the containment
+        check and the removal, they happily re-resolve through the swapped
+        ancestor and can delete a same-suffix target outside every configured
+        root -- the guard/delete TOCTOU is not closed by checking a string once
+        if the removal still walks the filesystem by name again afterwards.
 
-        Containment is checked against the RESOLVED path, but the actual REMOVAL
-        never dereferences a symlink: when ``path`` ITSELF is a symlink (e.g. a
-        breadcrumb that turned out to be a link rather than the real placed
-        file), only that link entry is unlinked -- never ``shutil.rmtree``/
-        ``os.remove`` on whatever it points at, even though that target already
-        passed the containment check above. The target may be OTHER library
-        content (a different title/season) that some other request still
-        references directly; eviction owns the breadcrumb it was given, never
-        transitively whatever that breadcrumb happens to point to. A REAL file
-        or directory (what every import actually places) is entirely unaffected
-        by this: it is not a symlink, so it still falls through to the ordinary
-        file-or-tree removal below, exactly as before.
+        Instead, the removal is ANCHORED to file descriptors opened with
+        ``O_NOFOLLOW`` from the checked root's canonical parent down to the
+        leaf's own parent directory (:func:`_open_parent_nofollow`), and the
+        leaf itself is inspected (``os.lstat``) and removed
+        (``os.unlink``/``shutil.rmtree``) relative to that held descriptor
+        (``dir_fd=``) -- never by re-resolving ``path`` or ``real`` as a
+        string. A concurrent ancestor swap can no longer redirect the removal:
+        the kernel refuses to open a swapped-in symlink or non-directory
+        component (``ELOOP``/``ENOTDIR``), which is SURFACED as a
+        :class:`LocalFileSystemError` (north-star #3: honesty) rather than
+        silently followed.
 
-        ONLY once containment passes is existence checked (on ``path`` itself,
-        via ``lexists`` -- a dangling symlink still "exists" as a link entry
-        even though its target does not): a path that does not exist there at
-        all is a no-op, not an error, so a retried eviction (a previous partial
-        success, or a breadcrumb pointing at something already removed
-        out-of-band) sees a clean, idempotent success.
+        The leaf itself is never dereferenced either: when ``path`` ITSELF is a
+        symlink (e.g. a breadcrumb that turned out to be a link rather than the
+        real placed file), only that link entry is unlinked -- never
+        ``shutil.rmtree``/target removal on whatever it points at, even though
+        that target already passed the containment check above. The target may
+        be OTHER library content (a different title/season) that some other
+        request still references directly; eviction owns the breadcrumb it was
+        given, never transitively whatever that breadcrumb happens to point to.
+
+        A path (or an intermediate ancestor) that no longer exists at all is a
+        no-op, not an error, so a retried eviction (a previous partial success,
+        or a breadcrumb pointing at something already removed out-of-band) sees
+        a clean, idempotent success. On a platform that cannot guarantee
+        fd-anchored, no-follow removal (no ``O_NOFOLLOW`` / no ``dir_fd``
+        support / no symlink-attack-resistant ``shutil.rmtree``), every delete
+        is refused up front rather than silently falling back to the unsafe
+        pathname re-check this method exists to avoid.
         """
-        # Resolve-and-check ONCE: the returned ``real`` is the path whose containment
-        # was just affirmed, and it -- never a fresh re-resolution of ``path`` -- is
-        # what the real-file/tree removal below acts on (closes the guard/delete
-        # TOCTOU; see the docstring).
-        real = self.resolve_guarded(path)
-        if real is None:
+        if not (
+            hasattr(os, "O_NOFOLLOW")
+            and os.unlink in os.supports_dir_fd
+            and os.rmdir in os.supports_dir_fd
+            and shutil.rmtree.avoids_symlink_attacks
+        ):
+            raise LocalFileSystemError(
+                "refusing to delete: this platform cannot guarantee fd-anchored, "
+                "no-follow delete containment"
+            )
+        # Resolve-and-check ONCE: `root_real` is the configured root whose realpath
+        # anchors the fd walk below, and `entry_location` is the checked entry --
+        # this method never re-resolves `path` as a string afterwards (see the
+        # docstring for why that would reopen the very TOCTOU this closes).
+        resolution = self._guarded_resolution(path)
+        if resolution is None:
             raise LocalFileSystemError(
                 f"refusing to delete {path!r}: outside every configured library root"
             )
-        if not os.path.lexists(path):
-            return  # already gone -- idempotent no-op, not an error
-        if os.path.islink(path):
-            # Remove ONLY the link entry -- never follow it into its target,
-            # and never shutil.rmtree a symlinked directory's contents.
-            os.remove(path)
-            return
-        if os.path.isdir(real):
-            shutil.rmtree(real)
-        else:
-            os.remove(real)
+        root_real, entry_location, _real = resolution
+        start_dir = os.path.dirname(root_real) or os.sep
+        components = os.path.relpath(entry_location, start_dir).split(os.sep)
+        parent_fd = _open_parent_nofollow(start_dir, components, path)
+        if parent_fd is None:
+            return  # an intermediate ancestor is already gone -- idempotent no-op
+        try:
+            leaf = components[-1]
+            try:
+                leaf_stat = os.lstat(leaf, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return  # already gone -- idempotent no-op, not an error
+            if stat.S_ISLNK(leaf_stat.st_mode):
+                # Remove ONLY the link entry -- never follow it into its target,
+                # and never shutil.rmtree a symlinked directory's contents.
+                os.unlink(leaf, dir_fd=parent_fd)
+            elif stat.S_ISDIR(leaf_stat.st_mode):
+                shutil.rmtree(leaf, dir_fd=parent_fd)
+            else:
+                os.unlink(leaf, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
 
     def reclaimable_bytes(self, path: str) -> int:
         """Return how many bytes deleting ``path`` would ACTUALLY reclaim, hardlink-aware.
