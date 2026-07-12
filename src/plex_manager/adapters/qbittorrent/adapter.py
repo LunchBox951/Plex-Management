@@ -217,6 +217,9 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
         return None
 
 
+_HEX_BTIH_PATTERN: Final = re.compile(r"[0-9A-Fa-f]{40}")
+
+
 def _normalize_btih(value: str) -> str:
     """Normalise a ``btih`` info-hash to the 40-char lowercase hex qBittorrent uses.
 
@@ -227,13 +230,16 @@ def _normalize_btih(value: str) -> str:
     ``ClientMissing`` forever. A valid 40-char hex value is returned lowercased; a
     valid 32-char base32 value is decoded to its hex form.
 
-    A 32-char value that is NOT valid base32 is a MALFORMED source, not a hash:
+    Anything else — including a 40-char value that is NOT hex, and any OTHER
+    length (short garbage, off-by-one) — is a MALFORMED source, not a hash:
     raising :class:`QbittorrentSourceError` routes it through the existing typed
     source-error taxonomy (the manual grab's ``torrent_source_unresolvable`` /
     auto-grab's per-release source-failure path) rather than passing the garbage
-    through as if it were a real hash — a value that could never match the client
-    snapshot, stranding the download as ``ClientMissing`` forever (north star #3:
-    surface the malformed source, don't swallow it).
+    through as if it were a real hash. Before this (issue #212), only the
+    32-char branch was validated — a wrong-length or 40-char non-hex value was
+    returned lowercased unchanged, a value that could never match qBittorrent's
+    actual info-hash, stranding the download as ``ClientMissing`` forever
+    (north star #3: surface the malformed source, don't swallow it).
     """
     if len(value) == 32:
         try:
@@ -251,19 +257,36 @@ def _normalize_btih(value: str) -> str:
         if len(decoded) != 20:
             raise QbittorrentSourceError("base32 btih decodes to a non-20-byte hash")
         return decoded.hex()
-    return value.lower()
+    if len(value) == 40 and _HEX_BTIH_PATTERN.fullmatch(value):
+        return value.lower()
+    raise QbittorrentSourceError("btih is not a valid 40-char hex or 32-char base32 info-hash")
 
 
 def _info_hash_from_magnet(magnet: str) -> str | None:
-    """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter.
+    """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter(s).
 
     Total: an UNPARSABLE magnet (an attacker-controlled redirect can supply e.g.
     ``magnet://[::1x/…`` whose bogus netloc makes ``urlparse`` raise ValueError)
     returns ``None`` — no hash derivable — instead of escaping the source-error
     taxonomy with a raw ValueError. A present-but-MALFORMED ``btih`` (invalid
-    base32) instead raises :class:`QbittorrentSourceError` via
-    :func:`_normalize_btih` — a typed source error IN the taxonomy, never garbage
-    passed through as a hash (see that function's docstring).
+    base32, wrong length, non-hex) instead raises :class:`QbittorrentSourceError`
+    via :func:`_normalize_btih` — a typed source error IN the taxonomy, never
+    garbage passed through as a hash (see that function's docstring).
+
+    A magnet may legally repeat ``xt=urn:btih:`` — real-world producers do this
+    to carry both the v1 (hex/base32) and v2 forms, or simply duplicate the same
+    value. qBittorrent delegates parsing to libtorrent, which iterates every
+    ``xt`` and OVERWRITES its tracked v1 hash on each valid one it sees — so
+    when two values normalize to DIFFERENT hashes, the client ends up tracking
+    whichever was LAST, not necessarily the one this function would otherwise
+    have picked. Persisting a guess risks storing hash A while the client
+    tracks hash B: the reconciler then falsely decides ``ClientMissing``,
+    rearms the request, and cleanup removes the WRONG hash — orphaning a live
+    torrent (issue #212). So every ``xt=urn:btih:`` value is normalized and
+    collected; repeats that normalize identically collapse to the one hash
+    (fine — no ambiguity), but two or more DISTINCT normalized hashes make the
+    magnet itself the malformed/ambiguous source, rejected outright before any
+    qBittorrent request rather than guessed at.
     """
     try:
         parsed = urlparse(magnet)
@@ -271,10 +294,20 @@ def _info_hash_from_magnet(magnet: str) -> str | None:
         return None
     if parsed.scheme != "magnet":
         return None
-    for xt in parse_qs(parsed.query).get("xt", []):
-        if xt.startswith("urn:btih:"):
-            return _normalize_btih(xt[len("urn:btih:") :])
-    return None
+    hashes: list[str] = [
+        _normalize_btih(xt[len("urn:btih:") :])
+        for xt in parse_qs(parsed.query).get("xt", [])
+        if xt.startswith("urn:btih:")
+    ]
+    if not hashes:
+        return None
+    unique_hashes = set(hashes)
+    if len(unique_hashes) > 1:
+        raise QbittorrentSourceError(
+            "magnet names conflicting btih values; qBittorrent may track a "
+            "different one than any single value picked here"
+        )
+    return next(iter(unique_hashes))
 
 
 def _is_add_success(response: httpx.Response) -> bool:
