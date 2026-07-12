@@ -71,8 +71,14 @@ from plex_manager.models import (
 from plex_manager.ports.media_probe import MediaProbeError, MediaProbeUnavailableError
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import path_visibility, purge_service, season_request_service
+from plex_manager.services import (
+    path_visibility,
+    purge_service,
+    season_episode_service,
+    season_request_service,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -2172,9 +2178,54 @@ async def _import_tv_locked(
             quality_id=installed_quality.id,
             profile_index=installed_profile_index,
         )
-        await season_request_service.mark_completed(
-            session, media_request_id=request.id, season_number=season
+
+        # Episode-level completeness (ADR-0018, issue #178): the target is read
+        # from ``season_episode_states`` WITHOUT calling TMDB -- import may run
+        # while TMDB is down, and the target is whatever auto-grab's fallback
+        # already seeded. An empty/unseeded target (this download's season was
+        # never touched by the fallback -- a plain whole-season-pack request, the
+        # common case) means "target unknown", and ``apply_import`` degrades to
+        # the LEGACY behavior: any TV import completes the season, unchanged from
+        # before this feature existed.
+        season_row = await SqlSeasonRequestRepository(session).ensure(
+            request.id, season, status=RequestStatus.pending.value
         )
+        target = frozenset(
+            state.episode_number
+            for state in await SqlSeasonEpisodeStateRepository(session).list_for_season(
+                season_row.id
+            )
+        )
+        accepted_episodes = {ep for result in validation.accepted for ep in result.episodes}
+        complete = await season_episode_service.apply_import(
+            session,
+            media_request_id=request.id,
+            season_number=season,
+            imported_episodes=accepted_episodes,
+            download_id=download_id,
+            target=target,
+        )
+        if complete:
+            await season_request_service.mark_completed(
+                session, media_request_id=request.id, season_number=season
+            )
+        else:
+            # Target known and still incomplete (a partial fallback assembly,
+            # e.g. a pack with a hole, or a single-episode grab): re-arm the
+            # season to keep collecting rather than falsely completing it. Do
+            # NOT clear ``library_path`` (the episodes just placed are real) or
+            # ``installed_quality`` (already set above). Reset the search
+            # backoff so the next missing episode is searched promptly, not
+            # throttled by a stale ladder from before this partial import.
+            await season_request_service.set_status(
+                session,
+                media_request_id=request.id,
+                season_number=season,
+                status=RequestStatus.searching.value,
+            )
+            await SqlSeasonRequestRepository(session).schedule_search(
+                season_row.id, search_attempts=0, next_search_at=None
+            )
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
     finally:
