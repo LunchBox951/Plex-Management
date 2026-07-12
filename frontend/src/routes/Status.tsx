@@ -298,7 +298,7 @@ export function Status() {
   }
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-8 px-5 py-8 sm:px-8">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="font-display text-2xl font-extrabold">Status</h1>
         <Button variant="secondary" onClick={() => void onFreeSpace()} loading={evict.isPending}>
