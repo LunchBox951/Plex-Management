@@ -23,9 +23,10 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0015](0015-anime-library-routing.md) | Anime library routing (optional anime roots, routing only) | Accepted |
 | [0016](0016-plex-oauth-owner-sessions.md) | Plex-first setup + browser-side Plex sign-in (single verify endpoint, session cookie) | Accepted |
 | [0017](0017-plex-video-download-validation.md) | Positive Plex-video validation before library import | Accepted |
+| [0018](0018-episode-level-fallback-whole-season.md) | Episode-level fallback for whole-season TV requests | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
-first frontend-alpha session; 0010–0017 across the subsequent beta feature
+first frontend-alpha session; 0010–0018 across the subsequent beta feature
 sessions (each ADR's own header carries its date). Full context:
 [`docs/design/overview.md`](../design/overview.md).
