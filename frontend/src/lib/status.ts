@@ -71,6 +71,34 @@ export function downloadStatus(status: string): StatusPresentation {
   return lookup(DOWNLOAD_STATUS, status)
 }
 
+/**
+ * The `RequestStatus` values that count as "in flight" — a request the pipeline
+ * is actively working right now: hunting a release (`searching`), pulling one
+ * (`downloading`), or between retries after finding none acceptable
+ * (`no_acceptable_release`, which is non-terminal and re-searches on a schedule).
+ *
+ * Deliberately EXCLUDES:
+ *   - not-yet-started intents (`pending`, `waiting_for_air_date`);
+ *   - settled/terminal states (`available`, `partially_available`, `completed`,
+ *     `failed`, `import_blocked`, `cancelled`, `evicted`).
+ *
+ * This is the single source of truth for "something is happening now" so the
+ * shell's Requests nav badge (issue #187) can't silently desync from the status
+ * vocabulary above — the same reason `glyphKind` reads canonical labels rather
+ * than hardcoding strings. The badge count is only ever as truthful as the
+ * actor-scoped `/requests` payload it is derived from (own requests for a shared
+ * user; every request for an admin — matching what that actor sees on the page).
+ */
+export const IN_FLIGHT_REQUEST_STATUSES: ReadonlySet<string> = new Set([
+  'searching',
+  'downloading',
+  'no_acceptable_release',
+])
+
+export function isInFlightRequestStatus(status: string): boolean {
+  return IN_FLIGHT_REQUEST_STATUSES.has(status)
+}
+
 /** Tailwind classes per intent (background tint + text + ring), used by StatusBadge. */
 export const INTENT_CLASSES: Record<StatusIntent, string> = {
   searching: 'bg-searching/15 text-searching ring-searching/30',
