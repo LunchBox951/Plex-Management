@@ -709,6 +709,42 @@ class SqlDownloadRepository:
             )
         return updated
 
+    async def update_scope_status_if_in(
+        self,
+        scope_id: int,
+        status: str,
+        allowed_from: frozenset[str],
+    ) -> bool:
+        """Compare-and-swap ONE :class:`DownloadScope` row's status: move to
+        ``status`` only if its CURRENT persisted status is in ``allowed_from``.
+        Returns whether a row was updated.
+
+        The per-download :meth:`update_status_if_in` CAS decides whether a WHOLE
+        physical torrent's row may transition; this is the same idiom scoped to a
+        single logical scope row, needed because a shared multi-season pack can
+        carry several independent scopes whose lifecycles diverge (one imports
+        while a sibling is still active). A caller that snapshots a DTO's
+        ``scopes`` tuple and then wants to act on one of them (e.g.
+        ``correction_service._rescue_shared_pack_siblings`` re-arming a sibling
+        season) must re-validate against the DATABASE, not the stale snapshot: a
+        concurrent import retry can move that exact scope to ``imported`` in the
+        gap between the read and the act. Issuing a single ``UPDATE ... WHERE id =
+        ? AND status IN (...)`` makes that re-validation and the write one atomic
+        statement -- ``False`` means the scope left ``allowed_from`` under the
+        caller and the sibling-specific action must be skipped, never forced.
+
+        ``synchronize_session="fetch"`` mirrors :meth:`update_status_if_in` so any
+        already-loaded identity-map instance stays consistent with the DB result.
+        """
+        stmt = (
+            update(DownloadScope)
+            .where(DownloadScope.id == scope_id, DownloadScope.status.in_(allowed_from))
+            .values(status=status)
+            .execution_options(synchronize_session="fetch")
+        )
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
+
     async def refresh_progress(
         self,
         download_id: int,

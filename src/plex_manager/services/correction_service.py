@@ -10,8 +10,14 @@ a terminal):
   download's history), (b) re-arm the request/season to ``searching`` -- the claim
   of the ``uq_media_requests_active`` slot -- so a racing re-request that grabbed the
   slot collides HERE (surfaced as ``ActiveDuplicateError`` 409) while nothing is yet
-  deleted, rather than after the file/torrent are irreversibly gone, (c) remove the
-  culprit torrent WITH data, (d) purge the library file via the shared root-guarded
+  deleted, rather than after the file/torrent are irreversibly gone. Still inside
+  that same claim, ANY sibling season of a shared multi-season pack torrent (issue
+  #175 -- a partial-import ``import_blocked`` row carrying an ``imported`` scope for
+  the reported season and a non-terminal scope for another) is rescued: its scope and
+  the pack's download row are terminalized and the sibling season is independently
+  re-armed to ``searching``, so it is never silently orphaned when (c) below deletes
+  the shared torrent's payload. (c) remove the culprit torrent WITH data, (d) purge
+  the library file via the shared root-guarded
   purge primitive (clearing the breadcrumb only when the file was actually removed),
   (e) trigger a Plex scan, (f) write an audit history row + commit, (g) synchronously
   run the SAME decision-engine -> grab path the grab endpoint uses, so the re-search
@@ -286,6 +292,160 @@ async def _mark_download_scopes_terminal(
         )
         .values(status=status)
     )
+
+
+async def _rescue_shared_pack_siblings(
+    session: AsyncSession,
+    culprit: DownloadRecord,
+    *,
+    reported_request_id: int,
+    reported_season: int | None,
+    log_extra: dict[str, object],
+) -> None:
+    """Rescue sibling seasons of a PARTIAL multi-season pack before its torrent is
+    removed (issue #175).
+
+    A single multi-season torrent import runs ONCE at completion
+    (``import_service._import_tv``): a partial success leaves the download ROW at
+    ``import_blocked`` with one ``imported`` :class:`DownloadScope` for the season(s)
+    that made it in and a sibling ``import_blocked``/``active`` scope for the
+    season(s) that did not. ``report_issue`` on the GOOD season used to re-arm only
+    that season, then remove the shared torrent WITH DATA at step (c) -- deleting the
+    sibling season's payload out from under it while its scope/row silently rotted at
+    ``import_blocked`` with no live torrent (a zombie: never auto-drained, since
+    ``import_blocked`` is retried only on demand).
+
+    This mirrors ``queue_service``'s ``mark_failed`` precedent (the existing manual
+    recovery for exactly this shape): terminalize every non-terminal sibling scope,
+    terminalize the pack's download row, then re-arm each sibling's OWN season to a
+    fresh ``searching`` via the same ``reset_for_research`` idiom report-issue already
+    uses for the reported season -- so the sibling is picked up by the merged
+    auto-grab worker instead of being silently orphaned.
+
+    A no-op (returns immediately) for movies and any single-season / fully-imported
+    pack: it is only sibling ``active``/``import_blocked`` scopes -- OTHER than the
+    one being reported -- that trigger the rescue, so the fix is surgical.
+
+    Race safety (two independent CAS layers, both required): ``siblings`` is built
+    from ``culprit.scopes``, a DTO snapshot read BEFORE this function's own writes --
+    a concurrent import retry can complete a sibling (its scope -> ``imported``)
+    anywhere in the gap between that read and this function actually running. Acting
+    on the stale snapshot alone would re-arm an already-satisfied season back to
+    ``searching``, and a later re-search could grab a needless duplicate.
+
+    1. The DOWNLOAD-ROW CAS below (``update_status_if_in``) must be WON before
+       touching any scope: losing it means a different actor (another concurrent
+       report-issue redo of the same pack, or the row reaching a terminal status on
+       its own) already owns this download, so nothing here is re-derived from a
+       stale read of a row we do not control -- this function returns immediately.
+    2. Winning the row CAS is NOT enough for any ONE sibling. ``import_service``'s TV
+       finalize can process several targets of the SAME retry in one transaction: if
+       season 2 (our sibling) succeeds while a DIFFERENT season in that same retry
+       fails, the row's own status is committed right back to ``import_blocked`` --
+       identical to what it was before, just blocked on a different season now. That
+       retry's commit is invisible to the row-level CAS above (``import_blocked ->
+       import_blocked`` is not a value change it can detect), yet the sibling's OWN
+       scope DID move to ``imported`` in that same commit. So each sibling's
+       terminalize-and-rearm is separately gated on its OWN
+       :meth:`SqlDownloadRepository.update_scope_status_if_in` CAS -- won only while
+       that exact scope is STILL in ``_UNRESOLVED_SCOPE_STATUSES`` at write time. A
+       lost scope CAS skips that sibling (honest log, no re-arm); it does not abort
+       the others.
+
+    A final sweep (:func:`_mark_download_scopes_terminal`, unconditional and
+    already race-safe -- it is a single ``UPDATE ... WHERE status IN (...)``) runs
+    AFTER the per-sibling loop to terminalize any stray non-terminal scope this
+    function could not individually re-arm (e.g. one whose owning request/season
+    was already cleared -- see the ``continue`` below), so nothing is orphaned at
+    ``active``/``import_blocked`` once the shared torrent is gone.
+    """
+    siblings: list[tuple[int, int, int, str]] = []
+    for scope in culprit.scopes:
+        if scope.status not in _UNRESOLVED_SCOPE_STATUSES:
+            continue
+        if scope.media_request_id is None or scope.season is None:
+            continue
+        if (scope.media_request_id, scope.season) == (reported_request_id, reported_season):
+            continue
+        siblings.append((scope.media_request_id, scope.season, scope.id, scope.status))
+
+    if not siblings:
+        return
+
+    download_repo = SqlDownloadRepository(session)
+    moved = await download_repo.update_status_if_in(
+        culprit.id,
+        DownloadState.Failed.value,
+        frozenset({DownloadState.ImportBlocked.value}),
+        failed_reason="torn down by a report-issue redo of a shared season pack",
+        clear_download_path=True,
+    )
+    _logger.info(
+        "report_issue: terminalized shared-pack download row",
+        extra={
+            "download_id": safe_int(culprit.id),
+            "moved": moved,
+            **log_extra,
+        },
+    )
+    if not moved:
+        # Lost the row CAS: some other actor already owns this download's status
+        # (a concurrent redo of the same pack, or a legitimate independent
+        # transition). We have no exclusive claim on its scopes -- do NOT
+        # terminalize or re-arm anything from the stale ``siblings`` snapshot.
+        _logger.info(
+            "report_issue: skipped shared-pack sibling rescue -- lost the download-row CAS",
+            extra={"download_id": safe_int(culprit.id), **log_extra},
+        )
+        return
+
+    for sibling_request_id, sibling_season, sibling_scope_id, prior_status in siblings:
+        scope_won = await download_repo.update_scope_status_if_in(
+            sibling_scope_id,
+            RequestStatus.failed.value,
+            _UNRESOLVED_SCOPE_STATUSES,
+        )
+        if not scope_won:
+            # Raced by a concurrent import retry that resolved this exact sibling
+            # scope (e.g. to ``imported``) between the DTO read and this CAS --
+            # honor whoever moved it and never re-arm a season that is no longer
+            # actually unresolved.
+            _logger.info(
+                "report_issue: skipped shared-pack sibling season -- scope left the "
+                "non-terminal set before the rescue could claim it",
+                extra={
+                    "download_id": safe_int(culprit.id),
+                    "sibling_request_id": safe_int(sibling_request_id),
+                    "sibling_season": safe_int(sibling_season),
+                    "prior_scope_status": safe_text(prior_status),
+                    **log_extra,
+                },
+            )
+            continue
+
+        await season_request_service.reset_for_research(
+            session,
+            media_request_id=sibling_request_id,
+            season_number=sibling_season,
+            clear_library_path=False,
+        )
+        _logger.info(
+            "report_issue: rescued shared-pack sibling season",
+            extra={
+                "download_id": safe_int(culprit.id),
+                "sibling_request_id": safe_int(sibling_request_id),
+                "sibling_season": safe_int(sibling_season),
+                "prior_scope_status": safe_text(prior_status),
+                **log_extra,
+            },
+        )
+
+    # Sweep any remaining non-terminal scope on this download that the per-sibling
+    # loop above could not address (e.g. one whose owning request/season was
+    # already cleared to NULL -- filtered out of ``siblings`` since there is
+    # nothing to re-arm). Race-safe on its own (WHERE status IN (...)); harmless
+    # when the loop above already resolved every sibling.
+    await _mark_download_scopes_terminal(session, culprit.id, RequestStatus.failed.value)
 
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal
@@ -747,6 +907,20 @@ async def report_issue(
             )
         else:
             await request_repo.reset_for_research(request_id, clear_library_path=False)
+
+        # Rescue any sibling season(s) of a shared multi-season pack BEFORE the
+        # torrent-with-data removal at (c) below deletes their payload out from
+        # under them (issue #175) -- inside this try/except so a collision here
+        # rolls back everything (blocklist + partial re-arm + rescue) with
+        # NOTHING yet deleted, same as the target re-arm above.
+        if culprit is not None:
+            await _rescue_shared_pack_siblings(
+                session,
+                culprit,
+                reported_request_id=request_id,
+                reported_season=target.season,
+                log_extra=log_extra,
+            )
     except IntegrityError as exc:
         # The re-arm collided on ``uq_media_requests_active`` -- a newer active sibling
         # grabbed the slot between the upfront check and this flush. Roll back (undoing

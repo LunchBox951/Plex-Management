@@ -856,6 +856,404 @@ async def test_report_issue_tv_season_purges_and_parks_on_nothing_acceptable(
     assert blocklist[0].media_type == "tv"
 
 
+async def _seed_partial_shared_pack(
+    sm: SessionMaker,
+    *,
+    tv_root: Path,
+    season_01_dir: Path,
+    season_02_dir: Path | None = None,
+    season_1_status: RequestStatus = RequestStatus.available,
+    season_2_status: RequestStatus = RequestStatus.import_blocked,
+    download_status: str = DownloadState.ImportBlocked.value,
+    season_1_scope_status: str = "imported",
+    season_2_scope_status: str = "import_blocked",
+) -> tuple[int, int, int, int]:
+    """Seed a partial multi-season pack: one shared ``_CULPRIT`` torrent, season 1
+    imported/available, season 2 still non-terminal. Returns
+    ``(request_id, download_id, season1_id, season2_id)``."""
+    async with sm() as session:
+        show = MediaRequest(
+            tmdb_id=1399,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.available,
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=show.id,
+            season_number=1,
+            status=season_1_status,
+            library_path=str(season_01_dir),
+        )
+        season_2 = SeasonRequest(
+            media_request_id=show.id,
+            season_number=2,
+            status=season_2_status,
+            library_path=str(season_02_dir) if season_02_dir is not None else None,
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_CULPRIT,
+            status=download_status,
+            media_request_id=show.id,
+            tmdb_id=1399,
+            season=1,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=show.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status=season_1_scope_status,
+                ),
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=show.id,
+                    season_request_id=season_2.id,
+                    season_number=2,
+                    scope_key="season:2|episodes:*",
+                    status=season_2_scope_status,
+                ),
+                DownloadHistory(
+                    tmdb_id=1399,
+                    torrent_hash=_CULPRIT,
+                    event_type=DownloadHistoryEvent.grabbed,
+                    source_title="Some.Show.S01.1080p.WEB-DL.x264-GROUP",
+                    indexer="FakeIndexer",
+                ),
+            ]
+        )
+        await session.commit()
+        return show.id, download.id, season_1.id, season_2.id
+
+
+async def test_report_issue_rescues_a_shared_pack_sibling_season(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    tv_root = tmp_path / "tv"
+    season_01_dir = tv_root / "Some Show" / "Season 01"
+    season_01_dir.mkdir(parents=True)
+    (season_01_dir / "Some.Show.S01E01.mkv").write_bytes(b"x" * 2048)
+
+    request_id, download_id, _season1_id, _season2_id = await _seed_partial_shared_pack(
+        sessionmaker_, tv_root=tv_root, season_01_dir=season_01_dir
+    )
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            # Only the culprit release is on offer -> blocklisted -> the reported
+            # season parks; the sibling rescue is unrelated to what is on offer.
+            FakeProwlarr([candidate("Some.Show.S01.1080p.WEB-DL.x264-GROUP", info_hash=_CULPRIT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert (_CULPRIT, True) in qbt.removed
+    assert not season_01_dir.exists()
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest)
+                    .where(SeasonRequest.media_request_id == request_id)
+                    .order_by(SeasonRequest.season_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        season_1, season_2 = seasons
+        download = await session.get(Download, download_id)
+        assert download is not None
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scope_by_season = {scope.season_number: scope for scope in scopes}
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+
+    assert season_2.status == RequestStatus.searching  # rescued, not orphaned
+    assert season_1.status == RequestStatus.no_acceptable_release  # parked honestly
+    assert download.status == DownloadState.Failed.value  # no zombie import_blocked row
+    assert scope_by_season[2].status == "failed"  # terminalized
+    assert scope_by_season[1].status == "imported"  # untouched
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _CULPRIT
+    assert blocklist[0].media_type == "tv"
+
+
+async def test_report_issue_shared_pack_sibling_scope_becomes_reattachable(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    tv_root = tmp_path / "tv"
+    season_01_dir = tv_root / "Some Show" / "Season 01"
+    season_01_dir.mkdir(parents=True)
+    (season_01_dir / "Some.Show.S01E01.mkv").write_bytes(b"x" * 2048)
+
+    request_id, _download_id, _season1_id, season2_id = await _seed_partial_shared_pack(
+        sessionmaker_, tv_root=tv_root, season_01_dir=season_01_dir
+    )
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([candidate("Some.Show.S01.1080p.WEB-DL.x264-GROUP", info_hash=_CULPRIT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    async with sessionmaker_() as session:
+        new_download = Download(
+            torrent_hash="b" * 40,
+            status=DownloadState.Downloading.value,
+            media_request_id=request_id,
+            tmdb_id=1399,
+            season=2,
+        )
+        session.add(new_download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=new_download.id,
+                media_request_id=request_id,
+                season_request_id=season2_id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="active",
+            )
+        )
+        # Must NOT raise IntegrityError on uq_download_scopes_active_scope -- the
+        # old sibling scope was terminalized to 'failed' by the rescue.
+        await session.flush()
+
+        old_scope = (
+            await session.execute(
+                select(DownloadScope).where(
+                    DownloadScope.media_request_id == request_id,
+                    DownloadScope.season_number == 2,
+                    DownloadScope.download_id != new_download.id,
+                )
+            )
+        ).scalar_one()
+        assert old_scope.status == "failed"
+
+
+async def test_report_issue_does_not_rearm_an_already_imported_sibling(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    tv_root = tmp_path / "tv"
+    season_01_dir = tv_root / "Some Show" / "Season 01"
+    season_02_dir = tv_root / "Some Show" / "Season 02"
+    season_01_dir.mkdir(parents=True)
+    season_02_dir.mkdir(parents=True)
+    (season_01_dir / "Some.Show.S01E01.mkv").write_bytes(b"x" * 2048)
+    (season_02_dir / "Some.Show.S02E01.mkv").write_bytes(b"x" * 2048)
+
+    request_id, download_id, _season1_id, _season2_id = await _seed_partial_shared_pack(
+        sessionmaker_,
+        tv_root=tv_root,
+        season_01_dir=season_01_dir,
+        season_02_dir=season_02_dir,
+        season_2_status=RequestStatus.available,
+        download_status="imported",
+        season_2_scope_status="imported",
+    )
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([candidate("Some.Show.S01.1080p.WEB-DL.x264-GROUP", info_hash=_CULPRIT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert (_CULPRIT, True) in qbt.removed
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest)
+                    .where(SeasonRequest.media_request_id == request_id)
+                    .order_by(SeasonRequest.season_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        season_1, season_2 = seasons
+        download = await session.get(Download, download_id)
+        assert download is not None
+        scope_2 = (
+            await session.execute(
+                select(DownloadScope).where(
+                    DownloadScope.download_id == download_id,
+                    DownloadScope.season_number == 2,
+                )
+            )
+        ).scalar_one()
+
+    assert season_1.status == RequestStatus.no_acceptable_release
+    assert season_2.status == RequestStatus.available  # untouched -- no spurious re-arm
+    assert scope_2.status == "imported"
+    assert download.status == "imported"  # CAS gated on {ImportBlocked} no-ops
+
+
+async def test_report_issue_does_not_rearm_a_sibling_completed_by_a_racing_import(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # P2 hardening: the rescue's ``siblings`` list is built from the ``culprit.scopes``
+    # DTO snapshot, read BEFORE the rescue's own writes. Simulate a concurrent import
+    # retry that completes season 2 (its DownloadScope -> 'imported') in the gap
+    # between that snapshot and the rescue's per-sibling compare-and-set: the season-2
+    # scope-level CAS must lose (the scope is no longer in the non-terminal set) and
+    # the season must NOT be re-armed -- re-arming already-available content back to
+    # 'searching' risks a needless duplicate re-grab. The download-ROW CAS still wins
+    # (untouched by the race), so the rescue proceeds for the row but must still
+    # individually honor the sibling's own, separately-raced status.
+    tv_root = tmp_path / "tv"
+    season_01_dir = tv_root / "Some Show" / "Season 01"
+    season_01_dir.mkdir(parents=True)
+    (season_01_dir / "Some.Show.S01E01.mkv").write_bytes(b"x" * 2048)
+
+    request_id, download_id, _season1_id, _season2_id = await _seed_partial_shared_pack(
+        sessionmaker_, tv_root=tv_root, season_01_dir=season_01_dir
+    )
+
+    real_update_status_if_in = SqlDownloadRepository.update_status_if_in
+    raced = {"done": False}
+
+    async def racing_update_status_if_in(
+        self: SqlDownloadRepository,
+        download_id_: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        failed_reason: str | None = None,
+        clear_download_path: bool = False,
+    ) -> bool:
+        # Matches ONLY the rescue's own download-row CAS (this exact target status +
+        # predicate) so a later, unrelated CAS in the same flow (e.g. the inline
+        # replacement grab's row reuse) is never intercepted. The keyword-only
+        # params mirror exactly what the rescue's call site passes -- no ``**kwargs``
+        # forwarding, so this stays typed under strict pyright.
+        if (
+            not raced["done"]
+            and download_id_ == download_id
+            and status == DownloadState.Failed.value
+            and allowed_from == frozenset({DownloadState.ImportBlocked.value})
+        ):
+            raced["done"] = True
+            async with sessionmaker_() as competitor:
+                scope = (
+                    await competitor.execute(
+                        select(DownloadScope).where(
+                            DownloadScope.download_id == download_id_,
+                            DownloadScope.season_number == 2,
+                        )
+                    )
+                ).scalar_one()
+                scope.status = "imported"
+                await competitor.commit()
+        return await real_update_status_if_in(
+            self,
+            download_id_,
+            status,
+            allowed_from,
+            failed_reason=failed_reason,
+            clear_download_path=clear_download_path,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "update_status_if_in", racing_update_status_if_in)
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([candidate("Some.Show.S01.1080p.WEB-DL.x264-GROUP", info_hash=_CULPRIT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert (_CULPRIT, True) in qbt.removed
+    assert raced["done"]  # the race actually fired -- a false pass would prove nothing
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest)
+                    .where(SeasonRequest.media_request_id == request_id)
+                    .order_by(SeasonRequest.season_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        season_1, season_2 = seasons
+        download = await session.get(Download, download_id)
+        assert download is not None
+        scope_2 = (
+            await session.execute(
+                select(DownloadScope).where(
+                    DownloadScope.download_id == download_id,
+                    DownloadScope.season_number == 2,
+                )
+            )
+        ).scalar_one()
+
+    assert season_1.status == RequestStatus.no_acceptable_release  # parked honestly
+    # NOT re-armed: the racing import's completion beat the rescue's scope-level CAS.
+    assert season_2.status == RequestStatus.import_blocked  # untouched, original status
+    assert scope_2.status == "imported"  # the race's write stands -- never overwritten
+    assert download.status == DownloadState.Failed.value  # row CAS still won independently
+
+
 async def test_report_issue_tv_requires_a_season(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
