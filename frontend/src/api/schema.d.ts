@@ -832,6 +832,9 @@ export interface paths {
          *     Setup mints no key, so a fresh install has none to reveal: that is an honest
          *     ``app_key_not_set`` envelope (404) whose hint points the operator at the
          *     Generate control, never a bare/opaque failure (north star #3).
+         *
+         *     The success response never touches an intermediate cache (issue #208): the
+         *     plaintext key is a recovery credential, not cacheable content.
          */
         get: operations["reveal_app_key_endpoint_api_v1_settings_app_key_get"];
         put?: never;
@@ -880,7 +883,8 @@ export interface paths {
          *     (``app_api_key IS NULL``) it GENERATES the first key (the CAS below has nothing
          *     to compare against, so it simply mints); when a key exists it ROTATES,
          *     invalidating the old one. Both run under ``_rotate_lock`` and return the
-         *     plaintext exactly once.
+         *     plaintext exactly once. Like the plaintext GET, the response is never
+         *     cache-eligible (issue #208).
          *
          *     Every OTHER device/browser with the OLD key saved (localStorage) is
          *     immediately locked out -- there is exactly one live key at a time, matching

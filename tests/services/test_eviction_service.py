@@ -20,7 +20,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import pytest
 from sqlalchemy import select
@@ -55,6 +55,12 @@ _NOW = datetime.now(UTC)
 _GRACE_DAYS = 30
 _STALE = _NOW - timedelta(days=_GRACE_DAYS + 10)
 _RECENT = _NOW - timedelta(days=1)
+# The cutoff ``run_eviction_sweep`` would compute for ``_GRACE_DAYS`` -- passed
+# explicitly by every test that calls ``_evict_one`` directly (bypassing
+# ``run_eviction_sweep``, which normally computes and threads it), so the #209
+# pre-claim re-read's watched+grace check evaluates the same way a real sweep's
+# would.
+_GRACE_CUTOFF = _NOW - timedelta(days=_GRACE_DAYS)
 
 
 async def _heartbeat_ticks_during[T](
@@ -1419,7 +1425,14 @@ async def test_recheck_honors_a_keep_forever_pin_that_lands_after_assembly(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(300, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -1488,7 +1501,14 @@ async def test_recheck_honors_a_keep_forever_pin_on_the_parent_for_a_tv_season(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(301, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -1551,7 +1571,14 @@ async def test_recheck_skips_a_row_a_concurrent_sweep_already_evicted(
 
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(302, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None  # never double-counted
@@ -1819,9 +1846,14 @@ async def test_concurrent_evict_one_calls_for_the_same_row_never_double_count(
             return await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
                 session=second_session,
                 fs=fs,
-                library=FakeLibrary(),
+                library=FakeLibrary(
+                    watch_states={
+                        (320, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                    }
+                ),
                 candidate=stale,
                 pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
             )
 
     fs = _ConcurrentSecondEvictFs(loop=asyncio.get_running_loop(), second_call=_second_call)
@@ -1831,9 +1863,14 @@ async def test_concurrent_evict_one_calls_for_the_same_row_never_double_count(
             first_outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
                 session=first_session,
                 fs=fs,
-                library=FakeLibrary(),
+                library=FakeLibrary(
+                    watch_states={
+                        (320, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                    }
+                ),
                 candidate=stale,
                 pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
             )
 
         # EXACTLY ONE of the two overlapping calls actually recorded the
@@ -1923,7 +1960,14 @@ async def test_claim_refuses_to_delete_a_movie_pinned_before_the_claim(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(400, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2003,7 +2047,14 @@ async def test_claim_refuses_to_delete_a_season_whose_parent_pinned_before_the_c
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(401, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2061,7 +2112,14 @@ async def test_claim_loser_on_a_concurrent_status_change_never_deletes(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(402, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2119,7 +2177,14 @@ async def test_failed_delete_restores_the_claimed_row_to_available(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(403, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2181,7 +2246,14 @@ async def test_deferred_purge_does_not_restore_while_replacement_import_owns_pat
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(423, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2277,7 +2349,14 @@ async def test_tv_purge_registration_stays_held_until_eviction_finalizes(
     fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(424, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is not None
@@ -2340,7 +2419,14 @@ async def test_failed_season_delete_restores_the_claimed_season_to_available(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(404, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2422,7 +2508,14 @@ async def test_failed_season_delete_after_rearm_keeps_the_breadcrumb(
     fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(811, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -2499,7 +2592,14 @@ async def test_successful_season_delete_after_rearm_clears_the_breadcrumb_once(
     fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(812, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is not None  # the eviction finalized
@@ -2926,7 +3026,14 @@ async def test_failed_delete_restore_cancels_the_in_window_movie_regrab(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(620, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -3001,7 +3108,14 @@ async def test_failed_delete_restore_never_cancels_an_operator_forced_reacquire(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(622, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -3070,7 +3184,14 @@ async def test_failed_delete_restore_leaves_a_regrab_that_already_grabbed(
     fs = LocalFileSystem(library_roots=[str(tmp_path)])
     async with sessionmaker_() as session:
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(621, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is None
@@ -4335,7 +4456,14 @@ async def test_finalize_flips_a_cancelled_rearm_to_evicted_and_the_guard_holds(
         )
         fs = LocalFileSystem(library_roots=[str(tmp_path)])
         outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
-            session=session, fs=fs, library=FakeLibrary(), candidate=stale, pending=pending
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(680, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
         )
 
     assert outcome is not None  # the eviction itself completed
@@ -4584,3 +4712,371 @@ async def test_sweep_folds_a_cancelled_rearm_with_the_file_present_to_available(
     assert season_row.status is RequestStatus.available  # folded: disk truth
     assert season_row.library_path == s1_path  # handle kept for eviction/report
     assert show is not None and show.status is RequestStatus.available
+
+
+# --------------------------------------------------------------------------- #
+# Issues #207/#209: path-correlated watch state, re-read immediately before
+# the claim. #207 lives mostly in the adapter (tests/adapters/plex/
+# test_plex_library.py); the tests below cover the SERVICE-side wiring (the
+# path is actually threaded through) plus the FakeLibrary-modeled behavior a
+# path-correlated verdict produces, and #209's pre-claim re-read in full.
+# --------------------------------------------------------------------------- #
+
+
+async def test_eviction_threads_library_path_into_watch_state(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "Threaded Movie.mkv")
+    await _movie(sessionmaker_, tmdb_id=700, title="Threaded Movie", library_path=library_path)
+    library = FakeLibrary(
+        watch_states={(700, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    # Assembly read + the #209 pre-claim re-read both carry the row's own
+    # breadcrumb -- never an untargeted read.
+    assert library.watch_state_path_calls == [library_path, library_path]
+
+
+async def test_eviction_threads_season_library_path_into_watch_state(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    s1_path = _movie_file(tmp_path, "Threaded Show S01.mkv")
+    await _show_with_seasons(
+        sessionmaker_, tmdb_id=701, title="Threaded Show", seasons={1: s1_path}
+    )
+    library = FakeLibrary(
+        watch_states={(701, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert library.watch_state_path_calls == [s1_path, s1_path]
+
+
+async def test_path_correlated_unwatched_verdict_prevents_deletion(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """#207: a tmdb-keyed 'watched' verdict (as if a DUPLICATE elsewhere were
+    watched) must never authorize deleting THIS candidate's own file once the
+    adapter's path-correlated read says otherwise."""
+    library_path = _movie_file(tmp_path, "Duplicate Target.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=702, title="Duplicate Target", library_path=library_path
+    )
+    library = FakeLibrary(
+        # The untargeted (legacy/tmdb-keyed) read says watched -- what a
+        # first-match-across-sections bug would have used.
+        watch_states={(702, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)},
+        # The path-correlated read -- what the real adapter would resolve
+        # for THIS exact candidate's file -- says unwatched.
+        watch_states_by_path={library_path: WatchState(watched=False, last_viewed_at=None)},
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available
+
+
+async def test_path_correlated_unwatched_verdict_prevents_season_deletion(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    s1_path = _movie_file(tmp_path, "Duplicate Show S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=703, title="Duplicate Show", seasons={1: s1_path}
+    )
+    library = FakeLibrary(
+        watch_states={(703, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)},
+        watch_states_by_path={s1_path: WatchState(watched=False, last_viewed_at=None)},
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.status is RequestStatus.available
+
+
+class _RewatchDuringSweepLibrary(FakeLibrary):
+    """Watch state flips from stale-watched to just-watched AFTER the first
+    (assembly) read for a given tmdb id -- models a rewatch landing during the
+    sweep, between candidate assembly and the #209 pre-claim re-read."""
+
+    def __init__(self, *, target_tmdb_id: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._target_tmdb_id = target_tmdb_id
+        self.calls_for_target = 0
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        season: int | None = None,
+        library_path: str | None = None,
+    ) -> WatchState:
+        result = await super().watch_state(
+            tmdb_id,
+            cast(Literal["movie", "tv"], media_type),
+            season=season,
+            library_path=library_path,
+        )
+        if tmdb_id == self._target_tmdb_id:
+            self.calls_for_target += 1
+            if self.calls_for_target > 1:
+                return WatchState(watched=True, last_viewed_at=_RECENT)
+        return result
+
+
+async def test_rewatch_during_sweep_is_re_read_before_claim_and_survives(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "Rewatched.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=704, title="Rewatched", library_path=library_path
+    )
+    library = _RewatchDuringSweepLibrary(
+        target_tmdb_id=704,
+        watch_states={(704, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)},
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available
+    # Assembly + the pre-claim re-read: at least two reads for the target tmdb.
+    assert library.calls_for_target >= 2
+
+
+async def test_rewatch_of_one_candidate_does_not_spare_the_others(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The #209 re-read is per-candidate: one rewatch must never abort or
+    spare the REST of the sweep."""
+    a_path = _movie_file(tmp_path, "Rewatched A.mkv")
+    b_path = _movie_file(tmp_path, "Stays Stale B.mkv")
+    a_id = await _movie(sessionmaker_, tmdb_id=705, title="Rewatched A", library_path=a_path)
+    await _movie(sessionmaker_, tmdb_id=706, title="Stays Stale B", library_path=b_path)
+    library = _RewatchDuringSweepLibrary(
+        target_tmdb_id=705,
+        watch_states={
+            (705, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (706, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        },
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert [o.title for o in outcomes] == ["Stays Stale B"]
+    assert Path(a_path).exists()  # rewatched -- survives
+    assert not Path(b_path).exists()  # never rewatched -- evicted normally
+    async with sessionmaker_() as session:
+        a_row = await session.get(MediaRequest, a_id)
+        assert a_row is not None
+        assert a_row.status is RequestStatus.available
+
+
+class _RaisesOnSecondWatchStateCall(FakeLibrary):
+    """The assembly read succeeds; the #209 pre-claim re-read (the SECOND call
+    for the same tmdb id) raises ``PlexLibraryError``."""
+
+    def __init__(self, *, target_tmdb_id: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._target_tmdb_id = target_tmdb_id
+        self._calls_for_target = 0
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        season: int | None = None,
+        library_path: str | None = None,
+    ) -> WatchState:
+        if tmdb_id == self._target_tmdb_id:
+            self._calls_for_target += 1
+            if self._calls_for_target > 1:
+                raise PlexLibraryError("simulated Plex outage on the pre-claim re-read")
+        return await super().watch_state(
+            tmdb_id,
+            cast(Literal["movie", "tv"], media_type),
+            season=season,
+            library_path=library_path,
+        )
+
+
+async def test_watch_state_error_before_claim_fails_closed(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    library_path = _movie_file(tmp_path, "Errors On Recheck.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=707, title="Errors On Recheck", library_path=library_path
+    )
+    library = _RaisesOnSecondWatchStateCall(
+        target_tmdb_id=707,
+        watch_states={(707, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)},
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.eviction_service"):
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    assert "could not re-read Plex watch state" in caplog.text
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available
+
+
+class _AbsentOnSecondWatchStateCall(FakeLibrary):
+    """The assembly read succeeds; the #209 pre-claim re-read (the SECOND call
+    for the same tmdb id) finds NO correlated item at all -- e.g. the
+    duplicate that used to back the tmdb-keyed read is gone. This must fail
+    closed exactly like an outright error, not merely skip re-checking."""
+
+    def __init__(self, *, target_tmdb_id: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._target_tmdb_id = target_tmdb_id
+        self._calls_for_target = 0
+
+    async def watch_state(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        season: int | None = None,
+        library_path: str | None = None,
+    ) -> WatchState:
+        if tmdb_id == self._target_tmdb_id:
+            self._calls_for_target += 1
+            if self._calls_for_target > 1:
+                return WatchState(watched=False, last_viewed_at=None)
+        return await super().watch_state(
+            tmdb_id,
+            cast(Literal["movie", "tv"], media_type),
+            season=season,
+            library_path=library_path,
+        )
+
+
+async def test_watch_state_absent_before_claim_fails_closed(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "No Longer Correlated.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=708, title="No Longer Correlated", library_path=library_path
+    )
+    library = _AbsentOnSecondWatchStateCall(
+        target_tmdb_id=708,
+        watch_states={(708, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)},
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.status is RequestStatus.available
