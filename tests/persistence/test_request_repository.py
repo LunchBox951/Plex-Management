@@ -605,6 +605,58 @@ async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> No
     assert await repo.rearm_false_available_to_pending(with_path.id) is False
 
 
+async def test_delete_false_available_sibling_collapse_cas(session: AsyncSession) -> None:
+    """Succeeds ONLY when the row's ownership at delete time still matches the
+    caller's snapshot -- guards the window between the heal pass's
+    top-of-cycle candidate read and this delete, in which a concurrent user
+    create can claim (adopt) an ownerless false-claim row out from under it."""
+    repo = SqlRequestRepository(session)
+    row = await repo.create(tmdb_id=24, media_type="movie", title="Loser", status="available")
+
+    # Ownership changed since the (implied) candidate read: expecting ownerless
+    # but the row now belongs to a real user -- the CAS must refuse.
+    user = User(username="claimer", permissions=0)
+    session.add(user)
+    await session.flush()
+    orm_row = await session.get(MediaRequest, row.id)
+    assert orm_row is not None
+    orm_row.user_id = user.id
+    await session.flush()
+    assert (
+        await repo.delete_false_available_sibling_collapse(row.id, expected_user_id=None) is False
+    )
+    survivor = await repo.get(row.id)
+    assert survivor is not None  # NOT deleted
+    assert survivor.user_id == user.id
+
+    # Ownership UNCHANGED (still that same user) -- the CAS succeeds.
+    assert (
+        await repo.delete_false_available_sibling_collapse(row.id, expected_user_id=user.id) is True
+    )
+    assert await repo.get(row.id) is None
+
+    # A genuinely ownerless row deletes when expected_user_id is None.
+    ownerless = await repo.create(
+        tmdb_id=25, media_type="movie", title="Ownerless", status="available"
+    )
+    assert (
+        await repo.delete_false_available_sibling_collapse(ownerless.id, expected_user_id=None)
+        is True
+    )
+    assert await repo.get(ownerless.id) is None
+
+    # A row that carries a real library_path is never the false-claim signature.
+    with_path = await repo.create(
+        tmdb_id=26, media_type="movie", title="WithPath", status="available"
+    )
+    await repo.set_library_path(with_path.id, "/movies/w")
+    assert (
+        await repo.delete_false_available_sibling_collapse(with_path.id, expected_user_id=None)
+        is False
+    )
+    assert await repo.get(with_path.id) is not None
+
+
 async def test_latest_library_path_returns_newest_breadcrumb(session: AsyncSession) -> None:
     """Across several rows for the same media, returns the NEWEST non-NULL
     ``library_path``; ``None`` when none carry one."""

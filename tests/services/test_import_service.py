@@ -50,6 +50,7 @@ from plex_manager.ports.media_probe import (
 )
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
+from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import (
     eviction_service,
     import_service,
@@ -4137,6 +4138,47 @@ async def test_heal_collapses_null_path_available_onto_real_path_sibling(
     )
 
 
+async def test_heal_sibling_collapse_cas_skips_when_ownership_changed_since_read(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``delete_false_available_sibling_collapse`` must not delete a row whose
+    ownership no longer matches the caller's snapshot -- the CAS guarding
+    the exact race a concurrent user create's adoption
+    (``request_service._claim_dedup_winner_if_unowned``) can win in the
+    multi-second window between the heal pass's top-of-cycle candidate read
+    and this delete: an ownerless false-available row is claimed by user X's
+    concurrent create (``find_in_library`` ranks it above a foreign-owned
+    real-path sibling) before the heal ever reaches its delete call. A plain
+    unconditional delete would silently vanish X's just-succeeded request."""
+    tmdb_id = 9001
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=tmdb_id, status=RequestStatus.available, library_path=None
+    )
+    async with sessionmaker_() as session:
+        owner_x = User(username="owner-x", permissions=0)
+        session.add(owner_x)
+        await session.commit()
+        owner_x_id = owner_x.id
+        # Simulate a concurrent create claiming the ownerless candidate in the
+        # window between the heal pass's candidate read and its delete.
+        row = await session.get(MediaRequest, row_id)
+        assert row is not None
+        row.user_id = owner_x_id
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        repo = SqlRequestRepository(session)
+        deleted = await repo.delete_false_available_sibling_collapse(row_id, expected_user_id=None)
+        await session.commit()
+    assert deleted is False  # ownership moved off the read snapshot -- CAS refuses
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None  # NOT deleted -- X's now-claimed row survives
+    assert row.user_id == owner_x_id
+    assert row.status == RequestStatus.available
+
+
 async def test_heal_restamps_when_genuinely_present(sessionmaker_: SessionMaker) -> None:
     """No sibling, but a live GUID check confirms Plex genuinely has it after all
     -- re-stamp ``library_verified_at``, leave the row 'available'/NULL-path, and
@@ -4276,14 +4318,16 @@ async def test_heal_differing_owner_sibling_not_deleted(sessionmaker_: SessionMa
     assert a.library_verified_at is not None  # healed via the GUID branch instead
 
 
-async def test_heal_cross_owner_sibling_corroborated_by_path_is_stamped_verified(
+async def test_heal_cross_owner_sibling_corroborated_by_path_still_rearms(
     sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A cross-owner sibling's ``library_path`` is left uncollapsed by the
-    ownership guard (issue #58) AND the GUID batch misses this row -- but the
-    path fallback (issue #158) corroborates the sibling's directory is
-    genuinely indexed in Plex. The row must be stamped verified (converged),
-    never blindly re-armed to search for content that is already on disk."""
+    ownership guard (issue #58) AND the GUID batch misses this row -- the path
+    fallback (issue #158) corroborates the sibling's directory is genuinely
+    indexed in Plex, but that is a DIFFERENT owner's copy, not this row's own.
+    The row must still re-arm to pending (never a one-way convergence stamp
+    keyed on another owner's file, which would strand it permanently
+    'available' with no re-heal path if that sibling is later evicted)."""
     tmdb_id = 782
     async with sessionmaker_() as session:
         owner_a = User(username="owner-a2", permissions=0)
@@ -4315,14 +4359,15 @@ async def test_heal_cross_owner_sibling_corroborated_by_path_is_stamped_verified
 
     async with sessionmaker_() as session:
         a = await session.get(MediaRequest, row_a)
-    assert a is not None  # NOT deleted, NOT re-armed
-    assert a.status == RequestStatus.available
+    assert a is not None  # NOT deleted
+    assert a.status == RequestStatus.pending  # re-armed, not converged
     assert a.library_path is None
-    assert a.available_heal_verified_at is not None  # converged
+    assert a.available_heal_verified_at is None  # never one-way-stamped on another owner's file
     assert library.confirm_paths_calls == [("movie", frozenset({"/movies/cross-owner"}))]
     assert any(
         "cross-owner sibling's library_path corroborated" in r.getMessage() for r in caplog.records
     )
+    assert any("re-armed to pending" in r.getMessage() for r in caplog.records)
 
 
 async def test_heal_cross_owner_sibling_unconfirmed_by_path_still_rearms(

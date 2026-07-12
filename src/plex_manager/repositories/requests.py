@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, case, func, insert, or_, select, update
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import aliased
@@ -575,6 +576,46 @@ class SqlRequestRepository:
                 .execution_options(synchronize_session="fetch")
             ),
         )
+        return result.rowcount == 1
+
+    async def delete_false_available_sibling_collapse(
+        self, request_id: int, *, expected_user_id: int | None
+    ) -> bool:
+        """CAS-delete a false-available heal candidate collapsing onto a sibling
+        (branch 1 of ``_heal_false_available_movies``'s sibling collapse).
+
+        A single ``DELETE ... WHERE id = ? AND status = 'available' AND
+        library_path IS NULL AND user_id IS <expected_user_id>`` -- the DATABASE,
+        not the caller's earlier read, decides whether the row's ownership is
+        STILL exactly what the caller's ownership-guard decision (mirroring
+        ``request_service._owned_by_another_user``) was computed against.
+
+        Why this matters (issue #58 class): the heal pass reads its candidates'
+        owners once, at the very top of ``run_availability_cycle``, then does a
+        ``present_ids`` Plex crawl and (for cross-owner siblings) a
+        ``confirm_paths`` crawl before this delete ever fires -- a multi-second
+        window. An OWNERLESS candidate (``expected_user_id`` ``None``) ranks
+        ABOVE a foreign-owned real-path sibling in ``find_in_library``, so a
+        concurrent user create can adopt (claim) that exact row in the window
+        and return it as THEIR just-succeeded request. A plain ``delete(id)``
+        would then silently vanish that user's request. This CAS ties the
+        delete to the SAME ownership snapshot the caller's safe-sibling
+        decision used: if a concurrent claim (or any other write) has moved the
+        row off that exact ``(status, library_path, user_id)`` signature,
+        ``rowcount`` is 0 and nothing is deleted -- the caller must leave the
+        row for the next cycle to re-evaluate from scratch, never blindly retry
+        the delete against the new owner.
+        """
+        stmt = sa_delete(MediaRequest).where(
+            MediaRequest.id == request_id,
+            MediaRequest.status == RequestStatus.available,
+            MediaRequest.library_path.is_(None),
+        )
+        if expected_user_id is None:
+            stmt = stmt.where(MediaRequest.user_id.is_(None))
+        else:
+            stmt = stmt.where(MediaRequest.user_id == expected_user_id)
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
         return result.rowcount == 1
 
     async def latest_library_path(self, tmdb_id: int, media_type: str) -> str | None:
