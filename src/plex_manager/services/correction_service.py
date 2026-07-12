@@ -325,8 +325,41 @@ async def _rescue_shared_pack_siblings(
     A no-op (returns immediately) for movies and any single-season / fully-imported
     pack: it is only sibling ``active``/``import_blocked`` scopes -- OTHER than the
     one being reported -- that trigger the rescue, so the fix is surgical.
+
+    Race safety (two independent CAS layers, both required): ``siblings`` is built
+    from ``culprit.scopes``, a DTO snapshot read BEFORE this function's own writes --
+    a concurrent import retry can complete a sibling (its scope -> ``imported``)
+    anywhere in the gap between that read and this function actually running. Acting
+    on the stale snapshot alone would re-arm an already-satisfied season back to
+    ``searching``, and a later re-search could grab a needless duplicate.
+
+    1. The DOWNLOAD-ROW CAS below (``update_status_if_in``) must be WON before
+       touching any scope: losing it means a different actor (another concurrent
+       report-issue redo of the same pack, or the row reaching a terminal status on
+       its own) already owns this download, so nothing here is re-derived from a
+       stale read of a row we do not control -- this function returns immediately.
+    2. Winning the row CAS is NOT enough for any ONE sibling. ``import_service``'s TV
+       finalize can process several targets of the SAME retry in one transaction: if
+       season 2 (our sibling) succeeds while a DIFFERENT season in that same retry
+       fails, the row's own status is committed right back to ``import_blocked`` --
+       identical to what it was before, just blocked on a different season now. That
+       retry's commit is invisible to the row-level CAS above (``import_blocked ->
+       import_blocked`` is not a value change it can detect), yet the sibling's OWN
+       scope DID move to ``imported`` in that same commit. So each sibling's
+       terminalize-and-rearm is separately gated on its OWN
+       :meth:`SqlDownloadRepository.update_scope_status_if_in` CAS -- won only while
+       that exact scope is STILL in ``_UNRESOLVED_SCOPE_STATUSES`` at write time. A
+       lost scope CAS skips that sibling (honest log, no re-arm); it does not abort
+       the others.
+
+    A final sweep (:func:`_mark_download_scopes_terminal`, unconditional and
+    already race-safe -- it is a single ``UPDATE ... WHERE status IN (...)``) runs
+    AFTER the per-sibling loop to terminalize any stray non-terminal scope this
+    function could not individually re-arm (e.g. one whose owning request/season
+    was already cleared -- see the ``continue`` below), so nothing is orphaned at
+    ``active``/``import_blocked`` once the shared torrent is gone.
     """
-    siblings: list[tuple[int, int, str]] = []
+    siblings: list[tuple[int, int, int, str]] = []
     for scope in culprit.scopes:
         if scope.status not in _UNRESOLVED_SCOPE_STATUSES:
             continue
@@ -334,12 +367,13 @@ async def _rescue_shared_pack_siblings(
             continue
         if (scope.media_request_id, scope.season) == (reported_request_id, reported_season):
             continue
-        siblings.append((scope.media_request_id, scope.season, scope.status))
+        siblings.append((scope.media_request_id, scope.season, scope.id, scope.status))
 
     if not siblings:
         return
 
-    moved = await SqlDownloadRepository(session).update_status_if_in(
+    download_repo = SqlDownloadRepository(session)
+    moved = await download_repo.update_status_if_in(
         culprit.id,
         DownloadState.Failed.value,
         frozenset({DownloadState.ImportBlocked.value}),
@@ -354,10 +388,41 @@ async def _rescue_shared_pack_siblings(
             **log_extra,
         },
     )
+    if not moved:
+        # Lost the row CAS: some other actor already owns this download's status
+        # (a concurrent redo of the same pack, or a legitimate independent
+        # transition). We have no exclusive claim on its scopes -- do NOT
+        # terminalize or re-arm anything from the stale ``siblings`` snapshot.
+        _logger.info(
+            "report_issue: skipped shared-pack sibling rescue -- lost the download-row CAS",
+            extra={"download_id": safe_int(culprit.id), **log_extra},
+        )
+        return
 
-    await _mark_download_scopes_terminal(session, culprit.id, RequestStatus.failed.value)
+    for sibling_request_id, sibling_season, sibling_scope_id, prior_status in siblings:
+        scope_won = await download_repo.update_scope_status_if_in(
+            sibling_scope_id,
+            RequestStatus.failed.value,
+            _UNRESOLVED_SCOPE_STATUSES,
+        )
+        if not scope_won:
+            # Raced by a concurrent import retry that resolved this exact sibling
+            # scope (e.g. to ``imported``) between the DTO read and this CAS --
+            # honor whoever moved it and never re-arm a season that is no longer
+            # actually unresolved.
+            _logger.info(
+                "report_issue: skipped shared-pack sibling season -- scope left the "
+                "non-terminal set before the rescue could claim it",
+                extra={
+                    "download_id": safe_int(culprit.id),
+                    "sibling_request_id": safe_int(sibling_request_id),
+                    "sibling_season": safe_int(sibling_season),
+                    "prior_scope_status": safe_text(prior_status),
+                    **log_extra,
+                },
+            )
+            continue
 
-    for sibling_request_id, sibling_season, prior_status in siblings:
         await season_request_service.reset_for_research(
             session,
             media_request_id=sibling_request_id,
@@ -374,6 +439,13 @@ async def _rescue_shared_pack_siblings(
                 **log_extra,
             },
         )
+
+    # Sweep any remaining non-terminal scope on this download that the per-sibling
+    # loop above could not address (e.g. one whose owning request/season was
+    # already cleared to NULL -- filtered out of ``siblings`` since there is
+    # nothing to re-arm). Race-safe on its own (WHERE status IN (...)); harmless
+    # when the loop above already resolved every sibling.
+    await _mark_download_scopes_terminal(session, culprit.id, RequestStatus.failed.value)
 
 
 # The ACTIVE download states a cancel may fail out from under -- every non-terminal

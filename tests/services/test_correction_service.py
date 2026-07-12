@@ -1137,6 +1137,123 @@ async def test_report_issue_does_not_rearm_an_already_imported_sibling(
     assert download.status == "imported"  # CAS gated on {ImportBlocked} no-ops
 
 
+async def test_report_issue_does_not_rearm_a_sibling_completed_by_a_racing_import(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # P2 hardening: the rescue's ``siblings`` list is built from the ``culprit.scopes``
+    # DTO snapshot, read BEFORE the rescue's own writes. Simulate a concurrent import
+    # retry that completes season 2 (its DownloadScope -> 'imported') in the gap
+    # between that snapshot and the rescue's per-sibling compare-and-set: the season-2
+    # scope-level CAS must lose (the scope is no longer in the non-terminal set) and
+    # the season must NOT be re-armed -- re-arming already-available content back to
+    # 'searching' risks a needless duplicate re-grab. The download-ROW CAS still wins
+    # (untouched by the race), so the rescue proceeds for the row but must still
+    # individually honor the sibling's own, separately-raced status.
+    tv_root = tmp_path / "tv"
+    season_01_dir = tv_root / "Some Show" / "Season 01"
+    season_01_dir.mkdir(parents=True)
+    (season_01_dir / "Some.Show.S01E01.mkv").write_bytes(b"x" * 2048)
+
+    request_id, download_id, _season1_id, _season2_id = await _seed_partial_shared_pack(
+        sessionmaker_, tv_root=tv_root, season_01_dir=season_01_dir
+    )
+
+    real_update_status_if_in = SqlDownloadRepository.update_status_if_in
+    raced = {"done": False}
+
+    async def racing_update_status_if_in(
+        self: SqlDownloadRepository,
+        download_id_: int,
+        status: str,
+        allowed_from: frozenset[str],
+        *,
+        failed_reason: str | None = None,
+        clear_download_path: bool = False,
+    ) -> bool:
+        # Matches ONLY the rescue's own download-row CAS (this exact target status +
+        # predicate) so a later, unrelated CAS in the same flow (e.g. the inline
+        # replacement grab's row reuse) is never intercepted. The keyword-only
+        # params mirror exactly what the rescue's call site passes -- no ``**kwargs``
+        # forwarding, so this stays typed under strict pyright.
+        if (
+            not raced["done"]
+            and download_id_ == download_id
+            and status == DownloadState.Failed.value
+            and allowed_from == frozenset({DownloadState.ImportBlocked.value})
+        ):
+            raced["done"] = True
+            async with sessionmaker_() as competitor:
+                scope = (
+                    await competitor.execute(
+                        select(DownloadScope).where(
+                            DownloadScope.download_id == download_id_,
+                            DownloadScope.season_number == 2,
+                        )
+                    )
+                ).scalar_one()
+                scope.status = "imported"
+                await competitor.commit()
+        return await real_update_status_if_in(
+            self,
+            download_id_,
+            status,
+            allowed_from,
+            failed_reason=failed_reason,
+            clear_download_path=clear_download_path,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "update_status_if_in", racing_update_status_if_in)
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([candidate("Some.Show.S01.1080p.WEB-DL.x264-GROUP", info_hash=_CULPRIT)]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert (_CULPRIT, True) in qbt.removed
+    assert raced["done"]  # the race actually fired -- a false pass would prove nothing
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest)
+                    .where(SeasonRequest.media_request_id == request_id)
+                    .order_by(SeasonRequest.season_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        season_1, season_2 = seasons
+        download = await session.get(Download, download_id)
+        assert download is not None
+        scope_2 = (
+            await session.execute(
+                select(DownloadScope).where(
+                    DownloadScope.download_id == download_id,
+                    DownloadScope.season_number == 2,
+                )
+            )
+        ).scalar_one()
+
+    assert season_1.status == RequestStatus.no_acceptable_release  # parked honestly
+    # NOT re-armed: the racing import's completion beat the rescue's scope-level CAS.
+    assert season_2.status == RequestStatus.import_blocked  # untouched, original status
+    assert scope_2.status == "imported"  # the race's write stands -- never overwritten
+    assert download.status == DownloadState.Failed.value  # row CAS still won independently
+
+
 async def test_report_issue_tv_requires_a_season(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
