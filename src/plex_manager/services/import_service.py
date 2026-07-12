@@ -2266,6 +2266,7 @@ async def run_import_cycle(
 
 async def _heal_false_available_movies(
     *,
+    library: LibraryPort,
     session: AsyncSession,
     candidates: Sequence[RequestRecord],
     present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]],
@@ -2311,17 +2312,34 @@ async def _heal_false_available_movies(
        for good, instead of keeping the exact same ``available`` +
        ``library_path IS NULL`` signature (and being re-verified, and
        re-occupying the bounded per-tick scan window) forever.
-    3. **Absent, no usable sibling**: re-arm to ``pending`` -- the original
-       request was never actually fulfilled, so it re-enters the normal
-       search/grab pipeline (``list_due_for_search`` picks up a re-armed
-       ``pending`` row immediately; the CAS resets the auto-grab backoff).
+    3. **Cross-owner sibling, path-corroborated**: a real-``library_path``
+       sibling exists (same ``tmdb_id``/``'movie'``) but belongs to a
+       DIFFERENT owner, so branch 1's ownership guard left it alone -- and the
+       GUID batch in branch 2 also missed this row. Rather than blindly
+       re-arming a row whose content is verifiably on disk under that
+       sibling's path, corroborate the sibling's ``library_path`` with the
+       SAME GUID-independent path fallback the promotion loop above uses
+       (:meth:`~plex_manager.ports.library.LibraryPort.confirm_paths`, issue
+       #158) -- one extra BATCHED call for the whole heal pass (every
+       cross-owner candidate's sibling path(s) folded into it), never one call
+       per row. A confirmed path stamps ``available_heal_verified_at`` (same
+       convergence as branch 2) instead of deleting or touching the sibling --
+       the ownership guard still holds, only THIS row's own false-claim
+       signature is resolved.
+    4. **Absent, no usable/confirmable sibling**: re-arm to ``pending`` -- the
+       original request was never actually fulfilled, so it re-enters the
+       normal search/grab pipeline (``list_due_for_search`` picks up a
+       re-armed ``pending`` row immediately; the CAS resets the auto-grab
+       backoff).
 
-    Branches 2 and 3 both require a CONCLUSIVE answer: when
-    ``present_ids_succeeded`` is ``False`` (the shared batch call itself
-    raised -- Plex unreachable, auth failure, etc.), every row that didn't
-    collapse onto a sibling is left completely untouched for the next tick's
-    retry -- a same-tick transport failure must never be misread as "genuinely
-    absent" and wrongly re-armed.
+    Branches 2-4 all require a CONCLUSIVE answer: when ``present_ids_succeeded``
+    is ``False`` (the shared batch call itself raised -- Plex unreachable, auth
+    failure, etc.), every row that didn't collapse onto a sibling is left
+    completely untouched for the next tick's retry -- a same-tick transport
+    failure must never be misread as "genuinely absent" and wrongly re-armed.
+    Likewise, when a row reaches branch 3/4 with an unconfirmable cross-owner
+    sibling and the batched ``confirm_paths`` call itself raises, that row is
+    ALSO left untouched rather than wrongly re-armed on an "unknown" answer.
 
     Every branch is its own transaction (commit/rollback per row) so one bad
     row never aborts the rest of the pass, mirroring the promotion loops
@@ -2331,13 +2349,21 @@ async def _heal_false_available_movies(
     unexplained.
     """
     repo = SqlRequestRepository(session)
+
+    # Phase 1: resolve every candidate's siblings + the ownership-guarded
+    # "safe" one up front (DB-only, cheap) so phase 2 below can fold every
+    # cross-owner candidate's sibling path(s) into ONE batched confirm_paths
+    # call for the WHOLE pass, instead of one call per row.
+    row_siblings: dict[int, list[RequestRecord]] = {}
+    row_safe_sibling: dict[int, RequestRecord | None] = {}
     for row in candidates:
         siblings = [
             sibling
             for sibling in await repo.list_for_media(row.tmdb_id, "movie", _IN_LIBRARY_STATUSES)
             if sibling.id != row.id and sibling.library_path is not None
         ]
-        safe_sibling = next(
+        row_siblings[row.id] = siblings
+        row_safe_sibling[row.id] = next(
             (
                 sibling
                 for sibling in siblings
@@ -2345,6 +2371,37 @@ async def _heal_false_available_movies(
             ),
             None,
         )
+
+    # Phase 2: cross-owner sibling path corroboration (branch 3 above). Only
+    # candidates that will NOT collapse (no safe sibling) and were NOT already
+    # confirmed by the GUID batch need a path answer at all.
+    cross_owner_paths: set[str] = set()
+    for row in candidates:
+        if row_safe_sibling[row.id] is not None:
+            continue
+        if present_ids_succeeded and (row.tmdb_id, "movie") in present_movie_keys:
+            continue
+        for sibling in row_siblings[row.id]:
+            if sibling.library_path:
+                cross_owner_paths.add(sibling.library_path)
+    confirmed_cross_owner_paths: frozenset[str] = frozenset()
+    # Vacuously "succeeded" when nothing needed checking -- no row will ever
+    # consult this flag unless it actually has a cross-owner path pending.
+    cross_owner_check_succeeded = not cross_owner_paths
+    if cross_owner_paths:
+        try:
+            confirmed_cross_owner_paths = await library.confirm_paths("movie", cross_owner_paths)
+            cross_owner_check_succeeded = True
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            _logger.warning(
+                "cross-owner sibling path corroboration failed for %d false-available "
+                "movie row(s); will retry next cycle",
+                len(cross_owner_paths),
+            )
+
+    for row in candidates:
+        siblings = row_siblings[row.id]
+        safe_sibling = row_safe_sibling[row.id]
         if safe_sibling is not None:
             await repo.delete(row.id)
             await session.commit()
@@ -2375,11 +2432,42 @@ async def _heal_false_available_movies(
                 )
             else:
                 await session.rollback()
+            continue
+        cross_owner_sibling = next(
+            (
+                sibling
+                for sibling in siblings
+                if sibling.library_path in confirmed_cross_owner_paths
+            ),
+            None,
+        )
+        if cross_owner_sibling is not None:
+            if await repo.mark_heal_verified_present(row.id):
+                await session.commit()
+                _logger.info(
+                    "healed false-available movie row: cross-owner sibling's "
+                    "library_path corroborated via the path fallback; "
+                    "re-verified and stamped instead of re-arming",
+                    extra={
+                        "tmdb_id": row.tmdb_id,
+                        "request_id": row.id,
+                        "sibling_request_id": cross_owner_sibling.id,
+                    },
+                )
+            else:
+                await session.rollback()
+            continue
+        if siblings and not cross_owner_check_succeeded:
+            _logger.warning(
+                "heal: cross-owner sibling path corroboration failed for "
+                "false-available movie row; leaving it for next cycle",
+                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+            )
         elif await repo.rearm_false_available_to_pending(row.id):
             await session.commit()
             _logger.info(
-                "healed false-available movie row: not in Plex and no sibling "
-                "copy; re-armed to pending for a fresh search",
+                "healed false-available movie row: not in Plex and no "
+                "confirmable sibling copy; re-armed to pending for a fresh search",
                 extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
             )
         else:
@@ -2451,19 +2539,24 @@ async def run_availability_cycle(
     NULL`` -- the unique signature the already-in-library short-circuit
     (``request_service.create_request_result``) mints when a transient/
     mis-tagged Plex GUID makes it believe a movie is present that never
-    actually was. Each false claim is either collapsed onto a genuine sibling
-    row, re-verified and stamped ``available_heal_verified_at`` (which
-    converges it out of future scans -- a genuinely-present row is never
-    re-verified or re-paged again), or re-armed to ``pending`` for a fresh,
-    honest search -- north stars "correction without a terminal" and "honesty
-    over silence": a wrongly-terminal row self-corrects on the next reconcile
-    tick instead of silently shadowing a real re-request (or perpetually
-    consuming the bounded per-tick heal budget and starving a later,
-    higher-id false claim) forever. These candidate rows are fetched HERE,
-    before the promotion loop, so their ``tmdb_id``s can be folded into the
-    SAME single batched ``present_ids`` call the promotion loop already needs
-    -- the heal pass never issues its own (formerly per-ROW, full-library-page)
-    Plex call.
+    actually was. Each false claim is either collapsed onto a genuine
+    same-owner-or-ownerless sibling row, re-verified and stamped
+    ``available_heal_verified_at`` (by the GUID batch OR, for a cross-owner
+    sibling the ownership guard left uncollapsed, by corroborating that
+    sibling's ``library_path`` via the path fallback instead -- which
+    converges it out of future scans either way, a genuinely-present row is
+    never re-verified or re-paged again), or re-armed to ``pending`` for a
+    fresh, honest search -- north stars "correction without a terminal" and
+    "honesty over silence": a wrongly-terminal row self-corrects on the next
+    reconcile tick instead of silently shadowing a real re-request (or
+    perpetually consuming the bounded per-tick heal budget and starving a
+    later, higher-id false claim) forever. These candidate rows are fetched
+    HERE, before the promotion loop, so their ``tmdb_id``s can be folded into
+    the SAME single batched ``present_ids`` call the promotion loop already
+    needs -- the heal pass's GUID check never issues its own (formerly
+    per-ROW, full-library-page) Plex call; its cross-owner path fallback
+    issues AT MOST one additional batched ``confirm_paths`` call for the
+    whole pass, never one per row.
     """
     effective_now = now if now is not None else datetime.now(UTC)
     promoted = 0
@@ -2587,6 +2680,7 @@ async def run_availability_cycle(
     # the SAME batched ``present_movie_keys``/``present_ids_succeeded`` answer
     # the promotion loop just used.
     await _heal_false_available_movies(
+        library=library,
         session=session,
         candidates=heal_candidates,
         present_movie_keys=present_movie_keys,

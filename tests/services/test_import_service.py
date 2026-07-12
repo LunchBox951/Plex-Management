@@ -4276,6 +4276,138 @@ async def test_heal_differing_owner_sibling_not_deleted(sessionmaker_: SessionMa
     assert a.library_verified_at is not None  # healed via the GUID branch instead
 
 
+async def test_heal_cross_owner_sibling_corroborated_by_path_is_stamped_verified(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cross-owner sibling's ``library_path`` is left uncollapsed by the
+    ownership guard (issue #58) AND the GUID batch misses this row -- but the
+    path fallback (issue #158) corroborates the sibling's directory is
+    genuinely indexed in Plex. The row must be stamped verified (converged),
+    never blindly re-armed to search for content that is already on disk."""
+    tmdb_id = 782
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a2", permissions=0)
+        owner_b = User(username="owner-b2", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/cross-owner",
+        user_id=owner_b_id,
+    )
+    # GUID misses this tmdb id entirely (available=set()), but the sibling's
+    # directory IS indexed under Plex's known movie file paths.
+    library = FakeLibrary(available=set(), movie_file_paths=["/movies/cross-owner/movie.mkv"])
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None  # NOT deleted, NOT re-armed
+    assert a.status == RequestStatus.available
+    assert a.library_path is None
+    assert a.available_heal_verified_at is not None  # converged
+    assert library.confirm_paths_calls == [("movie", frozenset({"/movies/cross-owner"}))]
+    assert any(
+        "cross-owner sibling's library_path corroborated" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_heal_cross_owner_sibling_unconfirmed_by_path_still_rearms(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The cross-owner sibling's path fallback is consulted but does NOT
+    corroborate (Plex genuinely has neither the GUID nor that directory) --
+    the row still honestly re-arms rather than being stuck 'available'."""
+    tmdb_id = 783
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a3", permissions=0)
+        owner_b = User(username="owner-b3", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/nonexistent",
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available=set())  # no movie_file_paths -> confirm_paths finds nothing
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None
+    assert a.status == RequestStatus.pending
+    assert library.confirm_paths_calls == [("movie", frozenset({"/movies/nonexistent"}))]
+
+
+async def test_heal_cross_owner_sibling_path_check_error_leaves_row_untouched(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The batched ``confirm_paths`` corroboration call itself fails (Plex
+    unreachable) -- honesty over silence: the row is left completely
+    unchanged rather than misread as 'absent' and wrongly re-armed."""
+    tmdb_id = 784
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a4", permissions=0)
+        owner_b = User(username="owner-b4", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/unreachable",
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available=set(), confirm_paths_raises=PlexLibraryError("unreachable"))
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None
+    assert a.status == RequestStatus.available
+    assert a.library_path is None
+    assert a.available_heal_verified_at is None
+    assert any(
+        "cross-owner sibling path corroboration failed" in r.getMessage() for r in caplog.records
+    )
+
+
 async def test_heal_leaves_row_when_live_check_errors(
     sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
 ) -> None:
