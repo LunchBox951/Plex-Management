@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
@@ -43,11 +43,27 @@ vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) 
 // Passthrough Dialog so the shared modal renders as plain DOM (no Radix portal
 // focus-trap noise in jsdom) — same shim Requests.test.tsx uses.
 vi.mock('../components/ui/Dialog', () => ({
-  Dialog: ({ title, children }: { title: string; children: ReactNode }) => (
+  Dialog: ({
+    title,
+    children,
+    customChrome = false,
+  }: {
+    title: string
+    children: ReactNode
+    customChrome?: boolean
+  }) => (
     <div>
-      <h2>{title}</h2>
+      {customChrome ? null : <h2>{title}</h2>}
       {children}
     </div>
+  ),
+  DialogTitle: ({ children, ...props }: HTMLAttributes<HTMLHeadingElement>) => (
+    <h2 {...props}>{children}</h2>
+  ),
+  DialogClose: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>
+      {children}
+    </button>
   ),
 }))
 
