@@ -1,6 +1,7 @@
 import { Link, NavLink, Outlet } from 'react-router-dom'
 import { useAuthMe, useLogout, useRequests } from '../api/hooks'
 import { cn } from '../lib/cn'
+import { isInFlightRequestStatus } from '../lib/status'
 import { HealthDot } from './HealthDot'
 import { Button } from './ui/Button'
 
@@ -17,20 +18,17 @@ const ADMIN_NAV = [
   { to: '/blocklist', label: 'Blocklist', end: false },
 ] as const
 
-const REQUEST_NAV_BADGE_STATUSES = new Set([
-  'searching',
-  'downloading',
-  'no_acceptable_release',
-])
-
 export function Layout() {
   const logout = useLogout()
   const auth = useAuthMe()
   const requests = useRequests({ poll: true })
   const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
-  const requestAttentionCount = requests.data
-    ? requests.data.requests.filter((request) => REQUEST_NAV_BADGE_STATUSES.has(request.status))
-        .length
+  // Only a settled `/requests` payload feeds the badge: while the query is
+  // unresolved (or has never succeeded) the count stays `undefined` and the
+  // badge is hidden — never an optimistic guess. A transient poll error keeps
+  // the last good `data`, so the count holds rather than flashing to nothing.
+  const inFlightRequestCount = requests.data
+    ? requests.data.requests.filter((request) => isInFlightRequestStatus(request.status)).length
     : undefined
 
   return (
@@ -58,12 +56,12 @@ export function Layout() {
                   }
                 >
                   <span>{item.label}</span>
-                  {item.to === '/requests' && requestAttentionCount ? (
+                  {item.to === '/requests' && inFlightRequestCount ? (
                     <span className="inline-flex min-w-4.5 items-center justify-center rounded-full bg-gold px-1.5 py-0.5 font-mono text-[10px] leading-none font-semibold text-gold-ink tabular-nums">
-                      <span aria-hidden>{requestAttentionCount}</span>
+                      <span aria-hidden>{inFlightRequestCount}</span>
                       <span className="sr-only">
-                        {`, ${requestAttentionCount} `}
-                        {requestAttentionCount === 1 ? 'active request' : 'active requests'}
+                        {`, ${inFlightRequestCount} `}
+                        {inFlightRequestCount === 1 ? 'active request' : 'active requests'}
                       </span>
                     </span>
                   ) : null}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { downloadStatus, glyphKind, requestStatus } from './status'
+import { downloadStatus, glyphKind, isInFlightRequestStatus, requestStatus } from './status'
 
 describe('requestStatus', () => {
   it('maps known request statuses to labels + intents', () => {
@@ -33,6 +33,34 @@ describe('downloadStatus', () => {
 
   it('never throws on an unrecognized state', () => {
     expect(downloadStatus('weird').intent).toBe('neutral')
+  })
+})
+
+describe('isInFlightRequestStatus', () => {
+  it('counts the actively-worked statuses that drive the Requests nav badge', () => {
+    for (const status of ['searching', 'downloading', 'no_acceptable_release']) {
+      expect(isInFlightRequestStatus(status)).toBe(true)
+    }
+  })
+
+  it('excludes not-yet-started, settled, and terminal-error statuses', () => {
+    for (const status of [
+      'pending',
+      'waiting_for_air_date',
+      'completed',
+      'available',
+      'partially_available',
+      'import_blocked',
+      'failed',
+      'cancelled',
+      'evicted',
+    ]) {
+      expect(isInFlightRequestStatus(status)).toBe(false)
+    }
+  })
+
+  it('treats an unknown status as not in flight rather than throwing', () => {
+    expect(isInFlightRequestStatus('some_new_state')).toBe(false)
   })
 })
 
