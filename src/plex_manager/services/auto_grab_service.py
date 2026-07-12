@@ -66,16 +66,23 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
-from plex_manager.domain.season_pack import MultiSeasonRequestIntent, SeasonPackSeasonState
+from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
+from plex_manager.domain.season_pack import (
+    MultiSeasonRequestIntent,
+    SeasonPackSeasonState,
+    episode_numbers,
+)
 from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     decision_service,
     grab_service,
     request_service,
+    season_episode_service,
     season_request_service,
 )
 from plex_manager.services.grab_service import (
@@ -90,15 +97,18 @@ from plex_manager.services.log_capture_service import AUTO_GRAB_TELEMETRY_LOGGER
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import date
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.domain.quality_profile import QualityProfile
     from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.indexer import IndexerPort
+    from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.parser import ParserPort
 
 __all__ = [
+    "AIRING_REFRESH_MAX_PER_CYCLE",
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE",
     "BACKOFF_SCHEDULE",
     "COOLDOWN_SCHEDULE",
@@ -171,6 +181,13 @@ AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
 # unaffected: one scope still costs exactly one search no matter how many of its
 # accepted releases are tried.
 MAX_GRAB_ATTEMPTS_PER_SCOPE: int = 3
+
+# At most this many ``available``/``completed`` TV seasons get their aired target
+# refreshed from TMDB per cycle by the airing pre-pass (ADR-0018 §6,
+# :func:`plex_manager.services.season_episode_service.reconcile_airing`) -- a
+# module constant mirroring :data:`AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`, protecting
+# the single TMDB budget from a large install with many finished shows.
+AIRING_REFRESH_MAX_PER_CYCLE: int = 5
 
 # --------------------------------------------------------------------------- #
 # In-process grab-pipeline cooldown (Codex PR #31 round-3 #2)
@@ -279,6 +296,11 @@ class AutograbCycleResult:
     ``AutograbStatus`` health record so the operator can SEE the grab pipeline
     failing (honesty over silence), rather than wondering why eager scopes never
     reach ``downloading``.
+
+    ``season_episode_fallback_grabs`` (ADR-0018, issue #178) counts scopes settled
+    by the Pass-2 episode-level fallback rather than a Pass-1 season-pack grab --
+    included in ``grabbed`` too, broken out here for observability into how often
+    the fallback path (vs. a clean pack grab) is what actually completes a season.
     """
 
     searched: int = 0
@@ -288,6 +310,7 @@ class AutograbCycleResult:
     grab_errors: int = 0
     last_grab_error: GrabError | None = None
     cooled_down: int = 0
+    season_episode_fallback_grabs: int = 0
 
 
 @dataclass(frozen=True)
@@ -385,6 +408,223 @@ async def _collect_due_scopes(
         key=lambda sc: (_scope_key(sc) in cooldowns, _due_sort_key(sc.status, sc.next_search_at))
     )
     return scopes
+
+
+@dataclass(frozen=True)
+class _EpisodeFallbackOutcome:
+    """What one Pass-2 episode-level-fallback attempt (:func:`_attempt_episode_fallback`)
+    did for a single whole-season scope.
+
+    ``settled`` mirrors the Pass-1 grab loop's ``park_scope`` convention inverted:
+    ``True`` means the scope must NOT be parked this cycle (a grab happened, or a
+    per-scope refusal/operational failure settled it some other way); ``False``
+    means "found nothing, fall through to the normal park" (target unknown, no
+    missing episodes, nothing accepted, or every accepted release was ungrabbable).
+    """
+
+    settled: bool
+    grabbed: bool = False
+    grab_error: GrabError | None = None
+    source_failures: int = 0
+
+
+async def _attempt_episode_fallback(
+    session: AsyncSession,
+    metadata: MetadataPort,
+    prowlarr: IndexerPort,
+    parser: ParserPort,
+    profile: QualityProfile,
+    qbt: DownloadClientPort,
+    download_repo: SqlDownloadRepository,
+    scope: _PendingScope,
+    title: str,
+    year: int | None,
+    today: date,
+    save_path: str,
+    cooldowns: CooldownRegistry,
+    clock: Callable[[], datetime],
+) -> _EpisodeFallbackOutcome:
+    """Pass-2 of the whole-season scope's cycle (ADR-0018, issue #178): only called
+    when Pass 1 (the season-pack-only search) accepted nothing this cycle.
+
+    1. Refresh the aired-episode target from TMDB. A raise (``TmdbApiError``/
+       ``TmdbAuthError``) means "target unknown this cycle" -- logged, no grab,
+       fall through to the normal park (never a guessed target).
+    2. Compute the still-missing aired episodes (target minus imported minus any
+       in-flight download). Empty -> nothing to fetch, fall through to the normal
+       park (an honest "nothing acceptable" is correct when nothing is missing).
+    3. Search + decide via :func:`decision_service.preview_episode_fallback`
+       (``prefer_season_pack=False``, the engine's ``episode_subset`` gate set to
+       the missing set). Try the accepted releases in rank order exactly like the
+       Pass-1 grab loop -- the SAME per-release-failure fall-through, bounded by
+       :data:`MAX_GRAB_ATTEMPTS_PER_SCOPE` -- until one grabs or the list is
+       exhausted.
+
+    On a successful grab, the covered episodes are marked ``grabbed`` in
+    ``season_episode_states`` (crash-visibility / observability; ``compute_missing``
+    itself trusts the live active download, not this breadcrumb) and the season is
+    now ``downloading`` (via :func:`grab_service.grab`), so it must NOT be parked.
+    """
+    # Narrows ``scope.season``/``scope.season_request_id`` from ``int | None`` to
+    # ``int`` for the type checker: the caller only invokes this for a due TV
+    # season scope (``scope.season is not None``), which -- by ``_PendingScope``'s
+    # own construction in ``_collect_due_scopes`` -- always carries a
+    # ``season_request_id`` too. The ``None`` branch is unreachable in practice;
+    # returning "target unknown, fall through to the normal park" is the honest,
+    # crash-free response if it were ever reached.
+    season = scope.season
+    season_request_id = scope.season_request_id
+    if season is None or season_request_id is None:  # pragma: no cover - a tv scope always has both
+        return _EpisodeFallbackOutcome(settled=False)
+    scope_key = _scope_key(scope)
+
+    try:
+        target = await season_episode_service.refresh_target(
+            session,
+            metadata,
+            media_request_id=scope.request_id,
+            season_number=season,
+            tmdb_id=scope.tmdb_id,
+            today=today,
+        )
+    except (TmdbApiError, TmdbAuthError) as exc:
+        _logger.info(
+            "auto-grab: episode-fallback target lookup failed (%s); target unknown "
+            "this cycle, falling through to the normal park",
+            type(exc).__name__,
+            extra={
+                "request_id": scope.request_id,
+                "season": season,
+                "tmdb_id": scope.tmdb_id,
+            },
+        )
+        return _EpisodeFallbackOutcome(settled=False)
+
+    missing = await season_episode_service.compute_missing(
+        session,
+        download_repo,
+        media_request_id=scope.request_id,
+        season_number=season,
+        season_request_id=season_request_id,
+        target=target,
+    )
+    if not missing:
+        return _EpisodeFallbackOutcome(settled=False)
+
+    fb_result = await decision_service.preview_episode_fallback(
+        prowlarr,
+        parser,
+        profile,
+        SqlBlocklistRepository(session),
+        tmdb_id=scope.tmdb_id,
+        title=title,
+        season=season,
+        missing_episodes=missing,
+    )
+    fb_candidates = fb_result.accepted[:MAX_GRAB_ATTEMPTS_PER_SCOPE]
+    if not fb_candidates:
+        return _EpisodeFallbackOutcome(settled=False)
+
+    source_failures = 0
+    for attempt, scored in enumerate(fb_candidates, start=1):
+        covered = sorted(episode_numbers(scored.parsed.episode))
+        try:
+            record = await grab_service.grab(
+                qbt,
+                session,
+                scored=scored,
+                request_id=scope.request_id,
+                tmdb_id=scope.tmdb_id,
+                year=year,
+                season=season,
+                episodes=covered,
+                save_path=save_path,
+                expected_season_status=scope.status,
+            )
+            await SqlSeasonEpisodeStateRepository(session).mark_grabbed(
+                season_request_id, covered, record.id
+            )
+            await session.commit()
+            cooldowns.pop(scope_key, None)
+            return _EpisodeFallbackOutcome(settled=True, grabbed=True)
+        except (AlreadyDownloadingError, RequestNotActiveError, SeasonRequiredError) as exc:
+            # Same posture as the Pass-1 loop: a scope-level concurrency/shape
+            # refusal, not a per-release one -- trying another candidate cannot
+            # help, so settle without parking.
+            await session.rollback()
+            cooldowns.pop(scope_key, None)
+            _logger.warning(
+                "auto-grab: episode-fallback grab refused (%s); leaving scope for a later cycle",
+                type(exc).__name__,
+                extra={"request_id": scope.request_id, "season": season},
+            )
+            return _EpisodeFallbackOutcome(settled=True)
+        except GrabError as exc:
+            # Operational failure (qBittorrent accepted the torrent but no
+            # info-hash could be derived): same cooldown treatment as the Pass-1
+            # loop -- never park (that would lie), and cool the scope so it
+            # doesn't monopolise the per-cycle budget.
+            await session.rollback()
+            cooling = cooldowns.get(scope_key)
+            prior_failures = cooling.failures if cooling is not None else 0
+            delay = cooldown_delay(prior_failures)
+            cooldowns[scope_key] = ScopeCooldown(
+                failures=prior_failures + 1, not_before=clock() + delay
+            )
+            _logger.warning(
+                "auto-grab: episode-fallback grab operational failure (%s); cooling "
+                "scope (consecutive failure #%d, %s window)",
+                type(exc).__name__,
+                prior_failures + 1,
+                delay,
+                extra={"request_id": scope.request_id, "season": season},
+            )
+            return _EpisodeFallbackOutcome(settled=True, grab_error=exc)
+        except QbittorrentSourceError as exc:
+            # A LOWER-ranked accepted release may still be grabbable -- fall
+            # through to the next candidate (do NOT settle).
+            await session.rollback()
+            source_failures += 1
+            _telemetry_logger.warning(
+                "auto-grab: episode-fallback accepted release source-unresolvable "
+                "(%s): title=%r indexer=%r guid=%r info_hash=%s season=%s, "
+                "attempt %d/%d; trying next accepted release",
+                type(exc).__name__,
+                safe_text(scored.candidate.title),
+                safe_text(scored.candidate.indexer_name),
+                safe_guid(scored.candidate.guid),
+                safe_text(scored.candidate.info_hash) if scored.candidate.info_hash else "-",
+                season,
+                attempt,
+                len(fb_candidates),
+                extra={
+                    "request_id": scope.request_id,
+                    "tmdb_id": scope.tmdb_id,
+                    "season": season,
+                    "source_title": safe_text(scored.candidate.title),
+                    "indexer": safe_text(scored.candidate.indexer_name),
+                    "guid": safe_guid(scored.candidate.guid),
+                    "info_hash": (
+                        safe_text(scored.candidate.info_hash)
+                        if scored.candidate.info_hash
+                        else None
+                    ),
+                    "attempt": attempt,
+                    "attempts_total": len(fb_candidates),
+                },
+            )
+        except (NoGrabSourceError, TorrentAlreadyTrackedError) as exc:
+            # Same fall-through posture as the Pass-1 loop's sibling handler.
+            await session.rollback()
+            _logger.warning(
+                "auto-grab: episode-fallback accepted release unusable (%s), "
+                "attempt %d/%d; trying next accepted release",
+                type(exc).__name__,
+                attempt,
+                len(fb_candidates),
+                extra={"request_id": scope.request_id},
+            )
+    return _EpisodeFallbackOutcome(settled=False, source_failures=source_failures)
 
 
 async def _park(
@@ -490,6 +730,7 @@ async def run_grab_cycle(
     parser: ParserPort,
     profile: QualityProfile,
     qbt: DownloadClientPort,
+    metadata: MetadataPort | None = None,
     max_searches: int = AUTO_GRAB_MAX_SEARCHES_PER_CYCLE,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -550,6 +791,16 @@ async def run_grab_cycle(
     manual grab, rather than qBittorrent's own (possibly invisible) default.
     ``""`` (the default) leaves qBittorrent's own default in charge, unchanged
     prior behaviour.
+
+    ``metadata`` (ADR-0018, issue #178) is the optional :class:`MetadataPort` (TMDB)
+    that powers the episode-level fallback for whole-season TV scopes: an airing
+    pre-pass (bounded, :data:`AIRING_REFRESH_MAX_PER_CYCLE`) re-arms any
+    ``available``/``completed`` season whose aired target has grown, THEN, for each
+    whole-season scope where Pass 1 (the season-pack-only search) accepted nothing
+    this cycle, a Pass-2 episode-level fallback search is attempted (see
+    :func:`_attempt_episode_fallback`). ``None`` (the default -- an unconfigured
+    TMDB) disables both cleanly: Pass 1 behaves exactly as before this feature
+    existed, and a scope with nothing acceptable still parks honestly.
     """
     now = now or datetime.now(UTC)
     # Park + cooldown scheduling read the clock FRESH at each event (round-3 #3); the
@@ -564,9 +815,21 @@ async def run_grab_cycle(
     season_repo = SqlSeasonRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
 
+    # Airing pre-pass (ADR-0018 §6): re-arm any available/completed season whose
+    # aired target has grown BEFORE due-scope collection, so a newly-aired episode
+    # re-enters ``DUE_SEARCH_STATUSES`` in time to be collected THIS cycle. Bounded
+    # and best-effort per season (a TMDB error for one season is logged and
+    # skipped, never aborting the pass); a no-op when TMDB is unconfigured.
+    if metadata is not None:
+        await season_episode_service.reconcile_airing(
+            session, metadata, today=now.date(), max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
+        )
+        await session.commit()
+
     scopes = await _collect_due_scopes(request_repo, season_repo, now, cooldowns)
 
     searched = grabbed = no_acceptable = skipped_active = grab_errors = 0
+    season_episode_fallback_grabs = 0
     # Beta-week telemetry (issue #43): count of ``QbittorrentSourceError`` per-release
     # failures this cycle -- folded into the closing summary INFO below. Each
     # individual occurrence is ALSO logged with full release identity (see the
@@ -891,6 +1154,39 @@ async def run_grab_cycle(
                     len(candidates),
                     extra={"request_id": scope.request_id},
                 )
+
+        # Pass 2 (ADR-0018, issue #178): ONLY when Pass 1 found zero acceptable
+        # season packs this cycle (``park_scope`` still True), the scope is a
+        # WHOLE-season TV scope (no specific episodes named), and TMDB is
+        # configured. The issue #167 hard gate (Pass 1, above) cannot be bypassed
+        # by this: Pass 2 never runs unless Pass 1 already accepted nothing.
+        if park_scope and metadata is not None and scope.season is not None and not scope_episodes:
+            fb_outcome = await _attempt_episode_fallback(
+                session,
+                metadata,
+                prowlarr,
+                parser,
+                profile,
+                qbt,
+                download_repo,
+                scope,
+                title,
+                year,
+                now.date(),
+                save_path,
+                cooldowns,
+                park_clock,
+            )
+            source_failures += fb_outcome.source_failures
+            if fb_outcome.settled:
+                park_scope = False
+                if fb_outcome.grabbed:
+                    grabbed += 1
+                    season_episode_fallback_grabs += 1
+                if fb_outcome.grab_error is not None:
+                    grab_errors += 1
+                    last_grab_error = fb_outcome.grab_error
+
         if park_scope:
             # Parking resolves the scope one way or the other, so clear any stale
             # cooldown (GrabError is its only feeder). ``_park`` re-checks for a
@@ -903,7 +1199,7 @@ async def run_grab_cycle(
     cooled_down = sum(1 for cd in cooldowns.values() if cd.not_before > now)
     _telemetry_logger.info(
         "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d "
-        "grab_errors=%d cooled_down=%d source_failures=%d",
+        "grab_errors=%d cooled_down=%d source_failures=%d season_episode_fallback_grabs=%d",
         searched,
         grabbed,
         no_acceptable,
@@ -911,7 +1207,11 @@ async def run_grab_cycle(
         grab_errors,
         cooled_down,
         source_failures,
-        extra={"source_failures": source_failures},
+        season_episode_fallback_grabs,
+        extra={
+            "source_failures": source_failures,
+            "season_episode_fallback_grabs": season_episode_fallback_grabs,
+        },
     )
     return AutograbCycleResult(
         searched=searched,
@@ -921,4 +1221,5 @@ async def run_grab_cycle(
         grab_errors=grab_errors,
         last_grab_error=last_grab_error,
         cooled_down=cooled_down,
+        season_episode_fallback_grabs=season_episode_fallback_grabs,
     )

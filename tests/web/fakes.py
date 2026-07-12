@@ -194,6 +194,9 @@ class FakeTmdb:
         # test double.
         self._season_episodes = season_episodes or {}
         self.season_episodes_error = season_episodes_error
+        # Call log (issue #178 pack-first-precedence test): proves the port was
+        # NEVER even consulted when Pass 1 alone settled a scope.
+        self.season_episodes_calls: list[tuple[int, int]] = []
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -224,6 +227,7 @@ class FakeTmdb:
         return self._page(self._popular_tv)
 
     async def season_episodes(self, tmdb_id: int, season_number: int) -> list[EpisodeInfo]:
+        self.season_episodes_calls.append((tmdb_id, season_number))
         if self.season_episodes_error is not None:
             raise self.season_episodes_error
         return list(self._season_episodes.get((tmdb_id, season_number), []))
