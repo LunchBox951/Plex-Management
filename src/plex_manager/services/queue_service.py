@@ -227,6 +227,7 @@ from plex_manager.domain.reconciler import (
     StallDetection,
     StateTransition,
     detect_stalls,
+    download_deadline,
     failed_download_events,
     reconcile,
     unmapped_client_states,
@@ -1167,6 +1168,19 @@ async def reconcile_and_list(
             continue
         live = snapshot.get(row.torrent_hash.lower())
         transition = transitions_by_id.get(row.id)
+        # The honest observability deadline (concern 3): recomputed from the LIVE
+        # raw_state + the row's ``added_at`` on EVERY present row each cycle, not
+        # merely on a transition — a movie grabbed from a full ``.torrent`` is
+        # created AND reported by qBittorrent as ``downloading`` in the SAME
+        # cycle, so no transition ever fires (target == current status) and a
+        # transition-only write would leave ``timeout_at`` stuck at the 45-min
+        # metadata deadline forever. detect_stalls stays anchored on ``added_at``
+        # — this column is never read for control.
+        new_timeout = (
+            download_deadline(live.raw_state, row.added_at)
+            if live is not None and row.added_at is not None
+            else None
+        )
         if transition is not None:
             applied = await download_repo.update_status_if_in(
                 transition.download_id,
@@ -1176,6 +1190,7 @@ async def reconcile_and_list(
                 seed_ratio=live.ratio if live is not None else None,
                 first_seen_at=now if transition.set_first_seen_at else None,
                 clear_first_seen_at=transition.clear_first_seen_at,
+                timeout_at=new_timeout,
             )
             if applied:
                 applied_transitions.append(transition)
@@ -1188,9 +1203,20 @@ async def reconcile_and_list(
             # qbt.get_all_statuses() await above, and writing the stale snapshot status
             # back would clobber that claim (defeating the import finalize CAS). A
             # progress-only update leaves any concurrent transition intact (G5).
-            if row.progress != live.progress or row.seed_ratio != live.ratio:
+            # The honest ``timeout_at`` (concern 3) is folded into the SAME skip
+            # guard: recomputed above from the live raw_state, it only moves when
+            # the torrent crosses the metadata->download-window boundary, so this
+            # write still fires on that rare change even while progress is flat.
+            if (
+                row.progress != live.progress
+                or row.seed_ratio != live.ratio
+                or (new_timeout is not None and row.timeout_at != new_timeout)
+            ):
                 await download_repo.refresh_progress(
-                    row.id, progress=live.progress, seed_ratio=live.ratio
+                    row.id,
+                    progress=live.progress,
+                    seed_ratio=live.ratio,
+                    timeout_at=new_timeout,
                 )
                 if changes is not None:
                     changes.queue = True

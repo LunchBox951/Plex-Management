@@ -11,7 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.domain.reconciler import StallDetection
+from plex_manager.domain.reconciler import (
+    METADATA_STALL_WINDOW,
+    STALLED_PROGRESS_WINDOW,
+    StallDetection,
+)
 from plex_manager.models import (
     Blocklist,
     Download,
@@ -209,6 +213,66 @@ async def test_live_progress_persisted_without_state_change(
         ).scalar_one()
     assert persisted.progress == 0.5
     assert persisted.seed_ratio == 1.2
+
+
+async def test_reconcile_updates_timeout_to_download_window_without_transition(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A movie grabbed from a full ``.torrent`` is created AND reported by
+    qBittorrent as ``downloading`` in the SAME cycle -- no transition ever
+    fires (target == current status). ``timeout_at`` must still be recomputed
+    from the live raw_state each cycle, or it would stay stuck at the 45-min
+    metadata deadline forever (dishonest observability column)."""
+    added_at = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash=_HASH,
+            status="downloading",
+            tmdb_id=603,
+            added_at=added_at,
+            timeout_at=added_at + METADATA_STALL_WINDOW,
+        )
+        session.add(download)
+        await session.commit()
+
+    live = DownloadStatus(info_hash=_HASH, name="Some.Movie", raw_state="downloading")
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[live]), session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download.id)
+        assert row is not None
+        assert row.timeout_at is not None
+        assert row.timeout_at.replace(tzinfo=UTC) == added_at + STALLED_PROGRESS_WINDOW
+
+
+async def test_reconcile_updates_timeout_on_metadata_to_downloading_transition(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A metaDL -> downloading transition (a real state change) also updates
+    the deadline from the 45-min metadata window to the 3h download window."""
+    added_at = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash=_HASH,
+            status="metadata_fetching",
+            tmdb_id=603,
+            added_at=added_at,
+            timeout_at=added_at + METADATA_STALL_WINDOW,
+        )
+        session.add(download)
+        await session.commit()
+
+    live = DownloadStatus(info_hash=_HASH, name="Some.Movie", raw_state="downloading")
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[live]), session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download.id)
+        assert row is not None
+        assert row.status == "downloading"
+        assert row.timeout_at is not None
+        assert row.timeout_at.replace(tzinfo=UTC) == added_at + STALLED_PROGRESS_WINDOW
 
 
 async def test_mark_failed_routes_downloading_through_failed_pending(

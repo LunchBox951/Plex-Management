@@ -13,6 +13,7 @@ import pytest
 from plex_manager.domain.reconciler import (
     StateTransition,
     detect_stalls,
+    download_deadline,
     failed_download_events,
     reconcile,
 )
@@ -71,13 +72,18 @@ def _row(
 
 
 def _status(
-    *, raw_state: str, info_hash: str = _HASH, last_activity_unix: int = 0
+    *,
+    raw_state: str,
+    info_hash: str = _HASH,
+    last_activity_unix: int = 0,
+    progress: float = 0.0,
 ) -> DownloadStatus:
     return DownloadStatus(
         info_hash=info_hash,
         name="Some.Release",
         raw_state=raw_state,
         last_activity_unix=last_activity_unix,
+        progress=progress,
     )
 
 
@@ -427,18 +433,22 @@ def test_stalled_dl_row_with_recent_activity_is_not_detected() -> None:
     assert detect_stalls(rows, client, now=_NOW) == []
 
 
-def test_stalled_dl_row_with_no_last_activity_unix_is_not_detected() -> None:
-    # ``last_activity_unix`` defaults to 0 (the client never reported one) --
-    # never treated as "epoch, therefore ancient", consistent with the
-    # downloading/forcedDL catch-all's treatment of a missing/zero value.
+def test_stalled_dl_row_with_no_last_activity_unix_but_partial_progress_is_not_detected() -> None:
+    # ``last_activity_unix`` defaults to 0 (the client never reported one, e.g.
+    # a restart reset it) -- but PARTIAL progress means real bytes are on disk,
+    # so the never-had-activity catch-all must NOT heal this (that guard is
+    # ``progress <= 0.0`` only).
     rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
-    client = [_status(raw_state="stalledDL", last_activity_unix=0)]
+    client = [_status(raw_state="stalledDL", last_activity_unix=0, progress=0.5)]
 
     assert detect_stalls(rows, client, now=_NOW) == []
 
 
 def test_downloading_row_under_stall_window_is_not_detected() -> None:
-    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=1))]
+    # Under BOTH the metadata window (45min) and the stalled-progress window
+    # (3h) -- neither the pre-existing stalled_progress branch nor the new
+    # never-had-activity catch-all may trip yet.
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(minutes=30))]
     client = [_status(raw_state="stalledDL")]
 
     assert detect_stalls(rows, client, now=_NOW) == []
@@ -465,11 +475,67 @@ def test_downloading_row_with_recent_activity_is_not_detected() -> None:
     assert detect_stalls(rows, client, now=_NOW) == []
 
 
-def test_downloading_row_with_no_last_activity_unix_and_no_stalled_dl_is_not_detected() -> None:
-    # ``last_activity_unix`` defaults to 0 (the client never reported one) --
-    # never treated as "epoch, therefore ancient".
+def test_downloading_row_with_no_last_activity_unix_but_partial_progress_is_not_detected() -> None:
+    # ``last_activity_unix`` defaults to 0 (the client never reported one) but
+    # PARTIAL progress means real bytes are on disk (e.g. a restart reset
+    # activity mid-download) -- the never-had-activity catch-all's
+    # ``progress <= 0.0`` guard must keep this untouched.
     rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
-    client = [_status(raw_state="downloading", last_activity_unix=0)]
+    client = [_status(raw_state="downloading", last_activity_unix=0, progress=0.5)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_never_activity_zero_progress_downloading_heals_as_metadata_stall() -> None:
+    # The gap this fix closes: a zero-seed magnet stuck in ``downloading`` that
+    # never produced ANY activity (last_activity_unix stays 0 forever) could
+    # previously never stall out, because the pre-existing stalled_progress
+    # branch requires ``last_activity_unix > 0``. Healed on the SAME
+    # metadata_stall path once past the (shorter) metadata window.
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(minutes=46))]
+    client = [_status(raw_state="downloading", last_activity_unix=0, progress=0.0)]
+
+    detections = detect_stalls(rows, client, now=_NOW)
+
+    assert len(detections) == 1
+    assert detections[0].shape == "metadata_stall"
+
+
+def test_never_activity_unknown_raw_state_heals_as_metadata_stall() -> None:
+    # Exercises the ``_UNKNOWN_FALLBACK`` path the spec calls out: an unmapped
+    # future raw state falls back to ``DownloadState.Downloading`` and, with no
+    # activity ever reported and zero progress, must heal exactly like the
+    # known ``downloading`` case above.
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(minutes=46))]
+    client = [_status(raw_state="someUnknownState", last_activity_unix=0, progress=0.0)]
+
+    detections = detect_stalls(rows, client, now=_NOW)
+
+    assert len(detections) == 1
+    assert detections[0].shape == "metadata_stall"
+
+
+def test_never_activity_under_metadata_window_is_not_detected() -> None:
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(minutes=30))]
+    client = [_status(raw_state="downloading", last_activity_unix=0, progress=0.0)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_paused_zero_progress_is_not_healed() -> None:
+    # Deliberately-idle denylist, north-star safety: an operator paused this --
+    # the never-had-activity catch-all must never remove/blocklist it.
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="pausedDL", last_activity_unix=0, progress=0.0)]
+
+    assert detect_stalls(rows, client, now=_NOW) == []
+
+
+def test_queued_zero_progress_is_not_healed() -> None:
+    # Deliberately-idle denylist: waiting its turn behind other torrents by
+    # design, not a failure.
+    rows = [_row(status=DownloadState.Downloading.value, added_at=_NOW - timedelta(hours=4))]
+    client = [_status(raw_state="queuedDL", last_activity_unix=0, progress=0.0)]
 
     assert detect_stalls(rows, client, now=_NOW) == []
 
@@ -577,3 +643,16 @@ def test_non_failure_downloading_side_row_is_never_flagged_by_last_activity(
     client = [_status(raw_state=raw_state, last_activity_unix=stale_activity)]
 
     assert detect_stalls(rows, client, now=_NOW) == []
+
+
+# --------------------------------------------------------------------------- #
+# download_deadline (concern 3 — honest observability, never read for control)
+# --------------------------------------------------------------------------- #
+def test_download_deadline_helper() -> None:
+    t = _NOW
+    assert download_deadline("metaDL", t) == t + timedelta(minutes=45)
+    assert download_deadline("forcedMetaDL", t) == t + timedelta(minutes=45)
+    assert download_deadline("downloading", t) == t + timedelta(hours=3)
+    assert download_deadline("someUnknownState", t) == t + timedelta(hours=3)
+    assert download_deadline("uploading", t) is None
+    assert download_deadline("error", t) is None

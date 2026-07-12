@@ -43,6 +43,7 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.datastructures import State
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.media_probe.ffprobe import FfprobeMediaProbe
@@ -155,6 +156,7 @@ __all__ = [
     "resolve_eviction_grace_days",
     "resolve_eviction_interval_minutes",
     "resolve_log_retention_days",
+    "resolve_qbittorrent",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -953,11 +955,55 @@ async def get_prowlarr(
     return ProwlarrIndexer(client, url, api_key)
 
 
-async def get_qbittorrent(
-    session: Annotated[AsyncSession, Depends(get_session)],
-    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+@dataclass(frozen=True)
+class _CachedQbittorrent:
+    """One cached :class:`QbittorrentClient` plus the settings key it was built
+    from, so a settings change invalidates the cache instead of silently
+    reusing stale credentials."""
+
+    key: tuple[str, str, str, str | None]
+    client: QbittorrentClient
+
+
+async def resolve_qbittorrent(
+    state: State,
+    session: AsyncSession,
+    client: httpx.AsyncClient,
 ) -> DownloadClientPort:
-    """Build a configured :class:`DownloadClientPort` (qBittorrent), else 409."""
+    """Build (or reuse) the configured qBittorrent adapter, else raise 409.
+
+    Caches ONE :class:`QbittorrentClient` on ``state.qbittorrent_client``, keyed
+    on the effective qbt settings tuple (url/username/password/prowlarr_url).
+    Without this cache, every caller of :func:`get_qbittorrent` -- including the
+    reconcile and auto-grab loops on their 15s ticks -- built a brand-new
+    ``QbittorrentClient`` with ``_logged_in = False`` AND a null adapter-local
+    ``_session_cookie``, so it re-``POST``ed ``/auth/login`` every cycle: pure
+    waste that drowned the genuine-login INFO log. Since #177 the qBittorrent
+    session cookie is held BY the adapter instance (never the process-wide
+    ``httpx.AsyncClient`` jar, whose portless cookies could cross services), so a
+    fresh instance loses the captured SID itself, not merely the ``_logged_in``
+    flag -- making instance reuse the ONLY way the session survives across
+    cycles. Reusing the instance keeps both ``_logged_in`` and the validated
+    ``_session_cookie``; the adapter's own ``_request`` still re-logs-in
+    transparently on a genuine 403, so that path is unaffected.
+
+    Mirrors :func:`get_health_cache`'s lazy ``app.state`` accessor pattern. A
+    settings change produces a different key, so the next resolve rebuilds a
+    fresh client (which re-parses the ``ServiceUrl`` from the new ``url`` and
+    logs in again with the new credentials) rather than reusing one whose
+    ``ServiceUrl`` / creds were built from stale settings. The key captures the
+    raw ``url`` string that feeds ``ServiceUrl.parse``, so any change to the
+    parsed service target necessarily changes the key.
+
+    Concurrency: the cached wrapper is shared across the reconcile loop, the
+    autograb loop, and concurrent HTTP requests -- exactly as the underlying
+    ``app.state.http_client`` already is. The only added shared mutable state
+    is ``_logged_in`` (bool), ``_session_cookie`` (tuple | None),
+    ``_properties_cache`` (dict), ``_stop_start`` (bool | None). asyncio is
+    single-threaded (no mid-statement preemption); a rare concurrent double-login
+    is idempotent (both POST valid creds, the SID cookie converges). Same sharing
+    posture as ``reconcile_status``/``health_cache``. No lock is warranted.
+    """
     store = SettingsStore(session)
     url = await store.get("qbittorrent_url")
     username = await store.get("qbittorrent_username")
@@ -972,12 +1018,29 @@ async def get_qbittorrent(
     # release ungrabbable. The app already trusts this exact URL with an API key
     # for every search call. None (unconfigured) keeps the veto fully closed.
     prowlarr_url = await store.get("prowlarr_url")
-    return QbittorrentClient(
+    key = (url, username, password, prowlarr_url or None)
+    cached = getattr(state, "qbittorrent_client", None)
+    if isinstance(cached, _CachedQbittorrent) and cached.key == key:
+        return cached.client
+    qbt = QbittorrentClient(
         client, url, username, password, trusted_source_origin=prowlarr_url or None
     )
+    state.qbittorrent_client = _CachedQbittorrent(key, qbt)
+    return qbt
+
+
+async def get_qbittorrent(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> DownloadClientPort:
+    """Build (or reuse the cached) configured :class:`DownloadClientPort`
+    (qBittorrent), else 409. See :func:`resolve_qbittorrent`."""
+    return await resolve_qbittorrent(request.app.state, session, client)
 
 
 async def get_qbittorrent_optional(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ) -> DownloadClientPort | None:
@@ -992,7 +1055,7 @@ async def get_qbittorrent_optional(
     unconfigured (never a silent skip).
     """
     try:
-        return await get_qbittorrent(session, client)
+        return await resolve_qbittorrent(request.app.state, session, client)
     except ServiceNotConfiguredError:
         return None
 

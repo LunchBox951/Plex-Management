@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
@@ -255,7 +256,12 @@ async def _reuse_terminal_row(
     ``release_title`` (issue #134) is refreshed the same way: a resurrected row
     otherwise keeps the PRIOR grab's release name, misleading the queue about
     which release is actually downloading now.
+
+    ``timeout_at`` is reset alongside ``added_at`` for the same reason: a
+    resurrected row gets a fresh, honest metadata-fetch deadline matching its
+    reset stall-detection anchor (observability only — never read for control).
     """
+    now = datetime.now(UTC)
     claimed = await download_repo.update_status_if_in(
         download_id,
         DownloadState.Downloading.value,
@@ -274,7 +280,8 @@ async def _reuse_terminal_row(
         episodes=episodes,
         media_type=media_type,
         release_title=release_title,
-        added_at=datetime.now(UTC),
+        added_at=now,
+        timeout_at=now + METADATA_STALL_WINDOW,
     )
     if not claimed:
         await session.rollback()
@@ -789,6 +796,7 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
                 release_title=candidate.title,
+                timeout_at=datetime.now(UTC) + METADATA_STALL_WINDOW,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release

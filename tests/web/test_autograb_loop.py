@@ -73,14 +73,16 @@ def _patch_adapters(
     async def _prowlarr(_session: AsyncSession, _client: httpx.AsyncClient) -> IndexerPort:
         return prowlarr
 
-    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         return qbt
 
     async def _enabled(_session: AsyncSession) -> bool:
         return enabled
 
     monkeypatch.setattr(app_module, "get_prowlarr", _prowlarr)
-    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_auto_grab_enabled", _enabled)
 
 

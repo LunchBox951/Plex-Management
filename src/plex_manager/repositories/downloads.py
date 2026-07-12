@@ -103,6 +103,7 @@ def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -
         failed_reason=row.failed_reason,
         first_seen_at=_as_utc(row.first_seen_at),
         added_at=_as_utc(row.added_at),
+        timeout_at=_as_utc(row.timeout_at),
         download_path=row.download_path,
         release_title=row.release_title,
         scopes=tuple(scopes or ()),
@@ -385,6 +386,7 @@ class SqlDownloadRepository:
         episodes: list[int] | None = None,
         media_type: str | None = None,
         release_title: str | None = None,
+        timeout_at: datetime | None = None,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -397,6 +399,7 @@ class SqlDownloadRepository:
             episodes_json=episodes,
             media_type=MediaType(media_type) if media_type is not None else None,
             release_title=release_title,
+            timeout_at=timeout_at,
         )
         self._session.add(row)
         await self._session.flush()
@@ -616,6 +619,7 @@ class SqlDownloadRepository:
         media_type: str | None = None,
         release_title: str | None = None,
         added_at: datetime | None = None,
+        timeout_at: datetime | None = None,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -641,6 +645,11 @@ class SqlDownloadRepository:
         keep the ORIGINAL grab's timestamp, so :func:`domain.reconciler.detect_stalls`
         could immediately misjudge the brand-new grab as stalled. ``None`` (the
         default) leaves the column untouched, for every other CAS caller.
+
+        ``timeout_at`` (issue: honest observability deadline, north star: honesty
+        over silence) lets a caller stamp the download-phase stall deadline on the
+        SAME CAS as the transition; ``None`` (the default) leaves the column
+        untouched.
 
         ``require_failed_reason`` (default: no predicate) additionally constrains the
         WHERE to rows whose CURRENT ``failed_reason`` exactly equals the given value
@@ -684,6 +693,8 @@ class SqlDownloadRepository:
             values["first_seen_at"] = first_seen_at
         if added_at is not None:
             values["added_at"] = added_at
+        if timeout_at is not None:
+            values["timeout_at"] = timeout_at
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))
@@ -751,15 +762,17 @@ class SqlDownloadRepository:
         *,
         progress: float | None = None,
         seed_ratio: float | None = None,
+        timeout_at: datetime | None = None,
     ) -> None:
-        """Update ONLY live progress / seed_ratio — never status.
+        """Update ONLY live progress / seed_ratio (+ the observability
+        ``timeout_at`` deadline) — never status.
 
         The reconcile loop refreshes progress on rows with no state transition. It must
         NOT rewrite status: an operator's import retry (or the importer) may have
         CAS-claimed the row to ``importing`` between the loop's ``list_active`` snapshot
         and this write, and rewriting the stale snapshot status would clobber that claim
         (defeating the import finalize CAS and stranding the placed file). Touching only
-        progress/seed_ratio leaves any concurrent status transition intact.
+        progress/seed_ratio/timeout_at leaves any concurrent status transition intact.
         """
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -768,4 +781,6 @@ class SqlDownloadRepository:
             row.progress = progress
         if seed_ratio is not None:
             row.seed_ratio = seed_ratio
+        if timeout_at is not None:
+            row.timeout_at = timeout_at
         await self._session.flush()
