@@ -55,7 +55,7 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
 - Configured service URLs (Plex/Prowlarr/qBittorrent/TMDB) are origin-confined,
   and changing a service's destination requires explicit operator consent
   ([ADR-0018](docs/adr/0018-origin-confined-service-urls.md)).
-- 18 Alembic migrations have shipped since the alpha's initial schema; every
+- 17 Alembic migrations have shipped since the alpha's initial schema; every
   container start runs `alembic upgrade head` before serving. Rollback and
   backup expectations are now documented honestly rather than implied — see
   [ADR-0021](docs/adr/0021-database-rollback-and-pre-migration-backup.md) and
