@@ -43,6 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
@@ -2298,12 +2299,18 @@ async def _heal_false_available_movies(
        confirmation fallback": that sibling was already confirmed at its own
        import/short-circuit time). Delete the NULL-path row and keep the
        sibling (mirrors ``request_service._collapse_available_race``'s
-       delete-the-loser). Ownership-guarded (issue #58): only when the
-       sibling is safe to keep for THIS row's owner (same owner, or either
-       side is ownerless) — a genuinely differing owner is left for the next
-       two branches instead, so a background heal (no user context) never
-       strands one owner's per-user list view to silently benefit another's.
-       Needs no Plex answer at all, so it runs regardless of
+       delete-the-loser). Ownership-guarded (issue #58): a PLAIN collapse only
+       when the delete strands no one's per-user list view — same owner, or the
+       NULL-path candidate is itself ownerless. An OWNED candidate whose only
+       real-path sibling is OWNERLESS is NOT a plain collapse (deleting the
+       owned row would drop it from that user's list, and the ownerless sibling
+       carries no owner to inherit the visibility): instead the ownerless
+       sibling is first ADOPTED for the candidate's owner
+       (:meth:`SqlRequestRepository.claim_if_unowned`) and only THEN collapsed
+       onto — atomically, so a lost adoption race (another user claimed the
+       sibling first) degrades to a logged skip rather than a strand. A
+       genuinely differing owner on every sibling is left for the branches
+       below. Needs no Plex answer at all, so it runs regardless of
        ``present_ids_succeeded``. The delete itself is a SECOND, independent
        CAS (:meth:`SqlRequestRepository.delete_false_available_sibling_collapse`)
        keyed on the row's ownership at the moment it read as of THIS pass's
@@ -2315,13 +2322,37 @@ async def _heal_false_available_movies(
        ownership no longer matches, it deletes nothing -- the row is left
        untouched for the next cycle to re-decide from a fresh read, never
        deleted out from under its new (or since-changed) owner.
-    2. **Genuinely present**: the batched GUID check confirms Plex has it
-       after all -- stamp ``available_heal_verified_at`` (a CAS write; see
+    2. **Genuinely present for THIS owner**: the batched GUID check confirms
+       Plex has it after all AND no cross-owner real-path sibling casts doubt on
+       whose copy that is (the candidate has NO real-path sibling at all -- any
+       same-owner/ownerless one would already have collapsed in branch 1) --
+       stamp ``available_heal_verified_at`` (a CAS write; see
        :meth:`SqlRequestRepository.mark_heal_verified_present`) so the row
        CONVERGES: it exits ``list_false_available_movies``'s scan population
        for good, instead of keeping the exact same ``available`` +
        ``library_path IS NULL`` signature (and being re-verified, and
-       re-occupying the bounded per-tick scan window) forever.
+       re-occupying the bounded per-tick scan window) forever. A GUID hit whose
+       ONLY corroboration is a DIFFERENT owner's real-path sibling is NOT owner-
+       corroborated: it must never one-way-converge THIS owner's row onto
+       someone else's file, so it falls through to the cross-owner re-arm
+       (branch 3) exactly like a GUID MISS with a cross-owner sibling does.
+
+       **Active-slot collision guard** (before every re-arm below): a re-request
+       for the same media may already hold this media's
+       ``uq_media_requests_active`` slot (any non-settled row -- ``pending`` /
+       ``downloading`` / ``completed`` / ...). Re-arming this NULL-path row to
+       ``pending`` would then violate that partial unique index, and the
+       resulting ``IntegrityError`` -- uncaught -- would abort the whole
+       availability cycle and repeat forever. So before any re-arm, look for
+       that active sibling: it already carries the user's live intent to fetch
+       the content, so COLLAPSE the false ``available`` row onto it (same
+       ownership-guarded CAS delete / adopt-then-collapse as branch 1) rather
+       than re-arming a duplicate. A genuinely cross-owner active sibling (which
+       the normal create paths make near-unreachable -- a foreign in-library row
+       is rejected 409, never grown into a second active row) can be neither
+       safely deleted nor re-armed over, so it degrades to a logged skip. Every
+       re-arm is additionally wrapped so a sibling appearing in the check->re-arm
+       gap is a rolled-back, logged skip -- never an aborted cycle.
     3. **Cross-owner sibling, path-corroborated**: a real-``library_path``
        sibling exists (same ``tmdb_id``/``'movie'``) but belongs to a
        DIFFERENT owner, so branch 1's ownership guard left it alone -- and the
@@ -2365,12 +2396,96 @@ async def _heal_false_available_movies(
     """
     repo = SqlRequestRepository(session)
 
+    async def _commit_collapse(row: RequestRecord, winner: RequestRecord, *, reason: str) -> None:
+        """CAS-delete the false-available ``row`` collapsing it onto ``winner``.
+
+        The delete is keyed on ``row``'s ownership snapshot (issue #58): if a
+        concurrent create claimed the row in the window since candidates were
+        read, the CAS finds nothing and the row is left for next cycle rather
+        than deleted out from under its new owner.
+        """
+        if await repo.delete_false_available_sibling_collapse(row.id, expected_user_id=row.user_id):
+            await session.commit()
+            _logger.info(
+                "healed duplicate false-available movie row: %s",
+                reason,
+                extra={
+                    "tmdb_id": safe_int(row.tmdb_id),
+                    "request_id": safe_int(row.id),
+                    "winner_request_id": safe_int(winner.id),
+                },
+            )
+        else:
+            await session.rollback()
+            _logger.warning(
+                "heal: false-available movie row's ownership changed before the "
+                "collapse could commit (likely claimed by a concurrent create in "
+                "the window since candidates were read); leaving it for next cycle "
+                "instead of deleting a row that may now be someone's just-succeeded "
+                "request",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+
+    async def _adopt_then_collapse(
+        row: RequestRecord, winner: RequestRecord, *, reason: str
+    ) -> None:
+        """Adopt an OWNERLESS ``winner`` for ``row``'s owner FIRST, then collapse
+        (finding 2 / issue #58): deleting an OWNED candidate onto an ownerless
+        sibling would drop the row from that user's per-user list with no owner to
+        inherit its visibility. Claim the sibling for the owner (atomic with the
+        collapse) so the owner keeps the row; a lost adoption race (another user
+        claimed the sibling first) degrades to a rolled-back logged skip.
+        """
+        owner = row.user_id
+        if owner is None or not await repo.claim_if_unowned(winner.id, owner):
+            await session.rollback()
+            _logger.warning(
+                "heal: could not adopt the ownerless sibling for the false-available "
+                "movie row's owner before collapsing (likely claimed by a concurrent "
+                "create in the window since candidates were read); leaving it for next "
+                "cycle rather than stranding the owner's per-user list view",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+            return
+        await _commit_collapse(row, winner, reason=reason)
+
+    async def _rearm(row: RequestRecord) -> bool:
+        """Re-arm the false-available ``row`` to ``pending``, guarded against the
+        ``uq_media_requests_active`` collision (finding 1): a concurrent active
+        re-request appearing in the check->re-arm gap makes the CAS UPDATE raise
+        ``IntegrityError``; catch it, roll back, and degrade to a logged skip so
+        the availability cycle NEVER aborts. Returns whether the row was re-armed.
+        """
+        try:
+            rearmed = await repo.rearm_false_available_to_pending(row.id)
+        except IntegrityError:
+            await session.rollback()
+            _logger.warning(
+                "heal: re-arm of false-available movie row collided with a concurrent "
+                "active re-request that now owns this media's uq_media_requests_active "
+                "slot; leaving it for next cycle (the active row carries the intent)",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+            return False
+        if rearmed:
+            await session.commit()
+            return True
+        await session.rollback()
+        return False
+
     # Phase 1: resolve every candidate's siblings + the ownership-guarded
     # "safe" one up front (DB-only, cheap) so phase 2 below can fold every
     # cross-owner candidate's sibling path(s) into ONE batched confirm_paths
     # call for the WHOLE pass, instead of one call per row.
+    #
+    # ``safe_sibling`` is a PLAIN collapse target: same owner, or the NULL-path
+    # candidate is itself ownerless (deleting it strands no per-user list). An
+    # OWNED candidate whose only real-path sibling is OWNERLESS is instead an
+    # ``adoptable_sibling`` (finding 2): the sibling must be claimed for the
+    # owner BEFORE collapsing so the owner keeps the row, never a plain delete.
     row_siblings: dict[int, list[RequestRecord]] = {}
     row_safe_sibling: dict[int, RequestRecord | None] = {}
+    row_adoptable_sibling: dict[int, RequestRecord | None] = {}
     for row in candidates:
         siblings = [
             sibling
@@ -2382,17 +2497,22 @@ async def _heal_false_available_movies(
             (
                 sibling
                 for sibling in siblings
-                if sibling.user_id == row.user_id or row.user_id is None or sibling.user_id is None
+                if sibling.user_id == row.user_id or row.user_id is None
             ),
             None,
         )
+        row_adoptable_sibling[row.id] = (
+            None
+            if row_safe_sibling[row.id] is not None or row.user_id is None
+            else next((sibling for sibling in siblings if sibling.user_id is None), None)
+        )
 
     # Phase 2: cross-owner sibling path corroboration (branch 3 above). Only
-    # candidates that will NOT collapse (no safe sibling) and were NOT already
-    # confirmed by the GUID batch need a path answer at all.
+    # candidates that will NOT collapse (no safe/adoptable sibling) and were NOT
+    # already confirmed by the GUID batch need a path answer at all.
     cross_owner_paths: set[str] = set()
     for row in candidates:
-        if row_safe_sibling[row.id] is not None:
+        if row_safe_sibling[row.id] is not None or row_adoptable_sibling[row.id] is not None:
             continue
         if present_ids_succeeded and (row.tmdb_id, "movie") in present_movie_keys:
             continue
@@ -2417,49 +2537,101 @@ async def _heal_false_available_movies(
     for row in candidates:
         siblings = row_siblings[row.id]
         safe_sibling = row_safe_sibling[row.id]
+        adoptable_sibling = row_adoptable_sibling[row.id]
+        # Branch 1: plain collapse onto a same-owner / candidate-ownerless
+        # real-path sibling. Needs no Plex answer.
         if safe_sibling is not None:
-            if await repo.delete_false_available_sibling_collapse(
-                row.id, expected_user_id=row.user_id
-            ):
-                await session.commit()
-                _logger.info(
-                    "healed duplicate false-available movie row: collapsed onto a "
-                    "sibling with a real library_path",
-                    extra={
-                        "tmdb_id": row.tmdb_id,
-                        "request_id": row.id,
-                        "winner_request_id": safe_sibling.id,
-                    },
-                )
-            else:
-                await session.rollback()
-                _logger.warning(
-                    "heal: false-available movie row's ownership changed before "
-                    "the sibling collapse could commit (likely claimed by a "
-                    "concurrent create in the window since candidates were "
-                    "read); leaving it for next cycle instead of deleting a "
-                    "row that may now be someone's just-succeeded request",
-                    extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
-                )
+            await _commit_collapse(
+                row, safe_sibling, reason="collapsed onto a sibling with a real library_path"
+            )
+            continue
+        # Branch 1b (finding 2): owned candidate + ownerless real-path sibling
+        # -> adopt the sibling for the owner, THEN collapse (never a plain delete
+        # that would strand the owner's per-user list view).
+        if adoptable_sibling is not None:
+            await _adopt_then_collapse(
+                row,
+                adoptable_sibling,
+                reason=(
+                    "adopted an ownerless sibling with a real library_path for this "
+                    "row's owner, then collapsed onto it"
+                ),
+            )
             continue
         if not present_ids_succeeded:
+            await session.rollback()
             _logger.warning(
                 "heal: batch availability check failed for false-available movie "
                 "row; leaving it for next cycle",
-                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
             )
             continue
-        if (row.tmdb_id, "movie") in present_movie_keys:
+        guid_present = (row.tmdb_id, "movie") in present_movie_keys
+        # Branch 2 (finding 4): genuinely present for THIS owner -- a GUID hit
+        # AND no cross-owner real-path sibling casting doubt on whose copy it is
+        # (any same-owner/ownerless one would already have collapsed above).
+        # Only then is convergence (a one-way stamp) honest.
+        if guid_present and not siblings:
             if await repo.mark_heal_verified_present(row.id):
                 await session.commit()
                 _logger.info(
                     "healed false-available movie row: Plex confirms present, "
                     "re-verified and stamped so it stops being re-scanned",
-                    extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
                 )
             else:
                 await session.rollback()
             continue
+        # Active-slot collision guard (finding 1): a re-request already holding
+        # this media's uq_media_requests_active slot (any non-settled row) would
+        # make the re-arm below raise IntegrityError and abort the whole cycle.
+        # It already carries the user's live intent, so collapse the false row
+        # onto it instead of re-arming a duplicate.
+        active_sibling = await repo.find_active(row.tmdb_id, "movie")
+        if active_sibling is not None:
+            if active_sibling.user_id == row.user_id or row.user_id is None:
+                await _commit_collapse(
+                    row,
+                    active_sibling,
+                    reason="collapsed onto an active re-request that already carries the intent",
+                )
+            elif active_sibling.user_id is None:
+                await _adopt_then_collapse(
+                    row,
+                    active_sibling,
+                    reason=(
+                        "adopted the ownerless active re-request for this row's owner, "
+                        "then collapsed onto it"
+                    ),
+                )
+            else:
+                await session.rollback()
+                _logger.warning(
+                    "heal: false-available movie row has an active re-request owned by "
+                    "a DIFFERENT user holding this media's dedup slot; can neither "
+                    "re-arm (would collide) nor collapse (would strand this owner) -- "
+                    "leaving it for next cycle",
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+                )
+            continue
+        # Branch 3 (finding 4): GUID present but corroborated ONLY by a cross-
+        # owner real-path sibling -> the content exists under a DIFFERENT owner's
+        # copy, not this owner's. Conclusive that it exists, so re-arm THIS owner
+        # for their own fresh copy rather than one-way-converging on another
+        # owner's file (which would strand this row if that sibling is later
+        # evicted, ADR-0012). No path check needed: the GUID hit is conclusive.
+        if guid_present:
+            if await _rearm(row):
+                _logger.info(
+                    "healed false-available movie row: Plex confirms the content "
+                    "present but only under a DIFFERENT owner's copy; re-armed to "
+                    "pending for this owner's own fresh search instead of converging "
+                    "on another owner's file",
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+                )
+            continue
+        # Branches 4 & 5 (GUID miss). A cross-owner sibling whose path could not
+        # be corroborated leaves the row untouched (never re-armed on an unknown).
         cross_owner_sibling = next(
             (
                 sibling
@@ -2469,13 +2641,14 @@ async def _heal_false_available_movies(
             None,
         )
         if siblings and not cross_owner_check_succeeded:
+            await session.rollback()
             _logger.warning(
                 "heal: cross-owner sibling path corroboration failed for "
                 "false-available movie row; leaving it for next cycle",
-                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
             )
-        elif await repo.rearm_false_available_to_pending(row.id):
-            await session.commit()
+            continue
+        if await _rearm(row):
             if cross_owner_sibling is not None:
                 # Corroborated: the content genuinely exists under a DIFFERENT
                 # owner's row. Still re-arm rather than stamping
@@ -2490,19 +2663,17 @@ async def _heal_false_available_movies(
                     "this owner's own fresh search instead of converging on "
                     "another owner's file",
                     extra={
-                        "tmdb_id": row.tmdb_id,
-                        "request_id": row.id,
-                        "sibling_request_id": cross_owner_sibling.id,
+                        "tmdb_id": safe_int(row.tmdb_id),
+                        "request_id": safe_int(row.id),
+                        "sibling_request_id": safe_int(cross_owner_sibling.id),
                     },
                 )
             else:
                 _logger.info(
                     "healed false-available movie row: not in Plex and no "
                     "confirmable sibling copy; re-armed to pending for a fresh search",
-                    extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
                 )
-        else:
-            await session.rollback()
 
 
 async def run_availability_cycle(

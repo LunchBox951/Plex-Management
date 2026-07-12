@@ -9,6 +9,8 @@ index over active statuses rejects the loser; ``create_request`` catches the
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
+from typing import Literal
 
 import httpx
 import pytest
@@ -2945,6 +2947,77 @@ async def test_short_circuit_denies_available_when_confirm_paths_raises(
             session, tmdb, tmdb_id=903, media_type="movie", library=library
         )
     assert record.status == RequestStatus.pending.value
+
+
+async def test_short_circuit_corroborates_breadcrumb_before_taking_media_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 3: the breadcrumb ``confirm_paths`` corroboration (network I/O)
+    must run BEFORE the per-media dedup lock is acquired -- never inside the
+    lock's open write transaction (on SQLite that stalls every unrelated writer
+    for the full Plex timeout). Mirrors the TV path's release-before-Plex
+    discipline: NO Plex port call may happen between lock acquire and release."""
+    calls: list[str] = []
+    real_confirm = FakeLibrary.confirm_paths
+    real_is_available = FakeLibrary.is_available
+    real_lock = SqlRequestRepository.acquire_media_lock
+
+    async def rec_confirm(
+        self: FakeLibrary, media_type: Literal["movie", "tv"], library_paths: Collection[str]
+    ) -> frozenset[str]:
+        calls.append("confirm_paths")
+        return await real_confirm(self, media_type, library_paths)
+
+    async def rec_is_available(
+        self: FakeLibrary,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        *,
+        use_cache: bool = True,
+        season: int | None = None,
+    ) -> bool:
+        calls.append("is_available")
+        return await real_is_available(
+            self, tmdb_id, media_type, use_cache=use_cache, season=season
+        )
+
+    async def rec_lock(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        calls.append("lock")
+        await real_lock(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(FakeLibrary, "confirm_paths", rec_confirm)
+    monkeypatch.setattr(FakeLibrary, "is_available", rec_is_available)
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", rec_lock)
+
+    # A prior terminal row leaves a real breadcrumb so confirm_paths is consulted.
+    async with sessionmaker_() as session:
+        session.add(
+            MediaRequest(
+                tmdb_id=905,
+                media_type=MediaType.movie,
+                title="Mario",
+                status=RequestStatus.cancelled,
+                library_path="/movies/mario",
+            )
+        )
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={905: MovieMetadata(tmdb_id=905, title="Mario", year=2023)})
+    library = FakeLibrary(available={905}, movie_file_paths=["/movies/mario/movie.mkv"])
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=905, media_type="movie", library=library
+        )
+
+    assert record.status == RequestStatus.available.value  # breadcrumb corroborated -> minted
+    assert "lock" in calls and "confirm_paths" in calls
+    lock_at = calls.index("lock")
+    # The network corroboration (and the presence probe) ran BEFORE the lock ...
+    assert calls.index("confirm_paths") < lock_at
+    # ... and NO Plex port call happened between lock acquire and release.
+    assert "confirm_paths" not in calls[lock_at + 1 :]
+    assert "is_available" not in calls[lock_at + 1 :]
 
 
 async def test_settled_status_value_sets_in_sync() -> None:

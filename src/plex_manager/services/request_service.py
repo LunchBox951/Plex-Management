@@ -799,7 +799,32 @@ async def create_request_result(
         # already knows the file is gone shouldn't pay for, or risk racing, a
         # presence check whose answer they are about to override).
         plex_present = force or await _already_in_library(library, tmdb_id)
+        # Whether a prior terminal row's ``library_path`` breadcrumb existed but Plex
+        # could NOT corroborate it -- resolved BEFORE the per-media lock below (see
+        # its own comment) and consumed by the mint-'available' branch further down.
+        breadcrumb_uncorroborated = False
         if plex_present:
+            # Corroborate the in-library short-circuit's breadcrumb BEFORE taking the
+            # per-media lock. ``confirm_paths`` is network I/O, and -- exactly like the
+            # TV path's Plex crawl below, which is also ordered before its
+            # ``acquire_media_lock`` -- it must NEVER run inside the lock's open write
+            # transaction: on SQLite (single-writer) the lock-row insert has already
+            # opened a write transaction, so a slow/unreachable Plex call held under it
+            # would stall every unrelated writer for the full Plex timeout. Only the
+            # non-``force`` mint-'available' branch consults this (``force`` never mints
+            # 'available'), so the round-trip is skipped for a forced re-acquire. The
+            # decision is re-applied under the lock below only after re-reading that no
+            # active/terminal row now supersedes it; a benign breadcrumb change in the
+            # gap merely falls through to the conservative 'pending'.
+            if not force:
+                breadcrumb = await repo.latest_library_path(tmdb_id, media_type)
+                if breadcrumb is not None:
+                    confirmed: frozenset[str]
+                    try:
+                        confirmed = await library.confirm_paths("movie", [breadcrumb])
+                    except (PlexLibraryError, PlexAuthError, NotImplementedError):
+                        confirmed = frozenset()
+                    breadcrumb_uncorroborated = breadcrumb not in confirmed
             # Dedup the available short-circuit: if this movie is already recorded as
             # in-library, return that row rather than accumulating duplicate 'available'
             # rows (the active-dedup partial index excludes terminal statuses, so it
@@ -904,26 +929,22 @@ async def create_request_result(
                 # (never placed by this app) has no breadcrumb and keeps today's
                 # behavior unchanged -- only a media with prior history gets the
                 # extra check, so the common case never pays for or risks a wasted
-                # re-download. When a breadcrumb exists but ``confirm_paths``
-                # cannot corroborate it (or the corroboration check itself fails),
-                # be conservative: fall through to a normal 'pending' request
-                # instead of instant-completing on a GUID match this app has
-                # independent reason to distrust.
-                breadcrumb = await repo.latest_library_path(tmdb_id, media_type)
-                if breadcrumb is not None:
-                    confirmed: frozenset[str]
-                    try:
-                        confirmed = await library.confirm_paths("movie", [breadcrumb])
-                    except (PlexLibraryError, PlexAuthError, NotImplementedError):
-                        confirmed = frozenset()
-                    if breadcrumb not in confirmed:
-                        _logger.info(
-                            "movie GUID-present but a prior library_path breadcrumb "
-                            "did not corroborate; not minting instant-available, "
-                            "proceeding as a normal pending request",
-                            extra={"tmdb_id": safe_int(tmdb_id)},
-                        )
-                        initial_status = RequestStatus.pending.value
+                # re-download. When a breadcrumb existed but ``confirm_paths``
+                # could not corroborate it (or the corroboration check itself
+                # failed), be conservative: fall through to a normal 'pending'
+                # request instead of instant-completing on a GUID match this app
+                # has independent reason to distrust. The ``confirm_paths``
+                # network call itself was made BEFORE the per-media lock (see
+                # ``breadcrumb_uncorroborated`` above) so the lock's write
+                # transaction is never held across Plex I/O.
+                if breadcrumb_uncorroborated:
+                    _logger.info(
+                        "movie GUID-present but a prior library_path breadcrumb "
+                        "did not corroborate; not minting instant-available, "
+                        "proceeding as a normal pending request",
+                        extra={"tmdb_id": safe_int(tmdb_id)},
+                    )
+                    initial_status = RequestStatus.pending.value
 
     if (
         media_type == "tv"
