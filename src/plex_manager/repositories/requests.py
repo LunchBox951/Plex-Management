@@ -464,7 +464,8 @@ class SqlRequestRepository:
         return result
 
     async def list_false_available_movies(self, *, limit: int) -> list[RequestRecord]:
-        """Movie rows ``status='available' AND library_path IS NULL``, id-ascending.
+        """Movie rows ``status='available' AND library_path IS NULL AND
+        available_heal_verified_at IS NULL``, id-ascending.
 
         The EXACT false-claim signature the already-in-library short-circuit mints
         (``request_service.create_request_result``): ``mark_available`` never sets
@@ -475,6 +476,17 @@ class SqlRequestRepository:
         lives on ``SeasonRequest`` for tv) -- scoped to ``movie`` only so a TV
         rollup row is never mistaken for a false claim. ``id``-ascending + capped
         at ``limit`` bounds the healing pass so a reconcile tick stays cheap.
+
+        ``available_heal_verified_at IS NULL`` is the CONVERGENCE guard: once the
+        heal pass (``import_service._heal_false_available_movies``) live-
+        reconfirms a row genuinely present, it stamps that column (see
+        :meth:`mark_heal_verified_present`) and the row permanently exits this
+        scan population. Without it, a genuinely-present row (which never gets a
+        ``library_path`` -- there was never a file for THIS app to place) would
+        keep the exact same signature forever: re-fetched, re-verified, and
+        re-occupying the bounded per-tick ``limit`` window on EVERY reconcile
+        tick, which could starve out a later, higher-id GENUINE false claim from
+        ever being scanned at all.
         """
         stmt = (
             select(MediaRequest)
@@ -482,12 +494,52 @@ class SqlRequestRepository:
                 MediaRequest.media_type == MediaType.movie,
                 MediaRequest.status == RequestStatus.available,
                 MediaRequest.library_path.is_(None),
+                MediaRequest.available_heal_verified_at.is_(None),
             )
             .order_by(MediaRequest.id)
             .limit(limit)
         )
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
+
+    async def mark_heal_verified_present(self, request_id: int) -> bool:
+        """CAS-stamp ``available_heal_verified_at`` for a false-available-heal
+        candidate the pass just live-reconfirmed genuinely present in Plex.
+
+        A single ``UPDATE ... WHERE id = ? AND status = 'available' AND
+        library_path IS NULL AND available_heal_verified_at IS NULL`` -- the
+        DATABASE, not a prior read, decides whether the exact false-claim
+        signature still holds (mirrors :meth:`rearm_false_available_to_pending`'s
+        CAS discipline). The ``available_heal_verified_at IS NULL`` arm makes
+        convergence a ONE-WAY door: once stamped, a repeat call (e.g. a stale
+        in-memory candidate list from a concurrent/overlapping cycle) is an
+        honest no-op rather than pointlessly re-writing the same stamp. Also
+        re-stamps ``library_verified_at`` (the row's presence WAS just
+        reconfirmed). This is what makes the heal pass CONVERGE: the row
+        permanently exits :meth:`list_false_available_movies`'s scan population
+        afterward, instead of keeping the exact same signature and being
+        re-verified (and re-occupying the bounded per-tick scan window) every
+        reconcile tick forever. Returns whether a row was actually updated --
+        ``False`` means a concurrent writer already moved the row off this exact
+        signature (e.g. collapsed it onto a sibling, re-armed it, or already
+        stamped it) and this call must not clobber that outcome.
+        """
+        now = datetime.now(UTC)
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(
+                    MediaRequest.id == request_id,
+                    MediaRequest.status == RequestStatus.available,
+                    MediaRequest.library_path.is_(None),
+                    MediaRequest.available_heal_verified_at.is_(None),
+                )
+                .values(available_heal_verified_at=now, library_verified_at=now)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
 
     async def rearm_false_available_to_pending(self, request_id: int) -> bool:
         """Re-arm a healed false-available row to ``pending`` (honest re-search).

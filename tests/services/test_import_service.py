@@ -4139,7 +4139,9 @@ async def test_heal_collapses_null_path_available_onto_real_path_sibling(
 
 async def test_heal_restamps_when_genuinely_present(sessionmaker_: SessionMaker) -> None:
     """No sibling, but a live GUID check confirms Plex genuinely has it after all
-    -- re-stamp ``library_verified_at`` and leave the row 'available'/NULL-path."""
+    -- re-stamp ``library_verified_at``, leave the row 'available'/NULL-path, and
+    CONVERGE (P1 regression): a second reconcile tick must not re-probe Plex for
+    this row at all -- it has permanently exited the heal scan population."""
     row_id = await _seed_movie_request(
         sessionmaker_, tmdb_id=777, status=RequestStatus.available, library_path=None
     )
@@ -4158,6 +4160,23 @@ async def test_heal_restamps_when_genuinely_present(sessionmaker_: SessionMaker)
     assert after.status == RequestStatus.available
     assert after.library_path is None
     assert after.library_verified_at is not None  # re-stamped
+    assert after.available_heal_verified_at is not None  # converged: exits future scans
+    assert library.present_ids_calls == 1
+
+    # Second tick: nothing else pending/completed/false-available exists, so a
+    # genuinely-converged row must not trigger ANY further Plex call -- the old
+    # per-row ``is_available(use_cache=False)`` would have paged the whole movie
+    # library again here, every 15s, forever.
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        after_second_tick = await session.get(MediaRequest, row_id)
+    assert after_second_tick is not None
+    assert after_second_tick.status == RequestStatus.available
+    assert after_second_tick.library_path is None
+    assert library.present_ids_calls == 1  # unchanged: the row was never re-probed
+    assert library.is_available_calls == 0
 
 
 async def test_heal_rearms_to_pending_when_absent_and_no_sibling(
@@ -4260,9 +4279,9 @@ async def test_heal_differing_owner_sibling_not_deleted(sessionmaker_: SessionMa
 async def test_heal_leaves_row_when_live_check_errors(
     sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The live availability check itself fails (Plex unreachable) -- honesty over
-    silence: the row is left completely unchanged (unknown != absent), and a
-    warning is logged."""
+    """The shared batched Plex check itself fails (Plex unreachable) -- honesty
+    over silence: the row is left completely unchanged (unknown != absent), and
+    a warning is logged rather than the row being wrongly re-armed."""
     row_id = await _seed_movie_request(
         sessionmaker_, tmdb_id=781, status=RequestStatus.available, library_path=None
     )
@@ -4277,7 +4296,50 @@ async def test_heal_leaves_row_when_live_check_errors(
     assert row is not None
     assert row.status == RequestStatus.available
     assert row.library_path is None
-    assert any("live availability check failed" in r.getMessage() for r in caplog.records)
+    assert row.available_heal_verified_at is None
+    assert any("batch availability check failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_convergence_frees_budget_for_higher_id_false_claim(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 regression: enough already-genuinely-present low-id rows to fill the
+    whole per-tick heal budget must not permanently starve a later, higher-id
+    GENUINE false claim out of ever being scanned. Each genuinely-present row
+    converges (stamps ``available_heal_verified_at`` and exits the scan
+    population) after being checked once, so the SECOND tick's budget is freed
+    up to finally reach the false claim."""
+    limit = import_service._HEAL_FALSE_AVAILABLE_LIMIT  # pyright: ignore[reportPrivateUsage]
+    genuine_tmdb_ids = list(range(3000, 3000 + limit + 2))
+    for tmdb_id in genuine_tmdb_ids:
+        await _seed_movie_request(
+            sessionmaker_, tmdb_id=tmdb_id, status=RequestStatus.available, library_path=None
+        )
+    # Created LAST, so its row id is the highest -- id-ascending + the bounded
+    # limit is exactly what starved it before this fix.
+    false_claim_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=3999, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(available=set(genuine_tmdb_ids))  # false claim absent, no sibling
+
+    # Tick 1: the low-id genuine rows fill the whole budget; the false claim
+    # (highest id) is outside this tick's window and stays untouched.
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+    async with sessionmaker_() as session:
+        after_tick_1 = await session.get(MediaRequest, false_claim_id)
+    assert after_tick_1 is not None
+    assert after_tick_1.status == RequestStatus.available
+
+    # Tick 2: every genuine row converged on tick 1 (stamped, excluded from the
+    # scan query), freeing the budget -- the false claim is now reachable and
+    # heals (re-armed to 'pending' for a fresh, honest search).
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+    async with sessionmaker_() as session:
+        after_tick_2 = await session.get(MediaRequest, false_claim_id)
+    assert after_tick_2 is not None
+    assert after_tick_2.status == RequestStatus.pending
 
 
 async def test_heal_is_bounded_per_cycle(sessionmaker_: SessionMaker) -> None:

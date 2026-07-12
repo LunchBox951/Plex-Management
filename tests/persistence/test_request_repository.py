@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plex_manager.models import User
+from plex_manager.models import MediaRequest, User
 from plex_manager.repositories import SqlRequestRepository
 
 # The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
@@ -514,9 +514,11 @@ async def test_clear_library_path_if_set_is_a_single_winner_gate(session: AsyncS
 
 
 async def test_list_false_available_movies_signature_and_bound(session: AsyncSession) -> None:
-    """Returns only movie + available + NULL-``library_path`` rows, id-ascending,
-    respecting ``limit``; excludes a non-movie, a non-available, and a
-    non-NULL-path row."""
+    """Returns only movie + available + NULL-``library_path`` +
+    NULL-``available_heal_verified_at`` rows, id-ascending, respecting ``limit``;
+    excludes a non-movie, a non-available, a non-NULL-path row, and a row the
+    heal pass already converged (P1 regression: without this last exclusion a
+    genuinely-present row would be re-scanned every tick forever)."""
     repo = SqlRequestRepository(session)
     qualifying_1 = await repo.create(tmdb_id=10, media_type="movie", title="Q1", status="available")
     qualifying_2 = await repo.create(tmdb_id=11, media_type="movie", title="Q2", status="available")
@@ -529,12 +531,49 @@ async def test_list_false_available_movies_signature_and_bound(session: AsyncSes
         tmdb_id=14, media_type="movie", title="WithPath", status="available"
     )
     await repo.set_library_path(with_path.id, "/movies/x")
+    # Excluded: the heal pass already live-reconfirmed this row present and
+    # stamped it -- it must never re-enter the scan population.
+    converged = await repo.create(
+        tmdb_id=15, media_type="movie", title="Converged", status="available"
+    )
+    assert await repo.mark_heal_verified_present(converged.id) is True
 
     rows = await repo.list_false_available_movies(limit=25)
     assert [r.id for r in rows] == [qualifying_1.id, qualifying_2.id]
 
     bounded = await repo.list_false_available_movies(limit=1)
     assert [r.id for r in bounded] == [qualifying_1.id]
+
+
+async def test_mark_heal_verified_present_cas(session: AsyncSession) -> None:
+    """Succeeds on the exact false-claim signature (available + NULL path),
+    stamping BOTH ``available_heal_verified_at`` and ``library_verified_at``; a
+    second call no-ops (returns False) since it already left that signature by
+    virtue of the FIRST stamp -- convergence is a one-way door."""
+    repo = SqlRequestRepository(session)
+    row = await repo.create(tmdb_id=22, media_type="movie", title="Heal", status="available")
+
+    changed = await repo.mark_heal_verified_present(row.id)
+    assert changed is True
+    healed = await repo.get(row.id)
+    assert healed is not None
+    assert healed.status == "available"
+    assert healed.library_path is None
+    healed_orm = await session.get(MediaRequest, row.id)
+    assert healed_orm is not None
+    assert healed_orm.library_verified_at is not None
+    assert healed_orm.available_heal_verified_at is not None
+
+    # Convergence is a one-way door: the row already left the exact false-claim
+    # signature the FIRST stamp created, so a second call no-ops.
+    assert await repo.mark_heal_verified_present(row.id) is False
+
+    # A row that carries a real library_path is never the false-claim signature.
+    with_path = await repo.create(
+        tmdb_id=23, media_type="movie", title="WithPath", status="available"
+    )
+    await repo.set_library_path(with_path.id, "/movies/z")
+    assert await repo.mark_heal_verified_present(with_path.id) is False
 
 
 async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> None:

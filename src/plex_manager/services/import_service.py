@@ -37,7 +37,7 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
@@ -2265,18 +2265,30 @@ async def run_import_cycle(
 
 
 async def _heal_false_available_movies(
-    *, library: LibraryPort, session: AsyncSession, exclude_ids: frozenset[int] = frozenset()
+    *,
+    session: AsyncSession,
+    candidates: Sequence[RequestRecord],
+    present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]],
+    present_ids_succeeded: bool,
 ) -> None:
     """Self-heal MOVIE rows falsely minted ``available`` by the in-library
     short-circuit (request-dedup bug: a transient/mis-tagged Plex GUID at
     create time, ``request_service.create_request_result``).
 
-    Scans ``status='available' AND library_path IS NULL`` -- the exact
-    false-claim signature (see :data:`_HEAL_FALSE_AVAILABLE_LIMIT`'s docstring
-    comment) -- capped at that limit per tick, id-ascending, excluding
-    ``exclude_ids`` (rows the CALLER's own movie promotion loop this SAME tick
-    already confirmed via the identical GUID/path checks -- see the call site
-    in :func:`run_availability_cycle`). Per row, in priority order:
+    ``candidates`` are ``status='available' AND library_path IS NULL AND
+    available_heal_verified_at IS NULL`` rows -- the exact false-claim
+    signature (see :data:`_HEAL_FALSE_AVAILABLE_LIMIT`'s docstring comment),
+    fetched by the CALLER (:func:`run_availability_cycle`) capped at that
+    limit per tick, id-ascending, BEFORE this tick's movie promotion loop runs
+    -- so a row that loop promotes this same tick was still ``completed`` (a
+    disjoint status) when ``candidates`` was read and can never double up here.
+    ``present_movie_keys``/``present_ids_succeeded`` are the SAME batched
+    ``LibraryPort.present_ids`` answer the promotion loop uses -- the caller
+    folds every candidate's ``tmdb_id`` into that ONE call before running
+    either loop (never a second Plex call, and never the old per-row
+    ``is_available(use_cache=False)``, which cost one full movie-library page
+    PER ROW and could starve a whole tick's healing budget on already-known
+    presence checks alone). Per row, in priority order:
 
     1. **Sibling collapse**: another row for the SAME ``(tmdb_id, 'movie')`` is
        ``available``/``completed`` and carries a REAL ``library_path`` -- the
@@ -2290,28 +2302,36 @@ async def _heal_false_available_movies(
        side is ownerless) — a genuinely differing owner is left for the next
        two branches instead, so a background heal (no user context) never
        strands one owner's per-user list view to silently benefit another's.
-    2. **Genuinely present**: a live (``use_cache=False``) GUID check confirms
-       Plex has it after all -- re-stamp ``library_verified_at`` (the row was
-       right, just unconfirmed by a fresh check) and leave it.
+       Needs no Plex answer at all, so it runs regardless of
+       ``present_ids_succeeded``.
+    2. **Genuinely present**: the batched GUID check confirms Plex has it
+       after all -- stamp ``available_heal_verified_at`` (a CAS write; see
+       :meth:`SqlRequestRepository.mark_heal_verified_present`) so the row
+       CONVERGES: it exits ``list_false_available_movies``'s scan population
+       for good, instead of keeping the exact same ``available`` +
+       ``library_path IS NULL`` signature (and being re-verified, and
+       re-occupying the bounded per-tick scan window) forever.
     3. **Absent, no usable sibling**: re-arm to ``pending`` -- the original
        request was never actually fulfilled, so it re-enters the normal
        search/grab pipeline (``list_due_for_search`` picks up a re-armed
        ``pending`` row immediately; the CAS resets the auto-grab backoff).
 
+    Branches 2 and 3 both require a CONCLUSIVE answer: when
+    ``present_ids_succeeded`` is ``False`` (the shared batch call itself
+    raised -- Plex unreachable, auth failure, etc.), every row that didn't
+    collapse onto a sibling is left completely untouched for the next tick's
+    retry -- a same-tick transport failure must never be misread as "genuinely
+    absent" and wrongly re-armed.
+
     Every branch is its own transaction (commit/rollback per row) so one bad
     row never aborts the rest of the pass, mirroring the promotion loops
-    above. Every outcome -- collapse, re-verify, re-arm, or a live-check
+    above. Every outcome -- collapse, re-verify, re-arm, or a transport
     failure that leaves the row untouched -- logs, honoring "honesty over
     silence": a duplicate/false row is never silently deleted or left
     unexplained.
     """
     repo = SqlRequestRepository(session)
-    rows = [
-        row
-        for row in await repo.list_false_available_movies(limit=_HEAL_FALSE_AVAILABLE_LIMIT)
-        if row.id not in exclude_ids
-    ]
-    for row in rows:
+    for row in candidates:
         siblings = [
             sibling
             for sibling in await repo.list_for_media(row.tmdb_id, "movie", _IN_LIBRARY_STATUSES)
@@ -2338,22 +2358,23 @@ async def _heal_false_available_movies(
                 },
             )
             continue
-        try:
-            present = await library.is_available(row.tmdb_id, "movie", use_cache=False)
-        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+        if not present_ids_succeeded:
             _logger.warning(
-                "heal: live availability check failed for false-available movie "
+                "heal: batch availability check failed for false-available movie "
                 "row; leaving it for next cycle",
                 extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
             )
             continue
-        if present:
-            await repo.mark_available(row.id)
-            await session.commit()
-            _logger.info(
-                "healed false-available movie row: Plex confirms present, re-verified",
-                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
-            )
+        if (row.tmdb_id, "movie") in present_movie_keys:
+            if await repo.mark_heal_verified_present(row.id):
+                await session.commit()
+                _logger.info(
+                    "healed false-available movie row: Plex confirms present, "
+                    "re-verified and stamped so it stops being re-scanned",
+                    extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+                )
+            else:
+                await session.rollback()
         elif await repo.rearm_false_available_to_pending(row.id):
             await session.commit()
             _logger.info(
@@ -2424,17 +2445,25 @@ async def run_availability_cycle(
     misattributed to a library/GUID mismatch; the "batch availability check
     failed" warning already logged above names the real cause.
 
-    SELF-HEAL FALSE 'AVAILABLE' CLAIMS (request-dedup bug): after the movie
-    promotion loop above, a bounded pass (:func:`_heal_false_available_movies`)
-    scans for MOVIE rows already ``available`` with ``library_path IS NULL`` --
-    the unique signature the already-in-library short-circuit
+    SELF-HEAL FALSE 'AVAILABLE' CLAIMS (request-dedup bug): a bounded pass
+    (:func:`_heal_false_available_movies`, run after the movie promotion loop
+    below) scans for MOVIE rows already ``available`` with ``library_path IS
+    NULL`` -- the unique signature the already-in-library short-circuit
     (``request_service.create_request_result``) mints when a transient/
     mis-tagged Plex GUID makes it believe a movie is present that never
     actually was. Each false claim is either collapsed onto a genuine sibling
-    row, re-verified live and left standing, or re-armed to ``pending`` for a
-    fresh, honest search -- north stars "correction without a terminal" and
-    "honesty over silence": a wrongly-terminal row self-corrects on the next
-    reconcile tick instead of silently shadowing a real re-request forever.
+    row, re-verified and stamped ``available_heal_verified_at`` (which
+    converges it out of future scans -- a genuinely-present row is never
+    re-verified or re-paged again), or re-armed to ``pending`` for a fresh,
+    honest search -- north stars "correction without a terminal" and "honesty
+    over silence": a wrongly-terminal row self-corrects on the next reconcile
+    tick instead of silently shadowing a real re-request (or perpetually
+    consuming the bounded per-tick heal budget and starving a later,
+    higher-id false claim) forever. These candidate rows are fetched HERE,
+    before the promotion loop, so their ``tmdb_id``s can be folded into the
+    SAME single batched ``present_ids`` call the promotion loop already needs
+    -- the heal pass never issues its own (formerly per-ROW, full-library-page)
+    Plex call.
     """
     effective_now = now if now is not None else datetime.now(UTC)
     promoted = 0
@@ -2444,24 +2473,45 @@ async def run_availability_cycle(
         for request in await request_repo.list_by_status(RequestStatus.completed.value)
         if request.media_type == "movie"
     ]
+    # False-available heal candidates (see the docstring section above and
+    # ``_heal_false_available_movies``) -- read NOW, before the promotion loop
+    # below runs, so a row that loop promotes this very tick was still
+    # ``completed`` (a status disjoint from ``available``) at THIS read and can
+    # never also show up here; no separate exclude-set is needed.
+    heal_candidates = await request_repo.list_false_available_movies(
+        limit=_HEAL_FALSE_AVAILABLE_LIMIT
+    )
     present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]] = frozenset()
     # Whether the GUID batch actually returned an answer this tick, as opposed
     # to defaulting to "nothing confirmed" because the call itself raised
     # (round-5 finding: a transport failure must never be mistaken for a
     # genuine "Plex doesn't have this" -- the "batch availability check
-    # failed" warning above already surfaces the real cause).
+    # failed" warning above already surfaces the real cause). Shared by both
+    # the promotion loop below and the heal pass after it.
     present_ids_succeeded = False
-    if completed_movies:
+    # ``present_ids`` costs AT MOST one movie-library crawl for the WHOLE
+    # call no matter how many keys it's asked about, so folding the heal
+    # candidates in here is free -- one call answers both the promotion loop
+    # AND the heal pass, instead of two (or, before this fix, N per-row) calls.
+    _completed_keys: list[tuple[int, Literal["movie", "tv"]]] = [
+        (request.tmdb_id, "movie") for request in completed_movies
+    ]
+    _heal_keys: list[tuple[int, Literal["movie", "tv"]]] = [
+        (row.tmdb_id, "movie") for row in heal_candidates
+    ]
+    combined_movie_keys = list(dict.fromkeys(_completed_keys + _heal_keys))
+    if combined_movie_keys:
         try:
             present_movie_keys = await library.present_ids(
-                [(request.tmdb_id, "movie") for request in completed_movies],
+                combined_movie_keys,
                 refresh_absent=True,
             )
             present_ids_succeeded = True
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             _logger.warning(
-                "batch availability check failed for %d completed movie(s); will retry next cycle",
-                len(completed_movies),
+                "batch availability check failed for %d completed/false-available "
+                "movie(s); will retry next cycle",
+                len(combined_movie_keys),
             )
 
     # Path-based fallback candidates (issue #158): every GUID-miss movie that
@@ -2490,13 +2540,6 @@ async def run_availability_cycle(
                 len(movies_needing_path_check),
             )
 
-    # ids promoted to 'available' in the loop just below, THIS tick -- excluded
-    # from the false-available heal pass right after it (see that call site):
-    # a row this tick's own promotion just confirmed via the SAME GUID/path
-    # checks above is never a stale false claim to re-litigate a moment later,
-    # even on the rare legacy row that (like a false-claim row) also happens to
-    # carry no ``library_path`` (e.g. a pre-breadcrumb-column import).
-    promoted_this_tick: set[int] = set()
     for request in completed_movies:
         key = _movie_unconfirmed_key(request.id)
         guid_confirmed = (request.tmdb_id, "movie") in present_movie_keys
@@ -2530,7 +2573,6 @@ async def run_availability_cycle(
             await session.commit()
             promoted += 1
             _forget_unconfirmed(key)
-            promoted_this_tick.add(request.id)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
@@ -2540,12 +2582,15 @@ async def run_availability_cycle(
 
     # Self-heal false 'available' movie claims (request-dedup bug, see
     # ``_heal_false_available_movies``'s docstring) -- a bounded pass, run once
-    # per tick after the movie promotion loop above. ``promoted_this_tick``
-    # excludes any row THIS tick's own promotion loop just confirmed (via the
-    # same GUID/path checks) from being re-litigated a moment later as a
-    # false claim.
+    # per tick after the movie promotion loop above, over ``heal_candidates``
+    # (fetched up top, before this tick's promotion could touch anything) using
+    # the SAME batched ``present_movie_keys``/``present_ids_succeeded`` answer
+    # the promotion loop just used.
     await _heal_false_available_movies(
-        library=library, session=session, exclude_ids=frozenset(promoted_this_tick)
+        session=session,
+        candidates=heal_candidates,
+        present_movie_keys=present_movie_keys,
+        present_ids_succeeded=present_ids_succeeded,
     )
 
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
