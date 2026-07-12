@@ -26,7 +26,7 @@ Conventions:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -46,11 +46,13 @@ __all__ = [
     "DownloadHistory",
     "DownloadHistoryEvent",
     "DownloadScope",
+    "EpisodeState",
     "LogEvent",
     "MediaRequest",
     "MediaType",
     "RequestDedupLock",
     "RequestStatus",
+    "SeasonEpisodeState",
     "SeasonRequest",
     "Setting",
     "SystemSettings",
@@ -155,6 +157,19 @@ class DownloadHistoryEvent(StrEnum):
     # time, so a migrated database's constraint would otherwise reject this new
     # value outright — see ``26bc01829ae1_add_stalled_download_history_event_type``.
     stalled = "stalled"
+
+
+class EpisodeState(StrEnum):
+    """One episode's collection state within a whole-season fallback (ADR-0018).
+
+    ``pending`` -> ``grabbed`` (a fallback release covering it was grabbed) ->
+    ``imported`` (the episode file was placed). A row is only ever created for an
+    episode that has (or had) an aired target, never speculatively.
+    """
+
+    pending = "pending"
+    grabbed = "grabbed"
+    imported = "imported"
 
 
 def _enum(enum_cls: type[StrEnum], *, name: str) -> sa.Enum:
@@ -480,6 +495,44 @@ class SeasonRequest(Base):
     # for the same
     # backward-compat reason as the movie mirror.
     eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
+
+
+class SeasonEpisodeState(Base):
+    """One aired episode's collection state for the episode-level fallback (ADR-0018).
+
+    One row per *aired* episode of a whole-season request (issue #178): the
+    episode-fallback (Pass 2 of the auto-grab cycle) reads/writes this table to
+    compute the missing set and season-level completeness without ever
+    re-deriving it by parsing free-text history. A row is keyed
+    ``(season_request_id, episode_number)`` and CASCADEs with its parent season.
+    """
+
+    __tablename__ = "season_episode_states"
+    __table_args__ = (
+        Index(
+            "uq_season_episode_states_season_episode",
+            "season_request_id",
+            "episode_number",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    season_request_id: Mapped[int] = mapped_column(
+        ForeignKey("season_requests.id", ondelete="CASCADE"), index=True
+    )
+    episode_number: Mapped[int] = mapped_column()
+    status: Mapped[EpisodeState] = mapped_column(
+        _enum(EpisodeState, name="ck_season_episode_states_status_enum"), index=True
+    )
+    air_date: Mapped[date | None] = mapped_column(sa.Date())
+    grabbed_download_id: Mapped[int | None] = mapped_column(
+        ForeignKey("downloads.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Download(Base):
