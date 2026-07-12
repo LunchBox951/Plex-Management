@@ -12,11 +12,19 @@ contract the reconciler can depend on without importing an adapter.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["AddResult", "DownloadClientPort", "DownloadStatus", "DownloadedFile"]
+__all__ = [
+    "AddResult",
+    "DownloadClientPort",
+    "DownloadStatus",
+    "DownloadedFile",
+    "FailureDetail",
+    "FailureDetailSource",
+]
 
 
 class AddResult(BaseModel):
@@ -63,6 +71,44 @@ class DownloadStatus(BaseModel):
     seeding_time_limit_minutes: int = -2
     inactive_seeding_time_limit_minutes: int = -2
     last_activity_unix: int = 0
+
+
+class FailureDetailSource(StrEnum):
+    """WHERE a :class:`FailureDetail` was read from -- a reported FACT, not a
+    judgment.
+
+    ``log`` is the download client's own application log (the only surface that
+    carries an OS/I-O-level cause -- a permission/disk/read-only error, i.e. the
+    HOST-side/environmental failures issue #181 exempts from the blocklist).
+    ``tracker`` is a tracker status message: a RELEASE/network-side condition (a
+    dead/unregistered torrent, a private-tracker rejection). The environmental
+    classification (``domain.failure_classification``) applies its
+    filesystem-errno allowlist ONLY to ``log`` text -- a tracker message that
+    happens to contain an errno-shaped phrase ("Permission denied" from a
+    private-tracker rejection) is NOT evidence of a host problem, and a transient
+    tracker outage's wording must not be what decides a release's blocklist fate.
+    Keeping the source a fact the adapter reports (not a pre-baked verdict) keeps
+    the port/domain split intact: the adapter says where it read the text, the
+    domain decides what it means.
+    """
+
+    log = "log"
+    tracker = "tracker"
+
+
+class FailureDetail(BaseModel):
+    """A best-effort diagnostic detail for a failed torrent, plus its SOURCE.
+
+    ``text`` is the human-readable, already-sanitized detail (redacted +
+    bounded by the adapter); ``source`` (see :class:`FailureDetailSource`) lets
+    the service layer decide whether that text is even eligible to be read as a
+    host-side/environmental signal before it gates the blocklist on it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    source: FailureDetailSource
 
 
 class DownloadedFile(BaseModel):
@@ -166,19 +212,22 @@ class DownloadClientPort(Protocol):
         bulk sweep and never the client's global default (see
         :meth:`get_default_save_path`)."""
 
-    async def get_failure_detail(self, info_hash: str) -> str | None:
-        """Return a best-effort, human-readable detail for why ``info_hash`` is
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
+        """Return a best-effort detail (text + SOURCE) for why ``info_hash`` is
         in a client-reported error/failure state, or ``None`` if none is
         available (issue #181).
 
         The reconciler's own raw-state mapping (``client reports 'error'``) is
         honest but useless to an operator with no terminal access: it names the
         SHAPE of the failure, never the CAUSE. This is the diagnostic
-        enrichment step -- pulling whatever qBittorrent itself can say about
-        THIS torrent (its own app log, its trackers' status messages) so the
+        enrichment step -- pulling whatever the client itself can say about THIS
+        torrent (its own app log, its trackers' status messages) so the
         persisted ``failed_reason`` and the service layer's environmental-vs-
         release-fault classification (``domain.failure_classification``) both
-        have something real to work with.
+        have something real to work with. The result carries its
+        :class:`FailureDetailSource` because that classification trusts an
+        environmental signal ONLY from the log, never a tracker message (see
+        that enum).
 
         Read-only and DIAGNOSTIC, like :meth:`get_default_save_path`: total,
         best-effort, and MUST NOT raise -- called only for an ALREADY-failed

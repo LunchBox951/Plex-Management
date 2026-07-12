@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import heapq
 import ipaddress
 import json
 import logging
@@ -65,7 +66,13 @@ import httpx
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.logsafe import safe_guid, safe_text
-from plex_manager.ports.download_client import AddResult, DownloadedFile, DownloadStatus
+from plex_manager.ports.download_client import (
+    AddResult,
+    DownloadedFile,
+    DownloadStatus,
+    FailureDetail,
+    FailureDetailSource,
+)
 
 __all__ = [
     "QbittorrentAuthError",
@@ -1323,7 +1330,7 @@ class QbittorrentClient:
         self._raise_for_status(response)
         self._properties_cache.pop(info_hash.lower(), None)
 
-    async def get_failure_detail(self, info_hash: str) -> str | None:
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
         """Best-effort qBittorrent-side detail for a failed torrent (issue #181).
 
         See the port docstring for the why; this is the concrete two-source
@@ -1331,38 +1338,71 @@ class QbittorrentClient:
 
         1. **The app log** (``GET /log/main``): the most recent warning/critical
            entry naming this torrent by its current ``/torrents/info`` name
-           (substring, case-insensitive). This is the ONLY surface that carries
-           an I/O-class error at all -- neither ``/torrents/info`` nor
-           ``/torrents/properties`` exposes one, and it is exactly where the
-           live incident's ``file_open ... error: Permission denied`` landed.
+           (substring, case-insensitive) AND no older than when this torrent
+           instance was added (its ``added_on``), so a stale line left by a
+           PRIOR download of the same title cannot drive the new hash's detail.
+           The log is the ONLY surface that carries an I/O-class error at all --
+           neither ``/torrents/info`` nor ``/torrents/properties`` exposes one,
+           and it is exactly where the live incident's ``file_open ... error:
+           Permission denied`` landed. Returned with
+           :attr:`FailureDetailSource.log`.
         2. **Tracker messages** (``GET /torrents/trackers``): the most recent
            NOT_WORKING tracker's ``msg``, when the log scan found nothing --
            covers release-side failures a log scan cannot see (an
-           unregistered/dead torrent, a private-tracker rejection).
+           unregistered/dead torrent, a private-tracker rejection). Returned
+           with :attr:`FailureDetailSource.tracker` so the environmental
+           classification never reads a tracker message as a host-side signal.
 
         Total and best-effort per the port contract: an unreadable torrent
         name, an empty log, no trackers, or any ``QbittorrentError`` from
         either call all return ``None`` rather than raising -- this enriches
         an ALREADY-failed torrent and must never itself abort the reconcile
-        cycle. The returned string is passed through
-        :func:`_sanitize_failure_detail` before return.
+        cycle. The text is passed through :func:`_sanitize_failure_detail`
+        before return; a detail that sanitizes to empty is dropped.
         """
+        info = await self._failure_info_row(info_hash)
+        if info is None:
+            return None
+        name, added_on = info
+        if not name:
+            return None
+        message = await self._scan_log_for_torrent(name, added_on)
+        source = FailureDetailSource.log
+        if message is None:
+            message = await self._latest_tracker_error(info_hash)
+            source = FailureDetailSource.tracker
+        if not message:
+            return None
+        text = _sanitize_failure_detail(message)
+        if not text:
+            return None
+        return FailureDetail(text=text, source=source)
+
+    async def _failure_info_row(self, info_hash: str) -> tuple[str, int] | None:
+        """Read this torrent's ``name`` + ``added_on`` (epoch seconds) from
+        ``/torrents/info`` for :meth:`get_failure_detail`, or ``None`` if it is
+        absent/unreadable. Best-effort: any ``QbittorrentError`` returns
+        ``None``. ``added_on`` gives the log scan a lower time bound so a stale
+        entry from a prior instance of the same name is ignored (0 when the
+        client omits it -- the bound is then simply disabled)."""
         try:
-            status = await self.get_status(info_hash)
+            response = await self._request(
+                "GET", "/torrents/info", params={"hashes": info_hash.lower()}
+            )
+            if response.status_code != _HTTP_OK:
+                return None
+            rows = _as_list(_decode_json(response, "/torrents/info"))
         except QbittorrentError:
             return None
-        if status is None or not status.name:
+        if not rows:
             return None
-        detail = await self._scan_log_for_torrent(status.name)
-        if detail is None:
-            detail = await self._latest_tracker_error(info_hash)
-        if not detail:
-            return None
-        return _sanitize_failure_detail(detail)
+        row = _as_dict(rows[0])
+        return _s(row.get("name")), _i(row.get("added_on"))
 
-    async def _scan_log_for_torrent(self, name: str) -> str | None:
+    async def _scan_log_for_torrent(self, name: str, added_on: int) -> str | None:
         """Return the most recent warning/critical app-log message naming
-        ``name``, or ``None``. Best-effort: any failure returns ``None``."""
+        ``name`` and no older than ``added_on``, or ``None``. Best-effort: any
+        failure returns ``None``."""
         try:
             response = await self._request(
                 "GET",
@@ -1374,13 +1414,26 @@ class QbittorrentClient:
             rows = _as_list(_decode_json(response, "/log/main"))
         except QbittorrentError:
             return None
-        entries = [entry for entry in (_as_dict(row) for row in rows) if entry]
-        # Newest first (log ids are monotonically increasing), bounded so an
-        # install with a long-lived, large in-memory log cannot make this an
-        # unbounded scan on the reconcile hot path.
-        entries.sort(key=lambda entry: _i(entry.get("id")), reverse=True)
+        entries = (_as_dict(row) for row in rows)
+        # Take only the newest _LOG_SCAN_LIMIT warning/critical rows (highest
+        # ``id``) WITHOUT sorting the whole (possibly long-lived, large)
+        # in-memory log: ``nlargest`` keeps a window-sized heap, so the work is
+        # O(n log LIMIT), not O(n log n), and the limit is applied DURING
+        # selection rather than after a full sort. Returned newest-first.
+        recent = heapq.nlargest(
+            _LOG_SCAN_LIMIT,
+            (entry for entry in entries if entry),
+            key=lambda entry: _i(entry.get("id")),
+        )
         needle = name.lower()
-        for entry in entries[:_LOG_SCAN_LIMIT]:
+        for entry in recent:
+            # Correlate the match to THIS torrent instance: skip any entry that
+            # predates the torrent's ``added_on`` so a stale line from a prior
+            # download of the same title cannot drive the new hash's detail /
+            # blocklist decision. A 0/absent ``added_on`` or ``timestamp``
+            # disables only this lower bound (best-effort), never the name match.
+            if added_on > 0 and 0 < _i(entry.get("timestamp")) < added_on:
+                continue
             message = _s(entry.get("message"))
             if message and needle in message.lower():
                 return message

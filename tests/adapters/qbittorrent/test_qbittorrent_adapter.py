@@ -28,9 +28,11 @@ from plex_manager.adapters.qbittorrent import (
 )
 from plex_manager.adapters.qbittorrent.adapter import (
     _HASHES_PER_REQUEST,  # pyright: ignore[reportPrivateUsage]
+    _LOG_SCAN_LIMIT,  # pyright: ignore[reportPrivateUsage]
     _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
     SafeFetchNetworkBackend,
 )
+from plex_manager.ports.download_client import FailureDetailSource
 
 BASE_URL = "http://qbit.local:8080"
 USERNAME = "admin"
@@ -1545,9 +1547,12 @@ def _failure_detail_handler(
     log_status: int = 200,
     trackers_status: int = 200,
     torrent_name: str = "Completed.Movie.1080p",
+    added_on: int = 0,
 ) -> Any:
     """A router for ``get_failure_detail`` tests: ``/torrents/info`` (single-hash
-    lookup, honoring ``info_status``), ``/log/main``, and ``/torrents/trackers``."""
+    lookup, honoring ``info_status``), ``/log/main``, and ``/torrents/trackers``.
+    ``added_on`` (0 = omit) sets the torrent's add time for the log-correlation
+    lower bound."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -1557,10 +1562,10 @@ def _failure_detail_handler(
         if path == "/api/v2/torrents/info" and method == "GET":
             if info_status != 200:
                 return httpx.Response(info_status, text="boom")
-            return httpx.Response(
-                200,
-                json=[{"hash": MAGNET_HASH, "name": torrent_name, "state": "error"}],
-            )
+            row: dict[str, Any] = {"hash": MAGNET_HASH, "name": torrent_name, "state": "error"}
+            if added_on:
+                row["added_on"] = added_on
+            return httpx.Response(200, json=[row])
         if path == "/api/v2/log/main" and method == "GET":
             if log_status != 200:
                 return httpx.Response(log_status, text="boom")
@@ -1590,7 +1595,8 @@ async def test_get_failure_detail_surfaces_log_permission_denied() -> None:
         MAGNET_HASH
     )
     assert detail is not None
-    assert "Permission denied" in detail
+    assert "Permission denied" in detail.text
+    assert detail.source is FailureDetailSource.log
 
 
 async def test_get_failure_detail_picks_most_recent_matching_log_entry() -> None:
@@ -1602,7 +1608,62 @@ async def test_get_failure_detail_picks_most_recent_matching_log_entry() -> None
     detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
         MAGNET_HASH
     )
-    assert detail == "Completed.Movie.1080p: No space left on device"
+    assert detail is not None
+    assert detail.text == "Completed.Movie.1080p: No space left on device"
+    assert detail.source is FailureDetailSource.log
+
+
+async def test_get_failure_detail_ignores_log_entry_older_than_added_on() -> None:
+    """Correlate the match to THIS torrent instance: a stale warning left by a
+    PRIOR download of the same title (timestamp before this torrent's
+    ``added_on``) is skipped, so it cannot drive the new hash's failure detail."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 900,  # before added_on -> a prior instance's line
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_keeps_log_entry_at_or_after_added_on() -> None:
+    """The correlation bound is a floor, not a strict window: a log line at/after
+    ``added_on`` belongs to THIS instance and is used."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 1500,
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is not None
+    assert "Permission denied" in detail.text
+    assert detail.source is FailureDetailSource.log
+
+
+async def test_get_failure_detail_bounds_scan_to_newest_entries() -> None:
+    """The scan is bounded to the newest ``_LOG_SCAN_LIMIT`` rows (highest id)
+    WITHOUT sorting the whole log: a match older than that window is not returned
+    even though its text matches, while the newest matching row within it wins."""
+    # A matching row buried below the newest-LIMIT window (small id) is invisible.
+    old_match = {"id": 1, "message": "Completed.Movie.1080p: buried old match", "type": 3}
+    filler = [
+        {"id": 100 + n, "message": f"other torrent {n}", "type": 3}
+        for n in range(_LOG_SCAN_LIMIT + 5)
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=[old_match, *filler])
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
 
 
 async def test_get_failure_detail_falls_back_to_tracker_message() -> None:
@@ -1614,7 +1675,9 @@ async def test_get_failure_detail_falls_back_to_tracker_message() -> None:
     detail = await _client(
         _failure_detail_handler(log_rows=[], tracker_rows=tracker_rows)
     ).get_failure_detail(MAGNET_HASH)
-    assert detail == "Unregistered torrent"
+    assert detail is not None
+    assert detail.text == "Unregistered torrent"
+    assert detail.source is FailureDetailSource.tracker
 
 
 async def test_get_failure_detail_prefers_log_over_tracker() -> None:
@@ -1627,7 +1690,9 @@ async def test_get_failure_detail_prefers_log_over_tracker() -> None:
     detail = await _client(
         _failure_detail_handler(log_rows=log_rows, tracker_rows=tracker_rows)
     ).get_failure_detail(MAGNET_HASH)
-    assert detail == "Completed.Movie.1080p: Read-only file system"
+    assert detail is not None
+    assert detail.text == "Completed.Movie.1080p: Read-only file system"
+    assert detail.source is FailureDetailSource.log
 
 
 async def test_get_failure_detail_returns_none_when_torrent_absent() -> None:
@@ -1671,9 +1736,9 @@ async def test_get_failure_detail_redacts_embedded_url_and_bounds_length() -> No
         MAGNET_HASH
     )
     assert detail is not None
-    assert "SECRET123" not in detail
-    assert "passkey" not in detail
-    assert len(detail) <= 300
+    assert "SECRET123" not in detail.text
+    assert "passkey" not in detail.text
+    assert len(detail.text) <= 300
 
 
 async def test_get_failure_detail_strips_cr_lf_from_log_message() -> None:
@@ -1684,8 +1749,8 @@ async def test_get_failure_detail_strips_cr_lf_from_log_message() -> None:
         MAGNET_HASH
     )
     assert detail is not None
-    assert "\r" not in detail
-    assert "\n" not in detail
+    assert "\r" not in detail.text
+    assert "\n" not in detail.text
 
 
 async def test_get_failure_detail_returns_none_when_nothing_matches() -> None:

@@ -23,6 +23,7 @@ from plex_manager.ports.download_client import (
     DownloadClientPort,
     DownloadedFile,
     DownloadStatus,
+    FailureDetail,
 )
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
@@ -192,7 +193,7 @@ class _FakeDownloadClient:
     async def set_location(self, info_hash: str, save_path: str) -> None:
         return None
 
-    async def get_failure_detail(self, info_hash: str) -> str | None:
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
         return None
 
 
