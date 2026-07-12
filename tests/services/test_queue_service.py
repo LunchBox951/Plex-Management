@@ -31,7 +31,7 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.services import queue_service
+from plex_manager.services import correction_service, queue_service
 from plex_manager.services.queue_service import (
     FailedPendingAdoptionRefusedError,
     OperatorClaimActiveError,
@@ -3336,3 +3336,113 @@ def test_register_operator_claim_refused_while_removal_in_flight() -> None:
     finally:
         queue_service.release_removal_in_flight(download_id)
     assert not queue_service.removal_in_flight(download_id)
+
+
+def test_removal_in_flight_refcounts_across_two_registrations() -> None:
+    """Hardening finding (P1) unit case: two REGISTER calls for the same id (one
+    per actor) require two RELEASE calls before the guard clears -- an early
+    release from just one of the two actors must not lift the guard while the
+    other's is still live. This is the narrow scenario the shared registry's
+    docstring now documents: a ``failed_pending`` row is non-terminal AND
+    cancellable, so reconcile's Phase B and a racing ``cancel_request`` CAN both
+    register the SAME download id."""
+    download_id = 999_003
+    queue_service.register_removal_in_flight(download_id)  # actor 1 (e.g. reconcile)
+    queue_service.register_removal_in_flight(download_id)  # actor 2 (e.g. cancel)
+    assert queue_service.removal_in_flight(download_id)
+
+    queue_service.release_removal_in_flight(download_id)  # actor 2 releases first
+    # A pre-fix unrefcounted set would have cleared the guard here already --
+    # the whole point of the fix is that it must NOT.
+    assert queue_service.removal_in_flight(download_id)
+
+    queue_service.release_removal_in_flight(download_id)  # actor 1 releases
+    assert not queue_service.removal_in_flight(download_id)
+
+
+class _CancelDuringReconcileRemovalQbt(FakeQbittorrent):
+    """P1 hardening regression: ``correction_service.cancel_request`` races
+    reconcile's OWN Phase-B delete for the SAME ``failed_pending`` row -- both
+    actors register removal-in-flight for the SAME download id, because a
+    ``failed_pending`` row is non-terminal (excluded from neither ``list_active``
+    nor cancel's ``_CANCELLABLE_DOWNLOAD_STATE_VALUES``, which explicitly
+    includes it). While THIS (reconcile's) delete await is still in flight, a
+    nested ``cancel_request`` for the SAME request runs end-to-end (its own
+    register -> CAS to ``Failed`` -> commit -> its own removal -> release) using
+    a SEPARATE session and a separate qbt instance, exactly mirroring two
+    independent concurrent actors."""
+
+    def __init__(self, sm: SessionMaker, request_id: int, download_id: int) -> None:
+        super().__init__(statuses=[])
+        self._sm = sm
+        self._request_id = request_id
+        self._download_id = download_id
+        self.nested_cancel_status: str | None = None
+        self.in_flight_after_nested_cancel: bool | None = None
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        await super().remove(info_hash, delete_files=delete_files)
+        if self.nested_cancel_status is None:
+            async with self._sm() as session:
+                updated = await correction_service.cancel_request(
+                    session, FakeQbittorrent(), request_id=self._request_id
+                )
+                self.nested_cancel_status = updated.status
+            # The inner (cancel) actor released ITS OWN claim in its own
+            # ``finally`` above -- but THIS outer (reconcile) actor's delete
+            # (this very call, not yet returned) registered its own claim
+            # before the nested call ran and has not released it yet. With
+            # correct refcounting the guard must still be up; a pre-fix
+            # unrefcounted set would report False here (the bug this test
+            # guards against).
+            self.in_flight_after_nested_cancel = queue_service.removal_in_flight(self._download_id)
+
+
+async def test_cancel_racing_reconcile_phase_b_refcounts_shared_guard(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Hardening finding (P1): a ``failed_pending`` row is non-terminal AND
+    cancellable, so reconcile's Phase B and a racing ``cancel_request`` CAN both
+    register the shared removal-in-flight guard for the SAME download id. An
+    unrefcounted set would let whichever actor releases FIRST (here: the
+    nested, inner cancel) clear the guard while the OTHER actor's (reconcile's)
+    own torrent-delete is still physically in flight -- reopening the exact
+    #206 reuse-during-delete race this registry exists to close. Refcounting
+    keeps the guard up until BOTH actors have released, and fully clears it
+    once they have -- no permanent leak."""
+    request_id, download_id = await _seed_movie_request_and_download(sessionmaker_)
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.first_seen_at = datetime.now(UTC) - timedelta(minutes=11)
+        await session.commit()
+
+    qbt = _CancelDuringReconcileRemovalQbt(sessionmaker_, request_id, download_id)
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    # The nested cancel ran to completion...
+    assert qbt.nested_cancel_status == RequestStatus.cancelled.value
+    # ...and while it was releasing its own claim, reconcile's own registration
+    # for the SAME id was still up: the shared guard is refcounted, not a plain
+    # set that either actor's release can clear out from under the other.
+    assert qbt.in_flight_after_nested_cancel is True
+    # Reconcile's own removal attempt for this hash still ran (best-effort,
+    # idempotent alongside the nested cancel's own removal of the same hash).
+    assert qbt.removed == [(_HASH, True)]
+
+    # Once BOTH actors have released (cancel's own finally, then reconcile's
+    # cycle-scope finally), the guard is fully clear.
+    assert not queue_service.removal_in_flight(download_id)
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+    # Cancel's terminal write won the race: it committed (and started its own
+    # removal) while reconcile's Phase B was still awaiting its own removal, so
+    # reconcile's later Phase-C completion CAS finds the row already changed
+    # out from under its observed marker and drops -- honest yield, not a
+    # double-completion.
+    assert download is not None and download.status == "failed"
+    assert download.failed_reason == "cancelled by operator"
+    assert request is not None and request.status is RequestStatus.cancelled

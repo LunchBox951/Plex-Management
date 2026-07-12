@@ -136,9 +136,14 @@ PREDICATE-ATOMIC (the final protocol form):
     ``correction_service.cancel_request`` also registers here — before its
     terminal commit, not merely before its delete await, because a cancelled
     row becomes reusable the instant that commit lands (see the registry's own
-    docstring below) — released in cancel's own ``finally``. The set is shared
-    so ``grab_service``'s terminal-row reuse and a racing operator mark-failed
-    both see every actor's in-flight removal, not just reconcile's.
+    docstring below) — released in cancel's own ``finally``. The registry is
+    shared so ``grab_service``'s terminal-row reuse and a racing operator
+    mark-failed both see every actor's in-flight removal, not just reconcile's
+    — and it is REFCOUNTED, not a plain set: a ``failed_pending`` row is
+    non-terminal and cancellable, so reconcile's Phase B and a racing
+    ``cancel_request`` CAN both register the SAME download id, and only the
+    last of the two releases actually clears the guard (the registry's own
+    docstring has the full race this closes).
   - **Pre-stamp invisibility fast-path.** A claim exists from BEFORE the marker
     is stamped, so reconcile skips claimed ids at every phase boundary (Phase-A
     transition application; Phase B, where a claimed completion is DROPPED from
@@ -366,13 +371,14 @@ _operator_fail_claims: dict[int, _OperatorClaim] = {}
 _claim_tokens = count(1)
 
 # Shared removal-physics registry (ALL actors that physically remove a torrent):
-# download ids whose removal has started and whose CONSEQUENCE has not yet
-# settled. ``_register_operator_claim`` refuses registration during this window
-# for the same physics reason described above — a claim registered mid-delete,
-# OR in the gap between the delete's return and the row's settlement, would
-# complete promising a file already destroyed. ``grab_service``'s terminal-row
-# reuse also consults this set (via ``removal_in_flight`` below) and refuses to
-# resurrect a row whose torrent is mid-removal (#206).
+# download id -> the number of actors currently holding its removal-in-flight
+# guard. ``_register_operator_claim`` refuses registration while a count is
+# present for the same physics reason described above — a claim registered
+# mid-delete, OR in the gap between the delete's return and the row's
+# settlement, would complete promising a file already destroyed.
+# ``grab_service``'s terminal-row reuse also consults this registry (via
+# ``removal_in_flight`` below) and refuses to resurrect a row whose torrent is
+# mid-removal (#206).
 #
 # Reconcile-side removal window: download ids whose AUTOMATIC reconcile-driven
 # Phase-B delete has started and whose CONSEQUENCE has not yet settled. An id
@@ -384,7 +390,20 @@ _claim_tokens = count(1)
 # Cancel-side removal window (#206): ``correction_service.cancel_request``
 # registers each row's id BEFORE its terminal commit — see
 # :func:`register_removal_in_flight` — and releases in its own ``finally``.
-_removals_in_flight: set[int] = set()
+#
+# REFCOUNTED, not a plain set (hardening finding): a ``failed_pending`` row is
+# NOT terminal (``repositories/downloads.py``'s ``_TERMINAL_DOWNLOAD_STATUSES``
+# excludes it), and IS in cancel's ``_CANCELLABLE_DOWNLOAD_STATE_VALUES`` — so
+# reconcile's Phase B and a concurrent ``cancel_request`` CAN both observe and
+# register the SAME download id (reconcile mid-cycle on a ``failed_pending``
+# row it is failing, cancel racing that same still-``failed_pending`` row
+# before either actor's terminal commit lands). An unrefcounted add/discard
+# would let whichever actor releases FIRST clear the guard while the OTHER's
+# torrent-delete await is still physically in flight — re-opening the exact
+# #206 reuse-during-delete race this registry exists to close. Counting means
+# the guard reports in-flight (``removal_in_flight`` True) until EVERY actor
+# that registered has released, regardless of order.
+_removals_in_flight: dict[int, int] = {}
 
 
 def _register_operator_claim(
@@ -482,16 +501,33 @@ def register_removal_in_flight(download_id: int) -> None:
     the commit, not merely the client I/O. While registered, ``removal_in_flight``
     reports True so ``grab_service``'s terminal-row reuse refuses, and
     ``_register_operator_claim`` refuses an operator mark-failed (removal-physics rule).
-    Ids never overlap across actors (a cancel's row is terminal, excluded from
-    ``list_active``; reconcile only registers ``failed_pending`` ids), so a plain set
-    with unrefcounted add/discard is safe.
+
+    REFCOUNTED (hardening finding): a ``failed_pending`` row is non-terminal and
+    cancellable (module docstring's REFCOUNTED note above ``_removals_in_flight``),
+    so reconcile's Phase B and a racing ``cancel_request`` CAN both register the
+    SAME id — incrementing here rather than a plain set-add means neither actor's
+    release (below) can prematurely clear a guard the OTHER actor still holds.
     """
-    _removals_in_flight.add(download_id)
+    _removals_in_flight[download_id] = _removals_in_flight.get(download_id, 0) + 1
 
 
 def release_removal_in_flight(download_id: int) -> None:
-    """Release a :func:`register_removal_in_flight` claim (idempotent)."""
-    _removals_in_flight.discard(download_id)
+    """Release a :func:`register_removal_in_flight` claim (idempotent).
+
+    REFCOUNTED: only the count reaching zero actually clears ``download_id`` from
+    the registry — a release while another actor's registration is still live just
+    decrements, leaving ``removal_in_flight`` True for that id until every actor
+    that registered has released. A release with no matching registration (double
+    release, or a stray call for an id never claimed) is a silent no-op, exactly
+    like the old set-discard behavior.
+    """
+    count = _removals_in_flight.get(download_id)
+    if count is None:
+        return
+    if count <= 1:
+        del _removals_in_flight[download_id]
+    else:
+        _removals_in_flight[download_id] = count - 1
 
 
 def removal_in_flight(download_id: int) -> bool:
@@ -1455,13 +1491,14 @@ async def reconcile_and_list(
                 unclaimed.append(completion)
                 continue
             # GUARD FIRST (round 10): registering the removal-physics guard is a
-            # SYNCHRONOUS set-add -- no await separates the claim check above from
-            # this line, and from this line no operator claim can be created for
-            # the row (_register_operator_claim refuses). So there is NO yield
-            # point between "operators are barred" and the durable verification
-            # below: anything an operator did finished BEFORE the bar and is
-            # visible to the re-proof SELECT; anything after the bar is refused.
-            _removals_in_flight.add(completion.download_id)
+            # SYNCHRONOUS registry increment -- no await separates the claim check
+            # above from this line, and from this line no operator claim can be
+            # created for the row (_register_operator_claim refuses). So there is
+            # NO yield point between "operators are barred" and the durable
+            # verification below: anything an operator did finished BEFORE the bar
+            # and is visible to the re-proof SELECT; anything after the bar is
+            # refused.
+            register_removal_in_flight(completion.download_id)
             settling.add(completion.download_id)
             # DURABLE re-proof immediately before the irreversible delete: the
             # claim check above sees only LIVE claims -- an operator who stamped,
@@ -1493,7 +1530,10 @@ async def reconcile_and_list(
                 # settle: release the bar NOW (not at cycle scope) so operator
                 # commands for a row this cycle no longer touches are not
                 # refused. Rows whose delete DOES run keep the round-8 lifetime.
-                _removals_in_flight.discard(completion.download_id)
+                # Refcounted release (this cycle's own registration only) -- a
+                # racing cancel's registration for the same id, if any, is
+                # untouched and keeps the guard up until cancel itself releases.
+                release_removal_in_flight(completion.download_id)
                 settling.discard(completion.download_id)
                 continue
             # Removal-physics rule, reconcile side: the guard registered above
@@ -1586,8 +1626,11 @@ async def reconcile_and_list(
         # Every removal this cycle performed has now SETTLED: its completion
         # committed, was dropped/deferred in Phase C, or Phase C exhausted
         # (leaving a plain reconcilable residual). Release the physics guard for
-        # exactly the ids this cycle added.
-        _removals_in_flight.difference_update(settling)
+        # exactly the ids this cycle added -- one release per id, matching the
+        # one register above (refcounted: a racing cancel's own registration for
+        # the same id, if any, is a separate count and is untouched here).
+        for download_id in settling:
+            release_removal_in_flight(download_id)
 
     # ``populate_existing`` refreshes the returned rows from the DB (issue #77): see
     # the same note in the no-failures early return above.
