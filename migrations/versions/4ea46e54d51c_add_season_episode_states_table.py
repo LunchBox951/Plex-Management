@@ -1,7 +1,7 @@
 """add season_episode_states table
 
 Revision ID: 4ea46e54d51c
-Revises: c86212dad733
+Revises: 1b661e856ac1
 Create Date: 2026-07-11 20:28:25.542538
 """
 
@@ -15,7 +15,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "4ea46e54d51c"
-down_revision: str | None = "c86212dad733"
+down_revision: str | None = "1b661e856ac1"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
