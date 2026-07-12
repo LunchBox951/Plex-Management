@@ -72,6 +72,7 @@ from plex_manager.web.deps import (
     get_prowlarr,
     get_qbittorrent,
     get_quality_profile,
+    get_tmdb,
     get_tv_root_optional,
 )
 from plex_manager.web.errors import install_error_handlers
@@ -314,12 +315,22 @@ async def _autograb_once(app: FastAPI) -> None:
         except ServiceNotConfiguredError:
             status.mark_ok()
             return
+        # TMDB is OPTIONAL here (ADR-0018, issue #178): it only powers the
+        # episode-level fallback for whole-season TV scopes (the airing pre-pass +
+        # Pass-2 search). An unconfigured TMDB cleanly disables both -- Pass 1
+        # behaves exactly as before this feature existed -- rather than blocking
+        # the whole cycle the way a missing Prowlarr/qBittorrent does.
+        try:
+            metadata = await get_tmdb(session, client)
+        except ServiceNotConfiguredError:
+            metadata = None
         result = await auto_grab_service.run_grab_cycle(
             session,
             prowlarr=prowlarr,
             parser=get_parser(),
             profile=get_quality_profile(),
             qbt=qbt,
+            metadata=metadata,
             cooldowns=_get_autograb_cooldowns(app),
             save_path=get_downloads_host_root(),
         )
