@@ -381,6 +381,40 @@ def test_safe_guid_is_total_for_lone_surrogates() -> None:
             "multi word pw",
             'headers={"password": "<redacted>"}',
         ),
+        # A quoted credential containing the OPPOSITE quote character
+        # (``SettingsUpdate`` accepts such passwords): the tempered run stops
+        # only at the MATCHING close quote, so the embedded quote does not end
+        # the value and no tail is left behind ``<redacted>``.
+        (
+            'password="abc\'FAKEEMBEDDED1"',
+            "FAKEEMBEDDED1",
+            'password="<redacted>"',
+        ),
+        (
+            "password='abc\"FAKEEMBEDDED2'",
+            "FAKEEMBEDDED2",
+            "password='<redacted>'",
+        ),
+        # TUPLE-rendered headers (``list(headers.items())``/raw header dumps):
+        # no ``:``/``=`` separator at all -- the dedicated tuple pass masks the
+        # quoted value whole, key name and surrounding structure intact.
+        (
+            "headers=[('X-Api-Key', 'FAKETUPLEKEY1')]",
+            "FAKETUPLEKEY1",
+            "headers=[('X-Api-Key', '<redacted>')]",
+        ),
+        (
+            'headers=[("x-plex-token", "FAKETUPLEKEY2")]',
+            "FAKETUPLEKEY2",
+            'headers=[("x-plex-token", "<redacted>")]',
+        ),
+        # An Authorization tuple: the quoted-value run masks through the
+        # internal space, so scheme AND credential are both consumed.
+        (
+            "sending [('Accept', 'json'), ('Authorization', 'Bearer FAKETUPLETOK')]",
+            "FAKETUPLETOK",
+            "sending [('Accept', 'json'), ('Authorization', '<redacted>')]",
+        ),
     ],
 )
 def test_redact_secrets_masks_key_value_shaped_secrets(
@@ -420,6 +454,12 @@ def test_redact_secrets_masks_empty_username_basic_auth_url() -> None:
     [
         ("Bearer", "FAKEBEARERTOKEN.abc.def"),
         ("Basic", "ZmFrZTpjcmVkZW50aWFs"),
+        # UNKNOWN schemes (RFC 7235 schemes are open-ended): a scheme allowlist
+        # would consume only the scheme word here and leave the credential after
+        # the space exposed -- the pattern must mask scheme + credential for ANY
+        # scheme word, not just the well-known four.
+        ("Token", "FAKEUNKNOWNSCHEME1"),
+        ("ApiKey", "FAKEUNKNOWNSCHEME2"),
     ],
 )
 def test_redact_secrets_masks_the_whole_authorization_value(scheme_word: str, token: str) -> None:
@@ -432,6 +472,14 @@ def test_redact_secrets_masks_the_whole_authorization_value(scheme_word: str, to
     assert result == "Authorization: <redacted>"
     assert token not in result
     assert scheme_word not in result
+
+
+def test_redact_secrets_leaves_a_benign_tuple_key_containing_a_secret_word_alone() -> None:
+    """The tuple pass fires only when a secret key word ENDS the quoted key
+    name -- a key merely containing one mid-phrase is not a credential field
+    and must pass through untouched."""
+    raw = "queue=[('token of love', 'a title')]"
+    assert redact_secrets(raw) == raw
 
 
 def test_redact_secrets_masks_a_fernet_key_shaped_blob_regardless_of_context() -> None:

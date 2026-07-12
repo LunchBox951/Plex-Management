@@ -155,9 +155,9 @@ def safe_guid(value: str) -> str:
 # without a per-adapter rule, and is CONSERVATIVE the way the task requires:
 # the key name always survives (debuggability), only the value is masked.
 #
-# Three independent passes, applied in sequence (each is a total no-op on text
-# it finds nothing to redact in, so the order between the first two never
-# matters -- they match disjoint key vocabularies):
+# Four independent passes, applied in sequence (each is a total no-op on text
+# it finds nothing to redact in, so their relative order never matters -- they
+# match disjoint syntactic shapes):
 #
 # 1. Basic-auth URL userinfo (``scheme://user:pass@host``): the PASSWORD half
 #    of ``user:pass@`` is masked; the username and the rest of the url survive
@@ -166,8 +166,11 @@ def safe_guid(value: str) -> str:
 #    key below, an Authorization value routinely carries an internal SPACE
 #    (``Basic <base64>``, ``Bearer <token>``) -- a plain single-token value
 #    capture would only swallow the scheme word and leave the credential
-#    itself exposed. This pass captures the whole ``<scheme> <token>`` (or a
-#    bare token with no scheme) and masks it entirely.
+#    itself exposed. This pass captures up to two whitespace-separated tokens
+#    -- ``<scheme> <credential>`` for ANY scheme word (no scheme allowlist:
+#    RFC 7235 schemes are open-ended, and an allowlist would leak the
+#    credential of every unknown scheme) -- or a bare scheme-less token, and
+#    masks the whole thing.
 # 3. Every other secret-key-shaped ``key<sep>value`` pair -- ``api_key``/
 #    ``apikey``, ``access_token``, ``auth_token``, a bare ``token`` (also
 #    matches ``X-Plex-Token``/``X-Api-Key``: the hyphen before the final word
@@ -188,8 +191,14 @@ def safe_guid(value: str) -> str:
 #    bracket (exactly one token -- a query-string ``key=value`` or header
 #    ``Key: value``); a QUOTED value (``key='...'`` / ``key="..."``, e.g. a
 #    ``qbittorrent_password`` containing spaces or commas) is consumed through to
-#    its matching closing quote, so no suffix of a multi-word quoted credential
-#    is left behind the ``<redacted>`` token.
+#    its MATCHING closing quote -- an embedded opposite-quote character does not
+#    end it -- so no suffix of a multi-word quoted credential is left behind the
+#    ``<redacted>`` token.
+# 4. The same secret key names in TUPLE rendering -- ``('X-Api-Key', 'SECRET')``,
+#    the shape ``list(headers.items())``/raw header dumps produce -- which has
+#    no ``:``/``=`` separator for pass 3 to key on: a quoted key name ending in
+#    a secret key word (or ``authorization``), a comma, then the quoted value
+#    masked whole.
 #
 # A final, UNCONDITIONAL pass (no key name involved at all) catches a
 # Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
@@ -223,34 +232,73 @@ _VALUE_CHARS: Final = r"[^\s&,'\"}\)\]]+"
 #     ``tmdb_api_key``); ``_`` is a word char, so a bare ``\b`` before ``token``
 #     would never fire on ``plex_token``. Bounded to keep the scan linear.
 #   * ``(?P<q>['\"])?`` -- the value's optional opening quote.
-#   * ``(?P<value> ... )`` -- when ``q`` matched, ``[^'\"]*`` runs to (not past)
-#     the matching closing quote, masking a whole multi-word quoted credential;
-#     otherwise the single unquoted token. ``_mask_value`` drops from the value
-#     start on, so a captured closing quote is never re-emitted -- the closing
-#     quote is deliberately left OUTSIDE the match (``[^'\"]`` cannot cross it),
-#     so it survives in the output around ``<redacted>``.
+#   * ``(?P<value> ... )`` -- when ``q`` matched, the tempered run
+#     ``(?:(?!(?P=q)).)*`` consumes everything up to (not past) the MATCHING
+#     closing quote -- crucially including the OPPOSITE quote character, so a
+#     credential like ``password="abc'def"`` (``SettingsUpdate`` accepts such
+#     passwords) is masked whole, never split at the embedded quote; otherwise
+#     the single unquoted token. The tempered dot is linear -- each position
+#     is a one-char lookahead plus one consume, no ambiguity for backtracking
+#     to explore (this file's tests just drew a CodeQL finding; the redactor
+#     must never hand it a ReDoS). ``_mask_value`` drops from the value start
+#     on, so the closing quote -- deliberately left OUTSIDE the match (the
+#     tempered run cannot cross it) -- survives around ``<redacted>``.
 _KV_SEP_PATTERN: Final = r"['\"]?\s*[:=]\s*"
+_QUOTED_VALUE: Final = r"(?:(?!(?P=q)).)*"  # up to, never past, the matching close quote
 _SECRET_KV_RE: Final = re.compile(
     r"(?i)\b[\w-]{0,64}?(?:"
     + _SECRET_KEY_PATTERN
     + r")\b"
     + _KV_SEP_PATTERN
-    + r"(?P<q>['\"])?(?P<value>(?(q)[^'\"]*|"
+    + r"(?P<q>['\"])?(?P<value>(?(q)"
+    + _QUOTED_VALUE
+    + r"|"
     + _VALUE_CHARS
     + r"))"
 )
 
-# ``Authorization`` gets its own pattern (see rationale above): the value may
-# be a scheme word plus a token (``Basic``/``Bearer``/``Digest``/``Negotiate``)
-# separated by a SPACE the generic value-capture above would stop at, or a
-# bare scheme-less token.
+# ``Authorization`` gets its own pattern (see rationale above): the value
+# routinely carries an internal SPACE (``<scheme> <credential>``) that the
+# generic single-token capture above would stop at. NO scheme allowlist here,
+# deliberately: RFC 7235 schemes are open-ended (``Token``, ``ApiKey``, AWS
+# SigV4, ...) and an allowlist turns every unknown scheme into a leak -- the
+# fallback would consume only the scheme word and leave the credential after
+# the space exposed. Instead the value is up to TWO whitespace-separated
+# tokens: the first (scheme or bare credential) and, when present, one more
+# (the credential after a scheme word). Masking a following non-credential
+# word in free prose (``authorization: abc then text`` eats ``then``) is
+# accepted over-redaction -- for an Authorization value, masking too much is
+# fine, leaking is not. Two tokens, not unbounded: an Authorization value has
+# at most scheme + credential (comma-delimited Digest params stop at the
+# ``,`` in ``_VALUE_CHARS`` regardless), and bounding the consumption keeps
+# the rest of the log line diagnosable.
 _AUTHORIZATION_RE: Final = re.compile(
     r"(?i)\bauthorization\b"
     + _SEP_PATTERN
-    + r"(?P<value>(?:Basic|Bearer|Digest|Negotiate)\s+"
+    + r"(?P<value>"
     + _VALUE_CHARS
-    + r"|"
+    + r"(?:[ \t]+"
     + _VALUE_CHARS
+    + r")?)"
+)
+
+# A TUPLE-rendered header/field pair -- ``('X-Api-Key', 'SECRET')`` -- the
+# shape ``list(headers.items())`` or a raw header dump produces. There is no
+# ``:``/``=`` separator for ``_SECRET_KV_RE`` to key on, only a quoted key
+# name, a comma, and a quoted value, so it needs its own pass: a quoted key
+# ending in one of the secret key words (or ``authorization`` -- its
+# space-bearing value is safely consumed here because the quoted-value run
+# masks through to the matching close quote, spaces included), the ``,``
+# separator, then the quoted value masked whole via the same linear tempered
+# run as ``_SECRET_KV_RE`` (``kq``/``q`` may be DIFFERENT quote characters --
+# each closes only its own). ``_mask_value`` keeps everything through the
+# value's opening quote; the closing quote sits outside the match and
+# survives: ``('X-Api-Key', '<redacted>')``.
+_SECRET_TUPLE_RE: Final = re.compile(
+    r"(?i)(?P<kq>['\"])[\w-]{0,64}?(?:"
+    + _SECRET_KEY_PATTERN
+    + r"|authorization)(?P=kq)\s*,\s*(?P<q>['\"])(?P<value>"
+    + _QUOTED_VALUE
     + r")"
 )
 
@@ -272,10 +320,10 @@ _REDACTED: Final = "<redacted>"
 
 
 def _mask_value(match: re.Match[str]) -> str:
-    """Replace a ``_SECRET_KV_RE``/``_AUTHORIZATION_RE`` match's ``value`` group
-    with :data:`_REDACTED`, keeping everything else the match consumed (the key
-    name, separator, and any quote) verbatim -- "mask the value, keep the key
-    name for debuggability"."""
+    """Replace a ``_SECRET_KV_RE``/``_AUTHORIZATION_RE``/``_SECRET_TUPLE_RE``
+    match's ``value`` group with :data:`_REDACTED`, keeping everything else the
+    match consumed (the key name, separator, and any quote) verbatim -- "mask
+    the value, keep the key name for debuggability"."""
     whole = match.group(0)
     value_offset = match.start("value") - match.start(0)
     return whole[:value_offset] + _REDACTED
@@ -306,5 +354,6 @@ def redact_secrets(text: str) -> str:
     redacted = _BASIC_AUTH_URL_RE.sub(_mask_basic_auth, text)
     redacted = _AUTHORIZATION_RE.sub(_mask_value, redacted)
     redacted = _SECRET_KV_RE.sub(_mask_value, redacted)
+    redacted = _SECRET_TUPLE_RE.sub(_mask_value, redacted)
     redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
     return redacted
