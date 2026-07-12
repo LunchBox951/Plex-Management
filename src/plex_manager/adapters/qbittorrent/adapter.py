@@ -64,6 +64,7 @@ import httpcore
 import httpx
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
+from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.ports.download_client import AddResult, DownloadedFile, DownloadStatus
 
 __all__ = [
@@ -83,6 +84,20 @@ _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
+# get_failure_detail (issue #181): bounds on the two best-effort diagnostic
+# sources it queries. _LOG_SCAN_LIMIT caps how many of qBittorrent's own
+# (potentially long-running-install-sized) in-memory app log entries are
+# scanned for a name match -- an unbounded scan would be an unbounded-cost
+# reconcile-cycle hot-path call. _MAX_FAILURE_DETAIL_CHARS bounds the returned
+# string so a runaway client message cannot bloat the persisted
+# ``failed_reason`` column / a log line.
+_LOG_SCAN_LIMIT: Final = 200
+_MAX_FAILURE_DETAIL_CHARS: Final = 300
+# qBittorrent's ``/torrents/trackers`` ``status`` enum: 0 Disabled, 1 Not
+# contacted yet, 2 Working, 3 Updating, 4 Not working. Only 4 carries a
+# meaningful failure ``msg`` (a dead/unregistered torrent, a private-tracker
+# rejection) worth surfacing.
+_TRACKER_STATUS_NOT_WORKING: Final = 4
 # A .torrent metafile is normally tens of KB, but a large multi-file pack with a
 # small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
 # real metafile yet still a hard ceiling against a hostile/unbounded source body.
@@ -406,6 +421,36 @@ def _i(value: object, default: int = 0) -> int:
 
 def _s(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
+
+
+# Matches a URI-shaped substring (``scheme://...`` or a bare ``magnet:...``)
+# embedded in an otherwise free-text qBittorrent log/tracker message -- the
+# rare case a log line quotes the source url/magnet it failed to fetch. A URI
+# never contains unencoded whitespace, so splitting on ``\S+`` cannot sever a
+# credential-bearing query string in two. Deliberately narrower than
+# ``logsafe.safe_guid``'s own contract (which redacts a value that IS,
+# wholesale, a GUID) -- applied only to matched tokens, so ordinary diagnostic
+# prose (file paths, "Permission denied:", host directory names) is never
+# touched.
+_EMBEDDED_URI_RE: Final = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://\S+|\bmagnet:\S+")
+
+
+def _sanitize_failure_detail(detail: str) -> str:
+    """Bound + redact a qBittorrent-sourced free-text detail before it can
+    reach the persisted ``failed_reason`` / UI (issue #181, north star #3).
+
+    ``safe_text`` collapses any line-boundary character so the detail cannot
+    forge a second log record; any embedded URL/magnet-shaped substring is
+    then redacted token-by-token via ``safe_guid`` (a tracker passkey or
+    session token can ride a quoted source url in a log line) with everything
+    else -- file paths, the actual error prose -- left byte-identical; finally
+    the whole string is capped to :data:`_MAX_FAILURE_DETAIL_CHARS`. Redaction
+    runs BEFORE truncation so a length cap can never sever a redaction
+    candidate mid-token and leak half a credential.
+    """
+    text = safe_text(detail)
+    text = _EMBEDDED_URI_RE.sub(lambda match: safe_guid(match.group(0)), text)
+    return text[:_MAX_FAILURE_DETAIL_CHARS]
 
 
 def _parse_webapi_version(text: str) -> tuple[int, ...]:
@@ -1277,6 +1322,97 @@ class QbittorrentClient:
         )
         self._raise_for_status(response)
         self._properties_cache.pop(info_hash.lower(), None)
+
+    async def get_failure_detail(self, info_hash: str) -> str | None:
+        """Best-effort qBittorrent-side detail for a failed torrent (issue #181).
+
+        See the port docstring for the why; this is the concrete two-source
+        implementation, queried in this priority:
+
+        1. **The app log** (``GET /log/main``): the most recent warning/critical
+           entry naming this torrent by its current ``/torrents/info`` name
+           (substring, case-insensitive). This is the ONLY surface that carries
+           an I/O-class error at all -- neither ``/torrents/info`` nor
+           ``/torrents/properties`` exposes one, and it is exactly where the
+           live incident's ``file_open ... error: Permission denied`` landed.
+        2. **Tracker messages** (``GET /torrents/trackers``): the most recent
+           NOT_WORKING tracker's ``msg``, when the log scan found nothing --
+           covers release-side failures a log scan cannot see (an
+           unregistered/dead torrent, a private-tracker rejection).
+
+        Total and best-effort per the port contract: an unreadable torrent
+        name, an empty log, no trackers, or any ``QbittorrentError`` from
+        either call all return ``None`` rather than raising -- this enriches
+        an ALREADY-failed torrent and must never itself abort the reconcile
+        cycle. The returned string is passed through
+        :func:`_sanitize_failure_detail` before return.
+        """
+        try:
+            status = await self.get_status(info_hash)
+        except QbittorrentError:
+            return None
+        if status is None or not status.name:
+            return None
+        detail = await self._scan_log_for_torrent(status.name)
+        if detail is None:
+            detail = await self._latest_tracker_error(info_hash)
+        if not detail:
+            return None
+        return _sanitize_failure_detail(detail)
+
+    async def _scan_log_for_torrent(self, name: str) -> str | None:
+        """Return the most recent warning/critical app-log message naming
+        ``name``, or ``None``. Best-effort: any failure returns ``None``."""
+        try:
+            response = await self._request(
+                "GET",
+                "/log/main",
+                params={"normal": "false", "info": "false", "warning": "true", "critical": "true"},
+            )
+            if response.status_code != _HTTP_OK:
+                return None
+            rows = _as_list(_decode_json(response, "/log/main"))
+        except QbittorrentError:
+            return None
+        entries = [entry for entry in (_as_dict(row) for row in rows) if entry]
+        # Newest first (log ids are monotonically increasing), bounded so an
+        # install with a long-lived, large in-memory log cannot make this an
+        # unbounded scan on the reconcile hot path.
+        entries.sort(key=lambda entry: _i(entry.get("id")), reverse=True)
+        needle = name.lower()
+        for entry in entries[:_LOG_SCAN_LIMIT]:
+            message = _s(entry.get("message"))
+            if message and needle in message.lower():
+                return message
+        return None
+
+    async def _latest_tracker_error(self, info_hash: str) -> str | None:
+        """Return the most recent NOT_WORKING tracker's ``msg`` for
+        ``info_hash``, or ``None``. Best-effort: any failure returns ``None``."""
+        try:
+            response = await self._request(
+                "GET", "/torrents/trackers", params={"hash": info_hash.lower()}
+            )
+            if response.status_code != _HTTP_OK:
+                return None
+            rows = _as_list(_decode_json(response, "/torrents/trackers"))
+        except QbittorrentError:
+            return None
+        for row in rows:
+            entry = _as_dict(row)
+            if not entry:
+                continue
+            url = _s(entry.get("url"))
+            if url.startswith("**"):
+                # qBittorrent's pseudo-tracker rows for DHT/PeX/LSD, not a real
+                # tracker -- never a meaningful failure message.
+                continue
+            if _i(entry.get("status")) != _TRACKER_STATUS_NOT_WORKING:
+                continue
+            msg = _s(entry.get("msg"))
+            if msg:
+                return msg
+        return None
 
     async def _fetch_properties(self, info_hash: str) -> dict[str, object] | None:
         """Fetch ``/torrents/properties`` for ``info_hash``, cached briefly.

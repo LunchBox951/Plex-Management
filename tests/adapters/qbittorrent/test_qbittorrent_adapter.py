@@ -1537,6 +1537,170 @@ async def test_set_location_drops_cached_properties_entry() -> None:
     assert await client.get_save_path(MAGNET_HASH) == "/home/lunchbox/Downloads"
 
 
+def _failure_detail_handler(
+    *,
+    log_rows: list[dict[str, Any]] | None = None,
+    tracker_rows: list[dict[str, Any]] | None = None,
+    info_status: int = 200,
+    log_status: int = 200,
+    trackers_status: int = 200,
+    torrent_name: str = "Completed.Movie.1080p",
+) -> Any:
+    """A router for ``get_failure_detail`` tests: ``/torrents/info`` (single-hash
+    lookup, honoring ``info_status``), ``/log/main``, and ``/torrents/trackers``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if path == "/api/v2/auth/login" and method == "POST":
+            return _login_response()
+        if path == "/api/v2/torrents/info" and method == "GET":
+            if info_status != 200:
+                return httpx.Response(info_status, text="boom")
+            return httpx.Response(
+                200,
+                json=[{"hash": MAGNET_HASH, "name": torrent_name, "state": "error"}],
+            )
+        if path == "/api/v2/log/main" and method == "GET":
+            if log_status != 200:
+                return httpx.Response(log_status, text="boom")
+            return httpx.Response(200, json=log_rows or [])
+        if path == "/api/v2/torrents/trackers" and method == "GET":
+            if trackers_status != 200:
+                return httpx.Response(trackers_status, text="boom")
+            return httpx.Response(200, json=tracker_rows or [])
+        return httpx.Response(404, text="unhandled")
+
+    return handler
+
+
+async def test_get_failure_detail_surfaces_log_permission_denied() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "some unrelated line", "type": 3},
+        {
+            "id": 2,
+            "message": (
+                "Completed.Movie.1080p: file_open: /downloads/.plex_manager/x.mkv, "
+                "error: Permission denied"
+            ),
+            "type": 3,
+        },
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert "Permission denied" in detail
+
+
+async def test_get_failure_detail_picks_most_recent_matching_log_entry() -> None:
+    """Newest (highest ``id``) matching log entry wins, regardless of list order."""
+    log_rows: list[dict[str, Any]] = [
+        {"id": 5, "message": "Completed.Movie.1080p: stale first attempt error", "type": 3},
+        {"id": 9, "message": "Completed.Movie.1080p: No space left on device", "type": 4},
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail == "Completed.Movie.1080p: No space left on device"
+
+
+async def test_get_failure_detail_falls_back_to_tracker_message() -> None:
+    tracker_rows: list[dict[str, Any]] = [
+        {"url": "**DHT**", "status": 4, "msg": "should be ignored (pseudo-tracker)"},
+        {"url": "http://tracker.example/announce", "status": 2, "msg": ""},
+        {"url": "http://tracker2.example/announce", "status": 4, "msg": "Unregistered torrent"},
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=[], tracker_rows=tracker_rows)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail == "Unregistered torrent"
+
+
+async def test_get_failure_detail_prefers_log_over_tracker() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "Completed.Movie.1080p: Read-only file system", "type": 4},
+    ]
+    tracker_rows: list[dict[str, Any]] = [
+        {"url": "http://tracker.example/announce", "status": 4, "msg": "Unregistered torrent"},
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, tracker_rows=tracker_rows)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail == "Completed.Movie.1080p: Read-only file system"
+
+
+async def test_get_failure_detail_returns_none_when_torrent_absent() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, text="unhandled")
+
+    assert await _client(handler).get_failure_detail(MAGNET_HASH) is None
+
+
+async def test_get_failure_detail_returns_none_on_log_and_tracker_outage() -> None:
+    """Best-effort per the port contract: a transport failure enriching an
+    already-failed torrent must never raise or abort the reconcile cycle."""
+    detail = await _client(
+        _failure_detail_handler(log_status=500, trackers_status=500)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_returns_none_when_info_lookup_fails() -> None:
+    detail = await _client(_failure_detail_handler(info_status=500)).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_redacts_embedded_url_and_bounds_length() -> None:
+    long_tail = "x" * 500
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 1,
+            "message": (
+                "Completed.Movie.1080p: failed fetching "
+                "http://tracker.example/announce?passkey=SECRET123 " + long_tail
+            ),
+            "type": 3,
+        },
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert "SECRET123" not in detail
+    assert "passkey" not in detail
+    assert len(detail) <= 300
+
+
+async def test_get_failure_detail_strips_cr_lf_from_log_message() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "Completed.Movie.1080p: line one\r\ninjected line two", "type": 3},
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert "\r" not in detail
+    assert "\n" not in detail
+
+
+async def test_get_failure_detail_returns_none_when_nothing_matches() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "some other torrent entirely: boom", "type": 4},
+    ]
+    tracker_rows: list[dict[str, Any]] = [
+        {"url": "http://tracker.example/announce", "status": 2, "msg": ""},
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, tracker_rows=tracker_rows)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
 def test_adapter_satisfies_download_client_port() -> None:
     from plex_manager.ports.download_client import DownloadClientPort
 

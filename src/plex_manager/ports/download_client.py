@@ -165,3 +165,24 @@ class DownloadClientPort(Protocol):
         outside the app's visible download mount (issues #133/#157), never a
         bulk sweep and never the client's global default (see
         :meth:`get_default_save_path`)."""
+
+    async def get_failure_detail(self, info_hash: str) -> str | None:
+        """Return a best-effort, human-readable detail for why ``info_hash`` is
+        in a client-reported error/failure state, or ``None`` if none is
+        available (issue #181).
+
+        The reconciler's own raw-state mapping (``client reports 'error'``) is
+        honest but useless to an operator with no terminal access: it names the
+        SHAPE of the failure, never the CAUSE. This is the diagnostic
+        enrichment step -- pulling whatever qBittorrent itself can say about
+        THIS torrent (its own app log, its trackers' status messages) so the
+        persisted ``failed_reason`` and the service layer's environmental-vs-
+        release-fault classification (``domain.failure_classification``) both
+        have something real to work with.
+
+        Read-only and DIAGNOSTIC, like :meth:`get_default_save_path`: total,
+        best-effort, and MUST NOT raise -- called only for an ALREADY-failed
+        torrent, so a transport hiccup enriching it is never itself a reason to
+        fail (or abort) the reconcile cycle. Implementations return ``None`` on
+        any failure to fetch or on finding nothing more specific to say, never
+        letting a client error escape from this call."""

@@ -266,6 +266,7 @@ class FakeQbittorrent:
         source_errors: set[str] | None = None,
         pre_existing: set[str] | None = None,
         default_save_path: str | None = None,
+        failure_details: dict[str, str] | None = None,
     ) -> None:
         self.statuses = statuses or []
         self.files = files or {}
@@ -275,6 +276,10 @@ class FakeQbittorrent:
         # and a recorder of every ``set_location`` call (lowercased hash, target).
         self.default_save_path = default_save_path
         self.relocated: list[tuple[str, str]] = []
+        # Canned ``get_failure_detail`` results, keyed by lowercased info-hash
+        # (issue #181) -- a hash absent from this map returns ``None``, mirroring
+        # the real adapter's "nothing more specific to say" default.
+        self.failure_details = failure_details or {}
         # Sources (a magnet/HTTP url) for which ``add`` raises
         # :class:`QbittorrentSourceError`, mirroring the real adapter's honest
         # "HTTP source resolved to neither a magnet nor a hashable .torrent" — the
@@ -339,6 +344,9 @@ class FakeQbittorrent:
 
     async def set_location(self, info_hash: str, save_path: str) -> None:
         self.relocated.append((info_hash.lower(), save_path))
+
+    async def get_failure_detail(self, info_hash: str) -> str | None:
+        return self.failure_details.get(info_hash.lower())
 
 
 class FakeLibrary:

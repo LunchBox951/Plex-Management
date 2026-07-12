@@ -174,6 +174,131 @@ async def test_auto_fail_blocklist_records_indexer_and_blocks_hashless_candidate
         assert other is False
 
 
+async def test_reconcile_environmental_failure_keeps_release_off_blocklist(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #181: a torrent qBittorrent reports in its raw ``error`` state whose
+    enriched detail names a HOST-side (environmental) problem must NOT
+    blocklist the release -- blocklisting the incident's actual release would
+    have blocked a perfectly good pack out of every future search once the
+    host permission problem was fixed. The enriched detail must still reach
+    the persisted ``failed_reason`` (UI-visible, honesty over silence)."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="error")],
+        failure_details={
+            _HASH: "file_open: /downloads/.plex_manager/x.mkv, error: Permission denied"
+        },
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+        failed = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert blocklist == []
+    assert request is not None
+    assert request.status is RequestStatus.searching
+    # The row still reaches the terminal Failed state (not stranded) -- only the
+    # blocklist write is skipped, so the very next auto-grab cycle can resolve
+    # back to the SAME (exonerated) release once the environment is fixed.
+    assert failed.status == "failed"
+    assert failed.failed_reason is not None
+    assert "Permission denied" in failed.failed_reason
+    # The dead/errored torrent is still removed from the client so it does not
+    # linger as a zombie "error" entry.
+    assert qbt.removed == [(_HASH, True)]
+
+
+async def test_reconcile_release_fault_failure_still_blocklists(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The other half of issue #181's fix: a failure whose enriched detail names
+    a RELEASE-side problem (a dead/unregistered torrent) still blocklists --
+    the taxonomy only exempts environmental failures, never this one."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="error")],
+        failure_details={_HASH: "Unregistered torrent"},
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        failed = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert len(blocklist) == 1
+    assert blocklist[0].torrent_hash == _HASH
+    assert failed.status == "failed"
+    assert failed.failed_reason is not None
+    assert "Unregistered torrent" in failed.failed_reason
+
+
+async def test_reconcile_failure_with_no_enrichable_detail_still_blocklists(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """No enriched detail available (the adapter's best-effort enrichment found
+    nothing further to say) must default to the pre-existing, safe behavior:
+    blocklist. An unclassifiable failure is not safe to assume environmental."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="error")],
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        failed = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert len(blocklist) == 1
+    assert failed.status == "failed"
+    assert failed.failed_reason == "client reports 'error'"
+
+
+async def test_reconcile_missing_files_raw_state_alone_classifies_environmental(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """qBittorrent's own raw ``missingFiles`` state is itself an environmental
+    signal -- data vanished from disk out from under the torrent, almost
+    always a host/mount problem, never the release's fault -- so it must not
+    blocklist even when the adapter's own enrichment finds nothing further to
+    add (the base ``_map_raw_state`` reason text alone carries the signal)."""
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="missingFiles")],
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        failed = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert blocklist == []
+    assert failed.status == "failed"
+    assert failed.failed_reason == "client reports 'missingFiles'"
+
+
 async def test_live_progress_persisted_without_state_change(
     sessionmaker_: SessionMaker,
 ) -> None:

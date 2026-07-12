@@ -234,6 +234,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.events import DownloadFailed
+from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
 from plex_manager.domain.reconciler import (
     StallDetection,
     StateTransition,
@@ -1407,11 +1408,33 @@ async def reconcile_and_list(
         event_row = rows_by_hash.get(event.torrent_hash.lower())
         if event_row is None:  # pragma: no cover - events derive from ``rows``
             continue
+        # Issue #181: enrich this genuinely-reconcile-detected failure with
+        # qBittorrent-side detail (client I/O, safe to run here -- OUTSIDE any
+        # open write transaction, same as Phase B's removal below) and
+        # classify it environmental-vs-release-fault BEFORE deciding whether
+        # to blocklist. An environmental failure (disk full, permission
+        # denied, I/O error, missing staging files -- the host's fault) must
+        # NOT blocklist the release: blocklisting it would block a perfectly
+        # good release out of every future search for as long as the
+        # blocklist entry lives, long after the host problem is fixed. Only a
+        # release-caused failure (dead torrent, no metadata, tracker
+        # rejection) still blocklists -- the pre-existing, safe default this
+        # classification falls back to when no detail could be fetched.
+        detail = await qbt.get_failure_detail(event.torrent_hash)
+        reason = f"{event.reason}: {detail}" if detail else event.reason
+        # Classify the FULL reason (base raw-state text + any enrichment), not
+        # just the enrichment: the base reason alone can already carry the
+        # signal (e.g. qBittorrent's own ``missingFiles`` raw state -- data
+        # vanished from disk out from under the torrent, almost always a
+        # host/mount problem) even when no further detail could be fetched
+        # (the torrent already gone by the time this call ran, or a transport
+        # hiccup on an otherwise-healthy install).
+        blocklist = classify_failure_detail(reason) is not FailureClass.environmental
         completions.append(
             _FailureCompletion(
                 download_id=event_row.id,
-                event=event,
-                blocklist=True,
+                event=replace(event, reason=reason),
+                blocklist=blocklist,
                 remove_torrent=True,
                 blocklist_reason=BlocklistReason.failed.value,
                 # The Phase-A transition CAS never writes ``failed_reason``, so the

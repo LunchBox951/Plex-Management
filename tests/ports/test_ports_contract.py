@@ -192,6 +192,9 @@ class _FakeDownloadClient:
     async def set_location(self, info_hash: str, save_path: str) -> None:
         return None
 
+    async def get_failure_detail(self, info_hash: str) -> str | None:
+        return None
+
 
 def test_fakes_satisfy_runtime_checkable_protocols() -> None:
     assert isinstance(_FakeParser(), ParserPort)
