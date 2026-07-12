@@ -146,6 +146,42 @@ beforeEach(() => {
   ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
 })
 
+describe('Row subtitle', () => {
+  it('renders muted secondary copy without changing the heading or controls', () => {
+    render(
+      <Row
+        title="Because you requested Unbadged Movie"
+        subtitle="more horror"
+        items={[MOVIE]}
+        onSelect={() => {}}
+        tileState={() => REQUESTED}
+      />,
+    )
+
+    expect(
+      screen.getByRole('heading', { name: 'Because you requested Unbadged Movie' }),
+    ).toBeInTheDocument()
+    expect(screen.getByText('more horror')).toHaveClass('text-muted')
+    expect(screen.getByRole('button', { name: 'Scroll left' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Scroll right' })).toBeInTheDocument()
+  })
+
+  it('omits the secondary node entirely when no subtitle is supplied', () => {
+    const { container } = render(
+      <Row
+        title="Home row"
+        items={[MOVIE]}
+        onSelect={() => {}}
+        tileState={() => REQUESTED}
+      />,
+    )
+
+    expect(screen.queryByText('more horror')).not.toBeInTheDocument()
+    expect(container.querySelectorAll('section p')).toHaveLength(0)
+    expect(screen.getByRole('heading', { name: 'Home row' })).toBeInTheDocument()
+  })
+})
+
 describe('Row quick-request action (issue #42)', () => {
   beforeEach(() => {
     vi.clearAllMocks()

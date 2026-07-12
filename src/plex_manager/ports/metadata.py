@@ -18,10 +18,14 @@ __all__ = [
     "MediaSearchResult",
     "MetadataPort",
     "MovieMetadata",
+    "RecommendationFacet",
+    "RecommendationMetric",
+    "RecommendationProfile",
     "TvMetadata",
 ]
 
 MediaKind = Literal["movie", "tv"]
+RecommendationMetric = Literal["genre", "director", "cast", "anime"]
 
 
 class MediaSearchResult(BaseModel):
@@ -100,6 +104,29 @@ class EpisodeInfo(BaseModel):
     air_date: date | None = None
 
 
+class RecommendationFacet(BaseModel):
+    """One typed recommendation dimension resolved from a title's TMDB detail.
+
+    ``value_id`` is the TMDB genre/person id for the three value-bearing metrics.
+    The anime metric is the well-known TMDB anime keyword and therefore needs no
+    caller-visible TMDB parameter id; the adapter owns that wire-level detail.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    metric: RecommendationMetric
+    value_id: int | None
+    label: str
+
+
+class RecommendationProfile(BaseModel):
+    """Immutable recommendation facets available for one movie or TV seed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    facets: tuple[RecommendationFacet, ...]
+
+
 @runtime_checkable
 class MetadataPort(Protocol):
     """Search for media and resolve movie / TV details by tmdb id."""
@@ -135,6 +162,22 @@ class MetadataPort(Protocol):
 
         No TV equivalent of ``upcoming_movies`` -- TMDB has no "upcoming" TV
         endpoint comparable to its movie release-date listing.
+        """
+        raise NotImplementedError
+
+    async def recommendation_profile(
+        self, tmdb_id: int, media_type: MediaKind
+    ) -> RecommendationProfile | None:
+        """Resolve typed recommendation facets, or ``None`` when the seed is absent."""
+        raise NotImplementedError
+
+    async def discover_recommendations(
+        self, media_type: MediaKind, facet: RecommendationFacet, page: int = 1
+    ) -> MediaPage:
+        """Discover titles matching one typed facet.
+
+        TMDB-specific query parameter names remain an adapter concern. Unsupported
+        combinations (notably cast/crew filters for TV) must not be sent upstream.
         """
         raise NotImplementedError
 

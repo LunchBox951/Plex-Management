@@ -163,6 +163,37 @@ class SqlRequestRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
+    async def list_personalization_history(self, user_id: int) -> list[RequestRecord]:
+        """Return only ``user_id``'s retained request intent, one row per title.
+
+        Privacy is enforced in SQL, not by loading global history and filtering in
+        Python. Cancelled rows are withdrawn intent and excluded before duplicate
+        collapse. For each media identity the same display rule as Discover tiles
+        applies: the oldest active row wins, otherwise the newest settled row.
+        Chosen rows are returned by id for a deterministic repository contract.
+        """
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.user_id == user_id,
+                MediaRequest.status != RequestStatus.cancelled,
+            )
+            .order_by(MediaRequest.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        grouped: dict[tuple[int, str], list[MediaRequest]] = {}
+        for row in rows:
+            grouped.setdefault((row.tmdb_id, row.media_type.value), []).append(row)
+
+        chosen: list[MediaRequest] = []
+        for group in grouped.values():
+            active = next(
+                (row for row in group if row.status not in _SETTLED_REQUEST_STATUSES), None
+            )
+            chosen.append(active if active is not None else group[-1])
+        chosen.sort(key=lambda row: row.id)
+        return [_to_record(row) for row in chosen]
+
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[RequestRecord]:

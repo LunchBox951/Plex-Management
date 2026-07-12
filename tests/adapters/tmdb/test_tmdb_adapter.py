@@ -13,12 +13,13 @@ skipped in CI.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
 
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError, TmdbMetadata
+from plex_manager.ports.metadata import RecommendationFacet
 
 API_KEY = "test-key-never-logged"
 
@@ -513,6 +514,186 @@ async def test_detail_lookup_404_still_returns_none() -> None:
     (issue #89): absence really is a valid answer for a single title lookup,
     unlike search/list 404s which mean a broken route."""
     assert await _adapter().get_movie(999999) is None
+
+
+async def test_movie_recommendation_profile_parses_genres_directors_and_top_ten_cast() -> None:
+    calls: list[httpx.Request] = []
+    cast = [{"id": 1000 + index, "name": f"Actor {index}"} for index in range(12)]
+    detail = {
+        **MOVIE_DETAIL,
+        "genres": [
+            {"id": 27, "name": "Horror"},
+            {"id": -1, "name": "Invalid"},
+            {"id": 28, "name": ""},
+        ],
+        "credits": {
+            "crew": [
+                {"id": 525, "name": "Christopher Nolan", "job": "Director"},
+                {"id": 777, "name": "Not a Director", "job": "Producer"},
+                {"id": 0, "name": "Invalid Director", "job": "Director"},
+            ],
+            "cast": cast,
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=detail)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    first = await adapter.recommendation_profile(27205, "movie")
+    second = await adapter.recommendation_profile(27205, "movie")
+
+    assert first is not None
+    assert second is first  # immutable cached profile is safe to share
+    assert len(calls) == 1
+    assert calls[0].url.path == "/3/movie/27205"
+    assert calls[0].url.params["append_to_response"] == "external_ids,keywords,credits"
+    assert [(facet.metric, facet.value_id, facet.label) for facet in first.facets] == [
+        ("genre", 27, "Horror"),
+        ("director", 525, "Christopher Nolan"),
+        *(("cast", 1000 + index, f"Actor {index}") for index in range(10)),
+    ]
+    assert isinstance(first.facets, tuple)
+
+
+async def test_tv_profile_exposes_genre_and_anime_but_never_people_facets() -> None:
+    detail = {
+        **TV_DETAIL,
+        "genres": [{"id": 16, "name": "Animation"}],
+        "keywords": {"results": [{"id": 210024, "name": "anime"}]},
+        # Even a malformed/unexpected credits append must not leak unsupported
+        # people filters into the TV profile.
+        "credits": {
+            "crew": [{"id": 1, "name": "Director", "job": "Director"}],
+            "cast": [{"id": 2, "name": "Actor"}],
+        },
+    }
+    seen_append: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_append.append(request.url.params.get("append_to_response"))
+        return httpx.Response(200, json=detail)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    profile = await adapter.recommendation_profile(1399, "tv")
+
+    assert profile is not None
+    assert [(facet.metric, facet.value_id, facet.label) for facet in profile.facets] == [
+        ("genre", 16, "Animation"),
+        ("anime", None, "anime"),
+    ]
+    assert seen_append == ["external_ids,keywords"]
+
+
+@pytest.mark.parametrize(
+    ("media_type", "facet", "expected_path", "facet_param"),
+    [
+        (
+            "movie",
+            RecommendationFacet(metric="genre", value_id=27, label="Horror"),
+            "/3/discover/movie",
+            ("with_genres", "27"),
+        ),
+        (
+            "tv",
+            RecommendationFacet(metric="genre", value_id=18, label="Drama"),
+            "/3/discover/tv",
+            ("with_genres", "18"),
+        ),
+        (
+            "movie",
+            RecommendationFacet(metric="director", value_id=525, label="Nolan"),
+            "/3/discover/movie",
+            ("with_crew", "525"),
+        ),
+        (
+            "movie",
+            RecommendationFacet(metric="cast", value_id=287, label="Actor"),
+            "/3/discover/movie",
+            ("with_cast", "287"),
+        ),
+        (
+            "tv",
+            RecommendationFacet(metric="anime", value_id=None, label="anime"),
+            "/3/discover/tv",
+            ("with_keywords", "210024"),
+        ),
+    ],
+)
+async def test_discover_recommendations_maps_exact_typed_query(
+    media_type: Literal["movie", "tv"],
+    facet: RecommendationFacet,
+    expected_path: str,
+    facet_param: tuple[str, str],
+) -> None:
+    calls: list[httpx.Request] = []
+    payload = TRENDING_MOVIES if media_type == "movie" else TRENDING_TV
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=payload)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    first = await adapter.discover_recommendations(media_type, facet)
+    second = await adapter.discover_recommendations(media_type, facet)
+
+    assert second is first
+    assert len(calls) == 1
+    request = calls[0]
+    assert request.url.path == expected_path
+    assert request.url.params[facet_param[0]] == facet_param[1]
+    assert request.url.params["sort_by"] == "popularity.desc"
+    assert request.url.params["include_adult"] == "false"
+    assert request.url.params["page"] == "1"
+    assert all(item.media_type == media_type for item in first.results)
+
+
+@pytest.mark.parametrize("metric", ["director", "cast"])
+async def test_tv_people_recommendations_fail_before_network(
+    metric: Literal["director", "cast"],
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=TRENDING_TV)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    facet = RecommendationFacet(metric=metric, value_id=1, label="Person")
+    with pytest.raises(ValueError, match="unsupported for TV"):
+        await adapter.discover_recommendations("tv", facet)
+    assert calls == 0
+
+
+async def test_value_bearing_anime_recommendation_fails_before_network() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=TRENDING_MOVIES)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    facet = RecommendationFacet(metric="anime", value_id=210024, label="anime")
+    with pytest.raises(ValueError, match="do not accept a facet id"):
+        await adapter.discover_recommendations("movie", facet)
+    assert calls == 0
+
+
+@pytest.mark.parametrize("status", [401, 404, 429, 500])
+async def test_recommendation_errors_are_surfaced_and_api_key_redacted(status: int) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"status_message": "nope"})
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    facet = RecommendationFacet(metric="genre", value_id=27, label="Horror")
+    expected = TmdbAuthError if status == 401 else TmdbApiError
+    with pytest.raises(expected) as exc_info:
+        await adapter.discover_recommendations("movie", facet)
+    assert API_KEY not in str(exc_info.value)
+    assert "/discover/movie" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("status", [301, 302, 307])

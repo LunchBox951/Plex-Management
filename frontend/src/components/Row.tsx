@@ -7,6 +7,7 @@ import { QuickRequestButton } from './QuickRequestButton'
 
 interface RowProps {
   title: string
+  subtitle?: string | undefined
   items: DiscoverResult[]
   onSelect: (item: DiscoverResult) => void
   /** Render skeletons instead of nothing while the first page loads. */
@@ -88,6 +89,7 @@ function wrapAtEdge(track: HTMLDivElement, setWidth: number): void {
  */
 export function Row({
   title,
+  subtitle,
   items,
   onSelect,
   loading = false,
@@ -169,7 +171,10 @@ export function Row({
   return (
     <section className="mb-8">
       <div className="mb-3 flex items-center justify-between gap-4">
-        <h2 className="font-display text-lg font-bold text-ink">{title}</h2>
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <h2 className="font-display text-lg font-bold text-ink">{title}</h2>
+          {subtitle ? <p className="text-sm text-muted">{subtitle}</p> : null}
+        </div>
         {items.length > 0 ? (
           <div className="flex gap-1.5">
             <ChevronButton direction="left" onClick={() => scrollBy(-SCROLL_STEP)} />

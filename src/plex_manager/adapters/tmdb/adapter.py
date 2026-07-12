@@ -32,6 +32,8 @@ from plex_manager.ports.metadata import (
     MediaPage,
     MediaSearchResult,
     MovieMetadata,
+    RecommendationFacet,
+    RecommendationProfile,
     TvMetadata,
 )
 
@@ -44,7 +46,8 @@ _IMAGE_BASE_URL: Final = "https://image.tmdb.org/t/p/w500"
 _BACKDROP_BASE_URL: Final = "https://image.tmdb.org/t/p/w780"
 _ANIME_KEYWORD_ID: Final = 210024
 _DEFAULT_TTL_SECONDS: Final = 3600.0
-_APPEND: Final = "external_ids,keywords"
+_MOVIE_APPEND: Final = "external_ids,keywords,credits"
+_TV_APPEND: Final = "external_ids,keywords"
 _HTTP_OK: Final = 200
 _HTTP_MULTIPLE_CHOICES: Final = 300
 _HTTP_NOT_FOUND: Final = 404
@@ -196,6 +199,10 @@ class TmdbMetadata:
         # per call (see below), so the cache entry itself can never be mutated.
         self._search_cache: _TtlCache[tuple[MediaSearchResult, ...]] = _TtlCache(cache_ttl_seconds)
         self._page_cache: _TtlCache[MediaPage] = _TtlCache(cache_ttl_seconds)
+        self._recommendation_profile_cache: _TtlCache[RecommendationProfile] = _TtlCache(
+            cache_ttl_seconds
+        )
+        self._recommendation_page_cache: _TtlCache[MediaPage] = _TtlCache(cache_ttl_seconds)
         # Same issue-#106 immutable-tuple-cached/fresh-list-returned pattern as
         # ``_search_cache`` above.
         self._season_episodes_cache: _TtlCache[tuple[EpisodeInfo, ...]] = _TtlCache(
@@ -318,7 +325,7 @@ class TmdbMetadata:
         if cached is not None:
             return cached
 
-        detail = await self._get(f"/movie/{tmdb_id}", {"append_to_response": _APPEND})
+        detail = await self._get(f"/movie/{tmdb_id}", {"append_to_response": _MOVIE_APPEND})
         if detail is None:
             return None
         external_ids = _as_mapping(detail.get("external_ids"))
@@ -345,7 +352,7 @@ class TmdbMetadata:
         if cached is not None:
             return cached
 
-        detail = await self._get(f"/tv/{tmdb_id}", {"append_to_response": _APPEND})
+        detail = await self._get(f"/tv/{tmdb_id}", {"append_to_response": _TV_APPEND})
         if detail is None:
             return None
         external_ids = _as_mapping(detail.get("external_ids"))
@@ -386,6 +393,141 @@ class TmdbMetadata:
     async def popular_tv(self, page: int = 1) -> MediaPage:
         """List currently popular TV shows via ``/tv/popular``."""
         return await self._list_page("/tv/popular", "popular:tv", page, "tv")
+
+    async def recommendation_profile(
+        self, tmdb_id: int, media_type: MediaKind
+    ) -> RecommendationProfile | None:
+        """Resolve immutable, typed recommendation facets from TMDB detail.
+
+        TV intentionally exposes only genre/anime facets: TMDB's TV discover
+        endpoint does not support the movie endpoint's ``with_crew`` /
+        ``with_cast`` filters. Invalid ids/names are dropped at this adapter
+        boundary rather than becoming malformed discover queries later.
+        """
+        cache_key = f"{media_type}:{tmdb_id}"
+        cached = self._recommendation_profile_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        path = f"/{media_type}/{tmdb_id}"
+        append = _MOVIE_APPEND if media_type == "movie" else _TV_APPEND
+        detail = await self._get(path, {"append_to_response": append})
+        if detail is None:
+            return None
+
+        facets: list[RecommendationFacet] = []
+        seen: set[tuple[str, int | None]] = set()
+
+        def add(metric: str, value_id: int | None, label: str | None) -> None:
+            if label is None or not label.strip():
+                return
+            normalized_label = label.strip()
+            if metric != "anime" and (value_id is None or value_id <= 0):
+                return
+            key = (metric, value_id)
+            if key in seen:
+                return
+            seen.add(key)
+            if metric == "genre":
+                facets.append(
+                    RecommendationFacet(metric="genre", value_id=value_id, label=normalized_label)
+                )
+            elif metric == "director":
+                facets.append(
+                    RecommendationFacet(
+                        metric="director", value_id=value_id, label=normalized_label
+                    )
+                )
+            elif metric == "cast":
+                facets.append(
+                    RecommendationFacet(metric="cast", value_id=value_id, label=normalized_label)
+                )
+            elif metric == "anime":
+                facets.append(
+                    RecommendationFacet(metric="anime", value_id=None, label=normalized_label)
+                )
+
+        for row in _as_sequence(detail.get("genres")):
+            fields = _as_mapping(row)
+            add("genre", _get_int(fields, "id"), _get_str(fields, "name"))
+
+        if media_type == "movie":
+            credits = _as_mapping(detail.get("credits"))
+            for row in _as_sequence(credits.get("crew")):
+                fields = _as_mapping(row)
+                if _get_str(fields, "job") == "Director":
+                    add("director", _get_int(fields, "id"), _get_str(fields, "name"))
+            for row in _as_sequence(credits.get("cast"))[:10]:
+                fields = _as_mapping(row)
+                add("cast", _get_int(fields, "id"), _get_str(fields, "name"))
+
+        if _contains_anime_keyword(detail):
+            add("anime", None, "anime")
+
+        profile = RecommendationProfile(facets=tuple(facets))
+        self._recommendation_profile_cache.set(cache_key, profile)
+        return profile
+
+    async def discover_recommendations(
+        self, media_type: MediaKind, facet: RecommendationFacet, page: int = 1
+    ) -> MediaPage:
+        """Discover popular titles matching one typed recommendation facet."""
+        clamped = max(_MIN_PAGE, min(page, _MAX_PAGE))
+        value_id = facet.value_id
+        if facet.metric == "genre":
+            if value_id is None or value_id <= 0:
+                raise ValueError("genre recommendations require a positive facet id")
+            facet_param = ("with_genres", str(value_id))
+        elif facet.metric == "director":
+            if media_type != "movie":
+                raise ValueError("director recommendations are unsupported for TV")
+            if value_id is None or value_id <= 0:
+                raise ValueError("director recommendations require a positive facet id")
+            facet_param = ("with_crew", str(value_id))
+        elif facet.metric == "cast":
+            if media_type != "movie":
+                raise ValueError("cast recommendations are unsupported for TV")
+            if value_id is None or value_id <= 0:
+                raise ValueError("cast recommendations require a positive facet id")
+            facet_param = ("with_cast", str(value_id))
+        else:
+            if value_id is not None:
+                raise ValueError("anime recommendations do not accept a facet id")
+            facet_param = ("with_keywords", str(_ANIME_KEYWORD_ID))
+
+        cache_key = (
+            f"recommendation:{media_type}:{facet.metric}:"
+            f"{value_id if value_id is not None else 'none'}:p{clamped}"
+        )
+        cached = self._recommendation_page_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        path = f"/discover/{media_type}"
+        payload = await self._get(
+            path,
+            {
+                "page": str(clamped),
+                "sort_by": "popularity.desc",
+                "include_adult": "false",
+                facet_param[0]: facet_param[1],
+            },
+            not_found_returns_none=False,
+        )
+        fields: Mapping[str, object] = payload if payload is not None else {}
+        results: list[MediaSearchResult] = []
+        for row in _as_sequence(fields.get("results")):
+            parsed = self._parse_search_row(_as_mapping(row), media_type)
+            if parsed is not None:
+                results.append(parsed)
+        media_page = MediaPage(
+            page=_get_int(fields, "page") or clamped,
+            total_pages=_get_int(fields, "total_pages") or 0,
+            total_results=_get_int(fields, "total_results") or 0,
+            results=tuple(results),
+        )
+        self._recommendation_page_cache.set(cache_key, media_page)
+        return media_page
 
     async def _list_page(
         self, path: str, cache_prefix: str, page: int, kind: MediaKind

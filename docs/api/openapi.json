@@ -522,6 +522,17 @@
             "title": "Row Type",
             "type": "string"
           },
+          "subtitle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtitle"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -3304,6 +3315,25 @@
       "get": {
         "description": "Return the server-composed Discover home (spotlights + ordered rows).",
         "operationId": "discover_home_api_v1_discover_home_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "load_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Load Id"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3314,6 +3344,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
