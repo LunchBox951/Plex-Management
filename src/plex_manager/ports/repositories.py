@@ -113,6 +113,10 @@ class DownloadRecord(BaseModel):
     episodes: list[int] | None = None
     media_type: str | None = None
     failed_reason: str | None = None
+    # Consecutive resumed-import probe-outage retries (``downloads.retry_count``,
+    # issue #180) -- see ``services.import_service._refresh_resumed_import_after_probe_outage``
+    # and ``_PROBE_OUTAGE_MAX_RETRIES``. Reset to 0 on terminal-row reuse.
+    retry_count: int = 0
     first_seen_at: datetime | None = None
     # When this download was grabbed (``downloads.added_at``, server-defaulted at
     # row creation, and explicitly RE-STAMPED to now by

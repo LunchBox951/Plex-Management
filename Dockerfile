@@ -53,8 +53,16 @@ WORKDIR /app
 # Validate downloaded candidates by their actual media container/streams before
 # they can enter a Plex library.  ffprobe ships in Debian's ffmpeg package; keep
 # it in the runtime stage only (the builder never probes media).
+# --only-upgrade liblzma5 also patches CVE-2026-34743 (xz/liblzma buffer
+# overflow decoding a Record-less Index): python:3.14-slim ships 5.8.1-1, and
+# the fixed 5.8.1-1+deb13u1 is already in the Debian repo the base image
+# points at -- the base image just hasn't picked it up. Scoped to the one
+# package rather than a blanket `apt-get upgrade` so the layer stays
+# deterministic and this line can be dropped once the base image rebases past
+# the fix.
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ffmpeg \
+    && apt-get install --yes --only-upgrade liblzma5 \
     && rm -rf /var/lib/apt/lists/*
 
 # Patch the base image's own system pip too (same CVE-2026-1703). The app runs
