@@ -104,18 +104,33 @@ def _sqlite_ro_uri(path: Path) -> str:
 def _current_revision(db_path: Path) -> str | None:
     """Read the ``alembic_version`` row from an existing SQLite file, read-only.
 
-    Returns ``None`` when the table doesn't exist yet (a database file that
-    predates Alembic, or a partially-initialized one) -- callers treat that the
-    same as "base" (nothing applied).
+    Returns ``None`` **only** when the ``alembic_version`` table does not exist
+    yet (a database file that predates Alembic, or a partially-initialized one)
+    -- callers treat that the same as "base" (nothing applied).
+
+    A missing table is the ONLY "nothing applied" signal, and it is detected
+    explicitly via ``sqlite_master`` rather than by broadly catching
+    ``OperationalError`` around the ``SELECT version_num``. That same exception
+    is *also* raised for an exclusive lock, a malformed/foreign
+    ``alembic_version`` table, or a disk I/O error -- none of which mean "base".
+    Mapping those to ``None`` would let :func:`create_pre_migration_backup`
+    publish and prune around a misleading ``pre-migrate-base-*`` unit before
+    Alembic itself later fails on the same database. Instead they propagate to
+    :func:`main`, which logs loudly and takes the documented fail-loud /
+    no-fresh-backup path (ADR-0021).
     """
     conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
     try:
-        cursor = conn.execute("SELECT version_num FROM alembic_version LIMIT 1")
-        row = cursor.fetchone()
+        table_present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'alembic_version'"
+        ).fetchone()
+        if table_present is None:
+            # Unstamped/legacy DB file -- Alembic has never run against it.
+            return None
+        # The table exists: any read error now is a genuine failure (lock,
+        # corruption, wrong schema), not a legacy DB, so let it propagate.
+        row = conn.execute("SELECT version_num FROM alembic_version LIMIT 1").fetchone()
         return str(row[0]) if row is not None else None
-    except sqlite3.OperationalError:
-        # e.g. "no such table: alembic_version" -- an unstamped/legacy DB file.
-        return None
     finally:
         conn.close()
 
@@ -348,7 +363,7 @@ README "Backup & recovery" section for the full policy.
     (dest_dir / _MANIFEST_NAME).write_text(manifest, encoding="utf-8")
 
 
-def _prune(backups_root: Path, keep: int = _KEEP_COUNT) -> None:
+def _prune(backups_root: Path, keep: int = _KEEP_COUNT, *, protect: Path | None = None) -> None:
     """Keep only the most recent ``keep`` backup directories under ``backups_root``.
 
     Sorted by ``st_mtime``, not by name: the directory name is
@@ -357,6 +372,16 @@ def _prune(backups_root: Path, keep: int = _KEEP_COUNT) -> None:
     revisions' hashes with no relation to time -- a pure name-sort is NOT
     reliably chronological. Each removal is isolated so one failure (e.g. a
     permissions fault) doesn't stop the rest from being pruned.
+
+    ``protect`` (the just-published backup) is ALWAYS kept and reserves one of
+    the ``keep`` slots, *regardless of its mtime*. If ``backups_root`` already
+    holds ``keep`` entries whose mtimes are newer than the fresh backup -- e.g.
+    archived backups were copied back into the directory, or the system clock
+    moved backward between starts -- a pure mtime sort would rank the fresh
+    backup oldest and delete the very unit we just wrote (and logged) before the
+    migration even runs. Excluding it by identity (not by mtime) closes that
+    hole. Omitting ``protect`` preserves the original keep-N behaviour for other
+    callers.
     """
     if not backups_root.is_dir():
         return
@@ -373,11 +398,21 @@ def _prune(backups_root: Path, keep: int = _KEEP_COUNT) -> None:
             logger.warning(
                 "Could not remove abandoned partial backup directory %s", partial, exc_info=True
             )
+    # Resolve the protected dir once so the identity check is robust to symlinks
+    # or path spelling; only honour it if it actually exists as a directory.
+    protected = protect.resolve() if protect is not None and protect.is_dir() else None
     candidates = sorted(
-        (p for p in backups_root.glob(f"{_PREFIX}*") if p.is_dir()),
+        (
+            p
+            for p in backups_root.glob(f"{_PREFIX}*")
+            if p.is_dir() and (protected is None or p.resolve() != protected)
+        ),
         key=lambda p: p.stat().st_mtime,
     )
-    for stale in candidates[:-keep] if keep > 0 else candidates:
+    # The protected fresh backup occupies one keep slot; keep ``keep - 1`` of the
+    # rest. When keep is 0 (or the reserved slot consumes it) everything else goes.
+    keep_others = max(keep - (1 if protected is not None else 0), 0)
+    for stale in candidates[:-keep_others] if keep_others > 0 else candidates:
         try:
             shutil.rmtree(stale)
         except OSError:
@@ -516,7 +551,10 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
             dest.parent,
         )
     else:
-        _prune(dest.parent)
+        # Protect the unit we just wrote: never let a mtime sort (skewed clock,
+        # or archived backups copied back with newer mtimes) evict the fresh
+        # pre-migration backup we just logged.
+        _prune(dest.parent, protect=dest)
     return dest
 
 

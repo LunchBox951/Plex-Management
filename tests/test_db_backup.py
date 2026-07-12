@@ -629,6 +629,119 @@ def test_partial_backup_is_not_published_on_failure(
         assert not any(n.startswith(".tmp-") for n in names), names
 
 
+def test_current_revision_none_only_for_missing_alembic_table(tmp_path: Path) -> None:
+    """A genuinely unstamped/legacy DB (no ``alembic_version`` table) reads as base.
+
+    This is the ONLY state that maps to ``None`` -- proven distinct from a
+    malformed-table read error by the companion test below.
+    """
+    db_path = tmp_path / "plex_manager.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        # A real database file with tables, but Alembic has never stamped it.
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert db_backup._current_revision(db_path) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_current_revision_propagates_non_missing_table_read_error(tmp_path: Path) -> None:
+    """Finding: only "no such table" is base; other read failures must propagate.
+
+    An ``alembic_version`` table that EXISTS but is malformed (foreign schema,
+    an exclusive lock, or corruption) raises ``OperationalError`` on the version
+    read. Swallowing that as ``None`` would let the entrypoint publish and prune
+    around a misleading ``pre-migrate-base-*`` unit before Alembic itself fails.
+    The error must surface, not be mapped to base.
+    """
+    db_path = tmp_path / "plex_manager.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        # Table present (so it is NOT the legacy "no such table" case) but with
+        # the wrong schema -- ``SELECT version_num`` cannot resolve its column.
+        conn.execute("CREATE TABLE alembic_version (wrong_col VARCHAR(32) NOT NULL)")
+        conn.execute("INSERT INTO alembic_version (wrong_col) VALUES ('x')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        db_backup._current_revision(db_path)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_malformed_version_table_is_not_backed_up_as_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End-to-end: a non-legacy read error takes the fail-loud path, not a base backup.
+
+    ``main`` must stay non-fatal (exit 0) yet must NOT leave a bogus
+    ``pre-migrate-base-*`` recovery unit behind for a database it could not even
+    read the revision of.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE alembic_version (wrong_col VARCHAR(32) NOT NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(db_backup, "get_settings", lambda: settings)
+
+    with caplog.at_level(logging.ERROR, logger=db_backup.logger.name):
+        db_backup.main()  # must not raise
+
+    backups_root = data_dir / "backups"
+    if backups_root.exists():
+        names = [p.name for p in backups_root.iterdir()]
+        assert not any(n.startswith("pre-migrate-base") for n in names), names
+    assert any(
+        "FAILED" in record.message and "proceeding" in record.message for record in caplog.records
+    )
+
+
+def test_prune_protects_fresh_backup_against_newer_mtime_siblings(tmp_path: Path) -> None:
+    """Finding: the just-written backup survives prune even if all siblings are newer.
+
+    If ``backups`` already holds ``_KEEP_COUNT`` directories whose mtimes are
+    newer than the fresh backup (archived backups copied back in, or a backward
+    clock jump), a pure mtime sort ranks the fresh one oldest and would delete
+    the very unit just logged as written. It must be protected by identity.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    backups_root = data_dir / "backups"
+    backups_root.mkdir(parents=True)
+    # _KEEP_COUNT existing backups, ALL far in the FUTURE relative to the fresh
+    # backup about to be written -- so a naive mtime sort ranks the fresh one
+    # oldest and (without the fix) would evict it instead of an existing one.
+    future = 9_000_000_000  # ~year 2255, safely newer than "now"
+    existing: list[str] = []
+    for i in range(db_backup._KEEP_COUNT):  # pyright: ignore[reportPrivateUsage]
+        d = backups_root / f"pre-migrate-fake-rev-2020010{i}T000000Z"
+        d.mkdir()
+        os.utime(d, (future + i, future + i))
+        existing.append(d.name)
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    assert result is not None
+    remaining = sorted(p.name for p in backups_root.iterdir() if p.is_dir())
+    # The fresh backup survived despite being the oldest by mtime...
+    assert result.name in remaining
+    # ...and the prune still bounded the total to _KEEP_COUNT by evicting the
+    # oldest EXISTING unit to make room, not the fresh one.
+    assert len(remaining) == db_backup._KEEP_COUNT  # pyright: ignore[reportPrivateUsage]
+
+
 def test_prune_sweeps_abandoned_temp_dirs(tmp_path: Path) -> None:
     """Finding 3: _prune removes orphaned ``.tmp-`` staging dirs from prior crashes."""
     settings = _settings(tmp_path)
