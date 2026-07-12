@@ -463,6 +463,91 @@ class SqlRequestRepository:
             result[key] = chosen.status.value
         return result
 
+    async def list_false_available_movies(self, *, limit: int) -> list[RequestRecord]:
+        """Movie rows ``status='available' AND library_path IS NULL``, id-ascending.
+
+        The EXACT false-claim signature the already-in-library short-circuit mints
+        (``request_service.create_request_result``): ``mark_available`` never sets
+        ``library_path``, so a movie promoted straight from the short-circuit
+        carries no breadcrumb, while a normally-imported movie always has one
+        (``set_library_path`` runs before promotion). A TV parent's ``available``
+        + ``library_path IS NULL`` is a DIFFERENT, legitimate shape (the column
+        lives on ``SeasonRequest`` for tv) -- scoped to ``movie`` only so a TV
+        rollup row is never mistaken for a false claim. ``id``-ascending + capped
+        at ``limit`` bounds the healing pass so a reconcile tick stays cheap.
+        """
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.media_type == MediaType.movie,
+                MediaRequest.status == RequestStatus.available,
+                MediaRequest.library_path.is_(None),
+            )
+            .order_by(MediaRequest.id)
+            .limit(limit)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def rearm_false_available_to_pending(self, request_id: int) -> bool:
+        """Re-arm a healed false-available row to ``pending`` (honest re-search).
+
+        A single ``UPDATE ... WHERE id = ? AND status = 'available' AND
+        library_path IS NULL`` -- the DATABASE, not a prior read, decides whether
+        the exact false-claim signature still holds (mirrors :meth:`set_status_if_in`'s
+        CAS discipline). Clears ``library_verified_at``/``completed_at`` so the row
+        stops asserting in-library (honesty over silence) and resets the auto-grab
+        backoff (``search_attempts``/``next_search_at``) so ``list_due_for_search``
+        picks the re-armed row up on the very next tick rather than waiting out a
+        stale schedule. ``library_path`` is left untouched (already ``NULL``).
+        Returns whether a row was actually updated -- ``False`` means a concurrent
+        writer already moved the row off this exact signature, and the caller must
+        not assume its own stale read still applies.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(
+                    MediaRequest.id == request_id,
+                    MediaRequest.status == RequestStatus.available,
+                    MediaRequest.library_path.is_(None),
+                )
+                .values(
+                    status=RequestStatus.pending,
+                    library_verified_at=None,
+                    completed_at=None,
+                    search_attempts=0,
+                    next_search_at=None,
+                )
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def latest_library_path(self, tmdb_id: int, media_type: str) -> str | None:
+        """The ``library_path`` breadcrumb of the NEWEST row (id DESC) for this
+        media that carries one, across ANY status, or ``None``.
+
+        The only handle to a file THIS app previously placed for
+        ``(tmdb_id, media_type)`` -- backs the dedup-time breadcrumb corroboration
+        gate (``request_service.create_request_result``'s in-library short-circuit):
+        a prior terminal row's real path is the one grounded signal available at
+        create time to corroborate a GUID-present-but-possibly-mistagged movie
+        before minting a fresh terminal ``available`` row.
+        """
+        stmt = (
+            select(MediaRequest.library_path)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.library_path.is_not(None),
+            )
+            .order_by(MediaRequest.id.desc())
+            .limit(1)
+        )
+        return (await self._session.execute(stmt)).scalars().first()
+
     async def find_earliest_available(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return the OLDEST ``available`` request for this media (lowest id), or None.
 

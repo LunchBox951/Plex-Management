@@ -37,6 +37,7 @@ __all__ = [
     "RequestOwnedByAnotherUserError",
     "create_request",
     "create_request_result",
+    "fold_requests_for_display",
     "get_request",
     "list_requests",
     "mark_available",
@@ -113,6 +114,26 @@ _PARKABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.pending,
         RequestStatus.searching,
         RequestStatus.no_acceptable_release,
+    )
+)
+
+# String-valued mirror of ``repositories.requests._SETTLED_REQUEST_STATUSES``,
+# for the requests-list fold (:func:`fold_requests_for_display`) -- that helper
+# works over ``RequestRecord.status`` (already a ``str``, per the DTO), so it
+# needs the string-valued set rather than the SQL-side ``RequestStatus`` enum
+# frozenset. ``completed`` and ``no_acceptable_release`` are deliberately NOT
+# settled here, for the SAME reason the repo module documents: a ``completed``
+# ("Finalizing") row must keep shadowing a stale duplicate rather than being
+# folded away by one. Kept in sync with the repo module's set by
+# ``test_settled_status_value_sets_in_sync`` -- if the two ever drift, that test
+# fails loudly rather than the list quietly folding the wrong row.
+_SETTLED_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    s.value
+    for s in (
+        RequestStatus.available,
+        RequestStatus.failed,
+        RequestStatus.evicted,
+        RequestStatus.cancelled,
     )
 )
 
@@ -626,7 +647,13 @@ async def create_request_result(
     is recorded directly as ``available`` (and ``library_verified_at`` stamped),
     short-circuiting the search/grab — a visible "already in your library" record,
     not a wasted grab. An unconfigured/unreachable Plex skips the check (see
-    :func:`_already_in_library`).
+    :func:`_already_in_library`). When a PRIOR terminal row for this media left a
+    ``library_path`` breadcrumb (this app placed a file here before), the GUID
+    match is additionally corroborated against that path via
+    :meth:`LibraryPort.confirm_paths` before minting — a transient/mis-tagged Plex
+    GUID that does not survive that corroboration falls through to a normal
+    ``pending`` request instead of instant-completing. A media with no prior
+    breadcrumb (the common already-owned-by-someone-else case) is unaffected.
 
     Re-acquire (issue #131): when ``force`` is True the movie already-in-library
     short-circuit's Plex probe and its terminal ``available`` mint are SKIPPED, so a
@@ -868,6 +895,35 @@ async def create_request_result(
                     )
                     return CreateRequestResult(record=in_library, created=False)
                 initial_status = RequestStatus.available.value
+                # Breadcrumb-gated corroboration (defense-in-depth for a
+                # RE-ACQUIRE): reached only when no available/completed
+                # ``find_in_library`` target exists yet Plex's GUID says present --
+                # exactly the shape a transient/mis-tagged Plex GUID can also
+                # produce for a movie THIS app placed before (a prior terminal row
+                # left a real ``library_path``). A first-time already-owned movie
+                # (never placed by this app) has no breadcrumb and keeps today's
+                # behavior unchanged -- only a media with prior history gets the
+                # extra check, so the common case never pays for or risks a wasted
+                # re-download. When a breadcrumb exists but ``confirm_paths``
+                # cannot corroborate it (or the corroboration check itself fails),
+                # be conservative: fall through to a normal 'pending' request
+                # instead of instant-completing on a GUID match this app has
+                # independent reason to distrust.
+                breadcrumb = await repo.latest_library_path(tmdb_id, media_type)
+                if breadcrumb is not None:
+                    confirmed: frozenset[str]
+                    try:
+                        confirmed = await library.confirm_paths("movie", [breadcrumb])
+                    except (PlexLibraryError, PlexAuthError, NotImplementedError):
+                        confirmed = frozenset()
+                    if breadcrumb not in confirmed:
+                        _logger.info(
+                            "movie GUID-present but a prior library_path breadcrumb "
+                            "did not corroborate; not minting instant-available, "
+                            "proceeding as a normal pending request",
+                            extra={"tmdb_id": safe_int(tmdb_id)},
+                        )
+                        initial_status = RequestStatus.pending.value
 
     if (
         media_type == "tv"
@@ -1145,6 +1201,47 @@ async def list_requests(
 ) -> list[RequestRecord]:
     """List media requests, optionally filtered by ``status``."""
     return await SqlRequestRepository(session).list_by_status(status)
+
+
+def fold_requests_for_display(records: list[RequestRecord]) -> list[RequestRecord]:
+    """Collapse duplicate rows per media so the requests list shows ONE row.
+
+    The already-in-library short-circuit (``create_request_result``) can leave
+    more than one terminal row for the same media (e.g. a false-``available``
+    row off a transient wrong Plex GUID, alongside a later genuine re-grab) —
+    display-only surgery over already-loaded records, mirroring
+    ``SqlRequestRepository.display_statuses_by_tmdb_ids``'s exact preference:
+    within a fold-key group, the first NON-settled (active) row wins, else the
+    newest (last) row when every row in the group is settled. Underlying DB
+    rows are never mutated — this only decides which rows the CALLER shows.
+
+    Fold key is ``(user_id, tmdb_id, media_type)``, not the bare
+    ``(tmdb_id, media_type)``: an admin's UNFILTERED view can legitimately hold
+    two DIFFERENT users' rows for the same title (each visible to its own
+    owner), and collapsing those together would silently hide one user's
+    request from the admin — an honesty regression. For a non-admin caller
+    (already filtered to their own rows before this is called) the key reduces
+    to ``(tmdb_id, media_type)`` exactly, since every row shares their
+    ``user_id``.
+
+    ``records`` is assumed id-ascending (``list_by_status`` orders by id), so
+    within a group the first non-settled row encountered is also the
+    LOWEST-id active one, matching :func:`SqlRequestRepository.find_active`.
+    The result is re-sorted by ``id`` ascending for a deterministic order.
+    """
+    groups: dict[tuple[int | None, int, str], list[RequestRecord]] = {}
+    order: list[tuple[int | None, int, str]] = []
+    for record in records:
+        key = (record.user_id, record.tmdb_id, record.media_type)
+        if key not in groups:
+            order.append(key)
+        groups.setdefault(key, []).append(record)
+    chosen: list[RequestRecord] = []
+    for key in order:
+        group = groups[key]
+        active = next((r for r in group if r.status not in _SETTLED_STATUS_VALUES), None)
+        chosen.append(active if active is not None else group[-1])
+    return sorted(chosen, key=lambda r: r.id)
 
 
 async def get_request(session: AsyncSession, request_id: int) -> RequestRecord | None:

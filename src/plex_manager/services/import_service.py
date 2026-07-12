@@ -150,6 +150,20 @@ _FINALIZING_WARN_AFTER_MINUTES: Final = 30.0
 # ``_check_bounded_finalizing``), no new column or timer needed.
 _FINALIZING_WARN_DUTY_CYCLE_MINUTES: Final = 60.0
 
+# False-available healing (request-dedup bug): the movie already-in-library
+# short-circuit (``request_service.create_request_result``) can mint a terminal
+# ``available`` row off a transient/mis-tagged Plex GUID; ``mark_available``
+# never sets ``library_path``, so ``available`` + ``library_path IS NULL`` is
+# that short-circuit's unique false-claim signature -- nothing else produces
+# it for a MOVIE (a TV parent's ``available`` + NULL path is the normal,
+# legitimate rollup shape; the breadcrumb lives per-season there). Bounded so
+# a reconcile tick stays cheap; the false-claim population is normally zero.
+_HEAL_FALSE_AVAILABLE_LIMIT: Final = 25
+# Statuses that mean "genuinely in the library" for a sibling row backing the
+# heal's collapse branch -- mirrors ``SqlRequestRepository.find_in_library``'s
+# own available/completed pairing.
+_IN_LIBRARY_STATUSES: Final = frozenset({"available", "completed"})
+
 # In-memory (never persisted -- no schema change) bookkeeping for the bounded-
 # Finalizing warning's duty cycle, keyed by a caller-chosen row identity (see
 # ``_movie_unconfirmed_key``/``_season_unconfirmed_key``). Maps to the elapsed-
@@ -2250,6 +2264,99 @@ async def run_import_cycle(
     return changed
 
 
+async def _heal_false_available_movies(*, library: LibraryPort, session: AsyncSession) -> None:
+    """Self-heal MOVIE rows falsely minted ``available`` by the in-library
+    short-circuit (request-dedup bug: a transient/mis-tagged Plex GUID at
+    create time, ``request_service.create_request_result``).
+
+    Scans ``status='available' AND library_path IS NULL`` -- the exact
+    false-claim signature (see :data:`_HEAL_FALSE_AVAILABLE_LIMIT`'s docstring
+    comment) -- capped at that limit per tick, id-ascending. Per row, in
+    priority order:
+
+    1. **Sibling collapse**: another row for the SAME ``(tmdb_id, 'movie')`` is
+       ``available``/``completed`` and carries a REAL ``library_path`` -- the
+       path-grounded signal that the content is genuinely present under a
+       DIFFERENT row (the faithful reading of the spec's "path-based
+       confirmation fallback": that sibling was already confirmed at its own
+       import/short-circuit time). Delete the NULL-path row and keep the
+       sibling (mirrors ``request_service._collapse_available_race``'s
+       delete-the-loser). Ownership-guarded (issue #58): only when the
+       sibling is safe to keep for THIS row's owner (same owner, or either
+       side is ownerless) — a genuinely differing owner is left for the next
+       two branches instead, so a background heal (no user context) never
+       strands one owner's per-user list view to silently benefit another's.
+    2. **Genuinely present**: a live (``use_cache=False``) GUID check confirms
+       Plex has it after all -- re-stamp ``library_verified_at`` (the row was
+       right, just unconfirmed by a fresh check) and leave it.
+    3. **Absent, no usable sibling**: re-arm to ``pending`` -- the original
+       request was never actually fulfilled, so it re-enters the normal
+       search/grab pipeline (``list_due_for_search`` picks up a re-armed
+       ``pending`` row immediately; the CAS resets the auto-grab backoff).
+
+    Every branch is its own transaction (commit/rollback per row) so one bad
+    row never aborts the rest of the pass, mirroring the promotion loops
+    above. Every outcome -- collapse, re-verify, re-arm, or a live-check
+    failure that leaves the row untouched -- logs, honoring "honesty over
+    silence": a duplicate/false row is never silently deleted or left
+    unexplained.
+    """
+    repo = SqlRequestRepository(session)
+    rows = await repo.list_false_available_movies(limit=_HEAL_FALSE_AVAILABLE_LIMIT)
+    for row in rows:
+        siblings = [
+            sibling
+            for sibling in await repo.list_for_media(row.tmdb_id, "movie", _IN_LIBRARY_STATUSES)
+            if sibling.id != row.id and sibling.library_path is not None
+        ]
+        safe_sibling = next(
+            (
+                sibling
+                for sibling in siblings
+                if sibling.user_id == row.user_id or row.user_id is None or sibling.user_id is None
+            ),
+            None,
+        )
+        if safe_sibling is not None:
+            await repo.delete(row.id)
+            await session.commit()
+            _logger.info(
+                "healed duplicate false-available movie row: collapsed onto a "
+                "sibling with a real library_path",
+                extra={
+                    "tmdb_id": row.tmdb_id,
+                    "request_id": row.id,
+                    "winner_request_id": safe_sibling.id,
+                },
+            )
+            continue
+        try:
+            present = await library.is_available(row.tmdb_id, "movie", use_cache=False)
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            _logger.warning(
+                "heal: live availability check failed for false-available movie "
+                "row; leaving it for next cycle",
+                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+            )
+            continue
+        if present:
+            await repo.mark_available(row.id)
+            await session.commit()
+            _logger.info(
+                "healed false-available movie row: Plex confirms present, re-verified",
+                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+            )
+        elif await repo.rearm_false_available_to_pending(row.id):
+            await session.commit()
+            _logger.info(
+                "healed false-available movie row: not in Plex and no sibling "
+                "copy; re-armed to pending for a fresh search",
+                extra={"tmdb_id": row.tmdb_id, "request_id": row.id},
+            )
+        else:
+            await session.rollback()
+
+
 async def run_availability_cycle(
     *, library: LibraryPort, session: AsyncSession, now: datetime | None = None
 ) -> int:
@@ -2308,6 +2415,18 @@ async def run_availability_cycle(
     tick's retry instead. A same-tick transport failure must never be
     misattributed to a library/GUID mismatch; the "batch availability check
     failed" warning already logged above names the real cause.
+
+    SELF-HEAL FALSE 'AVAILABLE' CLAIMS (request-dedup bug): after the movie
+    promotion loop above, a bounded pass (:func:`_heal_false_available_movies`)
+    scans for MOVIE rows already ``available`` with ``library_path IS NULL`` --
+    the unique signature the already-in-library short-circuit
+    (``request_service.create_request_result``) mints when a transient/
+    mis-tagged Plex GUID makes it believe a movie is present that never
+    actually was. Each false claim is either collapsed onto a genuine sibling
+    row, re-verified live and left standing, or re-armed to ``pending`` for a
+    fresh, honest search -- north stars "correction without a terminal" and
+    "honesty over silence": a wrongly-terminal row self-corrects on the next
+    reconcile tick instead of silently shadowing a real re-request forever.
     """
     effective_now = now if now is not None else datetime.now(UTC)
     promoted = 0
@@ -2402,6 +2521,12 @@ async def run_availability_cycle(
                 "availability promotion failed; will retry next cycle",
                 extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
             )
+
+    # Self-heal false 'available' movie claims (request-dedup bug, see
+    # ``_heal_false_available_movies``'s docstring) -- a bounded pass, run once
+    # per tick after the movie promotion loop above so a row this SAME tick just
+    # promoted is never re-scanned as a false claim.
+    await _heal_false_available_movies(library=library, session=session)
 
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
     # SeasonRequest rows -- a show's OTHER seasons may still be mid-flight while
