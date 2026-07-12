@@ -36,6 +36,9 @@ const EVICTION_ENABLED_DEFAULT = true
 const EVICTION_PROACTIVE_ENABLED_DEFAULT = false
 const EVICTION_INTERVAL_MINUTES_DEFAULT = 30
 const LOG_RETENTION_DAYS_DEFAULT = 7
+// The row-count companion to log_retention_days (issue #152) — mirrors the
+// backend default (web/deps.py LOG_MAX_ROWS_DEFAULT).
+const LOG_MAX_ROWS_DEFAULT = 100000
 // Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
 const AUTO_GRAB_ENABLED_DEFAULT = true
 
@@ -64,6 +67,7 @@ interface FormState {
   eviction_proactive_enabled: boolean
   eviction_interval_minutes: string
   log_retention_days: string
+  log_max_rows: string
   // Auto-grab worker (ADR-0013) — the master on/off switch.
   auto_grab_enabled: boolean
 }
@@ -97,6 +101,7 @@ function initialForm(data: SettingsResponse): FormState {
       data.eviction_interval_minutes ?? EVICTION_INTERVAL_MINUTES_DEFAULT,
     ),
     log_retention_days: String(data.log_retention_days ?? LOG_RETENTION_DAYS_DEFAULT),
+    log_max_rows: String(data.log_max_rows ?? LOG_MAX_ROWS_DEFAULT),
     auto_grab_enabled: data.auto_grab_enabled ?? AUTO_GRAB_ENABLED_DEFAULT,
   }
 }
@@ -117,6 +122,7 @@ type NumberKey =
   | 'eviction_grace_days'
   | 'eviction_interval_minutes'
   | 'log_retention_days'
+  | 'log_max_rows'
 type BoolKey = 'eviction_enabled' | 'eviction_proactive_enabled' | 'auto_grab_enabled'
 
 // Operator-facing label per numeric operability knob — reused by the Save
@@ -128,6 +134,7 @@ const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
   eviction_grace_days: 'Eviction grace period (days)',
   eviction_interval_minutes: 'Eviction check interval (minutes)',
   log_retention_days: 'Log retention (days)',
+  log_max_rows: 'Log retention (max rows)',
 }
 
 /** ``true`` only for a non-blank string that parses to a finite number.
@@ -710,6 +717,7 @@ export function Settings() {
       eviction_proactive_enabled: form.eviction_proactive_enabled,
       eviction_interval_minutes: Number(form.eviction_interval_minutes),
       log_retention_days: Number(form.log_retention_days),
+      log_max_rows: Number(form.log_max_rows),
       auto_grab_enabled: form.auto_grab_enabled,
     }
     if (form.plex_token) body.plex_token = form.plex_token
@@ -1150,6 +1158,7 @@ export function Settings() {
                 step: 0.1,
               })}
               {numberField('log_retention_days', 'Log retention (days)', { min: 0 })}
+              {numberField('log_max_rows', 'Log retention (max rows)', { min: 0 })}
             </div>
             <div className="flex flex-col gap-3">
               {checkboxField(

@@ -176,10 +176,20 @@ def safe_guid(value: str) -> str:
 #    simply copied through by ``re.sub`` unmodified), ``password``/``passwd``/
 #    ``pwd``, ``passkey`` (the private-tracker-URL shape ``safe_guid`` already
 #    covers at the call site; this is the same shape's defense-in-depth
-#    backstop), ``secret``. The value capture excludes whitespace/quote/``&``/
-#    ``,``/closing-bracket delimiters, so it never swallows past ONE token --
-#    correct for a query-string ``key=value``, a header ``Key: value``, or a
-#    JSON/dict ``"key": "value"`` entry, all in one pattern.
+#    backstop), ``secret``. A bounded, lazy ``[\w-]{0,64}?`` prefix in front of
+#    the alternation lets the key word be the SUFFIX of a longer
+#    underscore/hyphen-joined identifier, so THIS app's real settings-field
+#    names -- ``tmdb_api_key``, ``prowlarr_api_key``, ``plex_token``,
+#    ``qbittorrent_password``, ``app_api_key`` -- match even though ``_`` is a
+#    word char that would otherwise defeat a bare ``\b`` before ``api``/``token``
+#    /``password``; the whole field name (prefix included) survives in the
+#    output, only the value is masked. The value capture handles two shapes: an
+#    UNQUOTED value stops at the first whitespace/``&``/``,``/quote/closing
+#    bracket (exactly one token -- a query-string ``key=value`` or header
+#    ``Key: value``); a QUOTED value (``key='...'`` / ``key="..."``, e.g. a
+#    ``qbittorrent_password`` containing spaces or commas) is consumed through to
+#    its matching closing quote, so no suffix of a multi-word quoted credential
+#    is left behind the ``<redacted>`` token.
 #
 # A final, UNCONDITIONAL pass (no key name involved at all) catches a
 # Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
@@ -199,13 +209,35 @@ _SECRET_KEY_PATTERN: Final = (
 # immediately following "token" and is correctly left untouched), then an
 # optional opening quote for the value.
 _SEP_PATTERN: Final = r"['\"]?\s*[:=]\s*['\"]?"
-# The value itself: any run of characters that is not whitespace, a literal
+# The UNQUOTED value: any run of characters that is not whitespace, a literal
 # delimiter (`&`, `,`), a quote, or a closing bracket -- i.e. exactly one
 # token, correct for a query-string/header/dict-style single-value secret.
 _VALUE_CHARS: Final = r"[^\s&,'\"}\)\]]+"
 
+# ``key<sep>value`` for every secret key name EXCEPT ``Authorization`` (below).
+# The separator here (unlike :data:`_SEP_PATTERN`) stops BEFORE the value's
+# opening quote so that quote can be captured into ``q`` and a quoted value
+# consumed through to its matching close:
+#   * leading ``[\w-]{0,64}?`` -- a bounded, lazy prefix so a secret key word can
+#     be the tail of a longer ``_``/``-``-joined field name (``plex_token``,
+#     ``tmdb_api_key``); ``_`` is a word char, so a bare ``\b`` before ``token``
+#     would never fire on ``plex_token``. Bounded to keep the scan linear.
+#   * ``(?P<q>['\"])?`` -- the value's optional opening quote.
+#   * ``(?P<value> ... )`` -- when ``q`` matched, ``[^'\"]*`` runs to (not past)
+#     the matching closing quote, masking a whole multi-word quoted credential;
+#     otherwise the single unquoted token. ``_mask_value`` drops from the value
+#     start on, so a captured closing quote is never re-emitted -- the closing
+#     quote is deliberately left OUTSIDE the match (``[^'\"]`` cannot cross it),
+#     so it survives in the output around ``<redacted>``.
+_KV_SEP_PATTERN: Final = r"['\"]?\s*[:=]\s*"
 _SECRET_KV_RE: Final = re.compile(
-    r"(?i)\b(?:" + _SECRET_KEY_PATTERN + r")\b" + _SEP_PATTERN + r"(?P<value>" + _VALUE_CHARS + r")"
+    r"(?i)\b[\w-]{0,64}?(?:"
+    + _SECRET_KEY_PATTERN
+    + r")\b"
+    + _KV_SEP_PATTERN
+    + r"(?P<q>['\"])?(?P<value>(?(q)[^'\"]*|"
+    + _VALUE_CHARS
+    + r"))"
 )
 
 # ``Authorization`` gets its own pattern (see rationale above): the value may
@@ -225,8 +257,10 @@ _AUTHORIZATION_RE: Final = re.compile(
 # ``scheme://user:pass@host`` -- the PASSWORD half of HTTP basic-auth userinfo.
 # Group 1 captures ``scheme://user`` (stopping the username at the first
 # ``:``/``/``/``@``/quote/whitespace); the password itself is never captured
-# into the output, only its span is consumed so it can be dropped.
-_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]+):[^\s@'\"]+@")
+# into the output, only its span is consumed so it can be dropped. The username
+# run is ``*`` (not ``+``) so a valid empty-username basic-auth URL
+# (``https://:token@host``) still masks its token instead of leaking it.
+_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]*):[^\s@'\"]+@")
 
 # A standalone Fernet-key-shaped blob: 43 urlsafe-base64 characters plus the
 # one trailing ``=`` pad ``Fernet.generate_key()`` always produces (32 raw

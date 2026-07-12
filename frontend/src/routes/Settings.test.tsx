@@ -762,6 +762,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       eviction_proactive_enabled: null,
       eviction_interval_minutes: null,
       log_retention_days: null,
+      log_max_rows: null,
     }
     render(<Settings />, { wrapper: Wrapper })
 
@@ -770,6 +771,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(screen.getByLabelText('Eviction grace period (days)')).toHaveValue(30)
     expect(screen.getByLabelText('Eviction check interval (minutes)')).toHaveValue(30)
     expect(screen.getByLabelText('Log retention (days)')).toHaveValue(7)
+    expect(screen.getByLabelText('Log retention (max rows)')).toHaveValue(100000)
     expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeChecked()
     expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).not.toBeChecked()
 
@@ -785,6 +787,9 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       target: { value: '15' },
     })
     fireEvent.change(screen.getByLabelText('Log retention (days)'), { target: { value: '3' } })
+    fireEvent.change(screen.getByLabelText('Log retention (max rows)'), {
+      target: { value: '50000' },
+    })
     fireEvent.click(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i }))
     fireEvent.click(screen.getByRole('checkbox', { name: /^Proactive eviction/i }))
 
@@ -797,6 +802,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(body.eviction_grace_days).toBe(14)
     expect(body.eviction_interval_minutes).toBe(15)
     expect(body.log_retention_days).toBe(3)
+    expect(body.log_max_rows).toBe(50000)
     expect(body.eviction_enabled).toBe(false)
     expect(body.eviction_proactive_enabled).toBe(true)
   })

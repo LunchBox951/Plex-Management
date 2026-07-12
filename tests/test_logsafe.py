@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -347,6 +348,39 @@ def test_safe_guid_is_total_for_lone_surrogates() -> None:
             "FAKEWEBHOOKSECRET99",
             "loaded webhook secret=<redacted>",
         ),
+        # THIS app's real prefixed settings-field names: ``_`` is a word char, so
+        # a bare ``\b`` before ``api``/``token``/``password`` would never fire on
+        # these -- the bounded lazy prefix makes the key word a valid identifier
+        # suffix. The whole field name survives; only the value is masked.
+        (
+            "config tmdb_api_key=FAKETMDBKEY1234567",
+            "FAKETMDBKEY1234567",
+            "config tmdb_api_key=<redacted>",
+        ),
+        (
+            "loaded plex_token=FAKEPLEXTOKEN7890",
+            "FAKEPLEXTOKEN7890",
+            "loaded plex_token=<redacted>",
+        ),
+        (
+            "settings app_api_key=FAKEAPPKEY99",
+            "FAKEAPPKEY99",
+            "settings app_api_key=<redacted>",
+        ),
+        # A quoted credential whose value carries spaces/commas (a
+        # ``qbittorrent_password`` may contain any of these): the WHOLE quoted
+        # value is consumed, not just the first whitespace-delimited token, so no
+        # suffix is left behind the ``<redacted>``. The closing quote survives.
+        (
+            "login qbittorrent_password='FAKE pw, with spaces'",
+            "with spaces",
+            "login qbittorrent_password='<redacted>'",
+        ),
+        (
+            'headers={"password": "FAKE multi word pw"}',
+            "multi word pw",
+            'headers={"password": "<redacted>"}',
+        ),
     ],
 )
 def test_redact_secrets_masks_key_value_shaped_secrets(
@@ -363,7 +397,22 @@ def test_redact_secrets_masks_basic_auth_url_password() -> None:
     assert result == "connecting to https://tracker_user:<redacted>@tracker.example.com/announce"
     assert "FAKEURLPASSWORD1" not in result
     assert "tracker_user" in result  # the account name stays diagnosable
-    assert "tracker.example.com" in result  # the host stays diagnosable
+    # The host stays diagnosable. Compare the PARSED hostname rather than a bare
+    # substring check: an ``in`` test on an unparsed URL is the
+    # incomplete-URL-substring-sanitization shape CodeQL flags (the host could
+    # sit anywhere in the string); parsing pins it to the netloc exactly.
+    assert urlsplit(result.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
+
+
+def test_redact_secrets_masks_empty_username_basic_auth_url() -> None:
+    """A valid basic-auth URL with an EMPTY username (``https://:token@host``)
+    still carries a secret in its userinfo -- the username run is ``*`` not
+    ``+`` so the token is masked rather than leaked."""
+    raw = "connecting to https://:FAKEURLTOKEN9@tracker.example.com/announce"
+    result = redact_secrets(raw)
+    assert result == "connecting to https://:<redacted>@tracker.example.com/announce"
+    assert "FAKEURLTOKEN9" not in result
+    assert urlsplit(result.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
 
 
 @pytest.mark.parametrize(

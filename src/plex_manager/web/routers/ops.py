@@ -19,9 +19,13 @@ Every endpoint here is read-only or an idempotent operator action; none of them
 ever return a secret (subsystem ``detail`` strings and log messages carry
 whatever a call site already chose to log — see ``log_capture_service``'s
 module docstring on why that discipline lives upstream of this router, not in
-it). ``GET /logs/export`` additionally re-applies ``logsafe.redact_secrets``
-to every message as a second, independent redaction pass (issue #153) — see
-that endpoint's own docstring.
+it). Both durable-store READ boundaries — ``GET /logs`` and ``GET /logs/export``
+— re-apply ``logsafe.redact_secrets`` to every persisted message as a second,
+independent redaction pass (issue #153): capture-time redaction only covers rows
+this build wrote through ``log_capture_service``, so a pre-upgrade row or a
+direct repository write is masked consistently at BOTH read boundaries, not just
+on export. (``GET /logs/tail`` reads the in-memory ring buffer, which is written
+only by the already-redacting capture path, so it needs no second pass.)
 """
 
 from __future__ import annotations
@@ -244,7 +248,11 @@ async def list_logs_endpoint(
                 created_at=r.created_at,
                 level=r.level,
                 logger=r.logger,
-                message=r.message,
+                # Second redaction pass on the durable read (issue #153): capture-
+                # time redaction only covers rows THIS build wrote; a pre-upgrade
+                # row or a direct repository write is masked here just as it is on
+                # /logs/export, so both durable-read boundaries are secret-safe.
+                message=redact_secrets(r.message),
                 context=r.context,
             )
             for r in page.results
