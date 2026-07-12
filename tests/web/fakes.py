@@ -33,6 +33,7 @@ from plex_manager.ports.media_probe import (
     MediaProbeUnavailableError,
 )
 from plex_manager.ports.metadata import (
+    EpisodeInfo,
     MediaPage,
     MediaSearchResult,
     MetadataPort,
@@ -168,6 +169,8 @@ class FakeTmdb:
         upcoming: list[MediaSearchResult] | None = None,
         trending_tv_results: list[MediaSearchResult] | None = None,
         popular_tv_results: list[MediaSearchResult] | None = None,
+        season_episodes: dict[tuple[int, int], list[EpisodeInfo]] | None = None,
+        season_episodes_error: Exception | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
@@ -186,6 +189,11 @@ class FakeTmdb:
         self._popular_tv = (
             list(popular_tv_results) if popular_tv_results is not None else list(self.results)
         )
+        # ADR-0018 (issue #178): keyed (tmdb_id, season_number). ``season_episodes_error``
+        # (when set) is raised on every call -- the "TMDB outage / target unknown"
+        # test double.
+        self._season_episodes = season_episodes or {}
+        self.season_episodes_error = season_episodes_error
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -214,6 +222,11 @@ class FakeTmdb:
 
     async def popular_tv(self, page: int = 1) -> MediaPage:
         return self._page(self._popular_tv)
+
+    async def season_episodes(self, tmdb_id: int, season_number: int) -> list[EpisodeInfo]:
+        if self.season_episodes_error is not None:
+            raise self.season_episodes_error
+        return list(self._season_episodes.get((tmdb_id, season_number), []))
 
 
 class FakeProwlarr:
