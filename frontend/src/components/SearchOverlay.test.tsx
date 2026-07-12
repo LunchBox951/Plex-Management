@@ -312,6 +312,40 @@ describe('SearchOverlay — popular suggestions and debounced search', () => {
     expect(screen.getByRole('img', { name: 'In library' })).toBeInTheDocument()
   })
 
+  it('discards a superseded query: prior results never clobber a newer term', () => {
+    // The mocked hook returns the same payload for any argument, so the ONLY
+    // thing that can keep stale results off-screen is the client-side gate. This
+    // proves out-of-order/late responses for a superseded query can never leak:
+    // the instant the input changes, the overlay stops observing the old query
+    // (passes '' to the hook, disabling it) and suppresses its results until the
+    // debounce settles on the new term.
+    vi.useFakeTimers()
+    setSearch({ data: { results: [OWNED_MOVIE] } })
+    render(<SearchOverlay />)
+    const { input } = openOverlay()
+
+    fireEvent.change(input, { target: { value: 'first' } })
+    act(() => vi.advanceTimersByTime(300))
+    expect(useDiscoverSearch).toHaveBeenCalledWith('first')
+    expect(screen.getByRole('heading', { name: '1 result for “first”' })).toBeInTheDocument()
+
+    // Type a newer term. Before the debounce settles the overlay must drop the
+    // 'first' results and disable the in-flight query rather than show them under
+    // the new term.
+    fireEvent.change(input, { target: { value: 'firstly' } })
+    expect(useDiscoverSearch).toHaveBeenLastCalledWith('')
+    expect(useDiscoverSearch).not.toHaveBeenCalledWith('firstly')
+    expect(
+      screen.queryByRole('heading', { name: '1 result for “first”' }),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('Searching…')).toBeInTheDocument()
+
+    // Once the debounce settles, results are attributed to the current term only.
+    act(() => vi.advanceTimersByTime(300))
+    expect(useDiscoverSearch).toHaveBeenLastCalledWith('firstly')
+    expect(screen.getByRole('heading', { name: '1 result for “firstly”' })).toBeInTheDocument()
+  })
+
   it('renders result glyphs and keeps the one-click request gate scope-safe', async () => {
     setSearch({ data: { results: [OWNED_MOVIE, FRESH_MOVIE, RETRY_SHOW] } })
     setRequests([requestRow()])
