@@ -15,9 +15,15 @@ cannot follow HTTP->magnet itself), and a body that is a ``.torrent`` file is se
 as multipart with its SHA-1 info-hash computed locally. A 409 (already present)
 is treated as success and resolves to the existing hash.
 
-``get_status`` / ``get_all_statuses`` read ``/torrents/info`` and map each torrent
-to the port's :class:`DownloadStatus` DTO, keeping the qBittorrent ``state`` string
-verbatim in ``raw_state`` (the domain reconciler owns the raw->domain mapping).
+``get_status`` / ``get_all_statuses`` / ``get_statuses_for_hashes`` all read
+``/torrents/info`` and map each torrent to the port's :class:`DownloadStatus` DTO,
+keeping the qBittorrent ``state`` string verbatim in ``raw_state`` (the domain
+reconciler owns the raw->domain mapping). ``get_statuses_for_hashes`` is the
+SCOPED variant (issue #216): it filters via the API's pipe-separated ``hashes``
+param, chunked to a bounded URL size, so the frequent reconcile poll costs
+proportional to Plex Manager's own tracked downloads rather than the shared
+client's whole inventory; ``get_all_statuses`` remains for the few callers that
+genuinely want the full inventory (e.g. setup validation).
 ``/torrents/properties`` is consulted (cached) for the authoritative save path.
 
 ``pause`` / ``resume`` adapt to the server version: qBittorrent 5.0 (WebAPI
@@ -41,7 +47,14 @@ import logging
 import os
 import re
 import socket
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Sequence,
+)
 from datetime import UTC, datetime
 from typing import Final, cast
 from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
@@ -74,6 +87,13 @@ _PROPERTIES_TTL_SECONDS: Final = 30.0
 # small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
 # real metafile yet still a hard ceiling against a hostile/unbounded source body.
 _MAX_TORRENT_BYTES: Final = 10 * 1024 * 1024
+# /torrents/info?hashes=a|b|c has no documented server-side limit, but an
+# unbounded query string risks tripping a reverse proxy's URL/header length cap
+# (nginx's default is 8 KiB). 100 lowercase 40-char hex hashes joined by "|" is
+# ~4.1 KiB of query string -- comfortably under that even in a large household
+# queue -- so get_statuses_for_hashes chunks larger tracked sets instead of
+# growing the URL past this (issue #216).
+_HASHES_PER_REQUEST: Final = 100
 _QBT_SESSION_COOKIE_PREFIX: Final = "QBT_SID_"
 _SESSION_COOKIE_NAME_PATTERN: Final = rf"(?:SID|{_QBT_SESSION_COOKIE_PREFIX}[1-9][0-9]{{0,4}})"
 # qBittorrent's current SID is standard Base64; the unreserved additions retain
@@ -1088,6 +1108,32 @@ class QbittorrentClient:
             mapped = _as_dict(row)
             if mapped:
                 out.append(_torrent_to_status(mapped))
+        return out
+
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
+        """Return statuses for exactly the given hashes (issue #216's scoped poll).
+
+        An empty ``hashes`` short-circuits to ``[]`` with NO request at all --
+        the caller (``reconcile_and_list``) already has its own empty-rows fast
+        path, but this stays defensive against any other caller. A hash qBit
+        does not recognize is simply missing from its JSON array response, never
+        an HTTP error, so a short result here is the honest "gone from the
+        client" signal, not a failure to surface.
+        """
+        unique = sorted({h.lower() for h in hashes if h})
+        if not unique:
+            return []
+        out: list[DownloadStatus] = []
+        for start in range(0, len(unique), _HASHES_PER_REQUEST):
+            batch = unique[start : start + _HASHES_PER_REQUEST]
+            response = await self._request(
+                "GET", "/torrents/info", params={"hashes": "|".join(batch)}
+            )
+            self._raise_for_status(response)
+            for row in _as_list(_decode_json(response, "/torrents/info")):
+                mapped = _as_dict(row)
+                if mapped:
+                    out.append(_torrent_to_status(mapped))
         return out
 
     # ---- control -------------------------------------------------------- #

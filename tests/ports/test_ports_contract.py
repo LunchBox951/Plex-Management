@@ -165,6 +165,9 @@ class _FakeDownloadClient:
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         return []
 
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
+        return []
+
     async def pause(self, info_hash: str) -> None:
         return None
 

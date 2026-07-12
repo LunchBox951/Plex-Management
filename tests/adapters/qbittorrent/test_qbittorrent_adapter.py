@@ -27,6 +27,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.qbittorrent.adapter import (
+    _HASHES_PER_REQUEST,  # pyright: ignore[reportPrivateUsage]
     _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
     SafeFetchNetworkBackend,
 )
@@ -263,6 +264,114 @@ async def test_get_status_by_hash() -> None:
 async def test_get_status_absent_returns_none() -> None:
     status = await _client().get_status("ffffffffffffffffffffffffffffffffffffffff")
     assert status is None
+
+
+# --------------------------------------------------------------------------- #
+# get_statuses_for_hashes — the scoped snapshot query (issue #216)
+# --------------------------------------------------------------------------- #
+
+
+async def test_get_statuses_for_hashes_empty_input_sends_no_request() -> None:
+    """No tracked hashes means nothing to ask the client about at all -- not even
+    an authenticated round-trip. (The primary empty-fast-path guard lives in
+    ``queue_service.reconcile_and_list``; this is the adapter's own defense in
+    depth for any other caller.)"""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(404, text="unhandled")
+
+    result = await _client(handler).get_statuses_for_hashes([])
+    assert result == []
+    assert calls == []  # not even /auth/login
+
+
+async def test_get_statuses_for_hashes_scopes_the_query_to_given_hashes() -> None:
+    """The request carries EXACTLY the pipe-separated, lowercased tracked
+    hashes -- never an unfiltered inventory request."""
+    seen_params: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info" and request.method == "GET":
+            seen_params.append(request.url.params.get("hashes"))
+            wanted = set((request.url.params.get("hashes") or "").split("|"))
+            rows = [r for r in INFO_ROWS if r["hash"].lower() in wanted]
+            return httpx.Response(200, json=rows)
+        return httpx.Response(404, text="unhandled")
+
+    hashes = [INFO_ROWS[0]["hash"].upper(), INFO_ROWS[1]["hash"]]
+    statuses = await _client(handler).get_statuses_for_hashes(hashes)
+
+    assert len(seen_params) == 1  # one request -- both hashes fit in one chunk
+    requested = set((seen_params[0] or "").split("|"))
+    assert requested == {row["hash"].lower() for row in INFO_ROWS}
+    assert {s.info_hash for s in statuses} == {row["hash"].lower() for row in INFO_ROWS}
+
+
+async def test_get_statuses_for_hashes_unknown_hash_yields_empty_not_error() -> None:
+    """A hash qBittorrent doesn't recognize is simply absent from its JSON array
+    response -- never a raised error (the reconciler treats the resulting gap as
+    the honest ClientMissing signal, not a failure to surface)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info" and request.method == "GET":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, text="unhandled")
+
+    statuses = await _client(handler).get_statuses_for_hashes(
+        ["ffffffffffffffffffffffffffffffffffffff"]
+    )
+    assert statuses == []
+
+
+async def test_get_statuses_for_hashes_chunks_large_hash_sets() -> None:
+    """A tracked set larger than the per-request bound is split into multiple
+    bounded requests, never one unboundedly long URL."""
+    total = _HASHES_PER_REQUEST + 1
+    hashes = [f"{i:040x}" for i in range(total)]
+    request_hash_sets: list[set[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info" and request.method == "GET":
+            param: str = request.url.params.get("hashes") or ""
+            batch: set[str] = set(param.split("|"))
+            request_hash_sets.append(batch)
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).get_statuses_for_hashes(hashes)
+
+    assert len(request_hash_sets) == 2  # 101 hashes -> two chunks of <= 100
+    sizes = sorted(len(batch) for batch in request_hash_sets)
+    assert sizes == [1, _HASHES_PER_REQUEST]
+    combined: set[str] = set()
+    for batch in request_hash_sets:
+        combined |= batch
+    assert combined == set(hashes)
+
+
+async def test_get_statuses_for_hashes_dedupes_repeated_hashes() -> None:
+    """A season pack can put the SAME hash on multiple tracked rows; the query
+    must not send (or count) it more than once."""
+    seen_params: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info" and request.method == "GET":
+            seen_params.append(request.url.params.get("hashes"))
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, text="unhandled")
+
+    await _client(handler).get_statuses_for_hashes([MAGNET_HASH, MAGNET_HASH.upper()])
+    assert seen_params == [MAGNET_HASH]
 
 
 async def test_remove_and_get_save_path() -> None:

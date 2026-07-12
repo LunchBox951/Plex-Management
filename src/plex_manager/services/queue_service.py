@@ -1127,10 +1127,27 @@ async def reconcile_and_list(
 
     When ``changes`` is supplied it is updated only for writes that actually
     landed, allowing the background web loop to avoid emitting idle invalidations.
+
+    The client snapshot is SCOPED to exactly the tracked rows' hashes (issue
+    #216), via :meth:`DownloadClientPort.get_statuses_for_hashes` — never the
+    shared client's whole inventory — and skipped entirely when there are no
+    active rows at all. Every downstream helper below (``reconcile``,
+    ``unmapped_client_states``, ``detect_stalls``) already only ever looks up
+    the snapshot BY the tracked hash, so narrowing the fetch changes nothing
+    about what they see; a hash the client no longer recognizes is still
+    correctly absent from the scoped snapshot, driving the same ``ClientMissing``
+    grace policy as before.
     """
     download_repo = SqlDownloadRepository(session)
     rows = await download_repo.list_active()
-    statuses = await qbt.get_all_statuses()
+    if not rows:
+        # Empty fast path (issue #216): zero tracked rows means there is nothing
+        # for a client poll to reconcile against -- skip qBittorrent entirely
+        # rather than downloading (and mapping) its whole inventory for zero
+        # use. Safe to return ``rows`` (an empty list) directly: no await has
+        # run since ``list_active()`` above that could have raced in a new row.
+        return rows
+    statuses = await qbt.get_statuses_for_hashes([row.torrent_hash for row in rows])
     now = _utcnow()
 
     transitions = reconcile(rows, statuses, now=now)
@@ -1211,7 +1228,7 @@ async def reconcile_and_list(
             # Refresh live progress ONLY — never rewrite status. ``row.status`` is the
             # snapshot captured at list_active() time; an operator's import retry (or
             # the importer) may have CAS-claimed the row to ``importing`` during the
-            # qbt.get_all_statuses() await above, and writing the stale snapshot status
+            # qbt.get_statuses_for_hashes() await above, and writing the stale snapshot status
             # back would clobber that claim (defeating the import finalize CAS). A
             # progress-only update leaves any concurrent transition intact (G5).
             # The honest ``timeout_at`` (concern 3) is folded into the SAME skip

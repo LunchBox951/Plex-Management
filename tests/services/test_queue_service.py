@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -213,6 +213,76 @@ async def test_live_progress_persisted_without_state_change(
         ).scalar_one()
     assert persisted.progress == 0.5
     assert persisted.seed_ratio == 1.2
+
+
+# --------------------------------------------------------------------------- #
+# Scoped client snapshot (issue #216) — empty fast path + exact-hash scoping.
+# --------------------------------------------------------------------------- #
+
+
+async def test_reconcile_and_list_skips_client_call_when_no_active_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Zero tracked rows means nothing for a client poll to reconcile against --
+    the client is never even queried, let alone with an unfiltered request."""
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+    assert queue == []
+    assert qbt.status_queries == []  # get_statuses_for_hashes never called
+
+
+async def test_reconcile_and_list_requests_exactly_the_tracked_hashes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The scoped snapshot query carries exactly the active rows' hashes --
+    never a hash outside the tracked set, never an unfiltered request."""
+    other_hash = "a" * 40
+    async with sessionmaker_() as session:
+        session.add_all(
+            [
+                Download(torrent_hash=_HASH, status="downloading", tmdb_id=603),
+                Download(torrent_hash=other_hash, status="downloading", tmdb_id=604),
+            ]
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(info_hash=_HASH, name="a", raw_state="downloading"),
+            DownloadStatus(info_hash=other_hash, name="b", raw_state="downloading"),
+        ]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    assert len(qbt.status_queries) == 1
+    assert set(qbt.status_queries[0]) == {_HASH, other_hash}
+
+
+async def test_reconcile_and_list_tracked_hash_missing_from_scoped_response_goes_client_missing(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A hash absent from the SCOPED response (never present in the shared
+    client's inventory in the first place, or genuinely gone) is still honestly
+    recognized as missing -- the scoped fetch changes nothing about that."""
+    async with sessionmaker_() as session:
+        download = Download(torrent_hash=_HASH, status="downloading", tmdb_id=603)
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+
+    # The client's canned response has NO row for the tracked hash at all --
+    # simulating both "torrent genuinely gone" and "adapter correctly returned
+    # only the intersecting hashes it recognized" (issue #216's contract: an
+    # unrecognized/absent hash is silently omitted, never an error).
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        queue = await queue_service.reconcile_and_list(qbt, session)
+
+    item = next(i for i in queue if i.id == download_id)
+    assert item.status == "client_missing"
+    assert qbt.status_queries == [[_HASH]]
 
 
 async def test_reconcile_updates_timeout_to_download_window_without_transition(
@@ -909,7 +979,7 @@ async def test_reconcile_transition_does_not_overwrite_concurrent_status_change(
         download_id = download.id
 
     class _ConcurrentChangeQbt(FakeQbittorrent):
-        async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+        async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
             async with sessionmaker_() as session:
                 row = await session.get(Download, download_id)
                 assert row is not None
@@ -1599,8 +1669,8 @@ def test_claim_token_registry_single_owner_semantics() -> None:
 
 
 class _ClaimDuringSnapshotQbt(FakeQbittorrent):
-    """A client whose ``get_all_statuses`` registers an operator claim on the
-    seeded download — modelling a mark_failed that has REGISTERED but not yet
+    """A client whose ``get_statuses_for_hashes`` registers an operator claim on
+    the seeded download — modelling a mark_failed that has REGISTERED but not yet
     stamped its marker while a reconcile cycle is mid-Phase-A (finding 1)."""
 
     def __init__(self, download_id: int) -> None:
@@ -1608,7 +1678,7 @@ class _ClaimDuringSnapshotQbt(FakeQbittorrent):
         self._download_id = download_id
         self.token: int | None = None
 
-    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
         self.token = _register_operator_claim(
             self._download_id, _OperatorFailFlags(blocklist=False, remove_torrent=False)
         )
