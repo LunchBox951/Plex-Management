@@ -32,6 +32,16 @@ vi.mock('./HealthDot', () => ({
   HealthDot: () => <div>Health</div>,
 }))
 
+// SearchOverlay owns its detailed Radix/keyboard/query behavior in its focused
+// suite; shell tests keep only the authenticated-header integration seam.
+vi.mock('./SearchOverlay', () => ({
+  SearchOverlay: () => (
+    <button type="button" aria-label="Search TMDB to request">
+      Search
+    </button>
+  ),
+}))
+
 function requestRow(id: number, status: string): RequestResponse {
   return {
     id,
@@ -121,6 +131,7 @@ describe('Layout', () => {
       expect(screen.queryByRole('link', { name: label })).not.toBeInTheDocument()
     }
     expect(screen.getByText('Health').closest('a')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Search TMDB to request' })).toBeInTheDocument()
   })
 
   it('counts only request statuses that need attention and keeps stale data visible on error', () => {
