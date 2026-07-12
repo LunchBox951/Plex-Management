@@ -1,4 +1,4 @@
-# ADR-0017: Origin-confined configured service URLs
+# ADR-0018: Origin-confined configured service URLs
 
 - **Status:** Accepted — 2026-07-11
 - **Deciders:** LunchBox951 (owner)
