@@ -415,6 +415,87 @@ def test_safe_guid_is_total_for_lone_surrogates() -> None:
             "FAKETUPLETOK",
             "sending [('Accept', 'json'), ('Authorization', '<redacted>')]",
         ),
+        # P1 (escaped-quote leak): a JSON/repr dump of a quoted credential that
+        # itself contains a backslash-ESCAPED matching quote. The escape-aware
+        # run treats ``\"`` as one escaped char, not the close delimiter, so the
+        # suffix after it is masked instead of leaking past ``<redacted>``.
+        (
+            '{"password": "abc\\"FAKEESCSUFFIX"}',
+            "FAKEESCSUFFIX",
+            '{"password": "<redacted>"}',
+        ),
+        (
+            "{'password': 'abc\\'FAKEESCSUF2'}",
+            "FAKEESCSUF2",
+            "{'password': '<redacted>'}",
+        ),
+        # A backslash-escaped quote as the FIRST character of the value.
+        (
+            'password="\\"FAKEESCFIRST"',
+            "FAKEESCFIRST",
+            'password="<redacted>"',
+        ),
+        # P2 (list-wrapped): a multi-valued header/form mapping renders its value
+        # as a list -- the whole bracketed list is masked, not just the ``[``.
+        (
+            "sending request headers={'Accept': 'json', 'X-Api-Key': ['FAKELISTKEY1']}",
+            "FAKELISTKEY1",
+            "sending request headers={'Accept': 'json', 'X-Api-Key': <redacted>}",
+        ),
+        (
+            'headers={"X-Api-Key": ["FAKELISTKEY2", "FAKELISTKEY3"]}',
+            "FAKELISTKEY3",
+            'headers={"X-Api-Key": <redacted>}',
+        ),
+        # A list value with an embedded ``]`` inside a quoted element must not
+        # let that ``]`` close the list early.
+        (
+            "headers={'api_key': ['FAKE]LISTBRACKET']}",
+            "FAKE]LISTBRACKET",
+            "headers={'api_key': <redacted>}",
+        ),
+        # A tuple whose value is a list (``list(headers.items())`` of a
+        # multi-valued header).
+        (
+            "headers=[('X-Api-Key', ['FAKETUPLELIST'])]",
+            "FAKETUPLELIST",
+            "headers=[('X-Api-Key', <redacted>)]",
+        ),
+        # A NESTED list value: the body must not stop at the first inner ``]``
+        # and leave the later element (secret included) behind ``<redacted>``.
+        (
+            "headers={'X-Api-Key': [['FAKENESTA'], ['FAKENESTB']]}",
+            "FAKENESTB",
+            "headers={'X-Api-Key': <redacted>}",
+        ),
+        # A multi-valued Authorization list: the list pass covers it before the
+        # single-value Authorization pass can mis-grab the ``[``.
+        (
+            "headers={'Authorization': ['Bearer FAKEAUTHLIST']}",
+            "FAKEAUTHLIST",
+            "headers={'Authorization': <redacted>}",
+        ),
+        # P2 (session cookies): the browser ``plexmgr.session`` auth cookie and
+        # qBittorrent's upstream ``SID`` cookie -- keyed on the cookie name, the
+        # value masked up to the ``;`` attribute separator so ``Path``/``HttpOnly``
+        # stay diagnosable.
+        (
+            "Cookie: plexmgr.session=FAKESESSIONTOK",
+            "FAKESESSIONTOK",
+            "Cookie: plexmgr.session=<redacted>",
+        ),
+        (
+            "Set-Cookie: SID=FAKEQBTSID; Path=/; HttpOnly",
+            "FAKEQBTSID",
+            "Set-Cookie: SID=<redacted>; Path=/; HttpOnly",
+        ),
+        # Only the session cookie in a multi-cookie header is masked; benign
+        # cookies (and the surrounding ``;``-separated structure) survive.
+        (
+            "Cookie: theme=dark; plexmgr.session=FAKESESSIONTOK2; lang=en",
+            "FAKESESSIONTOK2",
+            "Cookie: theme=dark; plexmgr.session=<redacted>; lang=en",
+        ),
     ],
 )
 def test_redact_secrets_masks_key_value_shaped_secrets(
@@ -423,6 +504,79 @@ def test_redact_secrets_masks_key_value_shaped_secrets(
     result = redact_secrets(raw)
     assert result == expected
     assert secret not in result
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # The common English word "session" as prose -- followed by ``:`` and
+        # more text, NOT an adjacent ``=`` cookie assignment -- must not trip the
+        # cookie pass (the regression the existing ``access_token`` fixture also
+        # guards, isolated here).
+        "refreshing session: reconnecting in 5s",
+        "session established with upstream",
+        # ``sid`` only inside a longer word (no adjacent ``=``) is not a cookie.
+        "aside note: nothing secret here",
+    ],
+)
+def test_redact_secrets_leaves_session_prose_untouched(raw: str) -> None:
+    assert redact_secrets(raw) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # A never-closed quoted value (log line truncated mid-credential): the
+        # escape-aware run consumes to end, so the whole tail is masked -- fail
+        # closed, no trailing fragment survives.
+        "login password='FAKETRUNCPW",
+        # A never-closed list (truncated mid-list): consumed to end.
+        "headers={'api_key': ['FAKETRUNCLIST",
+        # A raw newline embedded in a quoted value (multi-line log record): the
+        # negated class matches the newline, so the value is masked past it.
+        'password="line one\nFAKEMULTILINE line two"',
+        # A lone surrogate inside a quoted value must not raise and must mask.
+        'password="FAKE\ud800SURROGATE"',
+        # Nested/mixed escaping.
+        'password="a\\"b\\\\c\\"FAKENESTESC"',
+        # A list element carrying an escaped quote.
+        "headers={'api_key': ['x\\'FAKELISTESC']}",
+    ],
+)
+def test_redact_secrets_fail_closed_on_adversarial_quoting(raw: str) -> None:
+    """Adversarial quoting/escaping/truncation the redaction must fail CLOSED on:
+    the obviously-fake credential embedded in each must never survive redaction.
+    The literal ``FAKE...`` markers below are never real secrets (mirrors the
+    fixture convention above), so pytest's assertion echo cannot leak one."""
+    result = redact_secrets(raw)
+    for marker in (
+        "FAKETRUNCPW",
+        "FAKETRUNCLIST",
+        "FAKEMULTILINE",
+        "FAKESURROGATE",
+        "FAKENESTESC",
+        "FAKELISTESC",
+    ):
+        assert marker not in result
+
+
+def test_redact_secrets_is_bounded_time_on_pathological_input() -> None:
+    """The value/list runs are backtracking-free (mutually exclusive branches /
+    possessive quantifiers): a long run of the ambiguity-inviting characters
+    (backslashes, quotes) must stay linear, never ReDoS. A generous ceiling --
+    the point is "not exponential", not a microbenchmark."""
+    import time
+
+    payloads = [
+        'password="' + "\\" * 40000,
+        "api_key=['" + "a'," * 20000,
+        "api_key=['" + "\\" * 40000,
+        'password="' + "a" * 200000,
+    ]
+    for payload in payloads:
+        start = time.perf_counter()
+        redact_secrets(payload)
+        assert time.perf_counter() - start < 1.0
 
 
 def test_redact_secrets_masks_basic_auth_url_password() -> None:
