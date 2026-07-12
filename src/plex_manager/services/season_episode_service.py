@@ -30,7 +30,7 @@ from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from datetime import date
+    from datetime import date, datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -151,7 +151,7 @@ async def reconcile_airing(
     session: AsyncSession,
     metadata: MetadataPort,
     *,
-    today: date,
+    now: datetime,
     max_refresh: int,
 ) -> int:
     """Re-arm a bounded number of ``available``/``completed`` seasons whose aired
@@ -174,6 +174,12 @@ async def reconcile_airing(
     seasons would only ever re-check the same id-lowest slice, permanently
     starving every other season's re-arm.
     """
+    # ``now`` (a full timestamp) is the rotation-cursor stamp -- P2 fix (issue
+    # #178 review round 2): a date-granular stamp collapsed the rotation to
+    # id-order once every candidate carried the same day, starving high-id
+    # seasons until midnight. ``today`` (its date) remains the aired-target
+    # cutoff, matching refresh_target's semantics.
+    today = now.date()
     season_repo = SqlSeasonRequestRepository(session)
     episode_repo = SqlSeasonEpisodeStateRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -209,7 +215,7 @@ async def reconcile_airing(
             # Leave the terminal episode-scoped season entirely alone; just rotate
             # it out of the bounded candidate window so it never starves a
             # whole-season sibling that legitimately needs re-arming.
-            await season_repo.mark_airing_refresh_checked(season.id, today)
+            await season_repo.mark_airing_refresh_checked(season.id, now)
             continue
 
         # (P1 fix, issue #178 review) Capture whether a real per-episode baseline
@@ -238,7 +244,7 @@ async def reconcile_airing(
             # Stamped even on failure: a persistently-erroring show must not
             # monopolise the bounded rotation window forever (it will simply be
             # re-tried once the rotation comes back around to it).
-            await season_repo.mark_airing_refresh_checked(season.id, today)
+            await season_repo.mark_airing_refresh_checked(season.id, now)
             continue
 
         if not had_baseline and target:
@@ -255,13 +261,13 @@ async def reconcile_airing(
             # ``target > imported`` re-arms the season then -- exactly as a normally
             # tracked season does.
             await episode_repo.adopt_baseline(season.id)
-            await season_repo.mark_airing_refresh_checked(season.id, today)
+            await season_repo.mark_airing_refresh_checked(season.id, now)
             continue
 
         states = await episode_repo.list_for_season(season.id)
         imported = {state.episode_number for state in states if state.status == "imported"}
         if target <= imported:
-            await season_repo.mark_airing_refresh_checked(season.id, today)
+            await season_repo.mark_airing_refresh_checked(season.id, now)
             continue  # nothing new aired -- still fully covered
 
         changed = await season_request_service.set_status_if_in(
@@ -274,6 +280,6 @@ async def reconcile_airing(
         if changed:
             await season_repo.schedule_search(season.id, search_attempts=0, next_search_at=None)
             rearmed += 1
-        await season_repo.mark_airing_refresh_checked(season.id, today)
+        await season_repo.mark_airing_refresh_checked(season.id, now)
 
     return rearmed

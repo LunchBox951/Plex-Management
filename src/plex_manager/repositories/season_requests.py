@@ -9,7 +9,7 @@ itself carries no ``tmdb_id`` column.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, case, or_, select, update
@@ -312,7 +312,9 @@ class SqlSeasonRequestRepository:
             records.append(_to_record(row, tmdb_ids[row.media_request_id]))
         return records
 
-    async def mark_airing_refresh_checked(self, season_request_id: int, checked_at: date) -> None:
+    async def mark_airing_refresh_checked(
+        self, season_request_id: int, checked_at: datetime
+    ) -> None:
         row = await self._session.get(SeasonRequest, season_request_id)
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")

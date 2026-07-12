@@ -6,7 +6,7 @@ Mirrors ``test_season_request_service.py``'s ``sessionmaker_`` fixture pattern.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -22,6 +22,7 @@ from tests.web.fakes import FakeTmdb
 SessionMaker = async_sessionmaker[AsyncSession]
 
 _TODAY = date(2026, 7, 11)
+_NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
 
 
 async def _make_show(sm: SessionMaker, tmdb_id: int = 800) -> int:
@@ -326,7 +327,7 @@ async def test_reconcile_airing_rearms_a_season_whose_target_grew(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=5
+            session, tmdb, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -362,7 +363,7 @@ async def test_reconcile_airing_leaves_season_alone_when_target_unchanged(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=5
+            session, tmdb, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -383,7 +384,7 @@ async def test_reconcile_airing_skips_a_season_on_tmdb_error_without_aborting(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=5
+            session, tmdb, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -428,7 +429,7 @@ async def test_reconcile_airing_skips_episode_scoped_request(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=5
+            session, tmdb, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -469,7 +470,7 @@ async def test_reconcile_airing_adopts_baseline_for_done_season_with_no_rows(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=5
+            session, tmdb, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -507,7 +508,7 @@ async def test_reconcile_airing_baseline_adoption_still_rearms_on_later_growth(
     )
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=5
+            session, tmdb, now=_NOW, max_refresh=5
         )
         await session.commit()
     assert rearmed == 0
@@ -524,7 +525,7 @@ async def test_reconcile_airing_baseline_adoption_still_rearms_on_later_growth(
     )
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb_grown, today=_TODAY, max_refresh=5
+            session, tmdb_grown, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -572,7 +573,7 @@ async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=3
+            session, tmdb, now=_NOW, max_refresh=3
         )
         await session.commit()
     assert rearmed == 0
@@ -581,7 +582,7 @@ async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, today=_TODAY, max_refresh=3
+            session, tmdb, now=_NOW, max_refresh=3
         )
         await session.commit()
     assert rearmed == 0
@@ -591,3 +592,56 @@ async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
     # The SAME three shows must not have been picked again -- proves the window
     # rotated instead of collapsing back to the id-lowest slice.
     assert first_cycle.isdisjoint(second_cycle)
+
+
+async def test_reconcile_airing_rotation_keeps_advancing_within_the_same_day(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2 fix (issue #178 review round 2): the rotation cursor is a TIMESTAMP,
+    not a date. With a date-granular cursor, once every candidate carried today's
+    stamp the ordering degraded to ``id`` and every remaining same-day cycle
+    re-selected the SAME lowest-id slice, starving the higher-id seasons until
+    midnight.
+
+    Four shows, ``max_refresh=2``, four cycles at successive times on ONE day:
+    cycle 1 -> {A, B}, cycle 2 -> {C, D}, cycle 3 -> {A, B} (oldest stamps),
+    cycle 4 MUST -> {C, D}. A date cursor would give cycle 4 = {A, B} again
+    (same-day tie broken by id).
+    """
+    tmdb_ids = list(range(920, 924))  # 4 shows: A, B, C, D
+
+    for tmdb_id in tmdb_ids:
+        show_id = await _make_show(sessionmaker_, tmdb_id=tmdb_id)
+        season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+        async with sessionmaker_() as session:
+            download = Download(torrent_hash=f"same-day-hash-{tmdb_id}", status="imported")
+            session.add(download)
+            await session.commit()
+            episode_repo = SqlSeasonEpisodeStateRepository(session)
+            await episode_repo.upsert_target(season_request_id, {1: date(2026, 1, 1)})
+            await episode_repo.mark_imported(season_request_id, [1], download_id=download.id)
+            await session.commit()
+
+    episodes = {
+        (tmdb_id, 1): [EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1))]
+        for tmdb_id in tmdb_ids
+    }
+
+    cycles: list[set[tuple[int, int]]] = []
+    for minutes in (0, 5, 10, 15):  # four cycles, all on _NOW's calendar day
+        tmdb = FakeTmdb(season_episodes=dict(episodes))
+        async with sessionmaker_() as session:
+            rearmed = await season_episode_service.reconcile_airing(
+                session, tmdb, now=_NOW + timedelta(minutes=minutes), max_refresh=2
+            )
+            await session.commit()
+        assert rearmed == 0
+        cycles.append(set(tmdb.season_episodes_calls))
+
+    assert all(len(cycle) == 2 for cycle in cycles)
+    assert cycles[0].isdisjoint(cycles[1])  # {A,B} then {C,D}
+    assert cycles[2] == cycles[0]  # oldest stamps come back around first
+    # THE pin: the 4th same-day cycle keeps rotating to the OTHER half. A
+    # date-granular cursor would have collapsed to id-order here and re-picked
+    # cycles[0]'s pair a second consecutive time.
+    assert cycles[3] == cycles[1]

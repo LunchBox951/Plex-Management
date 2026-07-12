@@ -657,11 +657,15 @@ class SeasonRequestRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def mark_airing_refresh_checked(self, season_request_id: int, checked_at: date) -> None:
+    async def mark_airing_refresh_checked(
+        self, season_request_id: int, checked_at: datetime
+    ) -> None:
         """Stamp the airing-refresh rotation cursor (see :meth:`list_for_airing_
         refresh`) after ``reconcile_airing`` has actually looked at this season this
         cycle -- rearmed or not, even after a TMDB error -- so the row moves to the
-        back of the rotation instead of being re-selected every cycle.
+        back of the rotation instead of being re-selected every cycle. A full
+        timestamp (not a date) so same-day cycles keep rotating (P2, issue #178
+        review round 2).
         """
         raise NotImplementedError
 
@@ -801,6 +805,11 @@ class SeasonEpisodeStateRepository(Protocol):
         existing ``grabbed``/``imported`` row back to ``pending``. Lets a newly
         aired episode join the target (airing growth, ADR-0020) without
         disturbing progress already made on episodes already tracked.
+
+        Also RETIRES (deletes) ``pending`` rows absent from ``aired`` -- TMDB
+        delaying/removing a previously-aired episode must not leave a stale
+        pending row that keeps the season searching forever. ``grabbed``/
+        ``imported`` rows are never retired.
         """
         raise NotImplementedError
 

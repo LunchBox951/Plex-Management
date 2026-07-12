@@ -117,6 +117,53 @@ async def test_upsert_target_adds_newly_aired_episode_without_disturbing_others(
     assert by_episode[2].status == "pending"
 
 
+async def test_upsert_target_retires_pending_rows_tmdb_no_longer_reports_aired(
+    session: AsyncSession,
+) -> None:
+    """P2 fix (issue #178 review round 2): TMDB delaying/removing a previously-
+    aired episode must retire its stale PENDING row -- otherwise it counts toward
+    the completion target forever and the season searches for an episode that is
+    not currently aired."""
+    season_request_id = await _make_season(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    await repo.upsert_target(
+        season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+    )
+    # TMDB retracts episode 3 (delayed to a future/unknown air date).
+    await repo.upsert_target(season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8)})
+
+    rows = await repo.list_for_season(season_request_id)
+    assert {r.episode_number for r in rows} == {1, 2}
+
+
+async def test_upsert_target_retraction_never_touches_grabbed_or_imported_rows(
+    session: AsyncSession,
+) -> None:
+    """Retraction only ever deletes never-progressed ``pending`` rows: a
+    ``grabbed``/``imported`` row records real work/content (including a round-1
+    adopted baseline, which is ``imported``) and is kept even when TMDB drops the
+    episode from the aired set."""
+    season_request_id = await _make_season(session)
+    download_id = await _make_download(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    await repo.upsert_target(
+        season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+    )
+    await repo.mark_imported(season_request_id, [1], download_id=download_id)
+    await repo.mark_grabbed(season_request_id, [2], download_id=download_id)
+
+    # TMDB now reports NONE of them as aired -- only the pending row 3 may go.
+    await repo.upsert_target(season_request_id, {})
+
+    rows = await repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r for r in rows}
+    assert set(by_episode) == {1, 2}
+    assert by_episode[1].status == "imported"
+    assert by_episode[2].status == "grabbed"
+
+
 async def test_mark_grabbed_sets_status_and_download_id(session: AsyncSession) -> None:
     season_request_id = await _make_season(session)
     download_id = await _make_download(session)

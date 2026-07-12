@@ -102,6 +102,19 @@ class SqlSeasonEpisodeStateRepository:
                 # A concurrent upsert_target for the same episode won the race;
                 # the winner's row already carries an (equal-or-fresher) target.
                 continue
+        # Retire PENDING rows no longer in the aired set (P2, issue #178 review
+        # round 2): TMDB can delay an episode to a future/unknown air date or
+        # remove it outright after an earlier refresh seeded it. Left in place,
+        # the stale pending row keeps counting toward the completion target and
+        # the season searches forever for an episode that is not currently
+        # aired. Only never-progressed ``pending`` rows are retired -- a
+        # ``grabbed``/``imported`` row records REAL work/content (including a
+        # round-1 adopted baseline, which is ``imported``) and is kept even if
+        # TMDB retracts the episode: completeness counts imported rows, so a
+        # kept row can never wedge the season the way a stale pending one does.
+        for episode_number, row in existing.items():
+            if episode_number not in aired and row.status == EpisodeState.pending:
+                await self._session.delete(row)
         await self._session.flush()
 
     async def mark_grabbed(

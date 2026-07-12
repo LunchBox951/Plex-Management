@@ -872,7 +872,7 @@ async def run_grab_cycle(
     # skipped, never aborting the pass); a no-op when TMDB is unconfigured.
     if metadata is not None:
         await season_episode_service.reconcile_airing(
-            session, metadata, today=now.date(), max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
+            session, metadata, now=now, max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
         )
         await session.commit()
 
