@@ -585,15 +585,33 @@ async def _attempt_episode_fallback(
             target
             and await download_repo.find_active_for_request(scope.request_id, season=season) is None
         ):
-            await season_request_service.mark_completed(
-                session, media_request_id=scope.request_id, season_number=season
+            # CAS-guarded (issue #229): a concurrent cancel/correction landing
+            # between ``_collect_due_scopes``' snapshot and this branch must
+            # never be resurrected as ``completed`` -- ``allowed_from`` is
+            # exactly the set of statuses this scope was legitimately due from.
+            completed = await season_request_service.mark_completed_if_in(
+                session,
+                media_request_id=scope.request_id,
+                season_number=season,
+                allowed_from=DUE_SEARCH_STATUSES,
             )
             await session.commit()
-            cooldowns.pop(scope_key, None)
+            if completed:
+                cooldowns.pop(scope_key, None)
+                _logger.info(
+                    "auto-grab: episode-fallback found the aired target fully imported "
+                    "(target shrank to the imported set); completing the season instead "
+                    "of parking it",
+                    extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
+                )
+                return _EpisodeFallbackOutcome(settled=True)
+            # Lost the CAS: a concurrent cancel/correction moved the season out
+            # of a due status. Don't resurrect it as completed; leave it as the
+            # other actor left it -- settled=True so the caller does not also
+            # park it (there is nothing due left to park).
             _logger.info(
-                "auto-grab: episode-fallback found the aired target fully imported "
-                "(target shrank to the imported set); completing the season instead "
-                "of parking it",
+                "auto-grab: episode-fallback completion skipped -- season no longer in a "
+                "due status (concurrent cancel/correction won); leaving as-is",
                 extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
             )
             return _EpisodeFallbackOutcome(settled=True)
@@ -926,7 +944,7 @@ async def run_grab_cycle(
     # skipped, never aborting the pass); a no-op when TMDB is unconfigured.
     if metadata is not None:
         await season_episode_service.reconcile_airing(
-            session, metadata, now=now, max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
+            session, metadata, parser=parser, now=now, max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
         )
         await session.commit()
 
