@@ -14,6 +14,7 @@ from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "SqlDownloadRepository",
     "SqlLogEventRepository",
     "SqlRequestRepository",
+    "SqlSeasonEpisodeStateRepository",
     "SqlSeasonRequestRepository",
 ]

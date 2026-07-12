@@ -15,7 +15,7 @@ and the ``LogEvent`` repository backing the durable, LLM-diagnosable log store.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -34,6 +34,8 @@ __all__ = [
     "QueueRecord",
     "RequestRecord",
     "RequestRepository",
+    "SeasonEpisodeStateRecord",
+    "SeasonEpisodeStateRepository",
     "SeasonRequestRecord",
     "SeasonRequestRepository",
 ]
@@ -199,6 +201,26 @@ class SeasonRequestRecord(BaseModel):
     # ``evicted`` -- the season-level eviction guard's own re-grab. See
     # ``SeasonRequest.eviction_regrab``'s docstring.
     eviction_regrab: bool = False
+
+
+class SeasonEpisodeStateRecord(BaseModel):
+    """One aired episode's collection state for a whole-season fallback (ADR-0018).
+
+    One row per aired episode of a :class:`SeasonRequestRecord`, tracking
+    ``pending -> grabbed -> imported`` progress for the episode-level fallback
+    (issue #178). ``air_date`` is ``None`` only for a row seeded before this
+    breadcrumb existed (pre-fallback back-compat), never a live "unknown" state --
+    a genuinely-unaired episode never gets a row in the first place.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    season_request_id: int
+    episode_number: int
+    status: str
+    air_date: date | None = None
+    grabbed_download_id: int | None = None
 
 
 class BlocklistRecord(BaseModel):
@@ -731,6 +753,68 @@ class SeasonRequestRepository(Protocol):
         self, season_request_id: int, *, quality_id: int, profile_index: int | None
     ) -> None:
         """Store the imported quality breadcrumb for this season."""
+        raise NotImplementedError
+
+
+@runtime_checkable
+class SeasonEpisodeStateRepository(Protocol):
+    """Persistence for per-episode fallback-collection state (ADR-0018, #178).
+
+    Bridges the aired-episode target set (from ``MetadataPort.season_episodes``)
+    to what has actually been grabbed/imported, so the episode-level fallback can
+    compute a season's "missing" set without re-deriving it from free-text
+    history.
+    """
+
+    async def list_for_season(self, season_request_id: int) -> list[SeasonEpisodeStateRecord]:
+        """List every tracked episode row for ``season_request_id``."""
+        raise NotImplementedError
+
+    async def upsert_target(
+        self, season_request_id: int, aired: Mapping[int, date | None]
+    ) -> None:
+        """Idempotently seed/refresh the aired-episode target.
+
+        For each episode in ``aired``: inserts a ``pending`` row if absent, and
+        refreshes ``air_date`` on an existing row -- but NEVER downgrades an
+        existing ``grabbed``/``imported`` row back to ``pending``. Lets a newly
+        aired episode join the target (airing growth, ADR-0018) without
+        disturbing progress already made on episodes already tracked.
+        """
+        raise NotImplementedError
+
+    async def mark_grabbed(
+        self, season_request_id: int, episode_numbers: Sequence[int], download_id: int
+    ) -> None:
+        """Mark ``episode_numbers`` ``grabbed`` (+ their ``grabbed_download_id``).
+
+        Creates a row as ``grabbed`` for an episode with no existing target row
+        (defensive; observability/crash-visibility only -- NOT read by
+        ``compute_missing``, which treats the live active download as
+        authoritative).
+        """
+        raise NotImplementedError
+
+    async def mark_imported(
+        self, season_request_id: int, episode_numbers: Sequence[int], download_id: int
+    ) -> None:
+        """Upsert ``episode_numbers`` to ``imported`` (+ ``grabbed_download_id``).
+
+        Creates rows for episodes not previously in the target (e.g. a season
+        pack placed episodes beyond the seeded aired set) -- they still count as
+        imported.
+        """
+        raise NotImplementedError
+
+    async def counts_for_seasons(
+        self, season_request_ids: Sequence[int]
+    ) -> dict[int, tuple[int, int]]:
+        """Batch ``{season_request_id: (imported_count, target_count)}``.
+
+        One grouped query for however many seasons are asked about -- the
+        requests-list "N/M episodes" badge's batched read, avoiding an N+1 over
+        the season rows on a page.
+        """
         raise NotImplementedError
 
 
