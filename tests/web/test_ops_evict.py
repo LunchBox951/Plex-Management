@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal, cast
 
 import httpx
 import pytest
@@ -302,11 +303,19 @@ class _RaisesForTvWatchState(FakeLibrary):
     succeed normally (so the movies root sweep is unaffected)."""
 
     async def watch_state(
-        self, tmdb_id: int, media_type: str, *, season: int | None = None
+        self,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        season: int | None = None,
+        library_path: str | None = None,
     ) -> WatchState:
         if media_type == "tv":
             raise PlexLibraryError("simulated Plex outage resolving TV watch state")
-        return await super().watch_state(tmdb_id, media_type, season=season)  # type: ignore[arg-type]
+        movie_type = cast(Literal["movie", "tv"], media_type)
+        return await super().watch_state(
+            tmdb_id, movie_type, season=season, library_path=library_path
+        )
 
 
 async def test_evict_one_roots_failure_does_not_hide_another_roots_evictions(

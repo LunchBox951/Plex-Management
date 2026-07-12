@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.domain.eviction import (
     EvictionCandidate,
@@ -296,7 +297,7 @@ async def _movie_candidates(
     ]
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row in rows:
-        watch = await library.watch_state(row.tmdb_id, "movie")
+        watch = await library.watch_state(row.tmdb_id, "movie", library_path=row.library_path)
         in_flight = (await download_repo.find_active_for_request(row.id, season=None)) is not None
         size_bytes = (
             await asyncio.to_thread(_size_bytes, row.library_path) if row.library_path else None
@@ -359,7 +360,9 @@ async def _season_candidates(
                 continue
             parent = fetched
             parents[row.media_request_id] = parent
-        watch = await library.watch_state(row.tmdb_id, "tv", season=row.season_number)
+        watch = await library.watch_state(
+            row.tmdb_id, "tv", season=row.season_number, library_path=row.library_path
+        )
         in_flight = (
             await download_repo.find_active_for_request(
                 row.media_request_id, season=row.season_number
@@ -1219,6 +1222,7 @@ async def _evict_one(
     library: LibraryPort,
     candidate: EvictionCandidate,
     pending: _Pending,
+    grace_cutoff: datetime,
 ) -> EvictionOutcome | None:
     """Claim (status CAS) + delete + log ONE selected candidate, in that order
     (#67): the atomic claim runs BEFORE the delete, so nothing is deleted until
@@ -1277,6 +1281,19 @@ async def _evict_one(
        purge-refused restore path) instead of deleting, so BOTH rows are decided
        fresh by later sweeps rather than one twin's delete silently orphaning
        the other.
+    8. A rewatch during the sweep NEVER gets deleted (#209): candidate assembly
+       (:func:`_movie_candidates`/:func:`_season_candidates`) reads Plex watch
+       state once, up front, for the WHOLE candidate pool -- a long, sequential
+       scan for a large library. Immediately BEFORE the claim, watch state is
+       RE-READ for just this one candidate and re-checked against the watched +
+       grace-cutoff predicate; anything now unwatched, too-recently-viewed, no
+       longer path-correlated (zero/ambiguous, see issue #207), or erroring on
+       the re-read is skipped with an honest log rather than claimed. This
+       narrows the rewatch race to the short window between the re-read and the
+       claim/delete immediately below -- it does not (and cannot) eliminate it.
+       Both this re-read and the assembly read above are issue #207
+       path-correlated: a duplicate elsewhere in the library can never stand in
+       for THIS candidate's own file.
 
     Full lifecycle state table, from the moment the claim COMMITS (row
     ``evicted``, breadcrumb set, file on disk); every permutation of
@@ -1329,6 +1346,9 @@ async def _evict_one(
     another live (available/in-flight) row --  breadcrumb kept; NOTHING deleted --
     the shared-breadcrumb twins shape (#155)   invariant #7; the sibling is decided
                                               fresh by its own later sweep pass
+    rewatch (or watch-state error) lands       skipped BEFORE the claim (invariant
+    between candidate assembly and the claim   #8, #209); row stays ``available``,
+    (#209)                                     file untouched, re-decided next sweep
     ========================================  =======================================
     """
     library_path = candidate.library_path
@@ -1355,6 +1375,46 @@ async def _evict_one(
         _logger.info(
             "skipping eviction of %r%s: now pinned/keep_forever, already evicted, "
             "or no longer an eviction candidate (re-checked immediately before the claim)",
+            candidate.title,
+            season_note,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return None
+
+    # Rewatch-during-sweep re-read (#209, invariant #8): _still_evictable above
+    # only re-checks DB status/pin/in_flight -- it never re-consults Plex, so a
+    # rewatch that lands DURING the sequential sweep (candidate assembly ran a
+    # Plex call per candidate, potentially long ago for a late candidate) would
+    # otherwise still be deleted on its now-stale "watched" verdict. Re-read
+    # path-correlated (#207) watch state for THIS candidate only, immediately
+    # before the claim, and re-apply the same watched + grace-cutoff predicate
+    # domain._is_eligible uses (inlined here since this function already holds
+    # ``grace_cutoff`; pin/status/in_flight are NOT re-checked again -- that is
+    # _still_evictable's and the claim CAS's job, not this one's).
+    try:
+        if isinstance(pending, _SeasonPending):
+            fresh = await library.watch_state(
+                pending.tmdb_id, "tv", season=pending.season_number, library_path=library_path
+            )
+        else:
+            fresh = await library.watch_state(pending.tmdb_id, "movie", library_path=library_path)
+    except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
+        _logger.warning(
+            "skipping eviction of %r%s: could not re-read Plex watch state before the "
+            "claim (%s); failing closed rather than deleting on unknown state",
+            candidate.title,
+            season_note,
+            type(exc).__name__,
+            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return None
+    if not (
+        fresh.watched and fresh.last_viewed_at is not None and fresh.last_viewed_at < grace_cutoff
+    ):
+        _logger.info(
+            "skipping eviction of %r%s: Plex watch state changed since candidate assembly "
+            "(now unwatched, recently rewatched, or no longer path-correlated); re-checked "
+            "immediately before the claim",
             candidate.title,
             season_note,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
@@ -1889,6 +1949,7 @@ async def _run_sweep(
                 library=library,
                 candidate=candidate,
                 pending=pending_by_id[id(candidate)],
+                grace_cutoff=grace_cutoff,
             )
         except Exception:
             # Mirrors import_service.run_import_cycle / run_availability_cycle:

@@ -272,6 +272,7 @@ class LibraryPort(Protocol):
         media_type: Literal["movie", "tv"],
         *,
         season: int | None = None,
+        library_path: str | None = None,
     ) -> WatchState:
         """Return whether ``tmdb_id`` (optionally one TV season) has been watched.
 
@@ -287,5 +288,18 @@ class LibraryPort(Protocol):
         ``watched=False, last_viewed_at=None`` honestly rather than raising --
         it can never be an eviction candidate anyway, so there is nothing to
         recover from by treating it as an error.
+
+        ``library_path`` (issue #207) is the ADR-0012 deletion-target breadcrumb
+        stored on the request/season row. When PROVIDED, the implementation MUST
+        resolve watch state ONLY from the Plex item whose reported media file path
+        corresponds to ``library_path``, and MUST FAIL CLOSED --
+        ``WatchState(watched=False, last_viewed_at=None)`` -- when the target
+        cannot be UNIQUELY correlated (absent, or ambiguous across duplicate
+        items sharing the same ``tmdb_id``, e.g. the same title imported into two
+        sections). It MUST NEVER union "watched anywhere" across duplicate items:
+        a watched duplicate must never authorize evicting an unwatched one.
+        ``library_path=None`` keeps the legacy UNCORRELATED first-match read --
+        only for callers with no known target, e.g. a row predating the
+        breadcrumb.
         """
         raise NotImplementedError
