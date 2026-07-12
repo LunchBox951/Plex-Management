@@ -175,7 +175,12 @@ class _UnreachablePlexLibrary(FakeLibrary):
     is exactly what the real adapter raises in both cases."""
 
     async def watch_state(
-        self, tmdb_id: int, media_type: str, *, season: int | None = None
+        self,
+        tmdb_id: int,
+        media_type: str,
+        *,
+        season: int | None = None,
+        library_path: str | None = None,
     ) -> WatchState:
         raise PlexLibraryError("plex request failed")
 
