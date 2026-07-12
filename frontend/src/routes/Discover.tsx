@@ -94,7 +94,7 @@ export function Discover() {
   const results = search.data?.results ?? []
 
   return (
-    <div>
+    <div className="w-full px-5 py-8 sm:px-8 lg:px-11">
       <div className="mb-8">
         <h1 className="font-display text-3xl font-extrabold">Discover</h1>
         <p className="mt-1 text-muted">Search TMDB to request a movie or show.</p>
