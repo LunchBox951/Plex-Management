@@ -133,6 +133,7 @@ def test_main_normalizes_log_level_before_uvicorn_run(
     assert captured["app"] == "plex_manager.web.app:app"
     assert isinstance(captured["log_level"], int)
     assert captured["log_level"] == expected_uvicorn_level
+    assert captured["timeout_graceful_shutdown"] == 5
 
 
 @pytest.mark.parametrize(

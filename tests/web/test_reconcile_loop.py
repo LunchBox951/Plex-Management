@@ -318,3 +318,131 @@ async def test_reconcile_outage_tick_still_heals_db_only_strand(
     assert download.failed_reason == "marked failed by operator"
     assert request is not None
     assert request.status == RequestStatus.searching  # re-armed on the outage tick
+
+
+async def test_reconcile_idle_cycle_does_not_publish_realtime_event(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entirely idle background tick must not invalidate frontend caches."""
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
+    )
+    qbt = FakeQbittorrent()
+    library = FakeLibrary()
+    phases: list[str] = []
+    published: list[tuple[tuple[str, ...], str]] = []
+
+    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+        return qbt
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    async def _root(_session: AsyncSession) -> str | None:
+        return None
+
+    async def _reconcile(
+        _qbt: DownloadClientPort,
+        _session: AsyncSession,
+        *,
+        changes: app_module.queue_service.ReconcileChanges | None = None,
+    ) -> list[object]:
+        assert changes is not None
+        phases.append("reconcile")
+        return []
+
+    async def _import(**_kwargs: object) -> int:
+        phases.append("import")
+        return 0
+
+    async def _availability(**_kwargs: object) -> int:
+        phases.append("availability")
+        return 0
+
+    def _publish(_app: FastAPI, topics: tuple[str, ...], *, reason: str) -> None:
+        published.append((topics, reason))
+
+    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    monkeypatch.setattr(app_module, "get_movies_root_optional", _root)
+    monkeypatch.setattr(app_module, "get_tv_root_optional", _root)
+    monkeypatch.setattr(app_module, "get_anime_movie_root_optional", _root)
+    monkeypatch.setattr(app_module, "get_anime_tv_root_optional", _root)
+    monkeypatch.setattr(app_module.queue_service, "reconcile_and_list", _reconcile)
+    monkeypatch.setattr(app_module.import_service, "run_import_cycle", _import)
+    monkeypatch.setattr(app_module.import_service, "run_availability_cycle", _availability)
+    monkeypatch.setattr(app_module, "publish_realtime", _publish)
+
+    try:
+        await app_module._reconcile_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert phases == ["reconcile", "import", "availability"]
+    assert published == []
+
+
+async def test_reconcile_coalesces_all_reported_changes_into_one_realtime_event(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile/import/availability changes share one ordered invalidation."""
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
+    )
+    qbt = FakeQbittorrent()
+    library = FakeLibrary()
+    published: list[tuple[tuple[str, ...], str]] = []
+
+    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+        return qbt
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    async def _root(_session: AsyncSession) -> str | None:
+        return None
+
+    async def _reconcile(
+        _qbt: DownloadClientPort,
+        _session: AsyncSession,
+        *,
+        changes: app_module.queue_service.ReconcileChanges | None = None,
+    ) -> list[object]:
+        assert changes is not None
+        changes.queue = True
+        changes.requests = True
+        changes.blocklist = True
+        return []
+
+    async def _import(**_kwargs: object) -> int:
+        return 2
+
+    async def _availability(**_kwargs: object) -> int:
+        return 1
+
+    def _publish(_app: FastAPI, topics: tuple[str, ...], *, reason: str) -> None:
+        published.append((topics, reason))
+
+    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    monkeypatch.setattr(app_module, "get_movies_root_optional", _root)
+    monkeypatch.setattr(app_module, "get_tv_root_optional", _root)
+    monkeypatch.setattr(app_module, "get_anime_movie_root_optional", _root)
+    monkeypatch.setattr(app_module, "get_anime_tv_root_optional", _root)
+    monkeypatch.setattr(app_module.queue_service, "reconcile_and_list", _reconcile)
+    monkeypatch.setattr(app_module.import_service, "run_import_cycle", _import)
+    monkeypatch.setattr(app_module.import_service, "run_availability_cycle", _availability)
+    monkeypatch.setattr(app_module, "publish_realtime", _publish)
+
+    try:
+        await app_module._reconcile_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert published == [(("queue", "requests", "blocklist", "discover"), "reconcile_cycle")]

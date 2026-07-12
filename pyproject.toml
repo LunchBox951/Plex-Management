@@ -11,7 +11,7 @@ license = "MIT"
 authors = [{ name = "LunchBox951", email = "95397613+LunchBox951@users.noreply.github.com " }]
 dynamic = ["version"]
 dependencies = [
-    "fastapi>=0.111",
+    "fastapi>=0.138.2",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",

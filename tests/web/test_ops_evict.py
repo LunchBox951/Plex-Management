@@ -20,6 +20,7 @@ from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRe
 from plex_manager.ports.library import WatchState
 from plex_manager.services import eviction_service
 from plex_manager.web.deps import SettingsStore
+from plex_manager.web.events import get_event_hub
 from tests.web.fakes import FakeLibrary, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -109,6 +110,33 @@ async def test_evict_frees_space_and_flips_status_to_evicted(
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status is RequestStatus.evicted
+
+
+async def test_evict_publishes_realtime_event_for_other_connected_clients(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+    subscription = get_event_hub(app).subscribe()
+    _ = await subscription.get()
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+
+    assert response.status_code == 200
+    event = await subscription.get()
+    assert event.topics == ("requests", "discover", "ops:disk", "ops:health")
+    assert event.reason == "eviction"
+    subscription.close()
 
 
 async def test_evict_still_runs_when_the_automatic_switch_is_disabled(

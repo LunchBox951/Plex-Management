@@ -72,6 +72,7 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
     require_admin,
 )
+from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
     AutograbStatusItem,
     DiskGaugeItem,
@@ -600,6 +601,7 @@ async def disk_endpoint(
 
 @router.post("/evict")
 async def evict_endpoint(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort, Depends(get_library)],
     cache: Annotated[TtlCache[DiskRootItem], Depends(_get_disk_preview_cache)],
@@ -727,6 +729,12 @@ async def evict_endpoint(
     # Always reached -- even a per-root failure above never skips this, so a
     # partial sweep's freed space is still visible on the very next poll.
     cache.clear()
+    if outcomes or errors:
+        publish_realtime(
+            request.app,
+            ("requests", "discover", "ops:disk", "ops:health"),
+            reason="eviction",
+        )
 
     return EvictResponse(
         evicted=[

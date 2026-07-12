@@ -6,6 +6,7 @@ import {
   isApiKeyAuthEnabled,
   setApiKey,
 } from '../lib/apiKey'
+import { beginApiKeyRotation } from '../lib/apiKeyRotation'
 import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from './client'
 
 const h = vi.hoisted(() => ({
@@ -152,6 +153,56 @@ describe('API auth middleware', () => {
     expect(isApiKeyAuthEnabled()).toBe(true)
     window.removeEventListener(AUTH_INVALID_EVENT, invalid)
     window.removeEventListener(AUTH_EXPIRED_EVENT, expired)
+  })
+
+  it('defers an old-key 401 until the winning rotation stores its replacement', async () => {
+    setApiKey('old-key')
+    enableApiKeyAuth()
+    const finishRotation = beginApiKeyRotation()
+    const request = new Request('http://localhost/api/v1/settings')
+    middleware().onRequest({ request })
+    const invalid = vi.fn()
+    window.addEventListener(AUTH_INVALID_EVENT, invalid)
+
+    middleware().onResponse({ request, response: new Response(null, { status: 401 }) })
+
+    expect(invalid).not.toHaveBeenCalled()
+    expect(getApiKey()).toBe('old-key')
+    expect(isApiKeyAuthEnabled()).toBe(true)
+
+    setApiKey('new-key')
+    finishRotation()
+    await Promise.resolve()
+
+    expect(invalid).not.toHaveBeenCalled()
+    expect(getApiKey()).toBe('new-key')
+    expect(isApiKeyAuthEnabled()).toBe(true)
+    window.removeEventListener(AUTH_INVALID_EVENT, invalid)
+  })
+
+  it("processes the rotate request's own 401 after its failed rotation releases the barrier", async () => {
+    setApiKey('old-key')
+    enableApiKeyAuth()
+    const finishRotation = beginApiKeyRotation()
+    const request = new Request('http://localhost/api/v1/settings/app-key/rotate', {
+      method: 'POST',
+    })
+    middleware().onRequest({ request })
+    const invalid = vi.fn()
+    window.addEventListener(AUTH_INVALID_EVENT, invalid)
+
+    // onResponse must return without awaiting its own rotation barrier; otherwise
+    // the mutation's finally block can never run to release that same barrier.
+    middleware().onResponse({ request, response: new Response(null, { status: 401 }) })
+    expect(invalid).not.toHaveBeenCalled()
+    expect(getApiKey()).toBe('old-key')
+
+    finishRotation()
+    await vi.waitFor(() => expect(invalid).toHaveBeenCalledTimes(1))
+
+    expect(getApiKey()).toBeNull()
+    expect(isApiKeyAuthEnabled()).toBe(false)
+    window.removeEventListener(AUTH_INVALID_EVENT, invalid)
   })
 
   it('adds CSRF from the readable cookie on unsafe session requests', () => {

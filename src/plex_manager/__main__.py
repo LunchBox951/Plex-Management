@@ -78,6 +78,10 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         log_level=_uvicorn_log_level(settings.log_level),
+        # SSE responses are intentionally unbounded. Bound graceful shutdown
+        # below Docker's default 10-second stop grace so stale/open streams can
+        # never pin a container rollout until SIGKILL.
+        timeout_graceful_shutdown=5,
     )
 
 
