@@ -20,12 +20,14 @@ import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
+from datetime import date
 from typing import Final, cast
 
 import httpx
 
 from plex_manager.logsafe import safe_int
 from plex_manager.ports.metadata import (
+    EpisodeInfo,
     MediaKind,
     MediaPage,
     MediaSearchResult,
@@ -131,6 +133,22 @@ def _year_from_date(fields: Mapping[str, object], key: str) -> int | None:
     return int(head) if head.isdigit() else None
 
 
+def _date_from(fields: Mapping[str, object], key: str) -> date | None:
+    """Parse a ``YYYY-MM-DD`` TMDB date string; ``None``/``""``/malformed -> None.
+
+    TMDB returns ``""`` (not a missing key) for an unaired episode's air date —
+    guarded here rather than raising, since "not yet aired" is a legitimate,
+    expected value, not a parse error.
+    """
+    date_str = _get_str(fields, key)
+    if date_str is None:
+        return None
+    try:
+        return date.fromisoformat(date_str)
+    except ValueError:
+        return None
+
+
 def _poster_url(fields: Mapping[str, object]) -> str | None:
     poster_path = _get_str(fields, "poster_path")
     return f"{_IMAGE_BASE_URL}{poster_path}" if poster_path else None
@@ -178,6 +196,11 @@ class TmdbMetadata:
         # per call (see below), so the cache entry itself can never be mutated.
         self._search_cache: _TtlCache[tuple[MediaSearchResult, ...]] = _TtlCache(cache_ttl_seconds)
         self._page_cache: _TtlCache[MediaPage] = _TtlCache(cache_ttl_seconds)
+        # Same issue-#106 immutable-tuple-cached/fresh-list-returned pattern as
+        # ``_search_cache`` above.
+        self._season_episodes_cache: _TtlCache[tuple[EpisodeInfo, ...]] = _TtlCache(
+            cache_ttl_seconds
+        )
 
     async def _get(
         self, path: str, params: Mapping[str, str], *, not_found_returns_none: bool = True
@@ -396,3 +419,36 @@ class TmdbMetadata:
         )
         self._page_cache.set(cache_key, media_page)
         return media_page
+
+    async def season_episodes(self, tmdb_id: int, season_number: int) -> list[EpisodeInfo]:
+        """Episodes of one TV season via ``/tv/{id}/season/{n}``.
+
+        A 404 here means the season/route is wrong (bad tmdb id, season that
+        doesn't exist for this show, or an API mismatch) -- NOT "no episodes" --
+        so it is surfaced as ``TmdbApiError`` (issue #89 pattern), never silently
+        mapped to an empty list. Callers (ADR-0018) treat any raise as "target
+        unknown this cycle" and retry later.
+        """
+        cache_key = f"{tmdb_id}:{season_number}"
+        cached = self._season_episodes_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        payload = await self._get(
+            f"/tv/{tmdb_id}/season/{season_number}", {}, not_found_returns_none=False
+        )
+        fields: Mapping[str, object] = payload if payload is not None else {}
+        results: list[EpisodeInfo] = []
+        for row in _as_sequence(fields.get("episodes")):
+            episode_fields = _as_mapping(row)
+            episode_number = _get_int(episode_fields, "episode_number")
+            if episode_number is None:
+                continue
+            results.append(
+                EpisodeInfo(
+                    episode_number=episode_number,
+                    air_date=_date_from(episode_fields, "air_date"),
+                )
+            )
+        self._season_episodes_cache.set(cache_key, tuple(results))
+        return list(results)

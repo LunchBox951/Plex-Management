@@ -36,6 +36,7 @@ class RejectionReason(StrEnum):
     WRONG_MEDIA = "wrong_media"
     MULTI_SEASON_PACK = "multi_season_pack"
     NOT_SEASON_PACK = "not_season_pack"
+    EPISODE_NOT_NEEDED = "episode_not_needed"
 
 
 @dataclass(frozen=True)
