@@ -493,21 +493,39 @@ def detect_stalls(
     return detections
 
 
-def download_deadline(raw_state: str, added_at: datetime) -> datetime | None:
+def download_deadline(status: DownloadStatus, added_at: datetime) -> datetime | None:
     """The honest stall deadline for a live download row, or ``None`` when the
     state has no meaningful download deadline (completed/seeding/failed).
 
     ``metaDL``/``forcedMetaDL`` -> ``added_at + METADATA_STALL_WINDOW`` (still
-    fetching metadata); any raw_state mapping to ``DownloadState.Downloading``
-    (including the unknown-state fallback) -> ``added_at +
-    STALLED_PROGRESS_WINDOW``; an ``ImportPending``/``FailedPending`` state ->
-    ``None`` (no download in flight).
+    fetching metadata); a never-had-activity row (``status.raw_state`` not in
+    :data:`_DELIBERATELY_IDLE_RAW_STATES`, ``last_activity_unix <= 0``, and
+    ``progress <= 0.0``) -> ALSO ``added_at + METADATA_STALL_WINDOW`` — this
+    MUST mirror :func:`detect_stalls`'s own never-had-activity predicate
+    exactly (Codex P2: the two used to disagree, so a zero-seed magnet's
+    ``timeout_at`` showed the 3h ``STALLED_PROGRESS_WINDOW`` deadline while the
+    self-heal actually fired 2h15m earlier, at the 45m metadata window); any
+    OTHER raw_state mapping to ``DownloadState.Downloading`` (including the
+    unknown-state fallback) -> ``added_at + STALLED_PROGRESS_WINDOW``; an
+    ``ImportPending``/``FailedPending`` state -> ``None`` (no download in
+    flight).
 
     Observability only — :func:`detect_stalls` remains anchored on ``added_at``;
     this column is never read for control.
     """
-    if raw_state in ("metaDL", "forcedMetaDL"):
+    if status.raw_state in ("metaDL", "forcedMetaDL"):
         return added_at + METADATA_STALL_WINDOW
-    if _RAW_STATE_MAP.get(raw_state, _UNKNOWN_FALLBACK) is DownloadState.Downloading:
-        return added_at + STALLED_PROGRESS_WINDOW
-    return None
+    if _RAW_STATE_MAP.get(status.raw_state, _UNKNOWN_FALLBACK) is not DownloadState.Downloading:
+        # ImportPending (uploading/stalledUP/...) or FailedPending (error/
+        # missingFiles): no download-phase deadline. Checked BEFORE the
+        # never-had-activity predicate below so an ImportPending raw_state can
+        # never be misread as "never had activity" just because ``progress``/
+        # ``last_activity_unix`` happen to be unset on the snapshot.
+        return None
+    if (
+        status.raw_state not in _DELIBERATELY_IDLE_RAW_STATES
+        and status.last_activity_unix <= 0
+        and status.progress <= 0.0
+    ):
+        return added_at + METADATA_STALL_WINDOW
+    return added_at + STALLED_PROGRESS_WINDOW

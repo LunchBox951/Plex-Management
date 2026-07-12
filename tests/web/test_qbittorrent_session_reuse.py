@@ -147,6 +147,75 @@ async def test_unconfigured_raises_service_not_configured(sessionmaker_: Session
     assert getattr(state, "qbittorrent_client", None) is None
 
 
+async def test_lifespan_restart_rebuilds_client_bound_to_the_new_http_client(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex P2 (concern 3): an ASGI lifespan shutdown/startup on the SAME app
+    object (``state`` persists across the cycle) closes the old
+    ``httpx.AsyncClient`` and installs a fresh one, but ``app.state.
+    qbittorrent_client`` is a separate attribute that survives the swap
+    untouched. Before this fix, the cache only compared settings, so it kept
+    returning a ``QbittorrentClient`` still wrapping the CLOSED client and
+    every qbt call failed until settings changed. The next resolve after a
+    restart must rebuild against the NEW client -- and repeated restarts must
+    each work cleanly, not just the first one."""
+    await _seed_qbt_settings(sessionmaker_)
+    login_counter = [0]
+    state = State()
+
+    # "Startup" generation 1.
+    transport1 = httpx.MockTransport(_counting_router(login_counter=login_counter))
+    http_client1 = httpx.AsyncClient(transport=transport1)
+    async with sessionmaker_() as session:
+        c1 = await resolve_qbittorrent(state, session, http_client1)
+    await c1.get_all_statuses()
+    # Reusing the SAME generation's client must still hit the cache (no new login).
+    async with sessionmaker_() as session:
+        c1_again = await resolve_qbittorrent(state, session, http_client1)
+    assert c1_again is c1
+    assert login_counter[0] == 1
+
+    # "Shutdown": the lifespan closes the old client (mirrors ``web/app.py``'s
+    # ``await app.state.http_client.aclose()``). ``state.qbittorrent_client`` is
+    # untouched by this -- it is a SEPARATE attribute the old lifespan never
+    # cleared.
+    await http_client1.aclose()
+
+    # "Startup" generation 2: a brand-new httpx client, same app.state object,
+    # same qbt settings (unchanged).
+    transport2 = httpx.MockTransport(_counting_router(login_counter=login_counter))
+    http_client2 = httpx.AsyncClient(transport=transport2)
+    try:
+        async with sessionmaker_() as session:
+            c2 = await resolve_qbittorrent(state, session, http_client2)
+        # The rebuilt client must actually work against the NEW transport, not
+        # raise against the closed old one.
+        statuses = await c2.get_all_statuses()
+        assert statuses == []
+        assert c2 is not c1
+        assert login_counter[0] == 2
+
+        # A THIRD restart must also work cleanly (not just the first swap).
+        transport3 = httpx.MockTransport(_counting_router(login_counter=login_counter))
+        http_client3 = httpx.AsyncClient(transport=transport3)
+        try:
+            async with sessionmaker_() as session:
+                c3 = await resolve_qbittorrent(state, session, http_client3)
+            await c3.get_all_statuses()
+            assert c3 is not c2
+            assert login_counter[0] == 3
+
+            # Reusing generation 3's client again still hits the cache.
+            async with sessionmaker_() as session:
+                c3_again = await resolve_qbittorrent(state, session, http_client3)
+            assert c3_again is c3
+            assert login_counter[0] == 3
+        finally:
+            await http_client3.aclose()
+    finally:
+        await http_client2.aclose()
+
+
 async def test_403_triggers_single_relogin_on_reused_client(sessionmaker_: SessionMaker) -> None:
     await _seed_qbt_settings(sessionmaker_)
     login_counter = [0]

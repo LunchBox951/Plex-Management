@@ -699,6 +699,141 @@ async def test_update_status_sets_optional_fields(session: AsyncSession) -> None
     assert fetched.download_path == "/data/movies/Foo"
 
 
+async def test_update_status_if_in_writes_timeout_at(session: AsyncSession) -> None:
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(torrent_hash="deadline1", status="metadata_fetching")
+    deadline = datetime(2026, 6, 29, 12, 45, tzinfo=UTC)
+
+    applied = await repo.update_status_if_in(
+        created.id,
+        "downloading",
+        frozenset({"metadata_fetching"}),
+        timeout_at=deadline,
+    )
+    assert applied is True
+
+    fetched = await repo.get_by_hash("deadline1")
+    assert fetched is not None
+    assert fetched.timeout_at == deadline
+
+
+async def test_update_status_if_in_clear_timeout_at_nulls_the_column(
+    session: AsyncSession,
+) -> None:
+    """Codex P2 (concern 1): moving into a no-deadline state (e.g.
+    ``import_pending``) must explicitly NULL a stale ``timeout_at`` rather than
+    silently leaving the prior download-phase deadline on the row -- ``None``
+    alone means "leave unchanged", so a dedicated flag is required."""
+    repo = SqlDownloadRepository(session)
+    stale_deadline = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
+    created = await repo.create(
+        torrent_hash="deadline2", status="downloading", timeout_at=stale_deadline
+    )
+
+    applied = await repo.update_status_if_in(
+        created.id,
+        "import_pending",
+        frozenset({"downloading"}),
+        clear_timeout_at=True,
+    )
+    assert applied is True
+
+    fetched = await repo.get_by_hash("deadline2")
+    assert fetched is not None
+    assert fetched.status == "import_pending"
+    assert fetched.timeout_at is None
+
+
+async def test_update_status_if_in_clear_timeout_at_wins_over_timeout_at(
+    session: AsyncSession,
+) -> None:
+    """A caller must never be able to pass both a deadline AND the clear flag
+    and have the deadline silently win -- ``clear_timeout_at`` is the
+    caller's explicit "no deadline" declaration and takes precedence."""
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(
+        torrent_hash="deadline3",
+        status="downloading",
+        timeout_at=datetime(2026, 6, 29, 15, 0, tzinfo=UTC),
+    )
+
+    applied = await repo.update_status_if_in(
+        created.id,
+        "import_pending",
+        frozenset({"downloading"}),
+        timeout_at=datetime(2026, 6, 29, 18, 0, tzinfo=UTC),
+        clear_timeout_at=True,
+    )
+    assert applied is True
+
+    fetched = await repo.get_by_hash("deadline3")
+    assert fetched is not None
+    assert fetched.timeout_at is None
+
+
+async def test_update_status_if_in_default_leaves_timeout_at_untouched(
+    session: AsyncSession,
+) -> None:
+    repo = SqlDownloadRepository(session)
+    deadline = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
+    created = await repo.create(torrent_hash="deadline4", status="downloading", timeout_at=deadline)
+
+    applied = await repo.update_status_if_in(
+        created.id, "downloading", frozenset({"downloading"}), progress=0.5
+    )
+    assert applied is True
+
+    fetched = await repo.get_by_hash("deadline4")
+    assert fetched is not None
+    assert fetched.timeout_at == deadline
+
+
+async def test_refresh_progress_writes_timeout_at(session: AsyncSession) -> None:
+    repo = SqlDownloadRepository(session)
+    created = await repo.create(torrent_hash="deadline5", status="downloading")
+    deadline = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
+
+    await repo.refresh_progress(created.id, progress=0.4, timeout_at=deadline)
+
+    fetched = await repo.get_by_hash("deadline5")
+    assert fetched is not None
+    assert fetched.timeout_at == deadline
+
+
+async def test_refresh_progress_clear_timeout_at_nulls_the_column(
+    session: AsyncSession,
+) -> None:
+    """Same clear semantics as :meth:`update_status_if_in`, for the
+    no-transition progress-refresh path (Codex P2 concern 1) -- a row that
+    stays ``import_pending`` while progress ticks must still shed a stale
+    download-phase deadline left over from before it settled."""
+    repo = SqlDownloadRepository(session)
+    stale_deadline = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
+    created = await repo.create(
+        torrent_hash="deadline6", status="import_pending", timeout_at=stale_deadline
+    )
+
+    await repo.refresh_progress(created.id, progress=1.0, clear_timeout_at=True)
+
+    fetched = await repo.get_by_hash("deadline6")
+    assert fetched is not None
+    assert fetched.timeout_at is None
+
+
+async def test_refresh_progress_default_leaves_timeout_at_untouched(
+    session: AsyncSession,
+) -> None:
+    repo = SqlDownloadRepository(session)
+    deadline = datetime(2026, 6, 29, 15, 0, tzinfo=UTC)
+    created = await repo.create(torrent_hash="deadline7", status="downloading", timeout_at=deadline)
+
+    await repo.refresh_progress(created.id, progress=0.7)
+
+    fetched = await repo.get_by_hash("deadline7")
+    assert fetched is not None
+    assert fetched.timeout_at == deadline
+
+
 async def test_update_status_leaves_unspecified_fields_untouched(
     session: AsyncSession,
 ) -> None:

@@ -620,6 +620,7 @@ class SqlDownloadRepository:
         release_title: str | None = None,
         added_at: datetime | None = None,
         timeout_at: datetime | None = None,
+        clear_timeout_at: bool = False,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -649,7 +650,13 @@ class SqlDownloadRepository:
         ``timeout_at`` (issue: honest observability deadline, north star: honesty
         over silence) lets a caller stamp the download-phase stall deadline on the
         SAME CAS as the transition; ``None`` (the default) leaves the column
-        untouched.
+        untouched. ``clear_timeout_at`` (Codex P2: a live raw_state with no
+        meaningful deadline — e.g. ``uploading``/``import_pending`` — must NULL
+        the column, not merely skip the write) takes precedence over
+        ``timeout_at`` and explicitly NULLs it; without a dedicated flag,
+        overloading ``None`` to mean BOTH "leave unchanged" and "clear" would
+        leave a stale 45m/3h deadline on a row that has already left every
+        download phase, misleading the observability column it was added for.
 
         ``require_failed_reason`` (default: no predicate) additionally constrains the
         WHERE to rows whose CURRENT ``failed_reason`` exactly equals the given value
@@ -693,7 +700,9 @@ class SqlDownloadRepository:
             values["first_seen_at"] = first_seen_at
         if added_at is not None:
             values["added_at"] = added_at
-        if timeout_at is not None:
+        if clear_timeout_at:
+            values["timeout_at"] = None
+        elif timeout_at is not None:
             values["timeout_at"] = timeout_at
         stmt = (
             update(Download)
@@ -763,6 +772,7 @@ class SqlDownloadRepository:
         progress: float | None = None,
         seed_ratio: float | None = None,
         timeout_at: datetime | None = None,
+        clear_timeout_at: bool = False,
     ) -> None:
         """Update ONLY live progress / seed_ratio (+ the observability
         ``timeout_at`` deadline) — never status.
@@ -773,6 +783,13 @@ class SqlDownloadRepository:
         and this write, and rewriting the stale snapshot status would clobber that claim
         (defeating the import finalize CAS and stranding the placed file). Touching only
         progress/seed_ratio/timeout_at leaves any concurrent status transition intact.
+
+        ``clear_timeout_at`` (Codex P2, mirrors :meth:`update_status_if_in`) NULLs
+        ``timeout_at`` when the caller has determined the live raw_state has no
+        meaningful deadline (e.g. a live-tracked row that moved to ``uploading``/
+        ``import_pending``) — ``timeout_at=None`` alone means "leave unchanged", so
+        without this flag a stale 45m/3h deadline would survive on a row that has
+        already left every download phase.
         """
         row = await self._session.get(Download, download_id)
         if row is None:
@@ -781,6 +798,8 @@ class SqlDownloadRepository:
             row.progress = progress
         if seed_ratio is not None:
             row.seed_ratio = seed_ratio
-        if timeout_at is not None:
+        if clear_timeout_at:
+            row.timeout_at = None
+        elif timeout_at is not None:
             row.timeout_at = timeout_at
         await self._session.flush()

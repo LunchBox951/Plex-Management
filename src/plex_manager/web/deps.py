@@ -957,11 +957,12 @@ async def get_prowlarr(
 
 @dataclass(frozen=True)
 class _CachedQbittorrent:
-    """One cached :class:`QbittorrentClient` plus the settings key it was built
-    from, so a settings change invalidates the cache instead of silently
-    reusing stale credentials."""
+    """One cached :class:`QbittorrentClient` plus the key (settings + the
+    ``httpx.AsyncClient`` it was built against) it was built from, so either a
+    settings change OR an ASGI lifespan restart invalidates the cache instead
+    of silently reusing stale credentials / a closed HTTP client."""
 
-    key: tuple[str, str, str, str | None]
+    key: tuple[str, str, str, str | None, httpx.AsyncClient]
     client: QbittorrentClient
 
 
@@ -973,7 +974,23 @@ async def resolve_qbittorrent(
     """Build (or reuse) the configured qBittorrent adapter, else raise 409.
 
     Caches ONE :class:`QbittorrentClient` on ``state.qbittorrent_client``, keyed
-    on the effective qbt settings tuple (url/username/password/prowlarr_url).
+    on the effective qbt settings tuple (url/username/password/prowlarr_url)
+    PLUS the ``httpx.AsyncClient`` instance passed in this call (Codex P2: an
+    ASGI lifespan shutdown/startup on the SAME ``FastAPI`` app object -- common
+    in tests, and possible for a real process that re-enters lifespan -- closes
+    ``app.state.http_client`` and replaces it with a fresh instance, but
+    ``app.state.qbittorrent_client`` is a SEPARATE attribute that survives that
+    swap untouched. A cache keyed on settings alone would then keep returning a
+    ``QbittorrentClient`` still wrapping the CLOSED old ``httpx.AsyncClient``,
+    so every qbt call would fail (``RuntimeError: client has been closed``)
+    until settings changed or the process restarted. Including ``client`` in
+    the key -- compared by identity, since ``httpx.AsyncClient`` defines no
+    ``__eq__`` -- makes a lifespan restart behave exactly like a settings
+    change: the key no longer matches, so the next resolve rebuilds against the
+    NEW client. This also handles repeated restarts cleanly: each restart's
+    client is a distinct object, so each produces its own cache entry with no
+    special-casing needed.
+
     Without this cache, every caller of :func:`get_qbittorrent` -- including the
     reconcile and auto-grab loops on their 15s ticks -- built a brand-new
     ``QbittorrentClient`` with ``_logged_in = False`` AND a null adapter-local
@@ -988,12 +1005,13 @@ async def resolve_qbittorrent(
     transparently on a genuine 403, so that path is unaffected.
 
     Mirrors :func:`get_health_cache`'s lazy ``app.state`` accessor pattern. A
-    settings change produces a different key, so the next resolve rebuilds a
-    fresh client (which re-parses the ``ServiceUrl`` from the new ``url`` and
-    logs in again with the new credentials) rather than reusing one whose
-    ``ServiceUrl`` / creds were built from stale settings. The key captures the
-    raw ``url`` string that feeds ``ServiceUrl.parse``, so any change to the
-    parsed service target necessarily changes the key.
+    settings change OR a new ``http`` client produces a different key, so the
+    next resolve rebuilds a fresh client (which re-parses the ``ServiceUrl``
+    from the new ``url`` and logs in again with the new credentials, over the
+    new ``httpx.AsyncClient``) rather than reusing one whose ``ServiceUrl`` /
+    creds / underlying HTTP client were built from a stale generation. The key
+    captures the raw ``url`` string that feeds ``ServiceUrl.parse``, so any
+    change to the parsed service target necessarily changes the key.
 
     Concurrency: the cached wrapper is shared across the reconcile loop, the
     autograb loop, and concurrent HTTP requests -- exactly as the underlying
@@ -1018,7 +1036,12 @@ async def resolve_qbittorrent(
     # release ungrabbable. The app already trusts this exact URL with an API key
     # for every search call. None (unconfigured) keeps the veto fully closed.
     prowlarr_url = await store.get("prowlarr_url")
-    key = (url, username, password, prowlarr_url or None)
+    # ``client`` is compared by identity (``httpx.AsyncClient`` defines no
+    # ``__eq__``, so tuple ``==`` falls back to ``is``) -- an ASGI lifespan
+    # restart swaps in a NEW client object, which changes this key even though
+    # every settings value is unchanged, forcing a rebuild against the live
+    # client rather than reusing one bound to the closed old one.
+    key = (url, username, password, prowlarr_url or None, client)
     cached = getattr(state, "qbittorrent_client", None)
     if isinstance(cached, _CachedQbittorrent) and cached.key == key:
         return cached.client

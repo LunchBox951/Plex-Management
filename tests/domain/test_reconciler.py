@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from plex_manager.domain.reconciler import (
+    StallDetection,
     StateTransition,
     detect_stalls,
     download_deadline,
@@ -650,9 +651,73 @@ def test_non_failure_downloading_side_row_is_never_flagged_by_last_activity(
 # --------------------------------------------------------------------------- #
 def test_download_deadline_helper() -> None:
     t = _NOW
-    assert download_deadline("metaDL", t) == t + timedelta(minutes=45)
-    assert download_deadline("forcedMetaDL", t) == t + timedelta(minutes=45)
-    assert download_deadline("downloading", t) == t + timedelta(hours=3)
-    assert download_deadline("someUnknownState", t) == t + timedelta(hours=3)
-    assert download_deadline("uploading", t) is None
-    assert download_deadline("error", t) is None
+    assert download_deadline(_status(raw_state="metaDL"), t) == t + timedelta(minutes=45)
+    assert download_deadline(_status(raw_state="forcedMetaDL"), t) == t + timedelta(minutes=45)
+    # A torrent that HAS reported real activity/progress uses the full download
+    # window, whatever its raw_state maps to (Downloading, or an unmapped future
+    # state via the fallback).
+    assert download_deadline(
+        _status(raw_state="downloading", last_activity_unix=1, progress=0.0), t
+    ) == t + timedelta(hours=3)
+    assert download_deadline(
+        _status(raw_state="downloading", last_activity_unix=0, progress=0.5), t
+    ) == t + timedelta(hours=3)
+    assert download_deadline(
+        _status(raw_state="someUnknownState", last_activity_unix=1, progress=0.0), t
+    ) == t + timedelta(hours=3)
+    assert download_deadline(_status(raw_state="uploading"), t) is None
+    assert download_deadline(_status(raw_state="error"), t) is None
+
+
+def test_download_deadline_zero_activity_mirrors_the_metadata_stall_window() -> None:
+    # Codex P2: a zero-seed magnet (or an unmapped raw state) that has NEVER
+    # reported activity or progress self-heals on the SAME 45-minute
+    # metadata_stall window as a genuine metadata stall (detect_stalls's
+    # never-had-activity catch-all) — the deadline column must say so too,
+    # not the 3-hour stalled_progress window a downloading-mapped raw_state
+    # would otherwise imply.
+    t = _NOW
+    for raw_state in ("downloading", "forcedDL", "stalledDL", "someUnknownFutureState"):
+        assert download_deadline(
+            _status(raw_state=raw_state, last_activity_unix=0, progress=0.0), t
+        ) == t + timedelta(minutes=45), raw_state
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    ["pausedDL", "stoppedDL", "queuedDL", "checkingDL", "checkingResumeData", "moving"],
+)
+def test_download_deadline_deliberately_idle_states_keep_the_download_window(
+    raw_state: str,
+) -> None:
+    # These raw states are excluded from the never-had-activity catch-all in
+    # BOTH detect_stalls and download_deadline (an operator pause / queue
+    # position / verification pass / relocation is never self-healed just
+    # because it never had activity), so their deadline stays the normal
+    # 3-hour download window even at zero progress/activity — mirroring
+    # detect_stalls exactly rather than claiming a 45-minute heal that will
+    # never fire.
+    t = _NOW
+    assert download_deadline(
+        _status(raw_state=raw_state, last_activity_unix=0, progress=0.0), t
+    ) == t + timedelta(hours=3)
+
+
+def test_download_deadline_matches_detect_stalls_self_heal_timing() -> None:
+    # The exact regression Codex flagged: for a zero-seed magnet, the deadline
+    # download_deadline() reports must equal the moment detect_stalls() ACTUALLY
+    # fires — not 2h15m later.
+    added_at = _NOW - timedelta(minutes=44)
+    rows = [_row(status=DownloadState.Downloading.value, added_at=added_at)]
+    status = _status(raw_state="downloading", last_activity_unix=0, progress=0.0)
+
+    deadline = download_deadline(status, added_at)
+    assert deadline is not None
+    assert deadline == added_at + timedelta(minutes=45)
+
+    # One minute before the reported deadline: not yet healed.
+    assert detect_stalls(rows, [status], now=deadline - timedelta(minutes=1)) == []
+    # At the reported deadline: healed.
+    assert detect_stalls(rows, [status], now=deadline) == [
+        StallDetection(download_id=1, torrent_hash=_HASH, shape="metadata_stall")
+    ]
