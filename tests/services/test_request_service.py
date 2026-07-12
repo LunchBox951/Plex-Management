@@ -27,6 +27,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
+from plex_manager.repositories import requests as requests_repo_module
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import request_service
 from tests.web.fakes import FakeLibrary, FakeTmdb
@@ -2835,3 +2836,125 @@ async def test_in_library_create_dedups_onto_a_concurrent_forced_pending(
             .all()
         )
     assert sorted(r.status.value for r in rows) == ["pending"]
+
+
+# --- Change 3: breadcrumb-gated corroboration at the movie short-circuit -----
+# (request-dedup healing, spec-request-dedup-healing.md)
+
+
+async def test_short_circuit_denies_available_when_breadcrumb_not_corroborated(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A prior terminal row left a real ``library_path`` breadcrumb for this movie;
+    Plex's GUID says the movie is present now, but ``confirm_paths`` cannot
+    corroborate that breadcrumb -- exactly the shape a transient/mis-tagged Plex
+    GUID produces. The fresh request must NOT instant-complete: it falls through
+    to a normal 'pending' request rather than minting a false 'available' row."""
+    async with sessionmaker_() as session:
+        prior = MediaRequest(
+            tmdb_id=900,
+            media_type=MediaType.movie,
+            title="Mario",
+            status=RequestStatus.cancelled,
+            library_path="/movies/mario",
+        )
+        session.add(prior)
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={900: MovieMetadata(tmdb_id=900, title="Mario", year=2023)})
+    # GUID says present, but the known file paths don't corroborate the breadcrumb.
+    library = FakeLibrary(available={900}, movie_file_paths=["/movies/somewhere-else/x.mkv"])
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=900, media_type="movie", library=library
+        )
+    assert record.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 900)))
+            .scalars()
+            .all()
+        )
+    assert sorted(r.status.value for r in rows) == ["cancelled", "pending"]
+    # No 'available' row was ever minted for this GUID-present-but-uncorroborated case.
+    assert all(r.status is not RequestStatus.available for r in rows)
+
+
+async def test_short_circuit_mints_available_when_breadcrumb_corroborated(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Same shape as above, but the breadcrumb IS corroborated by a known file path
+    -- mints 'available' exactly as today (no regression to a genuine re-acquire)."""
+    async with sessionmaker_() as session:
+        prior = MediaRequest(
+            tmdb_id=901,
+            media_type=MediaType.movie,
+            title="Mario",
+            status=RequestStatus.cancelled,
+            library_path="/movies/mario",
+        )
+        session.add(prior)
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={901: MovieMetadata(tmdb_id=901, title="Mario", year=2023)})
+    library = FakeLibrary(available={901}, movie_file_paths=["/movies/mario/movie.mkv"])
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=901, media_type="movie", library=library
+        )
+    assert record.status == RequestStatus.available.value
+
+
+async def test_short_circuit_mints_available_when_no_breadcrumb(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """No prior row ever left a library_path for this media (the common
+    already-owned-by-someone-else case) -- GUID presence alone still mints
+    'available', unaffected by the breadcrumb gate (no regression)."""
+    tmdb = FakeTmdb(movies={902: MovieMetadata(tmdb_id=902, title="Mario", year=2023)})
+    library = FakeLibrary(available={902})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=902, media_type="movie", library=library
+        )
+    assert record.status == RequestStatus.available.value
+
+
+async def test_short_circuit_denies_available_when_confirm_paths_raises(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A breadcrumb exists, but the corroboration check itself fails (Plex
+    unreachable etc.) -- conservative: falls through to 'pending' rather than
+    trusting the uncorroborated GUID match."""
+    async with sessionmaker_() as session:
+        prior = MediaRequest(
+            tmdb_id=903,
+            media_type=MediaType.movie,
+            title="Mario",
+            status=RequestStatus.failed,
+            library_path="/movies/mario",
+        )
+        session.add(prior)
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={903: MovieMetadata(tmdb_id=903, title="Mario", year=2023)})
+    library = FakeLibrary(available={903}, confirm_paths_raises=PlexLibraryError("boom"))
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=903, media_type="movie", library=library
+        )
+    assert record.status == RequestStatus.pending.value
+
+
+async def test_settled_status_value_sets_in_sync() -> None:
+    """The service module's string-valued settled set and the repo module's
+    ``RequestStatus``-valued one must never drift -- both drive the SAME
+    'which duplicate row wins' preference (fold display vs. dedup-status lookup)."""
+    settled_from_repo = {
+        s.value
+        for s in requests_repo_module._SETTLED_REQUEST_STATUSES  # pyright: ignore[reportPrivateUsage]
+    }
+    assert (
+        settled_from_repo == request_service._SETTLED_STATUS_VALUES  # pyright: ignore[reportPrivateUsage]
+    )

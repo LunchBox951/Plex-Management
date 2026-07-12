@@ -2264,15 +2264,19 @@ async def run_import_cycle(
     return changed
 
 
-async def _heal_false_available_movies(*, library: LibraryPort, session: AsyncSession) -> None:
+async def _heal_false_available_movies(
+    *, library: LibraryPort, session: AsyncSession, exclude_ids: frozenset[int] = frozenset()
+) -> None:
     """Self-heal MOVIE rows falsely minted ``available`` by the in-library
     short-circuit (request-dedup bug: a transient/mis-tagged Plex GUID at
     create time, ``request_service.create_request_result``).
 
     Scans ``status='available' AND library_path IS NULL`` -- the exact
     false-claim signature (see :data:`_HEAL_FALSE_AVAILABLE_LIMIT`'s docstring
-    comment) -- capped at that limit per tick, id-ascending. Per row, in
-    priority order:
+    comment) -- capped at that limit per tick, id-ascending, excluding
+    ``exclude_ids`` (rows the CALLER's own movie promotion loop this SAME tick
+    already confirmed via the identical GUID/path checks -- see the call site
+    in :func:`run_availability_cycle`). Per row, in priority order:
 
     1. **Sibling collapse**: another row for the SAME ``(tmdb_id, 'movie')`` is
        ``available``/``completed`` and carries a REAL ``library_path`` -- the
@@ -2302,7 +2306,11 @@ async def _heal_false_available_movies(*, library: LibraryPort, session: AsyncSe
     unexplained.
     """
     repo = SqlRequestRepository(session)
-    rows = await repo.list_false_available_movies(limit=_HEAL_FALSE_AVAILABLE_LIMIT)
+    rows = [
+        row
+        for row in await repo.list_false_available_movies(limit=_HEAL_FALSE_AVAILABLE_LIMIT)
+        if row.id not in exclude_ids
+    ]
     for row in rows:
         siblings = [
             sibling
@@ -2482,6 +2490,13 @@ async def run_availability_cycle(
                 len(movies_needing_path_check),
             )
 
+    # ids promoted to 'available' in the loop just below, THIS tick -- excluded
+    # from the false-available heal pass right after it (see that call site):
+    # a row this tick's own promotion just confirmed via the SAME GUID/path
+    # checks above is never a stale false claim to re-litigate a moment later,
+    # even on the rare legacy row that (like a false-claim row) also happens to
+    # carry no ``library_path`` (e.g. a pre-breadcrumb-column import).
+    promoted_this_tick: set[int] = set()
     for request in completed_movies:
         key = _movie_unconfirmed_key(request.id)
         guid_confirmed = (request.tmdb_id, "movie") in present_movie_keys
@@ -2515,6 +2530,7 @@ async def run_availability_cycle(
             await session.commit()
             promoted += 1
             _forget_unconfirmed(key)
+            promoted_this_tick.add(request.id)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
@@ -2524,9 +2540,13 @@ async def run_availability_cycle(
 
     # Self-heal false 'available' movie claims (request-dedup bug, see
     # ``_heal_false_available_movies``'s docstring) -- a bounded pass, run once
-    # per tick after the movie promotion loop above so a row this SAME tick just
-    # promoted is never re-scanned as a false claim.
-    await _heal_false_available_movies(library=library, session=session)
+    # per tick after the movie promotion loop above. ``promoted_this_tick``
+    # excludes any row THIS tick's own promotion loop just confirmed (via the
+    # same GUID/path checks) from being re-litigated a moment later as a
+    # false claim.
+    await _heal_false_available_movies(
+        library=library, session=session, exclude_ids=frozenset(promoted_this_tick)
+    )
 
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
     # SeasonRequest rows -- a show's OTHER seasons may still be mid-flight while

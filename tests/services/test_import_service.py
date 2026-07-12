@@ -39,6 +39,7 @@ from plex_manager.models import (
     MediaType,
     RequestStatus,
     SeasonRequest,
+    User,
 )
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.library import WatchState
@@ -3131,12 +3132,14 @@ async def _seed_movie_request(
     status: RequestStatus = RequestStatus.completed,
     library_path: str | None = None,
     completed_at: datetime | None = None,
+    user_id: int | None = None,
 ) -> int:
     """Insert a bare movie request row (no download) -- the availability cycle
     reads only ``MediaRequest``, so a batching test needs nothing else.
     ``library_path``/``completed_at`` (issue #158) let a path-confirmation-fallback
     or bounded-Finalizing test control the exact breadcrumb / elapsed-time anchor
-    without needing a full import run."""
+    without needing a full import run. ``user_id`` (request-dedup healing) lets an
+    ownership-guard test control the row's owner."""
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=tmdb_id,
@@ -3146,6 +3149,7 @@ async def _seed_movie_request(
             status=status,
             library_path=library_path,
             completed_at=completed_at,
+            user_id=user_id,
         )
         session.add(request)
         await session.commit()
@@ -4093,3 +4097,214 @@ async def test_begin_placement_refuses_while_a_purge_holds_the_path(
         )
     assert purge_service.begin_placement(str(season_dir)) is True
     purge_service.end_placement(str(season_dir))
+
+
+# --- Change 2: self-heal false 'available' movie claims -----------------------
+# (request-dedup healing, spec-request-dedup-healing.md)
+
+
+async def test_heal_collapses_null_path_available_onto_real_path_sibling(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Mario repro: row A is 'available' with library_path=None (the false
+    short-circuit claim); row B, same tmdb + same owner (both ownerless here), is
+    'available' with a REAL library_path. The heal collapses row A onto row B."""
+    tmdb_id = 1226863
+    row_a = await _seed_movie_request(
+        sessionmaker_, tmdb_id=tmdb_id, status=RequestStatus.available, library_path=None
+    )
+    row_b = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/mario",
+    )
+    library = FakeLibrary()
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+        b = await session.get(MediaRequest, row_b)
+    assert a is None  # collapsed (deleted)
+    assert (
+        b is not None and b.status == RequestStatus.available and b.library_path == "/movies/mario"
+    )
+    assert any(
+        "healed duplicate false-available movie row" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_heal_restamps_when_genuinely_present(sessionmaker_: SessionMaker) -> None:
+    """No sibling, but a live GUID check confirms Plex genuinely has it after all
+    -- re-stamp ``library_verified_at`` and leave the row 'available'/NULL-path."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=777, status=RequestStatus.available, library_path=None
+    )
+    async with sessionmaker_() as session:
+        before = await session.get(MediaRequest, row_id)
+        assert before is not None
+        assert before.library_verified_at is None
+
+    library = FakeLibrary(available={777})
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        after = await session.get(MediaRequest, row_id)
+    assert after is not None
+    assert after.status == RequestStatus.available
+    assert after.library_path is None
+    assert after.library_verified_at is not None  # re-stamped
+
+
+async def test_heal_rearms_to_pending_when_absent_and_no_sibling(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No sibling and Plex genuinely does not have it -- re-arm to 'pending' for a
+    fresh, honest search rather than leaving a false claim standing."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=778, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(available=set())
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None
+    assert row.status == RequestStatus.pending
+    assert row.library_verified_at is None
+    assert row.completed_at is None
+    assert row.library_path is None
+    assert any("re-armed to pending" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_ignores_available_rows_with_a_library_path(sessionmaker_: SessionMaker) -> None:
+    """A normally-imported 'available' row (a real library_path) is never a false
+    claim -- the heal must never touch it (no-false-positive)."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=779, status=RequestStatus.available, library_path="/movies/x"
+    )
+    library = FakeLibrary()  # would answer False for is_available -- must never be asked
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None
+    assert row.status == RequestStatus.available
+    assert row.library_path == "/movies/x"
+    assert library.is_available_calls == 0
+
+
+async def test_heal_leaves_tv_available_parent_untouched(sessionmaker_: SessionMaker) -> None:
+    """A TV parent MediaRequest 'available' with library_path=None is the NORMAL,
+    legitimate rollup shape (the breadcrumb lives per-season) -- the heal is
+    movie-only and must never select or mutate it."""
+    show_id = await _seed_show_request(sessionmaker_, tmdb_id=1001, status=RequestStatus.available)
+    library = FakeLibrary()
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+    assert show is not None
+    assert show.status == RequestStatus.available
+    assert show.library_path is None
+    assert library.is_available_calls == 0
+
+
+async def test_heal_differing_owner_sibling_not_deleted(sessionmaker_: SessionMaker) -> None:
+    """A real-path sibling owned by a DIFFERENT user must NOT collapse the
+    NULL-path row (issue #58: a background heal has no user context and must
+    never strand one owner's per-user list view). Falls through to the GUID
+    branch on its own merits instead."""
+    tmdb_id = 780
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a", permissions=0)
+        owner_b = User(username="owner-b", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/other-owner",
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available={tmdb_id})  # genuinely present -> re-stamp, not delete
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None  # NOT deleted
+    assert a.status == RequestStatus.available
+    assert a.library_verified_at is not None  # healed via the GUID branch instead
+
+
+async def test_heal_leaves_row_when_live_check_errors(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The live availability check itself fails (Plex unreachable) -- honesty over
+    silence: the row is left completely unchanged (unknown != absent), and a
+    warning is logged."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=781, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(raises=PlexLibraryError("plex unreachable"))
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None
+    assert row.status == RequestStatus.available
+    assert row.library_path is None
+    assert any("live availability check failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_is_bounded_per_cycle(sessionmaker_: SessionMaker) -> None:
+    """More false-available rows exist than the per-cycle cap -- at most the cap
+    is processed in one tick, keeping the reconcile pass cheap."""
+    limit = import_service._HEAL_FALSE_AVAILABLE_LIMIT  # pyright: ignore[reportPrivateUsage]
+    extra = 5
+    ids = [
+        await _seed_movie_request(
+            sessionmaker_,
+            tmdb_id=2000 + i,
+            status=RequestStatus.available,
+            library_path=None,
+        )
+        for i in range(limit + extra)
+    ]
+    library = FakeLibrary(available=set())  # every row would re-arm to pending if processed
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        statuses = []
+        for row_id in ids:
+            row = await session.get(MediaRequest, row_id)
+            assert row is not None
+            statuses.append(row.status)
+    processed = sum(1 for s in statuses if s == RequestStatus.pending)
+    assert processed == limit
+    assert statuses.count(RequestStatus.available) == extra

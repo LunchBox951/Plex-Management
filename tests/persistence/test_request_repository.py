@@ -508,3 +508,76 @@ async def test_clear_library_path_if_set_is_a_single_winner_gate(session: AsyncS
     fetched = await repo.get(created.id)
     assert fetched is not None
     assert fetched.library_path is None
+
+
+# --- request-dedup healing: new repo methods -----------------------------------
+
+
+async def test_list_false_available_movies_signature_and_bound(session: AsyncSession) -> None:
+    """Returns only movie + available + NULL-``library_path`` rows, id-ascending,
+    respecting ``limit``; excludes a non-movie, a non-available, and a
+    non-NULL-path row."""
+    repo = SqlRequestRepository(session)
+    qualifying_1 = await repo.create(tmdb_id=10, media_type="movie", title="Q1", status="available")
+    qualifying_2 = await repo.create(tmdb_id=11, media_type="movie", title="Q2", status="available")
+    # Excluded: a TV parent's 'available' + NULL path is the normal rollup shape.
+    await repo.create(tmdb_id=12, media_type="tv", title="Show", status="available")
+    # Excluded: not 'available'.
+    await repo.create(tmdb_id=13, media_type="movie", title="Pending", status="pending")
+    # Excluded: 'available' but carries a real library_path.
+    with_path = await repo.create(
+        tmdb_id=14, media_type="movie", title="WithPath", status="available"
+    )
+    await repo.set_library_path(with_path.id, "/movies/x")
+
+    rows = await repo.list_false_available_movies(limit=25)
+    assert [r.id for r in rows] == [qualifying_1.id, qualifying_2.id]
+
+    bounded = await repo.list_false_available_movies(limit=1)
+    assert [r.id for r in bounded] == [qualifying_1.id]
+
+
+async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> None:
+    """Succeeds on the exact false-claim signature (available + NULL path);
+    no-ops (returns False) once the row has already left that exact signature."""
+    repo = SqlRequestRepository(session)
+    row = await repo.create(tmdb_id=20, media_type="movie", title="Heal", status="available")
+    await repo.mark_available(row.id)  # stamp library_verified_at/completed_at, as the
+    # real already-in-library short-circuit does.
+
+    changed = await repo.rearm_false_available_to_pending(row.id)
+    assert changed is True
+    healed = await repo.get(row.id)
+    assert healed is not None
+    assert healed.status == "pending"
+    assert healed.completed_at is None
+    assert healed.search_attempts == 0
+    assert healed.next_search_at is None
+    assert healed.library_path is None
+
+    # Already left 'available' -> no-op.
+    assert await repo.rearm_false_available_to_pending(row.id) is False
+
+    # A row that carries a real library_path is never the false-claim signature.
+    with_path = await repo.create(
+        tmdb_id=21, media_type="movie", title="WithPath", status="available"
+    )
+    await repo.set_library_path(with_path.id, "/movies/y")
+    assert await repo.rearm_false_available_to_pending(with_path.id) is False
+
+
+async def test_latest_library_path_returns_newest_breadcrumb(session: AsyncSession) -> None:
+    """Across several rows for the same media, returns the NEWEST non-NULL
+    ``library_path``; ``None`` when none carry one."""
+    repo = SqlRequestRepository(session)
+    await repo.create(tmdb_id=30, media_type="movie", title="NoPath", status="pending")
+    assert await repo.latest_library_path(30, "movie") is None
+
+    older = await repo.create(tmdb_id=31, media_type="movie", title="Older", status="failed")
+    await repo.set_library_path(older.id, "/movies/older")
+    newer = await repo.create(tmdb_id=31, media_type="movie", title="Newer", status="cancelled")
+    await repo.set_library_path(newer.id, "/movies/newer")
+
+    assert await repo.latest_library_path(31, "movie") == "/movies/newer"
+    # Scoped to (tmdb_id, media_type): a tv row sharing the tmdb id never bleeds in.
+    assert await repo.latest_library_path(31, "tv") is None
