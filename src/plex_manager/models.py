@@ -631,6 +631,18 @@ class Download(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_reason: Mapped[str | None] = mapped_column(String)
+    # Consecutive resumed-import probe-outage retries (issue #180): bumped by
+    # ``import_service._refresh_resumed_import_after_probe_outage`` each cycle a
+    # crash-resumed ``Importing`` row auto-retries after
+    # ``MediaProbeUnavailableError``; once it exceeds
+    # ``import_service._PROBE_OUTAGE_MAX_RETRIES`` the row escalates to
+    # ``import_blocked`` instead of retrying forever. Reset to 0 by
+    # ``grab_service._reuse_terminal_row`` whenever a terminal row is
+    # resurrected for a fresh grab, so a resurrected row starts its own
+    # honest count rather than inheriting a stale one from a prior,
+    # unrelated life of the same torrent-hash row. Column predates this use
+    # (initial schema) and was otherwise unused, so no migration was needed
+    # to repurpose it.
     retry_count: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     torrent_attempt: Mapped[int] = mapped_column(default=1, server_default=sa.text("1"))
     scored_releases_json: Mapped[list[dict[str, Any]] | None] = mapped_column(sa.JSON)

@@ -978,6 +978,55 @@ async def test_import_probe_outage_keeps_crash_resumed_movie_auto_retryable(
     assert request is not None and request.status is RequestStatus.downloading
 
 
+async def test_import_probe_outage_escalates_crash_resumed_movie_past_retry_bound(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """#180: a crash-resumed ``Importing`` row auto-retries a transient probe
+    outage, but must NOT retry forever -- once ffprobe has been unavailable for
+    more consecutive resumed-import cycles than the bound allows (a permanently
+    broken adapter: an image regression, a missing binary), the row escalates
+    through the same ``import_blocked`` correction path every other honest
+    import failure uses, instead of sitting stuck ``Importing`` indefinitely
+    with no operator correction path (north star 1).
+    """
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.Importing.value,
+    )
+    max_retries = vars(import_service)["_PROBE_OUTAGE_MAX_RETRIES"]
+    assert isinstance(max_retries, int) and max_retries > 0
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        row.retry_count = max_retries  # already AT the bound
+        await session.commit()
+    library = FakeLibrary()
+
+    record = await _import(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        library,
+        media_probe=FakeMediaProbe(raises=MediaProbeUnavailableError("ffprobe timed out")),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "ffprobe timed out" in record.failed_reason
+    assert library.scanned == []
+    assert not any(movies_root.iterdir())
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status is RequestStatus.import_blocked
+
+
 class _PausingUnavailableProbe:
     """Pause in the probe thread so another DB session can change the row."""
 
@@ -1090,6 +1139,61 @@ async def test_verification_deadline_includes_executor_queue_delay(
         )
 
     assert probe.calls == []
+
+
+async def test_verification_deadline_truncation_mid_batch_is_wholly_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#179: when the aggregate deadline truncates the batch AFTER some
+    candidates already probed clean, the un-probed tail must never be folded
+    into 'unavailable' and silently dropped while the already-accepted subset
+    proceeds -- that would import a season pack missing its late episodes for a
+    reason unrelated to file validity. The whole batch must come back as a
+    single retryable ``_VideoVerificationUnavailableError`` instead, and every
+    un-probed candidate must be genuinely un-probed (never handed to the fake
+    probe at all).
+    """
+    # time.monotonic() call sequence inside _verified_plex_video_sources:
+    #   1. deadline = now() + BATCH_TIMEOUT         -> 0.0  (deadline = 5.0)
+    #   2. iteration 0 top-of-loop remaining check   -> 0.0  (remaining = 5.0, proceeds)
+    #   3. _probe_before_deadline's own remaining    -> 0.5  (remaining = 4.5, probe runs)
+    #   4. iteration 1 top-of-loop remaining check    -> 6.0  (remaining = -1.0, deadline hit)
+    # Beyond that, any further call just keeps reading "past the deadline"
+    # rather than raising StopIteration once the scripted sequence is
+    # exhausted. Rebinding the MODULE-LEVEL ``time`` name (rather than
+    # mutating the real ``time`` module's ``monotonic`` attribute in place)
+    # keeps this fake clock scoped to ``import_service`` alone -- asyncio's
+    # own internal timers (``asyncio.timeout``, task scheduling) read the
+    # SAME shared ``time.monotonic`` under the hood, so mutating it globally
+    # would desync the event loop's own clock from real wall time too.
+    schedule = [0.0, 0.0, 0.5, 6.0]
+
+    class _FakeClock:
+        @staticmethod
+        def monotonic() -> float:
+            return schedule.pop(0) if schedule else 6.0
+
+    monkeypatch.setattr(import_service, "time", _FakeClock)
+    monkeypatch.setattr(import_service, "_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS", 5.0)
+    probe = FakeMediaProbe()
+    sources = [
+        ("/downloads/episode.s01e01.mkv", 100, "episode.s01e01.mkv"),
+        ("/downloads/episode.s01e02.mkv", 100, "episode.s01e02.mkv"),
+        ("/downloads/episode.s01e03.mkv", 100, "episode.s01e03.mkv"),
+    ]
+
+    with pytest.raises(
+        import_service._VideoVerificationUnavailableError,  # pyright: ignore[reportPrivateUsage]
+        match="deadline",
+    ):
+        await import_service._verified_plex_video_sources(  # pyright: ignore[reportPrivateUsage]
+            probe, sources
+        )
+
+    # Only the FIRST candidate (already accepted before the deadline hit) was
+    # ever handed to the probe -- the other two were genuinely never attempted,
+    # not tallied as failed/unavailable verification.
+    assert [path.name for path in probe.calls] == ["episode.s01e01.mkv"]
 
 
 class _DeadlineHonoringProbe:
