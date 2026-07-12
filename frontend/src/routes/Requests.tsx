@@ -1,11 +1,15 @@
-import { useState, type ReactNode } from 'react'
-import { useRequests } from '../api/hooks'
+import { useRef, useState, type ReactNode } from 'react'
+import { useAuthMe, useRequests } from '../api/hooks'
 import type { DiscoverResult, RequestResponse } from '../api/types'
 import { Button } from '../components/ui/Button'
 import { LinkButton } from '../components/ui/LinkButton'
+import { ProgressBar } from '../components/ui/ProgressBar'
 import { StatusBadge } from '../components/ui/StatusBadge'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
-import { TitleDetailModal } from '../components/TitleDetailModal'
+import {
+  TitleDetailModal,
+  type TitleDetailModalAction,
+} from '../components/TitleDetailModal'
 import { requestStatus } from '../lib/status'
 
 /**
@@ -52,11 +56,24 @@ function requestStatusToLibraryState(status: string): DiscoverResult['library_st
   return 'none'
 }
 
-/** One request rendered as a row card (poster · title/meta · status). */
-function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () => void }) {
+/** One request rendered as a row card (poster · identity · live state). */
+function RequestRow({
+  request,
+  onOpen,
+  onReSearch,
+}: {
+  request: RequestResponse
+  onOpen: () => void
+  onReSearch: (() => void) | null
+}) {
   const meta: string[] = []
   if (request.year != null) meta.push(String(request.year))
   meta.push(request.media_type)
+
+  const showProgress = request.status === 'downloading' && request.download_progress != null
+  const progressPercent = showProgress
+    ? Math.round(Math.min(1, Math.max(0, request.download_progress ?? 0)) * 100)
+    : null
 
   // Fall back to the gradient placeholder both when there's no poster_url AND
   // when a real one fails to load (404 / expired TMDB URL) — a bad URL must
@@ -65,47 +82,60 @@ function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () 
   const showImg = Boolean(request.poster_url) && !imgFailed
 
   return (
-    <li className="rounded-xl border border-hairline bg-surface">
-      {/* role="button" (not a native <button>) so the block-level row content
-          (div/p/ul/li) stays valid HTML5. */}
-      <div
-        role="button"
-        tabIndex={0}
+    <li className="group relative grid grid-cols-[46px_minmax(0,1fr)] items-center gap-x-4 gap-y-3 rounded-xl border border-hairline bg-surface p-[13px] transition-colors hover:border-white/15 sm:grid-cols-[46px_minmax(0,1fr)_auto] sm:px-4">
+      {/* A stretched native button keeps the card and the shortcut as sibling
+          controls. It sits above the visual row but below the shortcut, so all
+          ordinary mouse/touch/Enter/Space activation opens details exactly once. */}
+      <button
+        type="button"
+        aria-label={`Open details for ${request.title}`}
         onClick={onOpen}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            onOpen()
-          }
-        }}
-        className="flex w-full cursor-pointer items-center gap-4 rounded-xl p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
-      >
-        {showImg ? (
-          <img
-            src={request.poster_url ?? undefined}
-            alt=""
-            loading="lazy"
-            className="aspect-[2/3] w-11 shrink-0 rounded object-cover"
-            onError={() => setImgFailed(true)}
-          />
-        ) : (
-          <div className="aspect-[2/3] w-11 shrink-0 rounded bg-poster bg-gradient-to-b from-white/10 to-transparent" />
-        )}
-        <div className="min-w-0 flex-1">
-          <p className="truncate font-display font-semibold text-ink">{request.title}</p>
-          <p className="mt-0.5 flex items-center gap-2 font-mono text-xs text-muted">
-            <span className="truncate">{meta.join(' · ')}</span>
-            {request.is_anime ? (
-              <span className="shrink-0 rounded bg-gold/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-gold">
-                ANIME
-              </span>
-            ) : null}
+        className="absolute inset-0 z-10 cursor-pointer rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+      />
+
+      {showImg ? (
+        <img
+          src={request.poster_url ?? undefined}
+          alt=""
+          loading="lazy"
+          className="aspect-[2/3] w-[46px] rounded-[5px] object-cover"
+          onError={() => setImgFailed(true)}
+        />
+      ) : (
+        <div className="aspect-[2/3] w-[46px] rounded-[5px] bg-poster bg-gradient-to-b from-white/10 to-transparent" />
+      )}
+
+      <div className="min-w-0">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
+          <p className="min-w-0 truncate font-display text-[15px] leading-tight font-bold text-ink">
+            {request.title}
           </p>
+          <span className="font-mono text-[11px] leading-none font-medium text-muted">
+            {meta.join(' · ')}
+          </span>
+          {request.is_anime ? (
+            <span className="shrink-0 rounded bg-gold/15 px-1.5 py-1 font-mono text-[9.5px] leading-none font-semibold tracking-[0.06em] text-gold">
+              ANIME
+            </span>
+          ) : null}
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-1.5">
+
+        <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2">
           <StatusBadge status={requestStatus(request.status)} />
+          {showProgress && progressPercent != null ? (
+            <div className="flex min-w-40 max-w-60 flex-[1_1_15rem] items-center gap-2">
+              <ProgressBar
+                value={request.download_progress ?? 0}
+                label={`Download progress for ${request.title}`}
+                className="min-w-20 flex-1"
+              />
+              <span className="shrink-0 font-mono text-[11px] text-muted tabular-nums">
+                {progressPercent}%
+              </span>
+            </div>
+          ) : null}
           {request.media_type === 'tv' && request.seasons && request.seasons.length > 0 ? (
-            <ul className="flex flex-wrap justify-end gap-1">
+            <ul className="flex min-w-0 flex-wrap gap-1">
               {request.seasons.map((season) => {
                 // Episode-level fallback progress (ADR-0020, issue #178): "N/M"
                 // while a whole-season request is partially assembled from a mix
@@ -129,12 +159,34 @@ function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () 
           ) : null}
         </div>
       </div>
+
+      <div className="pointer-events-none relative z-20 col-start-2 row-start-2 flex shrink-0 items-center justify-end gap-2 sm:col-start-3 sm:row-start-1">
+        {onReSearch ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="pointer-events-auto bg-gold/10 text-gold ring-1 ring-inset ring-gold/30 hover:bg-gold/20 hover:text-gold focus-visible:ring-gold/60"
+            aria-label={`Re-search ${request.title}`}
+            onClick={(event) => {
+              event.stopPropagation()
+              onReSearch()
+            }}
+          >
+            Re-search
+          </Button>
+        ) : null}
+        <span aria-hidden className="text-lg leading-none text-faint">
+          ›
+        </span>
+      </div>
     </li>
   )
 }
 
 export function Requests() {
   const { data, isLoading, isError, error, refetch } = useRequests({ poll: true })
+  const auth = useAuthMe()
+  const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
   const requests = data?.requests ?? []
 
   // The same TitleDetailModal Discover uses — reused, not forked. It correlates
@@ -143,10 +195,25 @@ export function Requests() {
   // report a problem, cancel, keep-forever) right where the stuck status lives.
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
+  const [modalAction, setModalAction] = useState<TitleDetailModalAction | null>(null)
+  const nextActionToken = useRef(0)
 
   const openRequest = (request: RequestResponse) => {
+    setModalAction(null)
     setSelected(requestToDiscoverResult(request))
     setModalOpen(true)
+  }
+
+  const reSearchRequest = (request: RequestResponse) => {
+    nextActionToken.current += 1
+    setSelected(requestToDiscoverResult(request))
+    setModalAction({ kind: 're-search', requestId: request.id, token: nextActionToken.current })
+    setModalOpen(true)
+  }
+
+  const changeModalOpen = (open: boolean) => {
+    setModalOpen(open)
+    if (!open) setModalAction(null)
   }
 
   let body: ReactNode
@@ -177,7 +244,16 @@ export function Requests() {
     body = (
       <ul className="flex flex-col gap-3">
         {requests.map((request) => (
-          <RequestRow key={request.id} request={request} onOpen={() => openRequest(request)} />
+          <RequestRow
+            key={request.id}
+            request={request}
+            onOpen={() => openRequest(request)}
+            onReSearch={
+              isAdmin && request.status === 'no_acceptable_release'
+                ? () => reSearchRequest(request)
+                : null
+            }
+          />
         ))}
       </ul>
     )
@@ -195,7 +271,12 @@ export function Requests() {
       </header>
       {body}
       {selected !== null ? (
-        <TitleDetailModal title={selected} open={modalOpen} onOpenChange={setModalOpen} />
+        <TitleDetailModal
+          title={selected}
+          open={modalOpen}
+          onOpenChange={changeModalOpen}
+          action={modalAction}
+        />
       ) : null}
     </div>
   )

@@ -2058,6 +2058,8 @@ export interface components {
         RequestResponse: {
             /** Backdrop Url */
             backdrop_url?: string | null;
+            /** Download Progress */
+            download_progress?: number | null;
             /** Id */
             id: number;
             /**

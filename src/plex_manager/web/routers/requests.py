@@ -13,7 +13,8 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.ports.repositories import RequestRecord
+from plex_manager.ports.repositories import DownloadRecord, RequestRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import correction_service, request_service
@@ -119,6 +120,7 @@ async def _to_response(
     record: RequestRecord,
     seasons_by_request: dict[int, list[SeasonRequestRecord]] | None = None,
     episode_counts_by_season_id: dict[int, tuple[int, int]] | None = None,
+    active_downloads_by_request: dict[int, list[DownloadRecord]] | None = None,
 ) -> RequestResponse:
     """Map a request record to the wire DTO, embedding its per-season rollup for tv.
 
@@ -139,6 +141,13 @@ async def _to_response(
     absent from the map (no tracked ``season_episode_states`` rows -- the common
     clean-single-pack-import case) renders both counts ``None``, never a fabricated
     ``0/0``.
+
+    ``active_downloads_by_request`` follows the same batching rule for byte
+    progress. The list endpoint supplies one actor-filtered batch; single-record
+    and mutation responses perform one corresponding request-id read. Progress is
+    truthful only for a displayed ``downloading`` request with exactly one active
+    physical download. Multiple concurrent TV-season downloads are intentionally
+    ambiguous -- never averaged, summed, or selected arbitrarily.
     """
     seasons: list[SeasonRequestRecord] | None = None
     if record.media_type == "tv":
@@ -151,6 +160,17 @@ async def _to_response(
         episode_counts = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(
             [s.id for s in seasons]
         )
+    active_downloads = active_downloads_by_request
+    if active_downloads is None:
+        active_downloads = await SqlDownloadRepository(session).list_active_for_requests(
+            [record.id]
+        )
+    matching_downloads = active_downloads.get(record.id, [])
+    download_progress = (
+        matching_downloads[0].progress
+        if record.status == "downloading" and len(matching_downloads) == 1
+        else None
+    )
     return RequestResponse(
         id=record.id,
         tmdb_id=record.tmdb_id,
@@ -183,6 +203,7 @@ async def _to_response(
             if seasons is not None
             else None
         ),
+        download_progress=download_progress,
         keep_forever=record.keep_forever,
     )
 
@@ -277,6 +298,13 @@ async def list_requests_endpoint(
     # above, so a non-admin's own visible row is never folded onto a row they
     # cannot see. Underlying rows are untouched (see the helper's docstring).
     records = request_service.fold_requests_for_display(records)
+    # Batch active physical downloads only AFTER actor filtering + display folding.
+    # This preserves the shared-user boundary and gives every visible request a
+    # consistent progress projection without calling the admin-only queue endpoint
+    # or issuing one query per row.
+    active_downloads_by_request = await SqlDownloadRepository(session).list_active_for_requests(
+        [r.id for r in records]
+    )
     # Batch every tv row's season rows in ONE query (avoids an N+1 query per tv
     # request that calling ``_to_response`` per-row without this would cause).
     tv_ids = [r.id for r in records if r.media_type == "tv"]
@@ -290,7 +318,13 @@ async def list_requests_endpoint(
     )
     return RequestListResponse(
         requests=[
-            await _to_response(session, r, seasons_by_request, episode_counts_by_season_id)
+            await _to_response(
+                session,
+                r,
+                seasons_by_request,
+                episode_counts_by_season_id,
+                active_downloads_by_request,
+            )
             for r in records
         ]
     )

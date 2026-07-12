@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { StrictMode, type ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useCancelRequest,
@@ -1015,6 +1015,124 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /request again/i })).toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — one-shot release-preview action', () => {
+  const EMPTY_PREVIEW: SearchPreviewResponse = {
+    accepted: [],
+    rejected: [],
+    no_acceptable_release: true,
+  }
+
+  function baseMocks(requests: RequestResponse[]) {
+    const previewMutation = mutation(EMPTY_PREVIEW)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(previewMutation)
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+    return previewMutation
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('consumes a movie re-search token once across rerenders', async () => {
+    const request: RequestResponse = {
+      id: 71,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const previewMutation = baseMocks([request])
+    const action = { kind: 're-search' as const, requestId: 71, token: 9 }
+    const view = render(
+      <StrictMode>
+        <TitleDetailModal title={TITLE} open onOpenChange={() => {}} action={action} />
+      </StrictMode>,
+    )
+
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 71 }),
+    )
+    expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
+
+    view.rerender(
+      <StrictMode>
+        <TitleDetailModal title={TITLE} open onOpenChange={() => {}} action={action} />
+      </StrictMode>,
+    )
+    await waitFor(() => expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1))
+  })
+
+  it('uses the modal-selected actionable TV season', async () => {
+    const title: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 100,
+      title: 'Test Show',
+      year: 2022,
+      library_state: 'processing',
+    }
+    const request: RequestResponse = {
+      id: 72,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'no_acceptable_release' },
+      ],
+    }
+    const previewMutation = baseMocks([request])
+
+    render(
+      <TitleDetailModal
+        title={title}
+        open
+        onOpenChange={() => {}}
+        action={{ kind: 're-search', requestId: 72, token: 10 }}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 72, season: 2 }),
+    )
+    expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails closed for a shared user even when an action is supplied', async () => {
+    authState.current = {
+      data: {
+        authenticated: true,
+        auth_method: 'plex_session',
+        is_admin: false,
+        user: { is_admin: false },
+      },
+      isLoading: false,
+    }
+    const previewMutation = baseMocks([])
+
+    render(
+      <TitleDetailModal
+        title={TITLE}
+        open
+        onOpenChange={() => {}}
+        action={{ kind: 're-search', requestId: 71, token: 11 }}
+      />,
+    )
+
+    await waitFor(() => expect(previewMutation.mutateAsync).not.toHaveBeenCalled())
   })
 })
 

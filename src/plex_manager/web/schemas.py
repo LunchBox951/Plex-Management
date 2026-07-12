@@ -895,6 +895,11 @@ class RequestResponse(BaseModel):
     # for a movie (movies have no ``SeasonRequest`` rows). ``status`` above is the
     # COMPUTED fold of these (``domain.season_rollup.rollup_status``).
     seasons: list[SeasonStatus] | None = None
+    # Passive projection of the reconciler-refreshed physical download row.
+    # Present only while this request reads ``downloading`` and exactly one active
+    # physical download maps to it. ``None`` means absent or ambiguous (for
+    # example, concurrent TV-season downloads); ``0.0`` is a real known value.
+    download_progress: float | None = None
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` will never
     # select this title (or, for a show, any of its seasons) regardless of watch
     # state or disk pressure. Toggled via ``POST /requests/{id}/keep-forever``.

@@ -9,9 +9,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from plex_manager.models import AuthSession, MediaRequest, MediaType, RequestStatus, User
+from plex_manager.models import AuthSession, Download, MediaRequest, MediaType, RequestStatus, User
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
-from plex_manager.ports.repositories import SeasonRequestRecord
+from plex_manager.ports.repositories import DownloadRecord, SeasonRequestRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.web.deps import hash_session_token
 from tests.web.fakes import FakeLibrary, FakeTmdb, override_adapters
@@ -139,6 +140,71 @@ async def test_shared_user_requests_are_limited_to_their_own_records(
     )
     assert pin.status_code == 403
     assert pin.json()["detail"] == "admin_required"
+
+
+async def test_shared_user_request_progress_is_filtered_with_their_records(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            movies={
+                603: MovieMetadata(tmdb_id=603, title="The Matrix", year=1999),
+                604: MovieMetadata(tmdb_id=604, title="Dark City", year=1998),
+            }
+        ),
+    )
+    shared_cookies, shared_headers = await _shared_user_cookies(app)
+
+    own = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=shared_cookies,
+        headers=shared_headers,
+    )
+    hidden = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 604, "media_type": "movie"},
+        headers=_HEADERS,
+    )
+    assert own.status_code == hidden.status_code == 201
+
+    async with app.state.sessionmaker() as session:
+        own_row = await session.get(MediaRequest, own.json()["id"])
+        hidden_row = await session.get(MediaRequest, hidden.json()["id"])
+        assert own_row is not None and hidden_row is not None
+        own_row.status = RequestStatus.downloading
+        hidden_row.status = RequestStatus.downloading
+        session.add_all(
+            [
+                Download(
+                    torrent_hash="shared-own-progress",
+                    status="downloading",
+                    media_request_id=own_row.id,
+                    media_type=MediaType.movie,
+                    progress=0.42,
+                ),
+                Download(
+                    torrent_hash="admin-hidden-progress",
+                    status="downloading",
+                    media_request_id=hidden_row.id,
+                    media_type=MediaType.movie,
+                    progress=0.91,
+                ),
+            ]
+        )
+        await session.commit()
+
+    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    assert listed.status_code == 200
+    assert listed.json()["requests"] == [
+        {
+            **own.json(),
+            "status": "downloading",
+            "download_progress": 0.42,
+        }
+    ]
 
 
 async def test_shared_user_dedup_claims_unowned_request_into_their_list(
@@ -426,8 +492,10 @@ async def test_list_requests_batches_season_rows_not_one_query_per_tv_row(
 
     batch_calls = {"n": 0}
     per_row_calls = {"n": 0}
+    download_batch_calls = {"n": 0}
     real_batch = SqlSeasonRequestRepository.list_for_requests
     real_per_row = SqlSeasonRequestRepository.list_for_request
+    real_download_batch = SqlDownloadRepository.list_active_for_requests
 
     async def counting_batch(
         self: SqlSeasonRequestRepository, media_request_ids: list[int]
@@ -441,8 +509,15 @@ async def test_list_requests_batches_season_rows_not_one_query_per_tv_row(
         per_row_calls["n"] += 1
         return await real_per_row(self, media_request_id)
 
+    async def counting_download_batch(
+        self: SqlDownloadRepository, media_request_ids: list[int]
+    ) -> dict[int, list[DownloadRecord]]:
+        download_batch_calls["n"] += 1
+        return await real_download_batch(self, media_request_ids)
+
     monkeypatch.setattr(SqlSeasonRequestRepository, "list_for_requests", counting_batch)
     monkeypatch.setattr(SqlSeasonRequestRepository, "list_for_request", counting_per_row)
+    monkeypatch.setattr(SqlDownloadRepository, "list_active_for_requests", counting_download_batch)
 
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
     assert listed.status_code == 200
@@ -450,6 +525,107 @@ async def test_list_requests_batches_season_rows_not_one_query_per_tv_row(
 
     assert batch_calls["n"] == 1
     assert per_row_calls["n"] == 0
+    assert download_batch_calls["n"] == 1
+
+
+async def test_request_download_progress_is_truthful_or_null(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Known zero/42% survive, while missing, ambiguous, and non-downloading
+    projections remain null rather than fabricating an aggregate/default."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with app.state.sessionmaker() as session:
+        known_zero = MediaRequest(
+            tmdb_id=610,
+            media_type=MediaType.movie,
+            title="Known Zero",
+            status=RequestStatus.downloading,
+        )
+        known_42 = MediaRequest(
+            tmdb_id=611,
+            media_type=MediaType.movie,
+            title="Known Forty Two",
+            status=RequestStatus.downloading,
+        )
+        missing = MediaRequest(
+            tmdb_id=612,
+            media_type=MediaType.movie,
+            title="Missing Download",
+            status=RequestStatus.downloading,
+        )
+        ambiguous_tv = MediaRequest(
+            tmdb_id=613,
+            media_type=MediaType.tv,
+            title="Two Seasons",
+            status=RequestStatus.downloading,
+        )
+        not_downloading = MediaRequest(
+            tmdb_id=614,
+            media_type=MediaType.movie,
+            title="Still Searching",
+            status=RequestStatus.searching,
+        )
+        session.add_all([known_zero, known_42, missing, ambiguous_tv, not_downloading])
+        await session.flush()
+        session.add_all(
+            [
+                Download(
+                    torrent_hash="known-zero",
+                    status="downloading",
+                    media_request_id=known_zero.id,
+                    media_type=MediaType.movie,
+                    progress=0.0,
+                ),
+                Download(
+                    torrent_hash="known-42",
+                    status="downloading",
+                    media_request_id=known_42.id,
+                    media_type=MediaType.movie,
+                    progress=0.42,
+                ),
+                Download(
+                    torrent_hash="tv-s1",
+                    status="downloading",
+                    media_request_id=ambiguous_tv.id,
+                    media_type=MediaType.tv,
+                    season=1,
+                    progress=0.25,
+                ),
+                Download(
+                    torrent_hash="tv-s2",
+                    status="downloading",
+                    media_request_id=ambiguous_tv.id,
+                    media_type=MediaType.tv,
+                    season=2,
+                    progress=0.75,
+                ),
+                Download(
+                    torrent_hash="searching-row",
+                    status="downloading",
+                    media_request_id=not_downloading.id,
+                    media_type=MediaType.movie,
+                    progress=0.8,
+                ),
+            ]
+        )
+        await session.commit()
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.status_code == 200
+    by_title = {item["title"]: item["download_progress"] for item in listed.json()["requests"]}
+    assert by_title == {
+        "Known Zero": 0.0,
+        "Known Forty Two": 0.42,
+        "Missing Download": None,
+        "Two Seasons": None,
+        "Still Searching": None,
+    }
+
+    # Single-record responses use the same one-request projection semantics.
+    single = await client.get(f"/api/v1/requests/{known_42.id}", headers=_HEADERS)
+    assert single.status_code == 200
+    assert single.json()["download_progress"] == 0.42
 
 
 # --- Change 1: fold duplicate rows in the requests list ------------------------
