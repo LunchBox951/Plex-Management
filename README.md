@@ -170,11 +170,16 @@ startup — not a replacement for your own backup strategy. Know its limits:
 # -wal sidecar (e.g. after a crash/kill; this is why the automatic backup
 # uses the same API):
 sqlite3 /path/to/volume/plex_manager.db ".backup './backup/plex_manager.db'"
-# The key is the other half of the recovery unit; keep it with the snapshot.
-# secret.key must keep mode 0600 on restore:
+# Key-file (default) deployments: the key is the other half of the recovery
+# unit; keep it with the snapshot (mode 0600 must be preserved on restore):
 cp /path/to/volume/secret.key ./backup/
 chmod 600 ./backup/secret.key
 ```
+
+The key half follows the same disposition rules as the PostgreSQL section
+below: on `PLEX_MANAGER_FERNET_KEY` deployments, skip the `secret.key` copy
+and preserve the env value instead — any leftover `secret.key` in the volume
+is stale and must **not** be saved as the key half.
 
 **Restoring** a SQLite backup: after copying `plex_manager.db` (and `secret.key`,
 per the key-half rules above) back into the volume, remove any stale

@@ -335,6 +335,61 @@ def test_prune_keeps_only_keep_count(tmp_path: Path) -> None:
     assert result.name in remaining
 
 
+def test_repeated_calls_same_pending_from_rev_never_evict_first_backup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding: a failed-migration restart loop must never evict the clean backup.
+
+    Under ``restart: unless-stopped``, a migration that fails midway (some DDL
+    applied, version not yet stamped) re-enters the entrypoint on every restart
+    with the SAME from-revision. The FIRST backup is the genuinely
+    pre-migration snapshot; a retry's snapshot would capture the
+    partially-migrated database while looking newer, and per-restart pruning
+    would eventually evict the clean one. So repeated calls with the same
+    pending from-revision must take at most ONE backup: the first, which is
+    logged as the recovery unit on every retry and is never evicted.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    first = db_backup.create_pre_migration_backup(settings)
+    assert first is not None
+    first_manifest = (first / "MANIFEST.txt").read_bytes()
+
+    # Simulate the partial migration mutating the DB between restarts -- the
+    # retries below must still reuse the first (clean) backup, not re-snapshot.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE half_applied_ddl (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    retries = db_backup._KEEP_COUNT + 3  # pyright: ignore[reportPrivateUsage]
+    with caplog.at_level(logging.WARNING, logger=db_backup.logger.name):
+        for _ in range(retries):
+            assert db_backup.create_pre_migration_backup(settings) is None
+
+    backups_root = data_dir / "backups"
+    remaining = sorted(p.name for p in backups_root.iterdir() if p.is_dir())
+    # Exactly the first backup remains -- no retry snapshots, nothing evicted,
+    # and its contents (including the clean pre-migration snapshot) untouched.
+    assert remaining == [first.name]
+    assert (first / "MANIFEST.txt").read_bytes() == first_manifest
+    copied = sqlite3.connect(f"file:{first / 'plex_manager.db'}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            copied.execute("SELECT id FROM half_applied_ddl").fetchall()
+    finally:
+        copied.close()
+    # Every retry says honestly that the existing backup is the recovery unit.
+    skips = [r for r in caplog.records if "already exists" in r.message]
+    assert len(skips) == retries
+
+
 def test_backup_failure_is_loud_but_nonfatal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

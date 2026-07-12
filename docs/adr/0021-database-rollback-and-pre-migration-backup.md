@@ -83,9 +83,23 @@ database.
   or stale and is deliberately not copied — same reasoning as §6 below), and
   the `MANIFEST.txt` records which disposition applied. The backup directory
   is therefore self-contained only in the key-file disposition.
+- Keeps **at most one backup per from-revision**: when a
+  `pre-migrate-<from-rev>-*` directory already exists for the pending
+  revision, no new snapshot is taken (and nothing is pruned) — the existing
+  directory is logged as the recovery unit. This guards against the
+  `restart: unless-stopped` retry loop of a migration that fails midway (some
+  DDL applied, the version not yet stamped): every restart re-enters with the
+  same from-revision, and a retry's snapshot would capture the
+  **partially-migrated** database while looking newer than the genuinely
+  clean first backup — which per-restart pruning would then eventually
+  evict. The `MANIFEST.txt` restore runbook therefore ends by telling the
+  operator to archive a used backup directory out of `backups/`, so a future
+  upgrade attempt from that same revision takes a fresh snapshot.
 - Prunes to the 5 most recent backup directories (sorted by modification time,
   not by directory name — the name embeds an arbitrary revision hash before
-  the timestamp, which is not chronologically sortable).
+  the timestamp, which is not chronologically sortable). A defensive
+  unknown-head backup never triggers this prune: no pending migration is
+  confirmed in that state, so it must not be able to evict a genuine backup.
 - Is **advisory and best-effort, not a substitute for an operator's own backup
   strategy** — see non-SQLite handling below.
 

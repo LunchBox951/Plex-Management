@@ -7,14 +7,24 @@ snapshots the SQLite database (WAL-consistent, via :func:`sqlite3.Connection.bac
 the Fernet encryption key as **one recovery unit** into
 ``<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/``, alongside a
 human-readable ``MANIFEST.txt`` restore runbook. Backups are pruned to the
-most recent :data:`_KEEP_COUNT` -- EXCEPT a defensive backup taken when the
-migration head could not be determined (see :data:`_UNKNOWN_HEAD`), which is
-written but never triggers a prune. Under ``restart: unless-stopped``, a
-broken image that fails ``alembic upgrade head`` restarts forever, producing
-one such defensive backup per restart; if that path pruned too, enough
-restarts would evict the genuine pre-migration backup guarding the last
-successful migration -- exactly the recovery unit this module exists to
-protect. See :func:`create_pre_migration_backup`.
+most recent :data:`_KEEP_COUNT`, with two guards that both protect the same
+thing -- the one genuinely clean pre-migration snapshot -- from
+``restart: unless-stopped`` retry loops:
+
+1. **At most one backup per from-revision.** A migration that fails midway
+   (some DDL applied, the version not yet stamped) re-enters on every restart
+   with the same from-revision; the first backup is the genuinely
+   pre-migration snapshot, while a retry's snapshot would capture the
+   partially-migrated database *and look newer*. Repeats are therefore
+   skipped (and skip pruning) rather than snapshotted -- so retry backups can
+   neither masquerade as clean recovery units nor feed :func:`_prune` until
+   it evicts the real one.
+2. **A defensive unknown-head backup never triggers a prune** (see
+   :data:`_UNKNOWN_HEAD`): when the head itself cannot be determined, no
+   pending migration is confirmed, so such a backup must not be able to evict
+   a genuine one.
+
+See :func:`create_pre_migration_backup`.
 
 This is advisory, not a replacement for an operator's own backup strategy
 (Postgres deployments are explicitly out of scope -- see :func:`_sqlite_file_path`)
@@ -325,6 +335,12 @@ Restore steps:
      rollback: this backup unit IS the recovery path -- see ADR-0021).
   6. Start the container and verify: sign in, and confirm a stored credential
      (e.g. a configured service) still decrypts correctly.
+  7. Move this backup directory out of <data_dir>/backups/ (keep it as an
+     archive elsewhere). At most ONE backup is kept per from-revision -- so a
+     failed migration's restart loop cannot bury the clean snapshot under
+     partially-migrated retries -- which means a future upgrade attempt from
+     this same database revision will find this directory and skip taking a
+     fresh pre-migration snapshot until it is moved away.
 
 See docs/adr/0021-database-rollback-and-pre-migration-backup.md and the
 README "Backup & recovery" section for the full policy.
@@ -372,8 +388,10 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     """Snapshot the DB + Fernet key as one unit when a migration is pending.
 
     Returns the created backup directory, or ``None`` when no backup was
-    written (non-SQLite backend, no existing database, or already at head --
-    every case is logged honestly so the operator knows why nothing happened).
+    written (non-SQLite backend, no existing database, already at head, or a
+    backup for the same pending from-revision already exists and remains the
+    recovery unit -- every case is logged honestly so the operator knows why
+    nothing happened).
     """
     settings = settings or get_settings()
 
@@ -426,6 +444,37 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     from_label = current or "base"
     backups_root = Path(settings.data_dir) / _BACKUP_SUBDIR
+
+    # At most ONE backup per from-revision. Under ``restart: unless-stopped``,
+    # a migration that fails midway (some DDL applied, the version not yet
+    # stamped) re-enters this function on every restart with the SAME
+    # from-revision. The FIRST backup is the genuinely pre-migration snapshot;
+    # a retry's snapshot would capture the partially-migrated database while
+    # looking newer -- and feeding one new backup per restart into _prune()
+    # would eventually evict the only clean recovery unit. So when a backup for
+    # this from-revision already exists, it IS the recovery unit: take nothing,
+    # prune nothing, and say so honestly. (An operator who deliberately rolled
+    # back and wants a fresh snapshot archives the old directory first -- the
+    # MANIFEST's final restore step says exactly that.)
+    if backups_root.is_dir():
+        existing = sorted(p for p in backups_root.glob(f"{_PREFIX}{from_label}-*") if p.is_dir())
+        if existing:
+            logger.warning(
+                "A pre-migration backup for revision %s already exists (%s): an "
+                "earlier container start already snapshotted this migration's "
+                "pre-state -- most likely the migration failed and the container "
+                "is retrying. That EXISTING backup is the recovery unit; a fresh "
+                "snapshot now could capture a partially-migrated database, so "
+                "none is taken and nothing is pruned. If you deliberately "
+                "restored/rolled back and want a fresh snapshot, move the "
+                "existing pre-migrate-%s-* directories out of %s first.",
+                from_label,
+                existing[-1],
+                from_label,
+                backups_root,
+            )
+            return None
+
     final_name = f"{_PREFIX}{from_label}-{timestamp}"
     dest = backups_root / final_name
     # Build into a ``.tmp-`` staging dir and publish it via an atomic rename only
@@ -455,18 +504,15 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     if is_defensive_unknown_head:
         # Do NOT prune here. This backup was forced because the migration head
         # itself is undeterminable, not because a confirmed pending migration
-        # was found -- under restart: unless-stopped, a broken image that keeps
-        # failing `alembic upgrade head` produces one of these per restart, and
-        # pruning on that cadence could evict the genuine pre-migration backup
-        # that guards the last successful migration. Skipping the prune trades
-        # unbounded disk growth in that (already-broken, operator-visible)
-        # scenario for never silently losing the real recovery unit.
+        # was found -- so it must not be able to evict a genuine pre-migration
+        # backup that guards the last successful migration. (The same-from-rev
+        # dedupe above already bounds a restart loop to at most one such
+        # defensive backup per from-revision.)
         logger.warning(
             "Migration head could not be determined; skipping the post-backup "
             "prune so this defensive backup cannot evict an existing genuine "
-            "pre-migration backup. Backups under %s may accumulate until the "
-            "head can be determined again -- investigate and prune manually "
-            "if disk usage becomes a concern.",
+            "pre-migration backup. Prune %s manually if disk usage becomes a "
+            "concern.",
             dest.parent,
         )
     else:
