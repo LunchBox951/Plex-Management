@@ -653,12 +653,14 @@ def test_download_deadline_helper() -> None:
     t = _NOW
     assert download_deadline(_status(raw_state="metaDL"), t) == t + timedelta(minutes=45)
     assert download_deadline(_status(raw_state="forcedMetaDL"), t) == t + timedelta(minutes=45)
-    # A torrent that HAS reported real activity/progress uses the full download
-    # window, whatever its raw_state maps to (Downloading, or an unmapped future
-    # state via the fallback).
+    # A torrent whose reported activity is OLDER than added_at (e.g. a
+    # resurrected row whose added_at was re-stamped) anchors on added_at —
+    # max(added_at, last_activity) picks added_at.
     assert download_deadline(
         _status(raw_state="downloading", last_activity_unix=1, progress=0.0), t
     ) == t + timedelta(hours=3)
+    # Progress with no reported activity (restart-reset shape) anchors on
+    # added_at too.
     assert download_deadline(
         _status(raw_state="downloading", last_activity_unix=0, progress=0.5), t
     ) == t + timedelta(hours=3)
@@ -667,6 +669,23 @@ def test_download_deadline_helper() -> None:
     ) == t + timedelta(hours=3)
     assert download_deadline(_status(raw_state="uploading"), t) is None
     assert download_deadline(_status(raw_state="error"), t) is None
+
+
+def test_download_deadline_has_activity_anchors_on_last_activity() -> None:
+    # Codex P2 round 2: the stalled-progress heal requires BOTH the row to be
+    # >= 3h old AND the client's last activity to be > 3h stale, so for a
+    # torrent whose last_activity is NEWER than added_at the honest deadline
+    # is last_activity + 3h — anchoring on added_at alone reported a deadline
+    # the heal could not possibly fire at (added 12:00 / active 13:30 showed
+    # 15:00; the heal cannot fire before 16:30).
+    added_at = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    last_activity = datetime(2026, 6, 29, 13, 30, 0, tzinfo=UTC)
+    status = _status(
+        raw_state="downloading",
+        last_activity_unix=int(last_activity.timestamp()),
+        progress=0.4,
+    )
+    assert download_deadline(status, added_at) == last_activity + timedelta(hours=3)
 
 
 def test_download_deadline_zero_activity_mirrors_the_metadata_stall_window() -> None:
@@ -704,9 +723,9 @@ def test_download_deadline_deliberately_idle_states_keep_the_download_window(
 
 
 def test_download_deadline_matches_detect_stalls_self_heal_timing() -> None:
-    # The exact regression Codex flagged: for a zero-seed magnet, the deadline
-    # download_deadline() reports must equal the moment detect_stalls() ACTUALLY
-    # fires — not 2h15m later.
+    # The exact regression Codex flagged (round 1): for a zero-seed magnet, the
+    # deadline download_deadline() reports must equal the moment detect_stalls()
+    # ACTUALLY fires — not 2h15m later.
     added_at = _NOW - timedelta(minutes=44)
     rows = [_row(status=DownloadState.Downloading.value, added_at=added_at)]
     status = _status(raw_state="downloading", last_activity_unix=0, progress=0.0)
@@ -720,4 +739,59 @@ def test_download_deadline_matches_detect_stalls_self_heal_timing() -> None:
     # At the reported deadline: healed.
     assert detect_stalls(rows, [status], now=deadline) == [
         StallDetection(download_id=1, torrent_hash=_HASH, shape="metadata_stall")
+    ]
+
+
+def test_download_deadline_matches_detect_stalls_timing_with_activity() -> None:
+    # Codex P2 round 2 — the has-activity mirror of the cross-check above:
+    # detect_stalls's stalled_progress branch fires only once now -
+    # last_activity EXCEEDS the window (strict >, never "at exactly"), so the
+    # reported deadline is the boundary instant — not healed at or before it,
+    # healed the moment it is genuinely past.
+    added_at = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    last_activity = datetime(2026, 6, 29, 13, 30, 0, tzinfo=UTC)
+    rows = [_row(status=DownloadState.Downloading.value, added_at=added_at)]
+    status = _status(
+        raw_state="downloading",
+        last_activity_unix=int(last_activity.timestamp()),
+        progress=0.4,
+    )
+
+    deadline = download_deadline(status, added_at)
+    assert deadline is not None
+    assert deadline == last_activity + timedelta(hours=3)  # 16:30, not 15:00
+
+    # The old added_at-anchored deadline (15:00) must NOT heal — this is the
+    # exact dishonesty round 2 flagged.
+    assert detect_stalls(rows, [status], now=added_at + timedelta(hours=3)) == []
+    # One minute before the reported deadline: not yet healed.
+    assert detect_stalls(rows, [status], now=deadline - timedelta(minutes=1)) == []
+    # One minute past the reported deadline: healed.
+    assert detect_stalls(rows, [status], now=deadline + timedelta(minutes=1)) == [
+        StallDetection(download_id=1, torrent_hash=_HASH, shape="stalled_progress")
+    ]
+
+
+def test_download_deadline_resurrected_row_anchors_on_added_at_with_old_activity() -> None:
+    # A resurrected row: added_at was re-stamped to now by
+    # grab_service._reuse_terminal_row, but the torrent's last_activity_unix
+    # still reports the ORIGINAL grab's old activity. The heal's binding
+    # constraint is then the row-age gate (elapsed >= window), so the honest
+    # deadline is added_at + 3h — the max() picks the newer added_at.
+    added_at = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    old_activity = datetime(2026, 6, 29, 6, 0, 0, tzinfo=UTC)  # 6h before re-grab
+    rows = [_row(status=DownloadState.Downloading.value, added_at=added_at)]
+    status = _status(
+        raw_state="downloading",
+        last_activity_unix=int(old_activity.timestamp()),
+        progress=0.4,
+    )
+
+    deadline = download_deadline(status, added_at)
+    assert deadline is not None
+    assert deadline == added_at + timedelta(hours=3)
+
+    assert detect_stalls(rows, [status], now=deadline - timedelta(minutes=1)) == []
+    assert detect_stalls(rows, [status], now=deadline) == [
+        StallDetection(download_id=1, torrent_hash=_HASH, shape="stalled_progress")
     ]

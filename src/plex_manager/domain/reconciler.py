@@ -502,16 +502,26 @@ def download_deadline(status: DownloadStatus, added_at: datetime) -> datetime | 
     :data:`_DELIBERATELY_IDLE_RAW_STATES`, ``last_activity_unix <= 0``, and
     ``progress <= 0.0``) -> ALSO ``added_at + METADATA_STALL_WINDOW`` — this
     MUST mirror :func:`detect_stalls`'s own never-had-activity predicate
-    exactly (Codex P2: the two used to disagree, so a zero-seed magnet's
-    ``timeout_at`` showed the 3h ``STALLED_PROGRESS_WINDOW`` deadline while the
-    self-heal actually fired 2h15m earlier, at the 45m metadata window); any
-    OTHER raw_state mapping to ``DownloadState.Downloading`` (including the
-    unknown-state fallback) -> ``added_at + STALLED_PROGRESS_WINDOW``; an
-    ``ImportPending``/``FailedPending`` state -> ``None`` (no download in
-    flight).
+    exactly (Codex P2 round 1: the two used to disagree, so a zero-seed
+    magnet's ``timeout_at`` showed the 3h ``STALLED_PROGRESS_WINDOW`` deadline
+    while the self-heal actually fired 2h15m earlier, at the 45m metadata
+    window); any OTHER raw_state mapping to ``DownloadState.Downloading``
+    (including the unknown-state fallback) with REPORTED activity
+    (``last_activity_unix > 0``) -> ``max(added_at, last_activity) +
+    STALLED_PROGRESS_WINDOW`` — the stalled-progress heal requires BOTH ``now -
+    added_at >= window`` AND ``now - last_activity > window``, so the honest
+    deadline is the LATER of the two anchors plus the window (Codex P2 round 2:
+    anchoring on ``added_at`` alone showed a deadline the heal could not
+    possibly fire at while ``last_activity`` was newer than ``added_at``, e.g.
+    added 12:00 / active 13:30 reported 15:00 when the heal cannot fire before
+    16:30); the residual Downloading-side shapes with no reported activity (a
+    deliberately-idle state, or activity reset by a restart with real bytes on
+    disk) -> ``added_at + STALLED_PROGRESS_WINDOW``; an ``ImportPending``/
+    ``FailedPending`` state -> ``None`` (no download in flight).
 
-    Observability only — :func:`detect_stalls` remains anchored on ``added_at``;
-    this column is never read for control.
+    Observability only — :func:`detect_stalls` remains anchored on the same
+    signals but stays the sole control path; this column is never read for
+    control.
     """
     if status.raw_state in ("metaDL", "forcedMetaDL"):
         return added_at + METADATA_STALL_WINDOW
@@ -528,4 +538,13 @@ def download_deadline(status: DownloadStatus, added_at: datetime) -> datetime | 
         and status.progress <= 0.0
     ):
         return added_at + METADATA_STALL_WINDOW
+    if status.last_activity_unix > 0:
+        # Mirrors the stalled-progress branch of detect_stalls: the heal fires
+        # only once the row is >= window old AND the client's last activity is
+        # > window stale, so the binding constraint — the honest deadline — is
+        # whichever anchor is later. A resurrected row (added_at re-stamped
+        # NEWER than the torrent's old last_activity) is correctly anchored on
+        # added_at by the max().
+        last_activity = datetime.fromtimestamp(status.last_activity_unix, tz=UTC)
+        return max(added_at, last_activity) + STALLED_PROGRESS_WINDOW
     return added_at + STALLED_PROGRESS_WINDOW
