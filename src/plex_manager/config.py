@@ -54,8 +54,11 @@ class Settings(BaseSettings):
     # the settings object; read the raw value with ``.get_secret_value()``.
     fernet_key: SecretStr | None = None
 
-    # Skip the API-key check on protected routes. Development convenience only;
-    # the :stable deployment leaves this False.
+    # Development convenience ONLY; the :stable deployment leaves this False. When
+    # True, authenticate_request()/require_setup_admin() return an anonymous
+    # AuthContext(method=dev_bypass, is_admin=True) BEFORE any session, CSRF,
+    # setup-token, or role/ownership check — every request is a credential-less
+    # administrator. Never enable on a shared or network-reachable listener.
     dev_auth_bypass: bool = False
 
     # Optional hardening: when set, first-run setup additionally requires this

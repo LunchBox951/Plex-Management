@@ -40,7 +40,8 @@ single app — with two differences that define the project:
   files and TV episodes under the configured library root, scan Plex, detect
   existing Plex availability, and surface import-blocked cases for correction.
 - **Operability tools**: health checks, live logs, disk usage, retention
-  settings, and manual or scheduled disk-pressure eviction.
+  settings, and automatic watched-media eviction (default-on, disk-pressure-
+  triggered; see Deploying).
 
 The typed contract for all of this is published at
 [`docs/api/openapi.json`](docs/api/openapi.json) (regenerate with `make openapi`).
@@ -86,11 +87,37 @@ Before starting the container, set `PLEX_MANAGER_MEDIA_ROOT` and
 `PLEX_MANAGER_DOWNLOADS_ROOT` in `.env` to host directories that contain the Plex
 libraries and qBittorrent downloads. They are mounted as `/media` and `/downloads`
 inside the container; the setup wizard paths must use those in-container paths.
+`PLEX_MANAGER_DOWNLOADS_ROOT` additionally serves a second role: Plex Manager
+sends its **literal host value** to qBittorrent as each torrent's save path, so
+qBittorrent must be able to write that exact path — a host qBittorrent writes it
+directly, a separate qBittorrent container must mount the same literal path (e.g.
+`/srv/downloads:/srv/downloads`, not `/srv/downloads:/downloads`), and a remote
+qBittorrent must expose it at the same absolute path. See `.env.example` for the
+per-topology matrix.
 The stock compose file publishes only on `127.0.0.1`. A default install claims
 first-run setup when the first Plex server owner signs in; for extra hardening,
 set `PLEX_MANAGER_SETUP_TOKEN` before starting and send it from the setup UI
 (`X-Setup-Token`). Use an SSH tunnel or reverse proxy for first setup; only set
 `PLEX_MANAGER_HOST_BIND=0.0.0.0` when the host is intentionally exposed.
+
+> **Heads-up — automatic watched-media eviction is ON by default.** To keep a
+> library disk from filling, Plex Manager runs a background eviction sweep
+> (default every 30 min). When a configured movie/TV/anime root crosses **90%**
+> used, it **physically deletes** the library files of titles/seasons that are
+> fully watched, last played more than the **30-day** grace period ago, not
+> pinned, and not in flight, working down to **80%** used. Deleted items become a
+> non-terminal `evicted` status and are **re-requestable** (playback disappears;
+> reacquisition costs time/bandwidth). Unwatched, recently-watched, pinned, and
+> in-flight content is never touched.
+>
+> Controls (all web, no terminal): **Settings → Eviction & logs** tunes the
+> threshold/target percent, grace days, and check interval, toggles **Enable
+> automatic eviction** off entirely, and toggles **Proactive eviction** — an
+> opt-in mode that evicts every eligible title regardless of disk pressure.
+> **Status** previews exactly what a sweep would remove per root and offers a
+> manual **Free space now** sweep. A title's detail modal has a **Keep forever**
+> pin that exempts it from eviction. See
+> [ADR-0012](docs/adr/0012-operability-health-logs-eviction.md).
 
 Each host is *designed* to auto-pull its release channel (the updater mechanism —
 Watchtower vs. a systemd timer — is an open decision and is not bundled in the
@@ -115,10 +142,13 @@ make openapi   # regenerate docs/api/openapi.json from the live app
 ```
 
 For short-lived local API/docs work only,
-`PLEX_MANAGER_DEV_AUTH_BYPASS=true make run` skips both setup-token and auth
-checks. Otherwise the local server supports the same first-run Plex sign-in flow
-as Docker; set `PLEX_MANAGER_SETUP_TOKEN` only when you want the optional
-pre-init hardening token.
+`PLEX_MANAGER_DEV_AUTH_BYPASS=true make run` grants every request an anonymous
+administrator context — it bypasses browser sessions, CSRF, the setup-token, and
+all role/ownership authorization, and setup completion skips the Plex-owner
+identity check. Run it only bound to loopback (the default host); never combine it
+with a shared or network-reachable listener. Otherwise the local server supports
+the same first-run Plex sign-in flow as Docker; set `PLEX_MANAGER_SETUP_TOKEN`
+only when you want the optional pre-init hardening token.
 
 Project layout and conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
