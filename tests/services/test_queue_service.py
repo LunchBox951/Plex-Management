@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -448,6 +449,63 @@ async def test_reconcile_done_marker_release_fault_still_blocklists(
         ).scalar_one()
 
     assert len(blocklist) == 1
+    assert failed.status == "failed"
+
+
+async def test_reconcile_environmental_stamp_execute_failure_is_non_fatal(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #181 (P2): the optional durability stamp's CAS UPDATE -- not only its
+    commit -- must stay best-effort. A transient ``SQLAlchemyError`` (SQLite
+    ``database is locked``) raised during the UPDATE ``execute`` must NOT abort the
+    whole reconcile/import/availability cycle: the environmental release still
+    reaches terminal Failed and stays OFF the blocklist, because this cycle's
+    Phase C still carries the in-memory no-blocklist verdict."""
+    request_id = await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="error")],
+        failure_details={
+            _HASH: FailureDetail(
+                text="file_open: /downloads/.plex_manager/x.mkv, error: Permission denied",
+                source=FailureDetailSource.log,
+            )
+        },
+    )
+
+    # Fail ONLY the environmental durability stamp's execute -- the FIRST
+    # ``update_status_if_in`` carrying the enriched host-side reason (Phase A
+    # never writes ``failed_reason``; the flag stops us from also breaking the
+    # later Phase-C terminal transition, so the rest of the cycle runs normally).
+    real_update = SqlDownloadRepository.update_status_if_in
+    raised = {"done": False}
+
+    async def _raise_on_env_stamp(self: SqlDownloadRepository, *args: Any, **kwargs: Any) -> bool:
+        failed_reason = kwargs.get("failed_reason")
+        is_env_stamp = isinstance(failed_reason, str) and "Permission denied" in failed_reason
+        if not raised["done"] and is_env_stamp:
+            raised["done"] = True
+            raise OperationalError("simulated", {}, Exception("database is locked"))
+        return await real_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlDownloadRepository, "update_status_if_in", _raise_on_env_stamp)
+
+    async with sessionmaker_() as session:
+        # Must NOT raise -- the stamp failure is swallowed to a logged warning.
+        await queue_service.reconcile_and_list(qbt, session)
+
+    assert raised["done"]  # the stamp path was actually exercised
+    async with sessionmaker_() as session:
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+        failed = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+
+    assert blocklist == []
+    assert request is not None
+    assert request.status is RequestStatus.searching
     assert failed.status == "failed"
 
 

@@ -29,9 +29,11 @@ from plex_manager.adapters.qbittorrent import (
 from plex_manager.adapters.qbittorrent.adapter import (
     _HASHES_PER_REQUEST,  # pyright: ignore[reportPrivateUsage]
     _LOG_SCAN_LIMIT,  # pyright: ignore[reportPrivateUsage]
+    _MAX_FAILURE_DETAIL_CHARS,  # pyright: ignore[reportPrivateUsage]
     _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
     SafeFetchNetworkBackend,
 )
+from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
 from plex_manager.ports.download_client import FailureDetailSource
 
 BASE_URL = "http://qbit.local:8080"
@@ -1650,6 +1652,44 @@ async def test_get_failure_detail_keeps_log_entry_at_or_after_added_on() -> None
     assert detail.source is FailureDetailSource.log
 
 
+async def test_get_failure_detail_normalizes_millisecond_log_timestamp_older() -> None:
+    """qBittorrent < 4.5.0 stamps ``/log/main`` timestamps in MILLISECONDS while
+    ``added_on`` is seconds. A stale line from a PRIOR download (its real time
+    before ``added_on``) must still be skipped after unit normalisation -- the
+    unnormalised ms value would dwarf the seconds ``added_on`` and be wrongly
+    kept, re-poisoning the new hash's detail on those versions."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 1_699_000_000_000,  # ms, real time BEFORE added_on
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1_700_000_000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_normalizes_millisecond_log_timestamp_newer() -> None:
+    """The mirror of the older-ms case: a ms-stamped line whose real time is at/
+    after ``added_on`` belongs to THIS instance and is kept after normalisation."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 1_701_000_000_000,  # ms, real time AFTER added_on
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1_700_000_000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is not None
+    assert "Permission denied" in detail.text
+
+
 async def test_get_failure_detail_bounds_scan_to_newest_entries() -> None:
     """The scan is bounded to the newest ``_LOG_SCAN_LIMIT`` rows (highest id)
     WITHOUT sorting the whole log: a match older than that window is not returned
@@ -1739,6 +1779,24 @@ async def test_get_failure_detail_redacts_embedded_url_and_bounds_length() -> No
     assert "SECRET123" not in detail.text
     assert "passkey" not in detail.text
     assert len(detail.text) <= 300
+
+
+async def test_get_failure_detail_preserves_errno_signal_past_cap() -> None:
+    """A ``file_open`` error on a long/nested path can push the errno phrase past
+    :data:`_MAX_FAILURE_DETAIL_CHARS`. The cap must NOT sever it: the classifier
+    still has to read ``Permission denied`` as environmental (issue #181), or a
+    good release gets wrongly blocklisted -- while the total stays bounded."""
+    long_path = "/downloads/.plex_manager/" + "nested_dir/" * 40
+    message = f"Completed.Movie.1080p: file_open: {long_path}x.mkv, error: Permission denied"
+    assert message.index("Permission denied") > _MAX_FAILURE_DETAIL_CHARS  # signal is past the cap
+    log_rows: list[dict[str, Any]] = [{"id": 1, "message": message, "type": 3}]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert len(detail.text) <= _MAX_FAILURE_DETAIL_CHARS
+    assert "Permission denied" in detail.text
+    assert classify_failure_detail(detail.text) is FailureClass.environmental
 
 
 async def test_get_failure_detail_strips_cr_lf_from_log_message() -> None:

@@ -65,6 +65,7 @@ import httpcore
 import httpx
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
+from plex_manager.domain.failure_classification import ENVIRONMENTAL_FAILURE_PATTERNS
 from plex_manager.logsafe import safe_guid, safe_text
 from plex_manager.ports.download_client import (
     AddResult,
@@ -100,6 +101,18 @@ _PROPERTIES_TTL_SECONDS: Final = 30.0
 # ``failed_reason`` column / a log line.
 _LOG_SCAN_LIMIT: Final = 200
 _MAX_FAILURE_DETAIL_CHARS: Final = 300
+# qBittorrent's ``/log/main`` emitted the entry ``timestamp`` in MILLISECONDS on
+# WebAPI/app versions before 4.5.0 and in SECONDS from 4.5.0 on, while
+# ``/torrents/info`` ``added_on`` is ALWAYS Unix-epoch seconds. The log-scan
+# lower-bound compare (below) needs both in the same unit, but this adapter
+# supports the whole 4.1--5.x line and may not always be able to read the
+# client's version -- so we normalise by MAGNITUDE, not by a version gate: a
+# plausible seconds epoch stays below ~1e10 for the next two centuries, while a
+# millisecond epoch has been >= ~1e12 since the year 2001, so any ``timestamp``
+# at/above this threshold is milliseconds and is scaled to seconds. A value in
+# the ambiguous <1e12 range is read as seconds -- correct for every real date a
+# running client would stamp; the whole scan is best-effort regardless.
+_LOG_MS_EPOCH_THRESHOLD: Final = 1_000_000_000_000  # 1e12 == the year 2001 in ms
 # qBittorrent's ``/torrents/trackers`` ``status`` enum: 0 Disabled, 1 Not
 # contacted yet, 2 Working, 3 Updating, 4 Not working. Only 4 carries a
 # meaningful failure ``msg`` (a dead/unregistered torrent, a private-tracker
@@ -430,6 +443,20 @@ def _s(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def _log_entry_epoch_seconds(entry: dict[str, object]) -> int:
+    """Return a ``/log/main`` entry's ``timestamp`` normalised to Unix-epoch
+    SECONDS so it is comparable to ``/torrents/info`` ``added_on``.
+
+    qBittorrent < 4.5.0 stamps this field in milliseconds; :data:`_LOG_MS_EPOCH_THRESHOLD`
+    detects those by magnitude and scales them down. A 0/absent/negative value
+    stays ``0`` -- the caller then simply disables the lower bound (best-effort).
+    """
+    ts = _i(entry.get("timestamp"))
+    if ts >= _LOG_MS_EPOCH_THRESHOLD:
+        return ts // 1000
+    return ts
+
+
 # Matches a URI-shaped substring (``scheme://...`` or a bare ``magnet:...``)
 # embedded in an otherwise free-text qBittorrent log/tracker message -- the
 # rare case a log line quotes the source url/magnet it failed to fetch. A URI
@@ -442,6 +469,43 @@ def _s(value: object, default: str = "") -> str:
 _EMBEDDED_URI_RE: Final = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://\S+|\bmagnet:\S+")
 
 
+def _cap_failure_detail(text: str) -> str:
+    """Cap ``text`` to :data:`_MAX_FAILURE_DETAIL_CHARS` for the persisted
+    ``failed_reason`` / UI WITHOUT severing the host-side signal the service
+    classifies on (issue #181).
+
+    A qBittorrent ``file_open`` error on a long/nested path can push its errno
+    phrase (``Permission denied``, ``No space left on device``, ...) past the
+    cap; a plain head truncation would drop the ONLY thing that tells
+    :func:`classify_failure_detail` the failure was environmental, and a good
+    release would then be wrongly blocklisted. So when the head would lose an
+    :data:`ENVIRONMENTAL_FAILURE_PATTERNS` phrase the full text carries, reserve
+    room and append that phrase -- the result stays within the cap (the head is
+    shortened by exactly the appended length) and the classifier still sees the
+    signal. No environmental phrase past the head -> a plain head cap.
+    """
+    if len(text) <= _MAX_FAILURE_DETAIL_CHARS:
+        return text
+    lowered = text.lower()
+    head_lower = lowered[:_MAX_FAILURE_DETAIL_CHARS]
+    for pattern in ENVIRONMENTAL_FAILURE_PATTERNS:
+        if pattern in head_lower or pattern not in lowered:
+            continue
+        # The phrase lives only beyond the head (or straddles the cap); keep it,
+        # in its real source casing, reserving room so the total never exceeds
+        # the cap.
+        index = lowered.find(pattern)
+        preserved = text[index : index + len(pattern)]
+        marker = "…"
+        head_room = _MAX_FAILURE_DETAIL_CHARS - len(marker) - len(preserved)
+        if head_room <= 0:
+            # Pathological: the phrase alone meets/exceeds the cap. Keep the
+            # bounded phrase so classification still works; drop the head.
+            return preserved[:_MAX_FAILURE_DETAIL_CHARS]
+        return f"{text[:head_room]}{marker}{preserved}"
+    return text[:_MAX_FAILURE_DETAIL_CHARS]
+
+
 def _sanitize_failure_detail(detail: str) -> str:
     """Bound + redact a qBittorrent-sourced free-text detail before it can
     reach the persisted ``failed_reason`` / UI (issue #181, north star #3).
@@ -451,13 +515,15 @@ def _sanitize_failure_detail(detail: str) -> str:
     then redacted token-by-token via ``safe_guid`` (a tracker passkey or
     session token can ride a quoted source url in a log line) with everything
     else -- file paths, the actual error prose -- left byte-identical; finally
-    the whole string is capped to :data:`_MAX_FAILURE_DETAIL_CHARS`. Redaction
-    runs BEFORE truncation so a length cap can never sever a redaction
-    candidate mid-token and leak half a credential.
+    the whole string is capped to :data:`_MAX_FAILURE_DETAIL_CHARS` via
+    :func:`_cap_failure_detail`, which preserves any environmental errno phrase
+    that would otherwise fall past the cap. Redaction runs BEFORE the cap so a
+    length limit can never sever a redaction candidate mid-token and leak half a
+    credential.
     """
     text = safe_text(detail)
     text = _EMBEDDED_URI_RE.sub(lambda match: safe_guid(match.group(0)), text)
-    return text[:_MAX_FAILURE_DETAIL_CHARS]
+    return _cap_failure_detail(text)
 
 
 def _parse_webapi_version(text: str) -> tuple[int, ...]:
@@ -1430,9 +1496,12 @@ class QbittorrentClient:
             # Correlate the match to THIS torrent instance: skip any entry that
             # predates the torrent's ``added_on`` so a stale line from a prior
             # download of the same title cannot drive the new hash's detail /
-            # blocklist decision. A 0/absent ``added_on`` or ``timestamp``
-            # disables only this lower bound (best-effort), never the name match.
-            if added_on > 0 and 0 < _i(entry.get("timestamp")) < added_on:
+            # blocklist decision. The log ``timestamp`` is normalised to seconds
+            # first (qBit < 4.5.0 stamps it in ms) so the compare is unit-safe.
+            # A 0/absent ``added_on`` or ``timestamp`` disables only this lower
+            # bound (best-effort), never the name match.
+            entry_epoch = _log_entry_epoch_seconds(entry)
+            if added_on > 0 and 0 < entry_epoch < added_on:
                 continue
             message = _s(entry.get("message"))
             if message and needle in message.lower():

@@ -1131,17 +1131,25 @@ async def _persist_environmental_reason(
     """
     if completion.observed_failed_reason == completion.event.reason:
         return completion
-    stamped = await download_repo.update_status_if_in(
-        completion.download_id,
-        DownloadState.FailedPending.value,
-        frozenset({DownloadState.FailedPending.value}),
-        failed_reason=completion.event.reason,
-        require_failed_reason=completion.observed_failed_reason,
-    )
-    if not stamped:
-        await session.rollback()
-        return completion
+    # The CAS UPDATE itself -- not only the commit -- must stay non-fatal: this
+    # stamp runs after Phase A and before Phase B, so a transient SQLAlchemyError
+    # raised during ``execute`` (e.g. SQLite ``database is locked``) would
+    # otherwise abort the WHOLE reconcile/import/availability cycle instead of
+    # leaving this one optional durability stamp best-effort. Catch it exactly
+    # like the commit below, rollback, log (never swallow -- north star #3), and
+    # return the untouched completion; this cycle's Phase C still carries the
+    # ``blocklist=False`` verdict in memory.
     try:
+        stamped = await download_repo.update_status_if_in(
+            completion.download_id,
+            DownloadState.FailedPending.value,
+            frozenset({DownloadState.FailedPending.value}),
+            failed_reason=completion.event.reason,
+            require_failed_reason=completion.observed_failed_reason,
+        )
+        if not stamped:
+            await session.rollback()
+            return completion
         await session.commit()
     except SQLAlchemyError:
         await session.rollback()

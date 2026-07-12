@@ -40,7 +40,11 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Final
 
-__all__ = ["FailureClass", "classify_failure_detail"]
+__all__ = [
+    "ENVIRONMENTAL_FAILURE_PATTERNS",
+    "FailureClass",
+    "classify_failure_detail",
+]
 
 
 class FailureClass(StrEnum):
@@ -62,7 +66,14 @@ class FailureClass(StrEnum):
 # vanished from disk out from under an otherwise-healthy torrent is almost
 # always a host/mount problem (a moved/deleted staging dir, an unmounted
 # volume), never something wrong with the RELEASE itself.
-_ENVIRONMENTAL_FAILURE_PATTERNS: Final[tuple[str, ...]] = (
+#
+# Public so the qBittorrent adapter can reuse the SAME allowlist when it caps a
+# long failure detail for storage/UI: the cap must never sever a phrase in this
+# tuple, or the service's :func:`classify_failure_detail` would no longer see the
+# host-side signal and would wrongly blocklist (issue #181). The adapter only
+# PRESERVES the signal through truncation; the blocklist JUDGMENT stays here in
+# the domain / the service that calls it.
+ENVIRONMENTAL_FAILURE_PATTERNS: Final[tuple[str, ...]] = (
     "permission denied",
     "read-only file system",
     "no space left on device",
@@ -78,7 +89,7 @@ def classify_failure_detail(detail: str | None) -> FailureClass:
     """Classify a failed download's (already-enriched) reason/detail text.
 
     ``detail`` is matched case-insensitively against
-    :data:`_ENVIRONMENTAL_FAILURE_PATTERNS`; the first match wins.
+    :data:`ENVIRONMENTAL_FAILURE_PATTERNS`; the first match wins.
     ``None`` or an empty string (no detail could be fetched/enriched, or the
     client had nothing further to say beyond the bare raw-state reason) — and
     any detail matching none of the patterns — is
@@ -88,7 +99,7 @@ def classify_failure_detail(detail: str | None) -> FailureClass:
     if not detail:
         return FailureClass.release_fault
     lowered = detail.lower()
-    for pattern in _ENVIRONMENTAL_FAILURE_PATTERNS:
+    for pattern in ENVIRONMENTAL_FAILURE_PATTERNS:
         if pattern in lowered:
             return FailureClass.environmental
     return FailureClass.release_fault
