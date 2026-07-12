@@ -106,14 +106,25 @@ function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () 
           <StatusBadge status={requestStatus(request.status)} />
           {request.media_type === 'tv' && request.seasons && request.seasons.length > 0 ? (
             <ul className="flex flex-wrap justify-end gap-1">
-              {request.seasons.map((season) => (
-                <li key={season.season_number}>
-                  <StatusBadge
-                    status={requestStatus(season.status)}
-                    detail={`S${season.season_number}`}
-                  />
-                </li>
-              ))}
+              {request.seasons.map((season) => {
+                // Episode-level fallback progress (ADR-0018, issue #178): "N/M"
+                // while a whole-season request is partially assembled from a mix
+                // of pack/episode grabs. Both counts are null for a season the
+                // fallback has never touched (the common clean-pack-import case)
+                // or once N reaches M (the badge degrades to the plain "Sxx" —
+                // the status itself already reads completed/available then).
+                const { imported_episode_count: imported, target_episode_count: target } =
+                  season
+                const detail =
+                  target != null && imported != null && imported < target
+                    ? `S${season.season_number} ${imported}/${target}`
+                    : `S${season.season_number}`
+                return (
+                  <li key={season.season_number}>
+                    <StatusBadge status={requestStatus(season.status)} detail={detail} />
+                  </li>
+                )
+              })}
             </ul>
           ) : null}
         </div>
