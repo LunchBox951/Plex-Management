@@ -8,10 +8,12 @@ environment variables.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic import SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import SecretStr, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -97,7 +99,33 @@ class Settings(BaseSettings):
     # by the client itself.
     trusted_proxy_hops: int = 0
 
+    # Extra HTTP Host names trusted beyond the always-trusted set (``localhost``
+    # plus any loopback/private-range/link-local IP literal — see
+    # ``web.trusted_host``). Populate this when a reverse proxy forwards a public
+    # hostname; a bare browser only ever sends an IP-literal ``Host`` when it
+    # connected to that literal address directly, so IP literals in those ranges
+    # cannot be a DNS-rebinding target and need no configuration. The literal
+    # ``"*"`` disables Host validation entirely (discouraged; documented escape
+    # hatch for unusual topologies). Comma-separated in the environment
+    # (``PLEX_MANAGER_ALLOWED_HOSTS=plexmgr.example.com,media.lan``); stored
+    # lowercased.
+    # NoDecode: pydantic-settings would otherwise try to JSON-decode this
+    # (it's a "complex" tuple type) before our validator ever sees the raw
+    # comma-separated env string, and fail on plain text. NoDecode hands the
+    # validator the raw string untouched.
+    allowed_hosts: Annotated[tuple[str, ...], NoDecode] = ()
+
     log_level: str = "INFO"
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def _split_allowed_hosts(cls, value: str | Sequence[str] | None) -> tuple[str, ...]:
+        """Accept a comma-separated env string (no JSON list required)."""
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return tuple(host.strip().lower() for host in value.split(",") if host.strip())
+        return tuple(host.strip().lower() for host in value if host.strip())
 
 
 @lru_cache
