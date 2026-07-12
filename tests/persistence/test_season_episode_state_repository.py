@@ -10,6 +10,7 @@ import itertools
 from datetime import date
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.models import (
@@ -135,6 +136,61 @@ async def test_upsert_target_retires_pending_rows_tmdb_no_longer_reports_aired(
 
     rows = await repo.list_for_season(season_request_id)
     assert {r.episode_number for r in rows} == {1, 2}
+
+
+async def test_upsert_target_retraction_loses_race_to_concurrent_import_promotion(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2 fix (issue #178 review round 4): the stale-pending retirement is a
+    GUARDED DB-side delete (``WHERE status = 'pending'``), not an ORM/PK delete
+    from the snapshot. Import and the airing refresh run in separate background
+    tasks, so a concurrent import can promote the row to ``imported`` between
+    the snapshot read and the delete -- the lost race must leave the
+    just-imported row intact (never retire real content)."""
+    season_request_id = await _make_season(session)
+    download_id = await _make_download(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    await repo.upsert_target(season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8)})
+
+    real_snapshot = (
+        SqlSeasonEpisodeStateRepository._existing_by_episode  # pyright: ignore[reportPrivateUsage]
+    )
+
+    async def _snapshot_then_lose_race(
+        self: SqlSeasonEpisodeStateRepository, sr_id: int
+    ) -> dict[int, SeasonEpisodeState]:
+        snapshot = await real_snapshot(self, sr_id)
+        # The interleave: AFTER the snapshot (which still reads episode 2 as
+        # ``pending``) but BEFORE the retirement delete runs, a concurrent
+        # import promotes episode 2 to ``imported`` at the database.
+        await self._session.execute(  # pyright: ignore[reportPrivateUsage]
+            update(SeasonEpisodeState)
+            .where(
+                SeasonEpisodeState.season_request_id == sr_id,
+                SeasonEpisodeState.episode_number == 2,
+            )
+            .values(status=EpisodeState.imported, grabbed_download_id=download_id)
+            .execution_options(synchronize_session=False)
+        )
+        return snapshot
+
+    monkeypatch.setattr(
+        SqlSeasonEpisodeStateRepository, "_existing_by_episode", _snapshot_then_lose_race
+    )
+    # TMDB retracted episode 2 -- the refresh would retire its (stale-pending)
+    # row, but the concurrent import above wins the race.
+    await repo.upsert_target(season_request_id, {1: date(2026, 1, 1)})
+    monkeypatch.undo()
+
+    session.expire_all()  # drop stale identity-map state; re-read from the DB
+    rows = await repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r for r in rows}
+    # THE pin: the just-imported row SURVIVED the retirement (pre-fix, the
+    # ORM/PK delete removed it and lost the only imported breadcrumb).
+    assert set(by_episode) == {1, 2}
+    assert by_episode[2].status == "imported"
+    assert by_episode[2].grabbed_download_id == download_id
 
 
 async def test_upsert_target_retraction_never_touches_grabbed_or_imported_rows(

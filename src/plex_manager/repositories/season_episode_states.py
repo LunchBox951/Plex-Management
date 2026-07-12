@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import Download, EpisodeState, SeasonEpisodeState
@@ -112,9 +112,29 @@ class SqlSeasonEpisodeStateRepository:
         # round-1 adopted baseline, which is ``imported``) and is kept even if
         # TMDB retracts the episode: completeness counts imported rows, so a
         # kept row can never wedge the season the way a stale pending one does.
+        #
+        # The retirement is a GUARDED, DB-side delete (round-4 P2): import and
+        # the airing refresh run in separate background tasks, so a concurrent
+        # import can promote this row to ``imported`` between the snapshot read
+        # above and this delete -- an ORM instance/PK delete would then remove a
+        # just-imported row, violating the invariant. ``WHERE status = pending``
+        # makes the DATABASE re-verify at write time (the same CAS discipline as
+        # every other race guard in this table); a lost race deletes nothing and
+        # the promoted row survives. ``synchronize_session=False``: the stale
+        # in-session snapshot instance must NOT be evaluated against the
+        # criteria (its stale ``pending`` would wrongly expunge the surviving
+        # row from the identity map); nothing re-reads these instances afterward
+        # and the caller's commit expires them.
         for episode_number, row in existing.items():
             if episode_number not in aired and row.status == EpisodeState.pending:
-                await self._session.delete(row)
+                await self._session.execute(
+                    delete(SeasonEpisodeState)
+                    .where(
+                        SeasonEpisodeState.id == row.id,
+                        SeasonEpisodeState.status == EpisodeState.pending,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
         await self._session.flush()
 
     async def mark_grabbed(

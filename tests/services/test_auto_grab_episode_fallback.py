@@ -151,9 +151,13 @@ async def test_episode_fallback_search_shares_the_per_cycle_search_budget(
     (``decision_service.preview_episode_fallback``) must be counted against the
     SAME ``max_searches`` per-cycle budget Pass 1 spends from, not an extra
     uncounted search. With ``max_searches=1``, Pass 1's single search for this
-    scope already exhausts the budget, so Pass 2 must skip its OWN search
-    entirely -- the scope falls through to the normal park, un-searched, and is
-    retried next cycle.
+    scope already exhausts the budget, so Pass 2 must skip its OWN search.
+
+    Round-4 P2 refinement: a budget-only skip must NOT park -- the fallback was
+    never searched, so a ``no_acceptable_release`` verdict would be a lie about
+    a search that never ran, and its backoff would delay a genuinely-missing
+    episode by at least the first rung. The scope is left EXACTLY as it was
+    (still due, backoff ladder untouched) and retried next cycle.
     """
     request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=2009)
     qbt = FakeQbittorrent()
@@ -171,17 +175,103 @@ async def test_episode_fallback_search_shares_the_per_cycle_search_budget(
     assert result.searched == 1  # Pass 1's search only -- Pass 2's was skipped
     assert result.grabbed == 0
     assert result.season_episode_fallback_grabs == 0
-    assert result.no_acceptable == 1
+    assert result.no_acceptable == 0  # a budget skip is NOT a nothing-acceptable verdict
     # Exactly one Prowlarr search reached the indexer this cycle -- Pass 2 never
     # issued its own ``preview_episode_fallback`` search.
     assert len(prowlarr.searched) == 1
     async with sessionmaker_() as session:
         season = await session.get(SeasonRequest, season_id)
         assert season is not None
+        # Left exactly as it was: still due next cycle, no park, no backoff.
+        assert season.status == RequestStatus.pending
+        assert season.next_search_at is None
+        assert season.search_attempts == 0
+        parent = await session.get(MediaRequest, request_id)
+        assert parent is not None
+        assert parent.status == RequestStatus.pending
+
+
+async def test_fallback_searched_and_empty_still_parks(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The counterpart of the budget-skip test (round-4 P2, "test both"): when
+    the fallback search ACTUALLY RAN and accepted nothing (episodes genuinely
+    missing, nothing acceptable on the indexer), the honest
+    ``no_acceptable_release`` park with backoff is still correct."""
+    request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=2013)
+    qbt = FakeQbittorrent()
+    prowlarr = _PerTmdbProwlarr({2013: []})  # searched, nothing found at all
+    metadata = FakeTmdb(
+        season_episodes={(2013, 1): [EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1))]}
+    )
+
+    result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata)
+
+    assert result.searched == 2  # Pass 1 AND Pass 2 both really searched
+    assert result.no_acceptable == 1
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
         assert season.status == RequestStatus.no_acceptable_release
+        assert season.next_search_at is not None  # backoff scheduled by a REAL verdict
+        assert season.search_attempts == 1
         parent = await session.get(MediaRequest, request_id)
         assert parent is not None
         assert parent.status == RequestStatus.no_acceptable_release
+
+
+async def test_fallback_completes_season_when_retraction_empties_the_missing_set(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2 regression (issue #178 review round 4): the retraction-empties-missing
+    shape. A partial import re-armed the season while episode 3 was still
+    pending; TMDB then retracted episode 3. This cycle's Pass-2 refresh retires
+    the stale pending row, leaving every currently-aired target episode ({1, 2})
+    imported and nothing in flight -- NO future import is coming to complete the
+    season. Pre-fix it fell through to an honest-looking but WRONG
+    ``no_acceptable_release`` park (frozen there forever); it must instead
+    complete via the same rollup path an import-completion uses.
+    """
+    request_id, season_id = await _seed_tv_season(
+        sessionmaker_, tmdb_id=2012, status=RequestStatus.searching
+    )
+    await _seed_imported_episode(sessionmaker_, season_id, 1)
+    await _seed_imported_episode(sessionmaker_, season_id, 2)
+    async with sessionmaker_() as session:
+        # The stale pending row from an earlier refresh, before TMDB retracted 3.
+        repo = SqlSeasonEpisodeStateRepository(session)
+        await repo.upsert_target(
+            season_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    prowlarr = _PerTmdbProwlarr({2012: []})  # Pass 1 finds nothing -> Pass 2 runs
+    metadata = FakeTmdb(
+        season_episodes={
+            (2012, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+                # Episode 3 retracted -- no longer reported at all.
+            ]
+        }
+    )
+
+    result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata)
+
+    assert result.no_acceptable == 0  # completed, never parked
+    assert result.grabbed == 0
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.completed
+        parent = await session.get(MediaRequest, request_id)
+        assert parent is not None
+        assert parent.status == RequestStatus.completed
+        repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await repo.list_for_season(season_id)
+    # The retracted episode's stale pending row was retired by the refresh.
+    assert {r.episode_number: r.status for r in rows} == {1: "imported", 2: "imported"}
 
 
 async def test_pack_first_wins_metadata_never_consulted(sessionmaker_: SessionMaker) -> None:

@@ -72,7 +72,7 @@ from plex_manager.domain.season_pack import (
     SeasonPackSeasonState,
     episode_numbers,
 )
-from plex_manager.logsafe import safe_guid, safe_text
+from plex_manager.logsafe import safe_guid, safe_int, safe_text
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -422,8 +422,10 @@ class _EpisodeFallbackOutcome:
     ``settled`` mirrors the Pass-1 grab loop's ``park_scope`` convention inverted:
     ``True`` means the scope must NOT be parked this cycle (a grab happened, or a
     per-scope refusal/operational failure settled it some other way); ``False``
-    means "found nothing, fall through to the normal park" (target unknown, no
-    missing episodes, nothing accepted, or every accepted release was ungrabbable).
+    means "found nothing, fall through to the normal park" (target unknown, an
+    empty aired target, nothing accepted, or every accepted release was
+    ungrabbable). A fully-imported NON-empty target is ``settled=True`` instead:
+    the season is completed, not parked (round-4 P2).
 
     ``searched`` (P2 fix, issue #178 review) is whether this call actually issued
     a Prowlarr search (:func:`decision_service.preview_episode_fallback`) -- the
@@ -431,6 +433,14 @@ class _EpisodeFallbackOutcome:
     spends from, so a scope's fallback attempt skipped because the budget was
     already exhausted this cycle reports ``searched=False`` and never inflates
     the count.
+
+    ``budget_skipped`` (P2 fix, issue #178 review round 4) is the third verdict:
+    the fallback was NEVER SEARCHED because the per-cycle budget was already
+    exhausted. The caller must neither park (a "no acceptable release" verdict
+    would be a lie about a search that never ran, and its backoff would delay a
+    genuinely missing episode by at least the first rung) nor treat the scope as
+    settled -- it is left EXACTLY as it was (due, backoff untouched) and simply
+    retried next cycle.
     """
 
     settled: bool
@@ -438,6 +448,7 @@ class _EpisodeFallbackOutcome:
     grab_error: GrabError | None = None
     source_failures: int = 0
     searched: bool = False
+    budget_skipped: bool = False
 
 
 async def _attempt_episode_fallback(
@@ -466,14 +477,19 @@ async def _attempt_episode_fallback(
        ``TmdbAuthError``) means "target unknown this cycle" -- logged, no grab,
        fall through to the normal park (never a guessed target).
     2. Compute the still-missing aired episodes (target minus imported minus any
-       in-flight download). Empty -> nothing to fetch, fall through to the normal
-       park (an honest "nothing acceptable" is correct when nothing is missing).
+       in-flight download). Empty with a NON-empty target and no racing active
+       download -> the aired target is fully imported (e.g. the refresh just
+       retired a retracted episode's pending row): COMPLETE the season via the
+       same rollup path an import-completion uses (round-4 P2) -- never park a
+       season that is actually done. Empty with an EMPTY target -> nothing to
+       fetch, fall through to the normal park.
     3. If the per-cycle Prowlarr search budget (``searched``/``max_searches``,
        the SAME counters Pass 1 spends from) is already exhausted, skip the
-       search entirely -- fall through to the normal park (P2 fix, issue #178
-       review: previously this fallback search was uncounted, letting a cycle
-       issue up to 2x ``max_searches`` Prowlarr searches). The scope stays due
-       and is retried next cycle.
+       search entirely and report ``budget_skipped`` (round-4 P2): the caller
+       leaves the scope due with its backoff untouched -- never a park verdict
+       about a search that never ran. (P2 fix, issue #178 review: previously
+       this fallback search was uncounted, letting a cycle issue up to 2x
+       ``max_searches`` Prowlarr searches.)
     4. Search + decide via :func:`decision_service.preview_episode_fallback`
        (``prefer_season_pack=False``, the engine's ``episode_subset`` gate set to
        the missing set). Try the accepted releases in rank order exactly like the
@@ -514,9 +530,9 @@ async def _attempt_episode_fallback(
             "this cycle, falling through to the normal park",
             type(exc).__name__,
             extra={
-                "request_id": scope.request_id,
-                "season": season,
-                "tmdb_id": scope.tmdb_id,
+                "request_id": safe_int(scope.request_id),
+                "season": safe_int(season),
+                "tmdb_id": safe_int(scope.tmdb_id),
             },
         )
         return _EpisodeFallbackOutcome(settled=False)
@@ -546,20 +562,58 @@ async def _attempt_episode_fallback(
         target=target,
     )
     if not missing:
+        # P2 fix (issue #178 review round 4): an EMPTY missing set with a
+        # non-empty target means every currently-aired target episode is already
+        # imported -- most notably after ``refresh_target`` above just RETIRED
+        # the only outstanding pending row (a TMDB retraction/delay). No future
+        # import is coming to complete the season, so falling through to the
+        # normal park would freeze a genuinely-complete season in
+        # ``no_acceptable_release`` forever. Complete it instead, via the SAME
+        # rollup path an import-completion uses (``mark_completed`` -> the
+        # availability cycle later confirms/promotes), after re-checking no
+        # download raced in (``compute_missing`` folds an active download into
+        # the "not missing" arithmetic, and completing an in-flight season would
+        # be premature -- the import that lands it completes it honestly).
+        # Consistent with the import-side stale-grabbed exclusion (round 3):
+        # ``compute_missing`` counts only IMPORTED rows, so a stale grabbed
+        # breadcrumb inside the aired target keeps the episode in ``missing``
+        # and the fallback keeps searching for it -- this branch fires only
+        # when the aired target is truly covered by imports.
+        # An EMPTY target (nothing aired yet) keeps the pre-existing park
+        # fall-through: there is nothing to complete.
+        if (
+            target
+            and await download_repo.find_active_for_request(scope.request_id, season=season) is None
+        ):
+            await season_request_service.mark_completed(
+                session, media_request_id=scope.request_id, season_number=season
+            )
+            await session.commit()
+            cooldowns.pop(scope_key, None)
+            _logger.info(
+                "auto-grab: episode-fallback found the aired target fully imported "
+                "(target shrank to the imported set); completing the season instead "
+                "of parking it",
+                extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
+            )
+            return _EpisodeFallbackOutcome(settled=True)
         return _EpisodeFallbackOutcome(settled=False)
 
     if searched >= max_searches:
         # Budget already exhausted by Pass 1 (and/or earlier scopes' Pass-2
         # fallbacks) this cycle -- P2 fix (issue #178 review): skip the search
-        # rather than issuing an uncounted extra Prowlarr hit. The scope stays
-        # due (falls through to the normal park, un-parked if a racing writer
-        # already resolved it) and is retried next cycle.
+        # rather than issuing an uncounted extra Prowlarr hit. Reported as
+        # ``budget_skipped`` (round-4 P2), NOT ``settled=False``: the fallback
+        # was never searched, so the caller must not park the season as
+        # ``no_acceptable_release`` (a verdict about a search that never ran)
+        # or advance its backoff ladder -- the scope is left exactly as it was,
+        # still due, and retried next cycle.
         _logger.info(
             "auto-grab: episode-fallback search skipped (per-cycle Prowlarr "
             "search budget exhausted); leaving scope for a later cycle",
-            extra={"request_id": scope.request_id, "season": season},
+            extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
         )
-        return _EpisodeFallbackOutcome(settled=False)
+        return _EpisodeFallbackOutcome(settled=False, budget_skipped=True)
 
     fb_result = await decision_service.preview_episode_fallback(
         prowlarr,
@@ -606,7 +660,7 @@ async def _attempt_episode_fallback(
             _logger.warning(
                 "auto-grab: episode-fallback grab refused (%s); leaving scope for a later cycle",
                 type(exc).__name__,
-                extra={"request_id": scope.request_id, "season": season},
+                extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
             )
             return _EpisodeFallbackOutcome(settled=True, searched=True)
         except GrabError as exc:
@@ -627,7 +681,7 @@ async def _attempt_episode_fallback(
                 type(exc).__name__,
                 prior_failures + 1,
                 delay,
-                extra={"request_id": scope.request_id, "season": season},
+                extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
             )
             return _EpisodeFallbackOutcome(settled=True, grab_error=exc, searched=True)
         except QbittorrentSourceError as exc:
@@ -644,13 +698,13 @@ async def _attempt_episode_fallback(
                 safe_text(scored.candidate.indexer_name),
                 safe_guid(scored.candidate.guid),
                 safe_text(scored.candidate.info_hash) if scored.candidate.info_hash else "-",
-                season,
+                safe_int(season),
                 attempt,
                 len(fb_candidates),
                 extra={
-                    "request_id": scope.request_id,
-                    "tmdb_id": scope.tmdb_id,
-                    "season": season,
+                    "request_id": safe_int(scope.request_id),
+                    "tmdb_id": safe_int(scope.tmdb_id),
+                    "season": safe_int(season),
                     "source_title": safe_text(scored.candidate.title),
                     "indexer": safe_text(scored.candidate.indexer_name),
                     "guid": safe_guid(scored.candidate.guid),
@@ -672,7 +726,7 @@ async def _attempt_episode_fallback(
                 type(exc).__name__,
                 attempt,
                 len(fb_candidates),
-                extra={"request_id": scope.request_id},
+                extra={"request_id": safe_int(scope.request_id)},
             )
     return _EpisodeFallbackOutcome(settled=False, source_failures=source_failures, searched=True)
 
@@ -1258,6 +1312,14 @@ async def run_grab_cycle(
                 # uncounted, letting a cycle double the intended load on a
                 # rate-limited indexer).
                 searched += 1
+            if fb_outcome.budget_skipped:
+                # Round-4 P2: the fallback was never searched (per-cycle budget
+                # exhausted), so a park would write a "no acceptable release"
+                # verdict about a search that never ran AND advance the backoff
+                # ladder, delaying a genuinely-missing episode by at least the
+                # first rung. Leave the scope exactly as it was -- still due,
+                # backoff untouched -- and retry next cycle.
+                park_scope = False
             if fb_outcome.settled:
                 park_scope = False
                 if fb_outcome.grabbed:
