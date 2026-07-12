@@ -7,7 +7,8 @@ import type {
   PlexServersResponse,
   ServiceValidateResponse,
 } from '../api/types'
-import { SetupWizard } from './SetupWizard'
+import { toApiError } from '../lib/errors'
+import { SetupWizard, WIZARD_STEPS } from './SetupWizard'
 
 const h = vi.hoisted(() => ({
   validate: vi.fn(), // useValidateService — prowlarr/qbittorrent/tmdb cards
@@ -17,6 +18,7 @@ const h = vi.hoisted(() => ({
   authMeRefetch: vi.fn(),
   setSetupToken: vi.fn(),
   clearSetupToken: vi.fn(),
+  toast: vi.fn(),
   authenticated: false,
   servers: { servers: [] } as PlexServersResponse,
   initialized: false,
@@ -57,7 +59,7 @@ vi.mock('../lib/apiKey', () => ({
 }))
 
 vi.mock('../components/ui/toast', () => ({
-  useToast: () => ({ toast: vi.fn() }),
+  useToast: () => ({ toast: h.toast }),
 }))
 
 vi.mock('react-router-dom', async () => {
@@ -113,6 +115,7 @@ function resetMocks() {
   h.authMeRefetch.mockReset()
   h.setSetupToken.mockReset()
   h.clearSetupToken.mockReset()
+  h.toast.mockReset()
   h.authenticated = false
   h.servers = { servers: [] }
   h.initialized = false
@@ -124,21 +127,77 @@ function resetMocks() {
 async function reachServices() {
   render(<SetupWizard />, { wrapper: Wrapper })
   fireEvent.click(await screen.findByRole('button', { name: /verify server/i }))
-  await screen.findByText('Plex: http://127.0.0.1:32400 — verified ✓')
+  await screen.findByText('Plex server verified ✓')
+}
+
+async function validateAllServices() {
+  for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
+    fireEvent.click(button)
+  }
+  await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled())
+}
+
+/** Follow the real service-validation gate so a test lands on Libraries. */
+async function reachLibraries() {
+  await reachServices()
+  await validateAllServices()
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('heading', { level: 1, name: 'Confirm library roots' })
 }
 
 describe('SetupWizard — step machine', () => {
   beforeEach(resetMocks)
 
+  it('renders the ordered five-step progress as non-interactive status', () => {
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    const progress = screen.getByRole('list', { name: 'Setup progress' })
+    const items = within(progress).getAllByRole('listitem')
+    expect(items).toHaveLength(WIZARD_STEPS.length)
+    WIZARD_STEPS.forEach((step, index) => {
+      expect(within(items[index]!).getByText(step.label)).toBeInTheDocument()
+      expect(within(items[index]!).getByText(String(index + 1))).toBeInTheDocument()
+    })
+    expect(items[0]).toHaveAttribute('aria-current', 'step')
+    expect(within(progress).queryByRole('button')).not.toBeInTheDocument()
+    expect(within(progress).queryByRole('link')).not.toBeInTheDocument()
+  })
+
+  it('keeps every approved heading and intro to one sentence with no exclamation mark', () => {
+    for (const metadata of WIZARD_STEPS) {
+      expect(metadata.heading).not.toContain('!')
+      expect(metadata.description).not.toContain('!')
+      expect(metadata.description.match(/[.!?]/g)).toHaveLength(1)
+    }
+  })
+
+  it('redirects an already initialized direct visit instead of reopening setup', () => {
+    h.initialized = true
+    render(<SetupWizard />, { wrapper: Wrapper })
+
+    expect(screen.queryByText('First-run setup')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1 })).not.toBeInTheDocument()
+  })
+
   it('shows the Plex sign-in first on a fresh, unauthenticated install', () => {
     render(<SetupWizard />, { wrapper: Wrapper })
 
+    expect(screen.getByRole('heading', { level: 1, name: 'Sign in with Plex' })).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'Plex is the identity provider, so the server owner administers Plex Manager and shared users get request access automatically.',
+      ),
+    ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /sign in with plex/i })).toBeInTheDocument()
     // No access-key link pre-init (the wizard passes only onSignedIn).
     expect(screen.queryByRole('button', { name: /use access key/i })).not.toBeInTheDocument()
     // Neither the server picker nor the service cards are reachable yet.
     expect(screen.queryByLabelText('Plex server')).not.toBeInTheDocument()
     expect(screen.queryByText('Prowlarr')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { level: 1, name: 'Pick your server' }),
+    ).not.toBeInTheDocument()
   })
 
   it('advances to the server picker once authenticated, listing owned servers', () => {
@@ -147,13 +206,33 @@ describe('SetupWizard — step machine', () => {
     render(<SetupWizard />, { wrapper: Wrapper })
 
     expect(screen.queryByRole('button', { name: /sign in with plex/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Pick your server' })).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'Choose one of the servers your Plex account can reach, with local connections preferred.',
+      ),
+    ).toBeInTheDocument()
     const select = screen.getByLabelText('Plex server')
     expect(
       within(select).getByText('Apollo — http://127.0.0.1:32400 (local, reachable)'),
     ).toBeInTheDocument()
   })
 
-  it('verifying a picked server advances to the services step and shows the summary + change link', async () => {
+  it('focuses the Server heading when owner authentication changes the active step', () => {
+    const { rerender } = render(<SetupWizard />, { wrapper: Wrapper })
+    expect(screen.getByRole('heading', { level: 1, name: 'Sign in with Plex' })).not.toHaveFocus()
+
+    h.authenticated = true
+    h.servers = SERVERS
+    rerender(<SetupWizard />)
+
+    expect(screen.getByRole('heading', { level: 1, name: 'Pick your server' })).toHaveFocus()
+    expect(
+      screen.queryByRole('heading', { level: 1, name: 'Sign in with Plex' }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('verifying a picked server advances to Services with checked prior steps and numbered future steps', async () => {
     h.authenticated = true
     h.servers = SERVERS
     h.validatePlex.mockResolvedValue(plexVerifyOk([movieLibrary, tvLibrary]))
@@ -164,18 +243,36 @@ describe('SetupWizard — step machine', () => {
     await waitFor(() =>
       expect(h.validatePlex).toHaveBeenCalledWith({ url: 'http://127.0.0.1:32400' }),
     )
-    expect(await screen.findByText('Plex: http://127.0.0.1:32400 — verified ✓')).toBeInTheDocument()
+    expect(await screen.findByText('Plex server verified ✓')).toBeInTheDocument()
+    expect(screen.queryByText(/127\.0\.0\.1:32400/)).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Connect services' })).toHaveFocus()
+    expect(
+      screen.getByText(
+        'Prowlarr finds releases and qBittorrent downloads them, so both must be validated before you continue.',
+      ),
+    ).toBeInTheDocument()
     expect(screen.getByText('Prowlarr')).toBeInTheDocument()
     // The Plex card itself is gone from the services step.
     expect(screen.queryByLabelText('Plex token')).not.toBeInTheDocument()
 
-    // "Change" returns to the server step.
-    fireEvent.click(screen.getByRole('button', { name: /change/i }))
+    const progress = screen.getByRole('list', { name: 'Setup progress' })
+    const items = within(progress).getAllByRole('listitem')
+    expect(items[0]).toHaveAccessibleName('Sign in, completed')
+    expect(items[1]).toHaveAccessibleName('Server, completed')
+    expect(within(items[0]!).getByText('✓')).toBeInTheDocument()
+    expect(within(items[1]!).getByText('✓')).toBeInTheDocument()
+    expect(items[2]).toHaveAttribute('aria-current', 'step')
+    expect(within(items[3]!).getByText('4')).toBeInTheDocument()
+    expect(within(items[4]!).getByText('5')).toBeInTheDocument()
+
+    // The footer Back action returns through the existing changeServer path.
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
     expect(screen.getByLabelText('Plex server')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Pick your server' })).toHaveFocus()
   })
 })
 
-describe('SetupWizard — services (library roots + completion)', () => {
+describe('SetupWizard — libraries + completion', () => {
   beforeEach(() => {
     resetMocks()
     h.authenticated = true
@@ -188,8 +285,15 @@ describe('SetupWizard — services (library roots + completion)', () => {
   })
 
   it('filters the movie picker to section_type "movie" and the tv picker to "tv"', async () => {
-    await reachServices()
+    await reachLibraries()
 
+    expect(screen.getByRole('heading', { level: 1, name: 'Confirm library roots' })).toHaveFocus()
+    expect(
+      screen.getByText(
+        'Choose where finished files land, using roots that are writable from inside the container.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Prowlarr' })).not.toBeInTheDocument()
     const movieSelect = screen.getByLabelText('Movies library folder')
     const tvSelect = screen.getByLabelText('TV library folder')
 
@@ -212,7 +316,7 @@ describe('SetupWizard — services (library roots + completion)', () => {
       writable: null,
     }
     h.validatePlex.mockResolvedValue(plexVerifyOk([hostLibrary, tvLibrary]))
-    await reachServices()
+    await reachLibraries()
 
     const movieSelect = screen.getByLabelText('Movies library folder')
     const option = within(movieSelect).getByText(
@@ -222,11 +326,7 @@ describe('SetupWizard — services (library roots + completion)', () => {
   })
 
   it('never requires a tv library folder to be chosen (tv_root is optional)', async () => {
-    await reachServices()
-    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
-      fireEvent.click(button)
-    }
-    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+    await reachLibraries()
 
     fireEvent.change(screen.getByLabelText('Movies library folder'), {
       target: { value: '/media/movies' },
@@ -237,11 +337,7 @@ describe('SetupWizard — services (library roots + completion)', () => {
   })
 
   it('completes a tv-only install: tv folder chosen, movies left unset', async () => {
-    await reachServices()
-    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
-      fireEvent.click(button)
-    }
-    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+    await reachLibraries()
 
     fireEvent.change(screen.getByLabelText('TV library folder'), { target: { value: '/media/tv' } })
 
@@ -249,17 +345,13 @@ describe('SetupWizard — services (library roots + completion)', () => {
   })
 
   it('disables completion until at least one library root is chosen', async () => {
-    await reachServices()
-    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
-      fireEvent.click(button)
-    }
-    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+    await reachLibraries()
 
     expect(screen.getByRole('button', { name: /complete setup/i })).toBeDisabled()
   })
 
   it('shows the tv section as optional when no folder is chosen', async () => {
-    await reachServices()
+    await reachLibraries()
     const tvSelect = screen.getByLabelText('TV library folder')
     const tvSection = tvSelect.closest('section')
     expect(tvSection).not.toBeNull()
@@ -267,7 +359,7 @@ describe('SetupWizard — services (library roots + completion)', () => {
   })
 
   it('reuses the Movies/TV Plex library lists for the anime pickers', async () => {
-    await reachServices()
+    await reachLibraries()
 
     const animeMovieSelect = screen.getByLabelText('Anime movies library folder')
     const animeTvSelect = screen.getByLabelText('Anime TV library folder')
@@ -279,11 +371,7 @@ describe('SetupWizard — services (library roots + completion)', () => {
   })
 
   it('completes an anime-only install: an anime root chosen, movies/tv left unset', async () => {
-    await reachServices()
-    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
-      fireEvent.click(button)
-    }
-    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+    await reachLibraries()
 
     fireEvent.change(screen.getByLabelText('Anime movies library folder'), {
       target: { value: '/media/movies' },
@@ -294,13 +382,13 @@ describe('SetupWizard — services (library roots + completion)', () => {
     expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled()
   })
 
-  it('submits chosen roots + the verified Plex machine identifier, then navigates home with no key screen', async () => {
-    h.complete.mockResolvedValue({ initialized: true, setup_token_required: false })
-    await reachServices()
-    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
-      fireEvent.click(button)
-    }
-    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+  it('submits the unchanged completion body once, shows Done, then navigates only from Open Discover', async () => {
+    h.complete.mockImplementation(async () => {
+      // Model the setup-status invalidation racing the local success render.
+      h.initialized = true
+      return { initialized: true, setup_token_required: false }
+    })
+    await reachLibraries()
 
     fireEvent.change(screen.getByLabelText('Movies library folder'), {
       target: { value: '/media/movies' },
@@ -315,15 +403,76 @@ describe('SetupWizard — services (library roots + completion)', () => {
     fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
 
     await waitFor(() => expect(h.complete).toHaveBeenCalledTimes(1))
-    const body = h.complete.mock.calls[0]![0] as Record<string, string>
-    expect(body.plex_machine_identifier).toBe('MID-APOLLO')
-    expect(body.plex_url).toBe('http://127.0.0.1:32400')
-    expect(body.movies_root).toBe('/media/movies')
-    expect(body.anime_movie_root).toBe('/media/movies')
+    expect(h.complete).toHaveBeenCalledWith({
+      plex_url: 'http://127.0.0.1:32400',
+      plex_machine_identifier: 'MID-APOLLO',
+      plex_token: null,
+      prowlarr_url: '',
+      prowlarr_api_key: '',
+      qbittorrent_url: '',
+      qbittorrent_username: '',
+      qbittorrent_password: '',
+      tmdb_api_key: '',
+      movies_root: '/media/movies',
+      tv_root: '',
+      anime_movie_root: '/media/movies',
+      anime_tv_root: '',
+    })
 
-    // No one-time key screen exists anymore — sign-in is the only credential.
+    const doneHeading = await screen.findByRole('heading', { level: 1, name: "You're set" })
+    expect(doneHeading).toHaveFocus()
+    expect(screen.getByText('Setup is complete.')).toBeInTheDocument()
+    expect(h.navigate).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument()
     expect(screen.queryByText(/save your access key/i)).toBeNull()
-    await waitFor(() => expect(h.navigate).toHaveBeenCalledWith('/', { replace: true }))
+    expect(screen.getAllByRole('button')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Discover' }))
+    expect(h.navigate).toHaveBeenCalledWith('/', { replace: true })
+  })
+
+  it('surfaces a completion rejection and remains on Libraries', async () => {
+    h.complete.mockRejectedValue(
+      toApiError({ detail: 'setup_complete_failed', message: 'Setup could not be saved.' }, 500),
+    )
+    await reachLibraries()
+    fireEvent.change(screen.getByLabelText('Movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /complete setup/i }))
+
+    await waitFor(() =>
+      expect(h.toast).toHaveBeenCalledWith({
+        title: 'Setup failed',
+        description: 'Setup could not be saved.',
+        intent: 'error',
+      }),
+    )
+    expect(h.complete).toHaveBeenCalledTimes(1)
+    expect(
+      screen.getByRole('heading', { level: 1, name: 'Confirm library roots' }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: "You're set" })).not.toBeInTheDocument()
+    expect(h.navigate).not.toHaveBeenCalled()
+  })
+
+  it('returns to Services without clearing roots or current validation results', async () => {
+    await reachLibraries()
+    fireEvent.change(screen.getByLabelText('Movies library folder'), {
+      target: { value: '/media/movies' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+
+    const servicesHeading = screen.getByRole('heading', { level: 1, name: 'Connect services' })
+    expect(servicesHeading).toHaveFocus()
+    expect(screen.getByText('3/3 verified')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await screen.findByRole('heading', { level: 1, name: 'Confirm library roots' })
+    expect(screen.getByLabelText('Movies library folder')).toHaveValue('/media/movies')
   })
 
   it('clears picked library roots when the server is changed, forcing re-selection from the new server', async () => {
@@ -343,13 +492,12 @@ describe('SetupWizard — services (library roots + completion)', () => {
 
     render(<SetupWizard />, { wrapper: Wrapper })
     fireEvent.click(await screen.findByRole('button', { name: /verify server/i }))
-    await screen.findByText('Plex: http://127.0.0.1:32400 — verified ✓')
+    await screen.findByText('Plex server verified ✓')
 
-    // Verify every service so completion gates ONLY on the library root below.
-    for (const button of screen.getAllByRole('button', { name: /test connection/i })) {
-      fireEvent.click(button)
-    }
-    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(3))
+    // Verify every service, then cross the real Services → Libraries gate.
+    await validateAllServices()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await screen.findByRole('heading', { level: 1, name: 'Confirm library roots' })
 
     // Pick a root from server A's libraries — completion becomes enabled.
     fireEvent.change(screen.getByLabelText('Movies library folder'), {
@@ -359,10 +507,14 @@ describe('SetupWizard — services (library roots + completion)', () => {
       expect(screen.getByRole('button', { name: /complete setup/i })).toBeEnabled(),
     )
 
-    // Change the server, then re-verify (now server B).
-    fireEvent.click(screen.getByRole('button', { name: /change/i }))
+    // Libraries Back preserves the root; Services Back invokes changeServer and
+    // clears it before the next owned server is verified.
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
     fireEvent.click(await screen.findByRole('button', { name: /verify server/i }))
-    await screen.findByText('Plex: http://127.0.0.1:32400 — verified ✓')
+    await screen.findByText('Plex server verified ✓')
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await screen.findByRole('heading', { level: 1, name: 'Confirm library roots' })
 
     // The previously-picked root is gone; it must be re-picked from server B's
     // libraries, and completion is disabled until then.
@@ -382,6 +534,54 @@ describe('SetupWizard — service validation flow', () => {
     h.authenticated = true
     h.servers = SERVERS
     h.validatePlex.mockResolvedValue(plexVerifyOk([movieLibrary]))
+  })
+
+  it('keeps Continue gated on all three current validations and advances without completing', async () => {
+    h.validate.mockImplementation(async ({ service }: { service: string }) => ({
+      ok: true,
+      message: `${service} ok`,
+    }))
+    await reachServices()
+
+    const continueButton = screen.getByRole('button', { name: 'Continue' })
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    expect(continueButton).toBeDisabled()
+
+    fireEvent.click(testButtons[0]!)
+    await screen.findByText('1/3 verified')
+    expect(continueButton).toBeDisabled()
+    fireEvent.click(testButtons[1]!)
+    await screen.findByText('2/3 verified')
+    expect(continueButton).toBeDisabled()
+    fireEvent.click(testButtons[2]!)
+    await waitFor(() => expect(continueButton).toBeEnabled())
+
+    fireEvent.click(continueButton)
+    expect(h.complete).not.toHaveBeenCalled()
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Confirm library roots' }),
+    ).toHaveFocus()
+    expect(screen.queryByRole('heading', { name: 'Prowlarr' })).not.toBeInTheDocument()
+  })
+
+  it('keeps Continue gated on the required setup token after services validate', async () => {
+    h.setupTokenRequired = true
+    h.storedSetupToken = 'boot-token'
+    h.validate.mockImplementation(async ({ service }: { service: string }) => ({
+      ok: true,
+      message: `${service} ok`,
+    }))
+    await reachServices()
+    await validateAllServices()
+
+    fireEvent.change(screen.getByLabelText('Setup token'), { target: { value: '' } })
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
+
+    fireEvent.change(screen.getByLabelText('Setup token'), { target: { value: 'new-token' } })
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByLabelText('Setup token')).toHaveValue('new-token')
+    expect(h.complete).not.toHaveBeenCalled()
   })
 
   it('ignores a stale service validation success after its fields are edited', async () => {

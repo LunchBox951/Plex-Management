@@ -95,4 +95,26 @@ describe('PlexLogin', () => {
     expect(screen.getByRole('button', { name: /sign in with plex/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /use access key/i })).not.toBeInTheDocument()
   })
+
+  it('embeds only the controls, surfaces errors, and preserves the sign-in callback', async () => {
+    h.runPlexPinFlow.mockRejectedValueOnce(new PlexPinError('plex_popup_blocked'))
+    const onSignedIn = vi.fn()
+    render(<PlexLogin embedded onSignedIn={onSignedIn} />)
+
+    expect(screen.queryByText('Sign in', { selector: 'div' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/use a Plex account with access/i)).not.toBeInTheDocument()
+
+    const button = screen.getByRole('button', { name: /sign in with plex/i })
+    fireEvent.click(button)
+    expect(
+      await screen.findByText(
+        'Your browser blocked the Plex sign-in popup. Allow popups for this site and try again.',
+      ),
+    ).toBeInTheDocument()
+    expect(onSignedIn).not.toHaveBeenCalled()
+
+    h.runPlexPinFlow.mockResolvedValue('plex-token-xyz')
+    fireEvent.click(button)
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1))
+  })
 })
