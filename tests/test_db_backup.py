@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -109,6 +110,21 @@ def test_backs_up_db_and_key_as_unit_when_migration_pending(tmp_path: Path) -> N
 
 
 def test_snapshot_captures_uncommitted_wal_rows(tmp_path: Path) -> None:
+    """A plain ``shutil.copy`` of the main .db file must FAIL this test.
+
+    SQLite checkpoints the WAL back into the main file when the last
+    connection closes, so a writer that closes cleanly before the backup runs
+    leaves nothing uncheckpointed to lose -- a naive file copy would pass just
+    as well as the real WAL-consistent snapshot, and the test would prove
+    nothing. The writer connection is therefore kept OPEN across the
+    ``create_pre_migration_backup`` call (mirroring the app process, which
+    holds its database connection open across the whole pre-migration-backup
+    step), so the row genuinely lives only in ``-wal`` at backup time. Verified
+    empirically: with this connection held open, a bare ``shutil.copy(src,
+    dst)`` of just the .db file raises ``sqlite3.OperationalError: no such
+    table: probe`` on the copy, while ``_snapshot_sqlite``'s
+    ``sqlite3.Connection.backup`` API correctly captures the row.
+    """
     settings = _settings(tmp_path)
     data_dir = Path(settings.data_dir)
     db_path = data_dir / "plex_manager.db"
@@ -121,15 +137,16 @@ def test_snapshot_captures_uncommitted_wal_rows(tmp_path: Path) -> None:
         conn.execute("INSERT INTO alembic_version (version_num) VALUES ('old-rev')")
         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, note TEXT)")
         conn.commit()
-        # Committed but deliberately NOT checkpointed -- lives only in -wal until
-        # something checkpoints it. A bare file copy of the main .db file would
-        # miss this row entirely.
+        # Committed but deliberately NOT checkpointed -- lives only in -wal
+        # until something checkpoints it. The connection stays open past this
+        # point (no close before the backup call) so the WAL is never
+        # auto-checkpointed out from under the test.
         conn.execute("INSERT INTO probe (note) VALUES ('uncommitted-to-main-file')")
         conn.commit()
+
+        result = db_backup.create_pre_migration_backup(settings)
     finally:
         conn.close()
-
-    result = db_backup.create_pre_migration_backup(settings)
 
     assert result is not None
     copied_db = result / "plex_manager.db"
@@ -139,6 +156,45 @@ def test_snapshot_captures_uncommitted_wal_rows(tmp_path: Path) -> None:
     finally:
         copy_conn.close()
     assert rows == [("uncommitted-to-main-file",)]
+
+
+def test_snapshot_naive_copy_would_miss_uncheckpointed_wal_rows(tmp_path: Path) -> None:
+    """Direct regression guard for the WAL-consistency claim itself.
+
+    Proves, independently of ``create_pre_migration_backup``, that a bare
+    ``shutil.copy`` of an open, uncheckpointed WAL database drops the row that
+    ``_snapshot_sqlite`` (the SQLite backup API) preserves -- so a future
+    accidental revert of ``_snapshot_sqlite`` to a plain file copy fails this
+    test directly, not just via a side effect of connection lifecycle.
+    """
+    db_path = tmp_path / "source.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.commit()
+        conn.execute("INSERT INTO probe (note) VALUES ('uncommitted-to-main-file')")
+        conn.commit()
+
+        naive_copy = tmp_path / "naive.db"
+        shutil.copy(db_path, naive_copy)
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            naive_conn = sqlite3.connect(f"file:{naive_copy}?mode=ro", uri=True)
+            try:
+                naive_conn.execute("SELECT note FROM probe").fetchall()
+            finally:
+                naive_conn.close()
+
+        api_copy = tmp_path / "api.db"
+        db_backup._snapshot_sqlite(db_path, api_copy)  # pyright: ignore[reportPrivateUsage]
+        api_conn = sqlite3.connect(f"file:{api_copy}?mode=ro", uri=True)
+        try:
+            rows = api_conn.execute("SELECT note FROM probe").fetchall()
+        finally:
+            api_conn.close()
+        assert rows == [("uncommitted-to-main-file",)]
+    finally:
+        conn.close()
 
 
 def test_missing_key_backs_up_db_only_nonfatal(
