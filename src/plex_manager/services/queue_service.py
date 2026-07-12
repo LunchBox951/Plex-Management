@@ -117,9 +117,9 @@ PREDICATE-ATOMIC (the final protocol form):
      marker's flags. No yield path strands the row.
 
 * **The in-process registry remains ONLY for what the DB cannot express**
-  (``_operator_fail_claims`` + ``_reconcile_removals_in_flight``):
+  (``_operator_fail_claims`` + ``_removals_in_flight``):
 
-  - **Removal physics (BOTH actors).** Removal is client I/O,
+  - **Removal physics (ALL actors).** Removal is client I/O,
     not a DB row mutation, so it cannot be predicate-gated: once a delete await
     has started the remove decision is irreversible, and
     ``_register_operator_claim`` REFUSES registration
@@ -127,12 +127,18 @@ PREDICATE-ATOMIC (the final protocol form):
     one is in flight. Operator side: the claim is flagged removal-in-flight
     immediately before :func:`mark_failed`'s delete await, held until release.
     Reconcile side: each automatic Phase-B delete registers its download id in
-    ``_reconcile_removals_in_flight`` from just before the delete await until
+    ``_removals_in_flight`` from just before the delete await until
     that row's removal CONSEQUENCE settles — its completion commits the
     terminal CAS, or is dropped/deferred in Phase C, or the cycle's Phase C
     exhausts — released at cycle scope, so the returned-but-unsettled gap
     between a delete and its completion cannot admit a ``remove_torrent=False``
-    command for data this cycle already destroyed.
+    command for data this cycle already destroyed. Cancel side (#206):
+    ``correction_service.cancel_request`` also registers here — before its
+    terminal commit, not merely before its delete await, because a cancelled
+    row becomes reusable the instant that commit lands (see the registry's own
+    docstring below) — released in cancel's own ``finally``. The set is shared
+    so ``grab_service``'s terminal-row reuse and a racing operator mark-failed
+    both see every actor's in-flight removal, not just reconcile's.
   - **Pre-stamp invisibility fast-path.** A claim exists from BEFORE the marker
     is stamped, so reconcile skips claimed ids at every phase boundary (Phase-A
     transition application; Phase B, where a claimed completion is DROPPED from
@@ -271,6 +277,9 @@ __all__ = [
     "list_queue",
     "mark_failed",
     "reconcile_and_list",
+    "register_removal_in_flight",
+    "release_removal_in_flight",
+    "removal_in_flight",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -356,18 +365,26 @@ _operator_fail_claims: dict[int, _OperatorClaim] = {}
 
 _claim_tokens = count(1)
 
-# Reconcile-side removal window (the removal-physics rule covers BOTH actors):
-# download ids whose AUTOMATIC reconcile-driven Phase-B delete has started and
-# whose CONSEQUENCE has not yet settled. ``_register_operator_claim`` refuses
-# registration during this window for the same physics reason as the operator
-# flag above — an operator ``remove_torrent=False`` claim registered mid-delete,
-# OR in the gap between the delete's return and the row's Phase-C settlement,
-# would complete promising a file this cycle already destroyed. An id enters just
-# before its delete await and leaves at the CYCLE-SCOPE finally, once that row's
-# completion committed its terminal CAS, was dropped/deferred in Phase C, or the
-# cycle's Phase C exhausted (the residual is then settled-but-unhealed — plain,
-# claimable, reconcilable).
-_reconcile_removals_in_flight: set[int] = set()
+# Shared removal-physics registry (ALL actors that physically remove a torrent):
+# download ids whose removal has started and whose CONSEQUENCE has not yet
+# settled. ``_register_operator_claim`` refuses registration during this window
+# for the same physics reason described above — a claim registered mid-delete,
+# OR in the gap between the delete's return and the row's settlement, would
+# complete promising a file already destroyed. ``grab_service``'s terminal-row
+# reuse also consults this set (via ``removal_in_flight`` below) and refuses to
+# resurrect a row whose torrent is mid-removal (#206).
+#
+# Reconcile-side removal window: download ids whose AUTOMATIC reconcile-driven
+# Phase-B delete has started and whose CONSEQUENCE has not yet settled. An id
+# enters just before its delete await and leaves at the CYCLE-SCOPE finally,
+# once that row's completion committed its terminal CAS, was dropped/deferred
+# in Phase C, or the cycle's Phase C exhausted (the residual is then
+# settled-but-unhealed — plain, claimable, reconcilable).
+#
+# Cancel-side removal window (#206): ``correction_service.cancel_request``
+# registers each row's id BEFORE its terminal commit — see
+# :func:`register_removal_in_flight` — and releases in its own ``finally``.
+_removals_in_flight: set[int] = set()
 
 
 def _register_operator_claim(
@@ -381,7 +398,7 @@ def _register_operator_claim(
     later token-gated phases yield. The ONE exception (the removal-physics rule):
     while a torrent-removal I/O for this download is in flight — EITHER the
     current owner's (``removal_in_flight`` on the claim) OR reconcile's automatic
-    Phase-B delete (``_reconcile_removals_in_flight``) — the remove decision is
+    Phase-B delete (``_removals_in_flight``) — the remove decision is
     already irreversible, so registration is REFUSED with
     :class:`RemovalInProgressError` — accepting a ``remove_torrent=False`` command
     then would promise a file the in-flight delete is destroying. This physics
@@ -401,7 +418,7 @@ def _register_operator_claim(
     caller's own pre-check (:func:`_is_operator_claimed` in
     :func:`reconcile_and_list`), which races against exactly this registration.
     """
-    if download_id in _reconcile_removals_in_flight:
+    if download_id in _removals_in_flight:
         raise RemovalInProgressError(download_id)
     existing = _operator_fail_claims.get(download_id)
     if existing is not None and existing.removal_in_flight:
@@ -453,6 +470,33 @@ def _release_operator_claim(download_id: int, token: int) -> None:
     claim = _operator_fail_claims.get(download_id)
     if claim is not None and claim.token == token:
         del _operator_fail_claims[download_id]
+
+
+def register_removal_in_flight(download_id: int) -> None:
+    """Claim ``download_id``'s torrent removal as physically in flight (#206).
+
+    Shared removal-physics registry (module docstring): reconcile's Phase-B delete
+    registers here just before its delete await, and ``correction_service.cancel_request``
+    registers here BEFORE it commits the row to terminal ``Failed`` — because a
+    cancelled row is reusable the instant that commit lands, the claim must bracket
+    the commit, not merely the client I/O. While registered, ``removal_in_flight``
+    reports True so ``grab_service``'s terminal-row reuse refuses, and
+    ``_register_operator_claim`` refuses an operator mark-failed (removal-physics rule).
+    Ids never overlap across actors (a cancel's row is terminal, excluded from
+    ``list_active``; reconcile only registers ``failed_pending`` ids), so a plain set
+    with unrefcounted add/discard is safe.
+    """
+    _removals_in_flight.add(download_id)
+
+
+def release_removal_in_flight(download_id: int) -> None:
+    """Release a :func:`register_removal_in_flight` claim (idempotent)."""
+    _removals_in_flight.discard(download_id)
+
+
+def removal_in_flight(download_id: int) -> bool:
+    """Whether a torrent removal is physically in flight for ``download_id``."""
+    return download_id in _removals_in_flight
 
 
 # The persisted provenance-AND-ownership marker (module docstring): the EXACT
@@ -1387,7 +1431,7 @@ async def reconcile_and_list(
     # must never complete the row with those stale pre-marker semantics -- the
     # residual instead heals NEXT cycle from the marker, the designed path.
     # Removal-physics guard lifetime (reconcile side): a removed row's id enters
-    # ``_reconcile_removals_in_flight`` just before its delete await and is HELD
+    # ``_removals_in_flight`` just before its delete await and is HELD
     # until the CONSEQUENCE of that removal settles -- this cycle's Phase C either
     # commits the row's terminal completion, drops it, or exhausts (the
     # cycle-scope ``finally`` below). Releasing at the delete's return would leave
@@ -1417,7 +1461,7 @@ async def reconcile_and_list(
             # point between "operators are barred" and the durable verification
             # below: anything an operator did finished BEFORE the bar and is
             # visible to the re-proof SELECT; anything after the bar is refused.
-            _reconcile_removals_in_flight.add(completion.download_id)
+            _removals_in_flight.add(completion.download_id)
             settling.add(completion.download_id)
             # DURABLE re-proof immediately before the irreversible delete: the
             # claim check above sees only LIVE claims -- an operator who stamped,
@@ -1449,7 +1493,7 @@ async def reconcile_and_list(
                 # settle: release the bar NOW (not at cycle scope) so operator
                 # commands for a row this cycle no longer touches are not
                 # refused. Rows whose delete DOES run keep the round-8 lifetime.
-                _reconcile_removals_in_flight.discard(completion.download_id)
+                _removals_in_flight.discard(completion.download_id)
                 settling.discard(completion.download_id)
                 continue
             # Removal-physics rule, reconcile side: the guard registered above
@@ -1543,7 +1587,7 @@ async def reconcile_and_list(
         # committed, was dropped/deferred in Phase C, or Phase C exhausted
         # (leaving a plain reconcilable residual). Release the physics guard for
         # exactly the ids this cycle added.
-        _reconcile_removals_in_flight.difference_update(settling)
+        _removals_in_flight.difference_update(settling)
 
     # ``populate_existing`` refreshes the returned rows from the DB (issue #77): see
     # the same note in the no-failures early return above.

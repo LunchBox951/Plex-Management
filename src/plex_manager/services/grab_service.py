@@ -35,7 +35,7 @@ from plex_manager.models import (
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import season_request_service
+from plex_manager.services import queue_service, season_request_service
 from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
 if TYPE_CHECKING:
@@ -53,6 +53,7 @@ __all__ = [
     "RequestNotActiveError",
     "SeasonRequiredError",
     "TorrentAlreadyTrackedError",
+    "TorrentRemovalInFlightError",
     "grab",
 ]
 
@@ -195,6 +196,24 @@ class TorrentAlreadyTrackedError(Exception):
         super().__init__(f"torrent {torrent_hash} is already tracked by request {owner_request_id}")
 
 
+class TorrentRemovalInFlightError(Exception):
+    """The terminal row's torrent is being removed right now — refuse to reuse it (#206).
+
+    A concurrent ``cancel_request`` (or a reconcile-driven failure) has claimed this
+    download's torrent removal as in flight. Resurrecting the terminal row would
+    re-own a torrent whose data is mid-deletion, so the fresh grab would lose its
+    payload the instant the removal completes. Surfaced (HTTP 409
+    ``removal_in_progress``), never a silent reuse: refuse and let the request retry —
+    by the next attempt the removal has settled (the torrent is gone, so a fresh add
+    creates a new one, or, on a removal failure, its data is intact and reuse is safe).
+    """
+
+    def __init__(self, torrent_hash: str, download_id: int) -> None:
+        self.torrent_hash = torrent_hash
+        self.download_id = download_id
+        super().__init__(f"torrent {torrent_hash} (download {download_id}) is being removed; retry")
+
+
 async def _reuse_terminal_row(
     session: AsyncSession,
     download_repo: SqlDownloadRepository,
@@ -261,6 +280,14 @@ async def _reuse_terminal_row(
     resurrected row gets a fresh, honest metadata-fetch deadline matching its
     reset stall-detection anchor (observability only — never read for control).
     """
+    # #206: refuse to resurrect a terminal row whose torrent is being removed right
+    # now (a concurrent cancel's post-commit delete, or a reconcile-driven removal).
+    # Re-owning it would hand this request a torrent whose data is mid-deletion.
+    # Checked here so BOTH reuse call sites (the get_by_hash precheck branch and the
+    # post-add UNIQUE-conflict branch) are covered in one place; a synchronous read of
+    # the in-process registry, no await between it and the CAS below.
+    if queue_service.removal_in_flight(download_id):
+        raise TorrentRemovalInFlightError(torrent_hash, download_id)
     now = datetime.now(UTC)
     claimed = await download_repo.update_status_if_in(
         download_id,

@@ -60,7 +60,7 @@ def clear_operator_claims() -> Iterator[None]:
     (and cascade through) later tests."""
     yield
     queue_service._operator_fail_claims.clear()  # pyright: ignore[reportPrivateUsage]
-    queue_service._reconcile_removals_in_flight.clear()  # pyright: ignore[reportPrivateUsage]
+    queue_service._removals_in_flight.clear()  # pyright: ignore[reportPrivateUsage]
 
 
 async def _seed_request_with_download(
@@ -2626,7 +2626,7 @@ async def test_operator_mark_failed_refused_until_removal_consequence_settles(
     assert sorted(row.torrent_hash or "" for row in blocklist) == [hash_x, hash_y]
 
     # The guard released at cycle scope (settled): nothing lingers...
-    assert not queue_service._reconcile_removals_in_flight  # pyright: ignore[reportPrivateUsage]
+    assert not queue_service._removals_in_flight  # pyright: ignore[reportPrivateUsage]
     # ...and a fresh mark_failed on the now-terminal row gets the honest
     # already-terminal handling, not removal_in_progress.
     async with sessionmaker_() as session:
@@ -2786,7 +2786,7 @@ async def test_removal_guard_bars_operators_before_the_pre_delete_reproof(
             # with guard-first ordering an operator registration here must be
             # refused. (Were the guard registered after the re-proof, this
             # registration would succeed and the probe list would stay empty.)
-            in_flight = queue_service._reconcile_removals_in_flight  # pyright: ignore[reportPrivateUsage]
+            in_flight = queue_service._removals_in_flight  # pyright: ignore[reportPrivateUsage]
             if download_id in in_flight and not refusals:
                 try:
                     _register_operator_claim(
@@ -2807,7 +2807,7 @@ async def test_removal_guard_bars_operators_before_the_pre_delete_reproof(
     async with sessionmaker_() as session:
         download = await session.get(Download, download_id)
     assert download is not None and download.status == "failed"
-    assert not queue_service._reconcile_removals_in_flight  # pyright: ignore[reportPrivateUsage]
+    assert not queue_service._removals_in_flight  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_reconcile_owned_removal_outcome_is_durable_and_heals_without_client(
@@ -3297,3 +3297,42 @@ async def test_self_heal_refuses_to_adopt_a_released_operator_residual(
     assert history == []
     assert request is not None
     assert request.status is RequestStatus.downloading  # not re-armed by self-heal
+
+
+# ---------------------------------------------------------------------------
+# #206: the removal-in-flight registry generalized to a shared, public
+# registry so ``correction_service.cancel_request`` and ``grab_service``'s
+# terminal-row reuse can both consult it, alongside reconcile's own use.
+# ---------------------------------------------------------------------------
+
+
+def test_removal_in_flight_register_release_roundtrip() -> None:
+    """The public helpers are a plain claim/query/release roundtrip, and a
+    double-release is a harmless no-op (mirrors the operator claim helpers)."""
+    download_id = 999_001
+    assert not queue_service.removal_in_flight(download_id)
+    queue_service.register_removal_in_flight(download_id)
+    assert queue_service.removal_in_flight(download_id)
+    queue_service.release_removal_in_flight(download_id)
+    assert not queue_service.removal_in_flight(download_id)
+    # Idempotent: releasing an already-released (or never-claimed) id is a no-op.
+    queue_service.release_removal_in_flight(download_id)
+    assert not queue_service.removal_in_flight(download_id)
+
+
+def test_register_operator_claim_refused_while_removal_in_flight() -> None:
+    """#206: registering a removal-in-flight claim through the PUBLIC helper (the
+    same one ``cancel_request`` now calls) bars a racing operator mark_failed via
+    the EXISTING removal-physics check on the (renamed, now-shared)
+    ``_removals_in_flight`` set -- proving cancel's registration plugs into the
+    same guard reconcile's Phase-B delete already relies on."""
+    download_id = 999_002
+    queue_service.register_removal_in_flight(download_id)
+    try:
+        with pytest.raises(RemovalInProgressError):
+            _register_operator_claim(
+                download_id, _OperatorFailFlags(blocklist=False, remove_torrent=False)
+            )
+    finally:
+        queue_service.release_removal_in_flight(download_id)
+    assert not queue_service.removal_in_flight(download_id)
