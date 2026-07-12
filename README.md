@@ -171,14 +171,22 @@ cp /path/to/volume/plex_manager.db /path/to/volume/secret.key ./backup/
 chmod 600 ./backup/secret.key
 ```
 
-**PostgreSQL deployment:** `pg_dump` backs up the database, but the Fernet key
-is **still local to the app container's data directory** (Postgres never sees
-it) — back it up separately and keep the two together:
-```bash
-pg_dump -Fc plexmanager > plexmanager.dump
-cp /path/to/data_dir/secret.key ./backup/secret.key
-chmod 600 ./backup/secret.key
-```
+**PostgreSQL deployment:** `pg_dump` backs up the database only — the Fernet
+key is never in Postgres. Where the key half lives depends on your deployment:
+
+- **Key file (the default):** the active key is `secret.key` in the app
+  container's data directory — copy it alongside the dump and keep the two
+  together:
+  ```bash
+  pg_dump -Fc plexmanager > plexmanager.dump
+  cp /path/to/data_dir/secret.key ./backup/secret.key
+  chmod 600 ./backup/secret.key
+  ```
+- **`PLEX_MANAGER_FERNET_KEY` deployments:** the active key is the environment
+  value, and any on-disk `secret.key` is absent or stale — it is **not** the
+  active key, so do not save it as if it were. Preserve the
+  `PLEX_MANAGER_FERNET_KEY` value from your environment/secret store together
+  with the dump.
 
 **Restore verification:** after restoring, start the container, sign in, and
 confirm a configured service (Plex/Prowlarr/qBittorrent/TMDB) still shows its
