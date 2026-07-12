@@ -26,7 +26,13 @@ SessionMaker = async_sessionmaker[AsyncSession]
 _NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 
 
-async def _make_show(sm: SessionMaker, tmdb_id: int, *, tv_request_mode: str | None = None) -> int:
+async def _make_show(
+    sm: SessionMaker,
+    tmdb_id: int,
+    *,
+    tv_request_mode: str | None = None,
+    requested_episodes: dict[str, list[int]] | None = None,
+) -> int:
     async with sm() as session:
         show = MediaRequest(
             tmdb_id=tmdb_id,
@@ -34,6 +40,7 @@ async def _make_show(sm: SessionMaker, tmdb_id: int, *, tv_request_mode: str | N
             title="Show",
             status=RequestStatus.waiting_for_air_date,
             tv_request_mode=tv_request_mode,
+            requested_episodes_json=requested_episodes,
         )
         session.add(show)
         await session.commit()
@@ -268,6 +275,112 @@ async def test_bounded_and_rotates_across_cycles(sessionmaker_: SessionMaker) ->
         stamped_after_cycle2.append(season.airing_refresh_checked_at)
     # Every row is now stamped -- the previously-unstamped one was picked up.
     assert all(ts is not None for ts in stamped_after_cycle2)
+
+
+async def test_still_future_season_not_rechecked_within_interval(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2: a still-future season must not re-cost a TMDB lookup every ~60s cycle.
+
+    Within ``_AIR_DATE_WAKE_MIN_INTERVAL`` of its last check the row is skipped
+    entirely (no ``get_tv_show``); once the interval elapses it is due again.
+    """
+    show_id = await _make_show(sessionmaker_, tmdb_id=1010)
+    season_id = await _make_waiting_season(sessionmaker_, show_id, 2)
+
+    # Pass 1: season 2 above season_count 1 -> stays waiting, stamped, TMDB queried.
+    tmdb1 = FakeTmdb(shows={1010: TvMetadata(tmdb_id=1010, title="Show", season_count=1)})
+    async with sessionmaker_() as session:
+        await season_request_service.wake_waiting_for_air_date(
+            session, tmdb1, None, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+    assert tmdb1.get_tv_show_calls == [1010]
+    stamped = (await _get_season(sessionmaker_, season_id)).airing_refresh_checked_at
+
+    # Pass 2: one minute later, still inside the interval -> row not even selected,
+    # so NO TMDB call and the stamp is unchanged.
+    tmdb2 = FakeTmdb(shows={1010: TvMetadata(tmdb_id=1010, title="Show", season_count=1)})
+    async with sessionmaker_() as session:
+        await season_request_service.wake_waiting_for_air_date(
+            session, tmdb2, None, now=_NOW + timedelta(minutes=1), max_refresh=5
+        )
+        await session.commit()
+    assert tmdb2.get_tv_show_calls == []
+    assert (await _get_season(sessionmaker_, season_id)).airing_refresh_checked_at == stamped
+
+    # Pass 3: past the interval -> due again, TMDB queried again.
+    tmdb3 = FakeTmdb(shows={1010: TvMetadata(tmdb_id=1010, title="Show", season_count=1)})
+    async with sessionmaker_() as session:
+        await season_request_service.wake_waiting_for_air_date(
+            session, tmdb3, None, now=_NOW + timedelta(hours=7), max_refresh=5
+        )
+        await session.commit()
+    assert tmdb3.get_tv_show_calls == [1010]
+
+
+async def test_whole_show_placeholder_expands_to_full_season_set(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2: a zero-season whole-show placeholder (parked S1) expands to
+    1..season_count on wake, not just the placeholder S1."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=1011, tv_request_mode="whole_show")
+    await _make_waiting_season(sessionmaker_, show_id, 1)
+    tmdb = FakeTmdb(shows={1011: TvMetadata(tmdb_id=1011, title="Show", season_count=3)})
+
+    async with sessionmaker_() as session:
+        woken = await season_request_service.wake_waiting_for_air_date(
+            session, tmdb, None, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert woken == 1  # the placeholder S1 transitioned out of waiting
+    async with sessionmaker_() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert {row.season_number: row.status for row in rows} == {
+        1: RequestStatus.pending,
+        2: RequestStatus.pending,
+        3: RequestStatus.pending,
+    }
+
+
+async def test_episode_scoped_wake_forced_pending_not_available(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2: an episode-scoped parked season (e.g. S2E10) must wake to ``pending``
+    and be searched, never be marked ``available`` off partial Plex season
+    presence (S2E1 present)."""
+    show_id = await _make_show(
+        sessionmaker_,
+        tmdb_id=1012,
+        tv_request_mode="explicit_episodes",
+        requested_episodes={"2": [10]},
+    )
+    season_id = await _make_waiting_season(sessionmaker_, show_id, 2)
+    tmdb = FakeTmdb(shows={1012: TvMetadata(tmdb_id=1012, title="Show", season_count=2)})
+    # Plex reports season 2 present (only S2E1 in reality) -> season-level presence
+    # would falsely satisfy the request without the force_pending guard.
+    library = FakeLibrary(available_tv_seasons={1012: frozenset({2})})
+
+    async with sessionmaker_() as session:
+        woken = await season_request_service.wake_waiting_for_air_date(
+            session, tmdb, library, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert woken == 1
+    season = await _get_season(sessionmaker_, season_id)
+    assert season.status == RequestStatus.pending
+    assert season.next_search_at is None
+    assert season.search_attempts == 0
 
 
 async def test_second_pass_is_noop_after_wake(sessionmaker_: SessionMaker) -> None:

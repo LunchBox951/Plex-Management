@@ -649,7 +649,7 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def list_for_airing_refresh(
-        self, statuses: frozenset[str], limit: int
+        self, statuses: frozenset[str], limit: int, *, checked_before: datetime | None = None
     ) -> list[SeasonRequestRecord]:
         """List up to ``limit`` seasons in ``statuses`` due for an airing-target
         refresh (ADR-0020 §6, ``season_episode_service.reconcile_airing``), oldest
@@ -660,6 +660,12 @@ class SeasonRequestRepository(Protocol):
         checked` advances a row to the back of the queue, so a bounded per-cycle
         ``limit`` still eventually revisits every row instead of permanently
         starving whichever ones do not fit in the first ``limit``-sized slice.
+
+        ``checked_before`` (when set) additionally suppresses any row already
+        stamped AT OR AFTER it, so a row re-checked this recently is not re-selected
+        -- a never-checked (``NULL``) row is always eligible. This is the per-row
+        due cutoff ``wake_waiting_for_air_date`` uses to keep still-future seasons
+        on an hours-scale re-check cadence instead of one TMDB lookup per cycle.
         """
         raise NotImplementedError
 

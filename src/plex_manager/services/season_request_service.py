@@ -27,6 +27,7 @@ the caller to already know the id.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
 
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.metadata import MetadataPort
-    from plex_manager.ports.repositories import SeasonRequestRecord
+    from plex_manager.ports.repositories import RequestRecord, SeasonRequestRecord
 
 __all__ = [
     "clear_library_path",
@@ -122,6 +123,23 @@ _REAL_DONE_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 _WAITING_FOR_AIR_DATE_STATUSES: Final[frozenset[str]] = frozenset(
     {RequestStatus.waiting_for_air_date.value}
 )
+
+# Minimum age between air-date wake re-checks of the SAME still-future season (P2
+# finding, issue #210). :func:`wake_waiting_for_air_date` runs every auto-grab
+# cycle (~60s), but a season TMDB does not yet report has nothing to gain from a
+# per-minute ``get_tv_show`` re-check -- a brand-new season announcement is an
+# hours-scale event, not a per-minute one. Without this, an install whose waiting
+# rows fit inside ``AIR_DATE_WAKE_MAX_PER_CYCLE`` would re-select and re-query the
+# exact same future rows every cycle (the rotation stamp alone can't throttle a
+# set that fits in one window). The cutoff is applied as
+# ``list_for_airing_refresh(checked_before=now - interval)`` so a row checked more
+# recently than this is skipped outright; a never-checked row is always eligible,
+# so a newly-parked season is still picked up on the very next cycle. Deliberately
+# a flat age cutoff (not an air-date-proximity tier): the season air date is not
+# persisted, so a finer near/far schedule would need its own next-check column
+# (migration) -- out of scope here; the flat cutoff already delivers the intended
+# "hours, not minutes" budget protection.
+_AIR_DATE_WAKE_MIN_INTERVAL: Final[timedelta] = timedelta(hours=6)
 
 # Season statuses from which a park to ``no_acceptable_release`` is a SAFE,
 # honest search-exhausted verdict -- the CAS's ``allowed_from`` for
@@ -566,15 +584,39 @@ async def wake_waiting_for_air_date(
     waiting row instead of permanently starving whichever ones don't fit in the
     first ``max_refresh``-sized slice.
 
-    Only the ONE waiting season is ever passed to :func:`ensure_seasons`
-    (``seasons=[season.season_number]``) -- NEVER widened to the show's other
-    seasons, so a whole-show placeholder wakes exactly S1 and an explicit-season
-    request never gains seasons the operator did not ask for (issue #210
-    acceptance: "Unrequested later seasons are not added"). The actual transition
-    -- Plex-present straight to ``available``, else ``pending``, plus the search
-    backoff reset and the parent rollup recompute -- is entirely delegated to
-    :func:`ensure_seasons` (the SAME CAS-based re-arm the request-create/dedup
-    wake path already uses), so this function owns none of that logic itself.
+    The set passed to :func:`ensure_seasons` mirrors the parent's ORIGINAL intent
+    (looked up ONCE per distinct ``media_request_id`` and memoised for the pass):
+
+    * An EXPLICIT-season / explicit-episode request wakes exactly its ONE parked
+      ``season.season_number`` -- never widened, so it gains no season the operator
+      did not ask for (issue #210 acceptance: "Unrequested later seasons are not
+      added").
+    * The ZERO-season WHOLE-SHOW placeholder (``tv_request_mode == "whole_show"``,
+      parked as S1 by ``_resolve_tv_season_plan``'s ``default_waiting_first_season``
+      because TMDB reported ``season_count == 0`` at request time) keeps "whole
+      show" intent, so when TMDB later reports ``season_count >= 1`` it expands to
+      the fresh ``1..season_count`` set -- the SAME resolution the fresh-create path
+      would have produced -- instead of stranding S2.. untracked until a manual
+      re-request (P2 finding).
+    * When the parked season is EPISODE-scoped for the parent (the parent's
+      ``requested_episodes`` names episodes for THIS season), the wake is forced
+      ``pending`` (``force_pending=True``) exactly like the request-create path: a
+      partial Plex presence for the season (e.g. S2E1 present, S2E10 requested)
+      proves only "some episode exists", never that the requested episodes are, so
+      the season must NOT wake straight to ``available`` and skip the search that
+      still owes those episodes (P2 finding).
+
+    The actual transition -- Plex-present straight to ``available`` (only when NOT
+    episode-scoped), else ``pending``, plus the search backoff reset and the parent
+    rollup recompute -- is entirely delegated to :func:`ensure_seasons` (the SAME
+    CAS-based re-arm the request-create/dedup wake path already uses), so this
+    function owns none of that logic itself.
+
+    Each still-future season is re-checked at most once per
+    :data:`_AIR_DATE_WAKE_MIN_INTERVAL` (a due cutoff threaded into
+    :meth:`SeasonRequestRepository.list_for_airing_refresh` as ``checked_before``),
+    so an idle install with a handful of parked seasons re-queries TMDB on an
+    hours-scale cadence rather than once per ~60s cycle (P2 finding).
 
     FLUSH-ONLY (module convention): the caller (``auto_grab_service.
     run_grab_cycle``) owns the commit boundary, exactly like :func:`ensure_seasons`
@@ -586,13 +628,17 @@ async def wake_waiting_for_air_date(
     ``rearmed`` return.
     """
     season_repo = SqlSeasonRequestRepository(session)
+    request_repo = SqlRequestRepository(session)
     candidates = await season_repo.list_for_airing_refresh(
-        _WAITING_FOR_AIR_DATE_STATUSES, limit=max_refresh
+        _WAITING_FOR_AIR_DATE_STATUSES,
+        limit=max_refresh,
+        checked_before=now - _AIR_DATE_WAKE_MIN_INTERVAL,
     )
 
     woken = 0
     show_season_count: dict[int, int | None] = {}
     errored_shows: set[int] = set()
+    parents: dict[int, RequestRecord | None] = {}
     for season in candidates:
         if season.tmdb_id in errored_shows:
             await season_repo.mark_airing_refresh_checked(season.id, now)
@@ -617,12 +663,34 @@ async def wake_waiting_for_air_date(
 
         season_count = show_season_count[season.tmdb_id]
         if season_count is not None and season.season_number <= season_count:
+            if season.media_request_id not in parents:
+                parents[season.media_request_id] = await request_repo.get(season.media_request_id)
+            parent = parents[season.media_request_id]
+            # A zero-season whole-show placeholder keeps "whole show" intent, so it
+            # expands to the freshly-reported 1..season_count set; every other parked
+            # row (explicit season or explicit episode) wakes ONLY itself. See the
+            # docstring for why explicit rows must never be widened.
+            if parent is not None and parent.tv_request_mode == "whole_show":
+                wake_seasons = list(range(1, season_count + 1))
+            else:
+                wake_seasons = [season.season_number]
+            # Episode-scoped for THIS season -> the same ``force_pending`` guard the
+            # request-create path uses: partial Plex presence proves "some episode",
+            # never the requested episodes, so the season must not wake straight to
+            # ``available`` and skip the still-owed search (see the docstring). The
+            # per-season gate mirrors ``season_episode_service.reconcile_airing``'s.
+            episode_scoped = bool(
+                parent is not None
+                and parent.requested_episodes
+                and parent.requested_episodes.get(season.season_number)
+            )
             records = await ensure_seasons(
                 session,
                 library,
                 media_request_id=season.media_request_id,
                 tmdb_id=season.tmdb_id,
-                seasons=[season.season_number],
+                seasons=wake_seasons,
+                force_pending=episode_scoped,
             )
             if any(
                 record.season_number == season.season_number

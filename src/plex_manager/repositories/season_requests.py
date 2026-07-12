@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, case, or_, select, update
+from sqlalchemy import ColumnElement, CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
@@ -285,7 +285,7 @@ class SqlSeasonRequestRepository:
         return records
 
     async def list_for_airing_refresh(
-        self, statuses: frozenset[str], limit: int
+        self, statuses: frozenset[str], limit: int, *, checked_before: datetime | None = None
     ) -> list[SeasonRequestRecord]:
         # NULLs (never checked) sort first via an EXPLICIT ``nulls_first()`` -- same
         # backend-portability reasoning as ``list_due_for_search`` above -- then
@@ -294,9 +294,25 @@ class SqlSeasonRequestRepository:
         # slice (P2 finding): every row this call actually returns gets stamped by
         # the caller (:meth:`mark_airing_refresh_checked`), which moves it to the
         # back of this ordering for the NEXT call.
+        where: list[ColumnElement[bool]] = [
+            SeasonRequest.status.in_([RequestStatus(s) for s in statuses])
+        ]
+        if checked_before is not None:
+            # Per-row due cutoff (P2 finding, issue #210): a row stamped at or after
+            # ``checked_before`` is not yet due, so it is excluded outright rather
+            # than merely rotated -- this is what keeps a small, stable set of
+            # still-future waiting seasons from being re-selected (and re-costing a
+            # TMDB ``get_tv_show``) on EVERY 60s cycle. A never-checked (``NULL``)
+            # row is always eligible.
+            where.append(
+                or_(
+                    SeasonRequest.airing_refresh_checked_at.is_(None),
+                    SeasonRequest.airing_refresh_checked_at < checked_before,
+                )
+            )
         stmt = (
             select(SeasonRequest)
-            .where(SeasonRequest.status.in_([RequestStatus(s) for s in statuses]))
+            .where(*where)
             .order_by(
                 SeasonRequest.airing_refresh_checked_at.asc().nulls_first(),
                 SeasonRequest.id,
