@@ -1,8 +1,12 @@
 import { cn } from '../lib/cn'
 import { useEvict, useOpsDisk, useOpsHealth, useSettings } from '../api/hooks'
 import type { DiskRootItem, HealthResponse, SubsystemHealthItem } from '../api/types'
+import { AdminEmptyState } from '../components/ui/AdminEmptyState'
+import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
 import { Dot, type DotTone } from '../components/ui/Dot'
+import { SectionHeader } from '../components/ui/SectionHeader'
+import { adminRowPadding } from '../components/ui/adminStyles'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { LinkButton } from '../components/ui/LinkButton'
 import { useToast } from '../components/ui/toast'
@@ -33,23 +37,41 @@ const SUBSYSTEM_LABEL: Record<SubsystemHealthItem['status'], string> = {
  * configured" with "down"). */
 function SubsystemCard({ subsystem }: { subsystem: SubsystemHealthItem }) {
   return (
-    <div className="rounded-xl border border-hairline bg-surface p-4">
-      <div className="flex items-center justify-between gap-3">
-        <span className="truncate font-display text-sm font-semibold text-ink capitalize">
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <h3 className="min-w-0 break-words font-display text-sm font-semibold text-ink capitalize">
           {subsystem.name}
-        </span>
-        <Dot tone={SUBSYSTEM_TONE[subsystem.status]} label={SUBSYSTEM_LABEL[subsystem.status]} />
+        </h3>
+        <div className="shrink-0">
+          <Dot
+            tone={SUBSYSTEM_TONE[subsystem.status]}
+            label={SUBSYSTEM_LABEL[subsystem.status]}
+          />
+        </div>
       </div>
-      {subsystem.detail ? <p className="mt-2 text-xs text-muted">{subsystem.detail}</p> : null}
+      {subsystem.detail ? (
+        <p className="mt-2 min-w-0 text-xs break-words text-muted [overflow-wrap:anywhere]">
+          {subsystem.detail}
+        </p>
+      ) : null}
       {/* Non-blocking, informational — distinct from `detail` (which only ever
           carries FAILURE diagnostics). E.g. qBittorrent's default save path not
           being visible inside this container (issues #133/#157); never flips
           `status`, so it renders even on an otherwise-healthy subsystem. */}
-      {subsystem.note ? <p className="mt-2 text-xs text-searching">⚠ {subsystem.note}</p> : null}
-      <p className="mt-2 font-mono text-[10px] text-faint">
+      {subsystem.note ? (
+        <p className="mt-2 min-w-0 text-xs break-words text-searching [overflow-wrap:anywhere]">
+          ⚠ {subsystem.note}
+        </p>
+      ) : null}
+      <p className="mt-2 min-w-0 font-mono text-[10px] break-words text-faint">
         checked {formatTimestamp(subsystem.checked_at)}
       </p>
-    </div>
+    </article>
   )
 }
 
@@ -65,20 +87,31 @@ function ReconcilePanel({ reconcile }: { reconcile: HealthResponse['reconcile'] 
   const tone: DotTone = !hasRun ? 'neutral' : healthy ? 'ok' : 'error'
   const label = !hasRun ? 'starting up' : healthy ? 'running clean' : 'failing'
   return (
-    <div className="rounded-xl border border-hairline bg-surface p-4">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="font-display text-sm font-semibold text-ink">Reconcile loop</h3>
-        <Dot tone={tone} label={label} />
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <h3 className="min-w-0 font-display text-sm font-semibold text-ink">Reconcile loop</h3>
+        <div className="shrink-0">
+          <Dot tone={tone} label={label} />
+        </div>
       </div>
-      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs text-muted">
-        <dt>Last run</dt>
-        <dd className="text-right">{formatTimestamp(reconcile.last_run_at)}</dd>
-        <dt>Last success</dt>
-        <dd className="text-right">{formatTimestamp(reconcile.last_ok_at)}</dd>
-        <dt>Consecutive failures</dt>
+      <dl className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-1.5 font-mono text-xs">
+        <dt className="min-w-0 text-faint">Last run</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(reconcile.last_run_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Last success</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(reconcile.last_ok_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Consecutive failures</dt>
         <dd
           className={cn(
-            'text-right',
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
             reconcile.consecutive_failures > 0 ? 'font-semibold text-error' : '',
           )}
         >
@@ -86,14 +119,14 @@ function ReconcilePanel({ reconcile }: { reconcile: HealthResponse['reconcile'] 
         </dd>
         {reconcile.last_error_type ? (
           <>
-            <dt>Last error</dt>
-            <dd className="text-right text-error">
+            <dt className="min-w-0 text-faint">Last error</dt>
+            <dd className="min-w-0 text-right text-error tabular-nums [overflow-wrap:anywhere]">
               {reconcile.last_error_type} · {formatTimestamp(reconcile.last_error_at)}
             </dd>
           </>
         ) : null}
       </dl>
-    </div>
+    </article>
   )
 }
 
@@ -106,20 +139,31 @@ function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
   const tone: DotTone = !hasRun ? 'neutral' : healthy ? 'ok' : 'error'
   const label = !hasRun ? 'starting up' : healthy ? 'running clean' : 'failing'
   return (
-    <div className="rounded-xl border border-hairline bg-surface p-4">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="font-display text-sm font-semibold text-ink">Auto-grab loop</h3>
-        <Dot tone={tone} label={label} />
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <h3 className="min-w-0 font-display text-sm font-semibold text-ink">Auto-grab loop</h3>
+        <div className="shrink-0">
+          <Dot tone={tone} label={label} />
+        </div>
       </div>
-      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs text-muted">
-        <dt>Last run</dt>
-        <dd className="text-right">{formatTimestamp(autograb.last_run_at)}</dd>
-        <dt>Last success</dt>
-        <dd className="text-right">{formatTimestamp(autograb.last_ok_at)}</dd>
-        <dt>Consecutive failures</dt>
+      <dl className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-1.5 font-mono text-xs">
+        <dt className="min-w-0 text-faint">Last run</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(autograb.last_run_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Last success</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(autograb.last_ok_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Consecutive failures</dt>
         <dd
           className={cn(
-            'text-right',
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
             autograb.consecutive_failures > 0 ? 'font-semibold text-error' : '',
           )}
         >
@@ -128,10 +172,10 @@ function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
         {/* Scopes whose grab keeps failing (GrabError) are cooled down so they don't
             starve the search budget — a non-zero count means the grab pipeline, not
             the search, is what's broken. */}
-        <dt>Cooling scopes</dt>
+        <dt className="min-w-0 text-faint">Cooling scopes</dt>
         <dd
           className={cn(
-            'text-right',
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
             autograb.cooled_down_scopes > 0 ? 'font-semibold text-searching' : '',
           )}
         >
@@ -139,14 +183,14 @@ function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
         </dd>
         {autograb.last_error_type ? (
           <>
-            <dt>Last error</dt>
-            <dd className="text-right text-error">
+            <dt className="min-w-0 text-faint">Last error</dt>
+            <dd className="min-w-0 text-right text-error tabular-nums [overflow-wrap:anywhere]">
               {autograb.last_error_type} · {formatTimestamp(autograb.last_error_at)}
             </dd>
           </>
         ) : null}
       </dl>
-    </div>
+    </article>
   )
 }
 
@@ -166,6 +210,7 @@ function DiskRootCard({
   targetPercent: number
 }) {
   const pct = Math.round(root.used_percent)
+  const gaugePct = Math.min(100, Math.max(0, pct))
   const underPressure = root.used_percent >= thresholdPercent
   const barTone = underPressure
     ? 'bg-error'
@@ -174,14 +219,23 @@ function DiskRootCard({
       : 'bg-available'
 
   return (
-    <div className="rounded-xl border border-hairline bg-surface p-4">
-      <div className="flex items-baseline justify-between gap-3">
-        <span className="font-mono text-xs font-semibold text-faint">{root.root}</span>
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-baseline justify-between gap-3">
+        <h3 className="min-w-0 break-words font-mono text-xs font-semibold text-faint">
+          {root.root}
+        </h3>
         {root.error ? null : (
-          <span className="font-mono text-xs text-muted tabular-nums">{pct}% used</span>
+          <span className="shrink-0 font-mono text-xs text-muted tabular-nums">
+            {pct}% used
+          </span>
         )}
       </div>
-      <p className="mt-0.5 truncate font-mono text-[11px] text-faint">{root.path}</p>
+      <p className="mt-0.5 min-w-0 font-mono text-[11px] break-all text-faint">{root.path}</p>
 
       {root.error ? (
         <div className="mt-3 flex flex-col items-start gap-2">
@@ -193,10 +247,20 @@ function DiskRootCard({
         </div>
       ) : (
         <>
-          <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+          <div
+            role="progressbar"
+            aria-label={`${root.root} disk usage`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={gaugePct}
+            className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10"
+          >
             <div
-              className={cn('h-full rounded-full transition-[width] duration-500', barTone)}
-              style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+              className={cn(
+                'h-full rounded-full motion-safe:transition-[width] motion-safe:duration-500',
+                barTone,
+              )}
+              style={{ width: `${gaugePct}%` }}
             />
           </div>
           <p className="mt-1 font-mono text-[11px] text-faint tabular-nums">
@@ -219,9 +283,9 @@ function DiskRootCard({
             {root.candidates.slice(0, 5).map((c) => (
               <li
                 key={`${c.request_id}-${c.season ?? 'movie'}`}
-                className="flex items-center justify-between gap-2 font-mono text-[11px] text-faint"
+                className="flex min-w-0 items-center justify-between gap-2 font-mono text-[11px] text-faint"
               >
-                <span className="truncate">
+                <span className="min-w-0 truncate">
                   {c.title}
                   {c.season != null ? ` · S${c.season}` : ''}
                 </span>
@@ -231,7 +295,7 @@ function DiskRootCard({
           </ul>
         </div>
       ) : null}
-    </div>
+    </article>
   )
 }
 
@@ -298,21 +362,32 @@ export function Status() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-8 px-5 py-8 sm:px-8">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="font-display text-2xl font-extrabold">Status</h1>
-        <Button variant="secondary" onClick={() => void onFreeSpace()} loading={evict.isPending}>
-          Free space now
-        </Button>
-      </header>
+    <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-8 px-5 py-8 sm:px-8 lg:px-11">
+      <AdminPageHeader
+        title="Status"
+        actions={
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void onFreeSpace()}
+            loading={evict.isPending}
+          >
+            Free space now
+          </Button>
+        }
+      />
 
-      <section>
-        <h2 className="mb-3 font-mono text-xs font-semibold tracking-wide text-faint uppercase">
-          Subsystems
-        </h2>
-        {health.isLoading ? (
+      <section className="flex flex-col gap-[10px]">
+        <SectionHeader>Subsystems</SectionHeader>
+        {health.data ? (
+          <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2 lg:grid-cols-3">
+            {health.data.subsystems.map((s) => (
+              <SubsystemCard key={s.name} subsystem={s} />
+            ))}
+          </div>
+        ) : health.isLoading ? (
           <CenteredSpinner label="Checking subsystems…" />
-        ) : health.isError || !health.data ? (
+        ) : (
           <StateMessage
             tone="error"
             title="Couldn't load health"
@@ -323,34 +398,42 @@ export function Status() {
               </Button>
             }
           />
-        ) : (
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {health.data.subsystems.map((s) => (
-              <SubsystemCard key={s.name} subsystem={s} />
-            ))}
-          </div>
         )}
       </section>
 
       {health.data ? (
-        <section>
-          <h2 className="mb-3 font-mono text-xs font-semibold tracking-wide text-faint uppercase">
-            Background loops
-          </h2>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <section className="flex flex-col gap-[10px]">
+          <SectionHeader>Background loops</SectionHeader>
+          <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2">
             <ReconcilePanel reconcile={health.data.reconcile} />
             <AutograbPanel autograb={health.data.autograb} />
           </div>
         </section>
       ) : null}
 
-      <section>
-        <h2 className="mb-3 font-mono text-xs font-semibold tracking-wide text-faint uppercase">
-          Disk
-        </h2>
-        {disk.isLoading ? (
+      <section className="flex flex-col gap-[10px]">
+        <SectionHeader>Disk</SectionHeader>
+        {disk.data ? (
+          disk.data.roots.length === 0 ? (
+            <AdminEmptyState
+              title="No library root configured"
+              message="Set a Movies or TV library folder in Settings to see disk usage."
+            />
+          ) : (
+            <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2">
+              {disk.data.roots.map((r) => (
+                <DiskRootCard
+                  key={r.root}
+                  root={r}
+                  thresholdPercent={thresholdPercent}
+                  targetPercent={targetPercent}
+                />
+              ))}
+            </div>
+          )
+        ) : disk.isLoading ? (
           <CenteredSpinner label="Reading disk usage…" />
-        ) : disk.isError || !disk.data ? (
+        ) : (
           <StateMessage
             tone="error"
             title="Couldn't load disk usage"
@@ -361,22 +444,6 @@ export function Status() {
               </Button>
             }
           />
-        ) : disk.data.roots.length === 0 ? (
-          <StateMessage
-            title="No library root configured"
-            message="Set a Movies or TV library folder in Settings to see disk usage."
-          />
-        ) : (
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {disk.data.roots.map((r) => (
-              <DiskRootCard
-                key={r.root}
-                root={r}
-                thresholdPercent={thresholdPercent}
-                targetPercent={targetPercent}
-              />
-            ))}
-          </div>
         )}
       </section>
     </div>

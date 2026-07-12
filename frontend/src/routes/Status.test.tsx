@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
@@ -97,6 +97,45 @@ describe('Status', () => {
     ;(useSettings as unknown as Mock).mockReturnValue({ data: undefined, isLoading: false, isError: false })
   })
 
+  it('uses the shared heading hierarchy and canonical dense card grammar', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    const { container } = render(<Status />, { wrapper: Wrapper })
+
+    const pageHeading = screen.getByRole('heading', { level: 1, name: 'Status' })
+    expect(pageHeading).toBeInTheDocument()
+    expect(pageHeading.closest('header')?.parentElement).toHaveClass(
+      'max-w-[1160px]',
+      'px-5',
+      'sm:px-8',
+      'lg:px-11',
+    )
+    expect(screen.getByRole('button', { name: 'Free space now' })).toHaveClass('h-8')
+    expect(screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent)).toEqual([
+      'Subsystems',
+      'Background loops',
+      'Disk',
+    ])
+    expect(screen.getByRole('heading', { level: 3, name: 'plex' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 3, name: 'Reconcile loop' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
+
+    const cards = container.querySelectorAll('article')
+    expect(cards).toHaveLength(6)
+    for (const card of cards) {
+      expect(card).toHaveClass(
+        'rounded-[10px]',
+        'border-hairline',
+        'bg-surface',
+        'px-[14px]',
+        'py-[11px]',
+      )
+      expect(card).not.toHaveClass('p-4')
+    }
+  })
+
   it('renders a card per subsystem with its honest status label', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
@@ -160,6 +199,15 @@ describe('Status', () => {
 
     expect(screen.getByText('movies_root')).toBeInTheDocument()
     expect(screen.getByText('90% used')).toBeInTheDocument()
+    const gauge = screen.getByRole('progressbar', { name: 'movies_root disk usage' })
+    expect(gauge).toHaveAttribute('aria-valuemin', '0')
+    expect(gauge).toHaveAttribute('aria-valuemax', '100')
+    expect(gauge).toHaveAttribute('aria-valuenow', '90')
+    expect(gauge.firstElementChild).toHaveStyle({ width: '90%' })
+    expect(gauge.firstElementChild).toHaveClass(
+      'motion-safe:transition-[width]',
+      'motion-safe:duration-500',
+    )
     expect(screen.getByText(/eviction candidates/i)).toBeInTheDocument()
     expect(screen.getByText(/Old Watched Movie/)).toBeInTheDocument()
   })
@@ -188,6 +236,7 @@ describe('Status', () => {
     render(<Status />, { wrapper: Wrapper })
     expect(screen.getByText(/isn't visible to Plex Manager/)).toBeInTheDocument()
     expect(screen.getByText('No such file or directory')).toBeInTheDocument()
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
     const link = screen.getByRole('link', { name: /fix in settings/i })
     expect(link).toHaveAttribute('href', '/settings')
   })
@@ -279,7 +328,70 @@ describe('Status', () => {
     // Both the reconcile AND auto-grab panels show the honest "starting up".
     expect(screen.getAllByText('starting up')).toHaveLength(2)
     // Both "Last run" and "Last success" render the same honest placeholder.
-    expect(screen.getAllByText('never').length).toBeGreaterThan(0)
+    const neverValues = screen.getAllByText('never')
+    expect(neverValues.length).toBeGreaterThan(0)
+    for (const value of neverValues) {
+      expect(value.tagName).toBe('DD')
+      expect(value).toHaveClass('text-right', 'text-ink', 'tabular-nums')
+    }
+  })
+
+  it('keeps loop statistics as semantic key/value pairs with honest emphasis', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        reconcile: {
+          last_run_at: '2026-01-01T00:00:00Z',
+          last_ok_at: '2025-12-31T23:59:00Z',
+          last_error_type: 'ReconcileDeadlineExceeded',
+          last_error_at: '2026-01-01T00:00:00Z',
+          consecutive_failures: 2,
+        },
+        autograb: {
+          last_run_at: '2026-01-01T00:00:00Z',
+          last_ok_at: '2025-12-31T23:59:00Z',
+          last_error_type: 'GrabPipelineUnavailable',
+          last_error_at: '2026-01-01T00:00:00Z',
+          consecutive_failures: 1,
+          cooled_down_scopes: 3,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const reconcileCard = screen
+      .getByRole('heading', { level: 3, name: 'Reconcile loop' })
+      .closest('article')
+    expect(reconcileCard).not.toBeNull()
+    const reconcileStats = within(reconcileCard as HTMLElement)
+    expect(reconcileStats.getByText('Consecutive failures').tagName).toBe('DT')
+    expect(reconcileStats.getByText('2')).toHaveClass(
+      'text-right',
+      'tabular-nums',
+      'text-error',
+    )
+    expect(reconcileStats.getByText(/ReconcileDeadlineExceeded/)).toHaveClass(
+      'text-right',
+      'tabular-nums',
+      'text-error',
+    )
+
+    const autograbCard = screen
+      .getByRole('heading', { level: 3, name: 'Auto-grab loop' })
+      .closest('article')
+    expect(autograbCard).not.toBeNull()
+    const autograbStats = within(autograbCard as HTMLElement)
+    expect(autograbStats.getByText('Cooling scopes').tagName).toBe('DT')
+    expect(autograbStats.getByText('3')).toHaveClass(
+      'text-right',
+      'tabular-nums',
+      'text-searching',
+    )
+    expect(autograbStats.getByText(/GrabPipelineUnavailable/)).toHaveClass('text-error')
   })
 
   it('surfaces how many scopes are in a grab-pipeline cooldown', () => {
@@ -341,6 +453,48 @@ describe('Status', () => {
     expect(screen.getByText(/only evicted once this root reaches 95% used/i)).toBeInTheDocument()
   })
 
+  it('uses the canonical no-root empty state without losing its correction guidance', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk({ roots: [] }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const title = screen.getByText('No library root configured')
+    expect(title.closest('[role="status"]')).toHaveClass('rounded-[10px]', 'border-dashed')
+    expect(
+      screen.getByText('Set a Movies or TV library folder in Settings to see disk usage.'),
+    ).toBeInTheDocument()
+  })
+
+  it('keeps cached health and disk snapshots visible when a background refetch fails', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health(),
+      isLoading: false,
+      isError: true,
+      error: { code: 'unknown_error', message: 'Health refresh failed', status: 0 },
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: true,
+      error: { code: 'unknown_error', message: 'Disk refresh failed', status: 0 },
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('heading', { level: 3, name: 'plex' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 3, name: 'Reconcile loop' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
+    expect(screen.queryByText("Couldn't load health")).not.toBeInTheDocument()
+    expect(screen.queryByText("Couldn't load disk usage")).not.toBeInTheDocument()
+  })
+
   it('shows a retry action when the health read fails', () => {
     const refetch = vi.fn()
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
@@ -355,6 +509,24 @@ describe('Status', () => {
 
     render(<Status />, { wrapper: Wrapper })
     expect(screen.getByText(/couldn't load health/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    expect(refetch).toHaveBeenCalled()
+  })
+
+  it('keeps the disk failure actionable with its own Retry button', () => {
+    const refetch = vi.fn()
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: { code: 'unknown_error', message: 'Disk probe failed', status: 0 },
+      refetch,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText(/couldn't load disk usage/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /retry/i }))
     expect(refetch).toHaveBeenCalled()
   })
