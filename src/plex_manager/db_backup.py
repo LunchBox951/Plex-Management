@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 _KEEP_COUNT: Final = 5
 _BACKUP_SUBDIR: Final = "backups"
 _PREFIX: Final = "pre-migrate-"
+# Prefix for an in-progress backup that has not yet been published. Chosen so it
+# never matches the ``pre-migrate-*`` glob: a partial (crashed) attempt is thus
+# invisible to _prune's keep-count AND to recovery, until it is atomically
+# renamed to its final ``pre-migrate-*`` name once every file is written.
+_TMP_PREFIX: Final = ".tmp-"
 _DB_COPY_NAME: Final = "plex_manager.db"
 _KEY_COPY_NAME: Final = "secret.key"
 _MANIFEST_NAME: Final = "MANIFEST.txt"
@@ -103,6 +108,29 @@ def _head_revision() -> str | None:
     return head
 
 
+def _revision_in_graph(revision: str) -> bool:
+    """Whether ``revision`` is a node in THIS image's Alembic migration graph.
+
+    A ``current`` revision that the on-disk ``migrations/`` do not contain means
+    the database was stamped by a DIFFERENT (newer) image than the one now
+    starting -- e.g. an older image accidentally launched against a
+    already-upgraded volume. Alembic will then refuse to upgrade from an unknown
+    revision, so there is no forward migration to guard and any snapshot taken
+    here would capture the already-migrated, unusable-for-rollback DB. Reads
+    ``migrations/`` via ``ScriptDirectory`` only (no DB or ``env.py`` execution);
+    any failure to resolve the revision is reported as "not in graph".
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    try:
+        script = ScriptDirectory.from_config(Config("alembic.ini"))
+        script.get_revision(revision)
+    except Exception:
+        return False
+    return True
+
+
 def _snapshot_sqlite(src: Path, dst: Path) -> None:
     """Write a WAL-consistent copy of ``src`` to ``dst`` via the SQLite backup API.
 
@@ -122,16 +150,50 @@ def _snapshot_sqlite(src: Path, dst: Path) -> None:
         src_conn.close()
 
 
+def _fernet_env_override_configured(settings: Settings) -> bool:
+    """Whether ``PLEX_MANAGER_FERNET_KEY`` supplies the active key.
+
+    Mirrors ``adapters.encryption._fernet_override``: the override is in effect
+    iff ``settings.fernet_key`` is set to a non-empty value (an empty override is
+    treated as unset, exactly as the encryption layer does). Kept as a local
+    mirror rather than importing that private helper so the backup path -- which
+    must agree with how :func:`~plex_manager.adapters.encryption.get_fernet`
+    actually resolves the key -- does not reach across a module's private API.
+    """
+    if settings.fernet_key is None:
+        return False
+    return bool(settings.fernet_key.get_secret_value())
+
+
 def _copy_key(settings: Settings, dest_dir: Path) -> bool:
-    """Copy the Fernet key file into the backup dir, preserving 0600. Returns
-    whether a key file was found and copied (``False`` when the operator uses
-    the ``PLEX_MANAGER_FERNET_KEY`` env override instead of a key file)."""
+    """Copy the ACTIVE Fernet key into the backup dir, preserving 0600. Returns
+    whether a key file was included in the backup.
+
+    Mirrors the encryption layer's key resolution (:func:`get_fernet` /
+    :func:`ensure_secret_key`): a configured ``PLEX_MANAGER_FERNET_KEY`` override
+    ALWAYS wins and the on-disk ``secret.key`` is never consulted. So when the
+    override is set we must NOT copy that file -- it may be a stale leftover that
+    no longer matches the active key. Copying it would put the WRONG key in the
+    backup while the manifest claimed the recovery unit was complete; restoring
+    that unit after a rollback would leave the database undecryptable. In that
+    case the active key lives only in the operator's environment/secret store and
+    is recorded (not embedded) as such."""
+    if _fernet_env_override_configured(settings):
+        logger.warning(
+            "Encryption key is provided via PLEX_MANAGER_FERNET_KEY (env "
+            "override), which the app uses in preference to any on-disk "
+            "secret.key; that file (if present) is NOT the active key and is "
+            "deliberately NOT copied into this backup. Preserve the "
+            "PLEX_MANAGER_FERNET_KEY value separately -- it and the database are "
+            "one recovery unit; a replacement key cannot decrypt existing ciphertext."
+        )
+        return False
     key = secret_key_path(settings)
     if not key.exists():
         logger.info(
-            "Encryption key is via PLEX_MANAGER_FERNET_KEY (env override) or "
-            "absent at %s; this backup will not include it -- preserve that "
-            "environment variable separately. The database and key are one "
+            "No encryption key file at %s and no PLEX_MANAGER_FERNET_KEY override; "
+            "this backup will not include a key. If this install stores encrypted "
+            "data, preserve the key separately -- the database and key are one "
             "recovery unit; a replacement key cannot decrypt existing ciphertext.",
             key,
         )
@@ -203,6 +265,19 @@ def _prune(backups_root: Path, keep: int = _KEEP_COUNT) -> None:
     """
     if not backups_root.is_dir():
         return
+    # Sweep abandoned in-progress backups (a crash between ``mkdir`` and the
+    # final publish rename). They never match the ``pre-migrate-*`` glob below
+    # (distinct ``.tmp-`` prefix), so they neither count toward ``keep`` nor
+    # shadow a real backup -- but they must not accumulate across failed starts.
+    for partial in backups_root.glob(f"{_TMP_PREFIX}{_PREFIX}*"):
+        if not partial.is_dir():
+            continue
+        try:
+            shutil.rmtree(partial)
+        except OSError:
+            logger.warning(
+                "Could not remove abandoned partial backup directory %s", partial, exc_info=True
+            )
     candidates = sorted(
         (p for p in backups_root.glob(f"{_PREFIX}*") if p.is_dir()),
         key=lambda p: p.stat().st_mtime,
@@ -246,14 +321,48 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
         )
         return None
 
+    # Guard against an OLDER image started against a NEWER-stamped database: the
+    # stamped revision is then absent from this image's migration graph. Alembic
+    # will refuse to upgrade from it, so backing up here would only snapshot the
+    # already-migrated (useless-for-rollback) DB -- and, under
+    # ``restart: unless-stopped``, every restart would _prune() away the genuine
+    # pre-migration backup ADR-0021's recovery path relies on. Skip backup AND
+    # prune, and log the mismatch honestly. (When head itself is undeterminable
+    # we cannot trust the graph read, so fall through to a defensive backup.)
+    if current is not None and head != _UNKNOWN_HEAD and not _revision_in_graph(current):
+        logger.warning(
+            "Database is stamped at revision %s, which is NOT in this image's "
+            "migration graph -- most likely an OLDER image was started against a "
+            "database already migrated by a NEWER one. Alembic cannot upgrade from "
+            "an unknown revision, so there is no forward migration to guard; "
+            "skipping the pre-migration backup AND prune so a genuine pre-migration "
+            "backup is neither overwritten nor pruned away. Re-point the deployment "
+            "at the image that matches revision %s (see ADR-0021).",
+            current,
+            current,
+        )
+        return None
+
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     from_label = current or "base"
-    dest = Path(settings.data_dir) / _BACKUP_SUBDIR / f"{_PREFIX}{from_label}-{timestamp}"
-    dest.mkdir(parents=True, exist_ok=True)
-
-    _snapshot_sqlite(db_path, dest / _DB_COPY_NAME)
-    key_included = _copy_key(settings, dest)
-    _write_manifest(dest, current, key_included)
+    backups_root = Path(settings.data_dir) / _BACKUP_SUBDIR
+    final_name = f"{_PREFIX}{from_label}-{timestamp}"
+    dest = backups_root / final_name
+    # Build into a ``.tmp-`` staging dir and publish it via an atomic rename only
+    # once the DB snapshot, key, and manifest are ALL written. A failure part-way
+    # therefore never leaves a partial ``pre-migrate-*`` dir that _prune would
+    # count toward its keep-limit or that recovery could mistake for a complete
+    # restore unit; the staging dir is removed on failure and swept by _prune.
+    staging = backups_root / f"{_TMP_PREFIX}{final_name}"
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        _snapshot_sqlite(db_path, staging / _DB_COPY_NAME)
+        key_included = _copy_key(settings, staging)
+        _write_manifest(staging, current, key_included)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    os.replace(staging, dest)
 
     logger.info(
         "Pre-migration backup written to %s (from rev %s, key_included=%s) -- "
